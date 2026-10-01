@@ -19,12 +19,83 @@ pub enum ExecutableError {
     /// the launcher's working directory.
     #[error("a program path containing `/` must be absolute")]
     RelativePath,
-    /// The absolute path is not an executable regular file.
-    #[error("the configured executable is not an executable file")]
-    NotExecutable,
+    /// The absolute path is not an executable the daemon may run; the payload
+    /// says which check failed.
+    #[error("the configured executable is not trusted: {0}")]
+    NotExecutable(Refusal),
     /// No searched directory holds an executable of that name.
     #[error("no executable of that name exists in the search path")]
     NotFound,
+}
+
+/// The check an executable candidate failed, with the facts observed.
+///
+/// Carries only numeric ids, modes, error numbers, and directory paths, never
+/// file contents.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// The path could not be resolved (`canonicalize` failed with this errno).
+    #[error("cannot resolve the path (errno {0})")]
+    Unresolvable(i32),
+    /// The final file is not a regular file.
+    #[error("not a regular file")]
+    NotRegular,
+    /// The file could not be opened for inspection.
+    #[error("cannot open the file for inspection (errno {0})")]
+    OpenFailed(i32),
+    /// The opened file could not be inspected.
+    #[error("cannot inspect the opened file (errno {0})")]
+    StatFailed(i32),
+    /// The file is owned by neither the effective user nor root.
+    #[error("owned by uid {owner}, not the effective user ({effective}) or root")]
+    Owner {
+        /// The observed owner.
+        owner: u32,
+        /// The effective user.
+        effective: u32,
+    },
+    /// The file is writable by group or others.
+    #[error("writable by group or others (mode {mode:o})")]
+    Writable {
+        /// The permission bits.
+        mode: u32,
+    },
+    /// An ACL entry grants a change right, or the ACL could not be read.
+    #[error("ACL check failed: {0}")]
+    Acl(String),
+    /// A directory of the lookup chain is untrusted.
+    #[error("lookup chain directory {dir} is untrusted: {detail}", dir = .dir.display())]
+    ChainDirectory {
+        /// The directory.
+        dir: PathBuf,
+        /// Why it failed the trusted-ancestor policy.
+        detail: String,
+    },
+    /// A symlink on the lookup chain is owned by someone else.
+    #[error("a symlink on the lookup chain is owned by uid {owner}")]
+    ChainSymlinkOwner {
+        /// The symlink's owner.
+        owner: u32,
+    },
+    /// A directory others can write holds a chain entry that is not ours.
+    #[error(
+        "directory {dir} is writable by others and holds an entry owned by uid {owner}",
+        dir = .dir.display()
+    )]
+    ChainSharedDirectory {
+        /// The writable directory.
+        dir: PathBuf,
+        /// The owner of the entry in it.
+        owner: u32,
+    },
+    /// The lookup chain could not be followed (loop, unreadable link, or a
+    /// missing component).
+    #[error("the lookup chain cannot be followed")]
+    ChainBroken,
+    /// The kernel refused execute access.
+    #[error("execute access refused (errno {0})")]
+    ExecuteDenied(i32),
 }
 
 /// Resolves `program` to an executable file.
@@ -104,15 +175,13 @@ fn resolve_in<'a>(
         if !path.is_absolute() {
             return Err(ExecutableError::RelativePath);
         }
-        return if is_trusted_executable(path, owners) {
-            Ok(path.to_path_buf())
-        } else {
-            Err(ExecutableError::NotExecutable)
-        };
+        return inspect_executable(path, owners)
+            .map(|()| path.to_path_buf())
+            .map_err(ExecutableError::NotExecutable);
     }
     directories
         .map(|directory| directory.join(program))
-        .find(|candidate| is_trusted_executable(candidate, owners))
+        .find(|candidate| inspect_executable(candidate, owners).is_ok())
         .ok_or(ExecutableError::NotFound)
 }
 
@@ -169,7 +238,7 @@ pub fn is_trusted_executable_file(path: &Path) -> bool {
     is_executable_file(path)
 }
 
-/// Whether every directory the lookup of `path` passes through is
+/// Checks that every directory the lookup of `path` passes through is
 /// owner-controlled, symlink targets included.
 ///
 /// The path is resolved component by component, and each directory searched on
@@ -184,7 +253,7 @@ pub fn is_trusted_executable_file(path: &Path) -> bool {
 /// others can write (a sticky `/tmp`) may hold a chain entry only when that
 /// entry is owned by `owners` too: sticky protects an entry from everyone but
 /// its owner, so an entry another account created there is the attack itself.
-fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> bool {
+fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> Result<(), Refusal> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt as _;
@@ -217,29 +286,34 @@ fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> bool {
         }
         let next = directory.join(&name);
         let Ok(metadata) = std::fs::symlink_metadata(&next) else {
-            return false;
+            return Err(Refusal::ChainBroken);
         };
         let owned = owners.allows(metadata.uid());
         let Ok(holder) = std::fs::metadata(&directory) else {
-            return false;
+            return Err(Refusal::ChainBroken);
         };
         let holder_mode = holder.mode();
         if holder_mode & WRITABLE_BY_OTHERS != 0 && !(holder_mode & STICKY != 0 && owned) {
-            return false;
+            return Err(Refusal::ChainSharedDirectory {
+                dir: directory,
+                owner: metadata.uid(),
+            });
         }
         if !metadata.file_type().is_symlink() {
             directory = next;
             continue;
         }
         if !owned {
-            return false;
+            return Err(Refusal::ChainSymlinkOwner {
+                owner: metadata.uid(),
+            });
         }
         links += 1;
         let Ok(target) = std::fs::read_link(&next) else {
-            return false;
+            return Err(Refusal::ChainBroken);
         };
         if links > MAX_LINKS {
-            return false;
+            return Err(Refusal::ChainBroken);
         }
         if target.is_absolute() {
             directory = PathBuf::from("/");
@@ -253,48 +327,105 @@ fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> bool {
     }
     // The filesystem root has no components for the ancestor policy to judge;
     // renaming below it needs write access to a directory that is judged.
-    searched
+    for dir in searched
         .iter()
         .filter(|dir| dir.as_path() != Path::new("/"))
-        .all(|dir| crate::filesystem::TrustedDir::open_absolute_ancestor(dir).is_ok())
+    {
+        crate::filesystem::TrustedDir::open_absolute_ancestor(dir).map_err(|error| {
+            Refusal::ChainDirectory {
+                dir: dir.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+    }
+    Ok(())
 }
 
 fn is_trusted_executable(path: &Path, owners: Owners) -> bool {
+    inspect_executable(path, owners).is_ok()
+}
+
+/// Runs every check of [`is_executable_file`] and names the first that fails.
+fn inspect_executable(path: &Path, owners: Owners) -> Result<(), Refusal> {
     use rustix::fs::{FileType, Mode, OFlags};
 
-    let Ok(target) = std::fs::canonicalize(path) else {
-        return false;
-    };
+    let errno = |error: &std::io::Error| error.raw_os_error().unwrap_or(0);
+    let target =
+        std::fs::canonicalize(path).map_err(|error| Refusal::Unresolvable(errno(&error)))?;
     // A FIFO without a writer or a device node must neither block the lookup
     // nor be opened at all, so non-regular files are skipped on a plain `stat`,
     // and the open itself is non-blocking.
     if !std::fs::metadata(&target).is_ok_and(|metadata| metadata.is_file()) {
-        return false;
+        return Err(Refusal::NotRegular);
     }
-    let Ok(descriptor) = rustix::fs::open(
+    let descriptor = rustix::fs::open(
         &target,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
-    ) else {
-        return false;
-    };
+    )
+    .map_err(|error| Refusal::OpenFailed(error.raw_os_error()))?;
     let file = std::fs::File::from(descriptor);
-    let Ok(stat) = rustix::fs::fstat(&file) else {
-        return false;
-    };
+    let stat =
+        rustix::fs::fstat(&file).map_err(|error| Refusal::StatFailed(error.raw_os_error()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(Refusal::NotRegular);
+    }
+    let owner: u32 = stat.st_uid;
+    if !owners.allows(owner) {
+        return Err(Refusal::Owner {
+            owner,
+            effective: owners.effective,
+        });
+    }
     let mode = Mode::from_raw_mode(stat.st_mode);
-    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
-        && owners.allows(stat.st_uid)
-        && !mode.intersects(Mode::WGRP | Mode::WOTH)
-        && crate::filesystem::validate_private_acl(&file, &target).is_ok()
-        && lookup_chain_is_owner_controlled(path, owners)
-        && rustix::fs::accessat(
-            rustix::fs::CWD,
-            &target,
-            rustix::fs::Access::EXEC_OK,
-            rustix::fs::AtFlags::EACCESS,
-        )
-        .is_ok()
+    if mode.intersects(Mode::WGRP | Mode::WOTH) {
+        return Err(Refusal::Writable {
+            mode: permission_bits(mode),
+        });
+    }
+    match crate::filesystem::acl_grants_change(&file) {
+        Ok(false) => {}
+        Ok(true) => return Err(Refusal::Acl("an entry grants a change right".to_owned())),
+        Err(error) => {
+            return Err(Refusal::Acl(format!(
+                "cannot read it (errno {})",
+                errno(&error)
+            )))
+        }
+    }
+    lookup_chain_is_owner_controlled(path, owners)?;
+    execute_access(&target)
+}
+
+/// The permission bits of `mode` as a `u32` (`mode_t` is 16 bits on macOS).
+#[cfg_attr(
+    not(target_vendor = "apple"),
+    expect(
+        clippy::useless_conversion,
+        reason = "mode_t is already u32 on this target"
+    )
+)]
+fn permission_bits(mode: rustix::fs::Mode) -> u32 {
+    mode.as_raw_mode().into()
+}
+
+/// Asks the kernel whether the effective user may execute `path`.
+///
+/// Uses `faccessat(X_OK, AT_EACCESS)`; a platform whose libc rejects the flag
+/// (`ENOSYS`, `EINVAL`, `EOPNOTSUPP`) falls back to the plain check, which
+/// answers for the real user and so agrees for a process that has not changed
+/// its ids.
+fn execute_access(path: &Path) -> Result<(), Refusal> {
+    use rustix::fs::{Access, AtFlags, CWD};
+    use rustix::io::Errno;
+
+    match rustix::fs::accessat(CWD, path, Access::EXEC_OK, AtFlags::EACCESS) {
+        Err(Errno::NOSYS | Errno::INVAL | Errno::OPNOTSUPP) => {
+            rustix::fs::accessat(CWD, path, Access::EXEC_OK, AtFlags::empty())
+        }
+        other => other,
+    }
+    .map_err(|error| Refusal::ExecuteDenied(error.raw_os_error()))
 }
 
 #[cfg(test)]
@@ -379,9 +510,12 @@ mod tests {
         let plain = dir.path().join("plain");
         fs::write(&plain, "data").expect("plain");
         let search = SearchPath::new(vec![dir.path().to_path_buf()]).expect("search");
-        assert_eq!(
-            resolve_executable(plain.as_os_str(), &search),
-            Err(ExecutableError::NotExecutable)
+        assert!(
+            matches!(
+                resolve_executable(plain.as_os_str(), &search),
+                Err(ExecutableError::NotExecutable(_))
+            ),
+            "refused"
         );
         assert_eq!(
             resolve_executable(OsStr::new("plain"), &search),
@@ -416,9 +550,12 @@ mod tests {
             resolve_executable(OsStr::new("agent"), &search).expect("agent"),
             usable
         );
-        assert_eq!(
-            resolve_executable(no_bits.as_os_str(), &search),
-            Err(ExecutableError::NotExecutable)
+        assert!(
+            matches!(
+                resolve_executable(no_bits.as_os_str(), &search),
+                Err(ExecutableError::NotExecutable(_))
+            ),
+            "refused"
         );
         // Executable by group and others only: the owner is refused by the
         // kernel, but root may run any file that has an execute bit.
@@ -522,10 +659,13 @@ mod tests {
                 "mode {mode:o}"
             );
             // A configured absolute path gets the same verdict.
-            assert_eq!(
-                resolve_executable(loose.join("agent").as_os_str(), &search),
-                Err(ExecutableError::NotExecutable),
-                "mode {mode:o}"
+            let refused = resolve_executable(loose.join("agent").as_os_str(), &search);
+            assert!(
+                matches!(
+                    refused,
+                    Err(ExecutableError::NotExecutable(Refusal::Writable { .. }))
+                ),
+                "mode {mode:o}: {refused:?}"
             );
         }
         // Tight modes are accepted, with or without the read bits for others.
@@ -559,9 +699,12 @@ mod tests {
             resolve_in(OsStr::new("agent"), dirs.into_iter(), strangers),
             Err(ExecutableError::NotFound)
         );
-        assert_eq!(
-            resolve_in(mine.as_os_str(), std::iter::empty(), strangers),
-            Err(ExecutableError::NotExecutable)
+        assert!(
+            matches!(
+                resolve_in(mine.as_os_str(), std::iter::empty(), strangers),
+                Err(ExecutableError::NotExecutable(_))
+            ),
+            "refused"
         );
         // Owned by the effective user, the first one wins again.
         let me = Owners {
@@ -637,17 +780,23 @@ mod tests {
             resolve_executable(OsStr::new("agent"), &search),
             Ok(trusted)
         );
-        assert_eq!(
-            resolve_executable(wild.join("agent").as_os_str(), &search),
-            Err(ExecutableError::NotExecutable)
+        assert!(
+            matches!(
+                resolve_executable(wild.join("agent").as_os_str(), &search),
+                Err(ExecutableError::NotExecutable(_))
+            ),
+            "refused"
         );
         // A directory below a writable one is refused as well.
         let below = wild.join("below");
         make_dir(dir.path(), &below);
         executable(&below, "agent");
-        assert_eq!(
-            resolve_executable(below.join("agent").as_os_str(), &search),
-            Err(ExecutableError::NotExecutable)
+        assert!(
+            matches!(
+                resolve_executable(below.join("agent").as_os_str(), &search),
+                Err(ExecutableError::NotExecutable(_))
+            ),
+            "refused"
         );
     }
 
@@ -693,24 +842,21 @@ mod tests {
             effective: u32::MAX - 1,
             root: u32::MAX - 2,
         };
-        assert!(!lookup_chain_is_owner_controlled(&link, strangers));
+        assert!(lookup_chain_is_owner_controlled(&link, strangers).is_err());
         // A plain entry another account put into the sticky directory is the
         // same attack.
-        assert!(!lookup_chain_is_owner_controlled(
-            &sticky.join("plain"),
-            strangers
-        ));
+        assert!(lookup_chain_is_owner_controlled(&sticky.join("plain"), strangers).is_err());
         // A symlink in a private directory is judged by its owner alone.
         let private = dir.path().join("private");
         make_dir(dir.path(), &private);
         let own = private.join("agent");
         std::os::unix::fs::symlink(&real, &own).expect("symlink");
-        assert!(!lookup_chain_is_owner_controlled(&own, strangers));
+        assert!(lookup_chain_is_owner_controlled(&own, strangers).is_err());
         let me = Owners {
             effective: rustix::process::geteuid().as_raw(),
             root: u32::MAX - 2,
         };
-        assert!(lookup_chain_is_owner_controlled(&own, me));
+        assert_eq!(lookup_chain_is_owner_controlled(&own, me), Ok(()));
     }
 
     #[test]
@@ -753,5 +899,98 @@ mod tests {
             .recv_timeout(Duration::from_secs(20))
             .expect("the lookup returned instead of blocking on the FIFO");
         assert_eq!(resolved, Ok(later));
+    }
+
+    #[test]
+    fn a_refusal_names_the_check_that_failed_with_the_observed_facts() {
+        let dir = fixture();
+        let bin = dir.path().join("bin");
+        make_dir(dir.path(), &bin);
+        let file = executable(&bin, "agent");
+        let strangers = Owners {
+            effective: u32::MAX - 1,
+            root: u32::MAX - 2,
+        };
+        let refusal =
+            |path: &Path, owners| inspect_executable(path, owners).expect_err("must be refused");
+        let real_uid = rustix::process::geteuid().as_raw();
+        assert_eq!(
+            refusal(&file, strangers),
+            Refusal::Owner {
+                owner: real_uid,
+                effective: u32::MAX - 1
+            }
+        );
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert_eq!(
+            refusal(&file, Owners::current()),
+            Refusal::Writable { mode: 0o777 }
+        );
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(matches!(
+            refusal(&file, Owners::current()),
+            Refusal::ExecuteDenied(_)
+        ));
+        assert!(matches!(
+            refusal(&dir.path().join("missing"), Owners::current()),
+            Refusal::Unresolvable(_)
+        ));
+        assert_eq!(refusal(&bin, Owners::current()), Refusal::NotRegular);
+        let wild = wild_dir(dir.path(), "wild");
+        let loose = executable(&wild, "agent");
+        let reason = refusal(&loose, Owners::current());
+        assert!(
+            matches!(&reason, Refusal::ChainSharedDirectory { dir, .. } if *dir == wild),
+            "{reason:?}"
+        );
+        // The message stays short and carries only ids, modes, and paths.
+        assert!(
+            reason.to_string().contains("writable by others"),
+            "{reason}"
+        );
+    }
+
+    /// Stock macOS binaries (root-owned, on the sealed system volume, behind
+    /// firmlinks) must be accepted; a failure prints the typed reason.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stock_macos_system_binaries_are_trusted() {
+        let absolute = [
+            "/bin/sh",
+            "/bin/false",
+            "/bin/zsh",
+            "/usr/bin/true",
+            "/usr/bin/open",
+            "/usr/bin/osascript",
+            "/usr/bin/git",
+        ];
+        for program in absolute {
+            if !Path::new(program).exists() {
+                // The Xcode command line tools shim may be absent.
+                eprintln!("skipping {program}: not installed on this runner");
+                continue;
+            }
+            let resolved = resolve_executable(OsStr::new(program), &SearchPath::empty());
+            assert!(resolved.is_ok(), "{program}: {resolved:?}");
+        }
+        let search = std::env::join_paths(["/usr/bin", "/bin"]).expect("join");
+        for name in ["sh", "false", "true", "zsh", "open", "osascript", "git"] {
+            let resolved = resolve_executable_in_path_value(OsStr::new(name), Some(&search));
+            if name == "git" && resolved.is_err() && !Path::new("/usr/bin/git").exists() {
+                eprintln!("skipping git: not installed on this runner");
+                continue;
+            }
+            let program = Path::new(if name == "false" || name == "sh" || name == "zsh" {
+                "/bin"
+            } else {
+                "/usr/bin"
+            })
+            .join(name);
+            assert!(
+                resolved.is_ok(),
+                "{name} on PATH=/usr/bin:/bin: {resolved:?} ({:?})",
+                resolve_executable(program.as_os_str(), &SearchPath::empty())
+            );
+        }
     }
 }

@@ -73,7 +73,13 @@ entry after the check. A
 path-based exec cannot be made atomic with the check; the chain check removes
 the attacker's ability to change what the path names. A private 0700 directory
 below the sticky root-owned `/tmp` passes. Group-writable executables or
-directories, such as an admin-group Intel Homebrew, are out of scope.
+directories, such as an admin-group Intel Homebrew, are out of scope. A refused configured
+executable reports which check failed (`Refusal`: owner uid, mode, ACL, the
+untrusted chain directory, or the errno of the open or execute check) so a
+rejection is diagnosable. On macOS an ACL counts only when an allow entry
+grants a change right (deny entries such as `everyone deny delete` do not), and
+a filesystem that cannot answer the ACL query (`ENOTSUP`, `EINVAL`) counts as
+having none.
 
 Login-shell output and the fallback table are untrusted input, so a directory
 is kept only when it is trusted: symlinks are resolved, every component of the

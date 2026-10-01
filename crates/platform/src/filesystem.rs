@@ -3161,7 +3161,7 @@ fn validate_fd_links(
 pub(crate) fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
     use std::os::fd::AsFd as _;
 
-    let acl = calcifer_macos_acl::read_acl(file.as_fd())
+    let acl = read_acl_or_none(file.as_fd())
         .map_err(|source| io_error("inspect trusted entry ACL", path, source))?;
     if acl_is_deny_only(&acl) {
         Ok(())
@@ -3170,6 +3170,70 @@ pub(crate) fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
             path: path.to_path_buf(),
         })
     }
+}
+
+/// Reads the extended ACL of an open vnode; a filesystem that cannot hold one
+/// counts as having none.
+///
+/// Sealed system volumes and some network filesystems answer the ACL query with
+/// `ENOTSUP`, `EOPNOTSUPP`, `ENOSYS`, or `EINVAL` instead of the `ENOENT` of a
+/// supporting filesystem without an ACL. Such an entry carries no ACL that
+/// could grant anyone access, so it is not a failure. Any other error stays one.
+#[cfg(target_os = "macos")]
+pub(crate) fn read_acl_or_none(
+    descriptor: std::os::fd::BorrowedFd<'_>,
+) -> io::Result<calcifer_macos_acl::Acl> {
+    match calcifer_macos_acl::read_acl(descriptor) {
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
+            ) =>
+        {
+            Ok(calcifer_macos_acl::Acl::default())
+        }
+        other => other,
+    }
+}
+
+/// ACL permission bits that let a principal change a file or its metadata:
+/// write data, delete, append, write attributes, write extended attributes,
+/// write security, and change owner.
+#[cfg(target_os = "macos")]
+const ACL_FILE_CHANGE_PERMISSIONS: u32 =
+    (1 << 2) | (1 << 4) | (1 << 5) | (1 << 8) | (1 << 10) | (1 << 12) | (1 << 13);
+
+/// Whether an ACL entry of `file` grants anyone the right to change it.
+///
+/// Deny entries (and `everyone deny delete`) never grant access, and an allow
+/// entry for reading or executing is harmless; only an allow entry carrying a
+/// change permission counts. An unknown tag is treated as granting, fail
+/// closed.
+///
+/// # Errors
+///
+/// Returns the I/O error of an ACL query that failed for a reason other than
+/// an absent or unsupported ACL.
+#[cfg(target_os = "macos")]
+pub(crate) fn acl_grants_change(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsFd as _;
+
+    let acl = read_acl_or_none(file.as_fd())?;
+    Ok(acl.entries.iter().any(|entry| match entry.tag {
+        calcifer_macos_acl::TAG_DENY => false,
+        calcifer_macos_acl::TAG_ALLOW => entry.permissions & ACL_FILE_CHANGE_PERMISSIONS != 0,
+        _ => true,
+    }))
+}
+
+/// Without ACLs no entry grants anything.
+#[cfg(not(target_os = "macos"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the call site identical across supported Unix targets"
+)]
+pub(crate) fn acl_grants_change(_file: &File) -> io::Result<bool> {
+    Ok(false)
 }
 
 #[cfg(target_os = "macos")]

@@ -470,16 +470,18 @@ const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 ///
 /// The leader's exit is polled with `try_wait`, never with a blocking wait or
 /// `waitid`, so no step depends on how a platform reports a stopped or killed
-/// process. On a timeout the whole group gets SIGKILL while the leader is still
-/// unreaped (its pid, the group id, cannot be recycled yet) and the leader is
-/// then reaped within [`REAP_BUDGET`]. After a normal exit the group is killed
-/// as well, so a wrapper script's background children do not outlive the
-/// command; the leader is already reaped then, which is safe because a group id
-/// is not reallocated while a member lives and a vanished group answers
-/// `ESRCH`.
+/// process. Only the deadline signals anything: the whole group gets SIGKILL
+/// while the leader is still unreaped (it is running or a zombie, and either
+/// way its pid, the group id, cannot be recycled), and the leader is then
+/// reaped within [`REAP_BUDGET`]. A leader that `try_wait` reports as exited is
+/// already reaped, so nothing is signalled after a normal exit: the group id of
+/// a reaped leader may belong to an unrelated group by then. A wrapper that
+/// backgrounds a child and exits has detached it on purpose.
 ///
 /// Standard error, when piped, is drained by a thread from the start (a full
-/// pipe cannot stall the command) and joined within [`STDERR_DRAIN_BUDGET`].
+/// pipe cannot stall the command) and joined within [`STDERR_DRAIN_BUDGET`]; a
+/// surviving descendant that keeps the pipe open costs that budget and the
+/// diagnostic.
 ///
 /// The limit: a descendant that leaves the group (`setsid` or `setpgid`) is
 /// out of reach.
@@ -512,7 +514,6 @@ pub(crate) fn run_bounded(
         }
         thread::sleep(remaining.min(EXIT_POLL_INTERVAL));
     };
-    kill_group(group);
     let stderr = stderr_reader
         .and_then(|receiver| receiver.recv_timeout(STDERR_DRAIN_BUDGET).ok())
         .unwrap_or_default();
@@ -1166,12 +1167,13 @@ mod tests {
     }
 
     #[test]
-    fn a_wrapper_that_exits_does_not_leave_background_children_behind() {
+    fn a_wrapper_that_exits_normally_does_not_get_its_group_signalled() {
         let _watchdog = crate::test_support::watchdog();
         let dir = crate::test_support::fixture();
         let marker = dir.path().join("background-pid");
         let wrapper = dir.path().join("wrapper");
-        // The child detaches its stdio, so only the group kill can end it.
+        // The child detaches its stdio on purpose; after a normal exit nothing
+        // may signal the group, whose id may no longer be ours.
         fs::write(
             &wrapper,
             format!(
@@ -1185,7 +1187,19 @@ mod tests {
         let output = run_bounded(&mut Command::new(&wrapper), WINDOW).expect("wrapper exits");
 
         assert!(output.status.success());
-        assert_background_child_gone(&marker);
+        let pid: i32 = fs::read_to_string(&marker)
+            .expect("marker")
+            .trim()
+            .parse()
+            .expect("pid");
+        let pid = rustix::process::Pid::from_raw(pid).expect("pid");
+        let survived = process_is_running(pid);
+        // Stop the survivor before asserting, so a failure leaves nothing behind.
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        assert!(
+            survived,
+            "the detached child was signalled after a normal exit"
+        );
     }
 
     #[test]

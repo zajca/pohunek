@@ -304,7 +304,7 @@ mod tests {
         assert!(matches!(
             resolver.resolve(),
             Err(BinError::Executable {
-                source: ExecutableError::NotExecutable,
+                source: ExecutableError::NotExecutable(_),
                 ..
             })
         ));
