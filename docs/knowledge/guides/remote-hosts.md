@@ -101,6 +101,39 @@ prefix such as `netbird:fd00::2` qualifies it. A failure in one configured
 overlay does not hide healthy peers from another overlay; discovery reports an
 error only when every provider fails.
 
+## macOS hosts
+
+A Mac is a first-class host on the same direct overlay path; there is no
+macOS-specific routing, bridging, or relay mode.
+
+- **Finding the `netbird` CLI.** The daemon (a launchd job), the GUI (started
+  from Finder) and the CLI (a shell) each locate `netbird` in their own
+  process: first the process `PATH`, then the trusted install directories
+  (`/opt/homebrew/bin`, `/usr/local/bin` among them). An executable another
+  account could replace is never used. `pohunek doctor` reports `netbird_cli`
+  through the same lookup. Its warning has several causes: read the detail. A
+  "not found" detail means no trusted `netbird` was located; install NetBird or
+  fix the ownership and permissions of the directory holding it. A "local state
+  is unavailable" or "no NetBird IP" detail means the CLI was found but is not
+  logged in or its daemon is down. When the daemon answers, the entry reads
+  `local: ...; daemon: ...` and the worse status wins: read each side, because
+  a warning from one process does not prove the other cannot find the CLI.
+- **The listener.** The daemon binds its overlay listener only to the address
+  the overlay reports for this host and re-binds when that address changes. The
+  Unix socket stays available while the VPN is down, starting, or
+  reconnecting; local clients are unaffected.
+- **Sleep and wake.** Nothing runs while the Mac is asleep; its sessions
+  continue after wake. Remote clients see the connection drop, retry with a
+  capped exponential backoff, and resynchronize from a fresh snapshot. A
+  request that failed while the host was unreachable is never replayed on the
+  new connection, so a session is not created twice and committed input is not
+  sent again. After wake, compare `runtime_id` before and after: the same id
+  is continuity.
+- **Troubleshooting.** Run `netbird status` in the same shell. If the daemon
+  logged `overlay CLI missing; listener disabled`, fix the CLI lookup above and
+  restart the daemon; for a VPN that was not ready, wait one retry interval and
+  look for `serving control protocol over overlay`.
+
 The future public team relay does not replace this direct overlay model and does
 not require NetBird. After host enrollment and transport work land, an enrolled
 `pohunekd` will initiate its own userspace WireGuard link and all control and
