@@ -1,9 +1,9 @@
 import { rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type SessionInfo } from "@pohunek/protocol";
 import { ClientError, type ControlChannel, type RawDuplex, type Transport } from "@pohunek/sdk";
+import { createFixtureRootSync } from "@pohunek/testkit";
 
 export type MockEndpoint =
   | { kind: "unix"; socketPath: string }
@@ -34,11 +34,14 @@ const CARRIAGE_RETURN = 0x0d;
 
 let nextSocketId = 0;
 
+// One private root keeps every socket path short and out of shared directories.
+const SOCKET_ROOT = createFixtureRootSync("pk-sdk-");
+process.on("exit", (): void => {
+  rmSync(SOCKET_ROOT, { recursive: true, force: true });
+});
+
 export async function startUnixDaemon(steps: ScriptStep[]): Promise<MockDaemon> {
-  const socketPath = join(
-    tmpdir(),
-    `pohunek-sdk-${process.pid}-${nextSocketId++}.sock`,
-  );
+  const socketPath = join(SOCKET_ROOT, `${nextSocketId++}.sock`);
   rmSync(socketPath, { force: true });
   const runtime = createRuntime(steps);
   const server = createServer({ allowHalfOpen: true }, (socket) => {

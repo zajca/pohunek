@@ -1,5 +1,4 @@
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
@@ -10,7 +9,12 @@ import {
   type BackendLogger,
 } from "@pohunek/backend";
 import type { HostRecord, NotificationRecord, ProjectInfo, SessionInfo } from "@pohunek/protocol";
-import { startFixtureDaemon, type FixtureDaemonHandle, type FixtureProject } from "@pohunek/testkit";
+import {
+  createFixtureRoot,
+  startFixtureDaemon,
+  type FixtureDaemonHandle,
+  type FixtureProject,
+} from "@pohunek/testkit";
 
 export const FIXTURE_LOOPBACK_HOST = "127.0.0.1";
 export const FIXTURE_LOCAL_HOST = "local";
@@ -26,7 +30,7 @@ export const FIXTURE_LEGACY_BASELESS_SESSION_ID = "s-legacy-baseless-seed";
 export const FIXTURE_PROJECT_ID = "p-local-seed";
 export const FIXTURE_OWNED_WORKTREE_PATH = "/tmp/pohunek-testkit/local-worktree";
 
-const FIXTURE_ROOT_PREFIX = "pohunek-frontend-";
+const FIXTURE_ROOT_PREFIX = "pk-fe-";
 const FIXTURE_LOCAL_SOCKET_FILENAME = "daemon.sock";
 const FIXTURE_LOCAL_DAEMON_VERSION = "0.0.0-testkit-local";
 const FIXTURE_PEER_DAEMON_VERSION = "0.0.0-testkit-peer";
@@ -56,7 +60,7 @@ export interface FixtureStackHandle {
 
 /** Starts the complete two-host backend fixture used by dev mode and browser tests. */
 export async function startFixtureStack(options: FixtureStackOptions = {}): Promise<FixtureStackHandle> {
-  const root = await mkdtemp(join(tmpdir(), FIXTURE_ROOT_PREFIX));
+  const root = await createFixtureRoot(FIXTURE_ROOT_PREFIX);
   const socketPath = join(root, FIXTURE_LOCAL_SOCKET_FILENAME);
   let peer: FixtureDaemonHandle | undefined;
   let local: FixtureDaemonHandle | undefined;

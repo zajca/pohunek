@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -31,16 +31,25 @@ export interface FixtureRootOptions {
  * Throws when the daemon socket below the root would not fit a Unix socket
  * path, so a long `TMPDIR` fails here with the cause instead of inside the daemon.
  */
-export async function createFixtureRoot(
+export function createFixtureRoot(
   prefix: string,
   options: FixtureRootOptions = {},
 ): Promise<string> {
+  try {
+    return Promise.resolve(createFixtureRootSync(prefix, options));
+  } catch (error: unknown) {
+    return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+  }
+}
+
+/** Synchronous form of {@link createFixtureRoot}, for module-level fixtures. */
+export function createFixtureRootSync(prefix: string, options: FixtureRootOptions = {}): string {
   const parent = options.parent
     ?? (process.platform === "darwin" ? MACOS_FIXTURE_ROOT_PARENT : tmpdir());
-  const root = await realpath(await mkdtemp(join(parent, prefix)));
+  const root = realpathSync(mkdtempSync(join(parent, prefix)));
   const socketBytes = Buffer.byteLength(`${root}${DAEMON_SOCKET_SUFFIX}`);
   if (socketBytes > SOCKET_PATH_BUDGET_BYTES) {
-    await rm(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
     throw new Error(
       `fixture root ${root} leaves a ${socketBytes}-byte daemon socket path, over the `
         + `${SOCKET_PATH_BUDGET_BYTES}-byte limit; use a shorter TMPDIR or prefix`,
