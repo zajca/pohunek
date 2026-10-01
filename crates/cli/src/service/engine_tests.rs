@@ -29,7 +29,8 @@ use crate::service::inherited::Token;
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
 use crate::service::usage::tests::{
-    own_identity, write_journal, write_live_journal, write_outdated_journal, SESSION,
+    own_identity, spawn_when_exec_free, write_journal, write_live_journal, write_outdated_journal,
+    SESSION,
 };
 
 const V1: &str = "1.0.0";
@@ -69,7 +70,7 @@ static TRACKED: Mutex<Vec<Pid>> = Mutex::new(Vec::new());
 
 /// Spawns a stand-in process that [`OwnProcesses`] lists in its process table.
 fn spawn_tracked(command: &mut std::process::Command) -> std::process::Child {
-    let child = command.spawn().expect("spawn stand-in");
+    let child = spawn_when_exec_free(command).expect("spawn stand-in");
     TRACKED.lock().expect("tracked lock").push(child.id());
     child
 }
@@ -2912,6 +2913,7 @@ async fn a_second_command_is_refused_while_a_transaction_holds_the_lock() {
     harness.assert_installed(V1);
 
     drop(held);
+    await_lock_released(&harness.engine().store).await;
     let status = harness
         .engine()
         .status(config.as_ref())
@@ -2961,6 +2963,7 @@ async fn a_record_left_by_a_crashed_holder_is_resumed_under_a_fresh_lock() {
         .await
         .expect_err("interrupted");
     // The interrupted engine released its lock like a crashed process would.
+    await_lock_released(&harness.engine().store).await;
     let status = harness.engine().status(None).await.expect("status");
     assert!(!status.transaction_in_progress);
     assert_eq!(
@@ -3031,13 +3034,7 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
     let token = handoff.token().clone();
     handoff.release().expect("remove the holder record");
     drop(holder);
-    assert_refused(
-        harness
-            .engine()
-            .store
-            .adopt(&token, record::Adoption::Transaction),
-        "no process holds the transaction lock",
-    );
+    assert_refused_once_free(&harness.engine().store, &token, NO_HOLDER).await;
     // An adopter that outlives its holder still keeps every other
     // transaction out until it ends.
     let refused = harness
@@ -3046,6 +3043,7 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
         .expect_err("an adopter still runs");
     assert_eq!(refused.code(), "service_transaction_in_progress");
     drop(adopted);
+    await_adopters_released(&harness.engine().store).await;
     harness
         .install(V1)
         .await
@@ -3075,9 +3073,7 @@ async fn adopted_transactions_of_one_holder_run_one_at_a_time() {
     );
 
     drop(first);
-    store
-        .adopt(handoff.token(), record::Adoption::Transaction)
-        .expect("the next adopter once the first ended");
+    let _next = adopt_once_free(&store, handoff.token(), record::Adoption::Transaction).await;
     drop(handoff);
     drop(holder);
 }
@@ -3088,6 +3084,89 @@ fn inherited_lock(harness: &Harness, handoff: &record::Handoff) -> TransactionLo
         .store
         .adopt(handoff.token(), record::Adoption::Relay)
         .expect("adopt the held lock")
+}
+
+/// Hang guard for a released lock to become free; expiry means it never was.
+///
+/// A dropped guard closes its descriptor at once, but a process another test
+/// thread spawned while it was open keeps a copy, and with it the `flock`,
+/// until that process's own `exec`. That takes microseconds; the bound only
+/// absorbs a spawned process the scheduler holds back on a loaded host.
+const LOCK_RELEASE_GUARD: Duration = Duration::from_secs(30);
+
+/// Poll interval while a released lock is awaited.
+const LOCK_RELEASE_POLL: Duration = Duration::from_millis(2);
+
+/// Polls `observe` until it yields a value, failing after [`LOCK_RELEASE_GUARD`].
+async fn until_released<T>(what: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+    let deadline = tokio::time::Instant::now() + LOCK_RELEASE_GUARD;
+    loop {
+        if let Some(value) = observe() {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} was not released"
+        );
+        tokio::time::sleep(LOCK_RELEASE_POLL).await;
+    }
+}
+
+/// Waits until the transaction lock itself is free.
+///
+/// Call it after dropping the last guard of the lock and before asserting
+/// anything that needs it free, such as a status report or an adoption that
+/// must find no holder. Adopters may still run.
+async fn await_lock_released(store: &record::Store) {
+    until_released("the transaction lock", || {
+        (!store.in_progress().expect("probe the transaction lock")).then_some(())
+    })
+    .await;
+}
+
+/// Waits until the transaction lock and every adopter's lock are free.
+async fn await_adopters_released(store: &record::Store) {
+    await_lock_released(store).await;
+    until_released("the adopters' locks", || {
+        store
+            .exclude_adopters()
+            .expect("probe the adopters")
+            .map(|_probe| ())
+    })
+    .await;
+}
+
+/// Adopts the lock as soon as the previous adopter's descriptors are gone.
+async fn adopt_once_free(
+    store: &record::Store,
+    token: &Token,
+    adoption: record::Adoption,
+) -> TransactionLock {
+    until_released("the adopted transaction lock", || {
+        match store.adopt(token, adoption) {
+            Ok(lock) => Some(lock),
+            Err(Error::TransactionInProgress { .. }) => None,
+            Err(error) => panic!("adopt: {error:?}"),
+        }
+    })
+    .await
+}
+
+/// The refusal of a token while no process holds the transaction lock.
+const NO_HOLDER: &str = "no process holds the transaction lock";
+
+/// Asserts that adopting `token` is refused with `detail` once the holder's
+/// descriptors are gone.
+///
+/// While a copy of the dropped lock descriptor lingers in a spawned process,
+/// the lock still looks held and the adoption proceeds; it is retried until
+/// the lock is free. Any other refusal is final.
+async fn assert_refused_once_free(store: &record::Store, token: &Token, detail: &str) {
+    let error = until_released("the transaction lock", || {
+        store.adopt(token, record::Adoption::Transaction).err()
+    })
+    .await;
+    assert_refused(Err(error), detail);
 }
 
 fn assert_refused(result: Result<TransactionLock, Error>, detail: &str) {
@@ -3129,10 +3208,7 @@ async fn a_token_that_proves_no_live_holder_is_refused() {
         "the state directory does not exist",
     );
     drop(store.lock().await.expect("create the state directory"));
-    assert_refused(
-        store.adopt(&token, record::Adoption::Transaction),
-        "no process holds the transaction lock",
-    );
+    assert_refused_once_free(&store, &token, NO_HOLDER).await;
 
     // The lock is held, but by a transaction that published no record.
     let holder = store.lock().await.expect("hold the lock");

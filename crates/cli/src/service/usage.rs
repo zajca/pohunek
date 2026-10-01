@@ -13,7 +13,7 @@
 //! that worker is provably gone or its phase is final the journal references
 //! nothing, and until then it makes every version referenced.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-10-01
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -473,6 +473,66 @@ pub(crate) mod tests {
 
     pub(crate) const SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
 
+    /// Runs `attempt` until it stops failing with `ETXTBSY` or the busy wait ends.
+    ///
+    /// Other results, and the busy error once the wait is exhausted, are
+    /// returned unchanged.
+    fn retry_while_exec_busy<T>(
+        mut attempt: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        use crate::service::layout::is_exec_busy;
+        use crate::service::settings::{EXEC_BUSY_POLL, EXEC_BUSY_WAIT};
+
+        let deadline = std::time::Instant::now() + EXEC_BUSY_WAIT;
+        loop {
+            match attempt() {
+                Err(error) if is_exec_busy(&error) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(EXEC_BUSY_POLL);
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Spawns `command`, waiting while the file it executes is busy.
+    ///
+    /// A test that copies or writes an executable and starts it can meet
+    /// `ETXTBSY` when a sibling test thread spawns a process while the file is
+    /// open for writing: that child holds a copy of the descriptor until its own
+    /// `exec`.
+    pub(crate) fn spawn_when_exec_free(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        retry_while_exec_busy(|| command.spawn())
+    }
+
+    #[test]
+    fn a_busy_executable_is_retried_and_other_errors_are_not() {
+        let busy = || std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy);
+        let mut busy_results = 2;
+        let mut attempts = 0;
+        let value = retry_while_exec_busy(|| {
+            attempts += 1;
+            if busy_results > 0 {
+                busy_results -= 1;
+                Err(busy())
+            } else {
+                Ok(attempts)
+            }
+        })
+        .expect("free after two busy attempts");
+        assert_eq!(value, 3);
+
+        let mut attempts = 0;
+        let error = retry_while_exec_busy(|| {
+            attempts += 1;
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .expect_err("not found");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
     /// Writes a worker journal the way a worker does.
     ///
     /// The recorded worker `pid` carries start identity `1`, which no live
@@ -796,9 +856,7 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).expect("version dir");
         let sleeper = dir.join("pohunek-sessiond");
         std::fs::copy("/bin/sleep", &sleeper).expect("copy sleep");
-        let mut child = std::process::Command::new(&sleeper)
-            .arg("30")
-            .spawn()
+        let mut child = spawn_when_exec_free(std::process::Command::new(&sleeper).arg("30"))
             .expect("spawn live worker stand-in");
         let inspector = HostInspector::new();
         await_executable(&inspector, child.id(), &sleeper);

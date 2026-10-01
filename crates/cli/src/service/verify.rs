@@ -1,8 +1,9 @@
 //! `systemd-analyze verify` of the rendered daemon unit and sessions slice.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-01
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pohunek_platform::supervisor::JobDefinition;
 
@@ -103,16 +104,25 @@ impl Drop for Scratch {
     }
 }
 
+/// Distinguishes scratch directories created in one process within one clock tick.
+static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Name of a scratch directory; the sequence keeps concurrent callers of one
+/// process apart when the clock returns the same nanosecond to both.
+fn scratch_name(pid: u32, nanos: u128, sequence: u64) -> String {
+    format!("pohunek-unit-verify-{pid}-{nanos}-{sequence}")
+}
+
 fn scratch_dir() -> Result<Scratch, Error> {
     use std::os::unix::fs::DirBuilderExt as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let path = std::env::temp_dir().join(format!(
-        "pohunek-unit-verify-{}-{}",
+    let path = std::env::temp_dir().join(scratch_name(
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos())
+            .map_or(0, |elapsed| elapsed.as_nanos()),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed),
     ));
     std::fs::DirBuilder::new()
         .mode(0o700)
@@ -140,6 +150,35 @@ mod tests {
     use crate::service::context::tests::context;
     use crate::service::context::tests::temp_root;
     use crate::service::definition::{daemon_definition, initial_config};
+
+    #[test]
+    fn scratch_names_differ_for_one_process_and_one_clock_reading() {
+        assert_ne!(scratch_name(7, 42, 0), scratch_name(7, 42, 1));
+    }
+
+    #[test]
+    fn concurrent_scratch_directories_never_collide() {
+        let scratches: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..16)
+                            .map(|_| scratch_dir().expect("scratch"))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("worker"))
+                .collect()
+        });
+        let distinct: std::collections::BTreeSet<_> = scratches
+            .iter()
+            .map(|scratch| scratch.path.clone())
+            .collect();
+        assert_eq!(distinct.len(), scratches.len());
+    }
 
     #[tokio::test]
     async fn rendered_units_pass_systemd_analyze() {
