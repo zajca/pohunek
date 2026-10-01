@@ -513,6 +513,18 @@ iso_env "$installed_cli" service uninstall >"$work/ev/uninstall.out" 2>"$work/ev
 [ -d "$work/state/pohunek" ] && [ -n "$(find "$work/state/pohunek" -type f -print -quit)" ] ||
   die "the durable state directory is gone or empty after uninstall"
 installed_cli=
+# Every process the last snapshot recorded (daemon, workers, session children)
+# must be gone: a leak after a successful uninstall is a failure, not something
+# the cleanup may quietly end.
+recorded_pids=$(awk '$1 == "daemon" { print $2 } $1 == "worker" || $1 == "child" { print $3 }' "$work/ev/snap-pids.txt")
+for pid in $recorded_pids; do
+  waited=0
+  until process_gone "$pid"; do
+    [ "$waited" -lt "$exit_timeout_s" ] || die "process $pid of the uninstalled installation is still running after ${exit_timeout_s}s"
+    sleep 1
+    waited=$((waited + 1))
+  done
+done
 printf 'uninstall removed the jobs, versions, and service.toml; durable state remains in %s\n' "$work/state/pohunek"
 
 printf '\nmacos-package-install: all checks passed\n'
