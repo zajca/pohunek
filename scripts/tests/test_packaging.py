@@ -241,6 +241,40 @@ class WriteManifestTest(unittest.TestCase):
         self.assertEqual((ws.out / name / "MANIFEST").read_text(), first)
 
 
+class HashFailureTest(unittest.TestCase):
+    """A hashing tool that fails or prints garbage never yields an entry."""
+
+    def shims(self, body):
+        root = Path(tempfile.mkdtemp(prefix="pohunek-hash-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name in ("sha256sum", "shasum"):
+            path = root / name
+            path.write_text("#!/bin/sh\n" + body)
+            path.chmod(0o755)
+        return {"PATH": "%s:%s" % (root, os.environ["PATH"])}
+
+    def test_a_failing_hash_tool_fails_the_manifest_and_the_archive(self):
+        ws = Workspace(self)
+        name = ws.stage("daemon")
+        for body in ("exit 3\n", "echo not-a-digest file\n"):
+            env = self.shims(body)
+            result = run(
+                [PACKAGING / "write-manifest", ws.out / name, "daemon", VERSION, TARGET, "none"],
+                env=env,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, body)
+            self.assertFalse((ws.out / name / "MANIFEST").exists())
+        run([PACKAGING / "write-manifest", ws.out / name, "daemon", VERSION, TARGET, "none"])
+        result = run(
+            [PACKAGING / "archive", ws.out, name, ws.out],
+            env=dict(self.shims("exit 3\n"), SOURCE_DATE_EPOCH=EPOCH),
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((ws.out / (name + ".tar.gz.sha256")).exists())
+
+
 class ArchiveTest(unittest.TestCase):
     def build(self, ws, name, out, umask=0o022, epoch=EPOCH):
         out.mkdir(exist_ok=True)

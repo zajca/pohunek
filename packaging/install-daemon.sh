@@ -92,11 +92,23 @@ manifest="$archive_dir/MANIFEST"
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
     refuse_archive "the archive has no MANIFEST: $manifest"
 fi
+# Every directory above the archive must belong to this user or root and be
+# closed to other accounts (a sticky shared directory such as /tmp is fine),
+# or another account could rename the verified tree away and put its own under
+# the same path.
+ancestor=$(CDPATH= cd -- "$archive_dir" && pwd -P)
+while [ "$ancestor" != / ]; do
+    ancestor=$(dirname -- "$ancestor")
+    if [ -n "$(find "$ancestor" -prune \( -perm -020 -o -perm -002 \) ! -perm -1000 -print)" ] \
+        || [ -n "$(find "$ancestor" -prune ! -user "$(/usr/bin/id -u)" ! -user 0 -print)" ]; then
+        refuse_archive "a directory above the archive is writable by another account or owned by another user: $ancestor"
+    fi
+done
 # Every directory and file of the archive must belong to this user or root, be
 # free of group and other write permission, and no entry may be a symbolic
 # link: another account could otherwise replace a member (the wrapper
 # re-executes itself from this tree) between the digest check and its use.
-host_uid=$(id -u)
+host_uid=$(/usr/bin/id -u)
 unsafe_entry=$(find "$archive_dir" \( -perm -020 -o -perm -002 \) -print -o \
     \( ! -user "$host_uid" ! -user 0 \) -print -o -type l -print | head -n 1)
 if [ -n "$unsafe_entry" ]; then
@@ -104,12 +116,13 @@ if [ -n "$unsafe_entry" ]; then
 fi
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -- "$1" | awk '{ print $1 }'
+        sum=$(sha256sum -- "$1") || refuse_archive "cannot compute the SHA-256 of $1"
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 -- "$1" | awk '{ print $1 }'
+        sum=$(shasum -a 256 -- "$1") || refuse_archive "cannot compute the SHA-256 of $1"
     else
         refuse_archive "neither sha256sum nor shasum is available to verify the archive"
     fi
+    printf '%s\n' "${sum%% *}"
 }
 manifest_component=
 manifest_version=

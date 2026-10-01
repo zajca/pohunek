@@ -77,10 +77,15 @@ rm -f -- "$tarball.tar.tmp"
 mv -- "$tarball.partial" "$tarball"
 
 if command -v sha256sum >/dev/null 2>&1; then
-    hash=$(sha256sum "$tarball" | awk '{ print $1 }')
+    sum=$(sha256sum "$tarball") || fail "cannot compute the SHA-256 of $tarball"
 elif command -v shasum >/dev/null 2>&1; then
-    hash=$(shasum -a 256 "$tarball" | awk '{ print $1 }')
+    sum=$(shasum -a 256 "$tarball") || fail "cannot compute the SHA-256 of $tarball"
 else
     fail "neither sha256sum nor shasum is available"
 fi
+hash=${sum%% *}
+case $hash in
+    *[!0-9a-f]* | '') fail "unexpected SHA-256 output for $tarball" ;;
+esac
+[ "${#hash}" -eq 64 ] || fail "unexpected SHA-256 output for $tarball"
 printf '%s  %s\n' "$hash" "$name.tar.gz" > "$tarball.sha256"

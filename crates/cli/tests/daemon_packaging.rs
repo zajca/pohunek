@@ -254,6 +254,17 @@ fn a_directory_inside_the_archive_writable_by_another_account_is_refused() {
 }
 
 #[test]
+fn a_directory_above_the_archive_writable_by_another_account_is_refused() {
+    // Another account could rename the verified tree away and put its own
+    // under the same path.
+    let fixture = Fixture::new();
+    fs::set_permissions(fixture.base(), fs::Permissions::from_mode(0o777))
+        .expect("loosen the archive's parent");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "a directory above the archive");
+}
+
+#[test]
 fn a_non_executable_required_binary_is_refused() {
     let fixture = Fixture::new();
     fs::set_permissions(

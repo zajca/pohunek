@@ -68,14 +68,22 @@ case $target in
 esac
 [ -d "$staging" ] || fail "not a directory: $staging"
 
+# Prints the SHA-256 of $1, or fails: a missing tool, an unreadable file, or
+# anything but 64 hex digits never yields a manifest entry.
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -- "$1" | awk '{ print $1 }'
+        sum=$(sha256sum -- "$1") || return 1
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 -- "$1" | awk '{ print $1 }'
+        sum=$(shasum -a 256 -- "$1") || return 1
     else
-        fail "neither sha256sum nor shasum is available"
+        return 1
     fi
+    sum=${sum%% *}
+    case $sum in
+        *[!0-9a-f]* | '') return 1 ;;
+    esac
+    [ "${#sum}" -eq 64 ] || return 1
+    printf '%s\n' "$sum"
 }
 
 cd "$staging"
@@ -108,7 +116,8 @@ list=$(find . -type f -print | LC_ALL=C sort)
         case $path in
             '' | *[!A-Za-z0-9._+@=,/-]*) fail "unsupported character in archive path: $path" ;;
         esac
-        printf 'sha256 %s %s\n' "$(sha256_of "$path")" "$path"
+        digest=$(sha256_of "$path") || fail "cannot compute the SHA-256 of $path"
+        printf 'sha256 %s %s\n' "$digest" "$path"
     done
 } > MANIFEST.tmp
 mv -- MANIFEST.tmp MANIFEST
