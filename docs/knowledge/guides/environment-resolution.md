@@ -79,9 +79,9 @@ directories, such as an admin-group Intel Homebrew, are out of scope. A refused 
 executable reports which check failed (`Refusal`: owner uid, mode, ACL, the
 untrusted chain directory, or the errno of the open or execute check) so a
 rejection is diagnosable. On macOS an ACL counts only when an allow entry
-grants a change right (deny entries such as `everyone deny delete` do not), and
-a filesystem that cannot answer the ACL query (`ENOTSUP`, `EINVAL`) counts as
-having none.
+grants a change right (deny entries such as `everyone deny delete` do not). An
+ACL that cannot be determined (any query error other than "no ACL") is not
+trusted: the candidate is refused with the errno.
 
 Login-shell output and the fallback table are untrusted input, so a directory
 is kept only when it is trusted: symlinks are resolved, every component of the

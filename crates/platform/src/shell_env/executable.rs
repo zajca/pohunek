@@ -61,9 +61,15 @@ pub enum Refusal {
         /// The permission bits.
         mode: u32,
     },
-    /// An ACL entry grants a change right, or the ACL could not be read.
-    #[error("ACL check failed: {0}")]
-    Acl(String),
+    /// An allow entry of the file's ACL grants a change right.
+    #[error("an ACL entry grants a change right")]
+    AclGrantsChange,
+    /// The file's ACL could not be determined; an unknown ACL is not trusted.
+    #[error("cannot determine the ACL (errno {errno})")]
+    AclUnreadable {
+        /// The error number of the failed query.
+        errno: i32,
+    },
     /// A directory of the lookup chain is untrusted.
     #[error("lookup chain directory {dir} is untrusted: {detail}", dir = .dir.display())]
     ChainDirectory {
@@ -385,12 +391,11 @@ fn inspect_executable(path: &Path, owners: Owners) -> Result<(), Refusal> {
     }
     match crate::filesystem::acl_grants_change(&file) {
         Ok(false) => {}
-        Ok(true) => return Err(Refusal::Acl("an entry grants a change right".to_owned())),
+        Ok(true) => return Err(Refusal::AclGrantsChange),
         Err(error) => {
-            return Err(Refusal::Acl(format!(
-                "cannot read it (errno {})",
-                errno(&error)
-            )))
+            return Err(Refusal::AclUnreadable {
+                errno: errno(&error),
+            })
         }
     }
     lookup_chain_is_owner_controlled(path, owners)?;

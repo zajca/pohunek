@@ -1222,17 +1222,59 @@ mod tests {
 
     use super::*;
 
+    /// Name prefix of every fixture root; short because each byte counts
+    /// against Darwin's 103-byte `sockaddr_un` limit.
+    const FIXTURE_PREFIX: &str = "phc";
+
+    /// Largest process id and per-process fixture counter the root-length
+    /// budget allows (7 and 4 decimal digits).
+    const MAX_FIXTURE_PID: u32 = 9_999_999;
+    const MAX_FIXTURE_COUNTER: u32 = 9_999;
+
     /// Scratch directory under the symlink-free, short fixture root.
     ///
     /// On macOS the root is `/private/tmp`: `/tmp` and the per-user temp dir
     /// are symlinked, and the latter overflows Darwin's 103-byte socket limit.
-    fn temp_dir(tag: &str) -> PathBuf {
+    /// `purpose` documents the call site and is not part of the path.
+    fn temp_dir(_purpose: &str) -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = pohunek_test_support::temp_root()
-            .join(format!("pohunek-hc-{tag}-{}-{n}", std::process::id()));
+        let dir = pohunek_test_support::temp_root().join(fixture_name(std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn fixture_name(pid: u32, counter: u32) -> String {
+        format!("{FIXTURE_PREFIX}-{pid}-{counter}")
+    }
+
+    #[test]
+    fn the_longest_worker_socket_fits_below_the_longest_fixture_root_on_macos() {
+        // The deepest runtime layout the tests build is `run/pohunek` below the
+        // root; `runtime` is shorter. The check is made with the real path
+        // validation for the macOS root `/private/tmp`, whatever the host is.
+        let root =
+            Path::new("/private/tmp").join(fixture_name(MAX_FIXTURE_PID, MAX_FIXTURE_COUNTER));
+        let workers = root.join("run").join("pohunek").join(WORKERS_SUBDIR);
+
+        let socket = worker_socket_path(
+            &workers,
+            &pohunek_paths::longest_worker_session_id(),
+            Platform::MacOs,
+        )
+        .expect("the longest worker socket path fits Darwin's limit");
+
+        assert!(socket.is_some());
+        // One more byte in the fixture root would overflow, so a longer prefix
+        // or tag fails here instead of on a macOS runner.
+        let longer =
+            root.with_file_name(format!("{FIXTURE_PREFIX}x-9999999-9999-xxxxxxxxxxxxxxxx"));
+        worker_socket_path(
+            &longer.join("run").join("pohunek").join(WORKERS_SUBDIR),
+            &pohunek_paths::longest_worker_session_id(),
+            Platform::MacOs,
+        )
+        .expect_err("a longer fixture prefix overflows the socket limit");
     }
 
     fn write_exec(dir: &Path, name: &str, mode: u32) -> PathBuf {

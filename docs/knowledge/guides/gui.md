@@ -76,14 +76,20 @@ attach_script_max_age_secs = 3600      # attach_terminal: sweep never-run script
 
 An absolute `pohunek_bin` is used as is and must be an executable file. A bare
 name such as `pohunek` is looked up per attach, off the UI thread, in a search
-path resolved by the shared environment policy
-([environment-resolution](environment-resolution.md)): on macOS one bounded
-non-interactive login-shell probe (Finder and launchd start apps with only the
-system directories on `PATH`) that receives `HOME`, `USER`, `LOGNAME`, `SHELL`
-(`/bin/zsh` when unset), and, when set, `ZDOTDIR` and `XDG_CONFIG_HOME`, so a
-profile that branches on them or lives in a custom location is read; an unusable
-value of one of them skips the probe and the status line names it, elsewhere the inherited `PATH`, then the fixed
-fallback directories (`~/.local/bin`, `~/.cargo/bin`, Homebrew, `/usr/local`).
+path built from tiers, first match wins, duplicates dropped. The GUI's own
+inherited `PATH` always comes first, sanitized by the same rules as the other
+tiers (absolute, existing, trusted directories; relative and empty entries are
+skipped; a refused directory is named with its reason when a lookup misses), so a
+GUI started from a shell finds what that shell finds. On macOS it is followed by
+one bounded non-interactive login-shell probe (Finder and launchd start apps
+with only the system directories on `PATH`) that receives `HOME`, `USER`,
+`LOGNAME`, `SHELL` (`/bin/zsh` when unset), and, when set, `ZDOTDIR` and
+`XDG_CONFIG_HOME`, so a profile that branches on them or lives in a custom
+location is read (an unusable value of one of them skips the probe and the
+status line names it), and then by the fixed fallback directories (`~/.local/bin`,
+`~/.cargo/bin`, Homebrew, `/usr/local`); elsewhere the fallback directories
+apply only when the inherited `PATH` yields nothing. The policy is the shared
+[environment-resolution](environment-resolution.md) one.
 The resolved search path is cached; a miss discards it once and discovers again,
 so a `pohunek` installed after the GUI started is found without a restart. An
 unresolvable name is an attach error in the status line, never a guessed

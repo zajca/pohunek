@@ -173,44 +173,86 @@ fn lookup(name: &OsStr, discovery: &Discovery) -> Result<PathBuf, BinError> {
     })
 }
 
-/// Discovers the search path by the documented tier order.
+/// Discovers the search path of this host from the process environment.
 ///
-/// macOS ignores the inherited `PATH` (a Finder launch carries only the system
-/// directories) and asks the login shell; every other host trusts its
-/// explicitly inherited `PATH`. Both fall back to the fixed directory list, and
-/// the reason for a fallback is carried in [`Discovery::cause`].
+/// See [`compose_search_path`] for the tiers.
 fn discover_host_search_path(login_shell: &LoginShellSettings) -> Result<Discovery, BinError> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    if cfg!(target_os = "macos") {
-        return match login_shell_spec(login_shell, |name| std::env::var_os(name)) {
-            Ok(spec) => discover_search_path(None, Some(&spec), home.as_deref(), None),
-            // An unusable `$SHELL` or profile selector cannot start the probe;
-            // the fallback directories apply and the cause is shown on a miss.
-            Err(error) => discover_search_path(
-                None,
-                None,
-                home.as_deref(),
-                Some(format!(
-                    "the login shell environment is unusable: {error}; searched the fallback directories"
-                )),
-            ),
-        };
-    }
-    let inherited_path = std::env::var("PATH")
-        .map_err(|error| error.to_string())
-        .and_then(|value| {
-            SearchPath::sanitize(&value, true)
-                .map(|sanitized| sanitized.path)
-                .map_err(|error| error.to_string())
-        });
-    let (inherited, inherited_cause) = match inherited_path {
-        Ok(path) => (Some(path), None),
-        Err(reason) => (
-            None,
-            Some(format!("the inherited PATH is unusable: {reason}")),
-        ),
+    compose_search_path(
+        cfg!(target_os = "macos"),
+        std::env::var("PATH").map_err(|error| error.to_string()),
+        login_shell_spec(login_shell, |name| std::env::var_os(name)),
+        home.as_deref(),
+    )
+}
+
+/// Builds the search path by the documented tier order.
+///
+/// Every host trusts its explicitly inherited `PATH` first: a GUI started from a
+/// shell finds what that shell finds. Entries are sanitized by the same rules
+/// as every other tier (absolute, existing, trusted directories; relative and
+/// empty entries skipped) and a refused entry is reported in the cause shown on
+/// a miss. Elsewhere that is the whole answer (then the fallback directories
+/// when the inherited value yields nothing). On macOS a Finder or launchd start
+/// carries only the system directories, so the login shell's `PATH` and then
+/// the fixed fallback directories follow, deduplicated.
+///
+/// `darwin` and the inputs are parameters so the macOS composition is tested on
+/// every host; `login` is the already built probe or why it cannot be built.
+fn compose_search_path(
+    darwin: bool,
+    inherited_value: Result<String, String>,
+    login: Result<LoginShellSpec, LoginEnvironmentError>,
+    home: Option<&Path>,
+) -> Result<Discovery, BinError> {
+    let mut causes: Vec<String> = Vec::new();
+    let inherited = match inherited_value
+        .and_then(|value| SearchPath::sanitize(&value, true).map_err(|error| error.to_string()))
+    {
+        Ok(sanitized) => {
+            for dropped in &sanitized.untrusted {
+                causes.push(format!(
+                    "the inherited PATH entry `{}` was refused: {}",
+                    dropped.entry, dropped.reason
+                ));
+            }
+            Some(sanitized.path)
+        }
+        Err(reason) => {
+            causes.push(format!("the inherited PATH is unusable: {reason}"));
+            None
+        }
     };
-    discover_search_path(inherited.as_ref(), None, home.as_deref(), inherited_cause)
+    if !darwin {
+        let discovery = discover_search_path(inherited.as_ref(), None, home, joined(&causes))?;
+        return Ok(discovery);
+    }
+    let rest = match login {
+        Ok(spec) => discover_search_path(None, Some(&spec), home, None)?,
+        // An unusable `$SHELL` or profile selector cannot start the probe; the
+        // fallback directories apply and the cause is shown on a miss.
+        Err(error) => discover_search_path(
+            None,
+            None,
+            home,
+            Some(format!(
+                "the login shell environment is unusable: {error}; searched the fallback directories"
+            )),
+        )?,
+    };
+    causes.extend(rest.cause);
+    let path = match inherited {
+        Some(inherited) => inherited.with_appended(&rest.path),
+        None => rest.path,
+    };
+    Ok(Discovery {
+        path,
+        cause: joined(&causes),
+    })
+}
+
+fn joined(causes: &[String]) -> Option<String> {
+    (!causes.is_empty()).then(|| causes.join("; "))
 }
 
 /// Builds the login-shell probe from the process environment.
@@ -266,6 +308,7 @@ fn discover_search_path(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -533,6 +576,100 @@ mod tests {
         }
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn compose(darwin: bool, path: &str, home: Option<&Path>) -> Result<Discovery, BinError> {
+        compose_search_path(
+            darwin,
+            Ok(path.to_owned()),
+            Err(LoginEnvironmentError::NotAbsolute {
+                var: "SHELL",
+                value: PathBuf::from("zsh"),
+            }),
+            home,
+        )
+    }
+
+    #[test]
+    fn on_macos_a_program_on_the_inherited_path_alone_is_found_first() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let tools = dir.path().join("tools");
+        fs::create_dir(&tools).expect("tools dir");
+        let kitty = executable(&tools, "only-on-inherited-path");
+        let value = format!("relative/bin::{}", tools.display());
+
+        let discovery = compose(true, &value, None).expect("composition");
+
+        // The inherited entry leads; relative and empty entries are skipped.
+        assert_eq!(discovery.path.entries()[0], tools);
+        assert!(!discovery
+            .path
+            .entries()
+            .iter()
+            .any(|entry| entry.ends_with("relative/bin")));
+        let resolver =
+            BinResolver::with_discovery_cause("pohunek", move || compose(true, &value, None));
+        assert_eq!(
+            resolver
+                .resolve_name(std::ffi::OsStr::new("only-on-inherited-path"))
+                .expect("found through the inherited PATH"),
+            kitty
+        );
+    }
+
+    #[test]
+    fn a_finder_launch_still_reaches_the_other_tiers() {
+        let _watchdog = crate::test_support::watchdog();
+        let home = crate::test_support::fixture();
+        let local = home.path().join(".local/bin");
+        fs::create_dir_all(&local).expect("local bin");
+        // Only the minimal Finder PATH is inherited.
+        let discovery = compose(true, "/usr/bin:/bin", Some(home.path())).expect("composition");
+
+        assert!(discovery.path.entries().contains(&local));
+        let unique: std::collections::HashSet<_> = discovery.path.entries().iter().collect();
+        assert_eq!(
+            unique.len(),
+            discovery.path.entries().len(),
+            "no duplicates"
+        );
+    }
+
+    #[test]
+    fn an_untrusted_inherited_entry_is_refused_with_a_reported_reason() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let loose = dir.path().join("loose");
+        fs::create_dir(&loose).expect("loose dir");
+        fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+        executable(&loose, "planted");
+        let value = loose.display().to_string();
+        let resolver =
+            BinResolver::with_discovery_cause("pohunek", move || compose(true, &value, None));
+
+        let error = resolver
+            .resolve_name(std::ffi::OsStr::new("planted"))
+            .expect_err("a group- and world-writable directory is not searched");
+
+        // The only entry was refused, so nothing usable remained.
+        assert!(
+            error.to_string().contains("refused as untrusted"),
+            "{error}"
+        );
+
+        // With another usable entry, the refused one is named with its reason.
+        let tools = dir.path().join("tools");
+        fs::create_dir(&tools).expect("tools dir");
+        let mixed = format!("{}:{}", loose.display(), tools.display());
+        let resolver =
+            BinResolver::with_discovery_cause("pohunek", move || compose(true, &mixed, None));
+        let error = resolver
+            .resolve_name(std::ffi::OsStr::new("planted"))
+            .expect_err("the planted program is still not searched");
+        let message = error.to_string();
+        assert!(message.contains("loose"), "{message}");
+        assert!(message.contains("was refused"), "{message}");
     }
 
     fn settings() -> LoginShellSettings {

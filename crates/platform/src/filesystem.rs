@@ -3161,7 +3161,7 @@ fn validate_fd_links(
 pub(crate) fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
     use std::os::fd::AsFd as _;
 
-    let acl = read_acl_or_none(file.as_fd())
+    let acl = calcifer_macos_acl::read_acl(file.as_fd())
         .map_err(|source| io_error("inspect trusted entry ACL", path, source))?;
     if acl_is_deny_only(&acl) {
         Ok(())
@@ -3169,30 +3169,6 @@ pub(crate) fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
         Err(FsError::UnsafeAcl {
             path: path.to_path_buf(),
         })
-    }
-}
-
-/// Reads the extended ACL of an open vnode; a filesystem that cannot hold one
-/// counts as having none.
-///
-/// Sealed system volumes and some network filesystems answer the ACL query with
-/// `ENOTSUP`, `EOPNOTSUPP`, `ENOSYS`, or `EINVAL` instead of the `ENOENT` of a
-/// supporting filesystem without an ACL. Such an entry carries no ACL that
-/// could grant anyone access, so it is not a failure. Any other error stays one.
-#[cfg(target_os = "macos")]
-pub(crate) fn read_acl_or_none(
-    descriptor: std::os::fd::BorrowedFd<'_>,
-) -> io::Result<calcifer_macos_acl::Acl> {
-    match calcifer_macos_acl::read_acl(descriptor) {
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL)
-            ) =>
-        {
-            Ok(calcifer_macos_acl::Acl::default())
-        }
-        other => other,
     }
 }
 
@@ -3213,12 +3189,14 @@ const ACL_FILE_CHANGE_PERMISSIONS: u32 =
 /// # Errors
 ///
 /// Returns the I/O error of an ACL query that failed for a reason other than
-/// an absent or unsupported ACL.
+/// an absent ACL.
 #[cfg(target_os = "macos")]
 pub(crate) fn acl_grants_change(file: &File) -> io::Result<bool> {
     use std::os::fd::AsFd as _;
 
-    let acl = read_acl_or_none(file.as_fd())?;
+    // Only a missing ACL (`ENOENT`, read as empty by the wrapper) means none;
+    // any other error means the ACL could not be determined and fails closed.
+    let acl = calcifer_macos_acl::read_acl(file.as_fd())?;
     Ok(acl.entries.iter().any(|entry| match entry.tag {
         calcifer_macos_acl::TAG_DENY => false,
         calcifer_macos_acl::TAG_ALLOW => entry.permissions & ACL_FILE_CHANGE_PERMISSIONS != 0,
