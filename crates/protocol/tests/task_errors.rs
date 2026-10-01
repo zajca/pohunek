@@ -27,6 +27,182 @@ const PRE_TASK_CODES: [&str; 6] = [
 /// documented for every method that raises it.
 const SHARED_WITH_DAEMON: [&str; 1] = ["worktree_in_use"];
 
+/// Exact fixed `msg` and `recover` text of every task-layer error; the public
+/// contract promises both as fixed text, so a reworded constructor must update
+/// this table deliberately.
+const TASK_ERROR_TEXTS: [(&str, &str, Option<&str>); 34] = [
+    (
+        "worktree_users_changed",
+        "the expected worktree users differ from the current set",
+        Some("re-read the worktree users with task.inspect and retry with the exact current set"),
+    ),
+    (
+        "task_turn_open",
+        "the task's latest turn is still open or already resumed",
+        Some("wait for the turn to settle with task.wait, then retry"),
+    ),
+    (
+        "task_attention_open",
+        "the task's latest turn awaits an answer to its attention",
+        Some("answer the pending attention with task.answer, or stop the task"),
+    ),
+    (
+        "task_agent_busy",
+        "the agent is still working on an earlier prompt",
+        Some("wait with task.wait or extend the turn with task.extend, then retry; or stop the task"),
+    ),
+    (
+        "task_worktree_busy",
+        "the worktree is occupied by another task or live session",
+        Some("inspect the worktree users with task.inspect and retry after the occupant settles or is stopped"),
+    ),
+    (
+        "worktree_busy",
+        "a task occupies this worktree; only observation is admitted",
+        Some("observe the session read-only, or retry after the occupying task settles or is stopped"),
+    ),
+    (
+        "task_worktree_unavailable",
+        "the shared worktree no longer exists",
+        Some("start a new task with its own worktree"),
+    ),
+    (
+        "task_worktree_mode_conflict",
+        "worktree_of cannot be combined with in_place or branch",
+        Some("send worktree_of alone, or in_place or branch without worktree_of"),
+    ),
+    (
+        "task_session_ended",
+        "the session belongs to an ended task and cannot be revived outside the task layer",
+        Some("continue the work with task.start and worktree_of naming the ended task"),
+    ),
+    (
+        "task_session_unavailable",
+        "the task has ended or its agent runtime is not live",
+        Some("inspect the task with task.inspect; continue ended work with task.start and worktree_of"),
+    ),
+    (
+        "task_turn_queued",
+        "the turn is queued and has no deadline until it is delivered",
+        Some("wait for delivery with task.wait before extending the turn"),
+    ),
+    (
+        "task_worktree_via_investigate",
+        "an executor task cannot join a worktree through an investigate-mode task",
+        Some("name a task that is not in investigate mode in worktree_of, or start in investigate mode"),
+    ),
+    (
+        "task_turn_ceiling_reached",
+        "the turn reached its total open-time ceiling",
+        Some("answer or stop the turn, or continue with a new turn once the agent is ready"),
+    ),
+    (
+        "task_answer_unsupported",
+        "this attention cannot be answered through the task layer",
+        Some("resolve the attention by terminal takeover, or stop the task"),
+    ),
+    (
+        "task_answer_unverifiable",
+        "a keystroke answer cannot be verified against the provider's pending request",
+        Some("set allow_unverified_delivery to accept an unverified answer, or resolve the attention in the terminal"),
+    ),
+    (
+        "task_payload_mismatch",
+        "the resubmitted payload does not match the stored request fingerprint; nothing was dispatched",
+        Some("resend the exact original payload with the same request key, or inspect the task first"),
+    ),
+    (
+        "task_stop_precondition_failed",
+        "the stop preconditions do not hold; nothing was changed",
+        Some("inspect the task and retry the stop with current preconditions"),
+    ),
+    (
+        "task_attention_stale",
+        "the named attention is not the current pending one; nothing was written",
+        Some("inspect the task for the current attention and revision before answering again"),
+    ),
+    (
+        "task_result_unknown",
+        "no result with the requested result_id exists",
+        Some("read the current result_id with task.result or task.inspect"),
+    ),
+    (
+        "task_snapshot_retired",
+        "the turn's snapshots were retired with the session content",
+        None,
+    ),
+    (
+        "task_cursor_expired",
+        "the paging cursor expired or belongs to another daemon epoch",
+        Some("restart the walk from the first page without a cursor"),
+    ),
+    (
+        "worktree_in_use",
+        "live sessions or active tasks use this worktree",
+        Some("stop the sessions or tasks that use the worktree, then retry the removal"),
+    ),
+    (
+        "task_result_pending",
+        "the turn settled but its checks have not finished",
+        Some("wait for publication with task.wait, then retry"),
+    ),
+    (
+        "task_check_unconfined",
+        "checks cannot be contained on this platform and unconfined checks are not allowed",
+        Some("run without checks, or have the host owner set checks.allow_unconfined for the project"),
+    ),
+    (
+        "task_check_not_permitted",
+        "a requested check is not enabled or not permitted for this caller",
+        Some("request only checks enabled for the project and permitted for this caller"),
+    ),
+    (
+        "task_store_full",
+        "a task store cap would be exceeded",
+        Some("end finished tasks or wait for retention to free space; the host owner may raise the task store caps"),
+    ),
+    (
+        "task_review_limit_reached",
+        "the result already holds verdicts from the maximum number of reviewers",
+        None,
+    ),
+    (
+        "task_waiter_limit_reached",
+        "the task waiter limit is currently reached",
+        Some("retry the wait after another task wait completes"),
+    ),
+    (
+        "task_fingerprint_key_missing",
+        "the fingerprint key version of the stored request is unavailable; nothing was compared or dispatched",
+        Some("inspect the task; the host owner must restore the task fingerprint key before resubmitting"),
+    ),
+    (
+        "task_request_conflict",
+        "the request key was already used with different parameters; nothing was executed",
+        Some("use a new client_request_id for a different request, or resend the original parameters"),
+    ),
+    (
+        "task_investigate_no_checks",
+        "investigate-mode tasks accept neither checks nor checks_baseline",
+        Some("omit checks and checks_baseline and rely on the executor task's checks"),
+    ),
+    (
+        "task_fork_unsupported",
+        "the task's agent cannot fork its session",
+        Some("start a new task on the same worktree with worktree_of"),
+    ),
+    (
+        "task_investigate_unsupported",
+        "the selected profile cannot enforce investigation mode",
+        Some("select a profile that can enforce investigation mode"),
+    ),
+    (
+        "check_cleanup_stuck",
+        "a daemon-owned check process in the worktree cannot be confirmed gone",
+        Some("inspect the occupying task with task.inspect; the worktree stays occupied until its check processes are gone"),
+    ),
+];
+
 /// Constructor, expected code, expected class and whether a recovery hint is set.
 type Case = (fn() -> ProtocolError, &'static str, ErrorClass, bool);
 
@@ -439,5 +615,19 @@ fn shared_codes_are_documented_for_every_raising_method() {
         .expect("worktree_in_use table row");
     for method in ["`session.remove`", "`worktree.remove`"] {
         assert!(row.contains(method), "worktree_in_use row misses {method}");
+    }
+}
+
+#[test]
+fn task_error_texts_are_pinned_exactly() {
+    let cases = task_errors();
+    assert_eq!(cases.len(), TASK_ERROR_TEXTS.len());
+    for (code, msg, recover) in TASK_ERROR_TEXTS {
+        let case = cases
+            .iter()
+            .find(|case| case.code == code)
+            .unwrap_or_else(|| panic!("{code}: missing from TASK_ERRORS"));
+        assert_eq!(case.error.msg, msg, "{code}: msg");
+        assert_eq!(case.error.recover.as_deref(), recover, "{code}: recover");
     }
 }

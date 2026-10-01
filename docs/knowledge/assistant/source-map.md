@@ -536,6 +536,7 @@ Assistant knowledge implementation work in progress:
 
 Design inputs:
 
+- `docs/design/delegated-task-runs-rfc.md`
 - `docs/design/universal-assistant.md`
 - `docs/design/universal-assistant-plan.md`
 - `docs/design/durable-session-workers-rfc.md`
