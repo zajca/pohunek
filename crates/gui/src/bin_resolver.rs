@@ -261,7 +261,6 @@ fn discover_search_path(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -270,7 +269,7 @@ mod tests {
     fn executable(dir: &Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, "#!/bin/sh\n").expect("write");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::make_executable(&path);
         path
     }
 
@@ -280,7 +279,7 @@ mod tests {
 
     #[test]
     fn a_configured_absolute_path_is_used_without_discovery() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         let bin = executable(dir.path(), "pohunek");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
@@ -295,7 +294,7 @@ mod tests {
 
     #[test]
     fn a_configured_path_that_is_not_executable_is_an_error_not_a_search() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         let path = dir.path().join("pohunek");
         fs::write(&path, "data").expect("write");
         let resolver = BinResolver::with_discovery(path.to_str().expect("utf8"), || {
@@ -328,7 +327,7 @@ mod tests {
 
     #[test]
     fn a_bare_name_resolves_through_the_discovered_search_path_once() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         let bin = executable(dir.path(), "pohunek");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
@@ -349,8 +348,8 @@ mod tests {
 
     #[test]
     fn a_miss_discards_the_cache_and_finds_a_later_installation() {
-        let stale = tempfile::tempdir().expect("stale");
-        let fresh = tempfile::tempdir().expect("fresh");
+        let stale = crate::test_support::fixture();
+        let fresh = crate::test_support::fixture();
         let bin = executable(fresh.path(), "pohunek");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
@@ -381,8 +380,8 @@ mod tests {
 
     #[test]
     fn a_cached_binary_that_vanished_is_rediscovered_once() {
-        let first = tempfile::tempdir().expect("first");
-        let second = tempfile::tempdir().expect("second");
+        let first = crate::test_support::fixture();
+        let second = crate::test_support::fixture();
         let first_bin = executable(first.path(), "pohunek");
         let second_bin = executable(second.path(), "pohunek");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -405,7 +404,7 @@ mod tests {
 
     #[test]
     fn a_missing_name_after_fresh_discovery_is_a_clear_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         let search_path = search(dir.path());
         let resolver = BinResolver::with_discovery("pohunek", move || Ok(search_path.clone()));
 
@@ -435,14 +434,14 @@ mod tests {
 
     #[test]
     fn discovery_prefers_the_configured_path_and_falls_back_to_the_table() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         let configured = search(dir.path());
 
         let resolved =
             discover_search_path(Some(&configured), None, None, None).expect("configured");
         assert_eq!(resolved.path, configured);
 
-        let home = tempfile::tempdir().expect("home");
+        let home = crate::test_support::fixture();
         let local_bin = home.path().join(".local/bin");
         fs::create_dir_all(&local_bin).expect("mkdir");
         let fallback = discover_search_path(None, None, Some(home.path()), None).expect("fallback");
@@ -451,7 +450,7 @@ mod tests {
 
     #[test]
     fn a_miss_carries_the_reason_the_search_path_fell_back() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         let path = search(dir.path());
         let resolver = BinResolver::with_discovery_cause("pohunek", move || {
             Ok(Discovery {
@@ -472,7 +471,7 @@ mod tests {
 
     #[test]
     fn a_hit_does_not_report_the_fallback_cause() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         executable(dir.path(), "pohunek");
         let path = search(dir.path());
         let resolver = BinResolver::with_discovery_cause("pohunek", move || {
@@ -487,7 +486,7 @@ mod tests {
 
     #[test]
     fn other_names_share_the_cached_search_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         let kitty = executable(dir.path(), "kitty");
         executable(dir.path(), "pohunek");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -508,7 +507,7 @@ mod tests {
 
     #[test]
     fn concurrent_callers_share_one_discovery() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = crate::test_support::fixture();
         executable(dir.path(), "pohunek");
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);

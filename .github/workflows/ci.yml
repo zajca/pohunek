@@ -301,6 +301,9 @@ jobs:
 
       - name: Test GUI
         if: ${{ !cancelled() }}
+        # A test waiting on a child process must fail with evidence, never hold
+        # the runner for hours.
+        timeout-minutes: 15
         run: cargo test --locked -p pohunek-gui
 
       - name: Build GUI binary
@@ -309,6 +312,7 @@ jobs:
 
       - name: GUI launch acceptance
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         env:
           GUI_ACCEPT_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/acceptance/macos-gui-launch

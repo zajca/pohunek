@@ -4341,6 +4341,7 @@ dependencies = [
  "pohunek-paths",
  "pohunek-platform",
  "pohunek-protocol",
+ "pohunek-test-support",
  "rustix 1.1.4",
  "serde",
  "tempfile",

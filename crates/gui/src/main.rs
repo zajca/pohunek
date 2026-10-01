@@ -13,6 +13,8 @@ mod notify;
 mod runtime;
 mod selection;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 mod view;
 
 #[cfg(target_os = "linux")]

@@ -245,6 +245,9 @@ impl Notifier {
             Err(BoundedError::Wait(error)) => {
                 NotificationOutcome::Unavailable(format!("waiting for the backend failed: {error}"))
             }
+            Err(BoundedError::Unreaped { waited_for, budget }) => NotificationOutcome::Unavailable(
+                format!("the backend is stuck after SIGKILL: waited {budget:?} for {waited_for}"),
+            ),
             Err(BoundedError::Timeout) => NotificationOutcome::Unavailable(format!(
                 "the backend did not finish within {:?} and was killed",
                 self.timeout
@@ -257,7 +260,6 @@ impl Notifier {
 mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -266,7 +268,7 @@ mod tests {
 
     fn script(path: &Path, body: &str) {
         fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write script");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        crate::test_support::make_executable(path);
     }
 
     /// Writes a fake backend that records its NUL-terminated argv, then runs `tail`.
@@ -330,6 +332,7 @@ mod tests {
 
     #[test]
     fn health_reports_only_state_changes() {
+        let _watchdog = crate::test_support::watchdog();
         let mut health = NotificationHealth::default();
         let unavailable = NotificationOutcome::Unavailable("gone".to_owned());
 
@@ -352,6 +355,7 @@ mod tests {
 
     #[test]
     fn a_first_failure_is_reported_even_before_any_success() {
+        let _watchdog = crate::test_support::watchdog();
         let mut health = NotificationHealth::default();
         assert!(apply_outcome(
             &mut health,
@@ -362,9 +366,10 @@ mod tests {
 
     #[test]
     fn a_custom_command_receives_title_and_body_as_two_positional_arguments() {
+        let _watchdog = crate::test_support::watchdog();
         for title in DIFFICULT {
             for body in DIFFICULT {
-                let dir = tempfile::tempdir().expect("tempdir");
+                let dir = crate::test_support::fixture();
                 let (program, record) = recording_backend(dir.path(), "my-notify", "exit 0");
 
                 let outcome = command_notifier(&program, LONG).notify(title, body);
@@ -380,8 +385,9 @@ mod tests {
 
     #[test]
     fn notify_send_gets_an_option_terminator_before_the_text() {
+        let _watchdog = crate::test_support::watchdog();
         for title in ["-t", "--help", "plain"] {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = crate::test_support::fixture();
             let (program, record) = recording_backend(dir.path(), "notify-send", "exit 0");
 
             let outcome = command_notifier(&program, LONG).notify(title, "-body");
@@ -396,8 +402,9 @@ mod tests {
 
     #[test]
     fn osascript_backend_passes_values_only_as_argv_after_the_terminator() {
+        let _watchdog = crate::test_support::watchdog();
         for title in DIFFICULT {
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = crate::test_support::fixture();
             let (program, record) = recording_backend(dir.path(), "osascript", "exit 0");
             let body = "body $(x) 'y'\n-z";
 
@@ -424,7 +431,8 @@ mod tests {
 
     #[test]
     fn a_non_zero_exit_is_unavailable() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (program, _record) = recording_backend(dir.path(), "backend", "exit 4");
 
         let outcome = command_notifier(&program, LONG).notify("t", "b");
@@ -437,7 +445,8 @@ mod tests {
 
     #[test]
     fn a_signalled_backend_is_unavailable() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (program, _record) = recording_backend(dir.path(), "backend", "kill -KILL $$");
 
         assert!(matches!(
@@ -448,7 +457,8 @@ mod tests {
 
     #[test]
     fn a_missing_executable_is_unavailable() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let missing = dir.path().join("no-such-backend");
 
         let osascript = osascript_notifier(&missing, LONG).notify("t", "b");
@@ -466,7 +476,8 @@ mod tests {
 
     #[test]
     fn an_unresolvable_bare_command_is_unavailable_not_healthy() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let search = pohunek_platform::shell_env::SearchPath::new(vec![dir.path().to_path_buf()])
             .expect("search path");
         let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
@@ -489,7 +500,8 @@ mod tests {
 
     #[test]
     fn the_command_is_resolved_once_and_a_miss_is_remembered() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
         let search = pohunek_platform::shell_env::SearchPath::new(vec![dir.path().to_path_buf()])
@@ -531,6 +543,7 @@ mod tests {
 
     #[test]
     fn a_resolution_that_exceeds_the_deadline_is_unavailable() {
+        let _watchdog = crate::test_support::watchdog();
         let (release, wait) = mpsc::channel::<()>();
         let wait = std::sync::Mutex::new(wait);
         let resolver = Arc::new(BinResolver::with_discovery("pohunek", move || {
@@ -556,7 +569,8 @@ mod tests {
 
     #[test]
     fn a_slow_lookup_and_a_slow_backend_share_one_deadline() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         // A stopped backend never exits by itself; only the deadline ends it.
         let (_program, _record) = recording_backend(dir.path(), "slowcmd", "kill -STOP $$");
         let search = pohunek_platform::shell_env::SearchPath::new(vec![dir.path().to_path_buf()])
@@ -593,7 +607,8 @@ mod tests {
 
     #[test]
     fn a_hanging_backend_is_killed_at_the_deadline() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         // A stopped process never exits by itself; only SIGKILL ends it.
         let (program, _record) = recording_backend(dir.path(), "backend", "kill -STOP $$");
 
@@ -607,7 +622,8 @@ mod tests {
 
     #[test]
     fn nul_bytes_are_rejected_before_spawning() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (program, record) = recording_backend(dir.path(), "backend", "exit 0");
 
         let outcome = command_notifier(&program, LONG).notify("a\0b", "body");
@@ -618,6 +634,7 @@ mod tests {
 
     #[test]
     fn osascript_arguments_place_terminator_before_values() {
+        let _watchdog = crate::test_support::watchdog();
         let arguments = osascript_arguments("-t", "b");
         assert_eq!(arguments[6], OsString::from("--"));
         assert_eq!(arguments[7].as_bytes(), b"-t");

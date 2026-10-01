@@ -19,10 +19,10 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use pohunek_platform::filesystem::{EntryKind, FsError, StageOutcome, TrustedDir};
-use rustix::process::{waitid, Pid, WaitId, WaitIdOptions};
+use rustix::process::Pid;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -299,6 +299,12 @@ impl TerminalLauncher {
                 opener: self.opener.clone(),
                 timeout: self.open_timeout,
             }),
+            Err(BoundedError::Unreaped { waited_for, budget }) => Err(TerminalError::OpenerWait {
+                opener: self.opener.clone(),
+                source: io::Error::other(format!(
+                    "stuck after SIGKILL: waited {budget:?} for {waited_for}"
+                )),
+            }),
         };
         if result.is_err() {
             // The script never ran, so it removes itself nowhere else.
@@ -419,7 +425,16 @@ fn script_name() -> Result<OsString, TerminalError> {
 pub(crate) enum BoundedError {
     Spawn(io::Error),
     Wait(io::Error),
+    /// The deadline passed; the group was killed and the leader reaped.
     Timeout,
+    /// The group was killed but the leader still could not be reaped within
+    /// the reap budget (it is stuck in the kernel); the process was abandoned.
+    Unreaped {
+        /// What was waited for.
+        waited_for: &'static str,
+        /// How long it was waited.
+        budget: Duration,
+    },
 }
 
 /// Exit status of a bounded run and any captured standard error.
@@ -430,23 +445,44 @@ pub(crate) struct BoundedOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
-/// Most standard-error bytes kept from a bounded run; classification needs
-/// only a short diagnostic line.
+/// Most standard-error bytes kept from a bounded run; a diagnostic needs only
+/// a short first line.
 const STDERR_CAPTURE_LIMIT: u64 = 4096;
+
+/// Pause between exit checks of a bounded run. A check is one `wait4(WNOHANG)`,
+/// so 10 ms bounds both the added latency of a quick command and the cost of
+/// the polling thread.
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Longest wait for the leader to be reaped after the group received SIGKILL.
+/// SIGKILL ends a running or stopped process at once; five seconds only
+/// matters for a process stuck in the kernel, which is then reported instead
+/// of waited for.
+const REAP_BUDGET: Duration = Duration::from_secs(5);
+
+/// Longest wait for the standard-error reader after the group is dead. The
+/// pipe reaches EOF once every holder is gone; a holder outside the group
+/// (one that called `setsid`) can keep it open, and its output is then dropped.
+const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(2);
 
 /// Runs `command` in its own process group and waits at most `timeout` for it
 /// to exit.
 ///
-/// A helper thread blocks in `waitid(WEXITED | WNOWAIT)`, which leaves the
-/// exited leader unreaped. Its pid, which is the group id, therefore cannot be
-/// recycled while the calling thread kills the whole group, and only then reaps
-/// the leader. Every path that returns kills the group first, so a wrapper
-/// script's background children do not outlive the deadline or the command.
+/// The leader's exit is polled with `try_wait`, never with a blocking wait or
+/// `waitid`, so no step depends on how a platform reports a stopped or killed
+/// process. On a timeout the whole group gets SIGKILL while the leader is still
+/// unreaped (its pid, the group id, cannot be recycled yet) and the leader is
+/// then reaped within [`REAP_BUDGET`]. After a normal exit the group is killed
+/// as well, so a wrapper script's background children do not outlive the
+/// command; the leader is already reaped then, which is safe because a group id
+/// is not reallocated while a member lives and a vanished group answers
+/// `ESRCH`.
 ///
-/// The limit: a descendant that leaves the group (it calls `setsid` or
-/// `setpgid`) is out of reach. When the command pipes stderr, the output is
-/// read after the group is dead, so a surviving group member cannot hold the
-/// pipe open.
+/// Standard error, when piped, is drained by a thread from the start (a full
+/// pipe cannot stall the command) and joined within [`STDERR_DRAIN_BUDGET`].
+///
+/// The limit: a descendant that leaves the group (`setsid` or `setpgid`) is
+/// out of reach.
 pub(crate) fn run_bounded(
     command: &mut Command,
     timeout: Duration,
@@ -455,48 +491,71 @@ pub(crate) fn run_bounded(
         .process_group(0)
         .spawn()
         .map_err(BoundedError::Spawn)?;
-    let pid = Pid::from_child(&child);
-    let (sender, receiver) = mpsc::channel();
-    let watcher = thread::Builder::new()
-        .name("pohunek-gui-bounded-wait".to_owned())
-        .spawn(move || {
-            let result = waitid(
-                WaitId::Pid(pid),
-                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
-            );
-            let _ = sender.send(result.map(|_| ()));
-        });
-    if let Err(source) = watcher {
-        kill_group(pid);
-        let _ = child.wait();
-        return Err(BoundedError::Spawn(source));
-    }
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(())) => {
-            kill_group(pid);
-            let mut stderr = Vec::new();
-            if let Some(pipe) = child.stderr.take() {
-                // The child exited, so the pipe reaches EOF; a read error
-                // only loses the diagnostic.
-                let _ = pipe.take(STDERR_CAPTURE_LIMIT).read_to_end(&mut stderr);
+    let group = Pid::from_child(&child);
+    let stderr_reader = child.stderr.take().map(drain_stderr);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(source) => {
+                kill_group(group);
+                reap_within(&mut child, REAP_BUDGET)?;
+                return Err(BoundedError::Wait(source));
             }
-            let status = child.wait().map_err(BoundedError::Wait)?;
-            Ok(BoundedOutput { status, stderr })
         }
-        Ok(Err(errno)) => {
-            kill_group(pid);
-            let _ = child.wait();
-            Err(BoundedError::Wait(io::Error::from(errno)))
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            kill_group(group);
+            reap_within(&mut child, REAP_BUDGET)?;
+            return Err(BoundedError::Timeout);
         }
-        Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-            kill_group(pid);
-            let _ = child.wait();
-            Err(BoundedError::Timeout)
+        thread::sleep(remaining.min(EXIT_POLL_INTERVAL));
+    };
+    kill_group(group);
+    let stderr = stderr_reader
+        .and_then(|receiver| receiver.recv_timeout(STDERR_DRAIN_BUDGET).ok())
+        .unwrap_or_default();
+    Ok(BoundedOutput { status, stderr })
+}
+
+/// Reads at most [`STDERR_CAPTURE_LIMIT`] bytes of `pipe` on a thread.
+fn drain_stderr(pipe: std::process::ChildStderr) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("pohunek-gui-stderr".to_owned())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            // A read error only loses the diagnostic.
+            let _ = pipe.take(STDERR_CAPTURE_LIMIT).read_to_end(&mut bytes);
+            let _ = sender.send(bytes);
+        });
+    // Without the thread the sender is dropped and the receiver reports
+    // disconnection, which the caller treats as no diagnostic.
+    drop(spawned);
+    receiver
+}
+
+/// Reaps the killed leader, polling for at most `budget`.
+fn reap_within(child: &mut std::process::Child, budget: Duration) -> Result<(), BoundedError> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(source) => return Err(BoundedError::Wait(source)),
         }
+        if Instant::now() >= deadline {
+            return Err(BoundedError::Unreaped {
+                waited_for: "the killed process to exit",
+                budget,
+            });
+        }
+        thread::sleep(EXIT_POLL_INTERVAL);
     }
 }
 
-/// Kills the process group `group`, whose leader is still unreaped.
+/// Kills the process group `group`.
 ///
 /// An already gone group (`ESRCH`) is fine.
 fn kill_group(group: Pid) {
@@ -648,7 +707,7 @@ mod tests {
     fn recorder(dir: &Path) -> PathBuf {
         let path = dir.join("recorder");
         fs::write(&path, "#!/bin/sh\nprintf '%s\\0' \"$@\"\n").expect("write recorder");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod recorder");
+        crate::test_support::make_executable(&path);
         path
     }
 
@@ -673,7 +732,8 @@ mod tests {
 
     #[test]
     fn script_delivers_every_difficult_value_byte_exact() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let recorder = recorder(dir.path());
         let values = difficult_values();
         let mut argv = vec![recorder.into_os_string()];
@@ -692,7 +752,8 @@ mod tests {
 
     #[test]
     fn script_delivers_a_non_utf8_argument_byte_exact() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let recorder = recorder(dir.path());
         let raw = OsStr::from_bytes(b"caf\xe9 '\xff'").to_owned();
         let argv = vec![recorder.into_os_string(), raw.clone()];
@@ -704,7 +765,8 @@ mod tests {
 
     #[test]
     fn script_deletes_itself_before_running_the_program() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let marker = dir.path().join("script-existed");
         let probe = dir.path().join("probe");
         // The probe records whether the script file was already gone.
@@ -716,7 +778,7 @@ mod tests {
             ),
         )
         .expect("write probe");
-        fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).expect("chmod probe");
+        crate::test_support::make_executable(&probe);
         let script = dir.path().join("script.command");
         let argv = vec![probe.into_os_string(), script.clone().into_os_string()];
         fs::write(&script, command_script(&argv).expect("script")).expect("write script");
@@ -730,6 +792,7 @@ mod tests {
 
     #[test]
     fn script_layout_is_shebang_self_delete_exec() {
+        let _watchdog = crate::test_support::watchdog();
         let script =
             command_script(&[OsString::from("/bin/echo"), OsString::from("it's")]).expect("script");
         assert_eq!(
@@ -740,6 +803,7 @@ mod tests {
 
     #[test]
     fn nul_bytes_and_empty_programs_are_rejected() {
+        let _watchdog = crate::test_support::watchdog();
         assert_eq!(
             command_script(&[OsString::from("/bin/echo"), OsString::from("a\0b")]),
             Err(ScriptError::NulByte)
@@ -757,6 +821,7 @@ mod tests {
 
     #[test]
     fn attach_arguments_keep_host_and_id_out_of_option_position() {
+        let _watchdog = crate::test_support::watchdog();
         assert_eq!(
             attach_arguments("", "s-1"),
             ["attach", "--", "s-1"].map(OsString::from)
@@ -779,7 +844,7 @@ mod tests {
             ),
         )
         .expect("write fake open");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod fake open");
+        crate::test_support::make_executable(&path);
         path
     }
 
@@ -806,7 +871,8 @@ mod tests {
 
     #[test]
     fn launch_invokes_open_with_an_argv_array_and_runs_the_script() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let output = dir.path().join("attach-argv");
         // The fake terminal runs the script it was handed, then records nothing else.
@@ -820,7 +886,7 @@ mod tests {
             ),
         )
         .expect("write target");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod target");
+        crate::test_support::make_executable(&target);
         let script_dir = dir.path().join("private").join("gui-attach");
         let launcher = launcher(opener.clone(), script_dir.clone(), Duration::from_secs(30));
         let mut argv = vec![target.into_os_string()];
@@ -849,7 +915,8 @@ mod tests {
 
     #[test]
     fn script_directory_and_file_are_owner_private() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         // Leaves the script in place so its mode can be inspected.
         let opener = fake_open(dir.path(), &record, "exit 0");
@@ -872,8 +939,34 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_runtime_hierarchy_is_created_owner_private() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let record = dir.path().join("open-argv");
+        let opener = fake_open(dir.path(), &record, "exit 0");
+        // The runtime directory and its parent do not exist yet, like a first
+        // launch under /private/tmp/pohunek-<uid>.
+        let runtime = dir.path().join("pohunek-1000");
+        let script_dir = runtime.join("gui-attach");
+        let launcher = launcher(opener, script_dir.clone(), WINDOW);
+
+        launcher
+            .launch(&[OsString::from("/bin/true")])
+            .expect("launch creates the hierarchy");
+
+        for created in [&runtime, &script_dir] {
+            let mode = fs::metadata(created)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", created.display());
+        }
+    }
+
+    #[test]
     fn every_launch_uses_a_fresh_script_name() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(dir.path(), &record, "exit 0");
         let script_dir = dir.path().join("gui-attach");
@@ -891,7 +984,8 @@ mod tests {
 
     #[test]
     fn a_group_writable_script_directory_is_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(dir.path(), &record, "exit 0");
         let script_dir = dir.path().join("gui-attach");
@@ -912,7 +1006,8 @@ mod tests {
 
     #[test]
     fn a_symlinked_script_directory_is_refused() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(dir.path(), &record, "exit 0");
         let real = dir.path().join("real");
@@ -935,7 +1030,8 @@ mod tests {
 
     #[test]
     fn a_nul_byte_fails_before_any_file_or_process_exists() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(dir.path(), &record, "exit 0");
         let script_dir = dir.path().join("gui-attach");
@@ -952,7 +1048,8 @@ mod tests {
 
     #[test]
     fn a_failing_opener_is_a_typed_error_and_leaves_no_script() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(dir.path(), &record, "exit 3");
         let script_dir = dir.path().join("gui-attach");
@@ -971,7 +1068,8 @@ mod tests {
 
     #[test]
     fn a_missing_opener_is_a_typed_error_and_leaves_no_script() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let script_dir = dir.path().join("gui-attach");
         let launcher = launcher(
             dir.path().join("no-such-open"),
@@ -992,7 +1090,8 @@ mod tests {
 
     #[test]
     fn a_stalled_opener_is_killed_at_the_deadline() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         // A stopped process never exits by itself; only SIGKILL ends it.
         let opener = fake_open(dir.path(), &record, "kill -STOP $$");
@@ -1045,7 +1144,8 @@ mod tests {
 
     #[test]
     fn a_timeout_kills_the_wrappers_background_children_too() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let marker = dir.path().join("background-pid");
         let wrapper = dir.path().join("wrapper");
         fs::write(
@@ -1056,7 +1156,7 @@ mod tests {
             ),
         )
         .expect("write wrapper");
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::make_executable(&wrapper);
 
         let error = run_bounded(&mut Command::new(&wrapper), Duration::from_secs(2))
             .expect_err("the wrapper never exits");
@@ -1067,7 +1167,8 @@ mod tests {
 
     #[test]
     fn a_wrapper_that_exits_does_not_leave_background_children_behind() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let marker = dir.path().join("background-pid");
         let wrapper = dir.path().join("wrapper");
         // The child detaches its stdio, so only the group kill can end it.
@@ -1079,7 +1180,7 @@ mod tests {
             ),
         )
         .expect("write wrapper");
-        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::make_executable(&wrapper);
 
         let output = run_bounded(&mut Command::new(&wrapper), WINDOW).expect("wrapper exits");
 
@@ -1089,6 +1190,7 @@ mod tests {
 
     #[test]
     fn a_quick_successful_exit_counts_as_started() {
+        let _watchdog = crate::test_support::watchdog();
         spawn_observed(
             OsStr::new("/bin/sh"),
             &[OsString::from("-c"), OsString::from("exit 0")],
@@ -1099,6 +1201,7 @@ mod tests {
 
     #[test]
     fn a_quick_failing_exit_is_reported_with_its_status() {
+        let _watchdog = crate::test_support::watchdog();
         let error = spawn_observed(
             OsStr::new("/bin/sh"),
             &[OsString::from("-c"), OsString::from("exit 127")],
@@ -1114,6 +1217,7 @@ mod tests {
 
     #[test]
     fn a_signalled_child_is_reported() {
+        let _watchdog = crate::test_support::watchdog();
         let error = spawn_observed(
             OsStr::new("/bin/sh"),
             &[OsString::from("-c"), OsString::from("kill -KILL $$")],
@@ -1126,7 +1230,8 @@ mod tests {
 
     #[test]
     fn a_child_still_running_at_the_deadline_counts_as_started_and_is_reaped_later() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let fifo = dir.path().join("release.fifo");
         let status = Command::new("mkfifo").arg(&fifo).status().expect("mkfifo");
         assert!(status.success());
@@ -1147,6 +1252,7 @@ mod tests {
 
     #[test]
     fn spawn_observed_reports_a_missing_program() {
+        let _watchdog = crate::test_support::watchdog();
         let error = spawn_observed(OsStr::new("/nonexistent/pohunek-attach"), &[], WINDOW)
             .expect_err("missing program");
 
@@ -1158,7 +1264,8 @@ mod tests {
 
     #[test]
     fn spawn_observed_puts_the_child_in_its_own_process_group() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let output = dir.path().join("pgid");
         spawn_observed(
             OsStr::new("/bin/sh"),
@@ -1183,7 +1290,8 @@ mod tests {
 
     #[test]
     fn an_opener_failure_carries_the_first_stderr_line() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(
             dir.path(),
@@ -1206,6 +1314,7 @@ mod tests {
 
     #[test]
     fn first_line_strips_control_characters_and_bounds_length() {
+        let _watchdog = crate::test_support::watchdog();
         assert_eq!(first_line(b"\n\x1b[31mred\x07\nnext"), "[31mred");
         assert_eq!(first_line(b"   \n"), "");
         assert_eq!(first_line(&[b'x'; 1000]).chars().count(), DETAIL_MAX_CHARS);
@@ -1227,7 +1336,8 @@ mod tests {
 
     #[test]
     fn a_launch_removes_stale_scripts_and_keeps_fresh_and_unrelated_files() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(dir.path(), &record, "exit 0");
         let script_dir = dir.path().join("gui-attach");
@@ -1252,7 +1362,8 @@ mod tests {
 
     #[test]
     fn an_unremovable_stale_script_is_a_warning_and_never_fails_the_launch() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let record = dir.path().join("open-argv");
         let opener = fake_open(dir.path(), &record, "exit 0");
         let script_dir = dir.path().join("gui-attach");
@@ -1265,7 +1376,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).expect("symlink");
         // A script with the wrong mode fails validation.
         let loose = private_file(&script_dir, "attach-loose.command");
-        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_support::make_executable(&loose);
         let launcher = launcher(opener, script_dir, WINDOW);
 
         let report = launcher

@@ -223,7 +223,7 @@ mod tests {
 
     fn script(path: &Path, body: &str) {
         fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("write script");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+        crate::test_support::make_executable(path);
     }
 
     /// Creates a recorder that writes its NUL-terminated argv into a FIFO, so a
@@ -295,7 +295,8 @@ mod tests {
 
     #[test]
     fn argv_mode_passes_values_as_single_arguments_without_a_shell() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, fifo) = fifo_recorder(dir.path());
         let plan = plan(
             command("{bin} --flag {host} attach {id}", AttachCommandMode::Argv),
@@ -309,7 +310,8 @@ mod tests {
 
     #[test]
     fn shell_mode_passes_values_as_single_arguments() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, fifo) = fifo_recorder(dir.path());
         let plan = plan(
             command("{bin} --flag {host} attach {id}", AttachCommandMode::Shell),
@@ -329,7 +331,8 @@ mod tests {
 
     #[test]
     fn argv_mode_reports_a_missing_program_with_its_name() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, _fifo) = fifo_recorder(dir.path());
         let plan = plan(
             command("/nonexistent/launcher {bin}", AttachCommandMode::Argv),
@@ -344,9 +347,10 @@ mod tests {
 
     #[test]
     fn argv_mode_resolves_a_bare_launcher_through_the_search_policy() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, fifo) = fifo_recorder(dir.path());
-        let bin_dir = tempfile::tempdir().expect("bin dir");
+        let bin_dir = crate::test_support::fixture();
         // A launcher that exists only in the discovered search path, not on the
         // GUI's own PATH, like kitty under a Finder launch.
         let launcher = bin_dir.path().join("fake-terminal");
@@ -373,9 +377,10 @@ mod tests {
 
     #[test]
     fn argv_mode_reports_a_bare_launcher_that_cannot_be_found() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, _fifo) = fifo_recorder(dir.path());
-        let empty = tempfile::tempdir().expect("empty dir");
+        let empty = crate::test_support::fixture();
         let search = pohunek_platform::shell_env::SearchPath::new(vec![empty.path().to_path_buf()])
             .expect("search path");
         let mut plan = plan(
@@ -395,7 +400,8 @@ mod tests {
 
     #[test]
     fn an_argv_launcher_that_exits_at_once_is_reported() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, _fifo) = fifo_recorder(dir.path());
         let plan = observing(plan(
             command("/bin/false {bin}", AttachCommandMode::Argv),
@@ -415,7 +421,8 @@ mod tests {
 
     #[test]
     fn a_dead_shell_template_is_reported_with_its_exit_status() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, _fifo) = fifo_recorder(dir.path());
         let plan = observing(plan(
             command("/nonexistent/terminal {bin}", AttachCommandMode::Shell),
@@ -429,7 +436,8 @@ mod tests {
 
     #[test]
     fn argv_mode_rejects_an_unterminated_template() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let (recorder, _fifo) = fifo_recorder(dir.path());
         let plan = plan(command("{bin} 'oops", AttachCommandMode::Argv), &recorder);
 
@@ -443,7 +451,8 @@ mod tests {
 
     #[test]
     fn an_unresolvable_pohunek_bin_fails_before_anything_is_spawned() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let marker = dir.path().join("spawned");
         let plan = plan(
             command(
@@ -478,7 +487,8 @@ mod tests {
 
     #[test]
     fn terminal_mode_runs_the_resolved_bin_with_attach_arguments_through_open() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let output = dir.path().join("argv.out");
         let recorder = dir.path().join("recorder");
         script(
@@ -508,7 +518,8 @@ mod tests {
 
     #[test]
     fn terminal_mode_surfaces_an_opener_failure_as_a_typed_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let recorder = dir.path().join("recorder");
         script(&recorder, "exit 0");
         let environment = terminal_environment(dir.path(), "exit 9");
@@ -531,7 +542,8 @@ mod tests {
 
     #[test]
     fn terminal_mode_rejects_a_nul_byte_in_the_session_id() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let recorder = dir.path().join("recorder");
         script(&recorder, "exit 0");
         let environment = terminal_environment(dir.path(), "exit 0");
@@ -554,7 +566,8 @@ mod tests {
 
     #[test]
     fn terminal_mode_surfaces_a_stale_script_cleanup_warning_without_failing() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
         let recorder = dir.path().join("recorder");
         script(&recorder, "exit 0");
         let environment = terminal_environment(dir.path(), "exit 0");
