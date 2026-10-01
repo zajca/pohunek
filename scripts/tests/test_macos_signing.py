@@ -498,6 +498,18 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for forbidden in ("--stage-release", "cargo", "bun ", "--version", "smoke", "stage-archive", "setup-"):
             self.assertNotIn(forbidden, self.sign, forbidden)
 
+    def test_every_action_that_shapes_the_signed_bytes_is_pinned(self):
+        for name, job in (("stage", self.stage), ("sign", self.sign), ("release", self.release)):
+            for use in re.findall(r"uses: (\S+)", job):
+                self.assertRegex(use, r"@[0-9a-f]{40}$", "%s: %s" % (name, use))
+
+    def test_the_team_id_is_a_repository_variable_every_job_can_read(self):
+        # Environment-level variables are visible only to jobs that name the
+        # environment; the verification job does not.
+        self.assertIn("vars.MACOS_TEAM_ID", self.release)
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("repository variable `MACOS_TEAM_ID`", readme)
+
     def test_the_staged_tree_travels_as_a_checked_tar(self):
         self.assertIn("stage.tar.sha256", self.stage)
         self.assertIn("shasum -a 256 -c stage.tar.sha256", self.sign)

@@ -981,7 +981,7 @@ self-contained Linux x86_64 web-control-center archive, and signed, notarized
 build runs without secrets; a separate signing job on a fresh runner runs in the protected `macos-signing` environment (secrets
 `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
 `APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,
-and the variable `MACOS_TEAM_ID`); a missing credential fails them before the
+and the repository variable `MACOS_TEAM_ID`, which must not be environment-scoped because the verification job reads it too); a missing credential fails them before the
 build, so a macOS archive is never published unsigned and the release run stays
 red until the credentials exist. The `macos-signing` environment is created and
 protected by the repository owner, not by the workflow: restrict it to the

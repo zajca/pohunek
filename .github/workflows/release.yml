@@ -499,7 +499,7 @@ jobs:
       matrix:
         component: [cli, daemon, gui]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -508,10 +508,12 @@ jobs:
         run: test "$(uname -m)" = "arm64"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-macos-${{ matrix.component }}
 
@@ -668,7 +670,7 @@ jobs:
       matrix:
         component: [cli, daemon, gui]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -722,7 +724,7 @@ jobs:
       - name: Install Python for Hermes release verification
         if: matrix.component == 'cli'
         id: python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -735,11 +737,13 @@ jobs:
 
       - name: Install Rust toolchain
         if: matrix.component == 'cli'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
 
       - name: Cache cargo build
         if: matrix.component == 'cli'
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-macos-verify
 
@@ -768,7 +772,7 @@ jobs:
           PATH="/bin:$PATH" "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           fail_on_unmatched_files: true
           files: |
