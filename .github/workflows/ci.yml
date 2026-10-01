@@ -293,18 +293,18 @@ jobs:
       # real GUI, daemon, and session worker run under a Finder-like environment
       # (scripts/acceptance/macos-gui-launch). Exit status 2 means the runner
       # has no window server; that fails the job, it is never a skip.
-      - name: Check and lint GUI
+      - name: Check and lint GUI and host probes
         if: ${{ !cancelled() }}
         run: |
-          cargo check --locked -p pohunek-gui --all-targets
-          cargo clippy --locked -p pohunek-gui --all-targets -- -D warnings
+          cargo check --locked -p pohunek-gui -p pohunek-hostcheck --all-targets
+          cargo clippy --locked -p pohunek-gui -p pohunek-hostcheck --all-targets -- -D warnings
 
-      - name: Test GUI
+      - name: Test GUI and host probes
         if: ${{ !cancelled() }}
         # A test waiting on a child process must fail with evidence, never hold
         # the runner for hours.
         timeout-minutes: 15
-        run: cargo test --locked -p pohunek-gui
+        run: cargo test --locked -p pohunek-gui -p pohunek-hostcheck
 
       - name: Build GUI binary
         if: ${{ !cancelled() }}
@@ -527,6 +527,7 @@ jobs:
               - 'crates/prompt/**'
               - 'crates/gui-core/**'
               - 'crates/gui/**'
+              - 'scripts/acceptance/**'
               - 'crates/relay-client/**'
               - 'crates/relay-protocol/**'
               - 'docs/knowledge/**'

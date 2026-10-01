@@ -51,35 +51,37 @@ pub(crate) enum NotificationOutcome {
     Unavailable(String),
 }
 
-/// Coarse state used to tell the user once per change.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// What the user was last told about the backend.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum NotificationHealth {
     /// No notification has completed yet.
     #[default]
     Unknown,
     Working,
-    Unavailable,
+    /// The last failure reason, so a different one is shown when it arrives.
+    Unavailable(String),
 }
 
-/// Records `outcome` and returns the status text to show when the state changed.
+/// Records `outcome` and returns the status text to show when it changed.
 ///
-/// Repeated identical failures return `None`, so a broken backend does not
-/// overwrite the status line once per notification. Recovery from a failure is
-/// announced once.
+/// Only an identical consecutive failure returns `None`, so a broken backend
+/// does not overwrite the status line once per notification, while a different
+/// reason (a timeout followed by a definitive not-found, say) replaces stale
+/// text. Recovery from a failure is announced once.
 pub(crate) fn apply_outcome(
     health: &mut NotificationHealth,
     outcome: &NotificationOutcome,
 ) -> Option<String> {
     let next = match outcome {
         NotificationOutcome::Submitted => NotificationHealth::Working,
-        NotificationOutcome::Unavailable(_) => NotificationHealth::Unavailable,
+        NotificationOutcome::Unavailable(reason) => NotificationHealth::Unavailable(reason.clone()),
     };
     let previous = std::mem::replace(health, next);
-    if previous == next {
+    if previous == *health {
         return None;
     }
     match outcome {
-        NotificationOutcome::Submitted => (previous == NotificationHealth::Unavailable)
+        NotificationOutcome::Submitted => matches!(previous, NotificationHealth::Unavailable(_))
             .then(|| "desktop notifications work again".to_owned()),
         NotificationOutcome::Unavailable(reason) => {
             Some(format!("desktop notifications are unavailable: {reason}"))
@@ -376,6 +378,25 @@ mod tests {
             apply_outcome(&mut health, &NotificationOutcome::Submitted),
             None
         );
+    }
+
+    #[test]
+    fn a_different_failure_reason_is_shown_and_an_identical_repeat_is_not() {
+        let mut health = NotificationHealth::default();
+        let timeout = NotificationOutcome::Unavailable("lookup still running".to_owned());
+        let verdict = NotificationOutcome::Unavailable("not found".to_owned());
+
+        assert!(apply_outcome(&mut health, &timeout)
+            .expect("first reason")
+            .contains("lookup still running"));
+        assert_eq!(apply_outcome(&mut health, &timeout), None);
+        assert!(apply_outcome(&mut health, &verdict)
+            .expect("different reason replaces stale text")
+            .contains("not found"));
+        assert_eq!(apply_outcome(&mut health, &verdict), None);
+        assert!(apply_outcome(&mut health, &NotificationOutcome::Submitted)
+            .expect("recovery")
+            .contains("work again"));
     }
 
     #[test]

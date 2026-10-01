@@ -211,9 +211,10 @@ attach remains on the same route as its control connection.
   running survives, because the group id of an already reaped leader can belong
   to an unrelated group by then. A descendant that starts its own session or
   group escapes the deadline kill.
-- The status line shows one message when the state changes to unavailable
-  (unresolvable command, spawn failure, timeout, non-zero exit or signal) and
-  one when it recovers; repeated identical failures stay silent.
+- The status line shows a message when the failure reason changes (unresolvable
+  command, spawn failure, timeout, non-zero exit or signal) and one when it
+  recovers; an identical repeated failure stays silent, but a different reason,
+  such as a definitive not-found after an earlier timeout, replaces the old text.
 
 What cannot be confirmed: `osascript` exits 0 whether the notification was shown
 or suppressed by System Settings (Notifications, Focus), and an unbundled binary
