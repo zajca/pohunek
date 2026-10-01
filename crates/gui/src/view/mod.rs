@@ -1,26 +1,26 @@
 //! Top-level Iced view tree: shared widget helpers and the view submodules.
 
 pub(crate) mod detail;
+mod hosts;
 pub(crate) mod inbox;
 mod modals;
 mod selectable_text;
 mod session;
-mod tree;
 
 use iced::widget::{button, center, column, container, mouse_area, opaque, row, stack, text};
 use iced::{Background, Center, Color, Element, Fill, Theme};
-use pohunek_gui_core::{ConnState, TreeNodeId};
+use pohunek_gui_core::ConnState;
 use protocol::{AgentKind, SessionInfo};
 
 use crate::message::{Message, ModalView};
 use crate::PohunekApp;
 
 use detail::detail_view;
+use hosts::{conn_color, hosts_modal_content};
 use inbox::inbox_modal_content;
 use modals::{assistant_modal_content, keymap_modal_content, start_modal_content};
 use selectable_text::selectable_text;
 use session::{confirm_delete_modal_content, session_modal_content};
-use tree::{assistant_entry_button, conn_color, inbox_entry_button, workspace_tree};
 
 /// Returns a provider-neutral label for an agent kind received from the wire.
 fn agent_kind_label(kind: &AgentKind) -> String {
@@ -57,8 +57,8 @@ fn section_title(label: &str) -> Element<'_, Message> {
     text(label).size(18).into()
 }
 
-/// Button style for selectable list rows (tree nodes, provider items, monitor
-/// rows): flat and transparent, with a hover tint and a filled accent when
+/// Button style for selectable list rows (sessions, notifications, provider
+/// items): flat and transparent, with a hover tint and a filled accent when
 /// selected, so lists read as lists rather than a wall of identical buttons.
 fn list_row_style(
     selected: bool,
@@ -96,33 +96,11 @@ fn list_button<'a>(
         .into()
 }
 
-/// A flat expand/collapse caret toggle.
-fn caret(expanded: bool, node: TreeNodeId) -> Element<'static, Message> {
-    button(text(if expanded { "v" } else { ">" }).size(13))
-        .padding([2, 6])
-        .on_press(Message::ToggleNode(node))
-        .style(iced::widget::button::text)
-        .into()
-}
-
 pub(crate) fn view(app: &PohunekApp) -> Element<'_, Message> {
-    let left = column![
-        assistant_entry_button(),
-        inbox_entry_button(app),
-        container(workspace_tree(app))
-            .padding(12)
-            .height(Fill)
-            .style(iced::widget::container::rounded_box)
-    ]
-    .spacing(12);
-
-    let base = container(row![
-        container(left).width(u32::from(app.ui_state.left_pane_width)),
-        container(detail_view(app)).padding([0, 16]).width(Fill)
-    ])
-    .padding(16)
-    .width(Fill)
-    .height(Fill);
+    let base = container(detail_view(app))
+        .padding(16)
+        .width(Fill)
+        .height(Fill);
     match app.modal {
         ModalView::None => base.into(),
         ModalView::Start => modal(base.into(), start_modal_content(app), Message::CloseModal),
@@ -139,6 +117,7 @@ pub(crate) fn view(app: &PohunekApp) -> Element<'_, Message> {
         ),
         ModalView::Keymap => modal(base.into(), keymap_modal_content(app), Message::CloseModal),
         ModalView::Inbox => modal(base.into(), inbox_modal_content(app), Message::CloseModal),
+        ModalView::Hosts => modal(base.into(), hosts_modal_content(app), Message::CloseModal),
     }
 }
 
@@ -184,14 +163,6 @@ fn dialog_card<'a>(
         .padding(20)
         .width(640)
         .style(iced::widget::container::rounded_box)
-        .into()
-}
-
-/// Indents a tree row by depth so the host > project > session hierarchy reads
-/// visually without spacer hacks.
-fn indent<'a>(depth: u16, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(content)
-        .padding(iced::Padding::ZERO.left(f32::from(depth) * 16.0))
         .into()
 }
 

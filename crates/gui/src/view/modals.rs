@@ -1,6 +1,6 @@
 //! Modal contents for session launch, assistant launch, key help, and toasts.
 
-// Rust guideline compliant 2026-08-12
+// Rust guideline compliant 2026-10-01
 
 use iced::widget::{button, checkbox, column, container, row, text, text_editor, text_input};
 use iced::{Center, Element};
@@ -8,7 +8,7 @@ use pohunek_gui_core::Toast;
 
 use crate::keyboard::{KeyBindingHelp, KeyContext};
 use crate::message::{FormField, Message};
-use crate::selection::{selected_assistant_project, selected_host_id};
+use crate::selection::project_host;
 use crate::view::session::session_name_input;
 use crate::PohunekApp;
 
@@ -26,6 +26,7 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
         "Prompt / initial input (optional)"
     };
     let mut panel = column![
+        form_select(app, "Project", FormField::StartProject),
         row![
             form_select(app, "Agent", FormField::StartAgent),
             form_select(app, "Template", FormField::StartTemplate),
@@ -58,7 +59,9 @@ pub(crate) fn start_modal_content(app: &PohunekApp) -> Element<'_, Message> {
         );
     }
     let mut start = button("Start session").style(iced::widget::button::primary);
-    if selected_host(app).is_some_and(|host| host.agent_is_launchable(&app.start.agent)) {
+    if project_host(app, app.start.project.as_ref())
+        .is_some_and(|host| host.agent_is_launchable(&app.start.agent))
+    {
         start = start.on_press(Message::CreateSession);
     }
     dialog_card("Start a session", panel.push(start))
@@ -70,11 +73,8 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
     } else {
         "Advanced >"
     };
-    let context = selected_assistant_project(app).map_or_else(std::convert::identity, |target| {
-        format!("{}  ·  {}", target.host.id, target.project_ref)
-    });
     let mut panel = column![
-        text(context).size(13),
+        form_select(app, "Project", FormField::AssistantProject),
         row![
             form_select(app, "Intent", FormField::AssistantIntent),
             form_select(app, "Agent", FormField::AssistantAgent),
@@ -117,7 +117,7 @@ pub(crate) fn assistant_modal_content(app: &PohunekApp) -> Element<'_, Message> 
                 .spacing(12),
             );
     }
-    let launchable = selected_host(app).is_some_and(|host| {
+    let launchable = project_host(app, app.assistant.project.as_ref()).is_some_and(|host| {
         app.assistant.agent.as_deref().map_or_else(
             || !host.launchable_assistant_agents().is_empty(),
             |agent| host.agent_is_assistant_capable(agent),
@@ -185,12 +185,6 @@ fn keymap_section(
         );
     }
     section.into()
-}
-
-fn selected_host(app: &PohunekApp) -> Option<&pohunek_gui_core::HostView> {
-    selected_host_id(app)
-        .ok()
-        .and_then(|host_id| app.workspace.hosts.get(&host_id))
 }
 
 fn form_select<'a>(

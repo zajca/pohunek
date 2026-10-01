@@ -1,7 +1,6 @@
 //! The Iced `update` reducer and the command/task builders it dispatches to.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
 
 use iced::widget::text_editor;
 use iced::Task;
@@ -16,7 +15,7 @@ use pohunek_gui_core::{
     set_notification_policy_with_options, set_session_metadata_with_options,
     stop_session_with_options, update_notification_with_options, wait_for_session_with_options,
     ConnectionOptions, CoreError, DomainEvent as CoreEvent, HostConfig, HostId, HostView,
-    Selection, WindowSize,
+    ProjectRef, Selection, WindowSize,
 };
 use protocol::{
     ForkCwdMode, NotificationDeleteParams, NotificationId, NotificationPolicyParams,
@@ -36,19 +35,15 @@ use crate::message::{
 use crate::notify::{apply_outcome, NotificationOutcome};
 use crate::runtime;
 use crate::selection::{
-    connection_options, host_config, optional_field, required_field, save_ui_state_task,
-    selected_assistant_project, selected_host_config, selected_project_reference,
-    selected_session_target, sync_rename_edit_for_selection, terminal_size,
+    connection_options, host_config, optional_field, preselected_project, project_host,
+    project_target, required_field, save_ui_state_task, selected_session_target,
+    sync_rename_edit_for_selection, terminal_size,
 };
 use crate::PohunekApp;
 
 // One GUI click reads a bounded page small enough to render responsively while
 // repeated clicks continue from the headless state's exact output cursor.
 const GUI_SESSION_OUTPUT_PAGE_BYTES: u32 = 16 * 1_024;
-
-// Match the conventional desktop double-click interval already used by the
-// GUI's interaction design.
-const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 #[expect(
     clippy::too_many_lines,
@@ -63,6 +58,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 _ => None,
             };
             app.workspace.apply(event);
+            normalize_project_filter(app);
             if let Some(host_id) = governance_host {
                 match governance_inspect_task(app, host_id) {
                     Ok(task) => tasks.push(task),
@@ -76,13 +72,10 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             app.hosts = result.hosts;
             app.status = result.warning;
         }
-        Message::ToggleNode(node) => {
-            if app.ui_state.expanded_nodes.contains(&node) {
-                app.ui_state.expanded_nodes.remove(&node);
-            } else {
-                app.ui_state.expanded_nodes.insert(node);
-            }
-            tasks.push(save_ui_state_task(app));
+        Message::SetProjectFilter(filter) => app.project_filter = filter,
+        Message::OpenHostsModal => {
+            app.modal = ModalView::Hosts;
+            tasks.push(keyboard::focus_task(app));
         }
         Message::OpenInbox => {
             app.modal = ModalView::Inbox;
@@ -171,7 +164,6 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
             host_id,
             session_id,
         } => {
-            app.last_project_click = None;
             app.workspace
                 .select_session(host_id.clone(), session_id.clone());
             app.ui_state.selection = Some(Selection::Session {
@@ -189,36 +181,6 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                 .unwrap_or_default();
             app.modal = ModalView::Session;
             tasks.push(save_ui_state_task(app));
-        }
-        Message::SelectProject {
-            host_id,
-            project_id,
-        } => {
-            let now = Instant::now();
-            let double_click = matches!(
-                &app.last_project_click,
-                Some((last_host, last_project, at))
-                    if *last_host == host_id
-                        && *last_project == project_id
-                        && now.duration_since(*at) <= DOUBLE_CLICK_WINDOW
-            );
-            app.workspace
-                .select_project(host_id.clone(), project_id.clone());
-            app.ui_state.selection = app.workspace.selection.clone();
-            app.start.template = None;
-            // Load the project's actions eagerly so the launch action picker is
-            // populated without a manual step.
-            if let Ok(task) = list_project_actions_task(app) {
-                tasks.push(task);
-            }
-            tasks.push(save_ui_state_task(app));
-            if double_click {
-                app.last_project_click = None;
-                open_start_modal(app);
-                tasks.push(keyboard::focus_task(app));
-            } else {
-                app.last_project_click = Some((host_id, project_id, now));
-            }
         }
         Message::OpenSession {
             host_id,
@@ -253,12 +215,17 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         },
         Message::OpenStartModal => {
             open_start_modal(app);
+            tasks.extend(load_start_actions_task(app));
             tasks.push(keyboard::focus_task(app));
         }
         Message::OpenAssistantModal => {
-            app.assistant = AssistantForm::default();
+            app.assistant = AssistantForm {
+                project: preselected_project(app),
+                ..AssistantForm::default()
+            };
+            ensure_assistant_agent_matches_host(app);
             app.assistant_editor = text_editor::Content::new();
-            app.form_focus = FormField::AssistantIntent;
+            app.form_focus = FormField::AssistantProject;
             app.form_select = None;
             app.modal = ModalView::Assistant;
             tasks.push(keyboard::focus_task(app));
@@ -270,6 +237,23 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
         Message::CloseModal => {
             app.modal = ModalView::None;
             app.form_select = None;
+        }
+        Message::StartProjectSelected(project) => {
+            if app.start.project.as_ref() != Some(&project) {
+                if app.start.template.take().is_some() {
+                    app.prompt_editor = text_editor::Content::new();
+                }
+                app.template_recipe = None;
+                app.start.project = Some(project);
+                ensure_start_agent_matches_host(app);
+                tasks.extend(load_start_actions_task(app));
+            }
+        }
+        Message::AssistantProjectSelected(project) => {
+            if app.assistant.project.as_ref() != Some(&project) {
+                app.assistant.project = Some(project);
+                ensure_assistant_agent_matches_host(app);
+            }
         }
         Message::StartAgentSelected(agent) => app.start.agent = agent,
         Message::StartTemplateSelected(template) => {
@@ -504,6 +488,7 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
                     _ => None,
                 };
                 app.workspace.apply(message);
+                normalize_project_filter(app);
                 if let Some(error) = observation_error {
                     app.status = Some(error);
                 }
@@ -587,13 +572,67 @@ pub(crate) fn update(app: &mut PohunekApp, message: Message) -> Task<Message> {
     Task::batch(tasks)
 }
 
+/// Drops a project filter whose project no longer has any session, so the list
+/// never stays filtered to an empty view with no chip to clear it.
+fn normalize_project_filter(app: &mut PohunekApp) {
+    let Some(filter) = &app.project_filter else {
+        return;
+    };
+    let still_listed = app
+        .workspace
+        .session_project_filters()
+        .iter()
+        .any(|choice| &choice.project == filter);
+    if !still_listed {
+        app.project_filter = None;
+    }
+}
+
 fn open_start_modal(app: &mut PohunekApp) {
-    app.start = StartForm::default();
-    app.form_focus = FormField::StartAgent;
+    app.start = StartForm {
+        project: preselected_project(app),
+        ..StartForm::default()
+    };
+    ensure_start_agent_matches_host(app);
+    app.form_focus = FormField::StartProject;
     app.form_select = None;
     app.template_recipe = None;
     app.prompt_editor = text_editor::Content::new();
     app.modal = ModalView::Start;
+}
+
+/// Keeps the Start form's agent launchable on the project's host: when the
+/// current agent is not, falls back to the host's first launchable agent.
+fn ensure_start_agent_matches_host(app: &mut PohunekApp) {
+    let Some(host) = project_host(app, app.start.project.as_ref()) else {
+        return;
+    };
+    if host.agent_is_launchable(&app.start.agent) {
+        return;
+    }
+    if let Some(agent) = host.launchable_agents().into_iter().next() {
+        app.start.agent = agent;
+    }
+}
+
+/// Resets an explicit assistant agent to automatic selection when the project's
+/// host cannot host the assistant with it.
+fn ensure_assistant_agent_matches_host(app: &mut PohunekApp) {
+    let Some(agent) = app.assistant.agent.as_deref() else {
+        return;
+    };
+    let capable = project_host(app, app.assistant.project.as_ref())
+        .is_some_and(|host| host.agent_is_assistant_capable(agent));
+    if !capable {
+        app.assistant.agent = None;
+    }
+}
+
+/// Loads the Start form's project actions so the template picker is populated
+/// without a manual step.
+fn load_start_actions_task(app: &PohunekApp) -> Option<Task<Message>> {
+    let project = app.start.project.as_ref()?;
+    list_project_actions_task(app, project).ok()
 }
 
 fn move_form_select(app: &mut PohunekApp, direction: ListDirection) {
@@ -730,7 +769,8 @@ fn governance_inspect_task(app: &mut PohunekApp, host_id: HostId) -> Result<Task
 /// prompt); branch/base come from the resolved template recipe when a template is
 /// selected, otherwise from the Advanced overrides. The agent is the picker value.
 fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
-    let host = selected_host_config(app)?;
+    let target = project_target(app, app.start.project.as_ref())?;
+    let host = target.host;
     let host_id = host.id.clone();
     let host_view = app
         .workspace
@@ -739,7 +779,7 @@ fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
         .ok_or_else(|| format!("unknown host `{host_id}`"))?;
     ensure_agent_launchable(&host_id, host_view, &app.start.agent)?;
     let options = connection_options(app)?;
-    let project = selected_project_reference(app)?;
+    let project = target.project_ref;
     let terminal_size = terminal_size(app)?;
     let input = app.prompt_editor.text();
     let (branch, base_branch) = match (&app.start.template, &app.template_recipe) {
@@ -778,7 +818,7 @@ fn create_session_task(app: &PohunekApp) -> Result<Task<Message>, String> {
 }
 
 fn launch_assistant_task(app: &PohunekApp) -> Result<Task<Message>, String> {
-    let target = selected_assistant_project(app)?;
+    let target = project_target(app, app.assistant.project.as_ref())?;
     let host_id = target.host.id.clone();
     let host = app
         .workspace
@@ -1024,9 +1064,10 @@ fn fork_selected_session_task(app: &PohunekApp) -> Result<Task<Message>, String>
 /// prompt, and returns the rendered text plus recipe so the Start modal can show
 /// it in an editable buffer before the operator launches the session.
 fn resolve_template_task(app: &PohunekApp, action_name: String) -> Result<Task<Message>, String> {
-    let host = selected_host_config(app)?;
+    let target = project_target(app, app.start.project.as_ref())?;
+    let host = target.host;
     let options = connection_options(app)?;
-    let project = selected_project_reference(app)?;
+    let project = target.project_ref;
     Ok(Task::perform(
         runtime::perform(async move {
             let action = resolve_project_action_with_options(
@@ -1326,11 +1367,15 @@ fn rename_selected_session_task(app: &PohunekApp, clear: bool) -> Result<Task<Me
     ))
 }
 
-fn list_project_actions_task(app: &PohunekApp) -> Result<Task<Message>, String> {
-    let host = selected_host_config(app)?;
+fn list_project_actions_task(
+    app: &PohunekApp,
+    project: &ProjectRef,
+) -> Result<Task<Message>, String> {
+    let target = project_target(app, Some(project))?;
+    let host = target.host;
     let host_id = host.id.clone();
     let options = connection_options(app)?;
-    let reference = selected_project_reference(app)?;
+    let reference = target.project_ref;
     let params = ProjectActionsParams {
         reference: reference.clone(),
     };
@@ -1363,36 +1408,323 @@ mod tests {
     use protocol::{
         AgentKind, AgentRuntime, ApprovalKeyReference, HostGovernanceStatus,
         HostId as StableHostId, NotificationKind, NotificationRecord, NotificationSeverity,
-        NotificationSource, ProjectInfo, ProjectSource,
+        NotificationSource, ProjectInfo, ProjectSource, SessionInfo,
     };
 
     use super::*;
     use crate::message::MetadataEdit;
 
-    #[test]
-    fn double_clicking_project_opens_fresh_start_modal() {
-        let host_id = HostId::new("local");
-        let mut app = app_without_selection();
-        app.workspace.hosts.insert(host_id.clone(), test_host());
-        let select_project = || Message::SelectProject {
-            host_id: host_id.clone(),
-            project_id: "p-1".to_owned(),
-        };
+    fn project_ref(host: &str, project: &str) -> ProjectRef {
+        ProjectRef {
+            host_id: HostId::new(host),
+            project_id: project.to_owned(),
+        }
+    }
 
-        let _ = update(&mut app, select_project());
-        assert_eq!(app.modal, ModalView::None);
-        app.start.name = "stale name".to_owned();
-
-        let _ = update(&mut app, select_project());
-
-        assert_eq!(app.modal, ModalView::Start);
-        assert!(app.start.name.is_empty());
-        assert_eq!(
-            app.ui_state.selection,
-            Some(Selection::Project {
-                host_id,
-                project_id: "p-1".to_owned(),
+    fn host_with(projects: &[(&str, &str)], agents: &[&str]) -> HostView {
+        let mut host = test_host();
+        host.projects = projects
+            .iter()
+            .map(|(id, label)| {
+                let mut project = test_project();
+                project.id = (*id).to_owned();
+                project.label = (*label).to_owned();
+                ((*id).to_owned(), project)
             })
+            .collect();
+        host.runtimes = agents
+            .iter()
+            .map(|agent| test_runtime(agent, None, true, None))
+            .collect();
+        host
+    }
+
+    /// Two connected hosts that both own a project labelled `api`; only `local`
+    /// has a codex runtime, only `remote` has a claude runtime.
+    fn app_with_two_hosts() -> PohunekApp {
+        let mut app = app_without_selection();
+        app.workspace.hosts.insert(
+            HostId::new("local"),
+            host_with(&[("p-1", "api"), ("p-2", "web")], &["codex"]),
+        );
+        app.workspace.hosts.insert(
+            HostId::new("remote"),
+            host_with(&[("p-9", "api")], &["claude"]),
+        );
+        app.hosts = vec![
+            HostConfig::tcp("local", "127.0.0.1:9".parse().expect("inert address")),
+            HostConfig::tcp("remote", "127.0.0.1:10".parse().expect("inert address")),
+        ];
+        app
+    }
+
+    fn test_session(id: &str, project: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            name: None,
+            id: SessionId(id.to_owned()),
+            external: Some(false),
+            capabilities: protocol::SessionCapabilities {
+                resume: true,
+                fork: true,
+            },
+            agent: "codex".to_owned(),
+            agent_base: protocol::AgentKind::Codex,
+            cwd: PathBuf::from("/tmp/project"),
+            cwd_source: Some(protocol::CwdSource::Launch),
+            pid: 42,
+            cols: 80,
+            rows: 24,
+            state: protocol::SessionState::Running,
+            state_source: protocol::StateSource::Process,
+            activity: None,
+            subagents: Vec::new(),
+            active_agent: None,
+            active_agent_base: None,
+            active_agent_pid: None,
+            active_agent_session_id: None,
+            active_agent_session_path: None,
+            native_session_id: Some("native-1".to_owned()),
+            native_session_path: None,
+            project_id: project.map(str::to_owned),
+            project_label: None,
+            metadata: BTreeMap::new(),
+            is_linked_worktree: Some(false),
+            repo: None,
+            branch: None,
+            worktree_path: None,
+            warnings: Vec::new(),
+            created_at: "2026-06-29T00:00:00Z".to_owned(),
+            updated_at: "2026-06-29T00:00:00Z".to_owned(),
+            exit_code: None,
+            runtime: None,
+        }
+    }
+
+    #[test]
+    fn changing_the_start_project_resets_template_actions_and_agent() {
+        let mut app = app_with_two_hosts();
+        app.workspace
+            .hosts
+            .get_mut(&HostId::new("local"))
+            .expect("local host")
+            .prompt
+            .actions_by_project
+            .insert(
+                "p-1".to_owned(),
+                protocol::ProjectActionsResult {
+                    actions: vec![protocol::ActionSummary {
+                        name: "review".to_owned(),
+                        provider: protocol::ProviderKind::None,
+                        template: "review".to_owned(),
+                        layer: protocol::PromptLayer::Host,
+                    }],
+                },
+            );
+        app.start.project = Some(project_ref("local", "p-1"));
+        app.start.agent = "codex".to_owned();
+        app.start.template = Some("review".to_owned());
+        app.template_recipe = Some(TemplateRecipe {
+            agent: "codex".to_owned(),
+            branch: None,
+            base_branch: None,
+        });
+        app.prompt_editor = text_editor::Content::with_text("rendered template");
+        assert_eq!(
+            crate::selection::available_actions(&app, &protocol::ProviderKind::None),
+            ["review"]
+        );
+
+        let _ = update(
+            &mut app,
+            Message::StartProjectSelected(project_ref("remote", "p-9")),
+        );
+
+        assert_eq!(app.start.project, Some(project_ref("remote", "p-9")));
+        assert!(app.start.template.is_none());
+        assert!(app.template_recipe.is_none());
+        assert!(app.prompt_editor.text().trim().is_empty());
+        assert_eq!(app.start.agent, "claude");
+        assert!(
+            crate::selection::available_actions(&app, &protocol::ProviderKind::None).is_empty()
+        );
+    }
+
+    #[test]
+    fn reselecting_the_same_start_project_keeps_the_template() {
+        let mut app = app_with_two_hosts();
+        app.start.project = Some(project_ref("local", "p-1"));
+        app.start.template = Some("review".to_owned());
+
+        let _ = update(
+            &mut app,
+            Message::StartProjectSelected(project_ref("local", "p-1")),
+        );
+
+        assert_eq!(app.start.template.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn assistant_project_change_drops_an_agent_the_new_host_cannot_run() {
+        let mut app = app_with_two_hosts();
+        app.assistant.project = Some(project_ref("local", "p-1"));
+        app.assistant.agent = Some("codex".to_owned());
+
+        let _ = update(
+            &mut app,
+            Message::AssistantProjectSelected(project_ref("remote", "p-9")),
+        );
+
+        assert_eq!(app.assistant.project, Some(project_ref("remote", "p-9")));
+        assert!(app.assistant.agent.is_none());
+    }
+
+    #[test]
+    fn start_modal_preselects_filter_then_selected_session_then_only_project() {
+        let mut app = app_with_two_hosts();
+        let local = HostId::new("local");
+        app.workspace
+            .hosts
+            .get_mut(&local)
+            .expect("local host")
+            .sessions
+            .insert("s-1".to_owned(), test_session("s-1", Some("p-2")));
+
+        let _ = update(&mut app, Message::OpenStartModal);
+        assert_eq!(app.modal, ModalView::Start);
+        assert_eq!(app.form_focus, FormField::StartProject);
+        assert!(app.start.project.is_none(), "several projects, no hint");
+
+        app.ui_state.selection = Some(Selection::Session {
+            host_id: local.clone(),
+            session_id: SessionId("s-1".to_owned()),
+        });
+        let _ = update(&mut app, Message::OpenStartModal);
+        assert_eq!(app.start.project, Some(project_ref("local", "p-2")));
+
+        app.project_filter = Some(project_ref("remote", "p-9"));
+        let _ = update(&mut app, Message::OpenStartModal);
+        assert_eq!(app.start.project, Some(project_ref("remote", "p-9")));
+
+        let mut single = app_without_selection();
+        single
+            .workspace
+            .hosts
+            .insert(local, host_with(&[("p-1", "api")], &["codex"]));
+        let _ = update(&mut single, Message::OpenStartModal);
+        assert_eq!(single.start.project, Some(project_ref("local", "p-1")));
+    }
+
+    #[test]
+    fn assistant_modal_preselects_like_the_start_modal() {
+        let mut app = app_with_two_hosts();
+        app.project_filter = Some(project_ref("local", "p-2"));
+
+        let _ = update(&mut app, Message::OpenAssistantModal);
+
+        assert_eq!(app.assistant.project, Some(project_ref("local", "p-2")));
+        assert_eq!(app.form_focus, FormField::AssistantProject);
+    }
+
+    #[test]
+    fn creating_a_session_targets_the_form_projects_host() {
+        let mut app = app_with_two_hosts();
+        app.ui_state.selection = Some(Selection::Session {
+            host_id: HostId::new("local"),
+            session_id: SessionId("s-1".to_owned()),
+        });
+        app.start.project = Some(project_ref("remote", "p-9"));
+        app.start.agent = "codex".to_owned();
+
+        let target = crate::selection::project_target(&app, app.start.project.as_ref())
+            .expect("form project target");
+        assert_eq!(target.host.id, HostId::new("remote"));
+        assert_eq!(target.project_ref, "p-9");
+
+        let Err(err) = create_session_task(&app) else {
+            panic!("codex is not launchable on the form project's host");
+        };
+        assert!(err.contains("`remote`"), "{err}");
+
+        app.start.project = None;
+        let Err(err) = create_session_task(&app) else {
+            panic!("a project is required");
+        };
+        assert_eq!(err, "choose a project first");
+    }
+
+    #[test]
+    fn project_filter_clears_when_its_project_has_no_sessions_left() {
+        let mut app = app_with_governance_host();
+        let route = HostId::new("local");
+        let mut with_session = governance_snapshot("local");
+        with_session.projects = vec![test_project()];
+        with_session.sessions = vec![test_session("s-1", Some("p-1"))];
+        let _ = update(
+            &mut app,
+            Message::Core(CoreEvent::HostSnapshotLoaded {
+                snapshot: with_session,
+            }),
+        );
+        let _ = update(
+            &mut app,
+            Message::SetProjectFilter(Some(project_ref("local", "p-1"))),
+        );
+
+        let _ = update(
+            &mut app,
+            Message::Core(CoreEvent::HostOperationFailed {
+                host_id: route.clone(),
+                error: "unrelated".to_owned(),
+            }),
+        );
+        assert_eq!(app.project_filter, Some(project_ref("local", "p-1")));
+
+        let mut emptied = governance_snapshot("local");
+        emptied.projects = vec![test_project()];
+        let _ = update(
+            &mut app,
+            Message::Core(CoreEvent::HostSnapshotLoaded { snapshot: emptied }),
+        );
+        assert!(app.project_filter.is_none());
+    }
+
+    #[test]
+    fn same_labelled_projects_on_different_hosts_stay_distinct() {
+        let mut app = app_with_two_hosts();
+        app.modal = ModalView::Start;
+
+        let options = keyboard::form_select_options(&app, FormField::StartProject);
+        assert_eq!(
+            options,
+            ["api  ·  local", "api  ·  remote", "web  ·  local"]
+        );
+
+        let pick = |cursor| {
+            keyboard::form_select_choice_message(
+                &app,
+                FormSelect {
+                    field: FormField::StartProject,
+                    cursor,
+                },
+            )
+        };
+        assert!(matches!(
+            pick(0),
+            Some(Message::StartProjectSelected(project)) if project == project_ref("local", "p-1")
+        ));
+        assert!(matches!(
+            pick(1),
+            Some(Message::StartProjectSelected(project)) if project == project_ref("remote", "p-9")
+        ));
+
+        app.start.project = Some(project_ref("remote", "p-9"));
+        assert_eq!(
+            keyboard::form_select_label(&app, FormField::StartProject),
+            "api  ·  remote"
+        );
+        assert_eq!(
+            keyboard::form_select_cursor(&app, FormField::StartProject),
+            1
         );
     }
 
@@ -1545,7 +1877,7 @@ mod tests {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
-            last_project_click: None,
+            project_filter: None,
             state_dir: None,
             status: None,
             notified_intents: 0,

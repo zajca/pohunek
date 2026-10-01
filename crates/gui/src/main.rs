@@ -22,13 +22,12 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Instant;
 
 use iced::widget::text_editor;
 use iced::{window, Subscription, Task, Theme};
 use pohunek_gui_core::{
     default_state_dir, AttachTemplateValues, HostConfig, HostId, NotificationFilter,
-    NotificationScope, UiState, Workspace,
+    NotificationScope, ProjectRef, UiState, Workspace,
 };
 use protocol::{NotificationId, SessionId};
 use thiserror::Error;
@@ -202,15 +201,15 @@ struct PohunekApp {
     /// Which layer of the inbox modal is showing.
     inbox_view: InboxView,
     /// Keyboard cursor for the inbox list layer. This stays local UI state; the
-    /// persisted UI selection remains reserved for workspace tree entities.
+    /// persisted UI selection remains reserved for the selected session.
     inbox_cursor: Option<(HostId, NotificationId)>,
     /// Whether the inbox message layer's `> Details` section is expanded.
     inbox_details_expanded: bool,
     metadata_edit: MetadataEdit,
     /// Edit buffer for renaming the selected session's display name.
     rename_edit: String,
-    /// Last project row click, used to open the Start modal on double-click.
-    last_project_click: Option<(HostId, String, Instant)>,
+    /// Project the session overview is narrowed to; `None` shows every session.
+    project_filter: Option<ProjectRef>,
     state_dir: Option<PathBuf>,
     status: Option<String>,
     notified_intents: usize,
@@ -253,7 +252,7 @@ impl PohunekApp {
                 inbox_details_expanded: false,
                 metadata_edit: MetadataEdit::default(),
                 rename_edit: String::new(),
-                last_project_click: None,
+                project_filter: None,
                 state_dir: boot.state_dir,
                 status: boot.status,
                 notified_intents: 0,
@@ -312,7 +311,7 @@ impl PohunekApp {
             inbox_details_expanded: false,
             metadata_edit: MetadataEdit::default(),
             rename_edit: String::new(),
-            last_project_click: None,
+            project_filter: None,
             state_dir: None,
             status: None,
             notified_intents: 0,
@@ -344,16 +343,8 @@ fn theme(_app: &PohunekApp) -> Theme {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use pohunek_gui_core::{ConnState, Selection};
-    use protocol::{ProjectInfo, SessionInfo};
-
     use super::*;
     use crate::config::RawGuiConfig;
-    use crate::selection::{
-        selected_assistant_project, selected_project_identity, selected_project_reference,
-    };
     use crate::view::inbox::{parse_rfc3339_utc_seconds, SECONDS_PER_DAY};
 
     #[test]
@@ -371,215 +362,6 @@ mod tests {
         assert_eq!(parse_rfc3339_utc_seconds("2023-02-29T00:00:00Z"), None);
         assert_eq!(parse_rfc3339_utc_seconds("2026-01-01T24:00:00Z"), None);
         assert_eq!(parse_rfc3339_utc_seconds("not-a-timestamp"), None);
-    }
-
-    fn test_session(id: &str, state: protocol::SessionState) -> SessionInfo {
-        SessionInfo {
-            name: None,
-            id: SessionId(id.to_owned()),
-            external: Some(false),
-            capabilities: protocol::SessionCapabilities {
-                resume: true,
-                fork: true,
-            },
-            agent: "codex".to_owned(),
-            agent_base: protocol::AgentKind::Codex,
-            cwd: PathBuf::from("/tmp/project"),
-            cwd_source: Some(protocol::CwdSource::Launch),
-            pid: 42,
-            cols: 80,
-            rows: 24,
-            state,
-            state_source: protocol::StateSource::Process,
-            activity: None,
-            subagents: Vec::new(),
-            active_agent: None,
-            active_agent_base: None,
-            active_agent_pid: None,
-            active_agent_session_id: None,
-            active_agent_session_path: None,
-            native_session_id: Some("native-1".to_owned()),
-            native_session_path: None,
-            project_id: None,
-            project_label: None,
-            metadata: BTreeMap::new(),
-            is_linked_worktree: Some(false),
-            repo: None,
-            branch: None,
-            worktree_path: None,
-            warnings: Vec::new(),
-            created_at: "2026-06-29T00:00:00Z".to_owned(),
-            updated_at: "2026-06-29T00:00:00Z".to_owned(),
-            exit_code: None,
-            runtime: None,
-        }
-    }
-
-    #[test]
-    fn selected_project_identity_uses_workspace_selection() {
-        let host_id = HostId::new("local");
-        let project = ProjectInfo {
-            id: "selected-project".to_owned(),
-            label: "Selected project".to_owned(),
-            repo_root: PathBuf::from("/tmp/selected-project"),
-            git_common_dir: PathBuf::from("/tmp/selected-project/.git"),
-            origin_url: None,
-            default_base_branch: None,
-            source: protocol::ProjectSource::Manual,
-            is_bare: false,
-            added_at: "2026-06-29T00:00:00Z".to_owned(),
-            last_used_at: "2026-06-29T00:00:00Z".to_owned(),
-        };
-        let mut host = pohunek_gui_core::HostView {
-            conn: ConnState::Connected,
-            health: None,
-            sessions: BTreeMap::new(),
-            projects: BTreeMap::new(),
-            project_details: BTreeMap::new(),
-            notifications: BTreeMap::new(),
-            prompt: pohunek_gui_core::PromptState::default(),
-            provider: pohunek_gui_core::ProviderState::default(),
-            review: pohunek_gui_core::ReviewTabState::default(),
-            last_agent_state: None,
-            last_error: None,
-            supported_agents: Vec::new(),
-            runtimes: Vec::new(),
-            notification_providers: Vec::new(),
-            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
-            governance: pohunek_gui_core::GovernanceState::default(),
-        };
-        host.projects.insert(project.id.clone(), project.clone());
-
-        let mut app = PohunekApp {
-            workspace: Workspace::default(),
-            config: Err("test config is intentionally absent".to_owned()),
-            keymap: keyboard::KeyMap::default(),
-            hosts: Vec::new(),
-            ui_state: UiState::default(),
-            start: StartForm::default(),
-            assistant: AssistantForm::default(),
-            form_focus: FormField::StartAgent,
-            form_select: None,
-            prompt_editor: text_editor::Content::new(),
-            assistant_editor: text_editor::Content::new(),
-            template_recipe: None,
-            modal: ModalView::None,
-            notification_filter: NotificationFilter::default(),
-            inbox_scope: NotificationScope::default(),
-            inbox_view: InboxView::default(),
-            inbox_cursor: None,
-            inbox_details_expanded: false,
-            metadata_edit: MetadataEdit::default(),
-            rename_edit: String::new(),
-            last_project_click: None,
-            state_dir: None,
-            status: None,
-            notified_intents: 0,
-            notification_health: notify::NotificationHealth::default(),
-        };
-        app.workspace.hosts.insert(host_id.clone(), host);
-        app.ui_state.selection = Some(Selection::Project {
-            host_id: host_id.clone(),
-            project_id: project.id.clone(),
-        });
-        app.workspace.selection.clone_from(&app.ui_state.selection);
-
-        let (project_id, repo_root) = selected_project_identity(&app).expect("selected project");
-
-        assert_eq!(project_id, project.id);
-        assert_eq!(repo_root, project.repo_root);
-        assert_eq!(
-            selected_project_reference(&app).expect("reference"),
-            project.id
-        );
-    }
-
-    #[test]
-    fn selected_assistant_project_uses_session_project() {
-        let host_id = HostId::new("local");
-        let project = ProjectInfo {
-            id: "selected-project".to_owned(),
-            label: "Selected project".to_owned(),
-            repo_root: PathBuf::from("/tmp/selected-project"),
-            git_common_dir: PathBuf::from("/tmp/selected-project/.git"),
-            origin_url: None,
-            default_base_branch: None,
-            source: protocol::ProjectSource::Manual,
-            is_bare: false,
-            added_at: "2026-06-29T00:00:00Z".to_owned(),
-            last_used_at: "2026-06-29T00:00:00Z".to_owned(),
-        };
-        let mut session = test_session("s-1", protocol::SessionState::Running);
-        session.cwd.clone_from(&project.repo_root);
-        session.native_session_id = None;
-        session.project_id = Some(project.id.clone());
-        session.project_label = Some(project.label.clone());
-        session.repo = Some(project.repo_root.clone());
-        session.branch = Some("main".to_owned());
-        session.worktree_path = Some(project.repo_root.clone());
-        let mut host = pohunek_gui_core::HostView {
-            conn: ConnState::Connected,
-            health: None,
-            sessions: BTreeMap::new(),
-            projects: BTreeMap::new(),
-            project_details: BTreeMap::new(),
-            notifications: BTreeMap::new(),
-            prompt: pohunek_gui_core::PromptState::default(),
-            provider: pohunek_gui_core::ProviderState::default(),
-            review: pohunek_gui_core::ReviewTabState::default(),
-            last_agent_state: None,
-            last_error: None,
-            supported_agents: Vec::new(),
-            runtimes: Vec::new(),
-            notification_providers: Vec::new(),
-            observation_capabilities: pohunek_gui_core::ObservationCapabilities::default(),
-            governance: pohunek_gui_core::GovernanceState::default(),
-        };
-        host.projects.insert(project.id.clone(), project.clone());
-        host.sessions.insert(session.id.0.clone(), session.clone());
-
-        let mut app = PohunekApp {
-            workspace: Workspace::default(),
-            config: Err("test config is intentionally absent".to_owned()),
-            keymap: keyboard::KeyMap::default(),
-            hosts: Vec::new(),
-            ui_state: UiState::default(),
-            start: StartForm::default(),
-            assistant: AssistantForm::default(),
-            form_focus: FormField::StartAgent,
-            form_select: None,
-            prompt_editor: text_editor::Content::new(),
-            assistant_editor: text_editor::Content::new(),
-            template_recipe: None,
-            modal: ModalView::None,
-            notification_filter: NotificationFilter::default(),
-            inbox_scope: NotificationScope::default(),
-            inbox_view: InboxView::default(),
-            inbox_cursor: None,
-            inbox_details_expanded: false,
-            metadata_edit: MetadataEdit::default(),
-            rename_edit: String::new(),
-            last_project_click: None,
-            state_dir: None,
-            status: None,
-            notified_intents: 0,
-            notification_health: notify::NotificationHealth::default(),
-        };
-        app.workspace.hosts.insert(host_id.clone(), host);
-        app.hosts.push(HostConfig::local(
-            "local",
-            PathBuf::from("/tmp/pohunek.sock"),
-        ));
-        app.ui_state.selection = Some(Selection::Session {
-            host_id: host_id.clone(),
-            session_id: session.id.clone(),
-        });
-        app.workspace.selection.clone_from(&app.ui_state.selection);
-
-        let target = selected_assistant_project(&app).expect("session project target");
-
-        assert_eq!(target.host.id, host_id);
-        assert_eq!(target.project_ref, project.id);
     }
 
     #[test]

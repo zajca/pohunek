@@ -33,7 +33,7 @@ use pohunek_gui_core::{
     HostEvent, HostId, HostSnapshot, PromptContext, PromptLaunchParams, PromptPreview,
     ProviderLaunchItem, ProviderLaunchParams, Review, ReviewComment, ReviewDispatchParams,
     ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection, SessionLinkKind,
-    SessionLinkProvider, TreeNodeId, UiState, WindowSize, Workspace,
+    SessionLinkProvider, UiState, WindowSize, Workspace,
 };
 use pohunek_test_support::worker_binary;
 use protocol::{
@@ -1434,17 +1434,12 @@ fn attach_command_spawn_intent_is_resolved_without_embedded_terminal() {
 #[test]
 fn ui_state_persists_and_restores() {
     let state_dir = temp_dir("gui-core-m1-ui-state");
-    let mut expanded = std::collections::BTreeSet::new();
     let host = HostConfig::tcp("host-a", "127.0.0.1:65535".parse().expect("addr"));
-    expanded.insert(TreeNodeId::host(host.id.clone()));
-    expanded.insert(TreeNodeId::project(host.id.clone(), "p-1"));
     let state = UiState {
-        left_pane_width: 312,
         window_size: WindowSize {
             width: 1440,
             height: 900,
         },
-        expanded_nodes: expanded,
         selection: Some(Selection::Session {
             host_id: host.id,
             session_id: SessionId("s-1".to_owned()),

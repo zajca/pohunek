@@ -735,28 +735,18 @@ impl Workspace {
     }
 
     fn selected_github_scope(&self, host_id: &HostId) -> Option<GitHubProviderScope> {
-        match self.selection.as_ref()? {
-            Selection::Project {
-                host_id: selected_host,
-                project_id,
-            } if selected_host == host_id => self
-                .hosts
-                .get(host_id)?
-                .projects
-                .get(project_id)
-                .map(GitHubProviderScope::from_project),
-            Selection::Session {
-                host_id: selected_host,
-                session_id,
-            } if selected_host == host_id => {
-                let host = self.hosts.get(host_id)?;
-                let project_id = host.sessions.get(&session_id.0)?.project_id.as_ref()?;
-                host.projects
-                    .get(project_id)
-                    .map(GitHubProviderScope::from_project)
-            }
-            _ => None,
+        let Selection::Session {
+            host_id: selected_host,
+            session_id,
+        } = self.selection.as_ref()?;
+        if selected_host != host_id {
+            return None;
         }
+        let host = self.hosts.get(host_id)?;
+        let project_id = host.sessions.get(&session_id.0)?.project_id.as_ref()?;
+        host.projects
+            .get(project_id)
+            .map(GitHubProviderScope::from_project)
     }
 
     /// Reduce one domain event (async daemon/provider I/O result) into state.
@@ -1983,15 +1973,6 @@ impl Workspace {
         });
     }
 
-    /// Select a project in the detail pane.
-    pub fn select_project(&mut self, host_id: HostId, project_id: String) {
-        self.invalidate_github_provider_requests(&host_id);
-        self.selection = Some(Selection::Project {
-            host_id,
-            project_id,
-        });
-    }
-
     /// Selects the session linked to a notification, when that session is
     /// still live.
     ///
@@ -2128,26 +2109,48 @@ impl Workspace {
 
     /// Build the prioritized native-GUI session list.
     ///
-    /// Rows are grouped by operator urgency and sorted by stable host/session
-    /// identity within each group. Activity changes may move a row between
-    /// groups, but never reorder unrelated rows inside one group.
+    /// Rows are grouped by operator urgency, then ordered by project label,
+    /// session name (or id), host, and session id. Activity changes may move a
+    /// row between groups, but never reorder unrelated rows inside one group.
     #[must_use]
     pub fn session_rows(&self) -> Vec<SessionRow> {
+        self.session_rows_filtered(None)
+    }
+
+    /// Build [`Workspace::session_rows`] restricted to `filter`'s project.
+    ///
+    /// `None` keeps every row, including sessions without a project.
+    #[must_use]
+    pub fn session_rows_filtered(&self, filter: Option<&ProjectRef>) -> Vec<SessionRow> {
         let mut rows = Vec::new();
         for (host_id, host) in &self.hosts {
             for session in host.sessions.values() {
+                let project = session.project_id.as_ref().map(|project_id| ProjectRef {
+                    host_id: host_id.clone(),
+                    project_id: project_id.clone(),
+                });
+                if filter.is_some_and(|wanted| project.as_ref() != Some(wanted)) {
+                    continue;
+                }
                 let attention = active_session_attention(host, session);
                 let access = session_access(session);
                 rows.push(SessionRow {
                     host_id: host_id.clone(),
                     session_id: session.id.clone(),
                     name: session.name.clone(),
-                    project_id: session.project_id.clone(),
-                    project_label: session.project_label.clone(),
+                    project_label: session.project_id.as_deref().map(|project_id| {
+                        session
+                            .project_label
+                            .clone()
+                            .unwrap_or_else(|| project_display_label(host, project_id))
+                    }),
+                    project,
                     agent: session.agent.clone(),
                     activity: session.activity,
                     state: session.state,
                     branch: session.branch.clone(),
+                    worktree_path: session.worktree_path.clone(),
+                    updated_at: session.updated_at.clone(),
                     group: session_group(session, access, attention.is_some()),
                     attention,
                     access,
@@ -2159,11 +2162,91 @@ impl Workspace {
         rows.sort_by(|left, right| {
             left.group
                 .cmp(&right.group)
+                .then_with(|| left.project_label.cmp(&right.project_label))
+                .then_with(|| left.display_name().cmp(right.display_name()))
                 .then_with(|| left.host_id.cmp(&right.host_id))
                 .then_with(|| left.session_id.0.cmp(&right.session_id.0))
         });
         rows
     }
+
+    /// Known projects of every host, for launch pickers.
+    ///
+    /// Sorted by label, then host id, then project id.
+    #[must_use]
+    pub fn project_choices(&self) -> Vec<ProjectChoice> {
+        let mut choices: Vec<ProjectChoice> = self
+            .hosts
+            .iter()
+            .flat_map(|(host_id, host)| {
+                host.projects.values().map(move |info| ProjectChoice {
+                    project: ProjectRef {
+                        host_id: host_id.clone(),
+                        project_id: info.id.clone(),
+                    },
+                    label: info.label.clone(),
+                    host_connected: host.conn == ConnState::Connected,
+                    known: true,
+                    session_count: host
+                        .sessions
+                        .values()
+                        .filter(|session| session.project_id.as_deref() == Some(info.id.as_str()))
+                        .count(),
+                })
+            })
+            .collect();
+        sort_project_choices(&mut choices);
+        choices
+    }
+
+    /// Projects that currently have at least one session, for the filter row.
+    ///
+    /// Includes project ids no [`ProjectInfo`] describes (`known == false`).
+    /// Sorted like [`Workspace::project_choices`].
+    #[must_use]
+    pub fn session_project_filters(&self) -> Vec<ProjectChoice> {
+        let mut choices = Vec::new();
+        for (host_id, host) in &self.hosts {
+            let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+            for project_id in host
+                .sessions
+                .values()
+                .filter_map(|session| session.project_id.as_deref())
+            {
+                *counts.entry(project_id).or_default() += 1;
+            }
+            for (project_id, session_count) in counts {
+                choices.push(ProjectChoice {
+                    project: ProjectRef {
+                        host_id: host_id.clone(),
+                        project_id: project_id.to_owned(),
+                    },
+                    label: project_display_label(host, project_id),
+                    host_connected: host.conn == ConnState::Connected,
+                    known: host.projects.contains_key(project_id),
+                    session_count,
+                });
+            }
+        }
+        sort_project_choices(&mut choices);
+        choices
+    }
+}
+
+/// Label of `project_id` on `host`, falling back to the id itself when the
+/// host has no matching [`ProjectInfo`].
+fn project_display_label(host: &HostView, project_id: &str) -> String {
+    host.projects
+        .get(project_id)
+        .map_or_else(|| project_id.to_owned(), |info| info.label.clone())
+}
+
+fn sort_project_choices(choices: &mut [ProjectChoice]) {
+    choices.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.project.cmp(&right.project))
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2542,6 +2625,28 @@ pub enum SessionAccess {
     Unavailable,
 }
 
+/// Identifies one project on one host.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProjectRef {
+    pub host_id: HostId,
+    pub project_id: String,
+}
+
+/// One project offered by a launch picker or the session filter row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectChoice {
+    pub project: ProjectRef,
+    /// Project label, or the project id when the host has no such project.
+    pub label: String,
+    /// Whether the owning host is currently connected.
+    pub host_connected: bool,
+    /// `false` when only sessions reference the project and the host lists no
+    /// matching [`ProjectInfo`].
+    pub known: bool,
+    /// Sessions currently assigned to the project.
+    pub session_count: usize,
+}
+
 /// Derived row for the prioritized session list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRow {
@@ -2549,12 +2654,19 @@ pub struct SessionRow {
     pub session_id: SessionId,
     /// Owner-set display name, or `None` to show the session id.
     pub name: Option<String>,
-    pub project_id: Option<String>,
+    /// Owning project, or `None` for a session without git identity.
+    pub project: Option<ProjectRef>,
+    /// Project display label: the session's own label, else the host's label
+    /// for the project, else the project id. `None` only without a project.
     pub project_label: Option<String>,
     pub agent: String,
     pub activity: Option<AgentActivity>,
     pub state: SessionState,
     pub branch: Option<String>,
+    /// Bound worktree path, when the session was launched in one.
+    pub worktree_path: Option<PathBuf>,
+    /// Last update timestamp in the daemon's wire timestamp format.
+    pub updated_at: String,
     pub group: SessionGroup,
     /// Current live owner-attention signal, distinct from unread history.
     pub attention: Option<SessionAttention>,
@@ -2563,6 +2675,14 @@ pub struct SessionRow {
     pub can_stop: bool,
     /// Whether removal can safely stop or discard the current logical session.
     pub can_remove: bool,
+}
+
+impl SessionRow {
+    /// Owner-set name, or the session id when none was set.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(&self.session_id.0)
+    }
 }
 
 /// Current owner-attention signal displayed directly on a session.
@@ -3816,7 +3936,7 @@ mod tests {
                     daemon_version: "0.0.0".to_owned(),
                     protocol_version: protocol::PROTOCOL_VERSION,
                 },
-                sessions: Vec::new(),
+                sessions: vec![project_session("s-1", "project-a", None)],
                 projects: vec![project("project-a", "/repo/current")],
                 project_error: None,
                 notifications: Vec::new(),
@@ -3826,10 +3946,7 @@ mod tests {
                 observation_capabilities: ObservationCapabilities::default(),
             },
         });
-        workspace.selection = Some(Selection::Project {
-            host_id: host_id.clone(),
-            project_id: "project-a".to_owned(),
-        });
+        workspace.select_session(host_id.clone(), SessionId("s-1".to_owned()));
         let request_id = workspace.begin_github_pull_requests_request(host_id.clone());
         workspace.apply(DomainEvent::GitHubProviderPullRequestsLoaded {
             host_id: host_id.clone(),
@@ -3909,7 +4026,7 @@ mod tests {
         let host_id = HostId::new("local");
         let mut workspace = Workspace::default();
         let stale_request = workspace.begin_github_pull_requests_request(host_id.clone());
-        workspace.select_project(host_id.clone(), "project-a".to_owned());
+        workspace.select_session(host_id.clone(), SessionId("s-1".to_owned()));
         workspace.apply(DomainEvent::ProviderOperationFailed {
             host_id: host_id.clone(),
             provider: SessionLinkProvider::GitHub,
@@ -5255,6 +5372,236 @@ mod tests {
             added_at: "2026-01-01T00:00:00Z".to_owned(),
             last_used_at: "2026-01-01T00:00:00Z".to_owned(),
         }
+    }
+
+    fn project_session(id: &str, project_id: &str, label: Option<&str>) -> SessionInfo {
+        SessionInfo {
+            project_id: Some(project_id.to_owned()),
+            project_label: label.map(str::to_owned),
+            ..session(id, Some(AgentActivity::Idle))
+        }
+    }
+
+    fn labelled_project(id: &str, label: &str) -> ProjectInfo {
+        ProjectInfo {
+            label: label.to_owned(),
+            ..project(id, &format!("/repo/{id}"))
+        }
+    }
+
+    fn connected_snapshot(
+        host_id: &str,
+        sessions: Vec<SessionInfo>,
+        projects: Vec<ProjectInfo>,
+    ) -> HostSnapshot {
+        HostSnapshot {
+            projects,
+            ..snapshot(host_id, sessions)
+        }
+    }
+
+    fn project_ref(host_id: &str, project_id: &str) -> ProjectRef {
+        ProjectRef {
+            host_id: HostId::new(host_id),
+            project_id: project_id.to_owned(),
+        }
+    }
+
+    #[test]
+    fn session_row_project_label_comes_from_host_projects_when_session_has_none() {
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "local",
+                vec![
+                    project_session("s-1", "p-1", None),
+                    project_session("s-2", "p-1", Some("session label")),
+                    session("s-3", None),
+                ],
+                vec![labelled_project("p-1", "Alpha")],
+            ),
+        });
+
+        let rows = workspace.session_rows();
+        let label = |id: &str| {
+            rows.iter()
+                .find(|row| row.session_id.0 == id)
+                .and_then(|row| row.project_label.clone())
+        };
+
+        assert_eq!(label("s-1").as_deref(), Some("Alpha"));
+        assert_eq!(label("s-2").as_deref(), Some("session label"));
+        assert_eq!(label("s-3"), None);
+        let unassigned = rows.iter().find(|row| row.session_id.0 == "s-3").unwrap();
+        assert_eq!(unassigned.project, None);
+    }
+
+    #[test]
+    fn session_row_with_unknown_project_falls_back_to_the_project_id() {
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "local",
+                vec![project_session("s-1", "p-gone", None)],
+                Vec::new(),
+            ),
+        });
+
+        let rows = workspace.session_rows();
+
+        assert_eq!(rows[0].project_label.as_deref(), Some("p-gone"));
+        assert_eq!(rows[0].project, Some(project_ref("local", "p-gone")));
+    }
+
+    #[test]
+    fn session_rows_order_by_project_then_name_inside_a_group() {
+        let mut zed_a = project_session("s-1", "p-z", None);
+        zed_a.name = Some("a-task".to_owned());
+        let mut alpha_b = project_session("s-2", "p-a", None);
+        alpha_b.name = Some("b-task".to_owned());
+        let mut alpha_a = project_session("s-3", "p-a", None);
+        alpha_a.name = Some("a-task".to_owned());
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "local",
+                vec![zed_a, alpha_b, alpha_a],
+                vec![
+                    labelled_project("p-a", "Alpha"),
+                    labelled_project("p-z", "Zed"),
+                ],
+            ),
+        });
+
+        let ids: Vec<String> = workspace
+            .session_rows()
+            .into_iter()
+            .map(|row| row.session_id.0)
+            .collect();
+
+        assert_eq!(ids, ["s-3", "s-2", "s-1"]);
+    }
+
+    #[test]
+    fn session_rows_filtered_distinguishes_same_label_projects_across_hosts() {
+        let mut workspace = Workspace::default();
+        for host in ["host-a", "host-b"] {
+            workspace.apply(DomainEvent::HostSnapshotLoaded {
+                snapshot: connected_snapshot(
+                    host,
+                    vec![
+                        project_session("s-1", "p-1", None),
+                        project_session("s-2", "p-2", None),
+                    ],
+                    vec![
+                        labelled_project("p-1", "Shared"),
+                        labelled_project("p-2", "Other"),
+                    ],
+                ),
+            });
+        }
+
+        let filter = project_ref("host-b", "p-1");
+        let rows = workspace.session_rows_filtered(Some(&filter));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host_id, HostId::new("host-b"));
+        assert_eq!(rows[0].project, Some(filter));
+        assert_eq!(
+            workspace.session_rows_filtered(None),
+            workspace.session_rows()
+        );
+        assert_eq!(workspace.session_rows().len(), 4);
+    }
+
+    #[test]
+    fn project_choices_are_sorted_and_report_host_connection() {
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "host-b",
+                vec![project_session("s-1", "p-1", None)],
+                vec![
+                    labelled_project("p-1", "Beta"),
+                    labelled_project("p-2", "Alpha"),
+                ],
+            ),
+        });
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "host-a",
+                Vec::new(),
+                vec![labelled_project("p-9", "Beta")],
+            ),
+        });
+        workspace
+            .hosts
+            .get_mut(&HostId::new("host-a"))
+            .expect("host-a")
+            .conn = ConnState::Disconnected;
+        workspace
+            .hosts
+            .get_mut(&HostId::new("host-b"))
+            .expect("host-b")
+            .conn = ConnState::Connected;
+
+        let choices = workspace.project_choices();
+
+        let summary: Vec<(&str, &str, bool, usize)> = choices
+            .iter()
+            .map(|choice| {
+                (
+                    choice.label.as_str(),
+                    choice.project.host_id.as_str(),
+                    choice.host_connected,
+                    choice.session_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("Alpha", "host-b", true, 0),
+                ("Beta", "host-a", false, 0),
+                ("Beta", "host-b", true, 1),
+            ]
+        );
+        assert!(choices.iter().all(|choice| choice.known));
+    }
+
+    #[test]
+    fn session_project_filters_count_sessions_including_unknown_projects() {
+        let mut workspace = Workspace::default();
+        workspace.apply(DomainEvent::HostSnapshotLoaded {
+            snapshot: connected_snapshot(
+                "local",
+                vec![
+                    project_session("s-1", "p-1", None),
+                    project_session("s-2", "p-1", None),
+                    project_session("s-3", "p-gone", None),
+                    session("s-4", None),
+                ],
+                vec![
+                    labelled_project("p-1", "Alpha"),
+                    labelled_project("p-idle", "Idle"),
+                ],
+            ),
+        });
+
+        let filters = workspace.session_project_filters();
+
+        assert_eq!(
+            filters.len(),
+            2,
+            "idle project and unassigned session are excluded"
+        );
+        assert_eq!(filters[0].label, "Alpha");
+        assert_eq!(filters[0].session_count, 2);
+        assert!(filters[0].known);
+        assert_eq!(filters[1].label, "p-gone");
+        assert_eq!(filters[1].project, project_ref("local", "p-gone"));
+        assert_eq!(filters[1].session_count, 1);
+        assert!(!filters[1].known);
     }
 
     fn linear_issue(identifier: &str, title: &str, branch: &str) -> providers::linear::LinearIssue {

@@ -1,111 +1,72 @@
-//! Host and project navigation for the native GUI.
+//! Host connection overview: the header button and the Hosts modal.
 
-// Rust guideline compliant 2026-08-12
-
-use std::collections::BTreeSet;
+// Rust guideline compliant 2026-10-01
 
 use iced::widget::{button, column, row, scrollable, text};
-use iced::{Center, Element, Fill, Theme};
-use pohunek_gui_core::{ConnState, GovernanceState, HostId, TreeNodeId};
-use protocol::{HostOwner, ProjectInfo};
+use iced::{Center, Element, Theme};
+use pohunek_gui_core::{ConnState, GovernanceState, HostId, HostView};
+use protocol::HostOwner;
 
-use crate::message::{Message, ModalView};
-use crate::selection::project_is_selected;
+use crate::message::Message;
 use crate::PohunekApp;
 
-use super::{caret, conn_dot, indent, list_button};
+use super::{card, conn_dot, dialog_card, muted_style};
 
-pub(crate) fn inbox_entry_button(app: &PohunekApp) -> Element<'_, Message> {
-    let button = button(text("Activity").size(14))
-        .width(Fill)
-        .padding([8, 10])
-        .on_press(Message::OpenInbox);
-    if app.modal == ModalView::Inbox {
-        button.style(iced::widget::button::primary).into()
-    } else {
-        button.style(iced::widget::button::secondary).into()
+/// Horizontal gap between the connection dots in the header button.
+const HOST_STRIP_SPACING: f32 = 3.0;
+
+/// Spacing between rows inside one host card.
+const HOST_CARD_SPACING: f32 = 4.0;
+
+/// Header button that opens the Hosts modal; its dots mirror every host's
+/// connection state so a lost connection is visible without opening it.
+pub(crate) fn hosts_button(app: &PohunekApp) -> Element<'_, Message> {
+    let mut strip = row![].spacing(HOST_STRIP_SPACING).align_y(Center);
+    for host in app.workspace.hosts.values() {
+        strip = strip.push(conn_dot(host.conn.clone()));
     }
-}
-
-pub(crate) fn assistant_entry_button() -> Element<'static, Message> {
     button(
-        row![text("◎").size(14), text("Assistant").size(14)]
-            .spacing(6)
+        row![text("Hosts").size(14), strip]
+            .spacing(8)
             .align_y(Center),
     )
-    .width(Fill)
     .padding([8, 10])
-    .on_press(Message::OpenAssistantModal)
-    .style(iced::widget::button::primary)
+    .on_press(Message::OpenHostsModal)
+    .style(iced::widget::button::secondary)
     .into()
 }
 
-pub(crate) fn workspace_tree(app: &PohunekApp) -> Element<'_, Message> {
-    let mut tree = column![text("Projects").size(16)].spacing(4);
-    if let Err(err) = &app.config {
-        tree = tree.push(text(format!("configuration error: {err}")).size(14));
-        return scrollable(tree).into();
-    }
+/// Hosts modal: connection state, last error and governance for every host.
+pub(crate) fn hosts_modal_content(app: &PohunekApp) -> Element<'_, Message> {
+    let mut hosts = column![].spacing(12);
     for (host_id, host) in &app.workspace.hosts {
-        let node = TreeNodeId::host(host_id.clone());
-        let expanded = app.ui_state.expanded_nodes.contains(&node);
-        let host_row = row![
-            caret(expanded, node),
-            conn_dot(host.conn.clone()),
-            text(host_id.to_string()).size(15)
-        ]
-        .spacing(6)
-        .align_y(Center);
-        tree = tree.push(host_row);
-        if let Some(error) = &host.last_error {
-            tree = tree.push(indent(1, text(error).size(12)));
-        }
-        if expanded {
-            tree = push_project_rows(tree, app, host_id, host);
-        }
+        hosts = hosts.push(host_card(host_id, host));
     }
     if app.workspace.hosts.is_empty() {
-        tree = tree.push(text("connecting…").size(13));
+        hosts = hosts.push(text("No hosts connected yet.").size(13).style(muted_style));
     }
-    scrollable(tree).into()
+    dialog_card("Hosts", scrollable(hosts))
 }
 
-fn push_project_rows<'a>(
-    mut tree: iced::widget::Column<'a, Message>,
-    app: &'a PohunekApp,
-    host_id: &'a HostId,
-    host: &'a pohunek_gui_core::HostView,
-) -> iced::widget::Column<'a, Message> {
-    tree = push_governance_rows(tree, host);
-    for project in host.projects.values() {
-        tree = tree.push(project_row(app, host_id, project));
+fn host_card<'a>(host_id: &'a HostId, host: &'a HostView) -> Element<'a, Message> {
+    let mut rows = column![row![
+        conn_dot(host.conn.clone()),
+        text(host_id.to_string()).size(15)
+    ]
+    .spacing(6)
+    .align_y(Center)]
+    .spacing(HOST_CARD_SPACING);
+    if let Some(error) = &host.last_error {
+        rows = rows.push(text(error).size(12));
     }
-    let missing_project_ids = host
-        .sessions
-        .values()
-        .filter_map(|session| {
-            let project_id = session.project_id.as_ref()?;
-            (!host.projects.contains_key(project_id)).then(|| project_id.clone())
-        })
-        .collect::<BTreeSet<_>>();
-    for project_id in missing_project_ids {
-        tree = tree.push(missing_project_row(app, host_id, &project_id));
+    for line in governance_rows(&host.governance) {
+        rows = rows.push(text(line).size(12).style(muted_style));
     }
-    tree
+    card(rows)
 }
 
 /// Render public read-only governance state. All fetching and state reduction
 /// stay in `gui-core` and the command layer.
-fn push_governance_rows<'a>(
-    mut tree: iced::widget::Column<'a, Message>,
-    host: &'a pohunek_gui_core::HostView,
-) -> iced::widget::Column<'a, Message> {
-    for row in governance_rows(&host.governance) {
-        tree = tree.push(indent(1, text(row).size(12)));
-    }
-    tree
-}
-
 fn governance_rows(governance: &GovernanceState) -> Vec<String> {
     match governance {
         GovernanceState::NotLoaded => vec!["Governance: not loaded".to_owned()],
@@ -139,42 +100,6 @@ fn governance_rows(governance: &GovernanceState) -> Vec<String> {
             rows
         }
     }
-}
-
-fn project_row(
-    app: &PohunekApp,
-    host_id: &HostId,
-    project: &ProjectInfo,
-) -> Element<'static, Message> {
-    indent(
-        1,
-        list_button(
-            text(project.label.clone()).size(14),
-            Message::SelectProject {
-                host_id: host_id.clone(),
-                project_id: project.id.clone(),
-            },
-            project_is_selected(app, host_id, &project.id),
-        ),
-    )
-}
-
-fn missing_project_row(
-    app: &PohunekApp,
-    host_id: &HostId,
-    project_id: &str,
-) -> Element<'static, Message> {
-    indent(
-        1,
-        list_button(
-            text(format!("Unknown project {project_id}")).size(14),
-            Message::SelectProject {
-                host_id: host_id.clone(),
-                project_id: project_id.to_owned(),
-            },
-            project_is_selected(app, host_id, project_id),
-        ),
-    )
 }
 
 pub(crate) fn conn_color(theme: &Theme, conn: &ConnState) -> iced::Color {

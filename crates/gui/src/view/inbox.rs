@@ -174,11 +174,7 @@ fn notification_policy_host(app: &PohunekApp) -> Option<HostId> {
         app.workspace
             .selection
             .as_ref()
-            .map(|selection| match selection {
-                Selection::Host { host_id }
-                | Selection::Project { host_id, .. }
-                | Selection::Session { host_id, .. } => host_id.clone(),
-            })
+            .map(|Selection::Session { host_id, .. }| host_id.clone())
     })
 }
 
