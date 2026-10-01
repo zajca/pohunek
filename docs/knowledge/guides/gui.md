@@ -126,7 +126,12 @@ login shell per use.
   GUI's environment is forwarded, and the script first `unset`s all five names, so
   a value from Terminal's own login environment can never replace the GUI's (a
   name the GUI does not set stays unset). The CLI therefore reaches the same
-  daemon socket as the GUI. `open` gets `open_timeout_ms` to accept
+  daemon socket as the GUI. `HOME` is forwarded too when the GUI has an absolute
+  one (the CLI derives every root without an XDG variable from it, and Terminal's
+  login environment may carry another); unlike the XDG names it is never unset, so
+  a GUI without a usable `HOME` leaves Terminal's own `HOME` in place. The script
+  removes itself with `/bin/rm` and otherwise uses only shell builtins and the
+  absolute program path, so it does not depend on Terminal's `PATH`. `open` gets `open_timeout_ms` to accept
   the request; a failure or timeout is an attach error (carrying the first line
   of `open`'s error output) and removes the script. A script Terminal never ran
   stays on disk until the next terminal launch, which removes owner-private

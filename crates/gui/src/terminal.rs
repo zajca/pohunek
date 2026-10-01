@@ -54,8 +54,11 @@ pub(crate) const SYSTEM_OPEN: &str = "/usr/bin/open";
 const SHEBANG: &[u8] = b"#!/bin/sh\n";
 
 /// First script command: the script removes itself before anything else runs,
-/// so the file never outlives its one execution.
-const SELF_DELETE: &[u8] = b"rm -f -- \"$0\"\n";
+/// so the file never outlives its one execution. `rm` is an absolute path
+/// because Terminal's `PATH` may lack it; `/bin/rm` exists on macOS and Linux.
+/// The rest of the script is shell builtins (`unset`, `export`, `exec`) and the
+/// absolute program path, so nothing else is looked up through `PATH`.
+const SELF_DELETE: &[u8] = b"/bin/rm -f -- \"$0\"\n";
 
 /// A stock terminal application the GUI can drive itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -179,8 +182,14 @@ pub(crate) const ENDPOINT_ENVIRONMENT: [&str; 5] = [
     "XDG_CACHE_HOME",
 ];
 
-/// Selects the [`ENDPOINT_ENVIRONMENT`] variables that are set in the GUI
-/// process, in allowlist order.
+/// Variable `pohunek_paths` falls back to for every root whose XDG variable is
+/// unset. Terminal's login environment may carry another `HOME`, so a valid one
+/// in the GUI is forwarded too. Unlike the XDG names it is never unset: a GUI
+/// without a usable `HOME` leaves Terminal's own `HOME` in place.
+pub(crate) const HOME_ENVIRONMENT: &str = "HOME";
+
+/// Selects the variables to forward: `HOME`, then the [`ENDPOINT_ENVIRONMENT`]
+/// names, each only when set in the GUI process.
 ///
 /// `lookup` reads one variable. A relative value is skipped, as the XDG
 /// specification says to ignore it; an absolute value is forwarded as the exact
@@ -189,8 +198,8 @@ pub(crate) const ENDPOINT_ENVIRONMENT: [&str; 5] = [
 pub(crate) fn endpoint_environment(
     lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Vec<(&'static str, OsString)> {
-    ENDPOINT_ENVIRONMENT
-        .into_iter()
+    std::iter::once(HOME_ENVIRONMENT)
+        .chain(ENDPOINT_ENVIRONMENT)
         .filter_map(|name| {
             let value = lookup(name)?;
             std::path::Path::new(&value)
@@ -904,6 +913,7 @@ mod tests {
         assert_eq!(
             forwarded,
             vec![
+                ("HOME", OsString::from("/home/x")),
                 ("XDG_RUNTIME_DIR", OsString::from("/run/user/1000")),
                 ("XDG_DATA_HOME", OsStr::from_bytes(b"/data/\xff").to_owned()),
                 ("XDG_STATE_HOME", OsString::from("/state")),
@@ -1070,6 +1080,109 @@ done
     }
 
     #[test]
+    fn a_relative_or_missing_home_is_not_forwarded() {
+        let _watchdog = crate::test_support::watchdog();
+        for home in [Some("relative/home"), None] {
+            let forwarded = endpoint_environment(|name| {
+                (name == "HOME").then(|| home.map(OsString::from)).flatten()
+            });
+            assert!(forwarded.is_empty(), "{forwarded:?}");
+        }
+    }
+
+    #[test]
+    fn the_guis_home_replaces_terminals_and_derived_roots_follow_it() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let recorder = dir.path().join("recorder");
+        // Derives the config root the way `pohunek_paths` does: the XDG value
+        // when set, otherwise `$HOME/.config`.
+        fs::write(
+            &recorder,
+            r#"#!/bin/sh
+printf 'HOME=%s\nCONFIG=%s\n' "${HOME-UNSET}" "${XDG_CONFIG_HOME:-$HOME/.config}"
+"#,
+        )
+        .expect("write recorder");
+        crate::test_support::make_executable(&recorder);
+        let run = |gui_home: Option<&str>| {
+            let environment: Vec<(&'static str, OsString)> = gui_home
+                .map(|home| vec![("HOME", OsString::from(home))])
+                .unwrap_or_default();
+            let script = dir.path().join("script.command");
+            fs::write(
+                &script,
+                command_script_with_environment(&environment, &[recorder.clone().into_os_string()])
+                    .expect("script"),
+            )
+            .expect("write script");
+            let output = Command::new("sh")
+                .arg(&script)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").expect("PATH"))
+                .env("HOME", "/terminal/home")
+                .output()
+                .expect("run script");
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        assert_eq!(
+            run(Some("/gui/home")),
+            "HOME=/gui/home\nCONFIG=/gui/home/.config\n"
+        );
+        // Without a GUI HOME, Terminal's own HOME stays in place.
+        assert_eq!(
+            run(None),
+            "HOME=/terminal/home\nCONFIG=/terminal/home/.config\n"
+        );
+    }
+
+    #[test]
+    fn the_script_needs_no_path_lookup_and_removes_itself() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let marker = dir.path().join("ran");
+        let target = dir.path().join("target");
+        fs::write(&target, format!("#!/bin/sh\n: > '{}'\n", marker.display()))
+            .expect("write target");
+        crate::test_support::make_executable(&target);
+        let script = dir.path().join("script.command");
+        fs::write(
+            &script,
+            command_script_with_environment(
+                &[("XDG_RUNTIME_DIR", OsString::from("/run/x"))],
+                &[target.into_os_string()],
+            )
+            .expect("script"),
+        )
+        .expect("write script");
+
+        // An empty and a hostile PATH: only builtins and absolute paths may run.
+        for path in ["", "/nonexistent:/also/missing"] {
+            let status = Command::new("/bin/sh")
+                .arg(&script)
+                .env_clear()
+                .env("PATH", path)
+                .status()
+                .expect("run script");
+            assert!(status.success(), "PATH={path:?}");
+            assert!(marker.exists(), "the program ran with PATH={path:?}");
+            assert!(
+                !script.exists(),
+                "the script removed itself with PATH={path:?}"
+            );
+            fs::remove_file(&marker).expect("reset marker");
+            fs::write(
+                &script,
+                command_script_with_environment(&[], &[dir.path().join("target").into_os_string()])
+                    .expect("script"),
+            )
+            .expect("rewrite script");
+        }
+    }
+
+    #[test]
     fn a_non_utf8_value_is_exported_byte_exact() {
         let _watchdog = crate::test_support::watchdog();
         let dir = crate::test_support::fixture();
@@ -1133,7 +1246,7 @@ done
             command_script(&[OsString::from("/bin/echo"), OsString::from("it's")]).expect("script");
         assert_eq!(
             String::from_utf8(script).expect("utf8"),
-            "#!/bin/sh\nunset XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME\nrm -f -- \"$0\"\nexec '/bin/echo' 'it'\\''s'\n"
+            "#!/bin/sh\nunset XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME\n/bin/rm -f -- \"$0\"\nexec '/bin/echo' 'it'\\''s'\n"
         );
     }
 
