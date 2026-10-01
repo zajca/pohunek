@@ -257,7 +257,9 @@ Application certificate, has Apple notarize them, and verifies the result, but
 only when the protected `macos-signing` credentials exist (see "Release" below);
 without them the macOS jobs fail and nothing macOS is published. A build made
 with `packaging/macos/package --development` is unsigned, named
-`...-unsigned-development`, and never released.
+`...-unsigned-development`, and never released. The install, upgrade, rollback,
+uninstall, log, logout/reboot, and Gatekeeper procedures are in the
+[macOS install runbook](docs/knowledge/runbooks/install-on-macos.md).
 
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.

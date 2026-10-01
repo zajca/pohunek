@@ -333,6 +333,8 @@ Release packaging and contributor verification:
   and native macOS arm64 hosts and verifies the archive `MANIFEST`: daemon
   component, target matching the host, macOS minimum version, every member
   present, a regular file, unmodified, and not writable by another account.
+- `docs/knowledge/runbooks/install-on-macos.md` — macOS install, upgrade,
+  rollback, uninstall, logs, logout/reboot, and Gatekeeper runbook.
 - `packaging/write-manifest` — writes an archive's `MANIFEST` (component,
   version, target, signing state, minimum macOS, SHA-256 of every member) as the
   last assembly step; refuses symbolic links and member names outside a plain
