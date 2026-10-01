@@ -133,6 +133,10 @@ while [ "$elapsed" -lt "$SMOKE_WINDOW_SECONDS" ]; do
     sleep 1
     elapsed=$((elapsed + 1))
 done
+if ! gui_is_ours; then
+    printf '%s\n' "the packaged GUI exited during the last second" >&2
+    exit 1
+fi
 if grep -qiE 'panicked at|fatal' "$work/gui.err"; then
     printf '%s\n' "the packaged GUI reported a panic or fatal error" >&2
     exit 1

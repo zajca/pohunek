@@ -268,10 +268,17 @@ class NotarizeTest(Base):
         self.assertIn("notary log for 11111111", result.stderr)
         self.assertEqual(self.calls("xcrun stapler"), [])
 
+    def test_a_failing_notarytool_is_never_trusted_even_with_an_accepted_plist(self):
+        self.app()
+        result = self.run_tool("notarize", self.staging, env=dict(NOTARY_ENV, SHIM_NOTARY_EXIT="1"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("exit status 1", result.stderr)
+        self.assertEqual(self.calls("xcrun stapler"), [])
+
     def test_no_submission_id_fails(self):
         result = self.run_tool("notarize", self.staging, env=dict(NOTARY_ENV, SHIM_NOTARY_ID="", SHIM_NOTARY_EXIT="1"))
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no submission id", result.stderr)
+        self.assertIn("not trusted", result.stderr)
 
     def test_every_credential_is_required(self):
         for missing in NOTARY_ENV:

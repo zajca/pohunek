@@ -55,6 +55,9 @@ submit_status=0
 notary submit "$submission" --wait --timeout 45m --output-format plist > "$result" || submit_status=$?
 status=$(plutil -extract status raw -o - "$result" 2>/dev/null || true)
 id=$(plutil -extract id raw -o - "$result" 2>/dev/null || true)
+if [ "$submit_status" -ne 0 ]; then
+    fail "notarytool submit failed with exit status $submit_status; the result is not trusted"
+fi
 if [ -z "$id" ]; then
     fail "the notary service returned no submission id (exit status $submit_status)"
 fi
