@@ -1,0 +1,107 @@
+#!/bin/sh
+# Assemble the staging directory of one release archive.
+#
+# usage: stage-archive <component> <version> <target> <bindir> <docs-dir> <output-dir>
+#
+# <component> is cli, daemon, gui, or relay. <bindir> holds the built
+# binaries (a `Pohunek.app` bundle instead of `pohunek-gui` for the macOS gui
+# component); <docs-dir> is the `cargo xtask docs site` output with `offline/`
+# and `manifest.json`. The staging directory <output-dir>/<name> is created
+# fresh and the archive name `<prefix>-<version>-<target>` is printed on
+# stdout. Run from the repository root: the installer, the smoke script, the
+# README, and the license are copied from it.
+#
+# Nothing here signs or hashes. Signing, `write-manifest`, and `archive` run
+# afterwards, in that order, because the manifest covers the final bytes.
+
+set -eu
+
+fail() {
+    printf 'stage-archive: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 6 ] || fail "usage: stage-archive <component> <version> <target> <bindir> <docs-dir> <output-dir>"
+component=$1
+version=$2
+target=$3
+bindir=$4
+docs=$5
+output=$6
+
+case $component in
+    cli) prefix=pohunek-cli ;;
+    daemon) prefix=pohunek-daemon ;;
+    gui) prefix=pohunek-gui ;;
+    relay) prefix=pohunek-relay ;;
+    *) fail "unsupported component: $component" ;;
+esac
+case $version in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) fail "version must be X.Y.Z: $version" ;;
+esac
+case $version in
+    *[!0-9.]*) fail "version must be X.Y.Z: $version" ;;
+esac
+case $target in
+    '' | *[!a-z0-9_-]*) fail "target must be a lowercase target triple: $target" ;;
+esac
+[ -d "$bindir" ] || fail "not a directory: $bindir"
+[ -d "$docs/offline" ] || fail "missing offline documentation: $docs/offline"
+[ -f "$docs/manifest.json" ] || fail "missing documentation manifest: $docs/manifest.json"
+mkdir -p "$output"
+[ -d "$output" ] || fail "not a directory: $output"
+for extra in README.md LICENSE; do
+    [ -f "$extra" ] || fail "required release file is missing: $extra (run from the repository root)"
+done
+
+name="$prefix-$version-$target"
+staging="$output/$name"
+rm -rf -- "$staging"
+mkdir -p "$staging"
+
+copy_binary() {
+    [ -f "$bindir/$1" ] || fail "built binary is missing: $bindir/$1"
+    cp "$bindir/$1" "$staging/$1"
+}
+
+case $component in
+    cli)
+        copy_binary pohunek
+        mkdir -p "$staging/packaging"
+        cp scripts/smoke-hermes-plugin-release "$staging/packaging/"
+        ;;
+    daemon)
+        copy_binary pohunekd
+        copy_binary pohunek
+        copy_binary pohunek-sessiond
+        mkdir -p "$staging/packaging"
+        cp packaging/install-daemon.sh "$staging/packaging/"
+        ;;
+    gui)
+        case $target in
+            *-apple-darwin)
+                [ -d "$bindir/Pohunek.app" ] || fail "built app bundle is missing: $bindir/Pohunek.app"
+                cp -Rp "$bindir/Pohunek.app" "$staging/Pohunek.app"
+                ;;
+            *) copy_binary pohunek-gui ;;
+        esac
+        ;;
+    relay)
+        copy_binary pohunek-relayd
+        ;;
+esac
+
+if [ "$component" = cli ] || [ "$component" = daemon ]; then
+    mkdir -p "$staging/completions"
+    "$bindir/pohunek" completions bash > "$staging/completions/pohunek.bash"
+    "$bindir/pohunek" completions zsh > "$staging/completions/_pohunek"
+    "$bindir/pohunek" completions fish > "$staging/completions/pohunek.fish"
+fi
+
+mkdir -p "$staging/docs"
+cp -R "$docs/offline" "$staging/docs/offline"
+cp "$docs/manifest.json" "$staging/docs/manifest.json"
+cp README.md LICENSE "$staging/"
+
+printf '%s\n' "$name"

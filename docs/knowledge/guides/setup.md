@@ -67,7 +67,12 @@ login shell or a refused directory; see
 Session workers are not installed: the daemon starts one systemd transient unit
 or one launchd job per worker generation, and the daemon and workers are
 siblings, so restarting the daemon never stops a worker. The release archive's
-`packaging/install-daemon.sh` wraps this command. The install is ready only
+`packaging/install-daemon.sh` wraps this command and first verifies the archive:
+the `MANIFEST` must describe a daemon archive built for this host (Linux x86_64
+or native macOS arm64, never an Intel Mac or a Rosetta shell), the host must meet
+the archive's minimum macOS version, and every listed member must be present,
+unmodified, and not writable by another account; otherwise it exits before
+running any archive binary, with nothing changed. The install is ready only
 when the daemon job's own main process answers `daemon.health` on the socket;
 an install that fails from the registration step on keeps its record and fails
 with `service_install_incomplete`, and rerunning `pohunek service install` with

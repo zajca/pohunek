@@ -110,7 +110,255 @@ fn an_unanswered_status_query_aborts_before_anything_changes() {
     assert_eq!(fixture.pohunek_calls(), [STATUS]);
 }
 
+/// Asserts that the wrapper refused the archive before it ran any archive
+/// binary, queried `systemctl`, or touched the install prefix.
+fn assert_refused_untouched(fixture: &Fixture, output: &Output, reason: &str) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(reason), "{stderr}");
+    assert!(stderr.contains("nothing was changed"), "{stderr}");
+    assert!(
+        !fixture.pohunek_log.exists() && !fixture.guard_log.exists(),
+        "an archive binary ran: {stderr}"
+    );
+    assert!(fixture.systemctl_calls().is_empty());
+    assert!(!fixture.prefix.exists(), "the prefix was created");
+    assert!(!fixture.config_home.join("pohunek").exists());
+}
+
+#[test]
+fn a_modified_archive_member_is_refused_before_any_binary_runs() {
+    for member in ["pohunek", "pohunekd", "pohunek-sessiond"] {
+        let fixture = Fixture::new();
+        let path = fixture.archive.join(member);
+        let mut contents = read(&path);
+        contents.push_str("# tampered\n");
+        fs::write(&path, contents).expect("tamper with member");
+        let output = fixture.run(&[], &[]);
+        assert_refused_untouched(&fixture, &output, "digest mismatch");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(member));
+    }
+}
+
+#[test]
+fn a_missing_archive_member_is_refused_before_any_binary_runs() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.archive.join("pohunek-sessiond")).expect("remove member");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "missing or not a regular file");
+}
+
+#[test]
+fn a_symlinked_archive_member_is_refused() {
+    let fixture = Fixture::new();
+    let member = fixture.archive.join("pohunekd");
+    let target = fixture.base().join("elsewhere");
+    fs::rename(&member, &target).expect("move member");
+    std::os::unix::fs::symlink(&target, &member).expect("link member");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "holds a symbolic link");
+}
+
+#[test]
+fn an_archive_without_a_manifest_is_refused() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.archive.join("MANIFEST")).expect("remove manifest");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "no MANIFEST");
+}
+
+#[test]
+fn a_malformed_manifest_is_refused() {
+    for (manifest, reason) in [
+        ("", "MANIFEST is empty"),
+        ("not a manifest\n", "not a pohunek archive manifest"),
+        (
+            "pohunek-archive-manifest 1\nsurprise x\n",
+            "unrecognized line",
+        ),
+        (
+            "pohunek-archive-manifest 1\nsha256 abc pohunek\n",
+            "malformed digest",
+        ),
+        (
+            "pohunek-archive-manifest 1\nsha256 \
+             0000000000000000000000000000000000000000000000000000000000000000 ../pohunek\n",
+            "unsafe member path",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.archive.join("MANIFEST"), manifest).expect("write manifest");
+        let output = fixture.run(&[], &[]);
+        assert_refused_untouched(&fixture, &output, reason);
+    }
+}
+
+#[test]
+fn a_manifest_that_omits_a_required_binary_is_refused() {
+    let fixture = Fixture::new();
+    fs::remove_file(fixture.archive.join("pohunek-sessiond")).expect("remove member");
+    seal_manifest(&fixture.archive, &host_target(), "daemon");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "does not list the required binary");
+}
+
+#[test]
+fn another_components_archive_is_refused() {
+    for component in ["cli", "gui", "web"] {
+        let fixture = Fixture::new();
+        seal_manifest(&fixture.archive, &host_target(), component);
+        let output = fixture.run(&[], &[]);
+        assert_refused_untouched(
+            &fixture,
+            &output,
+            &format!("this is the {component} archive"),
+        );
+    }
+}
+
+#[test]
+fn an_archive_built_for_another_architecture_is_refused() {
+    let fixture = Fixture::new();
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "is built for");
+}
+
+#[test]
+fn an_archive_member_writable_by_another_account_is_refused() {
+    let fixture = Fixture::new();
+    let member = fixture.archive.join("pohunekd");
+    fs::set_permissions(&member, fs::Permissions::from_mode(0o775)).expect("loosen member");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "writable by another account");
+
+    let fixture = Fixture::new();
+    fs::set_permissions(&fixture.archive, fs::Permissions::from_mode(0o757))
+        .expect("loosen archive directory");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "writable by another account");
+}
+
+#[test]
+fn a_directory_inside_the_archive_writable_by_another_account_is_refused() {
+    // Another account could replace `packaging/install-daemon.sh` between the
+    // digest check and the wrapper's re-execution.
+    let fixture = Fixture::new();
+    fs::set_permissions(
+        fixture.archive.join("packaging"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .expect("loosen packaging directory");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "writable by another account");
+}
+
+#[test]
+fn a_directory_above_the_archive_writable_by_another_account_is_refused() {
+    // Another account could rename the verified tree away and put its own
+    // under the same path.
+    let fixture = Fixture::new();
+    fs::set_permissions(fixture.base(), fs::Permissions::from_mode(0o777))
+        .expect("loosen the archive's parent");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "a directory above the archive");
+}
+
+#[test]
+fn a_non_executable_required_binary_is_refused() {
+    let fixture = Fixture::new();
+    fs::set_permissions(
+        fixture.archive.join("pohunekd"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("drop the executable bit");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "not executable");
+}
+
+#[test]
+fn unsupported_hosts_are_refused_before_the_archive_is_read() {
+    for (system, machine, reason) in [
+        ("Linux", "aarch64", "unsupported host: Linux aarch64"),
+        ("FreeBSD", "amd64", "unsupported host: FreeBSD amd64"),
+        (
+            "Darwin",
+            "x86_64",
+            "Intel Mac or a shell translated by Rosetta",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.fake_host(system, machine);
+        let output = fixture.run(&[], &[]);
+        assert_refused_untouched(&fixture, &output, reason);
+    }
+}
+
+#[test]
+fn a_macos_host_older_than_the_archive_minimum_is_refused() {
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(
+        &fixture.commands.join("sw_vers"),
+        "#!/bin/sh\necho 13.6.1\n",
+    );
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "needs macOS 14.0 or newer");
+}
+
+#[test]
+fn a_macos_install_keeps_the_owners_own_binaries_below_the_prefix() {
+    // Only the Linux installer ever wrote `<prefix>/bin/pohunekd`; on macOS a
+    // file there belongs to the owner.
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(&fixture.commands.join("sw_vers"), "#!/bin/sh\necho 15.1\n");
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
+    fixture.legacy_install_at(&fixture.prefix);
+    let own = fixture.prefix.join("bin/pohunekd");
+    let own_worker = fixture.prefix.join("libexec/pohunek-sessiond");
+    fs::remove_file(fixture.config_home.join("systemd/user/pohunekd.service")).expect("unit");
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    assert!(own.exists() && own_worker.exists(), "{output:?}");
+}
+
+#[test]
+fn a_macos_minimum_compares_minor_versions() {
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(&fixture.commands.join("sw_vers"), "#!/bin/sh\necho 14.0\n");
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
+    assert_success(&fixture.run(&[], &[]));
+    // An archive that needs 14.5 refuses macOS 14.0.
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(&fixture.commands.join("sw_vers"), "#!/bin/sh\necho 14.0\n");
+    seal_manifest_with_minimum(&fixture.archive, "aarch64-apple-darwin", "14.5");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "needs macOS 14.5 or newer");
+}
+
+#[test]
+fn a_macos_arm64_host_accepts_the_macos_archive() {
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(&fixture.commands.join("sw_vers"), "#!/bin/sh\necho 15.1\n");
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.install_call()]
+    );
+}
+
 const STATUS: &str = "service status --json";
+/// Version recorded in the fixture archive's manifest.
+const ARCHIVE_VERSION: &str = "0.5.0";
+/// Lowest macOS major version the fixture manifest accepts.
+const MINIMUM_MACOS: &str = "14.0";
 const STATE_QUERY: &str = "--user is-active pohunekd.service";
 const LIST_WORKERS: &str = "--user list-units pohunek-session@* --all --plain --no-legend";
 const DISABLE: &str = "--user disable --now pohunekd.service";
@@ -1697,19 +1945,24 @@ fn a_missing_staged_binary_or_extra_argument_fails_without_side_effects() {
 #[test]
 fn release_workflow_packages_the_wrapper_and_binaries_only() {
     let workflow = read(&repo_root().join(".github/workflows/release.yml"));
+    assert!(
+        workflow.contains("packaging/stage-archive"),
+        "the release workflow stages archives with packaging/stage-archive"
+    );
+    let stage = read(&repo_root().join("packaging/stage-archive"));
     for expected in [
-        r#"cp "${bindir}/pohunek" "${staging}/""#,
-        r#"cp "${bindir}/pohunek-sessiond" "${staging}/""#,
-        r#"mkdir -p "${staging}/packaging""#,
-        r#"cp packaging/install-daemon.sh "${staging}/packaging/""#,
+        "copy_binary pohunekd",
+        "copy_binary pohunek\n",
+        "copy_binary pohunek-sessiond",
+        r#"cp packaging/install-daemon.sh "$staging/packaging/""#,
     ] {
         assert!(
-            workflow.contains(expected),
+            stage.contains(expected),
             "missing release asset: {expected}"
         );
     }
     assert!(
-        !workflow.contains("packaging/systemd"),
+        !workflow.contains("packaging/systemd") && !stage.contains("packaging/systemd"),
         "unit templates are rendered by `pohunek service`, never shipped"
     );
     assert!(
@@ -1720,14 +1973,14 @@ fn release_workflow_packages_the_wrapper_and_binaries_only() {
 
 #[test]
 fn release_workflow_packages_static_shell_completions() {
-    let workflow = read(&repo_root().join(".github/workflows/release.yml"));
+    let stage = read(&repo_root().join("packaging/stage-archive"));
     for expected in [
-        r#""${bindir}/pohunek" completions bash > "${staging}/completions/pohunek.bash""#,
-        r#""${bindir}/pohunek" completions zsh > "${staging}/completions/_pohunek""#,
-        r#""${bindir}/pohunek" completions fish > "${staging}/completions/pohunek.fish""#,
+        r#""$bindir/pohunek" completions bash > "$staging/completions/pohunek.bash""#,
+        r#""$bindir/pohunek" completions zsh > "$staging/completions/_pohunek""#,
+        r#""$bindir/pohunek" completions fish > "$staging/completions/pohunek.fish""#,
     ] {
         assert!(
-            workflow.contains(expected),
+            stage.contains(expected),
             "missing packaged completion: {expected}"
         );
     }
@@ -1918,6 +2171,11 @@ impl Fixture {
         write_executable(&archive.join("pohunek"), FAKE_POHUNEK);
         write_executable(&archive.join("pohunekd"), "#!/bin/sh\nexit 0\n");
         write_executable(&archive.join("pohunek-sessiond"), "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &commands.join("uname"),
+            "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; *) exit 2 ;; esac\n",
+        );
+        seal_manifest(&archive, &host_target(), "daemon");
         // `is-active` reports `inactive`, `active` with
         // `POHUNEK_TEST_LEGACY_ACTIVE=1`, or any `POHUNEK_TEST_LEGACY_STATE`;
         // after a successful `start` (exit status `POHUNEK_TEST_START_STATUS`,
@@ -1997,6 +2255,16 @@ impl Fixture {
             _root: root,
             base,
         }
+    }
+
+    /// Makes `uname` report `system` and `machine`, as the installer asks.
+    fn fake_host(&self, system: &str, machine: &str) {
+        write_executable(
+            &self.commands.join("uname"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in -s) echo '{system}' ;; -m) echo '{machine}' ;; *) exit 2 ;; esac\n"
+            ),
+        );
     }
 
     fn legacy_files(&self) -> [PathBuf; 5] {
@@ -2187,6 +2455,39 @@ fn lines(path: &Path) -> Vec<String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => panic!("read {}: {error}", path.display()),
     }
+}
+
+/// The release target of the fixture archive. Every fixture simulates a Linux
+/// `x86_64` host (see `Fixture::fake_host`), whatever machine runs the tests, so
+/// the Linux-only legacy migration paths behave the same everywhere.
+const FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
+
+fn host_target() -> String {
+    FIXTURE_TARGET.to_owned()
+}
+
+/// Writes the archive MANIFEST over the archive's current contents with
+/// `packaging/write-manifest`, as the release workflow does.
+fn seal_manifest(archive: &Path, target: &str, component: &str) {
+    seal(archive, target, component, MINIMUM_MACOS);
+}
+
+/// Seals a daemon manifest that demands `minimum` as the macOS version.
+fn seal_manifest_with_minimum(archive: &Path, target: &str, minimum: &str) {
+    seal(archive, target, "daemon", minimum);
+}
+
+fn seal(archive: &Path, target: &str, component: &str, minimum: &str) {
+    let mut command = Command::new("sh");
+    command
+        .arg(repo_root().join("packaging/write-manifest"))
+        .arg(archive)
+        .args([component, ARCHIVE_VERSION, target, "none"]);
+    if target.ends_with("apple-darwin") {
+        command.arg(minimum);
+    }
+    let output = command.output().expect("run write-manifest");
+    assert_success(&output);
 }
 
 fn repo_root() -> PathBuf {

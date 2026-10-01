@@ -402,40 +402,20 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          name="${{ matrix.archive_prefix }}-${version}-${{ matrix.target }}"
-          staging="dist/${name}"
-          mkdir -p "${staging}"
-          bindir="target/${{ matrix.target }}/release"
-          cp "${bindir}/${{ matrix.binary }}" "${staging}/"
-          if [ "${{ matrix.component }}" = "daemon" ]; then
-            cp "${bindir}/pohunek" "${staging}/"
-            cp "${bindir}/pohunek-sessiond" "${staging}/"
-            mkdir -p "${staging}/packaging"
-            cp packaging/install-daemon.sh "${staging}/packaging/"
+          target="${{ matrix.target }}"
+          component="${{ matrix.component }}"
+          # Archives are stamped with the tagged commit's time, so rebuilding
+          # the same tag yields the same archive bytes.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          name="$(packaging/stage-archive "${component}" "${version}" "${target}" \
+            "target/${target}/release" target/pohunek-docs dist)"
+          if [ "${name}" != "${{ matrix.archive_prefix }}-${version}-${target}" ]; then
+            echo "::error::staged archive ${name} does not match the matrix archive prefix"
+            exit 1
           fi
-          if [ "${{ matrix.component }}" = "cli" ]; then
-            mkdir -p "${staging}/packaging"
-            cp scripts/smoke-hermes-plugin-release "${staging}/packaging/"
-            chmod 0755 "${staging}/packaging/smoke-hermes-plugin-release"
-          fi
-          if [ "${{ matrix.component }}" = "cli" ] || [ "${{ matrix.component }}" = "daemon" ]; then
-            mkdir -p "${staging}/completions"
-            "${bindir}/pohunek" completions bash > "${staging}/completions/pohunek.bash"
-            "${bindir}/pohunek" completions zsh > "${staging}/completions/_pohunek"
-            "${bindir}/pohunek" completions fish > "${staging}/completions/pohunek.fish"
-          fi
-          mkdir -p "${staging}/docs"
-          cp -R target/pohunek-docs/offline "${staging}/docs/offline"
-          cp target/pohunek-docs/manifest.json "${staging}/docs/manifest.json"
-          for extra in README.md LICENSE; do
-            if [ ! -f "${extra}" ]; then
-              echo "::error file=${extra}::required release file is missing"
-              exit 1
-            fi
-            cp "${extra}" "${staging}/"
-          done
-          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
-          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          sh packaging/write-manifest "dist/${name}" "${component}" "${version}" "${target}" none
+          sh packaging/archive dist "${name}" dist
           echo "archive=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
           echo "checksum=dist/${name}.tar.gz.sha256" >> "${GITHUB_OUTPUT}"
 
