@@ -123,8 +123,10 @@ login shell per use.
   the GUI process to an absolute value (a relative value is ignored, as the XDG
   specification says; an absolute value is forwarded byte for byte, UTF-8 or
   not), single-quoted like the arguments. Nothing else of the
-  GUI's environment is forwarded, so the CLI reaches the same daemon socket as
-  the GUI. `open` gets `open_timeout_ms` to accept
+  GUI's environment is forwarded, and the script first `unset`s all five names, so
+  a value from Terminal's own login environment can never replace the GUI's (a
+  name the GUI does not set stays unset). The CLI therefore reaches the same
+  daemon socket as the GUI. `open` gets `open_timeout_ms` to accept
   the request; a failure or timeout is an attach error (carrying the first line
   of `open`'s error output) and removes the script. A script Terminal never ran
   stays on disk until the next terminal launch, which removes owner-private

@@ -225,6 +225,14 @@ pub(crate) fn command_script_with_environment(
     }
     let mut script = Vec::new();
     script.extend_from_slice(SHEBANG);
+    // Terminal's own login environment may carry other values of these names;
+    // clearing them first leaves exactly the GUI's values, or none.
+    script.extend_from_slice(b"unset");
+    for name in ENDPOINT_ENVIRONMENT {
+        script.push(b' ');
+        script.extend_from_slice(name.as_bytes());
+    }
+    script.push(b'\n');
     for (name, value) in environment {
         script.extend_from_slice(b"export ");
         script.extend_from_slice(name.as_bytes());
@@ -1003,6 +1011,65 @@ done
     }
 
     #[test]
+    fn inherited_endpoint_variables_are_cleared_and_only_the_guis_survive() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let recorder = dir.path().join("recorder");
+        fs::write(
+            &recorder,
+            r#"#!/bin/sh
+for n in XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do
+  eval "v=\${$n-UNSET}"
+  printf '%s=%s\n' "$n" "$v"
+done
+"#,
+        )
+        .expect("write recorder");
+        crate::test_support::make_executable(&recorder);
+
+        // The GUI sets none, some, or all of the five; Terminal's environment
+        // carries a conflicting value for every one.
+        for provided in [0_usize, 2, 5] {
+            let environment: Vec<(&'static str, OsString)> = ENDPOINT_ENVIRONMENT
+                .into_iter()
+                .take(provided)
+                .map(|name| (name, OsString::from(format!("/gui/{name}"))))
+                .collect();
+            let script = dir.path().join("script.command");
+            fs::write(
+                &script,
+                command_script_with_environment(&environment, &[recorder.clone().into_os_string()])
+                    .expect("script"),
+            )
+            .expect("write script");
+            let mut command = Command::new("sh");
+            command
+                .arg(&script)
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").expect("PATH"));
+            for name in ENDPOINT_ENVIRONMENT {
+                command.env(name, format!("/terminal/{name}"));
+            }
+
+            let output = command.output().expect("run script");
+
+            assert!(output.status.success());
+            let expected: String = ENDPOINT_ENVIRONMENT
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    if index < provided {
+                        format!("{name}=/gui/{name}\n")
+                    } else {
+                        format!("{name}=UNSET\n")
+                    }
+                })
+                .collect();
+            assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+        }
+    }
+
+    #[test]
     fn a_non_utf8_value_is_exported_byte_exact() {
         let _watchdog = crate::test_support::watchdog();
         let dir = crate::test_support::fixture();
@@ -1060,13 +1127,13 @@ done
     }
 
     #[test]
-    fn script_layout_is_shebang_self_delete_exec() {
+    fn script_layout_is_shebang_unset_self_delete_exec() {
         let _watchdog = crate::test_support::watchdog();
         let script =
             command_script(&[OsString::from("/bin/echo"), OsString::from("it's")]).expect("script");
         assert_eq!(
             String::from_utf8(script).expect("utf8"),
-            "#!/bin/sh\nrm -f -- \"$0\"\nexec '/bin/echo' 'it'\\''s'\n"
+            "#!/bin/sh\nunset XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME\nrm -f -- \"$0\"\nexec '/bin/echo' 'it'\\''s'\n"
         );
     }
 
