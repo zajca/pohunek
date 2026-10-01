@@ -624,7 +624,13 @@ pub async fn launch_provider_item_with_options(
     .await
 }
 
-pub(crate) async fn load_host_snapshot_with_options(
+/// Load one host snapshot with explicit connection options.
+///
+/// # Errors
+///
+/// Returns [`CoreError`] when the selected daemon transport cannot connect or
+/// the health or session list exchange fails.
+pub async fn load_host_snapshot_with_options(
     config: &HostConfig,
     options: ConnectionOptions,
 ) -> Result<HostSnapshot, CoreError> {

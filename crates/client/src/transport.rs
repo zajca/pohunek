@@ -116,13 +116,6 @@ pub(crate) struct RequestOrigin {
 }
 
 impl RequestOrigin {
-    pub(crate) fn from_environment() -> Result<Option<Self>, ClientError> {
-        Self::from_values(
-            read_origin_environment(ENV_SESSION_ID)?,
-            read_origin_environment(ENV_DAEMON_ID)?,
-        )
-    }
-
     pub(crate) fn from_values(
         session_id: Option<String>,
         daemon_id: Option<String>,
@@ -178,6 +171,50 @@ pub enum RawStream {
     Remote(TcpStream),
 }
 
+/// Where an SDK connection takes its request origin from.
+///
+/// The origin is the `(session id, daemon id)` pair that attributes a request
+/// to the pohunek session issuing it. Both values are an atomic pair: a
+/// partial or invalid pair is rejected instead of being sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OriginSource {
+    /// Read the pair from the `POHUNEK_SESSION_ID` and `POHUNEK_DAEMON_ID`
+    /// environment variables of the calling process. Both absent means no
+    /// origin; exactly one present or an invalid value is an error.
+    #[default]
+    Environment,
+    /// Send no origin and never read the process environment.
+    Omitted,
+}
+
+impl OriginSource {
+    /// Resolve the origin for one connection or discovery run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::IncompleteOriginEnvironment`] or
+    /// [`ClientError::InvalidOriginEnvironment`] for [`Self::Environment`]
+    /// when the environment holds a partial or invalid pair.
+    pub(crate) fn resolve(self) -> Result<Option<RequestOrigin>, ClientError> {
+        self.resolve_with(read_origin_environment)
+    }
+
+    /// Resolve against an injected variable lookup; [`Self::Omitted`] never
+    /// calls it.
+    pub(crate) fn resolve_with(
+        self,
+        lookup: impl Fn(&str) -> Result<Option<String>, ClientError>,
+    ) -> Result<Option<RequestOrigin>, ClientError> {
+        match self {
+            Self::Environment => {
+                RequestOrigin::from_values(lookup(ENV_SESSION_ID)?, lookup(ENV_DAEMON_ID)?)
+            }
+            Self::Omitted => Ok(None),
+        }
+    }
+}
+
 /// Client transport settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -186,6 +223,8 @@ pub struct ClientOptions {
     pub request_timeout: Duration,
     /// Maximum time to wait for connection setup and remote discovery.
     pub connect_timeout: Duration,
+    /// Where the request origin is taken from.
+    pub origin_source: OriginSource,
 }
 
 impl Default for ClientOptions {
@@ -193,6 +232,7 @@ impl Default for ClientOptions {
         Self {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            origin_source: OriginSource::default(),
         }
     }
 }
@@ -209,6 +249,13 @@ impl ClientOptions {
     #[must_use]
     pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
         self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// Return options that take the request origin from `origin_source`.
+    #[must_use]
+    pub fn with_origin_source(mut self, origin_source: OriginSource) -> Self {
+        self.origin_source = origin_source;
         self
     }
 }
@@ -257,7 +304,7 @@ impl Client {
     ) -> Result<Self, ClientError> {
         // Validate the atomic pair before local dialing or remote discovery so
         // a partial marker can never escape on a request or be masked by I/O.
-        RequestOrigin::from_environment()?;
+        options.origin_source.resolve()?;
         if is_local_host(host) {
             Self::connect_local_with_options(socket_path, options).await
         } else {
@@ -298,7 +345,7 @@ impl Client {
         registry: OverlayRegistry,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
-        RequestOrigin::from_environment()?;
+        options.origin_source.resolve()?;
         if is_local_host(host) {
             Self::connect_local_with_options(socket_path, options).await
         } else {
@@ -318,7 +365,7 @@ impl Client {
         socket_path: impl AsRef<Path>,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
-        let origin = RequestOrigin::from_environment()?;
+        let origin = options.origin_source.resolve()?;
         let socket_path = socket_path.as_ref();
         let stream = connect_unix(socket_path, options.connect_timeout).await?;
 
@@ -349,7 +396,7 @@ impl Client {
         addr: SocketAddr,
         options: ClientOptions,
     ) -> Result<Self, ClientError> {
-        let origin = RequestOrigin::from_environment()?;
+        let origin = options.origin_source.resolve()?;
         let host = host.into();
         let stream = connect_tcp(&host, addr, options.connect_timeout).await?;
 
@@ -948,7 +995,7 @@ pub async fn connect_raw_with_options(
     socket_path: impl AsRef<Path>,
     options: ClientOptions,
 ) -> Result<RawStream, ClientError> {
-    RequestOrigin::from_environment()?;
+    options.origin_source.resolve()?;
     if is_local_host(host) {
         connect_raw_local_with_options(socket_path, options).await
     } else {
@@ -969,7 +1016,7 @@ pub async fn connect_raw_local_with_options(
     socket_path: impl AsRef<Path>,
     options: ClientOptions,
 ) -> Result<RawStream, ClientError> {
-    RequestOrigin::from_environment()?;
+    options.origin_source.resolve()?;
     Ok(RawStream::Local(
         connect_unix(socket_path.as_ref(), options.connect_timeout).await?,
     ))
@@ -990,7 +1037,7 @@ pub async fn connect_raw_tcp_addr_with_options(
     addr: SocketAddr,
     options: ClientOptions,
 ) -> Result<RawStream, ClientError> {
-    RequestOrigin::from_environment()?;
+    options.origin_source.resolve()?;
     let host = host.into();
     Ok(RawStream::Remote(
         connect_tcp(&host, addr, options.connect_timeout).await?,
@@ -1247,6 +1294,12 @@ mod tests {
     use tokio::io::{AsyncBufReadExt as _, BufReader};
     use tokio::net::TcpListener;
 
+    /// Options that send no request origin, so a test result never depends on
+    /// the `POHUNEK_*` variables of the developer's own session.
+    fn no_origin_options() -> ClientOptions {
+        ClientOptions::default().with_origin_source(OriginSource::Omitted)
+    }
+
     #[derive(Debug)]
     struct PolicyTransport {
         id: OverlayId,
@@ -1452,6 +1505,78 @@ mod tests {
         assert!(!invalid.to_string().contains("private"));
     }
 
+    /// Lookup holding only the session marker, the shape of a process that
+    /// inherited half of a pohunek session environment.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the fallible lookup signature of `OriginSource::resolve_with`"
+    )]
+    fn session_only_lookup(name: &str) -> Result<Option<String>, ClientError> {
+        Ok((name == ENV_SESSION_ID).then(|| "s-42".to_owned()))
+    }
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the fallible lookup signature of `OriginSource::resolve_with`"
+    )]
+    fn complete_lookup(name: &str) -> Result<Option<String>, ClientError> {
+        Ok(Some(
+            if name == ENV_SESSION_ID {
+                "s-42"
+            } else {
+                "daemon-a"
+            }
+            .to_owned(),
+        ))
+    }
+
+    #[test]
+    fn environment_origin_source_rejects_an_incomplete_environment() {
+        let error = OriginSource::default()
+            .resolve_with(session_only_lookup)
+            .expect_err("incomplete pair must fail");
+        assert!(matches!(error, ClientError::IncompleteOriginEnvironment));
+        assert_eq!(OriginSource::default(), OriginSource::Environment);
+        assert_eq!(
+            ClientOptions::default().origin_source,
+            OriginSource::Environment
+        );
+    }
+
+    #[test]
+    fn environment_origin_source_resolves_a_complete_environment() {
+        let origin = OriginSource::Environment
+            .resolve_with(complete_lookup)
+            .expect("complete pair")
+            .expect("origin");
+        assert_eq!(
+            origin,
+            RequestOrigin::from_values(Some("s-42".to_owned()), Some("daemon-a".to_owned()))
+                .expect("valid pair")
+                .expect("origin")
+        );
+    }
+
+    #[test]
+    fn omitted_origin_source_ignores_the_environment() {
+        for lookup in [
+            session_only_lookup as fn(&str) -> Result<Option<String>, ClientError>,
+            complete_lookup,
+            |_name| Err(ClientError::InvalidOriginEnvironment),
+        ] {
+            assert!(OriginSource::Omitted
+                .resolve_with(lookup)
+                .expect("omitted origin never fails")
+                .is_none());
+        }
+        assert_eq!(
+            ClientOptions::default()
+                .with_origin_source(OriginSource::Omitted)
+                .origin_source,
+            OriginSource::Omitted
+        );
+    }
+
     #[test]
     fn explicit_remote_route_format_is_canonical_and_validated() {
         assert_eq!(
@@ -1475,10 +1600,11 @@ mod tests {
             .expect("bind policy fixture");
         let address = listener.local_addr().expect("policy fixture address");
         let selector = address.to_string();
-        let error = Client::connect_with_registry(
+        let error = Client::connect_with_registry_and_options(
             &selector,
             "/unused/local.sock",
             policy_registry(address.ip(), address.port()),
+            no_origin_options(),
         )
         .await
         .expect_err("socket literal must not bypass overlay policy");
@@ -1504,10 +1630,11 @@ mod tests {
             peer
         });
 
-        let client = Client::connect_with_registry(
+        let client = Client::connect_with_registry_and_options(
             &address.ip().to_string(),
             "/unused/local.sock",
             policy_registry(address.ip(), address.port()),
+            no_origin_options(),
         )
         .await
         .expect("current member IP resolves through provider policy");
@@ -1535,10 +1662,14 @@ mod tests {
         let route =
             remote_host_with_port(&format!("policy:{identity}"), port).expect("stable route");
 
-        let first_client =
-            Client::connect_with_registry(&route, "/unused/local.sock", registry.clone())
-                .await
-                .expect("first GUI-style connection");
+        let first_client = Client::connect_with_registry_and_options(
+            &route,
+            "/unused/local.sock",
+            registry.clone(),
+            no_origin_options(),
+        )
+        .await
+        .expect("first GUI-style connection");
         let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), first_listener.accept())
             .await
             .expect("first accept deadline")
@@ -1546,9 +1677,14 @@ mod tests {
         drop(first_client);
 
         *current_ip.write().expect("member write lock") = second_ip;
-        let second_client = Client::connect_with_registry(&route, "/unused/local.sock", registry)
-            .await
-            .expect("reconnected GUI-style client");
+        let second_client = Client::connect_with_registry_and_options(
+            &route,
+            "/unused/local.sock",
+            registry,
+            no_origin_options(),
+        )
+        .await
+        .expect("reconnected GUI-style client");
         let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), second_listener.accept())
             .await
             .expect("second accept deadline")
@@ -1587,9 +1723,13 @@ mod tests {
             request
         });
 
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
         client.origin = Some(RequestOrigin {
             session_id: SessionId("s-origin".to_owned()),
             daemon_id: "daemon-origin".to_owned(),
@@ -1675,9 +1815,13 @@ mod tests {
             "timed_out": true
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
         client.origin = Some(test_request_origin());
         let runtime =
             protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
@@ -1709,9 +1853,13 @@ mod tests {
             "output_offset": "0"
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
         client.origin = Some(test_request_origin());
         let params = SessionWaitParams::new(
             SessionId("s-target".to_owned()),
@@ -1748,9 +1896,13 @@ mod tests {
             "activity_revision": "2"
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
         client.origin = Some(test_request_origin());
         let params = SessionInputParams {
             session_id: SessionId("s-target".to_owned()),
@@ -1784,9 +1936,13 @@ mod tests {
             "activity_revision": "2"
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
 
         client
             .session_input(SessionInputParams {
@@ -1808,9 +1964,13 @@ mod tests {
     async fn input_wait_rejects_legacy_success_without_runtime_evidence() {
         let result = serde_json::json!({"accepted": true});
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
         let params = SessionInputParams {
             session_id: SessionId("s-target".to_owned()),
             text: "hello".to_owned(),
@@ -1843,9 +2003,13 @@ mod tests {
     async fn generic_typed_call_routes_input_wait_through_contract_validation() {
         let (address, server) =
             spawn_dedicated_capture_server(serde_json::json!({"accepted": true})).await;
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
 
         let error = client
             .call::<protocol::method::SessionInput>(SessionInputParams {
@@ -1874,9 +2038,13 @@ mod tests {
             .await
             .expect("bind invalid-wait fixture");
         let address = listener.local_addr().expect("fixture address");
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect shared client");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect shared client");
         let (_shared_stream, _) = listener.accept().await.expect("accept shared client");
 
         for (timeout_ms, expected_code) in [
@@ -1932,9 +2100,13 @@ mod tests {
             "activity_revision": "2"
         });
         let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
         let params = SessionInputParams {
             session_id: SessionId("s-target".to_owned()),
             text: "hello".to_owned(),
@@ -1977,9 +2149,13 @@ mod tests {
             .await;
             request
         });
-        let mut client = Client::connect_trusted_tcp_addr("fixture-remote", address)
-            .await
-            .expect("connect remote");
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
         client.origin = Some(test_request_origin());
         let request = Request::new("subscribe-origin", protocol::method::SUBSCRIBE, Value::Null)
             .expect("valid subscribe request");
@@ -2009,9 +2185,13 @@ mod tests {
             raw.read_line(&mut line).await.expect("read attach header");
             line
         });
-        let client = Client::connect_trusted_tcp_addr("overlay-qualified-peer", address)
-            .await
-            .expect("connect selected endpoint");
+        let client = Client::connect_trusted_tcp_addr_with_options(
+            "overlay-qualified-peer",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect selected endpoint");
 
         let raw = client
             .attach_raw("stream-same-route")

@@ -19,7 +19,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::transport::RequestOrigin;
+use crate::transport::{OriginSource, RequestOrigin};
 
 /// Default lifetime for discovery snapshots.
 ///
@@ -54,6 +54,7 @@ pub struct DiscoveryOptions {
     probe_timeout: Duration,
     concurrency: NonZeroUsize,
     deadline: Duration,
+    origin_source: OriginSource,
 }
 
 impl DiscoveryOptions {
@@ -65,6 +66,7 @@ impl DiscoveryOptions {
             concurrency: NonZeroUsize::new(DEFAULT_PROBE_CONCURRENCY)
                 .expect("default concurrency is non-zero"),
             deadline: DEFAULT_DISCOVERY_DEADLINE,
+            origin_source: OriginSource::default(),
         }
     }
 
@@ -84,6 +86,19 @@ impl DiscoveryOptions {
     #[must_use]
     pub fn deadline(&self) -> Duration {
         self.deadline
+    }
+
+    /// Return where the probes take their request origin from.
+    #[must_use]
+    pub fn origin_source(&self) -> OriginSource {
+        self.origin_source
+    }
+
+    /// Return options that take the request origin from `origin_source`.
+    #[must_use]
+    pub fn with_origin_source(mut self, origin_source: OriginSource) -> Self {
+        self.origin_source = origin_source;
+        self
     }
 
     /// Return options with a custom probe timeout.
@@ -175,13 +190,14 @@ pub async fn discover_hosts(
 /// Returns [`crate::ClientError::RemoteDiscoveryFailed`] when no configured
 /// overlay completes before [`DiscoveryOptions::deadline`]. Completed healthy
 /// overlay snapshots remain usable when another provider reaches that
-/// deadline. Returns an origin-environment error when exactly one origin marker
-/// is present or a marker value is invalid.
+/// deadline. With [`crate::OriginSource::Environment`] (the default) returns an
+/// origin-environment error when exactly one origin marker is present or a
+/// marker value is invalid.
 pub async fn discover_hosts_with_options(
     registry: &OverlayRegistry,
     options: DiscoveryOptions,
 ) -> Result<Vec<HostRecord>, crate::ClientError> {
-    let origin = RequestOrigin::from_environment()?;
+    let origin = options.origin_source().resolve()?;
     discover_with_registry(registry, options, origin).await
 }
 

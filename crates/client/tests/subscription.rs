@@ -5,7 +5,7 @@ use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pohunek_client::protocol::{self, ErrorClass, ProtocolError, Request, Response};
-use pohunek_client::{Client, ClientError};
+use pohunek_client::{Client, ClientError, ClientOptions, OriginSource};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -14,6 +14,12 @@ use tokio::task::JoinHandle;
 
 const HOST: &str = "build-box";
 const LEGACY_PROTOCOL_VERSION: u32 = 1;
+
+/// Options that send no request origin, so a test result never depends on the
+/// `POHUNEK_*` variables of the developer's own session.
+fn no_origin_options() -> ClientOptions {
+    ClientOptions::default().with_origin_source(OriginSource::Omitted)
+}
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -57,7 +63,7 @@ async fn subscription_connect_local_returns_event_lines_until_close() {
         event_lines.clone(),
     );
 
-    let client = Client::connect_local(&daemon.socket_path)
+    let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local subscription test daemon");
     let mut subscription = client
@@ -94,7 +100,7 @@ async fn subscription_local_ack_error_maps_to_protocol_and_preserves_code() {
     let daemon =
         spawn_unix_subscription_daemon(response_error_line_for(&request, source.clone()), vec![]);
 
-    let client = Client::connect_local(&daemon.socket_path)
+    let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local subscription test daemon");
     let err = client
@@ -132,9 +138,10 @@ async fn subscription_remote_ack_error_maps_to_remote_protocol_and_preserves_cod
         spawn_tcp_subscription_daemon(response_error_line_for(&request, source.clone()), vec![])
             .await;
 
-    let client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
-        .await
-        .expect("connect tcp subscription test daemon");
+    let client =
+        Client::connect_trusted_tcp_addr_with_options(HOST, daemon.addr, no_origin_options())
+            .await
+            .expect("connect tcp subscription test daemon");
     let err = client
         .subscribe(&request)
         .await
@@ -182,7 +189,7 @@ async fn subscription_ack_response_id_mismatch_is_rejected() {
         vec![],
     );
 
-    let client = Client::connect_local(&daemon.socket_path)
+    let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local subscription test daemon");
     match client
@@ -225,7 +232,7 @@ async fn subscription_next_event_decodes_notification_created() {
         vec![event_line],
     );
 
-    let client = Client::connect_local(&daemon.socket_path)
+    let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local subscription test daemon");
     let mut subscription = client
@@ -271,7 +278,7 @@ async fn subscription_next_event_malformed_json_returns_typed_error() {
         vec!["definitely not json".to_owned()],
     );
 
-    let client = Client::connect_local(&daemon.socket_path)
+    let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local subscription test daemon");
     let mut subscription = client
@@ -314,7 +321,7 @@ async fn subscription_rejects_an_event_with_a_different_selected_version() {
         .to_string()],
     );
 
-    let client = Client::connect_local(&daemon.socket_path)
+    let client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local subscription daemon");
     let mut subscription = client
@@ -352,9 +359,10 @@ async fn remote_subscription_wrong_version_event_preserves_host_context() {
     )
     .await;
 
-    let client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
-        .await
-        .expect("connect remote subscription daemon");
+    let client =
+        Client::connect_trusted_tcp_addr_with_options(HOST, daemon.addr, no_origin_options())
+            .await
+            .expect("connect remote subscription daemon");
     let mut subscription = client
         .subscribe(&request)
         .await

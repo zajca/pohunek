@@ -296,7 +296,8 @@ documents another defaultable object.
 
 Origin markers are either both absent or both present, non-empty, bounded, and
 restricted to unescaped ASCII identifier characters. Managed children inherit
-the pair; the Rust SDK propagates inherited origin and the TypeScript SDK
+the pair; the Rust SDK propagates inherited origin (unless its options select
+`OriginSource::Omitted`) and the TypeScript SDK
 propagates an explicitly configured `ConnectOptions.origin` to normal,
 subscription, and dedicated connections. When both markers identify the target
 as the caller's own origin session, the daemon returns
@@ -1754,7 +1755,12 @@ Public exports:
 - `protocol`: re-export of `pohunek-protocol`.
 - `Client`: framed request/response and subscription client.
 - `ClientOptions`: `request_timeout` and `connect_timeout`, both defaulting to
-  5 seconds.
+  5 seconds, and `origin_source`, set with `with_origin_source`.
+- `OriginSource`: where a connection takes its request origin from.
+  `Environment` (the default) reads `POHUNEK_SESSION_ID` and
+  `POHUNEK_DAEMON_ID` from the calling process and rejects a partial or invalid
+  pair; `Omitted` sends no origin and never reads the environment.
+  `DiscoveryOptions::with_origin_source` selects it for discovery probes.
 - `Subscription`: raw event-line stream after a successful `subscribe`.
 - `RawStream`: local Unix or remote TCP raw byte stream for attach.
 - `ClientError`: SDK error enum with `to_protocol_error()` for structured
