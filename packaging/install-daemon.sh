@@ -92,8 +92,15 @@ manifest="$archive_dir/MANIFEST"
 if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
     refuse_archive "the archive has no MANIFEST: $manifest"
 fi
-if [ -n "$(find "$archive_dir" -prune \( -perm -020 -o -perm -002 \) -print)" ]; then
-    refuse_archive "the archive directory is writable by another account: $archive_dir"
+# Every directory and file of the archive must belong to this user or root, be
+# free of group and other write permission, and no entry may be a symbolic
+# link: another account could otherwise replace a member (the wrapper
+# re-executes itself from this tree) between the digest check and its use.
+host_uid=$(id -u)
+unsafe_entry=$(find "$archive_dir" \( -perm -020 -o -perm -002 \) -print -o \
+    \( ! -user "$host_uid" ! -user 0 \) -print -o -type l -print | head -n 1)
+if [ -n "$unsafe_entry" ]; then
+    refuse_archive "the archive is writable by another account, owned by another user, or holds a symbolic link: $unsafe_entry"
 fi
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then

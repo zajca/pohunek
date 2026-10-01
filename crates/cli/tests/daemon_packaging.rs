@@ -156,7 +156,7 @@ fn a_symlinked_archive_member_is_refused() {
     fs::rename(&member, &target).expect("move member");
     std::os::unix::fs::symlink(&target, &member).expect("link member");
     let output = fixture.run(&[], &[]);
-    assert_refused_untouched(&fixture, &output, "missing or not a regular file");
+    assert_refused_untouched(&fixture, &output, "holds a symbolic link");
 }
 
 #[test]
@@ -219,12 +219,7 @@ fn another_components_archive_is_refused() {
 #[test]
 fn an_archive_built_for_another_architecture_is_refused() {
     let fixture = Fixture::new();
-    let other = if host_target().contains("apple-darwin") {
-        "x86_64-unknown-linux-gnu"
-    } else {
-        "aarch64-apple-darwin"
-    };
-    seal_manifest(&fixture.archive, other, "daemon");
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
     let output = fixture.run(&[], &[]);
     assert_refused_untouched(&fixture, &output, "is built for");
 }
@@ -240,6 +235,20 @@ fn an_archive_member_writable_by_another_account_is_refused() {
     let fixture = Fixture::new();
     fs::set_permissions(&fixture.archive, fs::Permissions::from_mode(0o757))
         .expect("loosen archive directory");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "writable by another account");
+}
+
+#[test]
+fn a_directory_inside_the_archive_writable_by_another_account_is_refused() {
+    // Another account could replace `packaging/install-daemon.sh` between the
+    // digest check and the wrapper's re-execution.
+    let fixture = Fixture::new();
+    fs::set_permissions(
+        fixture.archive.join("packaging"),
+        fs::Permissions::from_mode(0o777),
+    )
+    .expect("loosen packaging directory");
     let output = fixture.run(&[], &[]);
     assert_refused_untouched(&fixture, &output, "writable by another account");
 }
@@ -2151,6 +2160,10 @@ impl Fixture {
         write_executable(&archive.join("pohunek"), FAKE_POHUNEK);
         write_executable(&archive.join("pohunekd"), "#!/bin/sh\nexit 0\n");
         write_executable(&archive.join("pohunek-sessiond"), "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &commands.join("uname"),
+            "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; *) exit 2 ;; esac\n",
+        );
         seal_manifest(&archive, &host_target(), "daemon");
         // `is-active` reports `inactive`, `active` with
         // `POHUNEK_TEST_LEGACY_ACTIVE=1`, or any `POHUNEK_TEST_LEGACY_STATE`;
@@ -2433,14 +2446,13 @@ fn lines(path: &Path) -> Vec<String> {
     }
 }
 
-/// The release target the fixture archive is built for: the one this host
-/// installs.
+/// The release target of the fixture archive. Every fixture simulates a Linux
+/// x86_64 host (see `Fixture::fake_host`), whatever machine runs the tests, so
+/// the Linux-only legacy migration paths behave the same everywhere.
+const FIXTURE_TARGET: &str = "x86_64-unknown-linux-gnu";
+
 fn host_target() -> String {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("linux", "x86_64") => "x86_64-unknown-linux-gnu".to_owned(),
-        ("macos", "aarch64") => "aarch64-apple-darwin".to_owned(),
-        (os, arch) => panic!("the installer supports no {os} {arch} host"),
-    }
+    FIXTURE_TARGET.to_owned()
 }
 
 /// Writes the archive MANIFEST over the archive's current contents with

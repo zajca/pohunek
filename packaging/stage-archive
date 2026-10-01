@@ -49,6 +49,7 @@ esac
 [ -d "$bindir" ] || fail "not a directory: $bindir"
 [ -d "$docs/offline" ] || fail "missing offline documentation: $docs/offline"
 [ -f "$docs/manifest.json" ] || fail "missing documentation manifest: $docs/manifest.json"
+mkdir -p "$output"
 [ -d "$output" ] || fail "not a directory: $output"
 for extra in README.md LICENSE; do
     [ -f "$extra" ] || fail "required release file is missing: $extra (run from the repository root)"

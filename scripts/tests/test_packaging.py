@@ -131,6 +131,15 @@ class StageArchiveTest(unittest.TestCase):
         self.assertTrue((staging / "Pohunek.app/Contents/MacOS/pohunek-gui").is_file())
         self.assertFalse((staging / "pohunek-gui").exists())
 
+    def test_the_output_directory_is_created_when_missing(self):
+        ws = Workspace(self)
+        out = ws.root / "fresh" / "dist"
+        run(
+            [PACKAGING / "stage-archive", "cli", VERSION, TARGET, ws.bindir, ws.docs, out],
+            cwd=ws.root,
+        )
+        self.assertTrue((out / ("pohunek-cli-%s-%s" % (VERSION, TARGET)) / "pohunek").is_file())
+
     def test_a_missing_binary_or_bad_argument_is_refused(self):
         ws = Workspace(self)
         (ws.bindir / "pohunekd").unlink()
@@ -283,6 +292,28 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(modes["README.md"], 0o644)
         # No AppleDouble or extended-header members.
         self.assertFalse([n for n in names if "/._" in n or "PaxHeaders" in n])
+
+    def test_relative_arguments_mean_the_callers_directory(self):
+        # The release workflow calls `archive dist "$name" dist` from the
+        # repository root.
+        ws = Workspace(self)
+        name = ws.stage("daemon")
+        run([PACKAGING / "write-manifest", ws.out / name, "daemon", VERSION, TARGET, "none"])
+        run(
+            [PACKAGING / "archive", "dist", name, "dist"],
+            cwd=ws.root,
+            env={"SOURCE_DATE_EPOCH": EPOCH},
+        )
+        self.assertTrue((ws.root / "dist" / (name + ".tar.gz")).is_file())
+        self.assertTrue((ws.root / "dist" / (name + ".tar.gz.sha256")).is_file())
+        self.assertFalse((ws.root / "dist" / "dist").exists())
+
+    def test_the_output_directory_is_created_when_missing(self):
+        ws = Workspace(self)
+        name = ws.stage("daemon")
+        out = ws.root / "new" / "out"
+        run([PACKAGING / "archive", ws.out, name, out], env={"SOURCE_DATE_EPOCH": EPOCH})
+        self.assertTrue((out / (name + ".tar.gz")).is_file())
 
     def test_a_different_commit_time_changes_the_archive(self):
         ws = Workspace(self)

@@ -30,7 +30,12 @@ case $name in
     '' | */* | . | .. | *[!A-Za-z0-9._+-]*) fail "archive name must be a plain file name: $name" ;;
 esac
 [ -d "$parent/$name" ] || fail "not a directory: $parent/$name"
+mkdir -p "$output"
 [ -d "$output" ] || fail "not a directory: $output"
+# Relative arguments mean the caller's directory, so both are made absolute
+# before the working directory changes.
+parent=$(CDPATH= cd -- "$parent" && pwd -P)
+output=$(CDPATH= cd -- "$output" && pwd -P)
 epoch=${SOURCE_DATE_EPOCH:-}
 case $epoch in
     '' | *[!0-9]*) fail "SOURCE_DATE_EPOCH must be set to a Unix timestamp" ;;
