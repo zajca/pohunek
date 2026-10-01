@@ -36,7 +36,7 @@ case "$tool $1" in
   "otool -l") exec cat "$2.otool-l" ;;
   "otool -L") exec cat "$2.otool-L" ;;
   "lipo -archs") exec cat "$2.archs" ;;
-  "strings -a") exec cat "$2.strings" ;;
+  "strings -a") [ ! -f "$2.strings-fails" ] || exit 1; exec cat "$2.strings" ;;
 esac
 echo "unexpected shim call: $tool $*" >&2
 exit 99
@@ -201,9 +201,42 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(self.audit("--require", "absent", self.tree).returncode, 1)
         self.assertEqual(self.audit("--require", "pohunek", self.tree / "pohunek").returncode, 2)
 
+    def test_a_failing_strings_tool_fails_the_audit(self):
+        path = self.binary("pohunek")
+        (self.tree / "pohunek.strings-fails").write_text("")
+        result = self.audit(path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("build-machine path check did not run", result.stderr)
+        self.assertNotIn("ok ", result.stdout)
+
     def test_bad_arguments_are_refused(self):
         for args in (["--minimum-os"], ["--forbid-string", ""], ["--minimum-os", "x", "."], ["--nope"], []):
             self.assertEqual(self.audit(*args).returncode, 2, args)
+
+
+class BuildReleaseTest(unittest.TestCase):
+    def test_a_relative_target_directory_is_reported_below_the_repository_root(self):
+        tools = Path(tempfile.mkdtemp(prefix="pohunek-build-"))
+        self.addCleanup(shutil.rmtree, tools, ignore_errors=True)
+        for name, text in (
+            ("uname", '#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo arm64 ;; esac\n'),
+            ("rustc", "#!/bin/sh\necho /fake/sysroot\n"),
+            ("cargo", "#!/bin/sh\nexit 0\n"),
+        ):
+            path = tools / name
+            path.write_text(text)
+            path.chmod(0o755)
+        env = dict(os.environ, PATH="%s:%s" % (tools, os.environ["PATH"]), CARGO_TARGET_DIR="out/target")
+        result = subprocess.run(
+            [str(MACOS / "build-release"), "cli"],
+            cwd=ROOT / "packaging",
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "%s/out/target/aarch64-apple-darwin/release" % ROOT)
 
 
 class ToolingTest(unittest.TestCase):

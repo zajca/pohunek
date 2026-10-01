@@ -166,7 +166,9 @@ audit_file() {
         failures=$((failures + $(wc -l < "$scratch/library-failures")))
     fi
 
-    strings -a "$file" > "$scratch/strings" 2>/dev/null || : > "$scratch/strings"
+    if ! strings -a "$file" > "$scratch/strings" 2>/dev/null; then
+        problem "$file" "strings cannot read it, so the build-machine path check did not run"
+    fi
     printf '%s\n' "$forbidden" | while IFS= read -r needle; do
         [ -n "$needle" ] || continue
         if grep -F -q -e "$needle" "$scratch/strings"; then

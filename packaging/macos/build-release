@@ -59,4 +59,9 @@ case $component in
 esac
 
 target_dir=${CARGO_TARGET_DIR:-$root/target}
+# Cargo resolved a relative override against the repository root.
+case $target_dir in
+    /*) ;;
+    *) target_dir=$root/$target_dir ;;
+esac
 printf '%s\n' "$target_dir/$target/release"
