@@ -385,7 +385,7 @@ mod tests {
     use std::sync::Arc;
 
     use protocol::{ProtocolVersion, ProtocolVersionRange, PROTOCOL_VERSION};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpSocket};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -577,17 +577,54 @@ mod tests {
         );
     }
 
+    /// A loopback endpoint that refuses every connection and that no other
+    /// socket can claim while the value is alive.
+    ///
+    /// The socket is bound but never put into the listening state, so the
+    /// kernel answers a connect with a reset. Keeping the socket open keeps the
+    /// port reserved; a port that was merely released could be handed to any
+    /// concurrently started listener.
+    struct RefusedEndpoint {
+        addr: SocketAddr,
+        _reservation: TcpSocket,
+    }
+
+    impl RefusedEndpoint {
+        fn reserve() -> Self {
+            let socket = TcpSocket::new_v4().expect("create reservation socket");
+            socket
+                .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .expect("bind reservation socket");
+            let addr = socket.local_addr().expect("reservation address");
+            Self {
+                addr,
+                _reservation: socket,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn closed_daemon_is_unreachable() {
-        let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("address");
-        drop(listener);
+        let closed = RefusedEndpoint::reserve();
         assert_eq!(
-            classify(addr, Duration::from_millis(100), None).await,
+            classify(closed.addr, Duration::from_millis(100), None).await,
             HostClass::Unreachable
         );
+    }
+
+    #[tokio::test]
+    async fn refused_endpoint_refuses_connects_and_cannot_be_claimed() {
+        let closed = RefusedEndpoint::reserve();
+
+        let connect_error = TcpStream::connect(closed.addr)
+            .await
+            .expect_err("a reserved, non-listening port refuses connects");
+        assert_eq!(connect_error.kind(), std::io::ErrorKind::ConnectionRefused);
+
+        let claim_error = TcpListener::bind(closed.addr)
+            .await
+            .expect_err("a live reservation must not be claimable by a stub server");
+        assert_eq!(claim_error.kind(), std::io::ErrorKind::AddrInUse);
     }
 
     async fn health_stub(line: Vec<u8>, delay: Duration) -> SocketAddr {
