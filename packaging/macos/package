@@ -18,10 +18,11 @@
 # signed archive differs between runs; the unsigned content it wraps is
 # reproducible.
 #
-# `--development` builds an unsigned archive for local use and CI acceptance.
-# Its name ends in `-unsigned-development` and its MANIFEST says
-# `signing unsigned-development`, so it can never be mistaken for a release
-# artifact and is never attached to a release.
+# `--development` builds an unsigned archive for local use and CI acceptance
+# (an app bundle gets only an ad-hoc seal so it can launch). Its name ends in
+# `-unsigned-development` and its MANIFEST says `signing unsigned-development`,
+# so it can never be mistaken for a release artifact and is never attached to a
+# release.
 #
 # `SOURCE_DATE_EPOCH` stamps the archive; it defaults to the commit time of
 # HEAD. Run from anywhere inside the repository on an arm64 Mac.
@@ -95,6 +96,14 @@ else
     signing=developer-id
 fi
 staging=$output/$name
+
+if [ "$mode" = --development ] && [ "$component" = gui ]; then
+    # Apple Silicon kills an app whose bundle seal is invalid. An ad-hoc seal
+    # (no identity, no trust) lets a development bundle launch; the manifest
+    # still says `unsigned-development`.
+    codesign --force --sign - "$staging/Pohunek.app" >&2
+    codesign --verify --strict --deep "$staging/Pohunek.app" >&2
+fi
 
 # shellcheck disable=SC2086
 "$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2

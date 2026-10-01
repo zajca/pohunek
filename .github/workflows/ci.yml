@@ -552,7 +552,7 @@ jobs:
           app="$(find "$extract_dir" -maxdepth 2 -name Pohunek.app -type d)"
           test -n "$app"
           /usr/bin/plutil -lint "$app/Contents/Info.plist"
-          codesign --verify --verbose=2 "$app/Contents/MacOS/pohunek-gui"
+          codesign --verify --strict --deep --verbose=2 "$app"
           scripts/smoke-gui-release-macos "$app"
 
   test:
