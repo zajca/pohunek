@@ -1,4 +1,4 @@
-import { loadBackendConfig, type BackendConfig } from "./config";
+import { BackendConfigError, loadBackendConfig, type BackendConfig } from "./config";
 import { BackendStartupError, startHostsPipeline, type HostsPipelineHandle } from "./hosts";
 import { errorClass, stdoutLogger, type BackendLogger } from "./log";
 import { startBackendServer, type BackendServerHandle } from "./server";
@@ -80,7 +80,7 @@ export function runBackend(): void {
         error_class: errorClass(error),
       });
       console.error(
-        error instanceof BackendStartupError
+        error instanceof BackendStartupError || error instanceof BackendConfigError
           ? error.message
           : `Cannot start @pohunek/backend (${errorClass(error)}). Check the backend configuration.`,
       );

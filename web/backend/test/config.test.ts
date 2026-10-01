@@ -1,3 +1,7 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
@@ -107,6 +111,30 @@ describe("backend configuration", () => {
       { ...baseEnv(), POHUNEK_BACKEND_STATIC_DIR: "" },
       "POHUNEK_BACKEND_STATIC_DIR",
     );
+  });
+});
+
+describe("backend startup diagnostics", () => {
+  test("a configuration error reaches the operator with the variable and the reason", async () => {
+    const entrypoint = join(dirname(fileURLToPath(import.meta.url)), "../src/entrypoint.ts");
+    const child = spawn(process.execPath, [entrypoint], {
+      env: {
+        PATH: process.env["PATH"] ?? "",
+        POHUNEK_BACKEND_BIND_HOST: "100.64.0.10",
+        POHUNEK_BACKEND_PORT: "8080",
+        XDG_RUNTIME_DIR: "relative/run",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string): void => {
+      stderr += chunk;
+    });
+    child.stdout.resume();
+    const [code] = (await once(child, "exit")) as [number | null];
+    expect(code).toBe(1);
+    expect(stderr.includes("XDG_RUNTIME_DIR must be an absolute path")).toBe(true);
   });
 });
 

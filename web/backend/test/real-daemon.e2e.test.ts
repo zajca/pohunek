@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { constants, readFileSync } from "node:fs";
-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
@@ -734,9 +734,10 @@ async function startDaemon(
   let exitStatus: ExitStatus | undefined;
   let spawnError: Error | undefined;
 
-  const defaultRuntimeDir = options.defaultRuntime === true
+  const defaultRuntime = options.defaultRuntime === true
     ? await claimDefaultRuntimeDir()
     : undefined;
+  const defaultRuntimeDir = defaultRuntime?.path;
   const isolatedEnv: NodeJS.ProcessEnv = {
     ...(defaultRuntimeDir === undefined ? { XDG_RUNTIME_DIR: dirs.runtime } : {}),
     XDG_DATA_HOME: dirs.data,
@@ -789,8 +790,8 @@ async function startDaemon(
   });
   const removeRoots = async (): Promise<void> => {
     await rm(tempRoot, { recursive: true, force: true });
-    if (defaultRuntimeDir !== undefined) {
-      await rm(defaultRuntimeDir, { recursive: true, force: true });
+    if (defaultRuntime !== undefined) {
+      await releaseDefaultRuntimeDir(defaultRuntime);
     }
   };
 
@@ -825,25 +826,49 @@ async function startDaemon(
   };
 }
 
+/** A default runtime directory this run created, identified by device and inode. */
+interface DefaultRuntimeClaim {
+  readonly path: string;
+  readonly dev: number;
+  readonly ino: number;
+}
+
 /**
- * Returns the macOS default runtime directory after proving this run owns it.
- * An existing directory belongs to a daemon of the same user, and removing it
- * at teardown would destroy that daemon's socket.
+ * Creates the macOS default runtime directory atomically (mode 0700), so this
+ * run provably owns it: an existing directory belongs to a daemon of the same
+ * user and `mkdir` fails instead of adopting it.
  */
-async function claimDefaultRuntimeDir(): Promise<string> {
+async function claimDefaultRuntimeDir(): Promise<DefaultRuntimeClaim> {
   const uid = process.geteuid?.();
   if (uid === undefined) {
     throw new Error("the effective user id is unavailable");
   }
-  const runtimeDir = `${MACOS_DEFAULT_RUNTIME_PREFIX}${String(uid)}`;
-  const present = await access(runtimeDir).then(() => true, () => false);
-  if (present) {
-    throw new Error(
-      `${runtimeDir} already exists; stop the daemon using the default runtime directory `
-        + "before running the default-runtime e2e",
-    );
+  const path = `${MACOS_DEFAULT_RUNTIME_PREFIX}${String(uid)}`;
+  try {
+    await mkdir(path, { mode: 0o700 });
+  } catch (error: unknown) {
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      throw new Error(
+        `${path} already exists; stop the daemon using the default runtime directory `
+          + "before running the default-runtime e2e",
+      );
+    }
+    throw error;
   }
-  return runtimeDir;
+  const info = await lstat(path);
+  return { path, dev: info.dev, ino: info.ino };
+}
+
+/** Removes the claimed directory, and only that directory: a replaced one is left alone. */
+async function releaseDefaultRuntimeDir(claim: DefaultRuntimeClaim): Promise<void> {
+  const info = await lstat(claim.path).catch(() => undefined);
+  if (info === undefined) {
+    return;
+  }
+  if (!info.isDirectory() || info.dev !== claim.dev || info.ino !== claim.ino) {
+    throw new Error(`${claim.path} is no longer the directory this run created; not removing it`);
+  }
+  await rm(claim.path, { recursive: true, force: true });
 }
 
 function withoutRuntimeDir(env: NodeJS.ProcessEnv, remove: boolean): NodeJS.ProcessEnv {
