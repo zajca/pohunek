@@ -1,16 +1,35 @@
 #!/bin/sh
 # Package built macOS binaries into a release-layout archive.
 #
-# usage: package --development <component> <version> <bindir> <docs-dir> <output-dir>
+# usage:
+#   package --development   <component> <version> <bindir> <docs-dir> <output-dir>
+#   package --stage-release <component> <version> <bindir> <docs-dir> <output-dir>
+#   package --sign-release  <component> <version> <staging-dir>
 #
-# <component> is cli or daemon. The staged tree is audited
-# (`audit-macho`), sealed with a MANIFEST, and archived reproducibly; the
-# archive path is printed on stdout.
+# <component> is cli, daemon, or gui (the gui archive holds Pohunek.app, built
+# here from <bindir>/pohunek-gui). The staged tree is audited (`audit-macho`),
+# then sealed with a MANIFEST and archived reproducibly; the archive path is
+# printed on stdout.
 #
-# `--development` builds an unsigned archive for local use and CI acceptance.
-# Its name ends in `-unsigned-development` and its MANIFEST says
-# `signing unsigned-development`, so it can never be mistaken for a release
-# artifact and is never attached to a release.
+# A release is made in two steps so that no built program runs while a signing
+# credential exists. `--stage-release` assembles and audits the tree, which runs
+# the built `pohunek` to write the shell completions, and needs no secret; it
+# prints the staging directory. `--sign-release` then signs the tree with the
+# Developer ID identity, has Apple notarize it (stapling app bundles), verifies
+# the result, and writes the manifest and the archive, so the manifest hashes the
+# final signed bytes and records `signing developer-id`. It audits the tree again
+# before signing (the tree came from another runner) and runs nothing from it. It needs the environment of `signing-keychain`
+# (MACOS_SIGNING_IDENTITY, MACOS_SIGNING_KEYCHAIN), of `notarize`
+# (APPLE_NOTARY_*), and MACOS_TEAM_ID, and fails when any is missing: a release
+# is never produced unsigned. Signing embeds Apple's secure timestamp, so a
+# signed archive differs between runs; the unsigned content it wraps is
+# reproducible.
+#
+# `--development` builds an unsigned archive for local use and CI acceptance
+# (an app bundle gets only an ad-hoc seal so it can launch). Its name ends in
+# `-unsigned-development` and its MANIFEST says `signing unsigned-development`,
+# so it can never be mistaken for a release artifact and is never attached to a
+# release.
 #
 # `SOURCE_DATE_EPOCH` stamps the archive; it defaults to the commit time of
 # HEAD. Run from anywhere inside the repository on an arm64 Mac.
@@ -22,25 +41,71 @@ fail() {
     exit 1
 }
 
-[ "$#" -eq 6 ] || fail "usage: package --development <component> <version> <bindir> <docs-dir> <output-dir>"
+usage="usage: package --development|--stage-release <component> <version> <bindir> <docs-dir> <output-dir>
+       package --sign-release <component> <version> <staging-dir>"
+[ "$#" -ge 1 ] || fail "$usage"
 mode=$1
+case $mode in
+    --development | --stage-release) [ "$#" -eq 6 ] || fail "$usage" ;;
+    --sign-release) [ "$#" -eq 4 ] || fail "$usage" ;;
+    *) fail "unsupported mode: $mode
+$usage" ;;
+esac
 component=$2
 version=$3
-bindir=$4
-docs=$5
-output=$6
 case $component in
     cli) require="--require pohunek" ;;
     daemon) require="--require pohunek --require pohunekd --require pohunek-sessiond" ;;
+    gui) require="--require Pohunek.app/Contents/MacOS/pohunek-gui" ;;
     *) fail "unsupported component: $component" ;;
 esac
-[ "$mode" = --development ] || fail "unsupported mode: $mode (only --development is available)"
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
 target=aarch64-apple-darwin
 minimum_macos=$(tr -d ' \n' < "$script_dir/DEPLOYMENT_TARGET")
 
+if [ "$mode" = --sign-release ]; then
+    # Checked first so a release with a missing credential fails before any
+    # work is done.
+    for variable in MACOS_SIGNING_IDENTITY MACOS_SIGNING_KEYCHAIN MACOS_TEAM_ID \
+        APPLE_NOTARY_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
+        eval "value=\${$variable:-}"
+        [ -n "$value" ] || fail "$variable is not set: a release is never produced unsigned"
+    done
+    staging=$(CDPATH= cd -- "$4" && pwd -P)
+    output=$(dirname -- "$staging")
+    name=$(basename -- "$staging")
+    case $name in
+        *-unsigned-development) fail "a development staging directory cannot be signed as a release: $name" ;;
+        "pohunek-$component-$version-$target") ;;
+        *) fail "unexpected staging directory name: $name" ;;
+    esac
+    cd "$root"
+    if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+        SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+    fi
+    export SOURCE_DATE_EPOCH
+    # The tree arrives from another runner, so what is about to be signed is
+    # checked again here: only regular files and directories, and every
+    # program a Mach-O file of the right platform, architecture, and target.
+    unexpected=$(find "$staging" ! -type f ! -type d -print | head -n 1)
+    [ -z "$unexpected" ] || fail "the staged tree holds a symbolic link or special file: $unexpected"
+    # shellcheck disable=SC2086
+    "$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2
+    "$script_dir/sign" "$staging" >&2
+    "$script_dir/notarize" "$staging" >&2
+    "$script_dir/verify-signed" --notarized --team-id "$MACOS_TEAM_ID" "$staging" >&2
+    sh "$root/packaging/write-manifest" "$staging" "$component" "$version" "$target" \
+        developer-id "$minimum_macos"
+    sh "$root/packaging/archive" "$output" "$name" "$output"
+    printf '%s\n' "$output/$name.tar.gz"
+    exit 0
+fi
+
+bindir=$4
+docs=$5
+output=$6
 # The caller's relative paths mean the caller's directory.
 bindir=$(CDPATH= cd -- "$bindir" && pwd -P)
 docs=$(CDPATH= cd -- "$docs" && pwd -P)
@@ -52,15 +117,36 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
 fi
 export SOURCE_DATE_EPOCH
 
+work=$(mktemp -d "${TMPDIR:-/tmp}/pohunek-package.XXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+if [ "$component" = gui ]; then
+    "$script_dir/build-app-bundle" "$bindir/pohunek-gui" "$version" "$work" > /dev/null
+    bindir=$work
+fi
+
 name=$("$root/packaging/stage-archive" "$component" "$version" "$target" "$bindir" "$docs" "$output")
-suffix=-unsigned-development
-rm -rf -- "$output/$name$suffix"
-mv -- "$output/$name" "$output/$name$suffix"
-name=$name$suffix
+if [ "$mode" = --development ]; then
+    suffix=-unsigned-development
+    rm -rf -- "$output/$name$suffix"
+    mv -- "$output/$name" "$output/$name$suffix"
+    name=$name$suffix
+fi
 staging=$output/$name
+
+if [ "$mode" = --development ] && [ "$component" = gui ]; then
+    # Apple Silicon kills an app whose bundle seal is invalid. An ad-hoc seal
+    # (no identity, no trust) lets a development bundle launch; the manifest
+    # still says `unsigned-development`.
+    codesign --force --sign - "$staging/Pohunek.app" >&2
+    codesign --verify --strict --deep "$staging/Pohunek.app" >&2
+fi
 
 # shellcheck disable=SC2086
 "$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2
+if [ "$mode" = --stage-release ]; then
+    printf '%s\n' "$staging"
+    exit 0
+fi
 sh "$root/packaging/write-manifest" "$staging" "$component" "$version" "$target" \
     unsigned-development "$minimum_macos"
 sh "$root/packaging/archive" "$output" "$name" "$output"

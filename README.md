@@ -248,6 +248,16 @@ installer. It runs beside a compatible local `pohunekd`; unpack it, run
 `~/.config/pohunek/backend.env`, then enable `pohunek-backend.service`. See the
 archive's `README.md` for the complete commands.
 
+macOS on Apple Silicon (macOS 14 or newer) is not yet a published platform:
+public macOS support is declared only when the final native acceptance gate
+(#105) passes. The release workflow already builds the `aarch64-apple-darwin`
+CLI, daemon, and GUI (`Pohunek.app`) archives, signs them with a Developer ID
+Application certificate, has Apple notarize them, and verifies the result, but
+only when the protected `macos-signing` credentials exist (see "Release" below);
+without them the macOS jobs fail and nothing macOS is published. A build made
+with `packaging/macos/package --development` is unsigned, named
+`...-unsigned-development`, and never released.
+
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
 
@@ -965,8 +975,19 @@ cargo xtask ts check      # CI gate
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
 Release workflow re-runs the gates on the tag, then builds and publishes glibc
-and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, and a
-self-contained Linux x86_64 web-control-center archive. The offline docs are
+and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, a
+self-contained Linux x86_64 web-control-center archive, and signed, notarized
+`aarch64-apple-darwin` CLI, daemon, and GUI (`Pohunek.app`) archives. The macOS
+build runs without secrets; a separate signing job on a fresh runner runs in the protected `macos-signing` environment (secrets
+`MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
+`APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,
+and the repository variable `MACOS_TEAM_ID`, which must not be environment-scoped because the verification job reads it too); a missing credential fails them before the
+build, so a macOS archive is never published unsigned and the release run stays
+red until the credentials exist. The `macos-signing` environment is created and
+protected by the repository owner, not by the workflow: restrict it to the
+`v*` release tags (and add a required reviewer if wanted), then add the five
+secrets and `MACOS_TEAM_ID`. A workflow that merely names an environment gets
+none of that protection. The offline docs are
 bundled into every native component archive. CLI archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
 source-locked Hermes runtime without provider credentials, runs the model-free

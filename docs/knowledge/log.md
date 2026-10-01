@@ -7,6 +7,12 @@
   it, and that the doctor `netbird_cli` check uses the same lookup. Added the
   macOS host section of the remote-hosts guide (listener binding, sleep and wake,
   troubleshooting).
+- Documented the macOS GUI app bundle (`Pohunek.app`, identifier
+  `io.github.zajca.pohunek.gui`), how it finds the installed CLI, and the
+  Developer ID signing and notarization pipeline of the release workflow
+  (owner-protected `macos-signing` environment, ephemeral keychain, notary API
+  key; missing credentials fail the macOS release jobs and nothing unsigned is
+  published). macOS is not yet a published platform.
 - Documented the native macOS package tooling: the deployment-target file, the
   Mach-O audit (arm64 only, deployment target, system libraries only, no
   build-machine paths), the unsigned development package, and the CI acceptance

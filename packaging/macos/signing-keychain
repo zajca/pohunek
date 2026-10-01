@@ -1,0 +1,106 @@
+#!/bin/bash
+# Create or remove the ephemeral keychain that holds the Developer ID
+# certificate during a release build.
+#
+# usage: signing-keychain create | delete
+#
+# create reads, from the environment only:
+#   MACOS_CERTIFICATE_P12_BASE64  the Developer ID Application certificate and
+#                                 key as a base64 PKCS#12 file
+#   MACOS_CERTIFICATE_PASSWORD    the PKCS#12 password
+# It fails when either is missing or empty: a release without signing
+# credentials must fail, never fall back to an unsigned artifact. It creates a
+# random-password keychain below RUNNER_TEMP (or TMPDIR), imports the
+# certificate, restricts the key to Apple's codesign tools, makes the keychain
+# searchable, and requires exactly one `Developer ID Application` identity.
+# The identity's SHA-1 and the keychain path are appended to GITHUB_ENV as
+# MACOS_SIGNING_IDENTITY and MACOS_SIGNING_KEYCHAIN (the password never is).
+#
+# delete removes that keychain, restores the saved keychain search list, and
+# removes every temporary file; it runs even when the build failed. Secret
+# values are never printed or exported; the random keychain password is masked.
+# `security` takes the passwords only as command-line arguments, so they are
+# visible to other processes of the single-tenant ephemeral runner for the
+# seconds each command runs. The only file holding secret material is the 0600
+# temporary PKCS#12, removed right after the import.
+
+set -euo pipefail
+umask 077
+
+fail() {
+    printf 'signing-keychain: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: signing-keychain create | delete"
+action=$1
+state_dir=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/pohunek-signing
+keychain=$state_dir/signing.keychain-db
+saved_list=$state_dir/keychains.orig
+
+case $action in
+    create)
+        [ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ] || fail "MACOS_CERTIFICATE_P12_BASE64 is not set: the Developer ID certificate secret is missing, so this release cannot be signed"
+        [ -n "${MACOS_CERTIFICATE_PASSWORD:-}" ] || fail "MACOS_CERTIFICATE_PASSWORD is not set: the Developer ID certificate secret is missing, so this release cannot be signed"
+        [ ! -e "$state_dir" ] || fail "$state_dir already exists; run \`signing-keychain delete\` first"
+        mkdir -p "$state_dir"
+        # A failure anywhere below removes the keychain, the temporary PKCS#12,
+        # and the search-list change before the script exits.
+        trap '"$0" delete >/dev/null 2>&1 || true' EXIT
+        p12=$state_dir/certificate.p12
+        # The state directory exists before the first secret is written, so
+        # `delete` always finds what to remove.
+        security list-keychains -d user > "$saved_list"
+        password=$(openssl rand -hex 24)
+        printf '::add-mask::%s\n' "$password"
+        security create-keychain -p "$password" "$keychain"
+        security set-keychain-settings -lut 21600 "$keychain"
+        security unlock-keychain -p "$password" "$keychain"
+        printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$p12"
+        security import "$p12" -k "$keychain" -f pkcs12 -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+        rm -f -- "$p12"
+        security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+        # codesign finds identities through the user search list.
+        originals=()
+        while IFS= read -r line; do
+            originals+=("$line")
+        done < <(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e '/^$/d' "$saved_list")
+        security list-keychains -d user -s "$keychain" ${originals[@]+"${originals[@]}"}
+        identities=$(security find-identity -v -p codesigning "$keychain" | grep 'Developer ID Application' || true)
+        count=$(printf '%s\n' "$identities" | grep -c . || true)
+        [ "$count" -eq 1 ] || fail "expected exactly one Developer ID Application identity in the certificate, found $count"
+        identity=$(printf '%s\n' "$identities" | awk '{ print $2 }')
+        [ -n "$identity" ] || fail "cannot read the signing identity"
+        if [ -n "${GITHUB_ENV:-}" ]; then
+            {
+                printf 'MACOS_SIGNING_IDENTITY=%s\n' "$identity"
+                printf 'MACOS_SIGNING_KEYCHAIN=%s\n' "$keychain"
+            } >> "$GITHUB_ENV"
+        fi
+        trap - EXIT
+        printf 'signing identity %s in %s\n' "$identity" "$keychain"
+        ;;
+    delete)
+        [ -d "$state_dir" ] || exit 0
+        status=0
+        if [ -e "$keychain" ]; then
+            security delete-keychain "$keychain" || {
+                printf 'signing-keychain: could not delete %s\n' "$keychain" >&2
+                status=1
+            }
+        fi
+        if [ -f "$saved_list" ]; then
+            originals=()
+            while IFS= read -r line; do
+                originals+=("$line")
+            done < <(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e '/^$/d' "$saved_list")
+            if [ "${#originals[@]}" -gt 0 ]; then
+                security list-keychains -d user -s "${originals[@]}" || status=1
+            fi
+        fi
+        rm -rf -- "$state_dir"
+        exit "$status"
+        ;;
+    *) fail "usage: signing-keychain create | delete" ;;
+esac

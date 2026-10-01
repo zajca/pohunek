@@ -1,0 +1,129 @@
+#!/bin/sh
+# Verify the signatures of an archive staging directory.
+#
+# usage: verify-signed [--notarized] --team-id TEAM <staging-dir>
+#
+# Every Mach-O file and app bundle must carry a valid, strict code signature
+# made with a `Developer ID Application` certificate of team TEAM, the hardened
+# runtime, and a secure timestamp; an ad-hoc signature, a missing signature, or
+# another team fails. With --notarized every bare Mach-O file must satisfy the
+# `notarized` code requirement and every app bundle must also have a valid
+# stapled ticket and be accepted by Gatekeeper (`spctl --assess`). Every
+# problem is reported before the exit status 1.
+
+set -eu
+
+fail() {
+    printf 'verify-signed: %s\n' "$*" >&2
+    exit 2
+}
+
+notarized=no
+team=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --notarized) notarized=yes; shift ;;
+        --team-id)
+            [ "$#" -ge 2 ] || fail "--team-id needs a value"
+            team=$2
+            shift 2
+            ;;
+        -*) fail "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+[ "$#" -eq 1 ] || fail "usage: verify-signed [--notarized] --team-id TEAM <staging-dir>"
+staging=$1
+[ -d "$staging" ] || fail "not a directory: $staging"
+[ -n "$team" ] || fail "--team-id is required"
+case $team in
+    *[!A-Z0-9]*) fail "--team-id must be an Apple team identifier: $team" ;;
+esac
+for tool in codesign od find; do
+    command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
+done
+
+failures=0
+checked=0
+problem() {
+    printf 'FAIL %s: %s\n' "$1" "$2" >&2
+    failures=$((failures + 1))
+}
+
+is_macho() {
+    case $(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n') in
+        cffaedfe | cafebabe | bebafeca | feedfacf | cefaedfe | feedface | cafebabf | bfbafeca) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/pohunek-verify.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+
+# Checks the signature details of $1; $2 is the extra codesign verify option.
+check_signature() {
+    target=$1
+    shift
+    if ! codesign --verify --strict --verbose=2 "$@" "$target" 2>"$scratch/verify"; then
+        problem "$target" "code signature does not verify: $(tr '\n' ' ' < "$scratch/verify")"
+        return
+    fi
+    if ! codesign -dvv "$target" >"$scratch/details" 2>&1; then
+        problem "$target" "codesign cannot describe it"
+        return
+    fi
+    if grep -q '^Signature=adhoc' "$scratch/details"; then
+        problem "$target" "ad-hoc signature"
+        return
+    fi
+    grep -q '^Authority=Developer ID Application:' "$scratch/details" ||
+        problem "$target" "not signed by a Developer ID Application certificate"
+    grep -q '^CodeDirectory .*flags=0x[0-9a-f]*(.*runtime' "$scratch/details" ||
+        problem "$target" "the hardened runtime is not enabled"
+    grep -q '^Timestamp=' "$scratch/details" ||
+        problem "$target" "no secure timestamp"
+    found_team=$(sed -n 's/^TeamIdentifier=//p' "$scratch/details" | head -n 1)
+    [ "$found_team" = "$team" ] ||
+        problem "$target" "team identifier is '${found_team:-none}', expected $team"
+    checked=$((checked + 1))
+}
+
+find "$staging" -type d -name '*.app' -prune -print | LC_ALL=C sort > "$scratch/apps"
+find "$staging" -type f -print | LC_ALL=C sort > "$scratch/files"
+while IFS= read -r file; do
+    inside_app=no
+    while IFS= read -r app; do
+        case $file in
+            "$app"/*) inside_app=yes ;;
+        esac
+    done < "$scratch/apps"
+    [ "$inside_app" = no ] || continue
+    is_macho "$file" || continue
+    check_signature "$file"
+    if [ "$notarized" = yes ]; then
+        # A bare command-line binary carries no stapled ticket; the requirement
+        # asks the notary service's records through the code signature.
+        codesign --verify --strict -R="notarized" --check-notarization "$file" 2>"$scratch/notarized" ||
+            problem "$file" "not notarized: $(tr '\n' ' ' < "$scratch/notarized")"
+    fi
+done < "$scratch/files"
+while IFS= read -r app; do
+    [ -n "$app" ] || continue
+    check_signature "$app" --deep
+    if [ "$notarized" = yes ]; then
+        xcrun stapler validate "$app" >/dev/null 2>&1 ||
+            problem "$app" "no valid stapled notarization ticket"
+        spctl --assess --type execute --verbose=4 "$app" 2>"$scratch/spctl" ||
+            problem "$app" "Gatekeeper rejects it: $(tr '\n' ' ' < "$scratch/spctl")"
+    fi
+done < "$scratch/apps"
+
+if [ "$checked" -eq 0 ] && [ "$failures" -eq 0 ]; then
+    printf 'verify-signed: nothing signed found below %s\n' "$staging" >&2
+    exit 1
+fi
+if [ "$failures" -ne 0 ]; then
+    printf 'verify-signed: %s problem(s)\n' "$failures" >&2
+    exit 1
+fi
+printf 'verify-signed: %s signed item(s) verified for team %s\n' "$checked" "$team"

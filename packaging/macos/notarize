@@ -1,0 +1,74 @@
+#!/bin/sh
+# Submit a signed archive staging directory to Apple's notary service, wait
+# for the verdict, and staple the ticket to its app bundles.
+#
+# usage: notarize <staging-dir>
+#
+# The credentials are an App Store Connect API key, from the environment only:
+#   APPLE_NOTARY_KEY_P8_BASE64  the .p8 private key, base64 encoded
+#   APPLE_NOTARY_KEY_ID         its key id
+#   APPLE_NOTARY_ISSUER_ID      the issuer id
+# Any of them missing fails the build: a release without notarization
+# credentials stays failed and never publishes an un-notarized artifact.
+#
+# The whole staging directory is submitted as one zip, so the verdict covers
+# every Mach-O file and app bundle in it. Only an app bundle can carry a
+# stapled ticket; Gatekeeper finds the ticket of a bare command-line binary
+# online. The verdict must be `Accepted`; anything else prints the notary log
+# and fails. The submission id is printed (and appended to the job summary)
+# as evidence.
+
+set -eu
+umask 077
+
+fail() {
+    printf 'notarize: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: notarize <staging-dir>"
+staging=$1
+[ -d "$staging" ] || fail "not a directory: $staging"
+[ -n "${APPLE_NOTARY_KEY_P8_BASE64:-}" ] || fail "APPLE_NOTARY_KEY_P8_BASE64 is not set: the notarization credentials are missing"
+[ -n "${APPLE_NOTARY_KEY_ID:-}" ] || fail "APPLE_NOTARY_KEY_ID is not set: the notarization credentials are missing"
+[ -n "${APPLE_NOTARY_ISSUER_ID:-}" ] || fail "APPLE_NOTARY_ISSUER_ID is not set: the notarization credentials are missing"
+for tool in xcrun ditto plutil base64; do
+    command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
+done
+
+printf '::add-mask::%s\n' "$APPLE_NOTARY_KEY_ID" "$APPLE_NOTARY_ISSUER_ID"
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/pohunek-notarize.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+key=$scratch/key.p8
+printf '%s' "$APPLE_NOTARY_KEY_P8_BASE64" | base64 --decode > "$key"
+
+submission=$scratch/submission.zip
+ditto -c -k --keepParent "$staging" "$submission"
+
+notary() {
+    xcrun notarytool "$@" --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID"
+}
+
+result=$scratch/result.plist
+submit_status=0
+notary submit "$submission" --wait --timeout 45m --output-format plist > "$result" || submit_status=$?
+status=$(plutil -extract status raw -o - "$result" 2>/dev/null || true)
+id=$(plutil -extract id raw -o - "$result" 2>/dev/null || true)
+if [ -z "$id" ]; then
+    fail "the notary service returned no submission id (exit status $submit_status)"
+fi
+printf 'notarization submission %s: %s\n' "$id" "${status:-unknown}"
+if [ "$status" != Accepted ]; then
+    printf 'notarize: submission %s was not accepted; the notary log follows\n' "$id" >&2
+    notary log "$id" >&2 || true
+    exit 1
+fi
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf -- '- notarization submission `%s` for `%s`: Accepted\n' "$id" "$(basename "$staging")" >> "$GITHUB_STEP_SUMMARY"
+fi
+
+find "$staging" -type d -name '*.app' -prune -print | LC_ALL=C sort | while IFS= read -r app; do
+    xcrun stapler staple "$app"
+    xcrun stapler validate "$app"
+done

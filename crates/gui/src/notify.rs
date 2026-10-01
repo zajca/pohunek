@@ -10,11 +10,11 @@
 //!
 //! [`NotificationOutcome::Submitted`] means the backend accepted the request and
 //! exited 0. `osascript` exits 0 whether the notification was shown or was
-//! suppressed by System Settings (Notifications, Focus), and an unbundled
-//! binary has no API to ask: `UNUserNotificationCenter` authorization needs an
-//! app bundle (issue #104). Delivery, and a user's denial, are therefore
-//! unobservable until the GUI ships as a bundle; every failure the GUI can
-//! observe is [`NotificationOutcome::Unavailable`].
+//! suppressed by System Settings (Notifications, Focus), and this backend has no
+//! API to ask: `UNUserNotificationCenter` authorization needs an app bundle
+//! and a native call (issue #102). Delivery, and a user's denial, are therefore
+//! unobservable; every failure the GUI can observe is
+//! [`NotificationOutcome::Unavailable`].
 
 // Rust guideline compliant 2026-10-01
 #![forbid(unsafe_code)]
