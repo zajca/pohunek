@@ -6,7 +6,8 @@
 # Every Mach-O file and app bundle must carry a valid, strict code signature
 # made with a `Developer ID Application` certificate of team TEAM, the hardened
 # runtime, and a secure timestamp; an ad-hoc signature, a missing signature, or
-# another team fails. With --notarized every app bundle must also have a valid
+# another team fails. With --notarized every bare Mach-O file must satisfy the
+# `notarized` code requirement and every app bundle must also have a valid
 # stapled ticket and be accepted by Gatekeeper (`spctl --assess`). Every
 # problem is reported before the exit status 1.
 
@@ -99,6 +100,12 @@ while IFS= read -r file; do
     [ "$inside_app" = no ] || continue
     is_macho "$file" || continue
     check_signature "$file"
+    if [ "$notarized" = yes ]; then
+        # A bare command-line binary carries no stapled ticket; the requirement
+        # asks the notary service's records through the code signature.
+        codesign --verify --strict -R="notarized" --check-notarization "$file" 2>"$scratch/notarized" ||
+            problem "$file" "not notarized: $(tr '\n' ' ' < "$scratch/notarized")"
+    fi
 done < "$scratch/files"
 while IFS= read -r app; do
     [ -n "$app" ] || continue

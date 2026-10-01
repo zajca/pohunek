@@ -47,6 +47,7 @@ for arg in "$@"; do
   fi
 done
 case " $* " in
+  *" --check-notarization "*) exit "${SHIM_CODESIGN_NOTARIZED_STATUS:-0}" ;;
   *" --verify "*) exit "${SHIM_CODESIGN_VERIFY_STATUS:-0}" ;;
 esac
 exit 0
@@ -316,6 +317,19 @@ class VerifySignedTest(Base):
             result = self.verify("--team-id", TEAM, self.staging)
             self.assertEqual(result.returncode, 1, label)
             self.assertIn(message, result.stderr, label)
+
+    def test_a_bare_binary_must_be_notarized_when_notarization_is_required(self):
+        self.macho("pohunek")
+        ok = self.verify("--notarized", "--team-id", TEAM, self.staging)
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertTrue(any("-R=notarized --check-notarization" in c for c in self.calls("codesign")))
+        bad = self.verify("--notarized", "--team-id", TEAM, self.staging, SHIM_CODESIGN_NOTARIZED_STATUS="3")
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("not notarized", bad.stderr)
+        # Without the switch the check does not run.
+        self.log.write_text("")
+        self.verify("--team-id", TEAM, self.staging)
+        self.assertFalse(any("--check-notarization" in c for c in self.calls("codesign")))
 
     def test_a_failing_verification_is_reported(self):
         self.macho("pohunek")
