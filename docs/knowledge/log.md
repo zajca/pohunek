@@ -7,6 +7,12 @@
   it, and that the doctor `netbird_cli` check uses the same lookup. Added the
   macOS host section of the remote-hosts guide (listener binding, sleep and wake,
   troubleshooting).
+- Added the macOS install runbook: archives and what each installs, verification
+  with `shasum`/`codesign`/`spctl`, daemon install, start/status/stop with the
+  launchd label, GUI and web backend, upgrade without lost sessions, rollback,
+  uninstall (refused with live sessions, `--stop-sessions` and `--purge`
+  explicit), log locations, logout/reboot/sleep semantics, and Gatekeeper
+  remediation that never disables it.
 - Documented the owner web backend's macOS archive and launchd agent: separate
   client service labelled with the daemon namespace, `plutil`-written property
   list, allowlisted non-secret environment copied from `backend.env`, bounded

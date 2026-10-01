@@ -36,8 +36,8 @@ Start here:
 - [Debug daemon](runbooks/debug-daemon.md),
   [debug session runtime](runbooks/debug-session-runtime.md),
   [debug launcher](runbooks/debug-launcher.md), and
-  [update after release](runbooks/update-after-release.md) are operational
-  runbooks.
+  [update after release](runbooks/update-after-release.md), and
+  [install on macOS](runbooks/install-on-macos.md) are operational runbooks.
 - [Trust model](safety/trust-model.md), [secrets](safety/secrets.md), and
   [repo `.pohunek/`](safety/repo-pohunek.md) are safety rules.
 - [Assistant system prompt](assistant/system.md) and
