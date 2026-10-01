@@ -661,9 +661,9 @@ landscape orientations.
 
 For local UI development with two fixture daemons, run `bun run dev` from
 `web/`; no Rust daemon or NetBird setup is required. Bun remains the workspace
-runtime, while the development orchestrator requires `node` on `PATH` to run
-Vite's WebSocket proxy in a compatible Node child process. Set
-`POHUNEK_NODE_BIN` only when the Node executable has a nonstandard path. A
+runtime, while the development orchestrator locates Node (`POHUNEK_NODE_BIN`, then
+`PATH`, then the Homebrew and installer prefixes on macOS) to run Vite's
+WebSocket proxy in a compatible Node child process. A
 deployed backend binds only to a NetBird address (loopback requires the explicit
 development flag; wildcard binds are rejected). The supplied systemd user unit
 and its environment file instructions are in

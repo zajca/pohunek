@@ -14,6 +14,23 @@ export {
   loadBackendConfig,
 } from "./config";
 export type { BackendConfig } from "./config";
+export {
+  APP_DIR,
+  MACOS_DEFAULT_RUNTIME_PREFIX,
+  RuntimePathError,
+  SOCKET_NAME,
+  SOCKET_PATH_MAX_BYTES,
+  currentRuntimePathContext,
+  resolveDaemonSocket,
+  resolveRuntimeDir,
+  validateSocketPath,
+} from "./runtime-paths";
+export type {
+  RuntimePathContext,
+  RuntimePathFailure,
+  RuntimePathReason,
+  RuntimePlatform,
+} from "./runtime-paths";
 export { externalFqdnSelector, externalPeerSelector } from "./identity";
 export { BackendStartupError, startHostsPipeline } from "./hosts";
 export type {

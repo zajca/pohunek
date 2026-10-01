@@ -1,12 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { constants, readFileSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import {
+  MACOS_DEFAULT_RUNTIME_PREFIX,
+  loadBackendConfig,
   startBackendFromEnv,
   type BackendHandle,
   type BackendHostEntry,
@@ -23,7 +24,7 @@ import {
   type Request,
   type Subscription,
 } from "@pohunek/sdk/browser";
-import { startDurableWorkerFixture } from "@pohunek/testkit";
+import { createFixtureRoot, startDurableWorkerFixture } from "@pohunek/testkit";
 
 const E2E_ENABLED = process.env["POHUNEK_E2E"] === "1";
 
@@ -130,6 +131,20 @@ interface SkippableTest {
 
 const skippableTest = test as SkippableTest;
 const realDaemonTest: SkippableTest = E2E_ENABLED ? skippableTest : skippableTest.skip;
+// The controlled Hermes scenario preloads a Linux socket interposer
+// (`LD_PRELOAD`, `/proc/self/stat`); `hermes-compatibility-macos` covers the
+// plugin natively on macOS.
+const pluginDaemonTest: SkippableTest = process.platform === "linux"
+  ? realDaemonTest
+  : skippableTest.skip;
+// The owner default `/private/tmp/pohunek-<uid>` is shared by every daemon of
+// the user, so a developer's own daemon would collide with it. The CI runner is
+// ephemeral and opts in.
+const DEFAULT_RUNTIME_E2E_ENABLED = process.platform === "darwin"
+  && process.env["POHUNEK_E2E_DEFAULT_RUNTIME"] === "1";
+const macosDefaultRuntimeTest: SkippableTest = E2E_ENABLED && DEFAULT_RUNTIME_E2E_ENABLED
+  ? skippableTest
+  : skippableTest.skip;
 
 realDaemonTest(
   "real pohunekd supports the browser lifecycle through the backend origin",
@@ -147,7 +162,25 @@ realDaemonTest(
   E2E_TEST_TIMEOUT_MS + BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS,
 );
 
-realDaemonTest(
+macosDefaultRuntimeTest(
+  "backend reaches a real pohunekd that uses the macOS default runtime directory",
+  async () => {
+    await withTimeout(
+      withDaemon(async (daemon) => {
+        expect(daemon.env["XDG_RUNTIME_DIR"]).toBeUndefined();
+        expect(daemon.socketPath).toBe(`/private/tmp/pohunek-${String(process.geteuid?.())}/daemon.sock`);
+        await withBackend(daemon, async (backend) => {
+          await runBrowserScenario(daemon, backend);
+        });
+      }, { defaultRuntime: true }),
+      E2E_TEST_TIMEOUT_MS,
+      `default-runtime real-daemon e2e did not finish within ${E2E_TEST_TIMEOUT_MS}ms`,
+    );
+  },
+  E2E_TEST_TIMEOUT_MS + BUN_TEST_TIMEOUT_BACKSTOP_MARGIN_MS,
+);
+
+pluginDaemonTest(
   "embedded Hermes plugin tools control a real durable shell session",
   async () => {
     const prerequisites = await pluginPrerequisites();
@@ -559,8 +592,11 @@ async function runBrowserScenario(
   }
 }
 
-async function withDaemon<T>(run: (daemon: DaemonHarness) => Promise<T>): Promise<T> {
-  const daemon = await startDaemon();
+async function withDaemon<T>(
+  run: (daemon: DaemonHarness) => Promise<T>,
+  options: DaemonOptions = {},
+): Promise<T> {
+  const daemon = await startDaemon(undefined, options);
   let result: T | undefined;
   let failure: unknown;
 
@@ -616,17 +652,20 @@ async function withBackend<T>(
   daemon: DaemonHarness,
   run: (backend: BackendHandle) => Promise<T>,
 ): Promise<T> {
-  const backend = await startBackendFromEnv(
-    {
-      POHUNEK_BACKEND_BIND_HOST: LOOPBACK_HOST,
-      POHUNEK_BACKEND_PORT: "0",
-      POHUNEK_BACKEND_ALLOW_LOOPBACK: "1",
-      POHUNEK_BACKEND_DAEMON_SOCKET: daemon.socketPath,
-      POHUNEK_BACKEND_DISCOVER_INTERVAL: BACKEND_DISCOVER_INTERVAL_SECONDS,
-      POHUNEK_BACKEND_STATIC_DIR: daemon.tempRoot,
-    },
-    silentLogger,
-  );
+  // No socket override: the backend must resolve the socket the daemon bound
+  // from the same environment, with the production resolver.
+  const backendEnv: NodeJS.ProcessEnv = {
+    POHUNEK_BACKEND_BIND_HOST: LOOPBACK_HOST,
+    POHUNEK_BACKEND_PORT: "0",
+    POHUNEK_BACKEND_ALLOW_LOOPBACK: "1",
+    POHUNEK_BACKEND_DISCOVER_INTERVAL: BACKEND_DISCOVER_INTERVAL_SECONDS,
+    POHUNEK_BACKEND_STATIC_DIR: daemon.tempRoot,
+    ...(daemon.env["XDG_RUNTIME_DIR"] === undefined
+      ? {}
+      : { XDG_RUNTIME_DIR: daemon.env["XDG_RUNTIME_DIR"] }),
+  };
+  expect(loadBackendConfig(backendEnv).daemonSocketPath).toBe(daemon.socketPath);
+  const backend = await startBackendFromEnv(backendEnv, silentLogger);
   let result: T | undefined;
   let failure: unknown;
 
@@ -651,12 +690,18 @@ async function withBackend<T>(
   return result as T;
 }
 
-function startDaemon(): Promise<DaemonHarness>;
+interface DaemonOptions {
+  /** Leave `XDG_RUNTIME_DIR` unset so the daemon picks its platform default runtime directory. */
+  readonly defaultRuntime?: boolean;
+}
+
+function startDaemon(plugin?: undefined, options?: DaemonOptions): Promise<DaemonHarness>;
 function startDaemon(plugin: PluginPrerequisites): Promise<PluginDaemonHarness>;
 async function startDaemon(
   plugin?: PluginPrerequisites,
+  options: DaemonOptions = {},
 ): Promise<DaemonHarness | PluginDaemonHarness> {
-  const tempRoot = await mkdtemp(join(tmpdir(), "pohunek-backend-e2e-"));
+  const tempRoot = await createFixtureRoot("pk-be-");
   const dirs = {
     runtime: join(tempRoot, "runtime"),
     data: join(tempRoot, "data"),
@@ -689,8 +734,11 @@ async function startDaemon(
   let exitStatus: ExitStatus | undefined;
   let spawnError: Error | undefined;
 
+  const defaultRuntimeDir = options.defaultRuntime === true
+    ? await claimDefaultRuntimeDir()
+    : undefined;
   const isolatedEnv: NodeJS.ProcessEnv = {
-    XDG_RUNTIME_DIR: dirs.runtime,
+    ...(defaultRuntimeDir === undefined ? { XDG_RUNTIME_DIR: dirs.runtime } : {}),
     XDG_DATA_HOME: dirs.data,
     XDG_STATE_HOME: dirs.state,
     XDG_CACHE_HOME: dirs.cache,
@@ -708,7 +756,7 @@ async function startDaemon(
     }),
   };
   const daemonEnv = plugin === undefined
-    ? { ...process.env, ...isolatedEnv }
+    ? { ...withoutRuntimeDir(process.env, defaultRuntimeDir !== undefined), ...isolatedEnv }
     : isolatedEnv;
   const child = spawn(daemonBin, [], {
     cwd: tempRoot,
@@ -732,17 +780,25 @@ async function startDaemon(
     return exitStatus;
   });
 
-  const socketPath = join(dirs.runtime, APP_DIR, SOCKET_NAME);
+  const socketPath = defaultRuntimeDir === undefined
+    ? join(dirs.runtime, APP_DIR, SOCKET_NAME)
+    : join(defaultRuntimeDir, SOCKET_NAME);
   const logs = (): Pick<DaemonHarness, "stdout" | "stderr"> => ({
     stdout: () => stdoutChunks.join(""),
     stderr: () => stderrChunks.join(""),
   });
+  const removeRoots = async (): Promise<void> => {
+    await rm(tempRoot, { recursive: true, force: true });
+    if (defaultRuntimeDir !== undefined) {
+      await rm(defaultRuntimeDir, { recursive: true, force: true });
+    }
+  };
 
   try {
     await waitForDaemonSocket(socketPath, () => exitStatus, () => spawnError, logs);
   } catch (error: unknown) {
     await stopChild(child, exitPromise, () => exitStatus).catch(() => undefined);
-    await rm(tempRoot, { recursive: true, force: true });
+    await removeRoots();
     throw error;
   }
 
@@ -758,7 +814,7 @@ async function startDaemon(
     ...logs(),
     stop: async (): Promise<void> => {
       const status = await stopChild(child, exitPromise, () => exitStatus);
-      await rm(tempRoot, { recursive: true, force: true });
+      await removeRoots();
       if (status.code !== 0 || status.signal !== null) {
         throw new Error(
           `pohunekd exited uncleanly (code=${String(status.code)}, signal=${String(status.signal)})\n`
@@ -767,6 +823,36 @@ async function startDaemon(
       }
     },
   };
+}
+
+/**
+ * Returns the macOS default runtime directory after proving this run owns it.
+ * An existing directory belongs to a daemon of the same user, and removing it
+ * at teardown would destroy that daemon's socket.
+ */
+async function claimDefaultRuntimeDir(): Promise<string> {
+  const uid = process.geteuid?.();
+  if (uid === undefined) {
+    throw new Error("the effective user id is unavailable");
+  }
+  const runtimeDir = `${MACOS_DEFAULT_RUNTIME_PREFIX}${String(uid)}`;
+  const present = await access(runtimeDir).then(() => true, () => false);
+  if (present) {
+    throw new Error(
+      `${runtimeDir} already exists; stop the daemon using the default runtime directory `
+        + "before running the default-runtime e2e",
+    );
+  }
+  return runtimeDir;
+}
+
+function withoutRuntimeDir(env: NodeJS.ProcessEnv, remove: boolean): NodeJS.ProcessEnv {
+  if (!remove) {
+    return env;
+  }
+  const rest = { ...env };
+  delete rest["XDG_RUNTIME_DIR"];
+  return rest;
 }
 
 async function isolatedDurableWorkerFixture(

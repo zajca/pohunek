@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-09-29)
 
+- Documented that the Bun owner backend resolves the daemon socket with the shared
+  runtime-path contract (including the macOS default and the native socket path
+  limit) and Node discovery for the dev stack.
 - Documented the executable search-path policy: the `service.toml`
   `[environment] search_path` key, the `service_search_path_unavailable` error
   code, and the environment-resolution guide.

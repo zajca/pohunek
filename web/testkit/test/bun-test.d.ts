@@ -20,4 +20,5 @@ declare module "bun:test" {
   export const expect: Expect;
   export function describe(name: string, fn: () => void): void;
   export const test: Test;
+  export function afterAll(fn: () => void | Promise<void>): void;
 }

@@ -2,6 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  resolveDaemonSocket,
+  resolveRuntimeDir,
+  RuntimePathError,
+  type RuntimePathContext,
+} from "@pohunek/backend";
 
 const FIXTURE_PATH = resolve(
   dirname(fileURLToPath(import.meta.url)),
@@ -101,6 +107,56 @@ describe("shared runtime path contract", () => {
     }
   });
 });
+
+describe("backend runtime path resolver", () => {
+  test("agrees with every case of the shared fixture", () => {
+    const fixture = readFixture();
+    for (const fixtureCase of fixture.cases) {
+      const context: RuntimePathContext = {
+        platform: fixtureCase.platform,
+        effectiveUid: fixtureCase.effective_uid,
+      };
+      const env = { ...fixtureCase.env };
+      const failure = fixtureCase.error;
+      if (failure !== undefined && failure.var === "XDG_RUNTIME_DIR") {
+        const caught = captureRuntimePathError(() => resolveRuntimeDir(context, env));
+        expect(caught.failure.variant === failure.variant).toBe(true);
+        expect(caught.variable).toBe(failure.var);
+        if (caught.failure.variant === "invalid_env") {
+          expect(caught.failure.reason).toBe(failure.reason);
+        }
+        continue;
+      }
+      // Cases that fail on a durable-state variable still resolve a runtime directory.
+      const runtimeDir = fixtureCase.expected?.runtime_dir
+        ?? fixtureCase.expected_runtime_dir
+        ?? deriveRuntimeDir(fixtureCase.platform, fixtureCase.effective_uid, fixtureCase.env);
+      expect(resolveRuntimeDir(context, env)).toBe(runtimeDir);
+      if (fixtureCase.expected !== undefined) {
+        expect(resolveDaemonSocket(context, env)).toBe(fixtureCase.expected.socket);
+      }
+    }
+  });
+
+  test("uses the effective uid of the macOS default, not a fixed one", () => {
+    const env = { HOME: "/Users/someone" };
+    for (const effectiveUid of [0, 501, 4_294_967_294]) {
+      expect(resolveRuntimeDir({ platform: "macos", effectiveUid }, env)).toBe(
+        `/private/tmp/pohunek-${effectiveUid}`,
+      );
+    }
+  });
+});
+
+function captureRuntimePathError(action: () => unknown): RuntimePathError {
+  try {
+    action();
+  } catch (error: unknown) {
+    if (error instanceof RuntimePathError) return error;
+    throw error;
+  }
+  throw new Error("expected a RuntimePathError");
+}
 
 function readFixture(): RuntimePathFixture {
   const value: unknown = JSON.parse(readFileSync(FIXTURE_PATH, "utf8"));

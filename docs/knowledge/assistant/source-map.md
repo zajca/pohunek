@@ -102,6 +102,9 @@ Web control center client:
 - `web/sdk/src/origin.ts`
 - `web/sdk/src/transport.ts`
 - `web/backend/src/config.ts`
+- `web/backend/src/runtime-paths.ts`
+- `web/testkit/src/runtime-root.ts`
+- `web/scripts/node-executable.ts`
 - `web/backend/src/hosts.ts`
 - `web/backend/src/server.ts`
 - `web/backend/systemd/pohunek-backend.service`
