@@ -97,7 +97,9 @@ process_gone() {
 # SIGKILL after the grace period. Sets `leftover=yes` when one survives.
 sweep_run_processes() {
   [ -n "$work" ] && [ -d "$work" ] || return 0
-  pids=$(ps -axeww -o pid=,comm=,command= 2>/dev/null |
+  # `ucomm` is the bare process name; `comm` is argv[0], which holds spaces
+  # when the prefix does.
+  pids=$(ps -axeww -o pid=,ucomm=,command= 2>/dev/null |
     awk -v prefix="$work/" -v self="$$" '
       index($0, prefix) > 0 && $1 != self {
         name = $2
@@ -511,6 +513,16 @@ while :; do
   sleep 1
   waited=$((waited + 1))
 done
+# What uninstall must keep: the host identity, the governance record, and the
+# session metadata. The lock file the uninstall leaves behind is not durable
+# state, so the check names these records instead of "any file".
+host_id_of() {
+  "$python_bin" -c 'import json, sys; print(json.load(open(sys.argv[1]))["host_id"])' "$work/state/pohunek/host/identity.json"
+}
+host_id_before=$(host_id_of) || die "cannot read the host identity before uninstall"
+[ -s "$work/state/pohunek/host/governance.json" ] || die "no governance record before uninstall"
+[ -s "$work/data/pohunek/metadata.jsonl" ] || die "no session metadata before uninstall"
+metadata_bytes_before=$(wc -c <"$work/data/pohunek/metadata.jsonl" | tr -d ' ')
 iso_env "$installed_cli" service uninstall >"$work/ev/uninstall.out" 2>"$work/ev/uninstall.err" ||
   die "uninstall failed; see $work/ev/uninstall.err"
 /bin/launchctl print "gui/$uid/$label_prefix.$namespace.daemon" >/dev/null 2>&1 &&
@@ -521,8 +533,11 @@ iso_env "$installed_cli" service uninstall >"$work/ev/uninstall.out" 2>"$work/ev
   die "an installed version directory remains after uninstall"
 [ ! -e "$installed_cli" ] || die "$installed_cli remains after uninstall"
 # Durable HostId, governance keys, and session history are never implicit cleanup.
-[ -d "$work/state/pohunek" ] && [ -n "$(find "$work/state/pohunek" -type f -print -quit)" ] ||
-  die "the durable state directory is gone or empty after uninstall"
+[ "$(host_id_of)" = "$host_id_before" ] || die "uninstall changed the host identity"
+[ -s "$work/state/pohunek/host/governance.json" ] || die "uninstall removed the governance record"
+[ -s "$work/data/pohunek/metadata.jsonl" ] || die "uninstall removed the session metadata"
+[ "$(wc -c <"$work/data/pohunek/metadata.jsonl" | tr -d ' ')" -ge "$metadata_bytes_before" ] ||
+  die "uninstall truncated the session metadata"
 installed_cli=
 # Every process the last snapshot recorded (daemon, workers, session children)
 # must be gone: a leak after a successful uninstall is a failure, not something
@@ -536,6 +551,6 @@ for pid in $recorded_pids; do
     waited=$((waited + 1))
   done
 done
-printf 'uninstall removed the jobs, versions, and service.toml; durable state remains in %s\n' "$work/state/pohunek"
+printf 'uninstall removed the jobs, versions, and service.toml; host identity %s, governance, and session metadata remain\n' "$host_id_before"
 
 printf '\nmacos-package-install: all checks passed\n'
