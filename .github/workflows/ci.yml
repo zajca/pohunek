@@ -527,11 +527,34 @@ jobs:
           git checkout -- Cargo.toml Cargo.lock
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+
+      - name: Install web dependencies
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      # The compiled backend for Apple Silicon (Bun runtime plus SPA), smoke
+      # tested by package.sh, packaged without signing.
+      - name: Build and package the owner web archive
+        id: package-web
+        shell: bash
+        run: |
+          set -euo pipefail
+          input="$(bash web/release/package.sh "${{ steps.package-a.outputs.version }}" aarch64-apple-darwin --input-only | tail -n 1)"
+          mkdir -p "$RUNNER_TEMP/dist-web"
+          archive="$(packaging/macos/package --development web "${{ steps.package-a.outputs.version }}" \
+            "$input" web "$RUNNER_TEMP/dist-web")"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
       - name: Install, upgrade, and uninstall from the archives
         timeout-minutes: 20
         env:
           PKG_ACCEPT_ARCHIVE: ${{ steps.package-a.outputs.archive }}
           PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
+          PKG_ACCEPT_WEB_ARCHIVE: ${{ steps.package-web.outputs.archive }}
         run: scripts/acceptance/macos-package-install
 
       # The unsigned development app bundle: its Info.plist identity, the audit,
@@ -789,6 +812,7 @@ jobs:
               - 'scripts/acceptance/macos-package-install'
               - 'scripts/acceptance/launchd_lifetime_evidence.py'
               - 'scripts/smoke-gui-release-macos'
+              - 'web/release/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'

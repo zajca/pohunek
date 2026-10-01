@@ -7,6 +7,11 @@
   it, and that the doctor `netbird_cli` check uses the same lookup. Added the
   macOS host section of the remote-hosts guide (listener binding, sleep and wake,
   troubleshooting).
+- Documented the owner web backend's macOS archive and launchd agent: separate
+  client service labelled with the daemon namespace, `plutil`-written property
+  list, allowlisted non-secret environment copied from `backend.env`, bounded
+  private logs, `install.sh --uninstall` keeping configuration and logs, and the
+  shared `packaging/verify-archive` preflight.
 - Documented the macOS GUI app bundle (`Pohunek.app`, identifier
   `io.github.zajca.pohunek.gui`), how it finds the installed CLI, and the
   Developer ID signing and notarization pipeline of the release workflow

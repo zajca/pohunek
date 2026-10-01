@@ -3,10 +3,11 @@
 #
 # usage: stage-archive <component> <version> <target> <bindir> <docs-dir> <output-dir>
 #
-# <component> is cli, daemon, gui, or relay. <bindir> holds the built
+# <component> is cli, daemon, gui, relay, or web. <bindir> holds the built
 # binaries (a `Pohunek.app` bundle instead of `pohunek-gui` for the macOS gui
 # component); <docs-dir> is the `cargo xtask docs site` output with `offline/`
-# and `manifest.json`. The staging directory <output-dir>/<name> is created
+# and `manifest.json` (the web component takes its own assets and ignores it).
+# The staging directory <output-dir>/<name> is created
 # fresh and the archive name `<prefix>-<version>-<target>` is printed on
 # stdout. Run from the repository root: the installer, the smoke script, the
 # README, and the license are copied from it.
@@ -34,6 +35,7 @@ case $component in
     daemon) prefix=pohunek-daemon ;;
     gui) prefix=pohunek-gui ;;
     relay) prefix=pohunek-relay ;;
+    web) prefix=pohunek-web ;;
     *) fail "unsupported component: $component" ;;
 esac
 case $version in
@@ -47,13 +49,16 @@ case $target in
     '' | *[!a-z0-9_-]*) fail "target must be a lowercase target triple: $target" ;;
 esac
 [ -d "$bindir" ] || fail "not a directory: $bindir"
-[ -d "$docs/offline" ] || fail "missing offline documentation: $docs/offline"
-[ -f "$docs/manifest.json" ] || fail "missing documentation manifest: $docs/manifest.json"
+if [ "$component" != web ]; then
+    [ -d "$docs/offline" ] || fail "missing offline documentation: $docs/offline"
+    [ -f "$docs/manifest.json" ] || fail "missing documentation manifest: $docs/manifest.json"
+fi
 mkdir -p "$output"
 [ -d "$output" ] || fail "not a directory: $output"
 for extra in README.md LICENSE; do
     [ -f "$extra" ] || fail "required release file is missing: $extra (run from the repository root)"
 done
+[ -f packaging/verify-archive ] || fail "packaging/verify-archive is missing (run from the repository root)"
 
 name="$prefix-$version-$target"
 staging="$output/$name"
@@ -76,7 +81,7 @@ case $component in
         copy_binary pohunek
         copy_binary pohunek-sessiond
         mkdir -p "$staging/packaging"
-        cp packaging/install-daemon.sh "$staging/packaging/"
+        cp packaging/install-daemon.sh packaging/verify-archive "$staging/packaging/"
         ;;
     gui)
         case $target in
@@ -90,6 +95,14 @@ case $component in
     relay)
         copy_binary pohunek-relayd
         ;;
+    web)
+        # The web archive is assembled by web/release/package.sh; <bindir> is
+        # its input tree (backend executable, frontend, installer, README).
+        cp -Rp "$bindir/." "$staging/"
+        mkdir -p "$staging/packaging"
+        cp packaging/verify-archive "$staging/packaging/"
+        cp LICENSE "$staging/"
+        ;;
 esac
 
 if [ "$component" = cli ] || [ "$component" = daemon ]; then
@@ -99,9 +112,11 @@ if [ "$component" = cli ] || [ "$component" = daemon ]; then
     "$bindir/pohunek" completions fish > "$staging/completions/pohunek.fish"
 fi
 
-mkdir -p "$staging/docs"
-cp -R "$docs/offline" "$staging/docs/offline"
-cp "$docs/manifest.json" "$staging/docs/manifest.json"
-cp README.md LICENSE "$staging/"
+if [ "$component" != web ]; then
+    mkdir -p "$staging/docs"
+    cp -R "$docs/offline" "$staging/docs/offline"
+    cp "$docs/manifest.json" "$staging/docs/manifest.json"
+    cp README.md LICENSE "$staging/"
+fi
 
 printf '%s\n' "$name"

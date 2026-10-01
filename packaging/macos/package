@@ -6,8 +6,10 @@
 #   package --stage-release <component> <version> <bindir> <docs-dir> <output-dir>
 #   package --sign-release  <component> <version> <staging-dir>
 #
-# <component> is cli, daemon, or gui (the gui archive holds Pohunek.app, built
-# here from <bindir>/pohunek-gui). The staged tree is audited (`audit-macho`),
+# <component> is cli, daemon, gui, or web (the gui archive holds Pohunek.app,
+# built here from <bindir>/pohunek-gui; for web, <bindir> is the input tree of
+# `web/release/package.sh <version> aarch64-apple-darwin --input-only` and
+# <docs-dir> is ignored but must exist). The staged tree is audited (`audit-macho`),
 # then sealed with a MANIFEST and archived reproducibly; the archive path is
 # printed on stdout.
 #
@@ -57,6 +59,7 @@ case $component in
     cli) require="--require pohunek" ;;
     daemon) require="--require pohunek --require pohunekd --require pohunek-sessiond" ;;
     gui) require="--require Pohunek.app/Contents/MacOS/pohunek-gui" ;;
+    web) require="--require pohunek-web --no-string-scan" ;;
     *) fail "unsupported component: $component" ;;
 esac
 
@@ -141,6 +144,8 @@ if [ "$mode" = --development ] && [ "$component" = gui ]; then
     codesign --verify --strict --deep "$staging/Pohunek.app" >&2
 fi
 
+# The Bun runtime embedded in the web backend carries its own build paths, so
+# its string scan is skipped through $require.
 # shellcheck disable=SC2086
 "$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2
 if [ "$mode" = --stage-release ]; then

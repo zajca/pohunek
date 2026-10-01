@@ -500,7 +500,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, gui]
+        component: [cli, daemon, gui, web]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -511,25 +511,48 @@ jobs:
         run: test "$(uname -m)" = "arm64"
 
       - name: Install Rust toolchain
+        if: matrix.component != 'web'
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
 
       - name: Cache cargo build
+        if: matrix.component != 'web'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-macos-${{ matrix.component }}
 
       - name: Build offline documentation
+        if: matrix.component != 'web'
         run: cargo xtask docs site
 
       - name: Build release binaries
+        if: matrix.component != 'web'
         id: build
         shell: bash
         run: |
           set -euo pipefail
           bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
           echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
+
+      - name: Install Bun
+        if: matrix.component == 'web'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+
+      - name: Install web dependencies
+        if: matrix.component == 'web'
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      # The compiled backend (Bun runtime plus the compiled SPA), smoke-tested
+      # unsigned by package.sh; signing happens in the signing job.
+      - name: Build the web control center input tree
+        if: matrix.component == 'web'
+        id: webinput
+        shell: bash
+        run: bash web/release/package.sh "${GITHUB_REF_NAME#v}" aarch64-apple-darwin --input-only
 
       # Staging runs the built `pohunek` to write the shell completions, which
       # is why it happens here and not next to the credentials.
@@ -544,7 +567,8 @@ jobs:
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
           staging="$(packaging/macos/package --stage-release "${{ matrix.component }}" "${version}" \
-            "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist)"
+            "${{ matrix.component == 'web' && steps.webinput.outputs.input || steps.build.outputs.bindir }}" \
+            "${{ matrix.component == 'web' && 'web' || 'target/pohunek-docs' }}" dist)"
           # A tar keeps the modes that an artifact upload would drop.
           mkdir -p "$RUNNER_TEMP/stage-upload"
           tar -cf "$RUNNER_TEMP/stage-upload/stage.tar" -C "$(dirname "$staging")" "$(basename "$staging")"
@@ -567,7 +591,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, gui]
+        component: [cli, daemon, gui, web]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -682,7 +706,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, gui]
+        component: [cli, daemon, gui, web]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -729,6 +753,29 @@ jobs:
           for binary in pohunek pohunekd pohunek-sessiond; do
             "$root/$binary" --version
           done
+
+      # The signed backend runs under the hardened runtime with its JIT
+      # entitlements, serving the compiled SPA from the extracted archive.
+      - name: Install Bun
+        if: matrix.component == 'web'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.11
+
+      - name: Install web dependencies
+        if: matrix.component == 'web'
+        working-directory: web
+        run: bun install --frozen-lockfile
+
+      - name: Smoke-test the packaged web backend
+        if: matrix.component == 'web'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${{ steps.extract.outputs.root }}"
+          test -x "$root/install.sh"
+          test -f "$root/packaging/verify-archive"
+          ( cd web && bun run release/smoke.ts "$root/pohunek-web" "$root/frontend" )
 
       - name: Smoke-test the packaged app bundle
         if: matrix.component == 'gui'
@@ -795,7 +842,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, gui]
+        component: [cli, daemon, gui, web]
     steps:
       - name: Download the signed archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

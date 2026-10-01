@@ -2,7 +2,7 @@
 # Audit the Mach-O files below the given paths for a native Apple Silicon
 # release.
 #
-# usage: audit-macho [--minimum-os X.Y] [--forbid-string TEXT]... [--require REL]... <path>...
+# usage: audit-macho [--minimum-os X.Y] [--forbid-string TEXT]... [--require REL]... [--no-string-scan] <path>...
 #
 # Every Mach-O file found (a file argument, or any regular file below a
 # directory argument) must be
@@ -17,7 +17,9 @@
 # is found at all, so a mistyped path cannot pass. Each `--require REL` names a
 # file, relative to the single directory argument, that must itself be a Mach-O
 # file: a required program that is a script, a Linux binary, or missing fails
-# even though the rest of the tree is fine. It needs `otool`, `lipo`,
+# even though the rest of the tree is fine. `--no-string-scan` skips the
+# build-machine path check for a third-party executable that embeds its own
+# build paths (the Bun runtime inside the web backend); every other check stays. It needs `otool`, `lipo`,
 # and `strings` from the Xcode command line tools.
 
 set -eu
@@ -40,6 +42,7 @@ fail() {
 minimum_os=$(tr -d ' \n' < "$script_dir/DEPLOYMENT_TARGET")
 forbidden=$DEFAULT_FORBIDDEN_STRINGS
 required=
+string_scan=yes
 paths=
 
 while [ "$#" -gt 0 ]; do
@@ -55,6 +58,10 @@ while [ "$#" -gt 0 ]; do
             forbidden="$forbidden
 $2"
             shift 2
+            ;;
+        --no-string-scan)
+            string_scan=no
+            shift
             ;;
         --require)
             [ "$#" -ge 2 ] || fail "--require needs a value"
@@ -174,7 +181,8 @@ audit_file() {
         failures=$((failures + $(wc -l < "$scratch/library-failures")))
     fi
 
-    if ! strings -a "$file" > "$scratch/strings" 2>/dev/null; then
+    : > "$scratch/strings"
+    if [ "$string_scan" = yes ] && ! strings -a "$file" > "$scratch/strings" 2>/dev/null; then
         problem "$file" "strings cannot read it, so the build-machine path check did not run"
     fi
     printf '%s\n' "$forbidden" | while IFS= read -r needle; do

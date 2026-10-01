@@ -11,7 +11,9 @@
 # notarization requires. Bare binaries get the stable identifier
 # `io.github.zajca.pohunek.<file name>`; an app bundle is signed after its
 # executable and takes its identifier from its Info.plist. No entitlement is
-# requested: none of the shipped programs needs one.
+# requested unless `packaging/macos/entitlements/<file name>.plist` exists: the
+# Bun runtime inside `pohunek-web` needs the JIT entitlements Bun documents for
+# signed standalone executables.
 
 set -eu
 
@@ -30,6 +32,7 @@ for tool in codesign od find; do
 done
 
 identifier_prefix=io.github.zajca.pohunek
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 is_macho() {
     case $(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n') in
@@ -57,9 +60,16 @@ while IFS= read -r file; do
     is_macho "$file" || continue
     name=$(basename "$file")
     printf 'signing %s\n' "$file"
-    codesign --force --options runtime --timestamp \
-        --sign "$MACOS_SIGNING_IDENTITY" --keychain "$MACOS_SIGNING_KEYCHAIN" \
-        --identifier "$identifier_prefix.$name" "$file"
+    entitlements=$script_dir/entitlements/$name.plist
+    if [ -f "$entitlements" ]; then
+        codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" --keychain "$MACOS_SIGNING_KEYCHAIN" \
+            --identifier "$identifier_prefix.$name" --entitlements "$entitlements" "$file"
+    else
+        codesign --force --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" --keychain "$MACOS_SIGNING_KEYCHAIN" \
+            --identifier "$identifier_prefix.$name" "$file"
+    fi
     codesign --verify --strict --verbose=2 "$file"
     signed=$((signed + 1))
 done < "$scratch/files"

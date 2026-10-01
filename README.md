@@ -236,10 +236,11 @@ runtime dependencies; there is no self-contained MUSL GUI archive. Every
 archive contains its license and offline documentation under `docs/offline/`.
 Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
 `packaging/install-daemon.sh` wrapper around `pohunek service install`.
-Every CLI, daemon, GUI, and relay archive is packed deterministically (members
-sorted, root-owned, stamped with the tagged commit time) and carries a `MANIFEST`
-with the SHA-256 of every member; the daemon installer verifies it, the host OS
-and architecture, and member permissions before it runs or changes anything.
+Every CLI, daemon, GUI, relay, and web archive is packed deterministically
+(members sorted, root-owned, stamped with the tagged commit time) and carries a
+`MANIFEST` with the SHA-256 of every member; the daemon and web installers verify
+it, the host OS and architecture, and member permissions before they run or
+change anything.
 
 Releases also publish `pohunek-web-*-linux-x86_64.tar.gz`: a standalone web
 control-center backend with Bun embedded, its compiled SPA, and a user-service
