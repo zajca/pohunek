@@ -598,10 +598,14 @@ pub fn validate_attach_shell_template(template: &str) -> Result<(), AttachTempla
 ///
 /// Returns the structural errors of [`render_attach_argv`].
 pub fn validate_attach_argv_template(template: &str) -> Result<(), AttachTemplateError> {
-    if split_template_words(template)?.is_empty() {
-        return Err(AttachTemplateError::EmptyCommand);
-    }
-    Ok(())
+    // The renderer is the single code path: probe values are non-empty, NUL-free
+    // and placeholder-free, so only the template itself can fail.
+    let probe = AttachTemplateValues {
+        bin: "bin".to_owned(),
+        host: "host".to_owned(),
+        id: "id".to_owned(),
+    };
+    render_attach_argv(template, &probe).map(drop)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1522,6 +1526,38 @@ mod attach_template_tests {
             "kitty -e {bin} --host={host} attach -- {id}",
         ] {
             assert_eq!(validate_attach_shell_template(template), Ok(()), "{template}");
+        }
+    }
+
+    #[test]
+    fn argv_validation_and_rendering_never_disagree() {
+        let probe = AttachTemplateValues {
+            bin: "bin".to_owned(),
+            host: "host".to_owned(),
+            id: "id".to_owned(),
+        };
+        for (template, expected) in [
+            ("kitty -e {bin} attach {id}", Ok(())),
+            ("'a b' {host}", Ok(())),
+            ("", Err(AttachTemplateError::EmptyCommand)),
+            ("   \t\n", Err(AttachTemplateError::EmptyCommand)),
+            ("''", Err(AttachTemplateError::EmptyProgram)),
+            ("\"\" x", Err(AttachTemplateError::EmptyProgram)),
+            ("kitty a\0b", Err(AttachTemplateError::NulByte)),
+            ("\0kitty", Err(AttachTemplateError::NulByte)),
+            ("kitty 'open", Err(AttachTemplateError::UnterminatedQuote)),
+            ("kitty \\", Err(AttachTemplateError::UnterminatedQuote)),
+        ] {
+            assert_eq!(
+                validate_attach_argv_template(template),
+                expected,
+                "{template:?}"
+            );
+            assert_eq!(
+                render_attach_argv(template, &probe).map(drop),
+                expected,
+                "{template:?}"
+            );
         }
     }
 

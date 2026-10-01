@@ -977,6 +977,55 @@ async fn check_and_install_agree_on_the_config_of_a_resumed_install() {
 }
 
 #[tokio::test]
+async fn rolling_back_an_interrupted_upgrade_needs_no_discovery() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for hostile in [true, false] {
+        let mut harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Binaries);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted upgrade");
+        assert!(harness.pending().is_some(), "an upgrade record is pending");
+
+        let marker = harness.root.join("probe-ran");
+        let shell = harness.root.join("marker-shell");
+        std::fs::write(
+            &shell,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("write shell");
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        harness.context = if hostile {
+            with_hostile_discovery_environment(&harness.context)
+        } else {
+            let discovery =
+                crate::service::context::managed_path_discovery(Some(shell), Vec::new())
+                    .expect("discovery");
+            harness.context.clone().with_path_discovery(discovery)
+        };
+        // `check` agrees: no discovery for the rollback of an upgrade.
+        let checked = crate::service::check_with(
+            &harness.context,
+            &harness.backend,
+            Some(harness.prefix()),
+            V1,
+            false,
+        )
+        .await;
+        assert!(!matches!(&checked, Err(error) if error.code() == "service_environment_invalid"));
+        // The install rolls the upgrade back, then finds the installation.
+        let error = harness.install(V1).await.expect_err("already installed");
+        assert_eq!(error.code(), "service_already_installed");
+        assert!(harness.pending().is_none(), "the rollback completed");
+        assert!(!marker.exists(), "no profile code ran");
+    }
+}
+
+#[tokio::test]
 async fn a_resume_refuses_a_service_toml_of_another_installation() {
     for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {
         let harness = Harness::new();

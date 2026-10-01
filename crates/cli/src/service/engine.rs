@@ -1499,9 +1499,15 @@ pub(crate) fn discover_for_plan(
 }
 
 /// Whether `plan` writes `service.toml` and so resolves the daemon `PATH`.
+///
+/// Rolling back an interrupted install leaves nothing installed, so install
+/// goes on to write a fresh file. Rolling back an interrupted upgrade restores
+/// the existing `service.toml`, so nothing is written and the rollback must
+/// need neither discovery nor a valid discovery environment.
 pub(crate) fn plan_discovers(plan: &Plan) -> bool {
     match plan {
-        Plan::Fresh | Plan::RollBack(_) => true,
+        Plan::Fresh => true,
+        Plan::RollBack(record) => record.operation == Operation::Install,
         Plan::Resume(record) => record.step < Step::Config,
     }
 }

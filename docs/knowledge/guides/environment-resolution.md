@@ -101,7 +101,8 @@ Discovery fails closed and never invents a value for required configuration:
 | `$SHELL` is unset | `/bin/zsh` is used and the report says so |
 
 The discovery environment is validated, and discovery run, before any install
-effect, including before a foreign pending transaction is rolled back, and
+effect, including before an interrupted install of another version is rolled
+back (rolling back an interrupted upgrade needs no discovery), and
 `pohunek service check` runs the same validation. If not even one trusted fallback directory exists, `pohunek service install`
 fails with `service_search_path_unavailable` instead of starting a daemon with
 an empty search path. A `HOME`, `USER`, or `LOGNAME` that is set but not UTF-8
