@@ -218,6 +218,26 @@ class SignTest(Base):
         # identifier of its own.
         self.assertFalse(any("--identifier" in c and "pohunek-gui" in c for c in self.calls("codesign")))
 
+    def test_the_web_backend_gets_its_jit_entitlements_and_nothing_else_does(self):
+        self.macho("pohunek-web")
+        self.macho("pohunek")
+        result = self.run_tool("sign", self.staging, env=SIGNING_ENV)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        signs = [c for c in self.calls("codesign") if "--sign" in c]
+        web = next(c for c in signs if c.endswith("/pohunek-web") or "pohunek-web" in c.split(" --entitlements ")[-1])
+        self.assertIn("--entitlements " + str(MACOS / "entitlements" / "pohunek-web.plist"), web)
+        other = next(c for c in signs if c.endswith("/pohunek"))
+        self.assertNotIn("--entitlements", other)
+        plist = (MACOS / "entitlements" / "pohunek-web.plist").read_text()
+        for key in (
+            "com.apple.security.cs.allow-jit",
+            "com.apple.security.cs.allow-unsigned-executable-memory",
+            "com.apple.security.cs.disable-executable-page-protection",
+            "com.apple.security.cs.allow-dyld-environment-variables",
+            "com.apple.security.cs.disable-library-validation",
+        ):
+            self.assertIn("<key>%s</key>" % key, plist)
+
     def test_missing_credentials_or_nothing_to_sign_fail(self):
         self.macho("pohunek")
         for missing in SIGNING_ENV:

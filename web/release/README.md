@@ -1,11 +1,13 @@
 # Pohunek web control center
 
-This archive contains the complete web control center for Linux x86_64:
+This archive contains the complete web control center for Linux x86_64 or
+macOS on Apple Silicon (the archive name says which):
 
 - `pohunek-web`, a standalone backend executable with Bun embedded;
 - `frontend/`, the built browser application served by that executable;
 - `install.sh`, which installs both under the current user's XDG data directory
-  and writes a systemd user unit; and
+  and writes a systemd user unit (Linux) or registers a launchd login agent
+  (macOS); and
 - `backend.env.example`, the required deployment configuration.
 
 It must run on the same host as a compatible `pohunekd` instance. The backend
@@ -49,3 +51,30 @@ and restart the running service afterward:
 systemctl --user daemon-reload
 systemctl --user restart pohunek-backend.service
 ```
+
+## macOS
+
+The `aarch64-apple-darwin` archive needs macOS 14 or newer and an installed
+daemon (`packaging/install-daemon.sh` from the daemon archive): the backend's
+launchd label carries the daemon installation's namespace, and installing,
+updating, or removing the backend never touches the daemon or any session.
+
+```sh
+./install.sh
+```
+
+creates `~/.config/pohunek/backend.env` (mode `0600`). Set
+`POHUNEK_BACKEND_BIND_HOST` and `POHUNEK_BACKEND_PORT`, then run `./install.sh`
+again: launchd has no environment file, so the installer copies the supported
+`POHUNEK_BACKEND_*` settings from `backend.env` into the agent
+`~/Library/LaunchAgents/io.github.zajca.pohunek.<namespace>.backend.plist` and
+registers it. Re-run it after every edit of `backend.env`. A setting the
+backend does not support, or one the installer manages (`POHUNEK_BACKEND_STATIC_DIR`,
+`POHUNEK_BACKEND_LOG_DIR`), is refused. The agent logs to the owner-private
+rotating `~/.local/state/pohunek/web-logs/pohunek-backend.jsonl`; a failure
+before the configuration loads goes to `launchd.stderr` in the same directory.
+
+Remove the agent and the installed files with `./install.sh --uninstall`; it
+keeps `backend.env` and the logs. If Gatekeeper refuses the downloaded
+executable, verify it with `codesign --verify --strict pohunek-web`; do not
+disable Gatekeeper.

@@ -1954,7 +1954,7 @@ fn release_workflow_packages_the_wrapper_and_binaries_only() {
         "copy_binary pohunekd",
         "copy_binary pohunek\n",
         "copy_binary pohunek-sessiond",
-        r#"cp packaging/install-daemon.sh "$staging/packaging/""#,
+        r#"cp packaging/install-daemon.sh packaging/verify-archive "$staging/packaging/""#,
     ] {
         assert!(
             stage.contains(expected),
@@ -2171,6 +2171,11 @@ impl Fixture {
         write_executable(&archive.join("pohunek"), FAKE_POHUNEK);
         write_executable(&archive.join("pohunekd"), "#!/bin/sh\nexit 0\n");
         write_executable(&archive.join("pohunek-sessiond"), "#!/bin/sh\nexit 0\n");
+        fs::copy(
+            repo_root().join("packaging/verify-archive"),
+            archive.join("packaging/verify-archive"),
+        )
+        .expect("copy archive verifier");
         write_executable(
             &commands.join("uname"),
             "#!/bin/sh\ncase \"$1\" in -s) echo Linux ;; -m) echo x86_64 ;; *) exit 2 ;; esac\n",

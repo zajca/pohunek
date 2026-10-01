@@ -357,6 +357,16 @@ Release packaging and contributor verification:
 - `scripts/acceptance/macos-package-install` — CI acceptance of installing,
   upgrading with live sessions, refusing bad archives, and uninstalling from
   the extracted macOS archives against real launchd.
+- `packaging/verify-archive` — shared installer preflight: supported host,
+  macOS minimum, MANIFEST component/target, and every member present, intact,
+  and not writable by another account; run by `packaging/install-daemon.sh` and
+  `web/release/install.sh` before they run or change anything.
+- `packaging/macos/entitlements/pohunek-web.plist` — the JIT entitlements the
+  signed Bun-based backend needs.
+- `web/release/install.sh` — Linux systemd user unit or macOS launchd agent
+  installer of the web backend, with `--uninstall` on macOS.
+- `web/release/test/install.test.ts` — its Linux and macOS behavior against
+  shims of `uname`, `launchctl`, `plutil`, and the daemon CLI.
 - `scripts/tests/test_macos_packaging.py` — regression checks for the audit
   (with `otool`/`lipo`/`strings` shims) and the packaging scripts.
 - `packaging/macos/build-app-bundle` — assembles `Pohunek.app` (bundle

@@ -154,3 +154,27 @@ The Bun backend never becomes a team authorization or relay-routing authority.
 The current foundation's native credential commands and bounded HTTPS endpoints
 do not create a team browser surface; [#86](https://github.com/zajca/pohunek/issues/86)
 owns that client.
+
+## macOS archive and launchd agent
+
+The release workflow also builds `pohunek-web-<version>-aarch64-apple-darwin`
+(the compiled backend with Bun embedded, the SPA, `install.sh`, and
+`packaging/verify-archive`) when the macOS signing credentials exist; macOS is
+not yet a published platform. Its `install.sh` verifies the archive `MANIFEST`
+(component, target, macOS 14 minimum, member digests), requires an installed
+daemon, and registers a launchd login agent
+`io.github.zajca.pohunek.<daemon namespace>.backend`, a separate client service:
+installing, updating (the backend restarts, nothing else), or removing it
+(`./install.sh --uninstall`, which keeps `backend.env` and the logs) never
+touches the daemon or a session. The agent's `ProgramArguments` is the installed
+backend path alone, the property list is written by `plutil`, and its
+environment holds only the non-secret `POHUNEK_BACKEND_*` settings copied from
+`backend.env` (an allowlist; the static and log directories belong to the
+installer), the log directory, and `XDG_RUNTIME_DIR` when set. launchd has no
+environment file, so the agent is registered only once the bind host and port are
+set, and `./install.sh` is re-run after each edit of `backend.env`. Logs go to the
+bounded owner-private `~/.local/state/pohunek/web-logs/pohunek-backend.jsonl`
+family; a failure before the configuration loads lands in `launchd.stderr` in the
+same directory. The signed executable carries the JIT entitlements Bun documents
+for standalone executables.
+
