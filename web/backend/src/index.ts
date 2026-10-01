@@ -13,7 +13,7 @@ export {
   BackendConfigError,
   loadBackendConfig,
 } from "./config";
-export type { BackendConfig } from "./config";
+export type { BackendConfig, DerivedRuntime } from "./config";
 export {
   APP_DIR,
   MACOS_DEFAULT_RUNTIME_PREFIX,

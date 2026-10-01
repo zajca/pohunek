@@ -9,6 +9,7 @@ import {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
   BackendConfigError,
   loadBackendConfig,
+  startBackend,
   type RuntimePathContext,
 } from "@pohunek/backend";
 
@@ -117,50 +118,66 @@ describe("backend configuration", () => {
 });
 
 describe("runtime directory trust", () => {
-  test("a daemon runtime directory must be a real, owner-only directory of the current user", async () => {
+  test("startup refuses a derived runtime directory that is not the user's own 0700 directory", async () => {
     const base = await realpath(await mkdtemp(join(tmpdir(), "pk-trust-")));
     const uid = process.geteuid?.() ?? 0;
     const context: RuntimePathContext = { platform: "linux", effectiveUid: uid };
     const env = { ...baseEnv(), XDG_RUNTIME_DIR: base };
     const runtimeDir = join(base, "pohunek");
     try {
-      // Absent: the connect reports an unreachable daemon instead.
-      expect(loadBackendConfig(env, context).daemonSocketPath).toBe(join(runtimeDir, "daemon.sock"));
+      // Absent: a directory created after the check would not be checked.
+      await expectRefused(env, context, "does not exist");
 
       await mkdir(runtimeDir, { mode: 0o700 });
-      expect(loadBackendConfig(env, context).daemonSocketPath).toBe(join(runtimeDir, "daemon.sock"));
-
       await chmod(runtimeDir, 0o750);
-      expectConfigError(env, "XDG_RUNTIME_DIR", context);
+      await expectRefused(env, context, "mode 0700");
       await chmod(runtimeDir, 0o700);
 
       // Another user's directory: the same check with a different effective uid.
-      expectConfigError(env, "XDG_RUNTIME_DIR", { platform: "linux", effectiveUid: uid + 1 });
+      await expectRefused(env, { platform: "linux", effectiveUid: uid + 1 }, "not owned");
+
+      await mkdir(join(runtimeDir, "daemon.sock"));
+      await expectRefused(env, context, "not a socket");
+      await rm(join(runtimeDir, "daemon.sock"), { recursive: true });
 
       await rm(runtimeDir, { recursive: true });
       const elsewhere = join(base, "elsewhere");
       await mkdir(elsewhere, { mode: 0o700 });
       await symlink(elsewhere, runtimeDir);
-      expectConfigError(env, "XDG_RUNTIME_DIR", context);
+      await expectRefused(env, context, "not a real directory");
+
+      // A parent that is not a directory reports the cause instead of a raw errno.
+      await expectRefused({ ...baseEnv(), XDG_RUNTIME_DIR: "/dev/null" }, context, "cannot be inspected");
     } finally {
       await rm(base, { recursive: true, force: true });
     }
   });
 
-  test("a present socket path that is not a socket of the current user is refused", async () => {
-    const base = await realpath(await mkdtemp(join(tmpdir(), "pk-trust-")));
-    const uid = process.geteuid?.() ?? 0;
-    const context: RuntimePathContext = { platform: "linux", effectiveUid: uid };
-    const env = { ...baseEnv(), XDG_RUNTIME_DIR: base };
-    try {
-      await mkdir(join(base, "pohunek"), { mode: 0o700 });
-      await mkdir(join(base, "pohunek", "daemon.sock"));
-      expectConfigError(env, "XDG_RUNTIME_DIR", context);
-    } finally {
-      await rm(base, { recursive: true, force: true });
-    }
+  test("an explicit socket override is not subject to the derived-directory check", () => {
+    const config = loadBackendConfig(
+      { ...baseEnv(), POHUNEK_BACKEND_DAEMON_SOCKET: "/tmp/custom.sock" },
+      LINUX,
+    );
+    expect(config.derivedRuntime).toBeUndefined();
   });
 });
+
+async function expectRefused(
+  env: NodeJS.ProcessEnv,
+  context: RuntimePathContext,
+  reason: string,
+): Promise<void> {
+  let failure: unknown;
+  try {
+    await startBackend(loadBackendConfig(env, context), { log: (): void => undefined });
+  } catch (error: unknown) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(BackendConfigError);
+  const refusal = failure as BackendConfigError;
+  expect(refusal.variable).toBe("XDG_RUNTIME_DIR");
+  expect(refusal.message.includes(reason)).toBe(true);
+}
 
 describe("backend startup diagnostics", () => {
   test("a configuration error reaches the operator with the variable and the reason", async () => {

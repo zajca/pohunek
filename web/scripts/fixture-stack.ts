@@ -98,6 +98,7 @@ export async function startFixtureStack(options: FixtureStackOptions = {}): Prom
         port: DYNAMIC_PORT,
         allowLoopbackBind: true,
         daemonSocketPath: socketPath,
+        derivedRuntime: undefined,
         discoverIntervalSeconds: DEFAULT_DISCOVER_INTERVAL_SECONDS,
         staticAssetsDir: options.staticAssetsDir ?? DEFAULT_STATIC_ASSETS_DIR,
       },

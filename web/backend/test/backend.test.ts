@@ -270,6 +270,7 @@ async function startBackendFixture(
         port: 0,
         allowLoopbackBind: true,
         daemonSocketPath: socketPath,
+        derivedRuntime: undefined,
         discoverIntervalSeconds,
         staticAssetsDir: assets,
       },

@@ -147,8 +147,8 @@ implementations):
 
 A socket path over the limit fails at startup with the variable that caused it
 instead of failing inside the connect call. When the socket is derived (not
-overridden), the backend also refuses to start unless an existing runtime
-directory is a real directory, without symlinked components, owned by the
+overridden), the backend also refuses to start unless the runtime directory
+exists and is a real directory, without symlinked components, owned by the
 current user with mode exactly `0700`, and a present socket is a socket of the
 same user: the macOS default lives under the shared `/private/tmp`, where
 another local user could pre-create the predictable path.

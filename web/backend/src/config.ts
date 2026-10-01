@@ -5,7 +5,6 @@ import {
   ENV_XDG_RUNTIME_DIR,
   resolveDaemonSocket,
   resolveRuntimeDir,
-  verifyDaemonRuntime,
   RuntimePathError,
   validateSocketPath,
   type RuntimePathContext,
@@ -30,11 +29,18 @@ const MAX_PORT = 65_535;
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_ENV_VALUES = new Set(["0", "false", "no", "off"]);
 
+export interface DerivedRuntime {
+  readonly dir: string;
+  readonly effectiveUid: number;
+}
+
 export interface BackendConfig {
   readonly bindHost: string;
   readonly port: number;
   readonly allowLoopbackBind: boolean;
   readonly daemonSocketPath: string;
+  /** Set when the socket is derived from the runtime directory; checked before connecting. */
+  readonly derivedRuntime: DerivedRuntime | undefined;
   readonly discoverIntervalSeconds: number;
   readonly staticAssetsDir: string;
 }
@@ -58,6 +64,9 @@ export function loadBackendConfig(
     port: parsePort(requiredEnv(env, ENV_PORT), ENV_PORT, MIN_PORT),
     allowLoopbackBind: parseBoolean(env[ENV_ALLOW_LOOPBACK], ENV_ALLOW_LOOPBACK),
     daemonSocketPath: resolveConfiguredSocket(env, runtime),
+    derivedRuntime: env[ENV_DAEMON_SOCKET] === undefined
+      ? { dir: resolveRuntimeDirChecked(env, runtime), effectiveUid: runtime.effectiveUid }
+      : undefined,
     discoverIntervalSeconds: parseDiscoverInterval(env[ENV_DISCOVER_INTERVAL]),
     staticAssetsDir: resolveStaticAssetsDir(env[ENV_STATIC_ASSETS_DIR]),
   };
@@ -71,6 +80,17 @@ function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+function resolveRuntimeDirChecked(env: NodeJS.ProcessEnv, runtime: RuntimePathContext): string {
+  try {
+    return resolveRuntimeDir(runtime, env);
+  } catch (error: unknown) {
+    if (error instanceof RuntimePathError) {
+      throw new BackendConfigError(error.variable, error.message);
+    }
+    throw error;
+  }
+}
+
 function resolveConfiguredSocket(env: NodeJS.ProcessEnv, runtime: RuntimePathContext): string {
   const override = env[ENV_DAEMON_SOCKET];
   try {
@@ -81,14 +101,7 @@ function resolveConfiguredSocket(env: NodeJS.ProcessEnv, runtime: RuntimePathCon
       validateSocketPath(runtime.platform, override, ENV_DAEMON_SOCKET);
       return override;
     }
-    const socket = resolveDaemonSocket(runtime, env);
-    verifyDaemonRuntime(
-      resolveRuntimeDir(runtime, env),
-      socket,
-      runtime.effectiveUid,
-      ENV_XDG_RUNTIME_DIR,
-    );
-    return socket;
+    return resolveDaemonSocket(runtime, env);
   } catch (error: unknown) {
     if (error instanceof RuntimePathError) {
       const hint = error.failure.variant === "missing_env"

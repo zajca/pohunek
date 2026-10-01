@@ -119,15 +119,17 @@ const RUNTIME_DIR_MODE = 0o700;
 const MODE_BITS = 0o777;
 
 /**
- * Fails closed unless an existing runtime directory and daemon socket are the
+ * Fails closed unless the daemon's runtime directory and socket are the
  * current user's own, as the daemon itself requires of them.
  *
  * The macOS default lives under the shared `/private/tmp`, where another local
  * user could pre-create the predictable directory with a socket of their own.
- * The directory must be a real directory (no symlink in the path) owned by
- * `effectiveUid` with mode exactly 0700, and a present socket must be a socket
- * owned by the same user. An absent entry is not an error here: the connect
- * reports an unreachable daemon.
+ * The directory must exist (a running daemon created it), be a real directory
+ * without symlinked path components, be owned by `effectiveUid` and have mode
+ * exactly 0700. A present socket must be a socket owned by the same user. An
+ * absent directory is an error too, because a later creator would not be
+ * checked. A directory owned by the current user at mode 0700 cannot be
+ * replaced by anyone else afterwards.
  */
 export function verifyDaemonRuntime(
   runtimeDir: string,
@@ -137,8 +139,11 @@ export function verifyDaemonRuntime(
 ): void {
   const untrusted = (detail: string): RuntimePathError =>
     new RuntimePathError({ variant: "runtime_dir_untrusted", variable, detail });
-  const directory = lstatIfPresent(runtimeDir);
-  if (directory !== undefined) {
+  try {
+    const directory = lstatIfPresent(runtimeDir);
+    if (directory === undefined) {
+      throw untrusted(`runtime directory ${runtimeDir} does not exist; start pohunekd first`);
+    }
     if (directory.isSymbolicLink() || !directory.isDirectory()) {
       throw untrusted(`runtime directory ${runtimeDir} is not a real directory`);
     }
@@ -151,10 +156,16 @@ export function verifyDaemonRuntime(
     if (realpathSync(runtimeDir) !== runtimeDir) {
       throw untrusted(`runtime directory ${runtimeDir} has a symlinked path component`);
     }
-  }
-  const entry = lstatIfPresent(socket);
-  if (entry !== undefined && (!entry.isSocket() || entry.uid !== effectiveUid)) {
-    throw untrusted(`${socket} is not a socket owned by the current user`);
+    const entry = lstatIfPresent(socket);
+    if (entry !== undefined && (!entry.isSocket() || entry.uid !== effectiveUid)) {
+      throw untrusted(`${socket} is not a socket owned by the current user`);
+    }
+  } catch (error: unknown) {
+    if (error instanceof RuntimePathError) {
+      throw error;
+    }
+    const code = error instanceof Error && "code" in error ? String(error.code) : "unknown";
+    throw untrusted(`runtime directory ${runtimeDir} cannot be inspected (${code})`);
   }
 }
 

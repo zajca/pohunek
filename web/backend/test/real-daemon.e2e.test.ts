@@ -789,9 +789,16 @@ async function startDaemon(
     stderr: () => stderrChunks.join(""),
   });
   const removeRoots = async (): Promise<void> => {
-    await rm(tempRoot, { recursive: true, force: true });
-    if (defaultRuntime !== undefined) {
-      await releaseDefaultRuntimeDir(defaultRuntime);
+    // Independent: a failure removing the fixture root must not leak the default runtime directory.
+    const results = await Promise.allSettled([
+      rm(tempRoot, { recursive: true, force: true }),
+      defaultRuntime === undefined ? Promise.resolve() : releaseDefaultRuntimeDir(defaultRuntime),
+    ]);
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason as unknown);
+    if (failures.length > 0) {
+      throw new AggregateError(failures, "removing the daemon fixture roots failed");
     }
   };
 
