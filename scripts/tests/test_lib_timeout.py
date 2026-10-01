@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import NamedTuple
 import unittest
@@ -18,6 +19,9 @@ SCENARIO_TIMEOUT_SECONDS = 20
 # from `ps`, far below the lifetime it would have had without the kill.
 REAP_BOUND_SECONDS = 2
 REAP_POLL_SECONDS = 0.05
+# Bound on how long a recorded pid may take to appear in its file: the shell
+# creates the file before it writes the pid, and may be descheduled in between.
+RECORD_BOUND_SECONDS = 5
 # Command-line fragments of the long sleeps the scenarios start. The module
 # runs next to a decoy process carrying all of them, so the reap assertions
 # must identify processes by what the test started, never by command line.
@@ -61,8 +65,12 @@ class Run(NamedTuple):
     group: int  # process group of the scenario's shell and its plain children
 
 
-def run(body, stdin=None):
-    """Runs `body` after sourcing lib.sh in a shell of its own process group."""
+def run(body, stdin=None, timeout=SCENARIO_TIMEOUT_SECONDS):
+    """Runs `body` after sourcing lib.sh in a shell of its own process group.
+
+    A scenario still running after `timeout` seconds is killed together with
+    every process it started, and `subprocess.TimeoutExpired` is raised.
+    """
     script = f'. "{LIB}"\nstatus=0\n{body}\nprintf "status=%s\\n" "$status"\n'
     started = time.monotonic()
     shell = subprocess.Popen(
@@ -74,10 +82,14 @@ def run(body, stdin=None):
         start_new_session=True,
     )
     try:
-        stdout, stderr = shell.communicate(stdin, timeout=SCENARIO_TIMEOUT_SECONDS)
+        stdout, stderr = shell.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
-        os.killpg(shell.pid, signal.SIGKILL)
-        shell.communicate()
+        kill_scenario(shell.pid)
+        try:
+            shell.communicate(timeout=REAP_BOUND_SECONDS)
+        except subprocess.TimeoutExpired:
+            # A process outside the shell's tree holds the pipes open.
+            shell.kill()
         raise
     if shell.returncode != 0:
         raise subprocess.CalledProcessError(shell.returncode, script, stdout, stderr)
@@ -89,24 +101,79 @@ def recorded(pid_file, *argv):
     return shlex.join(["sh", "-c", RECORD_PID_THEN_EXEC, "_", str(pid_file), *argv])
 
 
-def live_pids():
-    """Returns {pid: process group} of every process that is not a zombie.
+class Process(NamedTuple):
+    parent: int
+    group: int
+
+
+def live_processes():
+    """Returns {pid: Process} of every process that is not a zombie.
 
     A process killed by the helper may stay a zombie until its reaper runs;
     it no longer executes anything and does not count as alive.
     """
     listing = subprocess.run(
-        ["ps", "-A", "-o", "pid=,pgid=,stat="],
+        ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat="],
         capture_output=True,
         text=True,
         check=True,
     ).stdout
     alive = {}
     for line in listing.splitlines():
-        pid, group, state = line.split()
+        pid, parent, group, state = line.split()
         if not state.startswith("Z"):
-            alive[int(pid)] = int(group)
+            alive[int(pid)] = Process(int(parent), int(group))
     return alive
+
+
+def scenario_processes(root):
+    """Returns the live processes descending from `root`, `root` included.
+
+    `pohunek_run_with_timeout` starts the tested command in a process group
+    of its own, so the scenario cannot be named by one group; the parent
+    links tie every member to the scenario's shell. `ps` offers a session id
+    only on Linux, the parent links work on every `ps`.
+    """
+    table = live_processes()
+    members = {root} & table.keys()
+    grown = True
+    while grown:
+        grown = False
+        for pid, process in table.items():
+            if pid not in members and process.parent in members:
+                members.add(pid)
+                grown = True
+    return {pid: table[pid] for pid in members}
+
+
+def kill_scenario(root):
+    """Kills the scenario shell `root` and everything descending from it.
+
+    Repeats until no descendant is left, as a process may fork between the
+    listing and the kill. Process groups of the members are killed too, since
+    a member that forked away from its parent chain stays in its group.
+    """
+    deadline = time.monotonic() + REAP_BOUND_SECONDS
+    own_group = os.getpgrp()
+    members = scenario_processes(root)
+    while members and time.monotonic() <= deadline:
+        for group in {process.group for process in members.values()} - {own_group}:
+            kill_group(group)
+        for pid in members:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(REAP_POLL_SECONDS)
+        members = scenario_processes(root)
+
+
+def kill_group(group):
+    """Kills every member of process group `group`, if any is left."""
+    try:
+        os.killpg(group, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def survivors(pids=(), group=None):
@@ -117,8 +184,8 @@ def survivors(pids=(), group=None):
     """
     return sorted(
         pid
-        for pid, pid_group in live_pids().items()
-        if pid in pids or pid_group == group
+        for pid, process in live_processes().items()
+        if pid in pids or process.group == group
     )
 
 
@@ -141,11 +208,22 @@ class ScenarioTestCase(unittest.TestCase):
     def pid_file(self, name):
         return self.scratch / name
 
-    def recorded_pids(self, name):
-        """Returns the pids the scenario recorded in the file `name`."""
-        pids = [int(pid) for pid in self.pid_file(name).read_text().split()]
-        self.assertTrue(pids, "the scenario recorded no pid")
-        return pids
+    def recorded_pids(self, name, count=1):
+        """Returns the `count` pids the scenario recorded in the file `name`.
+
+        The recorder creates the file before it writes the pid, so the file is
+        read until it holds `count` complete lines.
+        """
+        path = self.pid_file(name)
+        deadline = time.monotonic() + RECORD_BOUND_SECONDS
+        while True:
+            text = path.read_text() if path.exists() else ""
+            lines = text.split("\n")[:-1]  # the last piece is an unfinished line
+            if len(lines) >= count or time.monotonic() > deadline:
+                break
+            time.sleep(REAP_POLL_SECONDS)
+        self.assertEqual(len(lines), count, "the scenario recorded too few pids")
+        return [int(line) for line in lines]
 
 
 class RunWithTimeoutTests(ScenarioTestCase):
@@ -272,8 +350,7 @@ class RunWithTimeoutTests(ScenarioTestCase):
         output, elapsed, _ = run(f"pohunek_run_with_timeout 1 {command} || status=$?")
         self.assertEqual(output, "status=124\n")
         self.assertLess(elapsed, 8)
-        pids = self.recorded_pids("descendants.pid")
-        self.assertEqual(len(pids), 2)
+        pids = self.recorded_pids("descendants.pid", count=2)
         self.assertEqual(
             survivors_after_reap(pids), [], "descendant survived the timeout"
         )
@@ -300,25 +377,73 @@ class ReapDetectionTests(ScenarioTestCase):
 
     def test_a_leftover_in_the_scenario_group_is_reported(self):
         _, _, group = run("sleep 31.5 >/dev/null 2>&1 &")
+        self.addCleanup(kill_group, group)
         left = survivors(group=group)
         # Nothing but the scenario's own leftover is in the group, whatever the
         # decoy or other processes on the host look like.
         self.assertEqual(len(left), 1)
-        os.killpg(group, signal.SIGKILL)
+        kill_group(group)
         self.assertEqual(survivors_after_reap(group=group), [])
 
     def test_a_recorded_command_left_running_is_reported(self):
-        pid_file = self.pid_file("command.pid")
-        command = recorded(pid_file, "sleep", "31.5")
-        run(f"{command} >/dev/null 2>&1 &")
-        deadline = time.monotonic() + REAP_BOUND_SECONDS
-        while not pid_file.exists() and time.monotonic() < deadline:
-            time.sleep(REAP_POLL_SECONDS)
+        command = recorded(self.pid_file("command.pid"), "sleep", "31.5")
+        _, _, group = run(f"{command} >/dev/null 2>&1 &")
+        self.addCleanup(kill_group, group)
         pids = self.recorded_pids("command.pid")
         self.assertEqual(survivors(pids), pids)
         for pid in pids:
             os.kill(pid, signal.SIGKILL)
         self.assertEqual(survivors_after_reap(pids), [])
+
+    def test_a_pid_is_read_only_once_its_line_is_complete(self):
+        # The recorder creates the file, then waits for the gate before it
+        # writes the pid, so the file exists but is empty until the test opens
+        # the gate.
+        gate = self.scratch / "gate"
+        os.mkfifo(gate)
+        gated = (
+            ': >>"$1"; read -r _ <"$2"; echo $$ >>"$1"; shift 2; exec "$@"'
+        )
+        command = shlex.join(
+            ["sh", "-c", gated, "_", str(self.pid_file("command.pid")), str(gate)]
+            + ["sleep", "31.5"]
+        )
+        _, _, group = run(f"{command} >/dev/null 2>&1 &")
+        self.addCleanup(kill_group, group)
+        pid_file = self.pid_file("command.pid")
+        deadline = time.monotonic() + RECORD_BOUND_SECONDS
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(REAP_POLL_SECONDS)
+        self.assertEqual(pid_file.read_text(), "")
+
+        def open_gate():
+            with open(gate, "w") as opened:
+                opened.write("go\n")
+
+        # A daemon thread: opening the FIFO blocks until the recorder reads it.
+        opener = threading.Thread(target=open_gate, daemon=True)
+        opener.start()
+        self.addCleanup(opener.join, RECORD_BOUND_SECONDS)
+        pids = self.recorded_pids("command.pid")
+        self.assertEqual(survivors(pids), pids)
+
+
+class ScenarioTimeoutTests(ScenarioTestCase):
+    """A scenario that outlives its timeout is killed with all it started."""
+
+    def test_the_command_of_a_timed_out_scenario_is_killed_at_once(self):
+        # The helper runs the command in a process group of its own and the
+        # command holds the captured pipes open for as long as it lives.
+        command = recorded(self.pid_file("command.pid"), "sleep", "45")
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run(f"pohunek_run_with_timeout 60 {command}", timeout=2)
+        self.assertLess(time.monotonic() - started, SCENARIO_TIMEOUT_SECONDS)
+        self.assertEqual(
+            survivors_after_reap(self.recorded_pids("command.pid")),
+            [],
+            "the timed-out scenario left its command behind",
+        )
 
 
 if __name__ == "__main__":
