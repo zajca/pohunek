@@ -5,6 +5,11 @@
 //! taxonomy in `docs/architecture.md` "Error Handling": configuration, daemon,
 //! transport, runtime, discovery. Keeping them typed lets `--json` consumers and
 //! operator agents branch on the failure instead of string-matching messages.
+//!
+//! The delegated task layer (`docs/design/delegated-task-runs-rfc.md` section
+//! 13.1) has its own constructor family. Those errors take no arguments: their
+//! message and recovery hint are fixed text, so they can never echo a prompt,
+//! answer, path, task id or secret back to the caller.
 
 use serde::{Deserialize, Serialize};
 
@@ -515,6 +520,557 @@ impl ProtocolError {
                 "upgrade the daemon to a pohunek version with universal assistant support"
                     .to_owned(),
             ),
+        )
+    }
+}
+
+/// Delegated task layer errors (task RFC section 13.1).
+///
+/// Every constructor is argument-free and builds its message and hint from
+/// fixed text. State conflicts, limits and policy refusals use
+/// [`ErrorClass::Runtime`], matching the existing worktree, waiter-limit and
+/// notification-policy analogues; the only exception is
+/// [`ProtocolError::task_check_unconfined`], see its documentation.
+impl ProtocolError {
+    /// Builds one payload-free task-layer error from fixed text.
+    fn fixed(
+        class: ErrorClass,
+        code: &'static str,
+        msg: &'static str,
+        recover: Option<&'static str>,
+    ) -> Self {
+        Self::new(class, code, msg, recover.map(str::to_owned))
+    }
+
+    /// The canonical `runtime/task_turn_open` error.
+    ///
+    /// Raised by `task.continue` and `task.answer` while the task's latest turn
+    /// is still open, queued or already resumed (task RFC invariant 2, section
+    /// 8.2). Code is stable: `task_turn_open`.
+    #[must_use]
+    pub fn task_turn_open() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_turn_open",
+            "the task's latest turn is still open or already resumed",
+            Some("wait for the turn to settle with task.wait, then retry"),
+        )
+    }
+
+    /// The canonical `runtime/task_attention_open` error.
+    ///
+    /// Raised by `task.continue` when the latest turn settled `attention` and
+    /// was not answered (task RFC invariant 2). Code is stable:
+    /// `task_attention_open`.
+    #[must_use]
+    pub fn task_attention_open() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_attention_open",
+            "the task's latest turn awaits an answer to its attention",
+            Some("answer the pending attention with task.answer, or stop the task"),
+        )
+    }
+
+    /// The canonical `runtime/task_agent_busy` error.
+    ///
+    /// Raised by `task.continue` while the agent is still visibly working on an
+    /// earlier prompt (task RFC invariant 2, section 8.4). Code is stable:
+    /// `task_agent_busy`.
+    #[must_use]
+    pub fn task_agent_busy() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_agent_busy",
+            "the agent is still working on an earlier prompt",
+            Some("wait with task.wait or extend the turn with task.extend, then retry; or stop the task"),
+        )
+    }
+
+    /// The canonical `runtime/task_worktree_busy` error.
+    ///
+    /// Raised by `task.start` (including `worktree_of`), `task.continue`,
+    /// `task.answer` and `task.extend` when another task occupies the worktree,
+    /// when a live non-task session is bound to it, or when a handoff cannot
+    /// prove the previous occupant's process scope empty (task RFC invariant
+    /// 11, section 8.7). Code is stable: `task_worktree_busy`.
+    #[must_use]
+    pub fn task_worktree_busy() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_worktree_busy",
+            "the worktree is occupied by another task or live session",
+            Some("inspect the worktree users with task.inspect and retry after the occupant settles or is stopped"),
+        )
+    }
+
+    /// The canonical `runtime/worktree_busy` error.
+    ///
+    /// Raised by `session.input`, attach with terminal control,
+    /// `session.resume`, `session.fork` with `cwd_mode: "same"` and in-place
+    /// `session.new` while a task occupies the session's worktree; only
+    /// observation is admitted (task RFC invariant 11 write fence). Code is
+    /// stable: `worktree_busy`.
+    #[must_use]
+    pub fn worktree_busy() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "worktree_busy",
+            "a task occupies this worktree; only observation is admitted",
+            Some("observe the session read-only, or retry after the occupying task settles or is stopped"),
+        )
+    }
+
+    /// The canonical `runtime/task_worktree_unavailable` error.
+    ///
+    /// Raised by `task.start` and `task.continue` when the shared worktree no
+    /// longer exists (task RFC section 8.7). Code is stable:
+    /// `task_worktree_unavailable`.
+    #[must_use]
+    pub fn task_worktree_unavailable() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_worktree_unavailable",
+            "the shared worktree no longer exists",
+            Some("start a new task with its own worktree"),
+        )
+    }
+
+    /// The canonical `runtime/task_worktree_mode_conflict` error.
+    ///
+    /// Raised by `task.start` when `worktree_of` is combined with `in_place` or
+    /// `branch`. Semantic parameter validation uses the runtime class, as
+    /// `session_input_invalid_wait` does. Code is stable:
+    /// `task_worktree_mode_conflict`.
+    #[must_use]
+    pub fn task_worktree_mode_conflict() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_worktree_mode_conflict",
+            "worktree_of cannot be combined with in_place or branch",
+            Some("send worktree_of alone, or in_place or branch without worktree_of"),
+        )
+    }
+
+    /// The canonical `runtime/task_session_ended` error.
+    ///
+    /// Raised by `session.resume`, `session.fork` and explicit session recovery
+    /// when the session belongs to an `ended` task (task RFC section 6.1).
+    /// Code is stable: `task_session_ended`.
+    #[must_use]
+    pub fn task_session_ended() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_session_ended",
+            "the session belongs to an ended task and cannot be revived outside the task layer",
+            Some("continue the work with task.start and worktree_of naming the ended task"),
+        )
+    }
+
+    /// The canonical `runtime/task_session_unavailable` error.
+    ///
+    /// Raised by `task.continue` and `task.answer` when the task is `ended` or
+    /// its agent runtime is not live. Code is stable:
+    /// `task_session_unavailable`.
+    #[must_use]
+    pub fn task_session_unavailable() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_session_unavailable",
+            "the task has ended or its agent runtime is not live",
+            Some("inspect the task with task.inspect; continue ended work with task.start and worktree_of"),
+        )
+    }
+
+    /// The canonical `runtime/task_turn_queued` error.
+    ///
+    /// Raised by `task.extend` on a turn queued behind a re-open window, which
+    /// has no deadline until it is delivered (task RFC section 8.2). Code is
+    /// stable: `task_turn_queued`.
+    #[must_use]
+    pub fn task_turn_queued() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_turn_queued",
+            "the turn is queued and has no deadline until it is delivered",
+            Some("wait for delivery with task.wait before extending the turn"),
+        )
+    }
+
+    /// The canonical `runtime/task_worktree_via_investigate` error.
+    ///
+    /// Raised by an executor-mode `task.start` whose `worktree_of` names an
+    /// investigate-mode task, so read access never becomes write access (task
+    /// RFC section 8.7). Code is stable: `task_worktree_via_investigate`.
+    #[must_use]
+    pub fn task_worktree_via_investigate() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_worktree_via_investigate",
+            "an executor task cannot join a worktree through an investigate-mode task",
+            Some("name a task that is not in investigate mode in worktree_of, or start in investigate mode"),
+        )
+    }
+
+    /// The canonical `runtime/task_turn_ceiling_reached` error.
+    ///
+    /// Raised by `task.extend` once the turn's total open time reached
+    /// `tasks.turn_open_ceiling_ms` (task RFC section 6.3). Code is stable:
+    /// `task_turn_ceiling_reached`.
+    #[must_use]
+    pub fn task_turn_ceiling_reached() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_turn_ceiling_reached",
+            "the turn reached its total open-time ceiling",
+            Some("answer or stop the turn, or continue with a new turn once the agent is ready"),
+        )
+    }
+
+    /// The canonical `runtime/task_answer_unsupported` error.
+    ///
+    /// Raised by `task.answer` on a degraded attention whose detection manifest
+    /// declares no input sequence for the requested approve or deny answer
+    /// (task RFC section 8.5). Code is stable: `task_answer_unsupported`.
+    #[must_use]
+    pub fn task_answer_unsupported() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_answer_unsupported",
+            "this attention cannot be answered through the task layer",
+            Some("resolve the attention by terminal takeover, or stop the task"),
+        )
+    }
+
+    /// The canonical `runtime/task_answer_unverifiable` error.
+    ///
+    /// Raised by `task.answer` for a keystroke answer sent without
+    /// `allow_unverified_delivery`, because the daemon cannot prove the provider
+    /// still waits on the named request (task RFC section 8.5). Code is stable:
+    /// `task_answer_unverifiable`.
+    #[must_use]
+    pub fn task_answer_unverifiable() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_answer_unverifiable",
+            "a keystroke answer cannot be verified against the provider's pending request",
+            Some("set allow_unverified_delivery to accept an unverified answer, or resolve the attention in the terminal"),
+        )
+    }
+
+    /// The canonical `runtime/task_payload_mismatch` error.
+    ///
+    /// Raised by a retried `task.start`, `task.continue` or `task.answer` whose
+    /// resubmitted payload does not match the stored keyed fingerprint or
+    /// ticket fingerprint; nothing is dispatched (task RFC section 8.8). Code
+    /// is stable: `task_payload_mismatch`.
+    #[must_use]
+    pub fn task_payload_mismatch() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_payload_mismatch",
+            "the resubmitted payload does not match the stored request fingerprint; nothing was dispatched",
+            Some("resend the exact original payload with the same request key, or inspect the task first"),
+        )
+    }
+
+    /// The canonical `runtime/task_stop_precondition_failed` error.
+    ///
+    /// Raised by `task.stop` when `if_latest_turn` or `require_idle` does not
+    /// hold; the stop changes nothing (task RFC section 13.1). Code is stable:
+    /// `task_stop_precondition_failed`.
+    #[must_use]
+    pub fn task_stop_precondition_failed() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_stop_precondition_failed",
+            "the stop preconditions do not hold; nothing was changed",
+            Some("inspect the task and retry the stop with current preconditions"),
+        )
+    }
+
+    /// The canonical `runtime/worktree_users_changed` error.
+    ///
+    /// Raised by `session.remove` when `expected_worktree_users` differs from
+    /// the current set of active user tasks (task RFC section 8.7). Code is
+    /// stable: `worktree_users_changed`.
+    #[must_use]
+    pub fn worktree_users_changed() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "worktree_users_changed",
+            "the expected worktree users differ from the current set",
+            Some(
+                "re-read the worktree users with task.inspect and retry with the exact current set",
+            ),
+        )
+    }
+
+    /// The canonical `runtime/task_attention_stale` error.
+    ///
+    /// Raised by `task.answer` when the named attention is not the current
+    /// pending one at that settlement revision, or the provider already
+    /// resolved it; nothing is written (task RFC section 8.5). Code is stable:
+    /// `task_attention_stale`.
+    #[must_use]
+    pub fn task_attention_stale() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_attention_stale",
+            "the named attention is not the current pending one; nothing was written",
+            Some("inspect the task for the current attention and revision before answering again"),
+        )
+    }
+
+    /// The canonical `runtime/task_result_unknown` error.
+    ///
+    /// Raised by `task.review` and `task.result` when no result with the given
+    /// `result_id` exists (task RFC section 13.1). Code is stable:
+    /// `task_result_unknown`.
+    #[must_use]
+    pub fn task_result_unknown() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_result_unknown",
+            "no result with the requested result_id exists",
+            Some("read the current result_id with task.result or task.inspect"),
+        )
+    }
+
+    /// The canonical `runtime/task_snapshot_retired` error.
+    ///
+    /// Raised by `session.diff` with a `turn` selector when that turn's
+    /// snapshots were retired with the session content (task RFC section 10).
+    /// No recovery exists: retired snapshots are not reproducible. Code is
+    /// stable: `task_snapshot_retired`.
+    #[must_use]
+    pub fn task_snapshot_retired() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_snapshot_retired",
+            "the turn's snapshots were retired with the session content",
+            None,
+        )
+    }
+
+    /// The canonical `runtime/task_cursor_expired` error.
+    ///
+    /// Raised by `task.list` and `task.inspect` when the paging cursor is older
+    /// than `tasks.cursor_ttl_ms` or from another daemon epoch (task RFC
+    /// section 13.1). Code is stable: `task_cursor_expired`.
+    #[must_use]
+    pub fn task_cursor_expired() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_cursor_expired",
+            "the paging cursor expired or belongs to another daemon epoch",
+            Some("restart the walk from the first page without a cursor"),
+        )
+    }
+
+    /// The canonical `runtime/worktree_in_use` error.
+    ///
+    /// Raised by `session.remove` when other active tasks use the session's
+    /// worktree, including users outside the caller's host share (task RFC
+    /// section 8.7), and by `worktree.remove` when a live session uses the
+    /// worktree. The code is shared by both methods, so the text and the hint
+    /// name no task-only remedy. Code is stable: `worktree_in_use`.
+    #[must_use]
+    pub fn worktree_in_use() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "worktree_in_use",
+            "live sessions or active tasks use this worktree",
+            Some("stop the sessions or tasks that use the worktree, then retry the removal"),
+        )
+    }
+
+    /// The canonical `runtime/task_result_pending` error.
+    ///
+    /// Raised by `task.result` and `task.continue` while the turn settled but
+    /// its checks have not finished, and by task-layer input while checks run
+    /// (task RFC section 12). Code is stable: `task_result_pending`.
+    #[must_use]
+    pub fn task_result_pending() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_result_pending",
+            "the turn settled but its checks have not finished",
+            Some("wait for publication with task.wait, then retry"),
+        )
+    }
+
+    /// The canonical `configuration/task_check_unconfined` error.
+    ///
+    /// Raised by `task.start` and `task.continue` when the platform offers no
+    /// kernel-enforced containment for checks and the project's host
+    /// configuration does not set `checks.allow_unconfined` (task RFC section
+    /// 12). The caller's request is valid; only an owner configuration opt-in
+    /// admits it, so the class is `configuration`. Code is stable:
+    /// `task_check_unconfined`.
+    #[must_use]
+    pub fn task_check_unconfined() -> Self {
+        Self::fixed(
+            ErrorClass::Configuration,
+            "task_check_unconfined",
+            "checks cannot be contained on this platform and unconfined checks are not allowed",
+            Some("run without checks, or have the host owner set checks.allow_unconfined for the project"),
+        )
+    }
+
+    /// The canonical `runtime/task_check_not_permitted` error.
+    ///
+    /// Raised by `task.start` and `task.continue` when a requested check is not
+    /// enabled for the project or not permitted for the caller's origin, before
+    /// the turn is delivered (task RFC section 12). A policy refusal of the
+    /// caller's request, like `notification_kind_disabled`. Code is stable:
+    /// `task_check_not_permitted`.
+    #[must_use]
+    pub fn task_check_not_permitted() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_check_not_permitted",
+            "a requested check is not enabled or not permitted for this caller",
+            Some("request only checks enabled for the project and permitted for this caller"),
+        )
+    }
+
+    /// The canonical `runtime/task_store_full` error.
+    ///
+    /// Raised by `task.start`, `task.continue` and `task.review` when a task
+    /// store cap (`tasks.store_max_bytes`, `tasks.max_turns_per_task`,
+    /// `tasks.max_tasks_retained`, `tasks.max_active_tasks`) would be exceeded
+    /// (task RFC section 14). Code is stable: `task_store_full`.
+    #[must_use]
+    pub fn task_store_full() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_store_full",
+            "a task store cap would be exceeded",
+            Some("end finished tasks or wait for retention to free space; the host owner may raise the task store caps"),
+        )
+    }
+
+    /// The canonical `runtime/task_review_limit_reached` error.
+    ///
+    /// Raised by `task.review` when `tasks.max_reviews_per_result` distinct
+    /// reviewers already hold a verdict on the result (task RFC section 13.1).
+    /// A reviewer that already holds a verdict replaces it instead. Code is
+    /// stable: `task_review_limit_reached`.
+    #[must_use]
+    pub fn task_review_limit_reached() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_review_limit_reached",
+            "the result already holds verdicts from the maximum number of reviewers",
+            None,
+        )
+    }
+
+    /// The canonical `runtime/task_waiter_limit_reached` error.
+    ///
+    /// Raised by `task.wait` when the task waiter pool (`tasks.max_waiters`,
+    /// `tasks.max_waiters_per_task`) is full; session waits are unaffected
+    /// (task RFC section 8.3). Code is stable: `task_waiter_limit_reached`.
+    #[must_use]
+    pub fn task_waiter_limit_reached() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_waiter_limit_reached",
+            "the task waiter limit is currently reached",
+            Some("retry the wait after another task wait completes"),
+        )
+    }
+
+    /// The canonical `runtime/task_fingerprint_key_missing` error.
+    ///
+    /// Raised by a retried `task.start`, `task.continue` or `task.answer` when
+    /// the key version a stored fingerprint names is unavailable, so the
+    /// comparison is not attempted and nothing is dispatched (task RFC
+    /// invariant 7). Code is stable: `task_fingerprint_key_missing`.
+    #[must_use]
+    pub fn task_fingerprint_key_missing() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_fingerprint_key_missing",
+            "the fingerprint key version of the stored request is unavailable; nothing was compared or dispatched",
+            Some("inspect the task; the host owner must restore the task fingerprint key before resubmitting"),
+        )
+    }
+
+    /// The canonical `runtime/task_request_conflict` error.
+    ///
+    /// Raised by every idempotent task method when a reused request key
+    /// carries different parameters; nothing is executed (task RFC invariant
+    /// 3). Code is stable: `task_request_conflict`.
+    #[must_use]
+    pub fn task_request_conflict() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_request_conflict",
+            "the request key was already used with different parameters; nothing was executed",
+            Some("use a new client_request_id for a different request, or resend the original parameters"),
+        )
+    }
+
+    /// The canonical `runtime/task_investigate_no_checks` error.
+    ///
+    /// Raised by `task.start` and `task.continue` when `checks` or
+    /// `checks_baseline` is requested for an investigate-mode task (task RFC
+    /// section 12). Code is stable: `task_investigate_no_checks`.
+    #[must_use]
+    pub fn task_investigate_no_checks() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_investigate_no_checks",
+            "investigate-mode tasks accept neither checks nor checks_baseline",
+            Some("omit checks and checks_baseline and rely on the executor task's checks"),
+        )
+    }
+
+    /// The canonical `runtime/task_fork_unsupported` error.
+    ///
+    /// Raised by `session.fork` on a task session whose agent cannot fork its
+    /// native session across per-session servers, as with `OpenCode` (task RFC
+    /// section 9.3). Code is stable: `task_fork_unsupported`.
+    #[must_use]
+    pub fn task_fork_unsupported() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_fork_unsupported",
+            "the task's agent cannot fork its session",
+            Some("start a new task on the same worktree with worktree_of"),
+        )
+    }
+
+    /// The canonical `runtime/task_investigate_unsupported` error.
+    ///
+    /// Raised by `task.start` with `mode: "investigate"` when the profile cannot
+    /// enforce investigation mode; the daemon never downgrades silently (task
+    /// RFC section 11.2). Code is stable: `task_investigate_unsupported`.
+    #[must_use]
+    pub fn task_investigate_unsupported() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "task_investigate_unsupported",
+            "the selected profile cannot enforce investigation mode",
+            Some("select a profile that can enforce investigation mode"),
+        )
+    }
+
+    /// The canonical `runtime/check_cleanup_stuck` error.
+    ///
+    /// Raised by a worktree handoff (`task.start` with `worktree_of`) when a
+    /// daemon-owned check process scope in the tree cannot be confirmed empty;
+    /// the worktree stays occupied (task RFC invariant 11, section 12). Code is
+    /// stable: `check_cleanup_stuck`.
+    #[must_use]
+    pub fn check_cleanup_stuck() -> Self {
+        Self::fixed(
+            ErrorClass::Runtime,
+            "check_cleanup_stuck",
+            "a daemon-owned check process in the worktree cannot be confirmed gone",
+            Some("inspect the occupying task with task.inspect; the worktree stays occupied until its check processes are gone"),
         )
     }
 }

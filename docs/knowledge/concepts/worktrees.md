@@ -57,6 +57,11 @@ graceful stop first lets in-flight creates finish, including delivery of a
 whose prompt was not delivered before the daemon stopped is removed at the next
 start, worktree included, since the prompt was never stored.
 
+Removing a worktree that a live session still uses is refused with the typed
+`worktree_in_use` error; the same code is reserved for `session.remove` when
+other active delegated tasks use the session's worktree. Stop the sessions or
+tasks that use the worktree, then retry the removal.
+
 Assistant guidance should preserve this boundary: verify which checkout or
 worktree is active before editing, avoid deleting user-managed worktrees, and
 prefer explicit project or repository targeting for project work.

@@ -3430,7 +3430,7 @@ async fn remove_worktree_refuses_a_live_session() {
         .remove_worktree(&worktree)
         .await
         .expect_err("a live worktree is refused");
-    assert_eq!(err.code, "worktree_in_use");
+    assert_eq!(err, protocol::ProtocolError::worktree_in_use());
     assert!(
         worktree.exists(),
         "a live session's worktree is left on disk"

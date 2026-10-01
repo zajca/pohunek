@@ -4474,6 +4474,7 @@ name = "pohunek-protocol"
 version = "0.31.6"
 dependencies = [
  "base64 0.22.1",
+ "pohunek-test-support",
  "proptest",
  "serde",
  "serde_json",

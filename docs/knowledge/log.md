@@ -12,6 +12,10 @@
   `packaging/install-daemon.sh` verifies it, the host OS and architecture, the
   macOS minimum version, and member permissions before it runs any archive
   binary or changes anything; archives are deterministic (`packaging/archive`).
+- Documented the reserved delegated task error contract: the `task_*`,
+  `worktree_*` and `check_*` codes, their fixed text, `worktree_in_use` shared by
+  `session.remove` and `worktree.remove`, and `task.*` still answering
+  `method_not_found`.
 - Documented the executable search-path policy: the `service.toml`
   `[environment] search_path` key, the `service_search_path_unavailable` error
   code, and the environment-resolution guide.

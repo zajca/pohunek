@@ -1642,10 +1642,7 @@ impl SessionRegistry {
             .filter_map(|session| session.worktree_path)
             .any(|worktree_path| canonical_or_original(&worktree_path) == target);
         if in_use {
-            return Err(runtime_error(
-                "worktree_in_use",
-                "a live session is using this worktree; stop the session before removing it",
-            ));
+            return Err(ProtocolError::worktree_in_use());
         }
         let path = path.to_owned();
         tokio::task::spawn_blocking(move || -> Result<WorktreeRemoveResult, ProtocolError> {

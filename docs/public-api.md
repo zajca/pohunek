@@ -1409,6 +1409,70 @@ proposal nonces, signatures, or private record bytes. Clients must treat an
 inspection failure as unavailable state and must not synthesize an owner,
 revision, or enrollment from an earlier response.
 
+### Delegated Task Errors
+
+The delegated task layer (`docs/design/delegated-task-runs-rfc.md` section
+13.1) defines the codes below. They are part of the public contract; the
+daemon raises them once the task methods are served (until then task methods
+answer `method_not_found`). Every one has a fixed `msg` and, where the table
+says `yes`, a fixed `recover` hint; `task_snapshot_retired` and
+`task_review_limit_reached` carry no hint. Task errors never echo a prompt,
+answer, path, task id or secret. The text is fixed in the daemon's response;
+the Rust SDK's remote path (`ClientError::RemoteProtocol`) prepends
+`host '<host>':` to `msg` and leaves `class`, `code` and `recover` unchanged.
+`ProtocolError` has no data field, so `worktree_in_use` and `task_worktree_busy`
+cannot name the users or the blocking task; the method slice decides where that
+data is carried. Session methods
+raise `worktree_busy`, `task_session_ended`, `task_fork_unsupported`,
+`worktree_in_use`, `worktree_users_changed` and `task_snapshot_retired` for
+sessions that belong to tasks.
+
+| Code | Class | Raised by | Meaning | `recover` |
+|---|---|---|---|---|
+| `task_turn_open` | `runtime` | `task.continue`, `task.answer` | The latest turn is still open, queued, or already resumed. | yes |
+| `task_attention_open` | `runtime` | `task.continue` | The latest turn settled `attention` and was not answered. | yes |
+| `task_agent_busy` | `runtime` | `task.continue` | The agent is still visibly working on an earlier prompt. | yes |
+| `task_worktree_busy` | `runtime` | `task.start`, `task.continue`, `task.answer`, `task.extend` | Another task or a live non-task session occupies the worktree. | yes |
+| `worktree_busy` | `runtime` | `session.input`, attach with terminal control, `session.resume`, `session.fork` (`cwd_mode: "same"`), in-place `session.new` | A task occupies the session's worktree; only observation is admitted. | yes |
+| `task_worktree_unavailable` | `runtime` | `task.start`, `task.continue` | The shared worktree no longer exists. | yes |
+| `task_worktree_mode_conflict` | `runtime` | `task.start` | `worktree_of` combined with `in_place` or `branch`. | yes |
+| `task_session_ended` | `runtime` | `session.resume`, `session.fork`, session recovery | The session belongs to an `ended` task; continue with `task.start { worktree_of }`. | yes |
+| `task_session_unavailable` | `runtime` | `task.continue`, `task.answer` | The task is `ended` or its runtime is not live. | yes |
+| `task_turn_queued` | `runtime` | `task.extend` | The turn is queued behind a re-open window and has no deadline yet. | yes |
+| `task_worktree_via_investigate` | `runtime` | `task.start` | An executor `worktree_of` start named an investigate-mode task. | yes |
+| `task_turn_ceiling_reached` | `runtime` | `task.extend` | The turn's total open time reached `tasks.turn_open_ceiling_ms`. | yes |
+| `task_answer_unsupported` | `runtime` | `task.answer` | A degraded attention whose manifest declares no input for the answer. | yes |
+| `task_answer_unverifiable` | `runtime` | `task.answer` | A keystroke answer without `allow_unverified_delivery`. | yes |
+| `task_payload_mismatch` | `runtime` | retried `task.start`, `task.continue`, `task.answer` | The resubmitted payload does not match the stored fingerprint; nothing is dispatched. | yes |
+| `task_stop_precondition_failed` | `runtime` | `task.stop` | `if_latest_turn` or `require_idle` did not hold; nothing changed. | yes |
+| `worktree_users_changed` | `runtime` | `session.remove` | `expected_worktree_users` differs from the current set. | yes |
+| `task_attention_stale` | `runtime` | `task.answer` | The named attention is not the current pending one at that revision, or the provider already resolved it. | yes |
+| `task_result_unknown` | `runtime` | `task.review`, `task.result` | No result with that `result_id`. | yes |
+| `task_snapshot_retired` | `runtime` | `session.diff` with `turn` | The turn's snapshots were retired with the session content. | no |
+| `task_cursor_expired` | `runtime` | `task.list`, `task.inspect` | The paging cursor is too old or from another daemon epoch. | yes |
+| `worktree_in_use` | `runtime` | `session.remove`, `worktree.remove` | `session.remove`: other active tasks use the session's worktree. `worktree.remove`: a live session uses the worktree. The code is shared; the removal is refused either way. | yes |
+| `task_result_pending` | `runtime` | `task.result`, `task.continue` | The turn settled but its checks have not finished. | yes |
+| `task_check_unconfined` | `configuration` | `task.start`, `task.continue` | No kernel-enforced check containment and `checks.allow_unconfined` is not set. | yes |
+| `task_check_not_permitted` | `runtime` | `task.start`, `task.continue` | A requested check is not enabled or not permitted for the caller's origin. | yes |
+| `task_store_full` | `runtime` | `task.start`, `task.continue`, `task.review` | A task store cap would be exceeded. | yes |
+| `task_review_limit_reached` | `runtime` | `task.review` | `tasks.max_reviews_per_result` distinct reviewers already hold a verdict on the result. | no |
+| `task_waiter_limit_reached` | `runtime` | `task.wait` | The task waiter pool is full; session waits are unaffected. | yes |
+| `task_fingerprint_key_missing` | `runtime` | retried `task.start`, `task.continue`, `task.answer` | The key version a stored fingerprint names is unavailable; nothing is compared or dispatched. | yes |
+| `task_request_conflict` | `runtime` | every idempotent task method | A reused request key with different parameters; nothing is executed. | yes |
+| `task_investigate_no_checks` | `runtime` | `task.start`, `task.continue` | `checks` or `checks_baseline` requested for an investigate-mode task. | yes |
+| `task_fork_unsupported` | `runtime` | `session.fork` | The task's agent cannot fork its native session (OpenCode). | yes |
+| `task_investigate_unsupported` | `runtime` | `task.start` | The profile cannot enforce investigation mode. | yes |
+| `check_cleanup_stuck` | `runtime` | `task.start` with `worktree_of` | A daemon-owned check process scope in the worktree cannot be confirmed empty; the worktree stays occupied. | yes |
+
+`task_check_unconfined` is the only `configuration` code: the request is
+valid and only the owner's `checks.allow_unconfined` opt-in admits it. The
+other codes are state conflicts, limits, or refusals of the caller's request.
+
+A queued turn that settles `cancelled` reports the reason `task_turn_reopened`,
+`task_stopped` or `session_ended` in its result through `task.wait` and
+`task.result`; those are result reasons, not error codes. `task_settled` and
+`task_attention` are notification kinds.
+
 Clients must not parse `msg`. Branch on `class` and `code`, then display `msg`
 and `recover` for unknown codes.
 
