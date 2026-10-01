@@ -1,4 +1,4 @@
-//! A hermetic per-test environment: private directories and a scrubbed
+//! A hermetic per-test environment: private directories and an allowlisted
 //! process environment.
 //!
 //! A test that spawns processes or builds trusted directories must not depend
@@ -9,9 +9,16 @@
 //!   [`TestEnv`] drops (also while a panic unwinds);
 //! - a private working directory, `HOME`, the five XDG base directories and a
 //!   `TMPDIR`, all inside that root and owner-only (`0700`);
-//! - an environment for child processes that is the parent environment minus
-//!   every variable that steers a process towards host state, with `HOME`,
-//!   `XDG_*` and `TMPDIR` pointed at the private directories.
+//! - an environment for child processes built from an allowlist: only the
+//!   parent variables named by [`INHERITED_VARS`] and [`INHERITED_PREFIXES`]
+//!   are passed on, `HOME`, `XDG_*` and `TMPDIR` point at the private
+//!   directories, and every other variable is dropped.
+//!
+//! An allowlist is used because ambient variables steer children towards host
+//! state in ways no denylist anticipates: shell startup hooks (`BASH_ENV`,
+//! `ENV`, `ZDOTDIR`), interpreter paths (`PYTHONPATH`, `PYTHONSTARTUP`),
+//! dynamic-linker injection (`LD_PRELOAD`), and credentials (`GH_TOKEN`,
+//! `*_API_KEY`).
 //!
 //! The scrub applies to children only. Library code that reads the process
 //! environment in-process, such as `std::env::var_os("POHUNEK_SESSION_ID")`,
@@ -19,8 +26,9 @@
 //!
 //! Children are started through [`TestEnv::command`] or
 //! [`TestEnv::tokio_command`]. Both clear the inherited environment, so a
-//! variable a child needs on purpose, such as `POHUNEK_WORKER_BIN`, is added
-//! explicitly on the returned command and then survives the scrub.
+//! variable a child needs and the allowlist does not cover, such as
+//! `POHUNEK_WORKER_BIN` or `SHELL`, is added explicitly on the returned
+//! command; variables added there are passed on unchanged.
 //!
 //! Unix socket paths below the root are checked against
 //! [`STRICTEST_SOCKET_PATH_CAPACITY`] by [`TestEnv::socket_path`].
@@ -88,54 +96,53 @@ const XDG_CACHE_HOME_VAR: &str = "XDG_CACHE_HOME";
 const XDG_RUNTIME_DIR_VAR: &str = "XDG_RUNTIME_DIR";
 const TMPDIR_VAR: &str = "TMPDIR";
 
-/// Variable-name prefixes removed from every child environment.
+/// Variable-name prefixes passed from the parent to every child environment.
 ///
-/// - `POHUNEK_`: session, daemon, socket and worker identity of an enclosing
-///   pohunek session, and every test fixture override. A child that inherits a
-///   session id without a daemon id fails origin validation.
-/// - `XDG_`: base-directory and session variables of the host user. The five
-///   base directories are re-pinned to private directories; the rest
-///   (`XDG_DATA_DIRS`, `XDG_CONFIG_DIRS`, `XDG_SESSION_*`, ...) fall back to
-///   their specification defaults.
-/// - `GIT_`: `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE` and `GIT_CONFIG_*`
-///   point git at the repository or configuration of the process that started
-///   the test, for example when it runs under a git hook.
-pub const SCRUBBED_PREFIXES: &[&str] = &["POHUNEK_", "XDG_", "GIT_"];
+/// - `LC_`: locale categories (`LC_ALL`, `LC_CTYPE`, ...). They select the
+///   character encoding and message language of child tools and carry no paths
+///   or credentials.
+pub const INHERITED_PREFIXES: &[&str] = &["LC_"];
 
-/// Exact variable names removed from every child environment.
+/// Exact variable names passed from the parent to every child environment.
 ///
-/// Each one steers a child towards host state or a host service:
-/// `HOME` and `TMPDIR` are replaced by private directories; `PWD` and `OLDPWD`
-/// describe the directory the test was started in, not the child's working
-/// directory; `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO` and
-/// `GNUPGHOME` reach the host's credential agents; `DBUS_SESSION_BUS_ADDRESS`
-/// and `DBUS_SYSTEM_BUS_ADDRESS` reach the host's secret service and system
-/// services; `NOTIFY_SOCKET` makes a child report readiness to the host's
-/// systemd; `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME` and
-/// `UV_CACHE_DIR` redirect the agent integrations and the Python tool cache
-/// that pohunek reads and writes to host directories.
+/// Everything else is dropped, including `POHUNEK_*` (an enclosing session's
+/// identity makes a child fail origin validation), `XDG_*` and `HOME` (replaced
+/// by private directories), `GIT_*`, `SSH_AUTH_SOCK`, `DBUS_*`, shell startup
+/// hooks, interpreter search paths, dynamic-linker variables and credentials.
+/// A test that needs one of them adds it on the returned command.
 ///
-/// Build and toolchain variables (`PATH`, `CARGO_*`, `RUSTUP_*`, `RUST*`,
-/// `LD_*`, `DYLD_*`) and locale variables are kept: children such as `cargo`
-/// need them, and none of them reaches pohunek's own state. Because `HOME` is
-/// private, a test that spawns `cargo` or `rustup` must pass `CARGO_HOME` and
-/// `RUSTUP_HOME` through its parent environment.
-pub const SCRUBBED_VARS: &[&str] = &[
-    HOME_VAR,
-    TMPDIR_VAR,
-    "PWD",
-    "OLDPWD",
-    "SSH_AUTH_SOCK",
-    "SSH_AGENT_PID",
-    "GPG_AGENT_INFO",
-    "GNUPGHOME",
-    "DBUS_SESSION_BUS_ADDRESS",
-    "DBUS_SYSTEM_BUS_ADDRESS",
-    "NOTIFY_SOCKET",
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
-    "HERMES_HOME",
-    "UV_CACHE_DIR",
+/// Each entry has a reason to cross the boundary:
+///
+/// - `PATH`: children locate tools through it. Pinning the tools themselves is a
+///   separate concern of the test that needs a specific tool.
+/// - `LANG`, `LANGUAGE`: locale selection, as for [`INHERITED_PREFIXES`].
+/// - `CARGO_HOME`, `RUSTUP_HOME`: `HOME` is private, so without them a child
+///   `cargo` or `rustup` cannot find the registry cache or the toolchains.
+/// - `RUSTUP_TOOLCHAIN`: selects the toolchain a rustup proxy runs.
+/// - `CARGO_TARGET_DIR`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `CARGO_ENCODED_RUSTFLAGS`:
+///   a child `cargo` that sees different values rebuilds into a different or
+///   invalidated target directory.
+/// - `RUST_BACKTRACE`: diagnostics only; a panicking child reports where.
+///
+/// Deliberately absent: `USER`/`LOGNAME` (the account name is the developer's,
+/// nothing needs it, and absence is valid), `TERM` and `TZ` (host display and
+/// clock configuration; a test that depends on them sets them), `SHELL`,
+/// `RUST_LOG` (changes child log output), `RUSTC_WRAPPER` (runs an arbitrary
+/// binary around the compiler), `LD_*` and `DYLD_*` (can inject libraries into
+/// a child), and the `CARGO_*` prefix (it includes `CARGO_REGISTRY_TOKEN` and
+/// `CARGO_REGISTRIES_*_TOKEN`).
+pub const INHERITED_VARS: &[&str] = &[
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO_TARGET_DIR",
+    "RUSTFLAGS",
+    "RUSTDOCFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "RUST_BACKTRACE",
 ];
 
 /// Why a socket path is not usable under a [`TestEnv`].
@@ -210,7 +217,10 @@ pub fn check_socket_path(path: &Path) -> Result<(), SocketPathError> {
 /// Dropping the value removes the root and everything beneath it, on success
 /// and while a panic unwinds. A test process that is killed or aborts cannot
 /// run the drop and leaves its root behind.
-#[derive(Debug)]
+///
+/// The `Debug` output lists the directories and the names of the child
+/// environment variables, never their values: the parent environment can hold
+/// credentials such as `GH_TOKEN` that an allowlisted variable might carry.
 pub struct TestEnv {
     root: TempDir,
     cwd: PathBuf,
@@ -222,6 +232,26 @@ pub struct TestEnv {
     runtime_dir: PathBuf,
     tmp_dir: PathBuf,
     environment: BTreeMap<OsString, OsString>,
+}
+
+impl fmt::Debug for TestEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestEnv")
+            .field("root", &self.root.path())
+            .field("cwd", &self.cwd)
+            .field("home", &self.home)
+            .field("config_home", &self.config_home)
+            .field("data_home", &self.data_home)
+            .field("state_home", &self.state_home)
+            .field("cache_home", &self.cache_home)
+            .field("runtime_dir", &self.runtime_dir)
+            .field("tmp_dir", &self.tmp_dir)
+            .field(
+                "environment_names",
+                &self.environment.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl TestEnv {
@@ -400,23 +430,23 @@ impl TestEnv {
     }
 }
 
-/// Returns whether `name` is removed from a child environment.
-fn is_scrubbed(name: &OsStr) -> bool {
+/// Returns whether `name` is passed from the parent to a child environment.
+fn is_inherited(name: &OsStr) -> bool {
     let bytes = name.as_bytes();
-    SCRUBBED_PREFIXES
+    INHERITED_PREFIXES
         .iter()
         .any(|prefix| bytes.starts_with(prefix.as_bytes()))
-        || SCRUBBED_VARS.iter().any(|var| bytes == var.as_bytes())
+        || INHERITED_VARS.iter().any(|var| bytes == var.as_bytes())
 }
 
-/// Builds a child environment: `parent` without the scrubbed variables, plus `pinned`.
+/// Builds a child environment: the allowlisted variables of `parent`, plus `pinned`.
 fn scrubbed(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
     pinned: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> BTreeMap<OsString, OsString> {
     parent
         .into_iter()
-        .filter(|(name, _)| !is_scrubbed(name))
+        .filter(|(name, _)| is_inherited(name))
         .chain(pinned)
         .collect()
 }
@@ -440,7 +470,7 @@ mod tests {
     const HOST_SESSION_ID: &str = "s-host-session";
 
     /// Values of the crafted parent variables that must not reach a child.
-    const SCRUBBED_HOST_VALUES: [&str; 11] = [
+    const SCRUBBED_HOST_VALUES: [&str; 20] = [
         HOST_SESSION_ID,
         "/run/host/pohunek.sock",
         "postgres://host/db",
@@ -452,7 +482,38 @@ mod tests {
         "/host/agent",
         "/host/bus",
         "/host/codex",
+        SYNTHETIC_TOKEN,
+        "/host/bash-env.sh",
+        "/host/zdotdir",
+        "/host/env.sh",
+        "/host/python",
+        "/host/startup.py",
+        "/host/preload.so",
+        "/host/registry-token",
+        "/host/log-filter",
     ];
+
+    /// Names of the crafted parent variables that must not reach a child.
+    const SCRUBBED_NAMES: [&str; 15] = [
+        "POHUNEK_SESSION_ID",
+        "BASH_ENV",
+        "ZDOTDIR",
+        "ENV",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "GH_TOKEN",
+        "LD_PRELOAD",
+        "CARGO_REGISTRY_TOKEN",
+        "RUST_LOG",
+        "GIT_DIR",
+        "SSH_AUTH_SOCK",
+        "XDG_DATA_DIRS",
+        "USER",
+        "TERM",
+    ];
+
+    /// Synthetic credential the crafted parent carries; never a real secret.
+    const SYNTHETIC_TOKEN: &str = "ghp_synthetic_token_value_0123456789";
 
     /// Longest socket suffix the daemon tests nest below a root:
     /// `run/pohunek/workers/<36-character id>/control.sock`.
@@ -476,9 +537,24 @@ mod tests {
             pair("SSH_AUTH_SOCK", "/host/agent"),
             pair("DBUS_SESSION_BUS_ADDRESS", "unix:path=/host/bus"),
             pair("CODEX_HOME", "/host/codex"),
+            pair("GH_TOKEN", SYNTHETIC_TOKEN),
+            pair("BASH_ENV", "/host/bash-env.sh"),
+            pair("ZDOTDIR", "/host/zdotdir"),
+            pair("ENV", "/host/env.sh"),
+            pair("PYTHONPATH", "/host/python"),
+            pair("PYTHONSTARTUP", "/host/startup.py"),
+            pair("LD_PRELOAD", "/host/preload.so"),
+            pair("CARGO_REGISTRY_TOKEN", "/host/registry-token"),
+            pair("RUST_LOG", "/host/log-filter"),
+            pair("USER", "host-user"),
+            pair("TERM", "xterm-host"),
             pair("PATH", "/host/bin:/usr/bin"),
             pair("CARGO_TARGET_DIR", "/host/target"),
+            pair("CARGO_HOME", "/host/cargo"),
+            pair("RUSTUP_HOME", "/host/rustup"),
+            pair("RUST_BACKTRACE", "1"),
             pair("LANG", "C.UTF-8"),
+            pair("LC_ALL", "C.UTF-8"),
         ]
     }
 
@@ -507,11 +583,39 @@ mod tests {
     }
 
     #[test]
-    fn scrub_removes_inherited_control_variables_and_keeps_build_variables() {
+    fn scrub_passes_only_allowlisted_variables() {
         let env = scrubbed(crafted_parent(), []);
         let names: Vec<&str> = env.keys().filter_map(|name| name.to_str()).collect();
-        assert_eq!(names, ["CARGO_TARGET_DIR", "LANG", "PATH"]);
+        assert_eq!(
+            names,
+            [
+                "CARGO_HOME",
+                "CARGO_TARGET_DIR",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+                "RUSTUP_HOME",
+                "RUST_BACKTRACE",
+            ]
+        );
         assert_eq!(env[OsStr::new("PATH")], "/host/bin:/usr/bin");
+        for name in SCRUBBED_NAMES {
+            assert!(
+                !env.contains_key(OsStr::new(name)),
+                "{name} reached a child"
+            );
+        }
+    }
+
+    #[test]
+    fn every_inherited_name_is_passed_on() {
+        let parent: Vec<_> = INHERITED_VARS
+            .iter()
+            .map(|name| pair(name, "v"))
+            .chain([pair("LC_MESSAGES", "v")])
+            .collect();
+        let env = scrubbed(parent, []);
+        assert_eq!(env.len(), INHERITED_VARS.len() + 1);
     }
 
     #[test]
@@ -522,24 +626,47 @@ mod tests {
 
     #[test]
     fn scrub_keeps_values_that_are_not_utf8() {
-        let name = OsString::from("RAW_VAR");
+        let name = OsString::from("LANG");
         let value = OsString::from_vec(vec![0xff, 0xfe]);
         let env = scrubbed([(name.clone(), value.clone())], []);
         assert_eq!(env[&name], value);
     }
 
     #[test]
-    fn scrub_matches_prefixes_case_sensitively_and_by_whole_name() {
+    fn scrub_matches_names_exactly_and_prefixes_case_sensitively() {
         let env = scrubbed(
             [
-                pair("pohunek_lower", "kept"),
-                pair("POHUNEK", "kept"),
-                pair("MY_HOME", "kept"),
-                pair("HOMEPATH", "kept"),
+                pair("lc_lower", "dropped"),
+                pair("LCX", "dropped"),
+                pair("LANGUAGES", "dropped"),
+                pair("MYPATH", "dropped"),
+                pair("PATHEXT", "dropped"),
+                pair("CARGO_HOME_EXTRA", "dropped"),
+                pair("LC_CTYPE", "kept"),
             ],
             [],
         );
-        assert_eq!(env.len(), 4);
+        let names: Vec<&str> = env.keys().filter_map(|name| name.to_str()).collect();
+        assert_eq!(names, ["LC_CTYPE"]);
+    }
+
+    #[test]
+    fn debug_output_names_variables_but_never_prints_values() {
+        let env = TestEnv::with_parent_environment(crafted_parent()).expect("create env");
+        let rendered = format!("{env:?}");
+        assert!(rendered.contains("PATH"), "{rendered}");
+        assert!(
+            rendered.contains(&env.root().display().to_string()),
+            "{rendered}"
+        );
+        for value in
+            SCRUBBED_HOST_VALUES
+                .iter()
+                .chain(&["/host/bin", "/host/target", "/host/cargo"])
+        {
+            assert!(!rendered.contains(value), "{value} leaked into {rendered}");
+        }
+        assert!(!rendered.contains("GH_TOKEN"), "{rendered}");
     }
 
     #[test]
@@ -697,7 +824,22 @@ mod tests {
         assert!(lines.contains(&cwd.as_str()), "{lines:?}");
         let home = format!("var=HOME={}", env.home().display());
         assert!(lines.contains(&home.as_str()), "{lines:?}");
-        assert!(lines.contains(&"var=LANG=C.UTF-8"), "{lines:?}");
+        for kept in [
+            "var=LANG=C.UTF-8",
+            "var=LC_ALL=C.UTF-8",
+            "var=PATH=/host/bin:/usr/bin",
+            "var=CARGO_HOME=/host/cargo",
+            "var=RUSTUP_HOME=/host/rustup",
+        ] {
+            assert!(lines.contains(&kept), "{kept} missing from {lines:?}");
+        }
+        for name in SCRUBBED_NAMES {
+            let prefix = format!("var={name}=");
+            assert!(
+                !lines.iter().any(|line| line.starts_with(&prefix)),
+                "{name} reached the child: {lines:?}"
+            );
+        }
         assert!(
             lines.contains(&"var=POHUNEK_TEST_ENV_PROBE_CHILD=1"),
             "{lines:?}"

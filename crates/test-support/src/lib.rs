@@ -19,7 +19,7 @@
 //! a path baked in at compile time. A nextest archive extracted at a different
 //! absolute path therefore finds its binaries and source files.
 //!
-//! The [`env`] module holds [`env::TestEnv`], the per-test fixture that owns a
+//! The [`mod@env`] module holds [`env::TestEnv`], the per-test fixture that owns a
 //! private root, working directory, `HOME` and XDG directories, and builds a
 //! scrubbed environment for child processes.
 //!
