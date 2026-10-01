@@ -158,7 +158,18 @@ where
                     ignored += extra.ignored;
                     discovery.path.with_appended(&extra.path)
                 }
-                Err(_no_fallback) => discovery.path,
+                Err(error) => {
+                    // Every existing fallback directory may have been refused;
+                    // each one is still reported.
+                    if let SearchPathError::AllUntrusted { untrusted: refused } = error {
+                        for dropped in refused {
+                            if !untrusted.iter().any(|known| known.entry == dropped.entry) {
+                                untrusted.push(dropped);
+                            }
+                        }
+                    }
+                    discovery.path
+                }
             };
             Ok(PathResolution {
                 path,
@@ -495,5 +506,37 @@ mod tests {
             reported,
             [loose_a.display().to_string(), loose_b.display().to_string()]
         );
+    }
+
+    #[test]
+    fn a_safe_login_path_with_only_untrusted_fallback_directories_reports_them_all() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = fixture();
+        let discovered = dir.path().join("nix/bin");
+        make_dir(dir.path(), &discovered);
+        let loose_a = dir.path().join("loose-a");
+        let loose_b = dir.path().join("loose-b");
+        for loose in [&loose_a, &loose_b] {
+            make_dir(dir.path(), loose);
+            fs::set_permissions(loose, fs::Permissions::from_mode(0o775)).expect("chmod");
+        }
+        let table = [loose_a.display().to_string(), loose_b.display().to_string()];
+        let spec = shell(
+            dir.path(),
+            &format!(
+                "PATH='{}'; export PATH\nexec /bin/sh -c \"$3\"",
+                discovered.display()
+            ),
+        );
+        let resolution =
+            resolve_search_path(&policy(Some(&spec), &refs(&table), None)).expect("resolution");
+        assert_eq!(resolution.source, PathSource::LoginShell);
+        assert_eq!(resolution.path.entries(), [discovered]);
+        let reported: Vec<&str> = resolution
+            .untrusted
+            .iter()
+            .map(|dropped| dropped.entry.as_str())
+            .collect();
+        assert_eq!(reported, [table[0].as_str(), table[1].as_str()]);
     }
 }

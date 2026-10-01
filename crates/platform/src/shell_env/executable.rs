@@ -159,6 +159,16 @@ pub(super) fn is_executable_file(path: &Path) -> bool {
     is_trusted_executable(path, Owners::current())
 }
 
+/// The public form of the candidate check every resolver here applies.
+///
+/// For callers that probe one known path (the doctor, the CLI's daemon
+/// lookup) and must agree with the spawn path; the rule is that of
+/// [`resolve_executable`].
+#[must_use]
+pub fn is_trusted_executable_file(path: &Path) -> bool {
+    is_executable_file(path)
+}
+
 /// Whether every directory the lookup of `path` passes through is
 /// owner-controlled, symlink targets included.
 ///

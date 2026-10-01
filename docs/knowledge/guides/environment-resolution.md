@@ -24,7 +24,9 @@ Highest priority first:
    and no search happens. The daemon resolves agent programs (capability
    detection, create, resume) and the helper programs it runs itself (`git`, the
    worktree-hook interpreter `sh`) through this same resolver and spawns the
-   pinned path, skipping empty and
+   pinned path; the doctor's `bin:` checks, the capability snapshot (`git_available`,
+   worktree support, agent runtimes), and the CLI's daemon lookup use the same
+   resolver, so all of them agree on what would run, skipping empty and
    relative `PATH` entries (a trailing colon is harmless) rather than failing, and launches the exact
    canonical path it probed.
 2. **An explicitly supplied environment `PATH`.** A caller that already has a

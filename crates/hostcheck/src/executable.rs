@@ -1,54 +1,39 @@
 //! Executable resolution shared by every host probe.
 //!
-//! A file counts as an executable only when it is a regular file (after
-//! following symlinks) that the kernel says the effective user can execute:
-//! owner, group, ACL and search permission on every parent directory all
-//! count. A candidate the user cannot execute is skipped, exactly as a shell
-//! skips it, so it neither resolves nor stops the `PATH` search. Resolution
-//! takes the `PATH` value as an argument so tests never mutate the process
-//! environment.
+//! Every probe delegates to `pohunek_platform::shell_env`, the resolver the
+//! daemon spawns programs with, so the doctor, the capability snapshot, and the
+//! spawn path always agree. A candidate counts only when it is a regular file
+//! (after following symlinks) owned by the effective user or root, writable by
+//! neither group nor others, in directories only the owner or root can change,
+//! and executable for the effective user. A candidate that fails is skipped, so
+//! it neither resolves nor stops the `PATH` search; relative and empty `PATH`
+//! entries are skipped too. Resolution takes the `PATH` value as an argument so
+//! tests never mutate the process environment.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-// Rust guideline compliant 2026-09-30
+use pohunek_platform::shell_env;
 
-/// Whether `path` is a regular file the effective user can execute.
+// Rust guideline compliant 2026-10-01
+
+/// Whether `path` is an executable the daemon would run.
 ///
-/// Uses `faccessat(X_OK, AT_EACCESS)`, the kernel's own answer for the
-/// effective user and group. Symlinks are followed, so a link to an executable
-/// qualifies and a link to a data file or a directory does not. The file is
-/// never run.
+/// The shared trusted-executable check: see the module documentation. The file
+/// is never run.
 #[must_use]
 pub fn is_executable_file(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
-        && rustix::fs::accessat(
-            rustix::fs::CWD,
-            path,
-            rustix::fs::Access::EXEC_OK,
-            rustix::fs::AtFlags::EACCESS,
-        )
-        .is_ok()
+    shell_env::is_trusted_executable_file(path)
 }
 
 /// Resolve `program` to an executable file.
 ///
-/// A `program` containing a path separator is checked as given; a bare name is
-/// searched in each directory of `path_var` in order. An unset `PATH` resolves
-/// nothing for a bare name.
+/// A `program` containing a path separator must be absolute and is checked as
+/// given; a bare name is searched in each absolute directory of `path_var` in
+/// order. An unset `PATH` resolves nothing for a bare name.
 #[must_use]
 pub fn resolve_executable(program: &str, path_var: Option<&OsStr>) -> Option<PathBuf> {
-    if program.is_empty() {
-        return None;
-    }
-    if program.contains('/') {
-        let candidate = PathBuf::from(program);
-        return is_executable_file(&candidate).then_some(candidate);
-    }
-    let path_var = path_var?;
-    std::env::split_paths(path_var)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable_file(candidate))
+    shell_env::resolve_executable_in_path_value(OsStr::new(program), path_var).ok()
 }
 
 #[cfg(test)]
@@ -88,8 +73,10 @@ mod tests {
     #[test]
     fn execute_permission_is_decided_for_the_effective_user() {
         let dir = tempfile_dir("owner-bits");
-        // Owner-only execute: executable for the owner running this test.
-        let owner_only = write_file(&dir, "owner-only", 0o100);
+        // Owner-only read and execute: executable for the owner running this
+        // test. (An execute-only file cannot be opened for inspection and is
+        // skipped like any candidate the shared check cannot vouch for.)
+        let owner_only = write_file(&dir, "owner-only", 0o500);
         // Group/other execute without the owner bit: the kernel denies the
         // owner, unlike a check of "any execute bit".
         let others_only = write_file(&dir, "others-only", 0o011);
@@ -156,15 +143,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A private (0700) random directory below the temporary root.
     fn tempfile_dir(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = pohunek_test_support::temp_root().join(format!(
-            "pohunek-hostcheck-exec-{tag}-{}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        pohunek_test_support::tempdir_with_prefix(&format!("ph-hc-{tag}-"))
+            .expect("private fixture directory")
+            .keep()
+    }
+
+    #[test]
+    fn a_writable_file_or_directory_never_resolves_and_a_safe_later_one_wins() {
+        let loose_file_dir = tempfile_dir("loose-file");
+        let loose_dir = tempfile_dir("loose-dir");
+        let safe_dir = tempfile_dir("safe");
+        write_file(&loose_file_dir, "git", 0o777);
+        std::fs::set_permissions(&loose_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        write_file(&loose_dir, "git", 0o755);
+        let safe = write_file(&safe_dir, "git", 0o755);
+        for unsafe_only in [&loose_file_dir, &loose_dir] {
+            let path_var = OsString::from(unsafe_only.as_os_str());
+            assert_eq!(resolve_executable("git", Some(&path_var)), None);
+            assert!(!is_executable_file(&unsafe_only.join("git")));
+            assert_ne!(
+                crate::binary_with_path("git", true, Some(&path_var), "").status,
+                crate::DoctorStatus::Ok
+            );
+        }
+        let path_var = std::env::join_paths([&loose_file_dir, &loose_dir, &safe_dir]).unwrap();
+        assert_eq!(
+            resolve_executable("git", Some(&path_var)),
+            Some(safe.clone())
+        );
+        let check = crate::binary_with_path("git", true, Some(&path_var), "");
+        assert_eq!(check.status, crate::DoctorStatus::Ok);
+        assert!(
+            check.detail.contains(&safe.display().to_string()),
+            "{check:?}"
+        );
     }
 }

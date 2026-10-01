@@ -926,6 +926,40 @@ mod tests {
     }
 
     #[test]
+    fn doctor_capabilities_and_spawn_agree_on_an_unsafe_git() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let loose_file = temp_dir("agree-file");
+        let loose_dir = temp_dir("agree-dir");
+        let safe_dir = temp_dir("agree-safe");
+        fake_git(&loose_file, "unsafe", 0o777);
+        fs::set_permissions(&loose_dir, fs::Permissions::from_mode(0o777)).expect("chmod");
+        fake_git(&loose_dir, "unsafe", 0o755);
+        let safe = fake_git(&safe_dir, "safe", 0o755);
+        // What each of the three consults, for one `PATH`.
+        let verdict = |path: &std::ffi::OsStr| {
+            let doctor = hostcheck::binary_with_path("git", true, Some(path), "");
+            let capability = hostcheck::resolve_executable("git", Some(path));
+            let spawn = with_path(Path::new(path), || trusted_program("git").ok());
+            (
+                doctor.status == protocol::DoctorStatus::Ok,
+                capability,
+                spawn,
+            )
+        };
+        for unsafe_only in [&loose_file, &loose_dir] {
+            let (doctor_ok, capability, spawn) = verdict(unsafe_only.as_os_str());
+            assert!(!doctor_ok, "doctor must not accept an unsafe git");
+            assert_eq!(capability, None);
+            assert_eq!(spawn, None);
+        }
+        let both = std::env::join_paths([&loose_file, &loose_dir, &safe_dir]).expect("join");
+        let (doctor_ok, capability, spawn) = verdict(&both);
+        assert!(doctor_ok);
+        assert_eq!(capability, Some(safe.clone()));
+        assert_eq!(spawn, Some(safe));
+    }
+
+    #[test]
     fn the_launch_path_refuses_relative_programs_and_path_entries() {
         let cwd = temp_dir("launch-relative");
         let relative_dir = cwd.join("bin");
