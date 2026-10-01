@@ -288,6 +288,39 @@ fn a_macos_host_older_than_the_archive_minimum_is_refused() {
 }
 
 #[test]
+fn a_macos_install_keeps_the_owners_own_binaries_below_the_prefix() {
+    // Only the Linux installer ever wrote `<prefix>/bin/pohunekd`; on macOS a
+    // file there belongs to the owner.
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(&fixture.commands.join("sw_vers"), "#!/bin/sh\necho 15.1\n");
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
+    fixture.legacy_install_at(&fixture.prefix);
+    let own = fixture.prefix.join("bin/pohunekd");
+    let own_worker = fixture.prefix.join("libexec/pohunek-sessiond");
+    fs::remove_file(fixture.config_home.join("systemd/user/pohunekd.service")).expect("unit");
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    assert!(own.exists() && own_worker.exists(), "{output:?}");
+}
+
+#[test]
+fn a_macos_minimum_compares_minor_versions() {
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(&fixture.commands.join("sw_vers"), "#!/bin/sh\necho 14.0\n");
+    seal_manifest(&fixture.archive, "aarch64-apple-darwin", "daemon");
+    assert_success(&fixture.run(&[], &[]));
+    // An archive that needs 14.5 refuses macOS 14.0.
+    let fixture = Fixture::new();
+    fixture.fake_host("Darwin", "arm64");
+    write_executable(&fixture.commands.join("sw_vers"), "#!/bin/sh\necho 14.0\n");
+    seal_manifest_with_minimum(&fixture.archive, "aarch64-apple-darwin", "14.5");
+    let output = fixture.run(&[], &[]);
+    assert_refused_untouched(&fixture, &output, "needs macOS 14.5 or newer");
+}
+
+#[test]
 fn a_macos_arm64_host_accepts_the_macos_archive() {
     let fixture = Fixture::new();
     fixture.fake_host("Darwin", "arm64");
@@ -2413,13 +2446,22 @@ fn host_target() -> String {
 /// Writes the archive MANIFEST over the archive's current contents with
 /// `packaging/write-manifest`, as the release workflow does.
 fn seal_manifest(archive: &Path, target: &str, component: &str) {
+    seal(archive, target, component, MINIMUM_MACOS);
+}
+
+/// Seals a daemon manifest that demands `minimum` as the macOS version.
+fn seal_manifest_with_minimum(archive: &Path, target: &str, minimum: &str) {
+    seal(archive, target, "daemon", minimum);
+}
+
+fn seal(archive: &Path, target: &str, component: &str, minimum: &str) {
     let mut command = Command::new("sh");
     command
         .arg(repo_root().join("packaging/write-manifest"))
         .arg(archive)
         .args([component, ARCHIVE_VERSION, target, "none"]);
     if target.ends_with("apple-darwin") {
-        command.arg(MINIMUM_MACOS);
+        command.arg(minimum);
     }
     let output = command.output().expect("run write-manifest");
     assert_success(&output);

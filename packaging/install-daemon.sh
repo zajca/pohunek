@@ -175,10 +175,21 @@ fi
 if [ "$host_os" = Darwin ]; then
     [ -n "$manifest_minimum_macos" ] || refuse_archive "MANIFEST has no minimum-macos"
     host_macos=$(sw_vers -productVersion) || refuse_archive "cannot read the macOS version with sw_vers"
-    case ${host_macos%%.*} in
-        '' | *[!0-9]*) refuse_archive "unreadable macOS version: $host_macos" ;;
+    case $host_macos in
+        '' | *[!0-9.]*) refuse_archive "unreadable macOS version: $host_macos" ;;
     esac
-    if [ "${host_macos%%.*}" -lt "${manifest_minimum_macos%%.*}" ]; then
+    if ! awk -v minimum="$manifest_minimum_macos" -v have="$host_macos" 'BEGIN {
+        n = split(have, a, ".")
+        m = split(minimum, b, ".")
+        count = (n > m) ? n : m
+        for (i = 1; i <= count; i++) {
+            x = (i <= n) ? a[i] + 0 : 0
+            y = (i <= m) ? b[i] + 0 : 0
+            if (x > y) exit 0
+            if (x < y) exit 1
+        }
+        exit 0
+    }'; then
         echo "this archive needs macOS $manifest_minimum_macos or newer, but this host runs macOS $host_macos" >&2
         echo "nothing was changed" >&2
         exit 1
@@ -708,8 +719,12 @@ retire_legacy_binary() {
         echo "below $prefix, so it is not a binary of the legacy install" >&2
     fi
 }
-retire_legacy_binary bin pohunekd
-retire_legacy_binary libexec pohunek-sessiond
+# Only the Linux installer ever wrote these paths; on macOS a file there is the
+# owner's own (for example a `cargo install --root ~/.local` binary).
+if [ "$host_os" = Linux ]; then
+    retire_legacy_binary bin pohunekd
+    retire_legacy_binary libexec pohunek-sessiond
+fi
 
 if [ "$service_action" = upgrade ]; then
     set -- service upgrade --from "$archive_dir"
