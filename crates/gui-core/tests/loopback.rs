@@ -2480,47 +2480,130 @@ async fn wait_for_file(path: &Path) -> String {
     .await
 }
 
-#[tokio::test]
-async fn recorded_prompt_is_unobservable_until_the_writer_has_published_it() {
-    let dir = temp_dir("gui-core-recorder-gate");
-    let prompt_out = dir.join("prompt.txt");
-    let gate = dir.join("gate.fifo");
-    let mkfifo = std::process::Command::new("mkfifo")
-        .arg(&gate)
-        .status()
-        .expect("run mkfifo");
-    assert!(mkfifo.success(), "mkfifo failed: {mkfifo}");
-    let script = dir.join("recorder.sh");
-    std::fs::write(&script, recorder_script(&prompt_out, Some(&gate))).expect("write recorder");
-    let expected = "PR 7: Fix filters\nBody text\nbranch=feature/filters\n";
-    let mut writer = std::process::Command::new("/bin/sh")
-        .arg(&script)
-        .arg(expected)
+/// A recorder process that is killed and reaped when dropped, including when
+/// the owning test unwinds.
+struct RecorderGuard(std::process::Child);
+
+impl Drop for RecorderGuard {
+    fn drop(&mut self) {
+        // The child may already have exited, which makes `kill` fail; reaping
+        // it is what matters.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_recorder(script: &Path, prompt: &str) -> RecorderGuard {
+    let child = std::process::Command::new("/bin/sh")
+        .arg(script)
+        .arg(prompt)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("spawn recorder");
+    RecorderGuard(child)
+}
+
+fn make_fifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+}
+
+/// Opens the gate FIFO and queues the release token without blocking.
+///
+/// A read-write open never waits for a reader, so a recorder that died before
+/// opening the FIFO cannot hang the test. The returned handle keeps the token
+/// buffered and must stay alive until the recorder has consumed it.
+fn release_gate(gate: &Path) -> std::fs::File {
+    use std::io::Write as _;
+
+    let mut fifo = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(gate)
+        .expect("open gate FIFO");
+    fifo.write_all(b"go\n").expect("queue gate release token");
+    fifo
+}
+
+/// Waits for `path` like [`wait_for_file`], failing at once if `recorder` exits
+/// first.
+async fn wait_for_file_while_recording(path: &Path, recorder: &mut RecorderGuard) -> String {
+    let what = format!("{} to be published", path.display());
+    let outcome = wait::wait_until(&what, || {
+        let probed = match read_published(path) {
+            Some(content) => Some(Ok(content)),
+            None => recorder
+                .0
+                .try_wait()
+                .expect("poll recorder status")
+                .map(Err),
+        };
+        std::future::ready(probed)
+    })
+    .await;
+    outcome.unwrap_or_else(|status| {
+        panic!(
+            "recorder exited with {status} before publishing {}",
+            path.display()
+        )
+    })
+}
+
+#[tokio::test]
+async fn recorded_prompt_is_unobservable_until_the_writer_has_published_it() {
+    let dir = temp_dir("gui-core-recorder-gate");
+    let prompt_out = dir.join("prompt.txt");
+    let gate = dir.join("gate.fifo");
+    make_fifo(&gate);
+    let script = dir.join("recorder.sh");
+    std::fs::write(&script, recorder_script(&prompt_out, Some(&gate))).expect("write recorder");
+    let expected = "PR 7: Fix filters\nBody text\nbranch=feature/filters\n";
+    let mut recorder = spawn_recorder(&script, expected);
 
     // The writer has started and is held at the gate: its partial file exists
     // while the published path must not.
     let partial = prompt_out.with_extension("partial");
-    assert_eq!(wait_for_file(&partial).await, "");
+    assert_eq!(
+        wait_for_file_while_recording(&partial, &mut recorder).await,
+        ""
+    );
     assert_eq!(
         read_published(&prompt_out),
         None,
         "an unfinished prompt is visible at the published path"
     );
 
-    let release = tokio::task::spawn_blocking(move || std::fs::write(&gate, "go\n"));
-    wait::guard("the gate release", release)
-        .await
-        .expect("gate release task")
-        .expect("write gate");
-    assert_eq!(wait_for_file(&prompt_out).await, expected);
+    let _token = release_gate(&gate);
+    assert_eq!(
+        wait_for_file_while_recording(&prompt_out, &mut recorder).await,
+        expected
+    );
+}
 
-    writer.kill().expect("stop recorder");
-    writer.wait().expect("reap recorder");
+#[tokio::test]
+#[should_panic(expected = "recorder exited with")]
+async fn recorder_that_dies_before_opening_the_gate_fails_the_wait_without_hanging() {
+    let dir = temp_dir("gui-core-recorder-dies");
+    let prompt_out = dir.join("prompt.txt");
+    let gate = dir.join("gate.fifo");
+    make_fifo(&gate);
+    let script = dir.join("recorder.sh");
+    let partial = prompt_out.with_extension("partial");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\n: > '{}'\nexit 3\n", partial.display()),
+    )
+    .expect("write recorder");
+    let mut recorder = spawn_recorder(&script, "unused");
+
+    // No reader ever opens the FIFO, so a blocking open would never return.
+    let _token = release_gate(&gate);
+    wait_for_file_while_recording(&prompt_out, &mut recorder).await;
 }
 
 async fn report_native_id(host: &HostConfig, id: &SessionId, agent: &str, native_id: &str) {
