@@ -305,6 +305,9 @@ namespace=$(json_get "$work/ev/status-a.json" ok.namespace)
 [ -z "$(json_get "$work/ev/status-a.json" ok.pending_transaction)" ] || die "an install transaction is still pending"
 daemon_pid_a=$(json_get "$work/ev/status-a.json" ok.daemon.pid)
 [ -n "$daemon_pid_a" ] || die "the daemon has no process"
+# Start time with the pid: a recycled pid is a different process.
+daemon_start_a=$(ps -o lstart= -p "$daemon_pid_a" 2>/dev/null || true)
+[ -n "$daemon_start_a" ] || die "the daemon process $daemon_pid_a is not running"
 jobs_a=$(/bin/launchctl list | awk -v ns="$label_prefix.$namespace." 'index($3, ns) == 1' | wc -l | tr -d ' ')
 [ "$jobs_a" -eq 1 ] || die "expected exactly one launchd job for namespace $namespace, found $jobs_a"
 
@@ -438,6 +441,14 @@ status_json "$work/ev/status-b.json"
 daemon_pid_b=$(json_get "$work/ev/status-b.json" ok.daemon.pid)
 [ -n "$daemon_pid_b" ] && [ "$daemon_pid_b" != "$daemon_pid_a" ] || die "the daemon was not replaced (pid $daemon_pid_a -> ${daemon_pid_b:-none})"
 [ "$(json_get "$work/ev/status-b.json" ok.daemon.state)" = running ] || die "the upgraded daemon is not running"
+# The replaced daemon must be gone, not merely replaced in launchd's books.
+waited=0
+while [ "$(ps -o lstart= -p "$daemon_pid_a" 2>/dev/null || true)" = "$daemon_start_a" ]; do
+  process_gone "$daemon_pid_a" && break
+  [ "$waited" -lt "$exit_timeout_s" ] || die "the replaced daemon $daemon_pid_a is still running ${exit_timeout_s}s after the upgrade"
+  sleep 1
+  waited=$((waited + 1))
+done
 [ "$(json_get "$work/ev/status-b.json" ok.pending_transaction)" = "" ] || die "an upgrade transaction is still pending"
 program=$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$plist")
 [ "$program" = "$prefix/libexec/pohunek/$version_b/pohunekd" ] || die "the agent still starts '$program'"
@@ -516,10 +527,10 @@ installed_cli=
 # Every process the last snapshot recorded (daemon, workers, session children)
 # must be gone: a leak after a successful uninstall is a failure, not something
 # the cleanup may quietly end.
-recorded_pids=$(awk '$1 == "daemon" { print $2 } $1 == "worker" || $1 == "child" { print $3 }' "$work/ev/snap-pids.txt")
+recorded_pids="$daemon_pid_a $(awk '$1 == "daemon" { print $2 } $1 == "worker" || $1 == "child" { print $3 }' "$work/ev/snap-pids.txt")"
 for pid in $recorded_pids; do
   waited=0
-  until process_gone "$pid"; do
+  until process_gone "$pid" || [ "$pid" = "$daemon_pid_a" -a "$(ps -o lstart= -p "$pid" 2>/dev/null || true)" != "$daemon_start_a" ]; do
     [ "$waited" -lt "$exit_timeout_s" ] || die "process $pid of the uninstalled installation is still running after ${exit_timeout_s}s"
     sleep 1
     waited=$((waited + 1))
