@@ -249,7 +249,6 @@ impl BaseEnv {
     }
 
     /// Borrows the variables in name order for child construction.
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
         self.0
             .iter()

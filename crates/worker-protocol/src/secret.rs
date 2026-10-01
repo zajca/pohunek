@@ -199,7 +199,6 @@ impl SecretEnv {
     }
 
     /// Borrows entries for child process construction.
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &str)> {
         self.0
             .iter()

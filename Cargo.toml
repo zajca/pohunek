@@ -195,6 +195,10 @@ literal_string_with_formatting_args = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+# `assert!(x.is_empty())` is the idiomatic emptiness check in tests; the
+# lint's `assert_eq!(x, [] as [T; 0])` replacement needs a spelled-out element
+# type at every site and reads worse than the assertion it replaces.
+assert_is_empty = "allow"
 
 # Line tables keep file:line panic and RUST_BACKTRACE frames for workspace
 # crates while skipping the variable/type DWARF that dominates dev codegen,
