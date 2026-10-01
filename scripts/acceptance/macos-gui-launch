@@ -64,6 +64,7 @@ work=
 daemon_pid=
 gui_pid=
 escalated=no
+sweep_failures=
 session_id=
 worker_pids=
 child_pid=
@@ -161,6 +162,80 @@ terminate_and_wait() {
   return 1
 }
 
+# Names of the programs a run starts; discovery and the descendant sweep only
+# ever signal a process whose command name is one of these (or a descendant of
+# one, signalled under its own verified name).
+run_process_names='pohunekd pohunek-sessiond pohunek-gui pohunek'
+
+# Prints `pid name` for every process of this run: a process of ours whose
+# environment or command line carries the isolated work directory (the
+# runtime, state, and socket paths are all below it). `ps e` appends the
+# environment, which is where the daemon and worker carry XDG_RUNTIME_DIR.
+# The name is the basename of the command name and is checked again before any
+# signal.
+discover_run_processes() {
+  ps -axeww -o pid=,comm=,command= 2>/dev/null |
+    awk -v prefix="$work/" -v names="$run_process_names" -v self="$$" '
+      BEGIN { count = split(names, list, " "); for (i = 1; i <= count; i++) allowed[list[i]] = 1 }
+      index($0, prefix) > 0 && $1 != self {
+        name = $2
+        sub(".*/", "", name)
+        if (name in allowed) print $1, name
+      }'
+}
+
+# Prints `pid name` for every descendant of process $1.
+descendant_lines() {
+  ps -axo pid=,ppid=,comm= 2>/dev/null |
+    awk -v root="$1" '
+      { pid[NR] = $1; parent[NR] = $2; comm[NR] = $3; total = NR }
+      END {
+        keep[root] = 1
+        changed = 1
+        while (changed) {
+          changed = 0
+          for (i = 1; i <= total; i++) {
+            if (!(pid[i] in keep) && (parent[i] in keep)) {
+              keep[pid[i]] = 1
+              changed = 1
+              name = comm[i]
+              sub(".*/", "", name)
+              print pid[i], name
+            }
+          }
+        }
+      }'
+}
+
+# Ends every process of this run that is still alive, found from the work
+# directory rather than from recorded pids, so a run that failed before it
+# recorded anything leaves nothing behind. Sets `leftover=yes` when a process
+# cannot be confirmed gone.
+sweep_run_processes() {
+  # An empty work directory would make the match prefix `/` select everything.
+  [ -n "$work" ] && [ -d "$work" ] || return 0
+  found=$(discover_run_processes || true)
+  [ -n "$found" ] || return 0
+  # Descendants come first in the list, so each is signalled before its parent.
+  everything=
+  while read -r sweep_pid sweep_name; do
+    [ -n "$sweep_pid" ] || continue
+    everything="$everything
+$(descendant_lines "$sweep_pid" || true)"
+  done <<SWEEP
+$found
+SWEEP
+  everything="$everything
+$found"
+  sweep_failures=$(mktemp "${TMPDIR:-/tmp}/pgl-sweep.XXXXXX")
+  printf '%s\n' "$everything" | awk 'NF == 2 && !seen[$1]++ { print }' |
+    while read -r sweep_pid sweep_name; do
+      terminate_and_wait "$sweep_pid" "$sweep_name" || echo "$sweep_pid" >>"$sweep_failures"
+    done
+  [ ! -s "$sweep_failures" ] || leftover=yes
+  rm -f -- "$sweep_failures"
+}
+
 cleanup() {
   status=$?
   trap - EXIT
@@ -180,6 +255,7 @@ cleanup() {
   done
   [ -z "$child_pid" ] || [ -z "$child_name" ] ||
     terminate_and_wait "$child_pid" "$child_name" || leftover=yes
+  sweep_run_processes
   if [ -n "$work" ] && [ -d "$work" ]; then
     if [ "$leftover" = yes ]; then
       printf 'macos-gui-launch: a process could not be ended; keeping %s\n' "$work" >&2

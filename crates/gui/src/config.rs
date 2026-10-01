@@ -117,6 +117,10 @@ impl AppConfig {
         let raw: RawConfig =
             toml::from_str(&raw).map_err(|source| ConfigError::Parse { path, source })?;
         let raw_gui = raw.gui.clone().unwrap_or_default();
+        validate_text_field("pohunek_bin", &raw.pohunek_bin)?;
+        if let Some(command) = &raw.notification_command {
+            validate_text_field("notification_command", command)?;
+        }
         let attach = attach_selection(&raw, cfg!(target_os = "macos"))?;
         let launch = raw_gui.launch_settings()?;
         let login_shell = LoginShellSettings {
@@ -344,6 +348,24 @@ fn notifier(
     }
 }
 
+/// Rejects a program or template value that is blank or holds a NUL byte, so
+/// the mistake fails at load instead of on every attach or notification.
+fn validate_text_field(field: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.trim().is_empty() {
+        return Err(ConfigError::Invalid {
+            field,
+            message: "must not be empty".to_owned(),
+        });
+    }
+    if value.contains('\0') {
+        return Err(ConfigError::Invalid {
+            field,
+            message: "must not contain a NUL byte".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Picks the single attach mechanism the configuration selects.
 ///
 /// `darwin` is a parameter so the macOS-only branch is testable on any host.
@@ -352,6 +374,7 @@ fn attach_selection(raw: &RawConfig, darwin: bool) -> Result<AttachSelection, Co
         (Some(_), Some(_)) => Err(ConfigError::AttachConflict),
         (None, None) => Err(ConfigError::AttachMissing),
         (Some(template), None) => {
+            validate_text_field("attach_command", template)?;
             let mode = raw.attach_command_mode.unwrap_or_default();
             match mode {
                 AttachCommandMode::Shell => validate_attach_shell_template(template),
@@ -603,6 +626,62 @@ open_inbox = "ctrl+i"
             attach_selection(&raw, true),
             Err(ConfigError::AttachModeWithoutCommand)
         ));
+    }
+
+    #[test]
+    fn blank_or_nul_text_fields_fail_at_load() {
+        for value in ["", "   ", "a\0b"] {
+            let err = validate_text_field("pohunek_bin", value).expect_err("invalid");
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Invalid {
+                        field: "pohunek_bin",
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+        }
+        validate_text_field("pohunek_bin", "/opt/pohunek").expect("valid");
+    }
+
+    #[test]
+    fn a_nul_in_the_toml_string_is_caught_by_the_field_check() {
+        let raw: RawConfig = toml::from_str(
+            "attach_terminal = \"terminal-app\"\npohunek_bin = \"a\\u0000b\"\nnotification_command = \"n\\u0000\"",
+        )
+        .expect("raw config");
+        validate_text_field("pohunek_bin", &raw.pohunek_bin).expect_err("NUL in pohunek_bin");
+        let command = raw.notification_command.expect("command");
+        validate_text_field("notification_command", &command)
+            .expect_err("NUL in notification_command");
+    }
+
+    #[test]
+    fn a_blank_attach_command_is_refused() {
+        for template in ["", "  "] {
+            let raw = RawConfig {
+                attach_command: Some(template.to_owned()),
+                ..raw("attach_command = \"x\"\npohunek_bin = \"p\"")
+            };
+            let err = attach_selection(&raw, true).expect_err("blank");
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::Invalid {
+                        field: "attach_command",
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+        }
+        let raw = RawConfig {
+            attach_command: Some("a\0b".to_owned()),
+            ..raw("attach_command = \"x\"\npohunek_bin = \"p\"")
+        };
+        attach_selection(&raw, true).expect_err("NUL");
     }
 
     #[test]

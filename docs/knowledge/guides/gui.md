@@ -151,6 +151,9 @@ attach_command = "wezterm start -- {bin} --host={host} attach -- {id}"
 For the local host `{host}` is empty, and an empty `--host=` selects the local
 daemon.
 
+`pohunek_bin`, `attach_command`, and `notification_command` must not be blank or
+contain a NUL byte; that fails at load with an error naming the field.
+
 Use an absolute `pohunek_bin` when you want no lookup at all. `attach_command`
 supports exactly `{bin}`, `{host}`, and `{id}`.
 For a discovered remote host, `{host}` is a provider-qualified
@@ -180,7 +183,10 @@ attach remains on the same route as its control connection.
   installing the command. A command that cannot be resolved is reported as
   unavailable, not treated as working.
 - Each notification gets `[gui] notification_timeout_ms` (default 5000, zero is
-  rejected); a backend that does not exit by then is killed and reaped.
+  rejected); a backend that does not exit by then is killed and reaped. It runs
+  in its own process group and the whole group is killed at the deadline (and
+  after a normal exit), so a wrapper script's background children do not
+  accumulate; a descendant that starts its own session or group escapes.
 - The status line shows one message when the state changes to unavailable
   (unresolvable command, spawn failure, timeout, non-zero exit or signal) and
   one when it recovers; repeated identical failures stay silent.

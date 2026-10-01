@@ -434,19 +434,27 @@ pub(crate) struct BoundedOutput {
 /// only a short diagnostic line.
 const STDERR_CAPTURE_LIMIT: u64 = 4096;
 
-/// Runs `command` and waits at most `timeout` for it to exit.
+/// Runs `command` in its own process group and waits at most `timeout` for it
+/// to exit.
 ///
 /// A helper thread blocks in `waitid(WEXITED | WNOWAIT)`, which leaves the
-/// exited child unreaped. The calling thread therefore still owns a live
-/// process handle when the deadline passes and can kill it without racing a
-/// recycled process id, then reap it. When the command pipes stderr, the
-/// output is read after the child exited; only pipe a single-process command,
-/// because a surviving grandchild would keep the pipe open.
+/// exited leader unreaped. Its pid, which is the group id, therefore cannot be
+/// recycled while the calling thread kills the whole group, and only then reaps
+/// the leader. Every path that returns kills the group first, so a wrapper
+/// script's background children do not outlive the deadline or the command.
+///
+/// The limit: a descendant that leaves the group (it calls `setsid` or
+/// `setpgid`) is out of reach. When the command pipes stderr, the output is
+/// read after the group is dead, so a surviving group member cannot hold the
+/// pipe open.
 pub(crate) fn run_bounded(
     command: &mut Command,
     timeout: Duration,
 ) -> Result<BoundedOutput, BoundedError> {
-    let mut child = command.spawn().map_err(BoundedError::Spawn)?;
+    let mut child = command
+        .process_group(0)
+        .spawn()
+        .map_err(BoundedError::Spawn)?;
     let pid = Pid::from_child(&child);
     let (sender, receiver) = mpsc::channel();
     let watcher = thread::Builder::new()
@@ -459,12 +467,13 @@ pub(crate) fn run_bounded(
             let _ = sender.send(result.map(|_| ()));
         });
     if let Err(source) = watcher {
-        let _ = child.kill();
+        kill_group(pid);
         let _ = child.wait();
         return Err(BoundedError::Spawn(source));
     }
     match receiver.recv_timeout(timeout) {
         Ok(Ok(())) => {
+            kill_group(pid);
             let mut stderr = Vec::new();
             if let Some(pipe) = child.stderr.take() {
                 // The child exited, so the pipe reaches EOF; a read error
@@ -475,16 +484,23 @@ pub(crate) fn run_bounded(
             Ok(BoundedOutput { status, stderr })
         }
         Ok(Err(errno)) => {
-            let _ = child.kill();
+            kill_group(pid);
             let _ = child.wait();
             Err(BoundedError::Wait(io::Error::from(errno)))
         }
         Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
-            let _ = child.kill();
+            kill_group(pid);
             let _ = child.wait();
             Err(BoundedError::Timeout)
         }
     }
+}
+
+/// Kills the process group `group`, whose leader is still unreaped.
+///
+/// An already gone group (`ESRCH`) is fine.
+fn kill_group(group: Pid) {
+    let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
 }
 
 /// Why an observed child did not count as started.
@@ -995,6 +1011,81 @@ mod tests {
     }
 
     const WINDOW: Duration = Duration::from_secs(30);
+
+    /// Whether `pid` still runs; a zombie awaiting its reaper counts as gone.
+    fn process_is_running(pid: rustix::process::Pid) -> bool {
+        let stat = format!("/proc/{}/stat", pid.as_raw_nonzero());
+        match fs::read_to_string(stat) {
+            Ok(text) => text
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.trim_start().chars().next())
+                .is_some_and(|state| state != 'Z'),
+            Err(_) if Path::new("/proc/self").exists() => false,
+            Err(_) => rustix::process::test_kill_process(pid).is_ok(),
+        }
+    }
+
+    /// Waits a bounded time for the pid recorded in `marker` to disappear.
+    fn assert_background_child_gone(marker: &Path) {
+        let pid: i32 = fs::read_to_string(marker)
+            .expect("marker")
+            .trim()
+            .parse()
+            .expect("pid");
+        let pid = rustix::process::Pid::from_raw(pid).expect("pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while process_is_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a descendant survived the group kill"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn a_timeout_kills_the_wrappers_background_children_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("background-pid");
+        let wrapper = dir.path().join("wrapper");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nsleep 300 &\necho $! > '{}'\nwait\n",
+                marker.display()
+            ),
+        )
+        .expect("write wrapper");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let error = run_bounded(&mut Command::new(&wrapper), Duration::from_secs(2))
+            .expect_err("the wrapper never exits");
+
+        assert!(matches!(error, BoundedError::Timeout), "{error:?}");
+        assert_background_child_gone(&marker);
+    }
+
+    #[test]
+    fn a_wrapper_that_exits_does_not_leave_background_children_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("background-pid");
+        let wrapper = dir.path().join("wrapper");
+        // The child detaches its stdio, so only the group kill can end it.
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nsleep 300 >/dev/null 2>&1 </dev/null &\necho $! > '{}'\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .expect("write wrapper");
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let output = run_bounded(&mut Command::new(&wrapper), WINDOW).expect("wrapper exits");
+
+        assert!(output.status.success());
+        assert_background_child_gone(&marker);
+    }
 
     #[test]
     fn a_quick_successful_exit_counts_as_started() {
