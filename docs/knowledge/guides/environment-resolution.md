@@ -146,6 +146,17 @@ returns before it replaces the job. To pick up a newly installed prefix,
 uninstall and install again. A command that refreshes the path in place is
 tracked in #319.
 
+## The NetBird CLI
+
+The `netbird` CLI that overlay discovery and `pohunek doctor` run is resolved by
+the same trusted-executable policy, in the process that runs it. The lookup
+uses the process `PATH` first. On macOS a process launched from Finder or launchd
+carries a minimal `PATH`, so a miss continues in the fixed fallback directories
+(Homebrew and package-installer prefixes among them); only trusted directories
+and executables count. The resolved absolute path is what runs, so the kernel
+does no second search. A `netbird` that fails the policy is reported as missing,
+and `netbird_cli` in the doctor agrees with the daemon's own probe.
+
 ## Safety rules
 
 - The login shell runs once, at install time, as the installing user. No user

@@ -13,8 +13,14 @@
 //! Defensive parsing rules: unknown fields are ignored, all fields are
 //! optional and default, and the parser never panics on real-world drift.
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use pohunek_platform::shell_env::{
+    fallback_search_path, resolve_executable, resolve_executable_in_path_value,
+    DARWIN_FALLBACK_DIRECTORIES,
+};
 use serde::de::Deserializer;
 use serde::Deserialize;
 
@@ -22,7 +28,10 @@ use crate::{is_netbird_ip, parse_addr_strip_cidr};
 
 /// Subcommand and flag used to ask `NetBird` for machine-readable status.
 const NETBIRD_STATUS_ARGS: [&str; 2] = ["status", "--json"];
-/// Default program name for the `NetBird` CLI (resolved via the OS through PATH).
+/// Program name of the `NetBird` CLI, resolved with the shared
+/// trusted-executable policy: first against the process `PATH`, then (macOS
+/// only) in the fixed install directories. A Finder-launched app carries a
+/// minimal `PATH` that omits the Homebrew and package-installer prefixes.
 const NETBIRD_PROGRAM: &str = "netbird";
 /// Maximum number of bytes of captured CLI output to surface in an error
 /// message. Bounds the size of a [`NetbirdError::StateUnavailable`] detail so a
@@ -32,7 +41,8 @@ const MAX_ERROR_DETAIL_BYTES: usize = 512;
 /// Errors raised while reading or interpreting `NetBird`'s local state.
 #[derive(Debug, thiserror::Error)]
 pub enum NetbirdError {
-    /// The `netbird` CLI binary could not be found on `PATH`.
+    /// No executable `netbird` that the shared trusted-executable policy accepts
+    /// was found on `PATH`.
     #[error("the `netbird` CLI was not found on PATH")]
     CliMissing,
     /// `NetBird` is installed but its local state could not be read (daemon down,
@@ -234,13 +244,17 @@ pub fn parse_status(json: &str) -> Result<NetbirdStatus, NetbirdError> {
 
 /// Run `netbird status --json` (resolved on `PATH`) and parse it.
 ///
+/// The program is the first trusted `netbird` on the process `PATH` or, on
+/// macOS, in the trusted fixed install directories, and that absolute path is
+/// what runs, so the kernel does no second `PATH` search.
+///
 /// Errors:
-/// - [`NetbirdError::CliMissing`] when the binary is not found (`ENOENT`).
+/// - [`NetbirdError::CliMissing`] when no trusted `netbird` is found.
 /// - [`NetbirdError::StateUnavailable`] on a non-zero exit (daemon down / not
 ///   logged in), carrying a short trimmed detail from stderr/stdout.
 /// - [`NetbirdError::Parse`] when the output is not valid status JSON.
 pub fn run_status() -> Result<NetbirdStatus, NetbirdError> {
-    run_status_with_program(NETBIRD_PROGRAM)
+    run_status_at(&resolve_host_program()?)
 }
 
 /// Asynchronously run `netbird status --json` and parse its output.
@@ -253,10 +267,43 @@ pub fn run_status() -> Result<NetbirdStatus, NetbirdError> {
 ///
 /// Returns the same errors as [`run_status`].
 pub async fn run_status_async() -> Result<NetbirdStatus, NetbirdError> {
-    run_status_async_with_program(NETBIRD_PROGRAM).await
+    let program = resolve_host_program()?;
+    run_status_async_at(&program).await
 }
 
-async fn run_status_async_with_program(program: &str) -> Result<NetbirdStatus, NetbirdError> {
+/// Resolves the `netbird` CLI for this host's environment.
+fn resolve_host_program() -> Result<PathBuf, NetbirdError> {
+    let fallback: &[&str] = if cfg!(target_os = "macos") {
+        DARWIN_FALLBACK_DIRECTORIES
+    } else {
+        &[]
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_program(
+        std::env::var_os("PATH").as_deref(),
+        fallback,
+        home.as_deref(),
+    )
+}
+
+/// Resolves the `netbird` CLI against a raw `PATH` value, then against the
+/// trusted directories of `fallback` (`~/` entries expand against `home`).
+fn resolve_program(
+    path: Option<&OsStr>,
+    fallback: &[&str],
+    home: Option<&Path>,
+) -> Result<PathBuf, NetbirdError> {
+    let program = OsStr::new(NETBIRD_PROGRAM);
+    if let Ok(found) = resolve_executable_in_path_value(program, path) {
+        return Ok(found);
+    }
+    let search = fallback_search_path(fallback, home)
+        .map_err(|_unresolved| NetbirdError::CliMissing)?
+        .path;
+    resolve_executable(program, &search).map_err(|_unresolved| NetbirdError::CliMissing)
+}
+
+async fn run_status_async_at(program: &Path) -> Result<NetbirdStatus, NetbirdError> {
     let output = tokio::process::Command::new(program)
         .args(NETBIRD_STATUS_ARGS)
         // The daemon may cancel this future while shutting down. Killing the
@@ -273,6 +320,10 @@ async fn run_status_async_with_program(program: &str) -> Result<NetbirdStatus, N
 /// Useful for tests (pass a non-existent program to deterministically hit
 /// [`NetbirdError::CliMissing`]).
 pub fn run_status_with_program(program: &str) -> Result<NetbirdStatus, NetbirdError> {
+    run_status_at(Path::new(program))
+}
+
+fn run_status_at(program: &Path) -> Result<NetbirdStatus, NetbirdError> {
     let output = Command::new(program)
         .args(NETBIRD_STATUS_ARGS)
         .output()
@@ -281,10 +332,13 @@ pub fn run_status_with_program(program: &str) -> Result<NetbirdStatus, NetbirdEr
     status_from_output(&output)
 }
 
-fn command_error(program: &str, err: &std::io::Error) -> NetbirdError {
+fn command_error(program: &Path, err: &std::io::Error) -> NetbirdError {
     match err.kind() {
         std::io::ErrorKind::NotFound => NetbirdError::CliMissing,
-        _ => NetbirdError::StateUnavailable(format!("failed to run `{program} status`: {err}")),
+        _ => NetbirdError::StateUnavailable(format!(
+            "failed to run `{} status`: {err}",
+            program.display()
+        )),
     }
 }
 
@@ -495,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn async_missing_program_is_cli_missing() {
-        let err = run_status_async_with_program("definitely-not-a-real-binary-xyz")
+        let err = run_status_async_at(Path::new("definitely-not-a-real-binary-xyz"))
             .await
             .expect_err("missing CLI returns an error");
         assert!(matches!(err, NetbirdError::CliMissing));
@@ -530,9 +584,7 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&program, permissions).expect("chmod script");
 
-        let mut status = Box::pin(run_status_async_with_program(
-            program.to_str().expect("utf8 path"),
-        ));
+        let mut status = Box::pin(run_status_async_at(&program));
         tokio::time::timeout(START_TIMEOUT, async {
             tokio::select! {
                 result = &mut status => panic!("slow status exited before cancellation: {result:?}"),
@@ -560,6 +612,94 @@ mod tests {
         .await
         .expect("timed-out status subprocess must be killed");
         fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    /// A private directory (canonical, mode 0700) holding a fake `netbird`
+    /// that prints `body` and exits 0, with `mode` as the file's permissions.
+    fn fake_netbird(tag: &str, body: &str, mode: u32) -> (tempfile::TempDir, PathBuf) {
+        let dir = pohunek_test_support::tempdir_with_prefix(&format!("pohunek-netbird-{tag}-"))
+            .expect("private test root");
+        let program = dir.path().join("netbird");
+        fs::write(&program, format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\n")).expect("script");
+        fs::set_permissions(&program, fs::Permissions::from_mode(mode)).expect("chmod");
+        (dir, program)
+    }
+
+    #[test]
+    fn program_resolves_from_the_supplied_path_and_runs_by_absolute_path() {
+        let (dir, program) = fake_netbird("resolve", STATUS_CURRENT, 0o755);
+        let resolved =
+            resolve_program(Some(dir.path().as_os_str()), &[], None).expect("trusted netbird");
+        assert_eq!(resolved, program);
+        let status = run_status_at(&resolved).expect("status via the resolved path");
+        assert_eq!(
+            status.self_netbird_ip(),
+            Some("100.92.10.20".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_untrusted_candidate_is_not_run() {
+        let (dir, _) = fake_netbird("untrusted", STATUS_CURRENT, 0o777);
+        assert!(matches!(
+            resolve_program(Some(dir.path().as_os_str()), &[], None),
+            Err(NetbirdError::CliMissing)
+        ));
+    }
+
+    #[test]
+    fn a_trusted_candidate_later_on_path_wins_over_an_untrusted_one() {
+        let (loose, _) = fake_netbird("loose", STATUS_CURRENT, 0o777);
+        let (safe, program) = fake_netbird("safe", STATUS_CURRENT, 0o755);
+        let path = std::env::join_paths([loose.path(), safe.path()]).expect("join");
+        assert_eq!(
+            resolve_program(Some(&path), &[], None).expect("safe one"),
+            program
+        );
+    }
+
+    #[test]
+    fn absent_empty_and_relative_path_resolve_nothing() {
+        assert!(matches!(
+            resolve_program(None, &[], None),
+            Err(NetbirdError::CliMissing)
+        ));
+        assert!(matches!(
+            resolve_program(Some(OsStr::new("")), &[], None),
+            Err(NetbirdError::CliMissing)
+        ));
+        assert!(matches!(
+            resolve_program(Some(OsStr::new("relative/bin:.")), &[], None),
+            Err(NetbirdError::CliMissing)
+        ));
+    }
+
+    #[test]
+    fn a_minimal_path_falls_back_to_the_trusted_install_directories() {
+        let (dir, program) = fake_netbird("fallback", STATUS_CURRENT, 0o755);
+        let table = [dir.path().to_str().expect("utf8 root")];
+        let minimal = OsStr::new("/nonexistent-minimal-path");
+        assert_eq!(
+            resolve_program(Some(minimal), &table, None).expect("fallback netbird"),
+            program
+        );
+        // The PATH wins over the fallback when both hold a netbird.
+        let (preferred, preferred_program) = fake_netbird("preferred", STATUS_CURRENT, 0o755);
+        assert_eq!(
+            resolve_program(Some(preferred.path().as_os_str()), &table, None)
+                .expect("path netbird"),
+            preferred_program
+        );
+    }
+
+    #[test]
+    fn the_fallback_directories_obey_the_trust_policy() {
+        let (loose, _) = fake_netbird("fallback-loose", STATUS_CURRENT, 0o777);
+        let table = [loose.path().to_str().expect("utf8 root")];
+        assert!(matches!(
+            resolve_program(None, &table, None),
+            Err(NetbirdError::CliMissing)
+        ));
     }
 
     #[test]

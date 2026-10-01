@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-09-29)
 
+- Documented that the `netbird` CLI is resolved by the trusted-executable policy
+  (process `PATH`, then the macOS fallback directories) in the process that runs
+  it, and that the doctor `netbird_cli` check uses the same lookup.
 - Documented the executable search-path policy: the `service.toml`
   `[environment] search_path` key, the `service_search_path_unavailable` error
   code, and the environment-resolution guide.

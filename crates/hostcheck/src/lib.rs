@@ -217,19 +217,13 @@ pub fn binary_with_path(
 /// Check `NetBird` availability.
 ///
 /// `NetBird` is *optional*: remote hosts need it, but local-only use is fully
-/// valid, so its absence is a `warn`, never a `fail`. When the CLI is present we
-/// additionally probe local state — a resolvable self `NetBird` IP yields `ok`;
-/// an unreadable state (daemon down / not logged in) is a `warn`.
+/// valid, so its absence is a `warn`, never a `fail`. The CLI is located by the
+/// same resolver the daemon and client use to run it, so the verdict cannot
+/// disagree with the spawn. When it is present we additionally probe local
+/// state: a resolvable self `NetBird` IP yields `ok`; an unreadable state
+/// (daemon down / not logged in) is a `warn`.
 #[must_use]
 pub fn netbird() -> DoctorCheck {
-    if which_on_path("netbird").is_none() {
-        return DoctorCheck::new(
-            "netbird_cli",
-            DoctorStatus::Warn,
-            "'netbird' not found on PATH; NetBird is optional (remote hosts need it)",
-        );
-    }
-
     match netbird::run_status() {
         Ok(status) => match status.self_netbird_ip() {
             Some(ip) => DoctorCheck::new(
@@ -243,6 +237,11 @@ pub fn netbird() -> DoctorCheck {
                 "found, but no NetBird IP resolved (not logged in or daemon down)",
             ),
         },
+        Err(netbird::NetbirdError::CliMissing) => DoctorCheck::new(
+            "netbird_cli",
+            DoctorStatus::Warn,
+            "'netbird' not found on PATH; NetBird is optional (remote hosts need it)",
+        ),
         Err(err) => DoctorCheck::new(
             "netbird_cli",
             DoctorStatus::Warn,
