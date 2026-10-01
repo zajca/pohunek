@@ -7,8 +7,8 @@
 #
 # Verified here:
 #   1. Two installers started at once leave exactly one healthy installation
-#      (one wins; the other is refused with `service_transaction_in_progress`
-#      or runs after it as an unchanged upgrade). The prefix contains a space
+#      (one wins; the other is refused because another `pohunek service`
+#      command is running, or runs after it as an unchanged upgrade). The prefix contains a space
 #      and a quote, so every launchd property list value must be serialized,
 #      never interpolated.
 #   2. Re-running the installer from the same archive changes nothing: the
@@ -284,9 +284,9 @@ printf 'installer exit statuses: %s and %s\n' "$status_one" "$status_two"
 if [ "$status_one" -ne 0 ] && [ "$status_two" -ne 0 ]; then
   die "both concurrent installers failed"
 fi
-# A refused installer must name the concurrent transaction, nothing else.
+# A refused installer must name the concurrent `pohunek service` command, nothing else.
 refused_for_other_reason() {
-  [ "$1" -ne 0 ] && ! grep -q 'service_transaction_in_progress' "$work/ev/install-$2.err" "$work/ev/install-$2.out"
+  [ "$1" -ne 0 ] && ! grep -q 'another .pohunek service. command is running' "$work/ev/install-$2.err" "$work/ev/install-$2.out"
 }
 if refused_for_other_reason "$status_one" 1; then
   die "installer 1 failed for a reason other than a concurrent transaction"

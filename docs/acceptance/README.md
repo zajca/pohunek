@@ -179,7 +179,7 @@ isolated root and checks, from the extracted archives alone:
 
 | Step | Outcome checked |
 |------|-----------------|
-| Two concurrent installers, prefix containing a space and a quote | One healthy installation: one launchd job, the agent property list valid and starting the version A daemon by its exact path; the loser is refused with `service_transaction_in_progress` or runs afterwards as an unchanged upgrade. |
+| Two concurrent installers, prefix containing a space and a quote | One healthy installation: one launchd job, the agent property list valid and starting the version A daemon by its exact path; the loser is refused because another `pohunek service` command is running, or runs afterwards as an unchanged upgrade. |
 | Installer run again | The daemon keeps its process. |
 | Corrupt, member-less, other-architecture, and group-writable archives with two live sessions | Refused before any change: daemon, workers, and session children keep PID, start time, and PTY. |
 | Upgrade A to B with two live sessions | The daemon is replaced; both workers and both session children keep PID, start time, PTY, and version A; version A stays installed; a new session runs from version B. |
