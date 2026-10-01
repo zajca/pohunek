@@ -1,14 +1,16 @@
 //! Rendering the review prompt and dispatching a review as a new
 //! same-worktree session.
 
-// Rust guideline compliant 2026-07-19
+// Rust guideline compliant 2026-10-01
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use protocol::{SessionInfo, SessionNewParams, SessionNewResult};
 
-use super::model::{now_rfc3339, Review, ReviewComment};
+use time::OffsetDateTime;
+
+use super::model::{format_rfc3339, Review, ReviewComment};
 use super::store::ReviewStore;
 use crate::{
     create_session_with_options, render_prompt, ConnectionOptions, CoreError, HostConfig,
@@ -200,9 +202,11 @@ pub async fn dispatch_review(
         });
     };
 
-    let mut metadata = copied_link_metadata(&session_info.metadata);
-    metadata.insert(REVIEW_SOURCE_KEY.to_owned(), review.id.as_str().to_owned());
-    metadata.insert(REVIEW_DISPATCHED_AT_KEY.to_owned(), now_rfc3339());
+    let metadata = review_session_metadata(
+        &session_info.metadata,
+        review.id.as_str(),
+        OffsetDateTime::now_utc(),
+    );
 
     let new_params = SessionNewParams {
         agent: agent.unwrap_or_else(|| session_info.agent.clone()),
@@ -226,6 +230,19 @@ pub async fn dispatch_review(
     Ok(created)
 }
 
+/// Builds the dispatched session's metadata: the source session's `link.*`
+/// keys plus `review.source` and `review.dispatched_at` (`now`, RFC3339).
+fn review_session_metadata(
+    source: &BTreeMap<String, String>,
+    review_id: &str,
+    now: OffsetDateTime,
+) -> BTreeMap<String, String> {
+    let mut metadata = copied_link_metadata(source);
+    metadata.insert(REVIEW_SOURCE_KEY.to_owned(), review_id.to_owned());
+    metadata.insert(REVIEW_DISPATCHED_AT_KEY.to_owned(), format_rfc3339(now));
+    metadata
+}
+
 fn copied_link_metadata(source: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     source
         .iter()
@@ -236,10 +253,16 @@ fn copied_link_metadata(source: &BTreeMap<String, String>) -> BTreeMap<String, S
 
 #[cfg(test)]
 mod tests {
-    use super::{render_comment_block, render_review_prompt_from_config_dir, review_context_json};
+    use std::collections::BTreeMap;
+
+    use super::{
+        render_comment_block, render_review_prompt_from_config_dir, review_context_json,
+        review_session_metadata, REVIEW_DISPATCHED_AT_KEY, REVIEW_SOURCE_KEY,
+    };
     use crate::review::model::{Review, ReviewComment, ReviewSide, ReviewSource};
     use crate::{CoreError, HostId};
     use protocol::SessionId;
+    use time::macros::datetime;
 
     /// Random, owner-private fixture root; removed when the guard drops.
     fn fixture_root() -> tempfile::TempDir {
@@ -355,5 +378,28 @@ mod tests {
             }
             other => panic!("expected CoreError::MissingReviewTemplate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn review_session_metadata_copies_links_and_stamps_the_given_instant() {
+        let source = BTreeMap::from([
+            ("link.provider".to_owned(), "github".to_owned()),
+            ("unrelated".to_owned(), "dropped".to_owned()),
+        ]);
+
+        let metadata =
+            review_session_metadata(&source, "review-1", datetime!(2026-10-01 08:00:00 UTC));
+
+        assert_eq!(
+            metadata,
+            BTreeMap::from([
+                ("link.provider".to_owned(), "github".to_owned()),
+                (REVIEW_SOURCE_KEY.to_owned(), "review-1".to_owned()),
+                (
+                    REVIEW_DISPATCHED_AT_KEY.to_owned(),
+                    "2026-10-01T08:00:00Z".to_owned()
+                ),
+            ])
+        );
     }
 }
