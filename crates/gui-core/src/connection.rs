@@ -632,6 +632,10 @@ enum ScanState {
     Unquoted,
     Single,
     Double,
+    /// An unquoted `#` at word start, up to the end of the line.
+    Comment,
+    /// `$'...'`, where a backslash escapes the next character.
+    AnsiC,
 }
 
 /// Walks `text` and returns the unquoted placeholders.
@@ -672,6 +676,8 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
             match state {
                 ScanState::Single => return Err(refuse("single quotes")),
                 ScanState::Double => return Err(refuse("double quotes")),
+                ScanState::Comment => return Err(refuse("a comment")),
+                ScanState::AnsiC => return Err(refuse("ANSI-C quoting")),
                 ScanState::Unquoted => {}
             }
             if follows_parameter(bytes, index) {
@@ -681,6 +687,24 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
             word_placeholder = true;
             index += placeholder.token().len();
             word_start = false;
+            continue;
+        }
+        if state == ScanState::Comment {
+            // Quotes inside a comment are plain text; only a newline ends it.
+            if byte == b'\n' {
+                state = ScanState::Unquoted;
+                word_start = true;
+            }
+            index += 1;
+            continue;
+        }
+        if state == ScanState::AnsiC {
+            match byte {
+                b'\'' => state = ScanState::Unquoted,
+                b'\\' => index += 1,
+                _ => {}
+            }
+            index += 1;
             continue;
         }
         if state == ScanState::Single {
@@ -731,7 +755,26 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
             b'(' | b')' | b'[' | b']' | b'<' | b'>' | b'{' | b'}' if strict && !in_double => {
                 return Err(refuse("parentheses, brackets, braces, or redirection"));
             }
+            b'$' if !in_double && bytes.get(index + 1) == Some(&b'\'') => {
+                state = ScanState::AnsiC;
+                index += 2;
+                continue;
+            }
+            // The body of a heredoc is not shell syntax this scan can follow, so
+            // a static template stops being scanned there.
+            b'<' if !in_double && bytes.get(index + 1) == Some(&b'<') => {
+                return if has_shell_content(text) {
+                    Ok(sites)
+                } else {
+                    Err(AttachTemplateError::EmptyCommand)
+                };
+            }
             b'#' if strict && !in_double && word_start => return Err(refuse("a comment")),
+            b'#' if !in_double && word_start => {
+                state = ScanState::Comment;
+                index += 1;
+                continue;
+            }
             b'*' | b'?' | b'~' if strict && !in_double => word_glob = true,
             _ => {}
         }
@@ -747,7 +790,10 @@ fn scan_shell_template(text: &str) -> Result<Vec<(usize, Placeholder)>, AttachTe
         }
         index += 1;
     }
-    if state != ScanState::Unquoted {
+    if matches!(
+        state,
+        ScanState::Single | ScanState::Double | ScanState::AnsiC
+    ) {
         return Err(AttachTemplateError::UnterminatedQuote);
     }
     if word_placeholder && word_glob {
@@ -1391,6 +1437,81 @@ mod attach_template_tests {
                 "slot {slot}"
             );
         }
+    }
+
+    #[test]
+    fn a_comment_in_a_static_template_is_skipped_like_the_shell_does() {
+        let values = AttachTemplateValues {
+            bin: "b".to_owned(),
+            host: "h".to_owned(),
+            id: "i".to_owned(),
+        };
+        for template in [
+            "true # user's wrapper",
+            "true\n# it's fine\ntrue",
+            "# \"unbalanced\ntrue",
+            "echo a#b 'x' # it's",
+        ] {
+            // The real shell parses each one.
+            let status = Command::new("sh")
+                .args(["-n", "-c", template])
+                .status()
+                .expect("run sh");
+            assert!(status.success(), "sh rejects {template:?}");
+            assert_eq!(
+                validate_attach_shell_template(template),
+                Ok(()),
+                "{template:?}"
+            );
+            assert_eq!(
+                render_attach_command(template, &values).as_deref(),
+                Ok(template)
+            );
+        }
+        // A real unterminated quote is still refused, and sh agrees.
+        let broken = "echo 'open # not a comment";
+        assert!(!Command::new("sh")
+            .args(["-n", "-c", broken])
+            .status()
+            .expect("run sh")
+            .success());
+        assert_eq!(
+            validate_attach_shell_template(broken),
+            Err(AttachTemplateError::UnterminatedQuote)
+        );
+        // A comment after real content on the same line as a placeholder, or
+        // holding one, would silently drop it, so it stays refused.
+        for template in ["true {id} # it's", "true # {id}", "true\n# note\ntrue {id}"] {
+            assert!(
+                matches!(
+                    validate_attach_shell_template(template),
+                    Err(AttachTemplateError::UnsafePlaceholderContext { .. })
+                ),
+                "{template:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_templates_with_ansi_c_quotes_or_heredocs_only_get_the_minimal_checks() {
+        for template in [
+            "echo $'it\\'s'",
+            "cat <<EOF\nit's here\nEOF",
+            "echo $'a\\\\' b",
+        ] {
+            assert_eq!(
+                validate_attach_shell_template(template),
+                Ok(()),
+                "{template:?}"
+            );
+        }
+        assert_eq!(
+            validate_attach_shell_template("echo $'open"),
+            Err(AttachTemplateError::UnterminatedQuote)
+        );
+        // With a placeholder the allowlist still applies.
+        assert!(validate_attach_shell_template("echo $'x' {id}").is_err());
+        assert!(validate_attach_shell_template("cat <<EOF {id}").is_err());
     }
 
     #[test]

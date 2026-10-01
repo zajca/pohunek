@@ -255,9 +255,15 @@ fn is_trusted_executable(path: &Path, owners: Owners) -> bool {
     let Ok(target) = std::fs::canonicalize(path) else {
         return false;
     };
+    // A FIFO without a writer or a device node must neither block the lookup
+    // nor be opened at all, so non-regular files are skipped on a plain `stat`,
+    // and the open itself is non-blocking.
+    if !std::fs::metadata(&target).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
     let Ok(descriptor) = rustix::fs::open(
         &target,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) else {
         return false;
@@ -711,5 +717,31 @@ mod tests {
             resolve_executable(OsStr::new("x"), &search),
             Ok(bin.join("x"))
         );
+    }
+
+    #[test]
+    fn a_fifo_without_a_writer_neither_blocks_nor_shadows_a_later_executable() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = fixture();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        make_dir(dir.path(), &first);
+        make_dir(dir.path(), &second);
+        let fifo = first.join("agent");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o755))
+            .expect("mkfifo");
+        let later = executable(&second, "agent");
+        let search = SearchPath::new(vec![first, second]).expect("search");
+        // A helper thread bounds the test: a blocking open would hang it.
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(sender.send(resolve_executable(OsStr::new("agent"), &search)));
+        });
+        let resolved = receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the lookup returned instead of blocking on the FIFO");
+        assert_eq!(resolved, Ok(later));
     }
 }

@@ -320,7 +320,7 @@ impl<'a> Engine<'a> {
         // after proving it still describes this installation.
         let (config, search_path_report) = match &resume {
             Some(record) if record.step >= Step::Config => {
-                let config = self.verified_resume_config(prefix, version)?;
+                let config = verify_resume_config(self.context, prefix, version)?;
                 let report = SearchPathReport {
                     source: "recorded",
                     entries: config.search_path().entries().to_vec(),
@@ -401,33 +401,6 @@ impl<'a> Engine<'a> {
             });
         }
         ensure_no_daemon_job(self.backend).await
-    }
-
-    /// Reads `service.toml` for an install resumed past the config step.
-    ///
-    /// The file is proven to describe this installation before any further
-    /// effect: its prefix, version, and namespace inputs must equal those of
-    /// the interrupted install and of the current user. A mismatch is an error;
-    /// the file is never overwritten here.
-    fn verified_resume_config(&self, prefix: &Path, version: &str) -> Result<ServiceConfig, Error> {
-        let config = ServiceConfig::load(&self.context.config_path())?;
-        let (state_root, runtime_root) = self.context.roots()?;
-        config.verify_installation(self.context.uid(), &state_root, &runtime_root)?;
-        if config.prefix() != prefix {
-            return Err(Error::ResumeConfigMismatch {
-                key: "prefix",
-                recorded: config.prefix().display().to_string(),
-                expected: prefix.display().to_string(),
-            });
-        }
-        if config.active_version() != version {
-            return Err(Error::ResumeConfigMismatch {
-                key: "active_version",
-                recorded: config.active_version().to_owned(),
-                expected: version.to_owned(),
-            });
-        }
-        Ok(config)
     }
 
     /// Upgrades the installation to `version` from the binaries in `from`.
@@ -1466,6 +1439,43 @@ pub(crate) fn install_preflight(context: &Context, prefix: &Path) -> Result<Inst
     let layout = install_layout(prefix)?;
     check_layout_dirs(context, &layout)?;
     Ok(layout)
+}
+
+/// Reads `service.toml` for an install resumed past the config step.
+///
+/// The file is proven to describe this installation before any further
+/// effect: its prefix, version, and namespace inputs must equal those of the
+/// interrupted install and of the current user. A mismatch is an error; the
+/// file is never overwritten here. `service check` runs this same function.
+///
+/// # Errors
+///
+/// Returns the load errors of [`ServiceConfig::load`] for a missing or
+/// invalid file, [`Error::Config`] for another namespace, and
+/// [`Error::ResumeConfigMismatch`] for another prefix or version.
+pub(crate) fn verify_resume_config(
+    context: &Context,
+    prefix: &Path,
+    version: &str,
+) -> Result<ServiceConfig, Error> {
+    let config = ServiceConfig::load(&context.config_path())?;
+    let (state_root, runtime_root) = context.roots()?;
+    config.verify_installation(context.uid(), &state_root, &runtime_root)?;
+    if config.prefix() != prefix {
+        return Err(Error::ResumeConfigMismatch {
+            key: "prefix",
+            recorded: config.prefix().display().to_string(),
+            expected: prefix.display().to_string(),
+        });
+    }
+    if config.active_version() != version {
+        return Err(Error::ResumeConfigMismatch {
+            key: "active_version",
+            recorded: config.active_version().to_owned(),
+            expected: version.to_owned(),
+        });
+    }
+    Ok(config)
 }
 
 /// Resolves the daemon `PATH` when the install plan will write `service.toml`.

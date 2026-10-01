@@ -929,6 +929,54 @@ async fn an_existing_installation_wins_over_discovery_and_never_starts_the_probe
 }
 
 #[tokio::test]
+async fn check_and_install_agree_on_the_config_of_a_resumed_install() {
+    for variant in ["missing", "prefix", "version", "valid"] {
+        let harness = Harness::new();
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registering);
+        engine
+            .install(&harness.staged(V1), &harness.prefix(), V1)
+            .await
+            .expect_err("interrupted");
+        let path = harness.context.config_path();
+        match variant {
+            "missing" => std::fs::remove_file(&path).expect("remove config"),
+            "prefix" | "version" => {
+                let mut spec = harness.config().expect("config").to_spec();
+                if variant == "prefix" {
+                    spec.prefix = harness.root.join("elsewhere");
+                } else {
+                    spec.active_version = "9.9.9".to_owned();
+                }
+                ServiceConfig::new(spec)
+                    .expect("valid edited config")
+                    .write(&path)
+                    .expect("write");
+            }
+            _ => {}
+        }
+        let checked = crate::service::check_with(
+            &harness.context,
+            &harness.backend,
+            Some(harness.prefix()),
+            V1,
+            false,
+        )
+        .await;
+        let installed = harness.install(V1).await;
+        match (&checked, &installed) {
+            (Ok(_), Ok(_)) => assert_eq!(variant, "valid"),
+            (Err(check), Err(install)) => {
+                assert_ne!(variant, "valid");
+                assert_eq!(check.code(), install.code(), "{variant}");
+                assert_eq!(check.to_string(), install.to_string(), "{variant}");
+            }
+            other => panic!("{variant}: check and install disagree: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_resume_refuses_a_service_toml_of_another_installation() {
     for (key, edit) in [("prefix", 0_u8), ("active_version", 1_u8)] {
         let harness = Harness::new();

@@ -552,6 +552,13 @@ pub(crate) fn check_local(
         };
         let layout = engine::install_preflight(context, &prefix)?;
         let plan = engine::install_plan(pending, &prefix, version)?;
+        // A resume past the config step reads the written file, so check proves
+        // it exactly as install does.
+        if let engine::Plan::Resume(record) = &plan {
+            if record.step >= record::Step::Config {
+                engine::verify_resume_config(context, &prefix, version)?;
+            }
+        }
         // A rollback of the pending record removes the `service.toml` it wrote.
         if matches!(plan, engine::Plan::Fresh) && exists(&config_path)? {
             return Err(Error::AlreadyInstalled { path: config_path });

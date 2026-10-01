@@ -156,7 +156,9 @@ one of two ways, both in `pohunek-gui-core`:
   unquoted word; its value is escaped as exactly one such word, so a value
   containing quotes, `$()`, backticks, newlines, `;`, spaces, Unicode, or
   another placeholder never changes the command's structure. The template is
-  not parsed as shell. When it holds a placeholder it must fit an allowlist
+  not parsed as shell: a template without a placeholder only gets the minimal checks
+  (NUL, no command, an unterminated quote; comments, `$'...'` and heredocs are
+  skipped like the shell does). When it holds a placeholder it must fit an allowlist
   grammar: outside single quotes, no backtick, parenthesis, bracket, `<`, `>`,
   literal brace, `#` comment, line continuation, or `$` other than a plain
   `$NAME`; double-quoted text may hold no `$` construct or backtick;
