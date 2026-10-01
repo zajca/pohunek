@@ -1,0 +1,94 @@
+#!/bin/sh
+
+# Starts the packaged macOS GUI the way Finder starts an app and requires it to
+# stay up. usage: smoke-gui-release-macos <Pohunek.app>
+#
+# The bundle identity is checked first (identifier, executable, minimum macOS).
+# The bundle's executable then runs with Finder's environment (`env -i`, HOME,
+# USER, LOGNAME, the minimal launchd PATH) and an isolated configuration, so it
+# neither reads nor changes the operator's own pohunek state. A process that
+# exits during the window, or reports a panic, fails the check. Needs a window
+# server: outside a GUI (Aqua) launchd session it exits 2, never reports
+# success without starting the app.
+
+set -eu
+umask 077
+
+readonly SMOKE_WINDOW_SECONDS=8
+readonly SMOKE_TERM_WAIT_SECONDS=15
+readonly EXPECTED_IDENTIFIER=io.github.zajca.pohunek.gui
+readonly FINDER_PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' "usage: $0 <Pohunek.app>" >&2
+    exit 64
+fi
+app=$1
+[ "$(uname -s)" = Darwin ] || { printf '%s\n' "this check runs on macOS only" >&2; exit 2; }
+[ -d "$app/Contents/MacOS" ] || { printf 'not an app bundle: %s\n' "$app" >&2; exit 66; }
+
+plist=$app/Contents/Info.plist
+identifier=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$plist")
+executable_name=$(/usr/bin/plutil -extract CFBundleExecutable raw -o - "$plist")
+minimum=$(/usr/bin/plutil -extract LSMinimumSystemVersion raw -o - "$plist")
+[ "$identifier" = "$EXPECTED_IDENTIFIER" ] || { printf 'bundle identifier is %s, expected %s\n' "$identifier" "$EXPECTED_IDENTIFIER" >&2; exit 1; }
+executable=$app/Contents/MacOS/$executable_name
+[ -x "$executable" ] || { printf 'bundle executable is missing or not executable: %s\n' "$executable" >&2; exit 1; }
+printf 'bundle %s, executable %s, minimum macOS %s\n' "$identifier" "$executable_name" "$minimum"
+
+manager=$(/bin/launchctl managername 2>/dev/null || printf unknown)
+if [ "$manager" != Aqua ]; then
+    printf 'no window server: launchd session is "%s", not "Aqua"\n' "$manager" >&2
+    exit 2
+fi
+
+work=$(mktemp -d /tmp/pohunek-gui-smoke.XXXXXX)
+work=$(CDPATH='' cd -- "$work" && pwd -P)
+gui_pid=
+cleanup() {
+    status=$?
+    trap - EXIT
+    if [ -n "$gui_pid" ] && kill -0 "$gui_pid" 2>/dev/null; then
+        kill -TERM "$gui_pid" 2>/dev/null || true
+        waited=0
+        while kill -0 "$gui_pid" 2>/dev/null && [ "$waited" -lt "$SMOKE_TERM_WAIT_SECONDS" ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        kill -KILL "$gui_pid" 2>/dev/null || true
+    fi
+    if [ "$status" -ne 0 ] && [ -f "$work/gui.err" ]; then
+        cat "$work/gui.err" >&2
+    fi
+    rm -rf -- "$work"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+home=$work/h
+mkdir -p "$home/.config/pohunek" "$work/run" "$work/state" "$work/data" "$work/cache"
+user=$(id -un)
+(
+    exec env -i \
+        HOME="$home" USER="$user" LOGNAME="$user" PATH="$FINDER_PATH" \
+        XDG_CONFIG_HOME="$home/.config" XDG_RUNTIME_DIR="$work/run" \
+        XDG_STATE_HOME="$work/state" XDG_DATA_HOME="$work/data" \
+        XDG_CACHE_HOME="$work/cache" "$executable" >"$work/gui.out" 2>"$work/gui.err"
+) &
+gui_pid=$!
+
+elapsed=0
+while [ "$elapsed" -lt "$SMOKE_WINDOW_SECONDS" ]; do
+    if ! kill -0 "$gui_pid" 2>/dev/null; then
+        printf '%s\n' "the packaged GUI exited during startup" >&2
+        exit 1
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+done
+if grep -qiE 'panicked at|fatal' "$work/gui.err"; then
+    printf '%s\n' "the packaged GUI reported a panic or fatal error" >&2
+    exit 1
+fi
+printf 'the packaged GUI stayed up for %ss\n' "$SMOKE_WINDOW_SECONDS"

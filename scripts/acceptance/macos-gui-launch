@@ -16,7 +16,7 @@
 #     no real Terminal.app is started); they are covered by the pohunek-gui unit
 #     tests that CI runs on macOS;
 #   - double-clicking an app icon in Finder, a Dock launch, and the Terminal.app
-#     window itself, which need the .app bundle from issue #104.
+#     window itself, which need a person at the Mac and the signed Pohunek.app.
 #
 # The GUI needs a window server. Outside a GUI (Aqua) login session, for example
 # over SSH or in a service session, the script exits 2, prints the manual Finder
@@ -85,15 +85,13 @@ die() {
 manual_steps() {
   cat >&2 <<EOF
 
-Manual Finder procedure (steps 3 and 5 need the .app bundle from issue #104):
+Manual Finder procedure (steps 3 and 5 need a person at the Mac):
   1. Log in at the Mac's GUI and run: pohunek service install
      Confirm with: pohunek service status
   2. Create ~/.config/pohunek/gui.toml with, for example:
        pohunek_bin = "pohunek"
        attach_terminal = "terminal-app"
-  3. Double-click the pohunek-gui app in Finder (bundle only). Without the
-     bundle, run: open -a Terminal <path-to>/pohunek-gui   or start the binary
-     from Finder's "Open With > Terminal".
+  3. Double-click Pohunek.app (from the pohunek-gui release archive) in Finder.
   4. Confirm the window opens, the local host appears, and no configuration
      error is shown in the status line.
   5. Start a session, click Open, and confirm Terminal.app opens attached to it.
@@ -484,4 +482,4 @@ state=$("$python_bin" "$helper" states "$work/ev/list-after.json" "$session_id" 
 printf 'worker and child unchanged; session %s still live\n' "$session_id"
 
 printf '\nmacos-gui-launch: all checks passed\n'
-printf 'Not verified here: the attach launchers, a session-row click, and Terminal.app (unit tests, or the .app bundle from issue #104).\n'
+printf 'Not verified here: the attach launchers, a session-row click, and Terminal.app (unit tests, or a person at the Mac with Pohunek.app).\n'

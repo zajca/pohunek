@@ -248,6 +248,17 @@ installer. It runs beside a compatible local `pohunekd`; unpack it, run
 `~/.config/pohunek/backend.env`, then enable `pohunek-backend.service`. See the
 archive's `README.md` for the complete commands.
 
+macOS on Apple Silicon (macOS 14 or newer) has `aarch64-apple-darwin` CLI,
+daemon, and GUI archives. They are signed with a Developer ID Application
+certificate, hardened-runtime and notarized by Apple, and the GUI archive holds
+`Pohunek.app` with the notarization ticket stapled. Install the daemon archive
+with its `packaging/install-daemon.sh` (a launchd login agent, no `sudo`), then
+copy `Pohunek.app` to `~/Applications`. If Gatekeeper refuses a download, check
+it with `codesign --verify --deep --strict` and `spctl --assess --type execute`;
+never disable Gatekeeper. A build made with `packaging/macos/package
+--development` is unsigned, named `...-unsigned-development`, and never
+released.
+
 Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
 
@@ -965,8 +976,15 @@ cargo xtask ts check      # CI gate
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
 Release workflow re-runs the gates on the tag, then builds and publishes glibc
-and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, and a
-self-contained Linux x86_64 web-control-center archive. The offline docs are
+and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, a
+self-contained Linux x86_64 web-control-center archive, and signed, notarized
+`aarch64-apple-darwin` CLI, daemon, and GUI (`Pohunek.app`) archives. The macOS
+jobs run in the protected `macos-signing` environment (secrets
+`MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
+`APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,
+and the variable `MACOS_TEAM_ID`); a missing credential fails them before the
+build, so a macOS archive is never published unsigned and the release run stays
+red until the credentials exist. The offline docs are
 bundled into every native component archive. CLI archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
 source-locked Hermes runtime without provider credentials, runs the model-free

@@ -359,6 +359,22 @@ Release packaging and contributor verification:
   the extracted macOS archives against real launchd.
 - `scripts/tests/test_macos_packaging.py` — regression checks for the audit
   (with `otool`/`lipo`/`strings` shims) and the packaging scripts.
+- `packaging/macos/build-app-bundle` — assembles `Pohunek.app` (bundle
+  identifier `io.github.zajca.pohunek.gui`, minimum macOS from the deployment
+  target) around `pohunek-gui`, writing the Info.plist with `plutil`.
+- `packaging/macos/signing-keychain` — creates the ephemeral keychain holding
+  the Developer ID certificate from protected CI secrets (and removes it);
+  fails when a secret is missing.
+- `packaging/macos/sign` — signs every Mach-O file and app bundle with the
+  hardened runtime and a secure timestamp.
+- `packaging/macos/notarize` — submits the signed tree to Apple's notary
+  service with an API key, requires `Accepted`, and staples app bundles.
+- `packaging/macos/verify-signed` — verifies the signatures, team identifier,
+  hardened runtime, timestamps, stapled tickets, and Gatekeeper verdict.
+- `scripts/smoke-gui-release-macos` — launches the packaged app bundle's
+  executable with a Finder-like environment and requires it to stay up.
+- `scripts/tests/test_macos_signing.py` — regression checks for the signing
+  tooling and the release workflow's credential handling, against shims.
 - `crates/cli/tests/daemon_packaging.rs`
 - `crates/cli/tests/service_lock.rs` — `pohunek service lock` and the lock it
   hands down, through the real binary.

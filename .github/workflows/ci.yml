@@ -534,6 +534,27 @@ jobs:
           PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
         run: scripts/acceptance/macos-package-install
 
+      # The unsigned development app bundle: its Info.plist identity, the audit,
+      # and a Finder-like launch of the bundle's executable.
+      - name: Build, package, and launch the GUI app bundle
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$(packaging/macos/build-release gui)"
+          mkdir -p "$RUNNER_TEMP/dist-gui"
+          archive="$(packaging/macos/package --development gui "${{ steps.package-a.outputs.version }}" \
+            "$bindir" target/pohunek-docs "$RUNNER_TEMP/dist-gui")"
+          extract_dir="$RUNNER_TEMP/extracted-gui"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir"
+          app="$(find "$extract_dir" -maxdepth 2 -name Pohunek.app -type d)"
+          test -n "$app"
+          /usr/bin/plutil -lint "$app/Contents/Info.plist"
+          codesign --verify --verbose=2 "$app/Contents/MacOS/pohunek-gui"
+          scripts/smoke-gui-release-macos "$app"
+
   test:
     name: fmt + clippy
     runs-on: ubuntu-latest
@@ -767,6 +788,7 @@ jobs:
               - 'LICENSE'
               - 'scripts/acceptance/macos-package-install'
               - 'scripts/acceptance/launchd_lifetime_evidence.py'
+              - 'scripts/smoke-gui-release-macos'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -789,6 +811,7 @@ jobs:
               - 'crates/gui-core/**'
               - 'crates/relay-client/**'
               - 'crates/relay-protocol/**'
+              - 'crates/gui/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
             # Pinned Hermes compatibility provisioning + runtime check

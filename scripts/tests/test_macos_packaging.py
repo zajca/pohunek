@@ -23,7 +23,12 @@ SCRIPTS = [
     MACOS / "audit-macho",
     MACOS / "build-release",
     MACOS / "package",
+    MACOS / "build-app-bundle",
+    MACOS / "sign",
+    MACOS / "notarize",
+    MACOS / "verify-signed",
     ROOT / "scripts" / "acceptance" / "macos-package-install",
+    ROOT / "scripts" / "smoke-gui-release-macos",
 ]
 
 MACHO_MAGIC = bytes.fromhex("cffaedfe")
@@ -290,6 +295,12 @@ class ToolingTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, "{}: {}".format(script, result.stderr))
             self.assertTrue(script.read_text().startswith("#!/bin/sh\n"), script)
 
+    def test_the_keychain_script_parses_as_bash(self):
+        script = MACOS / "signing-keychain"
+        self.assertTrue(os.stat(script).st_mode & stat.S_IXUSR)
+        result = subprocess.run(["bash", "-n", str(script)], stderr=subprocess.PIPE, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_the_deployment_target_is_one_value(self):
         target = (MACOS / "DEPLOYMENT_TARGET").read_text().strip()
         self.assertRegex(target, r"^\d+\.\d+$")
@@ -301,8 +312,11 @@ class ToolingTest(unittest.TestCase):
 
     def test_the_development_package_is_never_a_release_name(self):
         text = (MACOS / "package").read_text()
-        self.assertIn("-unsigned-development", text)
-        self.assertIn("unsigned-development", text.split("write-manifest", 1)[1])
+        development = text.split('if [ "$mode" = --development ]; then', 1)[1].split("else", 1)[0]
+        self.assertIn("suffix=-unsigned-development", development)
+        self.assertIn("signing=unsigned-development", development)
+        release = text.split("else\n    signing=", 1)[1].split("\nfi", 1)[0]
+        self.assertEqual(release, "developer-id")
 
 
 if __name__ == "__main__":

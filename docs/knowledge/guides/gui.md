@@ -226,8 +226,32 @@ What cannot be confirmed: `osascript` exits 0 whether the notification was shown
 or suppressed by System Settings (Notifications, Focus), and an unbundled binary
 cannot ask `UNUserNotificationCenter` for its authorization. "Submitted" means
 the backend accepted the request, not that it was displayed, and the GUI cannot
-detect that a user denied notifications. Denial detection needs the app bundle
-(issue #104).
+detect that a user denied notifications. The release's `Pohunek.app` gives the
+GUI the bundle identity such a check needs, but the GUI does not call
+`UNUserNotificationCenter` yet, so denial is still undetectable (tracked by
+issue #102).
+
+## macOS app bundle
+
+The macOS GUI archive `pohunek-gui-<version>-aarch64-apple-darwin.tar.gz`
+contains `Pohunek.app`, signed with a Developer ID Application certificate
+(hardened runtime, secure timestamp) and notarized, with the ticket stapled.
+Copy it to `~/Applications` (or `/Applications`) and open it from Finder.
+
+- Bundle identifier `io.github.zajca.pohunek.gui`, executable `pohunek-gui`,
+  minimum macOS 14.0, Apple Silicon only.
+- The bundle holds no CLI, daemon, or worker. The app finds the installed
+  `pohunek` the way a terminal-launched GUI does: `pohunek_bin` in `gui.toml`
+  when set, otherwise a login-shell `PATH` lookup, then `~/.local/bin`, where
+  `pohunek service install` places it. Install the daemon archive first.
+- It reads the same `~/.config/pohunek/gui.toml` and the same keychain items as
+  the unbundled binary.
+- A development build (`packaging/macos/package --development gui ...`) is
+  unsigned, named `...-unsigned-development`, and never released.
+- If Gatekeeper refuses an app that was downloaded with a browser, verify it
+  with `spctl --assess --type execute --verbose=4 Pohunek.app` and
+  `codesign --verify --deep --strict Pohunek.app`; do not disable Gatekeeper or
+  strip quarantine from other files. A signed and notarized app needs neither.
 
 Provider-specific GUI configuration and `open_url_command` are no longer read.
 Unknown legacy TOML fields are ignored by Serde, but they should be removed from
@@ -367,13 +391,13 @@ exits 2 and prints the manual steps; it never passes without starting the GUI.
 
 Not verified by the script: the attach launchers (no session-row click can be
 driven headlessly; the pohunek-gui unit tests that CI runs on macOS cover them),
-the Terminal.app window itself, and double-clicking an app icon, which need the
-`.app` bundle from issue #104. Manual procedure until then:
+the Terminal.app window itself, and double-clicking an app icon, which need a
+person at the Mac and the signed `Pohunek.app`. Manual procedure:
 
 1. Run `pohunek service install` and confirm `pohunek service status`.
 2. Write `~/.config/pohunek/gui.toml` with `pohunek_bin = "pohunek"` and
    `attach_terminal = "terminal-app"`.
-3. Start `pohunek-gui` from Finder (with the bundle, double-click it).
+3. Double-click `Pohunek.app` in Finder.
 4. Confirm the window opens, the local host appears, and the status line shows
    no configuration error.
 5. Start a session, click Open, and confirm Terminal.app opens attached to it.

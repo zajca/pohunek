@@ -9,6 +9,9 @@ name: Release
 # A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
 # the gate is duplicated here: no binary is published from a commit that fails
 # fmt, clippy, or tests.
+#
+# The native Apple Silicon archives are built by `build-macos` on macOS runners,
+# signed with a Developer ID certificate, and notarized; see that job.
 on:
   push:
     tags:
@@ -457,6 +460,196 @@ jobs:
             --hermes-bin "${{ steps.hermes.outputs.bin }}" \
             --pohunek-bin "$release_pohunek"
           "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+
+  # Signed and notarized native Apple Silicon archives (issue #104). Runs on
+  # the oldest supported macOS runner (macos-14) so the packaged binaries are
+  # exercised on the minimum OS. The protected `macos-signing` environment
+  # holds the Developer ID certificate and the notary API key; each secret is
+  # exposed only to the steps that use it. Missing credentials fail this job
+  # before the build: a macOS archive is never published unsigned, and the run
+  # stays red until the credentials exist.
+  build-macos:
+    name: Build ${{ matrix.component }} for aarch64-apple-darwin
+    needs: [gate, docs-gate, web-gate]
+    runs-on: macos-14
+    environment: macos-signing
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      RUSTFLAGS: -D warnings
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [cli, daemon, gui]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify native runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Require signing and notarization credentials
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for variable in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD \
+            APPLE_NOTARY_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID MACOS_TEAM_ID; do
+            if [[ -z "${!variable}" ]]; then
+              missing+=("$variable")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error::macOS release credentials are missing (${missing[*]}); the public macOS release gate stays failed and no unsigned macOS archive is published"
+            exit 1
+          fi
+
+      - name: Install Python for Hermes release verification
+        if: matrix.component == 'cli'
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv for Hermes release verification
+        if: matrix.component == 'cli'
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-${{ matrix.component }}
+
+      - name: Build offline documentation
+        run: cargo xtask docs site
+
+      - name: Build release binaries
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
+          echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
+
+      - name: Create ephemeral signing keychain
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: packaging/macos/signing-keychain create
+
+      - name: Sign, notarize, verify, and package
+        id: package
+        shell: bash
+        env:
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          # Archives are stamped with the tagged commit's time.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          archive="$(packaging/macos/package --release "${{ matrix.component }}" "${version}" \
+            "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist)"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+          echo "checksum=${archive}.sha256" >> "$GITHUB_OUTPUT"
+
+      # Always removes the keychain, restoring the runner's search list.
+      - name: Remove ephemeral signing keychain
+        if: always()
+        shell: bash
+        run: packaging/macos/signing-keychain delete
+
+      # Everything below runs from the extracted archive outside the
+      # checkout: the published bytes, not the build tree.
+      - name: Extract the archive and verify its signatures
+        id: extract
+        shell: bash
+        env:
+          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          archive="${{ steps.package.outputs.archive }}"
+          ( cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$archive").sha256" )
+          extract_dir="$RUNNER_TEMP/extracted"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          tar -xzf "$archive" -C "$extract_dir"
+          root="$extract_dir/$(basename "$archive" .tar.gz)"
+          if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+            echo "extracted archive is inside a Git worktree: $root" >&2
+            exit 1
+          fi
+          grep -q '^signing developer-id$' "$root/MANIFEST"
+          packaging/macos/verify-signed --notarized --team-id "$MACOS_TEAM_ID" "$root"
+          echo "root=$root" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the packaged daemon binaries
+        if: matrix.component == 'daemon'
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="${{ steps.extract.outputs.root }}"
+          for binary in pohunek pohunekd pohunek-sessiond; do
+            "$root/$binary" --version
+          done
+
+      - name: Smoke-test the packaged app bundle
+        if: matrix.component == 'gui'
+        shell: bash
+        run: scripts/smoke-gui-release-macos "${{ steps.extract.outputs.root }}/Pohunek.app"
+
+      - name: Provision locked Hermes runtime
+        if: matrix.component == 'cli'
+        id: hermes
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          hermes_bin="$(PATH="/bin:$PATH" scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
+          printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+
+      - name: Verify packaged CLI against pinned Hermes
+        if: matrix.component == 'cli'
+        shell: /bin/bash {0}
+        run: |
+          set -euo pipefail
+          release_root="${{ steps.extract.outputs.root }}"
+          release_pohunek="$(cd "$release_root" && pwd -P)/pohunek"
+          packaged_smoke="$release_root/packaging/smoke-hermes-plugin-release"
+          test -x "$release_pohunek"
+          test -x "$packaged_smoke"
+          cargo xtask hermes compatibility \
+            --hermes-bin "${{ steps.hermes.outputs.bin }}" \
+            --pohunek-bin "$release_pohunek"
+          PATH="/bin:$PATH" "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
