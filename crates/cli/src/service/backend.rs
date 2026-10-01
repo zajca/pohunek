@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use futures::{SinkExt as _, StreamExt as _};
-use pohunek_client::{Client, ClientError, ClientOptions, RawStream, LOCAL_HOST};
+use pohunek_client::{Client, ClientError, ClientOptions, OriginSource, RawStream, LOCAL_HOST};
 use pohunek_platform::process::Pid;
 use pohunek_platform::supervisor::{DaemonSupervisor, Namespace, Supervisor};
 use protocol::{
@@ -62,17 +62,37 @@ pub trait Control: Debug + Send + Sync {
 #[derive(Debug, Clone)]
 pub struct SocketControl {
     socket: PathBuf,
+    origin_source: OriginSource,
 }
 
 impl SocketControl {
-    /// Creates a control channel for the daemon listening on `socket`.
+    /// Creates a control channel for the daemon listening on `socket`, taking
+    /// the request origin from the process environment.
     #[must_use]
     pub fn new(socket: PathBuf) -> Self {
-        Self { socket }
+        Self {
+            socket,
+            origin_source: OriginSource::Environment,
+        }
+    }
+
+    /// Returns this channel taking its request origin from `origin_source`.
+    #[must_use]
+    pub fn with_origin_source(mut self, origin_source: OriginSource) -> Self {
+        self.origin_source = origin_source;
+        self
+    }
+
+    /// Transport bounds of every installer request to the local daemon.
+    fn options(&self) -> ClientOptions {
+        ClientOptions::default()
+            .with_request_timeout(settings::CONTROL_REQUEST_TIMEOUT)
+            .with_connect_timeout(settings::CONTROL_REQUEST_TIMEOUT)
+            .with_origin_source(self.origin_source)
     }
 
     async fn connect(&self) -> Result<Client, ClientError> {
-        Client::connect_with_options(LOCAL_HOST, &self.socket, options()).await
+        Client::connect_with_options(LOCAL_HOST, &self.socket, self.options()).await
     }
 
     /// Sends `daemon.health` and reads the serving process on one connection.
@@ -85,7 +105,7 @@ impl SocketControl {
     /// read-only probe the daemon answers the same for every caller.
     async fn served_health(&self) -> Result<Health, ClientError> {
         let RawStream::Local(stream) =
-            pohunek_client::connect_raw_local_with_options(&self.socket, options()).await?
+            pohunek_client::connect_raw_local_with_options(&self.socket, self.options()).await?
         else {
             return Err(ClientError::Framing(
                 "a local daemon connection did not yield a Unix socket".to_owned(),
@@ -121,13 +141,6 @@ impl SocketControl {
             pid: served_by.pid,
         })
     }
-}
-
-/// Transport bounds of every installer request to the local daemon.
-fn options() -> ClientOptions {
-    ClientOptions::default()
-        .with_request_timeout(settings::CONTROL_REQUEST_TIMEOUT)
-        .with_connect_timeout(settings::CONTROL_REQUEST_TIMEOUT)
 }
 
 /// Writes `request` as one line and reads its correlated response line.
@@ -360,6 +373,7 @@ mod tests {
         let server = tokio::spawn(serve_health(listener, true));
 
         let health = SocketControl::new(socket)
+            .with_origin_source(OriginSource::Omitted)
             .health()
             .await
             .expect("health answer");
@@ -376,6 +390,7 @@ mod tests {
         let server = tokio::spawn(serve_health(listener, false));
 
         let error = SocketControl::new(socket)
+            .with_origin_source(OriginSource::Omitted)
             .health()
             .await
             .expect_err("mismatched id");

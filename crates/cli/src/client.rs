@@ -20,7 +20,7 @@ pub(crate) struct Client {
 impl Client {
     /// Connect to the daemon for `host`.
     pub(crate) async fn connect(host: &str, paths: &Paths) -> Result<Self, CliError> {
-        Self::connect_with_options(host, paths, pohunek_client::ClientOptions::default()).await
+        Self::connect_with_options(host, paths, options_for(paths)).await
     }
 
     /// Connect to an explicit local daemon socket.
@@ -28,8 +28,8 @@ impl Client {
     /// The migration preflight dials the legacy daemon through this path after
     /// the install wrapper moved the socket node aside as its connect barrier,
     /// so the socket clap-side knob carries the renamed absolute path.
-    pub(crate) async fn connect_socket(socket: &Path) -> Result<Self, CliError> {
-        let inner = pohunek_client::Client::connect_local(socket)
+    pub(crate) async fn connect_socket(socket: &Path, paths: &Paths) -> Result<Self, CliError> {
+        let inner = pohunek_client::Client::connect_local_with_options(socket, options_for(paths))
             .await
             .map_err(map_connect_error)?;
         Ok(Self { inner })
@@ -41,8 +41,7 @@ impl Client {
         paths: &Paths,
         request_timeout: Duration,
     ) -> Result<Self, CliError> {
-        let options =
-            pohunek_client::ClientOptions::default().with_request_timeout(request_timeout);
+        let options = options_for(paths).with_request_timeout(request_timeout);
         Self::connect_with_options(host, paths, options).await
     }
 
@@ -118,6 +117,11 @@ impl Client {
             .await
             .map_err(map_connect_error)
     }
+}
+
+/// Default transport settings with the origin source carried by `paths`.
+fn options_for(paths: &Paths) -> pohunek_client::ClientOptions {
+    pohunek_client::ClientOptions::default().with_origin_source(paths.origin_source)
 }
 
 fn map_connect_error(err: pohunek_client::ClientError) -> CliError {

@@ -2583,6 +2583,7 @@ mod tests {
             cache_dir: root.join("cache"),
             config_home: root.join("config-home"),
             config_dir: root.join("config"),
+            origin_source: pohunek_client::OriginSource::Omitted,
         }
     }
 

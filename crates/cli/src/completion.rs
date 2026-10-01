@@ -410,6 +410,7 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
     }
     let paths = Paths::resolve().ok()?;
     let options = ClientOptions::default()
+        .with_origin_source(paths.origin_source)
         .with_connect_timeout(COMPLETION_DEADLINE)
         .with_request_timeout(COMPLETION_DEADLINE);
     let mut client = if host == LOCAL_HOST {
@@ -748,6 +749,7 @@ mod tests {
             cache_dir: PathBuf::from("/cache/pohunek"),
             config_home: PathBuf::from("/config"),
             config_dir: PathBuf::from("/config/pohunek"),
+            origin_source: pohunek_client::OriginSource::Omitted,
         };
         let data_home = Path::new("/data");
         assert_eq!(

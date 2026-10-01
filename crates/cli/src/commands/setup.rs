@@ -681,6 +681,7 @@ mod tests {
             cache_dir: root.join("cache"),
             config_home: config_home.clone(),
             config_dir: config_home.join("pohunek"),
+            origin_source: pohunek_client::OriginSource::Omitted,
         };
         TempPaths { paths, root }
     }
