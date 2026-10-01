@@ -344,6 +344,21 @@ Release packaging and contributor verification:
   `.tar.gz` (sorted members, root ownership, `SOURCE_DATE_EPOCH` timestamps,
   normalized modes, `gzip -n`) with its `.sha256`.
 - `scripts/tests/test_packaging.py` — regression checks for those three.
+- `packaging/macos/DEPLOYMENT_TARGET` — the macOS deployment target (`14.0`)
+  every native macOS build and audit uses.
+- `packaging/macos/build-release` — locked, deployment-target-pinned,
+  path-remapped native Apple Silicon release build of one component.
+- `packaging/macos/audit-macho` — fails a release tree unless every Mach-O file
+  is thin arm64, within the deployment target, linked only against system
+  libraries, with no runtime search path and no build-machine path.
+- `packaging/macos/package` — stages, audits, seals, and archives built macOS
+  binaries; `--development` produces the unsigned `-unsigned-development`
+  archive that is never released.
+- `scripts/acceptance/macos-package-install` — CI acceptance of installing,
+  upgrading with live sessions, refusing bad archives, and uninstalling from
+  the extracted macOS archives against real launchd.
+- `scripts/tests/test_macos_packaging.py` — regression checks for the audit
+  (with `otool`/`lipo`/`strings` shims) and the packaging scripts.
 - `crates/cli/tests/daemon_packaging.rs`
 - `crates/cli/tests/service_lock.rs` — `pohunek service lock` and the lock it
   hands down, through the real binary.

@@ -116,7 +116,13 @@ before pushing. The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `real systemd supervision` runs all three with `--ignored --test-threads 1`
 after building the daemon, worker, and CLI binaries. Run them locally the same
 way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
-suites at the built binaries). Intel Macs are outside the
+suites at the built binaries). The `macOS package install and upgrade
+(arm64)` CI job builds the daemon archive twice with `packaging/macos/build-release`
+and `packaging/macos/package --development` (the archives must be
+byte-identical and pass `packaging/macos/audit-macho`), then installs,
+upgrades with live sessions, refuses corrupt archives, and uninstalls from the
+extracted archives against real launchd
+(`scripts/acceptance/macos-package-install`). Intel Macs are outside the
 current release scope. This gate does not mean complete macOS host support;
 delivery scope, order, and status are tracked by the
 [`Complete macOS support` milestone](https://github.com/zajca/pohunek/milestone/2),

@@ -1,0 +1,62 @@
+#!/bin/sh
+# Build the release binaries of one component natively for Apple Silicon.
+#
+# usage: build-release <cli|daemon|gui>
+#
+# Prints the directory holding the built binaries on stdout. Runs only on an
+# arm64 Mac, from anywhere inside the repository. The build is locked to
+# Cargo.lock, targets the deployment target in packaging/macos/DEPLOYMENT_TARGET,
+# and maps the checkout, the cargo home, and the toolchain sysroot to fixed
+# names so no build-machine path reaches the binaries (`audit-macho` checks
+# that). `CARGO_TARGET_DIR`, `RUSTFLAGS` (for example `-D warnings`), and
+# `CARGO_LOCKED_FLAG` are honored; `CARGO_LOCKED_FLAG=` drops `--locked` for
+# acceptance builds of a throwaway version.
+
+set -eu
+
+fail() {
+    printf 'build-release: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: build-release <cli|daemon|gui>"
+component=$1
+[ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] \
+    || fail "native Apple Silicon builds run on an arm64 Mac only"
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
+target=aarch64-apple-darwin
+MACOSX_DEPLOYMENT_TARGET=$(tr -d ' \n' < "$script_dir/DEPLOYMENT_TARGET")
+export MACOSX_DEPLOYMENT_TARGET
+
+cd "$root"
+cargo_home=${CARGO_HOME:-$HOME/.cargo}
+sysroot=$(rustc --print sysroot)
+RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$root=/build/pohunek --remap-path-prefix=$cargo_home=/build/cargo --remap-path-prefix=$sysroot=/build/rust-sysroot"
+export RUSTFLAGS
+# Archive members written by ld64 or ar carry no timestamps.
+ZERO_AR_DATE=1
+export ZERO_AR_DATE
+
+locked=${CARGO_LOCKED_FLAG---locked}
+case $component in
+    cli)
+        # shellcheck disable=SC2086
+        cargo build --release $locked --target "$target" -p pohunek-cli --bin pohunek >&2
+        ;;
+    daemon)
+        # shellcheck disable=SC2086
+        cargo build --release $locked --target "$target" \
+            -p pohunek-cli -p pohunek-daemon -p pohunek-session-worker \
+            --bin pohunek --bin pohunekd --bin pohunek-sessiond >&2
+        ;;
+    gui)
+        # shellcheck disable=SC2086
+        cargo build --release $locked --target "$target" -p pohunek-gui --bin pohunek-gui >&2
+        ;;
+    *) fail "unsupported component: $component" ;;
+esac
+
+target_dir=${CARGO_TARGET_DIR:-$root/target}
+printf '%s\n' "$target_dir/$target/release"
