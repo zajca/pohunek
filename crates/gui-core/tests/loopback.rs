@@ -30,7 +30,7 @@ use pohunek_gui_core::{
     stop_session as stop_gui_session, wait_for_session, workspace_connection_stream,
     AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent, AttachTemplateValues, ConnState,
     ConnectionOptions, CoreError, DiffFileStatus, DomainEvent, HealthSummary, HostConfig,
-    HostEvent, HostId, HostSnapshot, PromptContext, PromptLaunchParams, PromptPreview,
+    HostEvent, HostId, HostSnapshot, HostView, PromptContext, PromptLaunchParams, PromptPreview,
     ProviderLaunchItem, ProviderLaunchParams, Review, ReviewComment, ReviewDispatchParams,
     ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection, SessionLinkKind,
     SessionLinkProvider, UiState, WindowSize, Workspace,
@@ -306,12 +306,14 @@ async fn unreachable_host_marks_error_without_breaking_other_hosts() {
         vec![dead_host.clone(), live_host.clone()],
         test_connection_options(),
     ));
-    wait_for_host_error(&mut workspace, &mut stream, &dead_host).await;
-    wait_for_hosts_with_sessions(&mut workspace, &mut stream, &[(&live_host, &session.id)]).await;
-
-    let dead = workspace.hosts.get(&dead_host.id).expect("dead host view");
+    // The dead host keeps cycling Unreachable -> Connecting between retries, so
+    // its state is asserted on the view captured when the error was observed,
+    // never re-read after the live host's wait has pumped further events.
+    let dead = wait_for_host_error(&mut workspace, &mut stream, &dead_host).await;
     assert_eq!(dead.conn, ConnState::Unreachable);
     assert!(dead.last_error.is_some());
+
+    wait_for_hosts_with_sessions(&mut workspace, &mut stream, &[(&live_host, &session.id)]).await;
     let live = workspace.hosts.get(&live_host.id).expect("live host view");
     assert_eq!(live.conn, ConnState::Connected);
     assert!(live.sessions.contains_key(&session.id.0));
@@ -2235,6 +2237,8 @@ fn test_connection_options() -> ConnectionOptions {
     }
 }
 
+// Requires `Connected` together with the session so a caller's follow-up read
+// of `conn` sees the state the predicate held on, not a later reconnect.
 async fn wait_for_hosts_with_sessions<S>(
     workspace: &mut Workspace,
     events: &mut S,
@@ -2244,10 +2248,9 @@ async fn wait_for_hosts_with_sessions<S>(
 {
     wait_for_workspace(events, workspace, |workspace| {
         expected.iter().all(|(host, session_id)| {
-            workspace
-                .hosts
-                .get(&host.id)
-                .is_some_and(|view| view.sessions.contains_key(&session_id.0))
+            workspace.hosts.get(&host.id).is_some_and(|view| {
+                view.conn == ConnState::Connected && view.sessions.contains_key(&session_id.0)
+            })
         })
     })
     .await;
@@ -2266,7 +2269,14 @@ where
     .await;
 }
 
-async fn wait_for_host_error<S>(workspace: &mut Workspace, events: &mut S, host: &HostConfig)
+// Returns a clone of the host view taken at the instant the predicate held. An
+// unreachable host retries on a backoff and re-enters `Connecting` (clearing
+// `last_error`), so only this snapshot is a stable record of the error.
+async fn wait_for_host_error<S>(
+    workspace: &mut Workspace,
+    events: &mut S,
+    host: &HostConfig,
+) -> HostView
 where
     S: futures::Stream<Item = DomainEvent> + Unpin,
 {
@@ -2277,6 +2287,11 @@ where
             .is_some_and(|view| view.conn == ConnState::Unreachable && view.last_error.is_some())
     })
     .await;
+    workspace
+        .hosts
+        .get(&host.id)
+        .cloned()
+        .expect("host view exists once its error was observed")
 }
 
 async fn wait_for_session_activity<S>(
