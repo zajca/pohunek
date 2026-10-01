@@ -482,7 +482,11 @@ struct Limits {
     startup_wait: Duration,
     turn_wait: Duration,
     working_wait: Duration,
+    /// Unconditional pause that lets the terminal accept typed input before submit.
     input_settle_wait: Duration,
+    /// Deadline for the interrupt acknowledgement; separate from the pause so
+    /// it can be a generous bound that costs nothing once evidence appears.
+    interrupt_wait: Duration,
     exit_grace: Duration,
 }
 
@@ -497,6 +501,7 @@ impl Limits {
             turn_wait: TURN_WAIT,
             working_wait: WORKING_WAIT,
             input_settle_wait: INPUT_SETTLE_WAIT,
+            interrupt_wait: INPUT_SETTLE_WAIT,
             exit_grace: EXIT_GRACE,
         }
     }
@@ -1609,9 +1614,13 @@ fn finish_mocked_pty(
     capture: Result<PtyCapture, XtaskError>,
     verification: Result<(), XtaskError>,
 ) -> Result<PtyCapture, XtaskError> {
-    verification?;
-    let capture = capture?;
-    Ok(capture)
+    match (verification, capture) {
+        (Ok(()), capture) => capture,
+        (Err(error), Ok(_capture)) => Err(error),
+        (Err(error), Err(capture_error)) => Err(fail(format!(
+            "{error}; the PTY capture also failed: {capture_error}"
+        ))),
+    }
 }
 
 fn load_lock(repo: &Path) -> Result<Lock, XtaskError> {
@@ -2524,7 +2533,7 @@ fn classic_scenarios(limits: Limits) -> Vec<Scenario> {
                 Action::Write(SUBMIT),
                 Action::WaitFor(Evidence::Working("sleep 30"), limits.working_wait),
                 Action::Write(INTERRUPT),
-                Action::WaitFor(Evidence::Interrupted, limits.input_settle_wait),
+                Action::WaitFor(Evidence::Interrupted, limits.interrupt_wait),
                 Action::Write(EXIT_COMMAND),
             ],
         },
@@ -2554,7 +2563,7 @@ fn turn_scenario(
         actions.push(Action::Write(INTERRUPT));
         actions.push(Action::WaitFor(
             Evidence::Interrupted,
-            limits.input_settle_wait,
+            limits.interrupt_wait,
         ));
     }
     actions.push(Action::Write(EXIT_COMMAND));
@@ -4022,16 +4031,18 @@ mod tests {
         WORKING_PROMPT_TEXT,
     };
     use super::{
-        isolation_root_budget, DAEMON_SOCKET_RELATIVE_PATH, DARWIN_SOCKET_PATH_MAX_BYTES,
+        isolation_root_budget, COMMAND_TIMEOUT, DAEMON_SOCKET_RELATIVE_PATH,
+        DARWIN_SOCKET_PATH_MAX_BYTES, EXIT_GRACE, INTEGRATION_ACTION_TIMEOUT,
         ISOLATED_RUNTIME_DIRECTORY, LINUX_SOCKET_PATH_MAX_BYTES, PRODUCTION_ISOLATION_PREFIX,
+        STARTUP_WAIT, TURN_WAIT, WORKING_WAIT,
     };
 
     /// Serializes PTY refresh scenarios within the test process.
     ///
     /// Every scenario drives a shell fixture that starts Python and an HTTP
-    /// round trip per turn, all inside `fast_limits` budgets of one second.
-    /// Running them concurrently lets CPU contention on a small runner (three
-    /// macOS cores) starve the fixture of its budget, so the tests take turns.
+    /// round trip per turn. Running them concurrently lets CPU contention on a
+    /// small runner (three macOS cores) slow the fixture, so the tests take
+    /// turns.
     static PTY_SCENARIOS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn refresh_with(
@@ -4045,17 +4056,24 @@ mod tests {
         super::refresh_with(repo, hermes_bin, limits)
     }
 
+    /// Limits for the controlled fixtures.
+    ///
+    /// Waits return as soon as their evidence appears, so the production
+    /// upper bounds cost nothing when the fixture is healthy and keep a stalled
+    /// runner from being mistaken for a failure. Only the unconditional input
+    /// pause is short, because every scenario pays it in full.
     fn fast_limits() -> Limits {
         Limits {
-            command_timeout: Duration::from_secs(2),
-            integration_action_timeout: Duration::from_secs(2),
+            command_timeout: COMMAND_TIMEOUT,
+            integration_action_timeout: INTEGRATION_ACTION_TIMEOUT,
             command_output_bytes: 16 * 1024,
             pty_output_bytes: 64 * 1024,
-            startup_wait: Duration::from_secs(1),
-            turn_wait: Duration::from_secs(1),
-            working_wait: Duration::from_secs(1),
+            startup_wait: STARTUP_WAIT,
+            turn_wait: TURN_WAIT,
+            working_wait: WORKING_WAIT,
             input_settle_wait: Duration::from_secs(1),
-            exit_grace: Duration::from_secs(1),
+            interrupt_wait: TURN_WAIT,
+            exit_grace: EXIT_GRACE,
         }
     }
 
@@ -5671,7 +5689,7 @@ PY
             "echo 'prompt echoed only'",
         );
 
-        let error = refresh_with(repo.path(), &binary, fast_limits())
+        let error = refresh_with(repo.path(), &binary, expiring_limits())
             .expect_err("prompt echo cannot satisfy response evidence");
 
         assert!(
@@ -5920,7 +5938,7 @@ PY
             tui_loop,
             "    echo 'node not found \u{2014} install Node.js to use the TUI.'\n    exit 1",
         );
-        let summary = refresh_with(repo.path(), &unavailable, fast_limits())
+        let summary = refresh_with(repo.path(), &unavailable, expiring_limits())
             .expect("recognized local TUI unavailability is recorded");
         assert_eq!(summary.unsupported, 1);
 
@@ -5931,7 +5949,7 @@ PY
             tui_loop,
             "    echo 'authentication failed'\n    exit 1",
         );
-        let error = refresh_with(crash_repo.path(), &crash, fast_limits())
+        let error = refresh_with(crash_repo.path(), &crash, expiring_limits())
             .expect_err("auth failure cannot be recorded as unsupported");
         assert!(error
             .to_string()
@@ -5946,7 +5964,11 @@ PY
         );
         let error = refresh_with(alt_crash_repo.path(), &alt_crash, fast_limits())
             .expect_err("alternate-screen entry does not hide a subsequent crash");
-        assert!(error.to_string().contains("crashed after entering"));
+        assert_eq!(
+            error.to_string(),
+            "Hermes alternate-screen TUI crashed after entering alternate-screen mode",
+            "the shell must exit by itself; a killed child bypasses the crash check"
+        );
     }
 
     #[test]
@@ -6090,11 +6112,160 @@ PY
             )),
         )
         .expect_err("specific mock verification failure must not be hidden by a PTY failure");
+        let message = error.to_string();
 
-        assert_eq!(
-            error.to_string(),
-            "Hermes compatibility mock received an unexpected request"
+        assert!(
+            message.starts_with("Hermes compatibility mock received an unexpected request"),
+            "mock error must come first: {message}"
         );
+        assert!(
+            message.contains("capture did not reach prompt-ready evidence"),
+            "PTY error must stay visible: {message}"
+        );
+    }
+
+    #[test]
+    fn single_mocked_pty_failure_is_reported_unchanged() {
+        let mock_only = finish_mocked_pty(
+            Ok(PtyCapture {
+                bytes: Vec::new(),
+                exit_code: Some(0),
+                killed: false,
+            }),
+            Err(fail("mock failure")),
+        )
+        .expect_err("mock failure alone is an error");
+        assert_eq!(mock_only.to_string(), "mock failure");
+
+        let capture_only = finish_mocked_pty(Err(fail("capture failure")), Ok(()))
+            .expect_err("capture failure alone is an error");
+        assert_eq!(capture_only.to_string(), "capture failure");
+    }
+
+    /// Delay injected once into the fake Hermes `/exit` handling and once into
+    /// its first mock request.
+    ///
+    /// Longer than a one-second wait and well inside the production budgets, so
+    /// it models a stalled runner. The stall fires once per kind so the test
+    /// pays it a single time.
+    #[cfg(unix)]
+    const FIXTURE_STALL: &str = "1.5";
+
+    /// Which fixture steps stall.
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    struct Stall {
+        exit: bool,
+        mock_request: bool,
+    }
+
+    #[cfg(unix)]
+    fn stall_once(root: &Path, name: &str) -> String {
+        let flag = root.join(format!("stalled-{name}"));
+        format!(
+            "if [ ! -e '{flag}' ]; then : > '{flag}'; sleep {FIXTURE_STALL}; fi\n",
+            flag = flag.display()
+        )
+    }
+
+    #[cfg(unix)]
+    fn stalled_fake_hermes(root: &Path, stall: Stall) -> PathBuf {
+        let binary = fake_hermes(root, "0.20.0");
+        if stall.mock_request {
+            rewrite_script(
+                &binary,
+                "mock_request() {\n",
+                &format!("mock_request() {{\n{}", stall_once(root, "mock")),
+            );
+        }
+        if stall.exit {
+            rewrite_script(
+                &binary,
+                "        /exit*)\n          if [ \"$had_turn\" -eq 0 ]",
+                &format!(
+                    "        /exit*)\n          {}          if [ \"$had_turn\" -eq 0 ]",
+                    stall_once(root, "exit")
+                ),
+            );
+        }
+        binary
+    }
+
+    /// One-second waits, shorter than the fixture stall, as a negative control
+    /// for the `fast_limits` budgets.
+    #[cfg(unix)]
+    fn one_second_limits() -> Limits {
+        let one_second = Duration::from_secs(1);
+        Limits {
+            startup_wait: one_second,
+            turn_wait: one_second,
+            working_wait: one_second,
+            interrupt_wait: one_second,
+            exit_grace: one_second,
+            ..fast_limits()
+        }
+    }
+
+    /// Budgets for fixtures that never produce the awaited evidence: every wait
+    /// expires after the short working-evidence window, so the scenario fails
+    /// there instead of at the production turn bound.
+    #[cfg(unix)]
+    fn expiring_limits() -> Limits {
+        Limits {
+            startup_wait: WORKING_WAIT,
+            turn_wait: WORKING_WAIT,
+            working_wait: WORKING_WAIT,
+            interrupt_wait: WORKING_WAIT,
+            ..fast_limits()
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refresh_tolerates_a_stalled_fixture_within_the_default_budgets() {
+        let repo = fixture_repo();
+        let binary = stalled_fake_hermes(
+            repo.path(),
+            Stall {
+                exit: true,
+                mock_request: true,
+            },
+        );
+
+        refresh_with(repo.path(), &binary, fast_limits())
+            .expect("a fixture stalled for 1.5 s stays within the PTY budgets");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn one_second_budgets_fail_on_a_stalled_exit() {
+        let repo = fixture_repo();
+        let binary = stalled_fake_hermes(
+            repo.path(),
+            Stall {
+                exit: true,
+                mock_request: false,
+            },
+        );
+
+        refresh_with(repo.path(), &binary, one_second_limits())
+            .expect_err("a 1.5 s exit stall exceeds the one-second exit grace");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn one_second_budgets_fail_on_a_stalled_mock_request() {
+        let repo = fixture_repo();
+        let binary = stalled_fake_hermes(
+            repo.path(),
+            Stall {
+                exit: false,
+                mock_request: true,
+            },
+        );
+
+        refresh_with(repo.path(), &binary, one_second_limits())
+            .expect_err("a 1.5 s mock request stall exceeds the one-second turn wait");
     }
 
     #[test]
