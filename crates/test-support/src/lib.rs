@@ -19,6 +19,12 @@
 //! a path baked in at compile time. A nextest archive extracted at a different
 //! absolute path therefore finds its binaries and source files.
 //!
+//! The [`wait`] module holds the readiness waits: [`wait::HANG_GUARD`], the
+//! single ceiling every incidental-deadline wait is bounded by, and
+//! [`wait::poll_until`], [`wait::wait_until`] and [`wait::guard`], which fail
+//! with a message naming the awaited condition instead of hanging until nextest
+//! terminates the test.
+//!
 //! This crate is a development dependency only; production code never picks
 //! its paths from here.
 //!
@@ -30,7 +36,9 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
+
+pub mod wait;
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
