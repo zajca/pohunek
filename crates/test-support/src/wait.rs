@@ -72,8 +72,10 @@ pub const POLL_INTERVAL: Duration = Duration::from_millis(20);
 ///
 /// # Panics
 ///
-/// Panics, naming `what` and the elapsed time, when `probe` has not yielded a
-/// value after [`HANG_GUARD`].
+/// Panics, naming `what` and the elapsed time, when [`HANG_GUARD`] has elapsed
+/// before `probe` yields a value. A value from a probe call that returns after
+/// the ceiling is discarded: reaching the ceiling is a hang, as it is for
+/// [`wait_until`] and [`guard`].
 ///
 /// # Examples
 ///
@@ -96,14 +98,15 @@ fn poll_until_within<T>(
 ) -> T {
     let start = Instant::now();
     loop {
-        if let Some(value) = probe() {
-            return value;
-        }
+        let found = probe();
         let elapsed = start.elapsed();
         assert!(
             elapsed < ceiling,
             "hang guard of {ceiling:?} elapsed after {elapsed:?} waiting for {what}"
         );
+        if let Some(value) = found {
+            return value;
+        }
         std::thread::sleep(interval.min(ceiling.saturating_sub(elapsed)));
     }
 }
@@ -256,6 +259,26 @@ mod tests {
         }));
         assert!(outcome.is_err());
         assert!(probes.get() >= 2, "probed {} times", probes.get());
+    }
+
+    #[test]
+    #[should_panic(expected = "hang guard of 30ms elapsed after")]
+    fn poll_until_rejects_a_condition_that_becomes_ready_only_after_the_ceiling() {
+        let first_probe = Cell::new(None::<Instant>);
+        poll_until_within(TINY_CEILING, TINY_INTERVAL, "a late condition", || {
+            let first = first_probe.get().unwrap_or_else(Instant::now);
+            first_probe.set(Some(first));
+            (first.elapsed() >= TINY_CEILING).then_some(())
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "waiting for a probe that blocks")]
+    fn poll_until_rejects_a_single_probe_that_returns_after_the_ceiling() {
+        poll_until_within(TINY_CEILING, TINY_INTERVAL, "a probe that blocks", || {
+            std::thread::sleep(TINY_CEILING * 2);
+            Some(())
+        });
     }
 
     #[tokio::test(start_paused = true)]
