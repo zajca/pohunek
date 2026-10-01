@@ -588,6 +588,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
         readme = (ROOT / "README.md").read_text()
         self.assertIn("repository variable `MACOS_TEAM_ID`", readme)
 
+    def test_no_artifact_derived_value_is_interpolated_into_a_script(self):
+        # Step outputs computed from the downloaded artifacts must never reach a
+        # `${{ }}` expression in the signing or verification jobs.
+        for name, job in (("sign", self.sign), ("verify", self.release)):
+            self.assertNotIn("steps.stage.outputs", job, name)
+        self.assertNotIn("$(ls", self.sign + self.release)
+        self.assertIn("entries outside", self.sign)
+        self.assertIn("parent-directory component", self.sign)
+
     def test_the_staged_tree_travels_as_a_checked_tar(self):
         self.assertIn("stage.tar.sha256", self.stage)
         self.assertIn("shasum -a 256 -c stage.tar.sha256", self.sign)

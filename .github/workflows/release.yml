@@ -606,17 +606,28 @@ jobs:
           name: macos-stage-${{ matrix.component }}
           path: ${{ runner.temp }}/stage-download
 
+      # The artifact is untrusted data: the directory it must hold is named from
+      # the component and the tag, never from the artifact, and no artifact
+      # value is ever interpolated into a script.
       - name: Check and extract the staged tree
-        id: stage
         shell: bash
         run: |
           set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="pohunek-${{ matrix.component }}-${version}-aarch64-apple-darwin"
           ( cd "$RUNNER_TEMP/stage-download" && shasum -a 256 -c stage.tar.sha256 )
+          entries="$(tar -tf "$RUNNER_TEMP/stage-download/stage.tar")"
+          if printf '%s\n' "$entries" | grep -v -e "^${name}/" -e "^${name}\$"; then
+            echo "::error::the staged tarball holds entries outside ${name}"
+            exit 1
+          fi
+          if printf '%s\n' "$entries" | grep -e '\.\.'; then
+            echo "::error::the staged tarball holds a parent-directory component"
+            exit 1
+          fi
           mkdir -p dist
           tar -xf "$RUNNER_TEMP/stage-download/stage.tar" -C dist
-          staging="$(find dist -mindepth 1 -maxdepth 1 -type d)"
-          test "$(printf '%s\n' "$staging" | wc -l | tr -d ' ')" = 1
-          echo "staging=$staging" >> "$GITHUB_OUTPUT"
+          test -d "dist/${name}"
 
       - name: Create ephemeral signing keychain
         shell: bash
@@ -641,7 +652,7 @@ jobs:
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
           archive="$(packaging/macos/package --sign-release "${{ matrix.component }}" "${version}" \
-            "${{ steps.stage.outputs.staging }}")"
+            "dist/pohunek-${{ matrix.component }}-${version}-aarch64-apple-darwin")"
           mkdir -p "$RUNNER_TEMP/signed-upload"
           cp "$archive" "$archive.sha256" "$RUNNER_TEMP/signed-upload/"
 
@@ -692,7 +703,9 @@ jobs:
           MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
         run: |
           set -euo pipefail
-          archive="$(ls "$RUNNER_TEMP"/signed-download/*.tar.gz)"
+          version="${GITHUB_REF_NAME#v}"
+          archive="$RUNNER_TEMP/signed-download/pohunek-${{ matrix.component }}-${version}-aarch64-apple-darwin.tar.gz"
+          test -f "$archive"
           ( cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$archive").sha256" )
           extract_dir="$RUNNER_TEMP/extracted"
           rm -rf "$extract_dir"
