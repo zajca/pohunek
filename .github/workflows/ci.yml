@@ -554,7 +554,7 @@ jobs:
         env:
           PKG_ACCEPT_ARCHIVE: ${{ steps.package-a.outputs.archive }}
           PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
-          PKG_ACCEPT_WEB_ARCHIVE: ${{ steps.package-web.outputs.archive }}
+          # Step 5b (the web backend agent) is disabled until https://github.com/zajca/pohunek/issues/368 is fixed.
         run: scripts/acceptance/macos-package-install
 
       # The unsigned development app bundle: its Info.plist identity, the audit,
