@@ -195,6 +195,9 @@ literal_string_with_formatting_args = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+# `assert!(x.is_empty())` already reports the expression on failure; the
+# suggested `assert_eq!` needs the element type of the empty value spelled out.
+assert_is_empty = "allow"
 
 # Line tables keep file:line panic and RUST_BACKTRACE frames for workspace
 # crates while skipping the variable/type DWARF that dominates dev codegen,
