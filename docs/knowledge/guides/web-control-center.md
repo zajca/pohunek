@@ -100,7 +100,7 @@ Vite frontend. It needs neither a Rust daemon nor NetBird. Bun remains the
 workspace runtime and orchestrates the fixture daemons and backend. The command
 also requires Node: Vite runs in a managed Node child process because
 Vite 8's WebSocket proxy relies on Node `net.Socket` APIs that Bun 1.3 does not
-provide. The orchestrator finds Node itself (see "Runtime paths and macOS");
+provide. The orchestrator finds Node itself (see "Runtime paths, logs and macOS");
 set `POHUNEK_NODE_BIN` to an absolute path to override.
 Structured output is also written under the gitignored `web/logs/` directory.
 
@@ -129,7 +129,7 @@ Browser code imports `Client` from `@pohunek/sdk/browser` and calls
 Unix sockets directly. The backend only tunnels the public newline-delimited
 JSON control frames and raw attach bytes; it does not define a second protocol.
 
-## Runtime paths and macOS
+## Runtime paths, logs and macOS
 
 The backend resolves the daemon socket with the same contract as the Rust
 host components (`crates/paths/fixtures/runtime-paths.json` drives both
@@ -148,11 +148,41 @@ implementations):
 A socket path over the limit fails at startup with the variable that caused it
 instead of failing inside the connect call.
 
+By default the backend writes one JSON object per line to standard output
+(journald keeps it under systemd). A launchd job has no journal, so setting
+`POHUNEK_BACKEND_LOG_DIR` makes the backend write an owner-private (`0700`
+directory, `0600` file) rotating family `pohunek-backend.jsonl[.N]` instead.
+`POHUNEK_BACKEND_LOG_MAX_FILE_BYTES` (default 32 MiB) and
+`POHUNEK_BACKEND_LOG_MAX_FILES` (default 8, including the active file) bound it
+like the daemon's own log family; the two limits are rejected without a log
+directory. A symlinked directory or file, a directory open to group or others,
+or a foreign owner stops startup. An event larger than one file is replaced by a
+fixed notice, so total disk use stays within the product of the two limits.
+
 The backend runs natively on Apple Silicon, both from the Bun workspace and as
 the compiled release executable. `bun run dev` locates Node itself: it uses
 `POHUNEK_NODE_BIN` when set (an absolute executable file), else the first
 executable `node` on `PATH`, else the Homebrew and package-installer prefixes
 on macOS, and names both the search and the override when none is found.
+
+On macOS the owner backend is a separate client service in the owner's launchd
+domain, never a worker supervisor: restarting, upgrading or removing it cannot
+stop the daemon or any agent session. Its contract, implemented by the install
+and packaging work (#104):
+
+- `ProgramArguments` is the absolute backend executable path alone,
+  serialized by a property-list writer, never through a shell or text
+  substitution.
+- The job environment carries only the non-secret `POHUNEK_BACKEND_*` values
+  and an explicit `XDG_RUNTIME_DIR` when one is configured, never the
+  installer's full environment. Credentials never go into the job definition or
+  its command line; `backend.env` stays owner-only (`0600`).
+- `POHUNEK_BACKEND_LOG_DIR` points at the private log directory, so rotation is
+  bounded. Output of a startup failure before configuration loads goes to the
+  job's standard error file.
+- The bind host is the NetBird address from `backend.env`. The listener binds
+  only to that address, and a missing address or an unavailable VPN at start
+  leaves the daemon's local Unix socket untouched.
 
 ## Separate accepted team web surface
 

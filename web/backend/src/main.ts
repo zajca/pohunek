@@ -1,6 +1,7 @@
 import { loadBackendConfig, type BackendConfig } from "./config";
 import { BackendStartupError, startHostsPipeline, type HostsPipelineHandle } from "./hosts";
 import { errorClass, stdoutLogger, type BackendLogger } from "./log";
+import { rotatingFileLogger } from "./log-files";
 import { startBackendServer, type BackendServerHandle } from "./server";
 
 export interface BackendHandle {
@@ -61,11 +62,21 @@ export async function startBackend(
   };
 }
 
+/**
+ * Starts the backend from its environment. The logger defaults to the
+ * configured destination: a rotating owner-private file family when
+ * `POHUNEK_BACKEND_LOG_DIR` is set (launchd keeps no journal), else standard output.
+ */
 export function startBackendFromEnv(
   env: NodeJS.ProcessEnv = process.env,
-  logger: BackendLogger = stdoutLogger,
+  logger?: BackendLogger,
 ): Promise<BackendHandle> {
-  return startBackend(loadBackendConfig(env), logger);
+  const config = loadBackendConfig(env);
+  return startBackend(config, logger ?? loggerFor(config));
+}
+
+function loggerFor(config: BackendConfig): BackendLogger {
+  return config.logFiles === undefined ? stdoutLogger : rotatingFileLogger(config.logFiles);
 }
 
 export function runBackend(): void {

@@ -100,6 +100,7 @@ export async function startFixtureStack(options: FixtureStackOptions = {}): Prom
         daemonSocketPath: socketPath,
         discoverIntervalSeconds: DEFAULT_DISCOVER_INTERVAL_SECONDS,
         staticAssetsDir: options.staticAssetsDir ?? DEFAULT_STATIC_ASSETS_DIR,
+        logFiles: undefined,
       },
       options.logger ?? silentLogger,
     );

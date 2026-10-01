@@ -272,6 +272,7 @@ async function startBackendFixture(
         daemonSocketPath: socketPath,
         discoverIntervalSeconds,
         staticAssetsDir: assets,
+        logFiles: undefined,
       },
       silentLogger,
     );
