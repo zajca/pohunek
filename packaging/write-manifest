@@ -1,0 +1,115 @@
+#!/bin/sh
+# Write the MANIFEST of a release archive staging directory.
+#
+# usage: write-manifest <staging-dir> <component> <version> <target> <signing> [<minimum-macos>]
+#
+# The manifest names the archive's component, version, target triple, signing
+# state, and the SHA-256 of every regular file below the staging directory, so
+# the installer can prove that what it is about to install is complete, intact,
+# and built for this host before it changes anything. It is the last step of
+# assembling an archive: signing, stapling, and bundle assembly come first
+# because the hashes cover the final bytes.
+#
+# <signing> is `none` for archives without a signing step (Linux),
+# `developer-id` for a signed and notarized macOS archive, and
+# `unsigned-development` for a local macOS build that must not be distributed.
+# <minimum-macos> is required for an `apple-darwin` target and refused for any
+# other.
+
+set -eu
+
+fail() {
+    printf 'write-manifest: %s\n' "$*" >&2
+    exit 1
+}
+
+if [ "$#" -ne 5 ] && [ "$#" -ne 6 ]; then
+    fail "usage: write-manifest <staging-dir> <component> <version> <target> <signing> [<minimum-macos>]"
+fi
+staging=$1
+component=$2
+version=$3
+target=$4
+signing=$5
+minimum_macos=${6:-}
+
+case $component in
+    cli | daemon | gui | relay | web) ;;
+    *) fail "unsupported component: $component" ;;
+esac
+case $version in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) fail "version must be X.Y.Z: $version" ;;
+esac
+case $version in
+    *[!0-9.]*) fail "version must be X.Y.Z: $version" ;;
+esac
+case $target in
+    '' | *[!a-z0-9_-]*) fail "target must be a lowercase target triple: $target" ;;
+esac
+case $signing in
+    none | developer-id | unsigned-development) ;;
+    *) fail "unsupported signing state: $signing" ;;
+esac
+case $target in
+    *-apple-darwin)
+        [ -n "$minimum_macos" ] || fail "an apple-darwin target needs <minimum-macos>"
+        case $minimum_macos in
+            [0-9]*.[0-9]* | [0-9]*) ;;
+            *) fail "minimum-macos must be numeric: $minimum_macos" ;;
+        esac
+        case $minimum_macos in
+            *[!0-9.]*) fail "minimum-macos must be numeric: $minimum_macos" ;;
+        esac
+        ;;
+    *)
+        [ -z "$minimum_macos" ] || fail "<minimum-macos> applies only to an apple-darwin target"
+        ;;
+esac
+[ -d "$staging" ] || fail "not a directory: $staging"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "$1" | awk '{ print $1 }'
+    else
+        fail "neither sha256sum nor shasum is available"
+    fi
+}
+
+cd "$staging"
+rm -f -- MANIFEST
+trap 'rm -f -- MANIFEST.tmp' EXIT
+
+if [ -n "$(find . -type l -print)" ]; then
+    fail "the staging directory contains a symbolic link: $(find . -type l -print | head -n 1)"
+fi
+if [ -n "$(find . ! -type f ! -type d -print)" ]; then
+    fail "the staging directory contains a special file: $(find . ! -type f ! -type d -print | head -n 1)"
+fi
+
+list=$(find . -type f -print | LC_ALL=C sort)
+[ -n "$list" ] || fail "the staging directory has no files"
+
+{
+    printf 'pohunek-archive-manifest 1\n'
+    printf 'component %s\n' "$component"
+    printf 'version %s\n' "$version"
+    printf 'target %s\n' "$target"
+    printf 'signing %s\n' "$signing"
+    if [ -n "$minimum_macos" ]; then
+        printf 'minimum-macos %s\n' "$minimum_macos"
+    fi
+    printf '%s\n' "$list" | while IFS= read -r path; do
+        path=${path#./}
+        # The installer parses one path per line and quotes nothing, so a
+        # path outside this alphabet is refused instead of escaped.
+        case $path in
+            '' | *[!A-Za-z0-9._+@=,/-]*) fail "unsupported character in archive path: $path" ;;
+        esac
+        printf 'sha256 %s %s\n' "$(sha256_of "$path")" "$path"
+    done
+} > MANIFEST.tmp
+mv -- MANIFEST.tmp MANIFEST
+chmod 0644 MANIFEST

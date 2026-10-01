@@ -61,10 +61,136 @@ POHUNEK_SOCKET_NAME=daemon.sock
 # `sun_path` still fits after the rename and the preflight can dial it.
 POHUNEK_BARRIER_NAME=retiring
 
-for required in pohunek pohunekd pohunek-sessiond; do
-    if [ ! -f "$archive_dir/$required" ] || [ ! -x "$archive_dir/$required" ]; then
-        echo "required staged binary is missing or not executable: $archive_dir/$required" >&2
+# Everything below that runs a binary from the archive, or changes the host,
+# comes after this check: the host is supported, and the archive is the daemon
+# archive of one version built for this host, with every member present,
+# unmodified, and not writable by another account. The check reads the archive
+# MANIFEST (`packaging/write-manifest`) and nothing else, so a corrupt or
+# foreign archive is refused before any of its code runs.
+refuse_archive() {
+    echo "$1" >&2
+    echo "nothing was changed; fix the archive (download and extract it again) and re-run $0" >&2
+    exit 1
+}
+host_os=$(uname -s)
+host_arch=$(uname -m)
+case "$host_os $host_arch" in
+    "Linux x86_64") host_targets="x86_64-unknown-linux-gnu x86_64-unknown-linux-musl" ;;
+    "Darwin arm64") host_targets="aarch64-apple-darwin" ;;
+    "Darwin x86_64")
+        echo "this is an Intel Mac or a shell translated by Rosetta; pohunek supports native Apple Silicon only" >&2
+        echo "nothing was changed" >&2
         exit 1
+        ;;
+    *)
+        echo "unsupported host: $host_os $host_arch (supported: Linux x86_64, macOS arm64)" >&2
+        echo "nothing was changed" >&2
+        exit 1
+        ;;
+esac
+manifest="$archive_dir/MANIFEST"
+if [ ! -f "$manifest" ] || [ -L "$manifest" ]; then
+    refuse_archive "the archive has no MANIFEST: $manifest"
+fi
+if [ -n "$(find "$archive_dir" -prune \( -perm -020 -o -perm -002 \) -print)" ]; then
+    refuse_archive "the archive directory is writable by another account: $archive_dir"
+fi
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 -- "$1" | awk '{ print $1 }'
+    else
+        refuse_archive "neither sha256sum nor shasum is available to verify the archive"
+    fi
+}
+manifest_component=
+manifest_version=
+manifest_target=
+manifest_signing=
+manifest_minimum_macos=
+manifest_header=0
+manifest_members=
+while IFS= read -r manifest_line; do
+    if [ "$manifest_header" -eq 0 ]; then
+        [ "$manifest_line" = "pohunek-archive-manifest 1" ] \
+            || refuse_archive "MANIFEST is not a pohunek archive manifest of format 1"
+        manifest_header=1
+        continue
+    fi
+    case $manifest_line in
+        "component "?*) manifest_component=${manifest_line#component } ;;
+        "version "?*) manifest_version=${manifest_line#version } ;;
+        "target "?*) manifest_target=${manifest_line#target } ;;
+        "signing "?*) manifest_signing=${manifest_line#signing } ;;
+        "minimum-macos "?*) manifest_minimum_macos=${manifest_line#minimum-macos } ;;
+        "sha256 "?*)
+            manifest_entry=${manifest_line#sha256 }
+            member_hash=${manifest_entry%% *}
+            member_path=${manifest_entry#* }
+            case $member_hash in
+                *[!0-9a-f]* | '') refuse_archive "MANIFEST has a malformed digest: $manifest_line" ;;
+            esac
+            [ "${#member_hash}" -eq 64 ] \
+                || refuse_archive "MANIFEST has a malformed digest: $manifest_line"
+            case $member_path in
+                '' | /* | ../* | */../* | */.. | .. | ./* | */./* | *//* | *[!A-Za-z0-9._+@=,/-]*)
+                    refuse_archive "MANIFEST names an unsafe member path: $member_path"
+                    ;;
+            esac
+            if [ ! -f "$archive_dir/$member_path" ] || [ -L "$archive_dir/$member_path" ]; then
+                refuse_archive "archive member is missing or not a regular file: $member_path"
+            fi
+            if [ -n "$(find "$archive_dir/$member_path" -prune \( -perm -020 -o -perm -002 \) -print)" ]; then
+                refuse_archive "archive member is writable by another account: $member_path"
+            fi
+            [ "$(sha256_of "$archive_dir/$member_path")" = "$member_hash" ] \
+                || refuse_archive "archive member is corrupt (digest mismatch): $member_path"
+            manifest_members="$manifest_members $member_path "
+            ;;
+        *) refuse_archive "MANIFEST has an unrecognized line: $manifest_line" ;;
+    esac
+done < "$manifest"
+[ "$manifest_header" -eq 1 ] || refuse_archive "MANIFEST is empty"
+[ "$manifest_component" = daemon ] \
+    || refuse_archive "this is the ${manifest_component:-unknown} archive; packaging/install-daemon.sh installs the daemon archive"
+case $manifest_version in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) refuse_archive "MANIFEST has no valid version" ;;
+esac
+case $manifest_version in
+    *[!0-9.]*) refuse_archive "MANIFEST has no valid version" ;;
+esac
+host_match=0
+for host_target in $host_targets; do
+    if [ "$manifest_target" = "$host_target" ]; then
+        host_match=1
+    fi
+done
+if [ "$host_match" -eq 0 ]; then
+    echo "this archive is built for ${manifest_target:-an unknown target}, but this host is $host_os $host_arch" >&2
+    echo "nothing was changed; download the archive for $host_targets" >&2
+    exit 1
+fi
+if [ "$host_os" = Darwin ]; then
+    [ -n "$manifest_minimum_macos" ] || refuse_archive "MANIFEST has no minimum-macos"
+    host_macos=$(sw_vers -productVersion) || refuse_archive "cannot read the macOS version with sw_vers"
+    case ${host_macos%%.*} in
+        '' | *[!0-9]*) refuse_archive "unreadable macOS version: $host_macos" ;;
+    esac
+    if [ "${host_macos%%.*}" -lt "${manifest_minimum_macos%%.*}" ]; then
+        echo "this archive needs macOS $manifest_minimum_macos or newer, but this host runs macOS $host_macos" >&2
+        echo "nothing was changed" >&2
+        exit 1
+    fi
+fi
+for required in pohunek pohunekd pohunek-sessiond; do
+    case "$manifest_members" in
+        *" $required "*) ;;
+        *) refuse_archive "MANIFEST does not list the required binary: $required" ;;
+    esac
+    if [ ! -x "$archive_dir/$required" ]; then
+        refuse_archive "required staged binary is not executable: $archive_dir/$required"
     fi
 done
 

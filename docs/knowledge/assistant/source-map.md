@@ -328,7 +328,22 @@ Release packaging and contributor verification:
   `migration preflight --socket <moved>`, worker inventory, stop, post-stop
   re-inventory), then runs `pohunek service install|upgrade`:
   `install` while `pohunek service status --json` reports a pending install
-  transaction or no `service.toml` exists, `upgrade` otherwise.
+  transaction or no `service.toml` exists, `upgrade` otherwise. Before any of
+  that, and before running any archive binary, it supports only Linux x86_64
+  and native macOS arm64 hosts and verifies the archive `MANIFEST`: daemon
+  component, target matching the host, macOS minimum version, every member
+  present, a regular file, unmodified, and not writable by another account.
+- `packaging/write-manifest` — writes an archive's `MANIFEST` (component,
+  version, target, signing state, minimum macOS, SHA-256 of every member) as the
+  last assembly step; refuses symbolic links and member names outside a plain
+  alphabet.
+- `packaging/stage-archive` — assembles one component's archive staging
+  directory (binaries or app bundle, completions, offline docs, installer or
+  smoke script, README, license) from the built binaries.
+- `packaging/archive` — packs a staging directory into a byte-reproducible
+  `.tar.gz` (sorted members, root ownership, `SOURCE_DATE_EPOCH` timestamps,
+  normalized modes, `gzip -n`) with its `.sha256`.
+- `scripts/tests/test_packaging.py` — regression checks for those three.
 - `crates/cli/tests/daemon_packaging.rs`
 - `crates/cli/tests/service_lock.rs` — `pohunek service lock` and the lock it
   hands down, through the real binary.

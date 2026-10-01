@@ -7,6 +7,11 @@
   it, and that the doctor `netbird_cli` check uses the same lookup. Added the
   macOS host section of the remote-hosts guide (listener binding, sleep and wake,
   troubleshooting).
+- Documented release archive integrity: every archive carries a `MANIFEST`
+  (component, version, target, signing state, SHA-256 of each member) and
+  `packaging/install-daemon.sh` verifies it, the host OS and architecture, the
+  macOS minimum version, and member permissions before it runs any archive
+  binary or changes anything; archives are deterministic (`packaging/archive`).
 - Documented the executable search-path policy: the `service.toml`
   `[environment] search_path` key, the `service_search_path_unavailable` error
   code, and the environment-resolution guide.

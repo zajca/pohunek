@@ -1,0 +1,81 @@
+#!/bin/sh
+# Create a deterministic release archive and its checksum file.
+#
+# usage: archive <parent-dir> <name> <output-dir>
+#
+# Packs <parent-dir>/<name> into <output-dir>/<name>.tar.gz and writes
+# <name>.tar.gz.sha256 next to it. The same input tree yields the same bytes
+# on every run of one host type (same tar flavor and zlib): members are listed
+# in byte order, owned by root, stamped with the commit time
+# (`SOURCE_DATE_EPOCH`), given normalized modes, and compressed without a name
+# or timestamp. The input tree is normalized in place, so run this on a
+# staging copy.
+#
+# `SOURCE_DATE_EPOCH` is required: an archive stamped with the build time
+# would differ between two builds of one commit.
+
+set -eu
+
+fail() {
+    printf 'archive: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 3 ] || fail "usage: archive <parent-dir> <name> <output-dir>"
+parent=$1
+name=$2
+output=$3
+
+case $name in
+    '' | */* | . | .. | *[!A-Za-z0-9._+-]*) fail "archive name must be a plain file name: $name" ;;
+esac
+[ -d "$parent/$name" ] || fail "not a directory: $parent/$name"
+[ -d "$output" ] || fail "not a directory: $output"
+epoch=${SOURCE_DATE_EPOCH:-}
+case $epoch in
+    '' | *[!0-9]*) fail "SOURCE_DATE_EPOCH must be set to a Unix timestamp" ;;
+esac
+
+# `touch -t` needs the calendar form, evaluated in UTC so the host time zone
+# never leaks in. GNU date takes `-d @epoch`; BSD date takes `-r epoch`.
+stamp=$(TZ=UTC date -d "@$epoch" +%Y%m%d%H%M.%S 2>/dev/null) \
+    || stamp=$(TZ=UTC date -r "$epoch" +%Y%m%d%H%M.%S) \
+    || fail "cannot convert SOURCE_DATE_EPOCH $epoch"
+
+cd "$parent"
+
+# Modes carry no host information: directories 0755, executables 0755, other
+# files 0644. The executable bit decides, so a umask never changes the result.
+find "$name" -type d -exec chmod 0755 {} +
+find "$name" -type f -perm -100 -exec chmod 0755 {} +
+find "$name" -type f ! -perm -100 -exec chmod 0644 {} +
+find "$name" -exec env TZ=UTC touch -h -t "$stamp" {} +
+
+list=$(mktemp "${TMPDIR:-/tmp}/pohunek-archive.XXXXXX")
+tarball="$output/$name.tar.gz"
+trap 'rm -f -- "$list" "$tarball.partial" "$tarball.tar.tmp"' EXIT
+find "$name" -print | LC_ALL=C sort > "$list"
+
+# macOS tar writes extended attributes and AppleDouble members unless told not
+# to; both depend on the build host.
+COPYFILE_DISABLE=1
+export COPYFILE_DISABLE
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+    tar --no-recursion --numeric-owner --owner=0 --group=0 \
+        --format=gnu -cf - -T "$list" > "$tarball.tar.tmp"
+else
+    tar -n --numeric-owner --uid 0 --gid 0 --uname '' --gname '' \
+        --no-xattrs --format gnutar -cf - -T "$list" > "$tarball.tar.tmp"
+fi
+gzip -n -9 < "$tarball.tar.tmp" > "$tarball.partial"
+rm -f -- "$tarball.tar.tmp"
+mv -- "$tarball.partial" "$tarball"
+
+if command -v sha256sum >/dev/null 2>&1; then
+    hash=$(sha256sum "$tarball" | awk '{ print $1 }')
+elif command -v shasum >/dev/null 2>&1; then
+    hash=$(shasum -a 256 "$tarball" | awk '{ print $1 }')
+else
+    fail "neither sha256sum nor shasum is available"
+fi
+printf '%s  %s\n' "$hash" "$name.tar.gz" > "$tarball.sha256"
