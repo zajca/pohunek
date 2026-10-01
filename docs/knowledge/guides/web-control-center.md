@@ -98,9 +98,10 @@ For development, run `bun run dev` from `web/`. It starts two loopback fixture
 daemons, the backend with its explicit loopback-development allowance, and the
 Vite frontend. It needs neither a Rust daemon nor NetBird. Bun remains the
 workspace runtime and orchestrates the fixture daemons and backend. The command
-also requires `node` on `PATH`: Vite runs in a managed Node child process because
+also requires Node: Vite runs in a managed Node child process because
 Vite 8's WebSocket proxy relies on Node `net.Socket` APIs that Bun 1.3 does not
-provide. Set `POHUNEK_NODE_BIN` when Node has a nonstandard executable path.
+provide. The orchestrator finds Node itself (see "Runtime paths and macOS");
+set `POHUNEK_NODE_BIN` to an absolute path to override.
 Structured output is also written under the gitignored `web/logs/` directory.
 
 A deployed backend requires its local `pohunekd` for health and host discovery
@@ -111,12 +112,6 @@ wildcard binds are rejected. Use the supplied
 `~/.config/pohunek/backend.env` owner-only. The environment file must set
 `POHUNEK_BACKEND_BIND_HOST` and `POHUNEK_BACKEND_PORT`; it can override the
 local daemon socket with `POHUNEK_BACKEND_DAEMON_SOCKET`.
-
-The Rust host components share a macOS runtime default, but the current Bun
-backend has not adopted that default yet. It still requires either
-`POHUNEK_BACKEND_DAEMON_SOCKET` or `XDG_RUNTIME_DIR`. Native macOS owner-WebUI
-integration, including consumption of the shared path fixtures, is tracked by
-#103; do not treat the secure-path foundation alone as a supported macOS WebUI.
 
 For a released Linux x86_64 deployment, download the
 `pohunek-web-*-linux-x86_64.tar.gz` release asset, unpack it, and run its
@@ -133,6 +128,31 @@ Browser code imports `Client` from `@pohunek/sdk/browser` and calls
 `Client.connectWs(window.location.origin, host)`. It must not dial daemon TCP or
 Unix sockets directly. The backend only tunnels the public newline-delimited
 JSON control frames and raw attach bytes; it does not define a second protocol.
+
+## Runtime paths and macOS
+
+The backend resolves the daemon socket with the same contract as the Rust
+host components (`crates/paths/fixtures/runtime-paths.json` drives both
+implementations):
+
+- An explicit, valid absolute `XDG_RUNTIME_DIR` selects
+  `$XDG_RUNTIME_DIR/pohunek/daemon.sock` on Linux and macOS. An empty,
+  relative, parent-component or NUL-containing value is a configuration error,
+  never treated as absent.
+- Without it, Linux fails fast and macOS uses
+  `/private/tmp/pohunek-<effective-uid>/daemon.sock`; `TMPDIR` plays no role.
+- `POHUNEK_BACKEND_DAEMON_SOCKET` overrides both and is checked by the same
+  rules: absolute, no parent component, no NUL, and within the platform's
+  socket path limit (103 bytes on macOS, 107 on Linux).
+
+A socket path over the limit fails at startup with the variable that caused it
+instead of failing inside the connect call.
+
+The backend runs natively on Apple Silicon, both from the Bun workspace and as
+the compiled release executable. `bun run dev` locates Node itself: it uses
+`POHUNEK_NODE_BIN` when set (an absolute executable file), else the first
+executable `node` on `PATH`, else the Homebrew and package-installer prefixes
+on macOS, and names both the search and the override when none is found.
 
 ## Separate accepted team web surface
 

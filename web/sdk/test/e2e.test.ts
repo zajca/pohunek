@@ -1,13 +1,12 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { access, mkdir, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolEvent } from "@pohunek/protocol";
 import { startRelay, type RelayHandle } from "@pohunek/backend";
-import { startDurableWorkerFixture } from "@pohunek/testkit";
+import { createFixtureRoot, startDurableWorkerFixture } from "@pohunek/testkit";
 import {
   Client,
   attachRawLocal,
@@ -214,7 +213,7 @@ async function withDaemon<T>(run: (daemon: DaemonHarness) => Promise<T>): Promis
 }
 
 async function startDaemon(): Promise<DaemonHarness> {
-  const tempRoot = await mkdtemp(join(tmpdir(), "pohunek-sdk-e2e-"));
+  const tempRoot = await createFixtureRoot("pk-sdk-");
   const dirs = {
     runtime: join(tempRoot, "runtime"),
     data: join(tempRoot, "data"),

@@ -2,6 +2,9 @@
 
 ## Unreleased (2026-09-29)
 
+- Documented that the Bun owner backend resolves the daemon socket with the shared
+  runtime-path contract (including the macOS default and the native socket path
+  limit) and Node discovery for the dev stack.
 - Documented that the `netbird` CLI is resolved by the trusted-executable policy
   (process `PATH`, then the macOS fallback directories) in the process that runs
   it, and that the doctor `netbird_cli` check uses the same lookup. Added the

@@ -57,6 +57,11 @@ const TASKS: readonly TypecheckTask[] = [
     args: [TSC_EXECUTABLE, "--noEmit", "-p", "release/test/tsconfig.json"],
   },
   {
+    name: "scripts-test",
+    cwd: WEB_ROOT,
+    args: [TSC_EXECUTABLE, "--noEmit", "-p", "scripts/test/tsconfig.json"],
+  },
+  {
     name: "frontend",
     cwd: join(WEB_ROOT, "frontend"),
     args: ["run", "typecheck"],
