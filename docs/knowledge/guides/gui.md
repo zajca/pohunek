@@ -113,7 +113,14 @@ login shell per use.
   pohunek runtime directory, is created exclusively under an unpredictable name,
   removes itself first, then `exec`s `<resolved pohunek_bin> [--host=<host>]
   attach -- <id>` with every value single-quoted. No AppleScript is built, so no
-  Automation permission prompt appears. `open` gets `open_timeout_ms` to accept
+  Automation permission prompt appears. Terminal runs the script in its own
+  environment, so the script first exports an allowlist of the GUI's endpoint
+  and configuration roots: `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME`, each only when set in
+  the GUI process to an absolute UTF-8 value (a relative value is ignored, as the
+  XDG specification says), single-quoted like the arguments. Nothing else of the
+  GUI's environment is forwarded, so the CLI reaches the same daemon socket as
+  the GUI. `open` gets `open_timeout_ms` to accept
   the request; a failure or timeout is an attach error (carrying the first line
   of `open`'s error output) and removes the script. A script Terminal never ran
   stays on disk until the next terminal launch, which removes owner-private
@@ -184,9 +191,12 @@ attach remains on the same route as its control connection.
   unavailable, not treated as working.
 - Each notification gets `[gui] notification_timeout_ms` (default 5000, zero is
   rejected); a backend that does not exit by then is killed and reaped. It runs
-  in its own process group and the whole group is killed at the deadline (and
-  after a normal exit), so a wrapper script's background children do not
-  accumulate; a descendant that starts its own session or group escapes.
+  in its own process group. At the deadline the whole group is killed while the
+  leader is still unreaped, so a wrapper's background children die with it. After
+  a normal exit nothing is signalled: a child the wrapper backgrounded and left
+  running survives, because the group id of an already reaped leader can belong
+  to an unrelated group by then. A descendant that starts its own session or
+  group escapes the deadline kill.
 - The status line shows one message when the state changes to unavailable
   (unresolvable command, spawn failure, timeout, non-zero exit or signal) and
   one when it recovers; repeated identical failures stay silent.

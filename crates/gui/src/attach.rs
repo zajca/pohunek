@@ -19,7 +19,8 @@ use crate::config::{AttachCommandMode, AttachSelection, LaunchSettings};
 use crate::message::Message;
 use crate::runtime;
 use crate::terminal::{
-    attach_arguments, spawn_observed, ObserveError, TerminalError, TerminalLauncher, SYSTEM_OPEN,
+    attach_arguments, endpoint_environment, spawn_observed, ObserveError, TerminalError,
+    TerminalLauncher, SYSTEM_OPEN,
 };
 use crate::PohunekApp;
 
@@ -129,7 +130,8 @@ pub(crate) fn run_attach(
                 script_dir,
                 plan.launch.open_timeout,
                 plan.launch.attach_script_max_age,
-            );
+            )
+            .with_environment(endpoint_environment(|name| std::env::var_os(name)));
             let mut argv = vec![bin.into_os_string()];
             argv.extend(attach_arguments(&plan.values.host, &plan.values.id));
             let report = launcher.launch(&argv)?;
@@ -404,7 +406,7 @@ mod tests {
         let dir = crate::test_support::fixture();
         let (recorder, _fifo) = fifo_recorder(dir.path());
         let plan = observing(plan(
-            command("/bin/false {bin}", AttachCommandMode::Argv),
+            command("/usr/bin/false {bin}", AttachCommandMode::Argv),
             &recorder,
         ));
 

@@ -162,18 +162,74 @@ fn first_line(stderr: &[u8]) -> String {
 ///
 /// Returns [`ScriptError::EmptyProgram`] for an empty `argv` or program and
 /// [`ScriptError::NulByte`] when any element contains a NUL byte.
+#[cfg(test)]
 pub(crate) fn command_script(argv: &[OsString]) -> Result<Vec<u8>, ScriptError> {
+    command_script_with_environment(&[], argv)
+}
+
+/// Variables the generated script exports for the CLI it starts: the endpoint
+/// and configuration roots that `pohunek_paths` reads. Terminal.app runs the
+/// script in its own environment, so without them the CLI would resolve
+/// another daemon socket than the GUI's local host uses.
+pub(crate) const ENDPOINT_ENVIRONMENT: [&str; 5] = [
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
+
+/// Selects the [`ENDPOINT_ENVIRONMENT`] variables that are set in the GUI
+/// process, in allowlist order.
+///
+/// `lookup` reads one variable. A value that is not absolute UTF-8 text is
+/// skipped, as the XDG specification says to ignore a relative value; no other
+/// variable of the GUI process is ever forwarded.
+pub(crate) fn endpoint_environment(
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, OsString)> {
+    ENDPOINT_ENVIRONMENT
+        .into_iter()
+        .filter_map(|name| {
+            let value = lookup(name)?;
+            let text = value.to_str()?;
+            text.starts_with('/').then_some((name, value))
+        })
+        .collect()
+}
+
+/// [`command_script`] with `export NAME='value'` lines for `environment`
+/// between the shebang and the self-delete line.
+///
+/// # Errors
+///
+/// As [`command_script`]; a NUL byte in a value is [`ScriptError::NulByte`].
+pub(crate) fn command_script_with_environment(
+    environment: &[(&'static str, OsString)],
+    argv: &[OsString],
+) -> Result<Vec<u8>, ScriptError> {
     let Some(program) = argv.first() else {
         return Err(ScriptError::EmptyProgram);
     };
     if program.is_empty() {
         return Err(ScriptError::EmptyProgram);
     }
-    if argv.iter().any(|word| word.as_bytes().contains(&0)) {
+    if argv.iter().any(|word| word.as_bytes().contains(&0))
+        || environment
+            .iter()
+            .any(|(_, value)| value.as_bytes().contains(&0))
+    {
         return Err(ScriptError::NulByte);
     }
     let mut script = Vec::new();
     script.extend_from_slice(SHEBANG);
+    for (name, value) in environment {
+        script.extend_from_slice(b"export ");
+        script.extend_from_slice(name.as_bytes());
+        script.push(b'=');
+        single_quote(value.as_bytes(), &mut script);
+        script.push(b'\n');
+    }
     script.extend_from_slice(SELF_DELETE);
     script.extend_from_slice(b"exec");
     for word in argv {
@@ -220,6 +276,7 @@ pub(crate) struct TerminalLauncher {
     script_dir: PathBuf,
     open_timeout: Duration,
     script_max_age: Duration,
+    environment: Vec<(&'static str, OsString)>,
 }
 
 /// What a successful launch also wants the user to know.
@@ -246,7 +303,16 @@ impl TerminalLauncher {
             script_dir,
             open_timeout,
             script_max_age,
+            environment: Vec::new(),
         }
+    }
+
+    /// Variables the script exports before it starts the CLI; see
+    /// [`endpoint_environment`].
+    #[must_use]
+    pub(crate) fn with_environment(mut self, environment: Vec<(&'static str, OsString)>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Script directory below the pohunek runtime root.
@@ -269,7 +335,7 @@ impl TerminalLauncher {
     /// file that is unsafe or unwritable, an opener that cannot start, exits
     /// unsuccessfully, or exceeds the timeout.
     pub(crate) fn launch(&self, argv: &[OsString]) -> Result<LaunchReport, TerminalError> {
-        let contents = command_script(argv)?;
+        let contents = command_script_with_environment(&self.environment, argv)?;
         let (script, report) = self.write_script(&contents)?;
         let mut command = Command::new(&self.opener);
         command
@@ -520,16 +586,31 @@ pub(crate) fn run_bounded(
     Ok(BoundedOutput { status, stderr })
 }
 
-/// Reads at most [`STDERR_CAPTURE_LIMIT`] bytes of `pipe` on a thread.
-fn drain_stderr(pipe: std::process::ChildStderr) -> mpsc::Receiver<Vec<u8>> {
+/// Reads `pipe` to EOF on a thread, keeping the first [`STDERR_CAPTURE_LIMIT`]
+/// bytes and discarding the rest.
+///
+/// The pipe stays open until EOF, so a writer of any size never gets SIGPIPE.
+fn drain_stderr(mut pipe: std::process::ChildStderr) -> mpsc::Receiver<Vec<u8>> {
     let (sender, receiver) = mpsc::channel();
     let spawned = thread::Builder::new()
         .name("pohunek-gui-stderr".to_owned())
         .spawn(move || {
-            let mut bytes = Vec::new();
-            // A read error only loses the diagnostic.
-            let _ = pipe.take(STDERR_CAPTURE_LIMIT).read_to_end(&mut bytes);
-            let _ = sender.send(bytes);
+            let limit = usize::try_from(STDERR_CAPTURE_LIMIT).unwrap_or(usize::MAX);
+            let mut kept = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let room = limit.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..count.min(room)]);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    // A read error only loses the diagnostic.
+                    Err(_) => break,
+                }
+            }
+            let _ = sender.send(kept);
         });
     // Without the thread the sender is dropped and the receiver reports
     // disconnection, which the caller treats as no diagnostic.
@@ -792,6 +873,160 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_environment_forwards_only_the_allowlist_of_absolute_utf8_values() {
+        let _watchdog = crate::test_support::watchdog();
+        let host: Vec<(&str, OsString)> = vec![
+            ("XDG_RUNTIME_DIR", OsString::from("/run/user/1000")),
+            ("XDG_CONFIG_HOME", OsString::from("relative/config")),
+            ("XDG_DATA_HOME", OsStr::from_bytes(b"/data/\xff").to_owned()),
+            ("XDG_STATE_HOME", OsString::from("/state")),
+            ("AWS_SECRET_ACCESS_KEY", OsString::from("/not-forwarded")),
+            ("HOME", OsString::from("/home/x")),
+            ("PATH", OsString::from("/usr/bin")),
+        ];
+
+        let forwarded = endpoint_environment(|name| {
+            host.iter()
+                .find(|(candidate, _)| *candidate == name)
+                .map(|(_, value)| value.clone())
+        });
+
+        assert_eq!(
+            forwarded,
+            vec![
+                ("XDG_RUNTIME_DIR", OsString::from("/run/user/1000")),
+                ("XDG_STATE_HOME", OsString::from("/state")),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_script_exports_the_allowlist_byte_exact_and_nothing_else() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let recorder = dir.path().join("recorder");
+        // Prints every exported variable name, then each allowlisted value,
+        // NUL-terminated; `env` lists the names the program really received.
+        fs::write(
+            &recorder,
+            r#"#!/bin/sh
+env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' | sort
+printf '==\n'
+for n in XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME; do
+  eval "v=\${$n-UNSET}"
+  printf '%s\0' "$v"
+done
+"#,
+        )
+        .expect("write recorder");
+        crate::test_support::make_executable(&recorder);
+        let hostile = [
+            "/run/it's \"quoted\"\nnext line",
+            "/cfg/$(echo INJECTED)`id`;x",
+            "/data/\u{10d}esk\u{fd} \u{1f980}",
+            "/state/{bin}",
+            "/cache/--flag",
+        ];
+        let environment: Vec<(&'static str, OsString)> = ENDPOINT_ENVIRONMENT
+            .into_iter()
+            .zip(hostile)
+            .map(|(name, value)| (name, OsString::from(value)))
+            .collect();
+        let script = dir.path().join("script.command");
+        fs::write(
+            &script,
+            command_script_with_environment(&environment, &[recorder.into_os_string()])
+                .expect("script"),
+        )
+        .expect("write script");
+
+        let output = Command::new("sh")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").expect("PATH"))
+            .output()
+            .expect("run script");
+
+        assert!(output.status.success());
+        let text = output.stdout;
+        let split = text
+            .windows(3)
+            .position(|window| window == b"==\n")
+            .expect("separator");
+        let names = String::from_utf8_lossy(&text[..split]).into_owned();
+        // The shell may add its own bookkeeping variables; nothing else.
+        for name in names.lines() {
+            assert!(
+                ENDPOINT_ENVIRONMENT.contains(&name)
+                    || ["PATH", "PWD", "OLDPWD", "SHLVL", "_", "LC_ALL", "LANG"].contains(&name),
+                "unexpected variable {name}"
+            );
+        }
+        let values: Vec<&[u8]> = text[split + 3..]
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .collect();
+        let expected: Vec<&[u8]> = hostile.iter().map(|value| value.as_bytes()).collect();
+        assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn a_launch_exports_the_endpoint_environment_to_the_cli() {
+        let _watchdog = crate::test_support::watchdog();
+        let dir = crate::test_support::fixture();
+        let record = dir.path().join("open-argv");
+        let output = dir.path().join("seen-runtime-dir");
+        let opener = fake_open(dir.path(), &record, "/bin/sh \"$3\"");
+        let target = dir.path().join("target");
+        fs::write(
+            &target,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$XDG_RUNTIME_DIR\" > '{}'\n",
+                output.display()
+            ),
+        )
+        .expect("write target");
+        crate::test_support::make_executable(&target);
+        let launcher = launcher(opener, dir.path().join("gui-attach"), WINDOW).with_environment(
+            vec![("XDG_RUNTIME_DIR", OsString::from("/run/pohunek-test"))],
+        );
+
+        launcher.launch(&[target.into_os_string()]).expect("launch");
+
+        assert_eq!(
+            fs::read_to_string(&output).expect("recorded"),
+            "/run/pohunek-test"
+        );
+    }
+
+    #[test]
+    fn a_nul_byte_in_an_exported_value_is_rejected() {
+        let _watchdog = crate::test_support::watchdog();
+        assert_eq!(
+            command_script_with_environment(
+                &[("XDG_RUNTIME_DIR", OsString::from("/a\0b"))],
+                &[OsString::from("/usr/bin/true")]
+            ),
+            Err(ScriptError::NulByte)
+        );
+    }
+
+    #[test]
+    fn a_stderr_writer_larger_than_the_capture_limit_is_not_cut_off() {
+        let _watchdog = crate::test_support::watchdog();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "head -c 65536 /dev/zero >&2; printf 'tail' >&2"])
+            .stderr(Stdio::piped());
+
+        let output = run_bounded(&mut command, WINDOW).expect("writer finishes");
+
+        // A closed pipe would end the writer with SIGPIPE instead of exit 0.
+        assert_eq!(output.status.code(), Some(0), "{:?}", output.status);
+        assert_eq!(output.stderr.len(), 4096);
+    }
+
+    #[test]
     fn script_layout_is_shebang_self_delete_exec() {
         let _watchdog = crate::test_support::watchdog();
         let script =
@@ -925,7 +1160,7 @@ mod tests {
         let launcher = launcher(opener, script_dir.clone(), Duration::from_secs(30));
 
         launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect("launch");
 
         let directory_mode = fs::metadata(&script_dir).expect("dir").permissions().mode();
@@ -952,7 +1187,7 @@ mod tests {
         let launcher = launcher(opener, script_dir.clone(), WINDOW);
 
         launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect("launch creates the hierarchy");
 
         for created in [&runtime, &script_dir] {
@@ -974,10 +1209,10 @@ mod tests {
         let launcher = launcher(opener, script_dir.clone(), Duration::from_secs(30));
 
         launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect("first");
         launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect("second");
 
         assert_eq!(scripts_in(&script_dir).len(), 2);
@@ -995,7 +1230,7 @@ mod tests {
         let launcher = launcher(opener, script_dir, Duration::from_secs(30));
 
         let error = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect_err("unsafe directory");
 
         assert!(
@@ -1019,7 +1254,7 @@ mod tests {
         let launcher = launcher(opener, link, Duration::from_secs(30));
 
         let error = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect_err("symlinked directory");
 
         assert!(
@@ -1039,7 +1274,7 @@ mod tests {
         let launcher = launcher(opener, script_dir.clone(), Duration::from_secs(30));
 
         let error = launcher
-            .launch(&[OsString::from("/bin/true"), OsString::from("a\0b")])
+            .launch(&[OsString::from("/usr/bin/true"), OsString::from("a\0b")])
             .expect_err("nul");
 
         assert!(matches!(error, TerminalError::Script(ScriptError::NulByte)));
@@ -1057,7 +1292,7 @@ mod tests {
         let launcher = launcher(opener, script_dir.clone(), Duration::from_secs(30));
 
         let error = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect_err("failing opener");
 
         assert!(
@@ -1079,7 +1314,7 @@ mod tests {
         );
 
         let error = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect_err("missing opener");
 
         assert!(
@@ -1100,7 +1335,7 @@ mod tests {
         let launcher = launcher(opener, script_dir.clone(), Duration::from_millis(200));
 
         let error = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect_err("stalled opener");
 
         assert!(
@@ -1315,7 +1550,7 @@ mod tests {
         let launcher = launcher(opener, dir.path().join("gui-attach"), WINDOW);
 
         let error = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect_err("failing opener");
 
         let message = error.to_string();
@@ -1365,7 +1600,7 @@ mod tests {
         let launcher = launcher(opener, script_dir.clone(), WINDOW);
 
         let report = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect("launch");
 
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
@@ -1394,7 +1629,7 @@ mod tests {
         let launcher = launcher(opener, script_dir, WINDOW);
 
         let report = launcher
-            .launch(&[OsString::from("/bin/true")])
+            .launch(&[OsString::from("/usr/bin/true")])
             .expect("launch still succeeds");
 
         assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);

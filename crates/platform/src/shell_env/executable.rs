@@ -957,7 +957,7 @@ mod tests {
     fn stock_macos_system_binaries_are_trusted() {
         let absolute = [
             "/bin/sh",
-            "/bin/false",
+            "/usr/bin/false",
             "/bin/zsh",
             "/usr/bin/true",
             "/usr/bin/open",
@@ -980,7 +980,7 @@ mod tests {
                 eprintln!("skipping git: not installed on this runner");
                 continue;
             }
-            let program = Path::new(if name == "false" || name == "sh" || name == "zsh" {
+            let program = Path::new(if name == "sh" || name == "zsh" {
                 "/bin"
             } else {
                 "/usr/bin"
