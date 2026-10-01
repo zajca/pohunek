@@ -1371,7 +1371,8 @@ mod attach_template_tests {
             "ls * crates/gui"
         );
         // A fixture directory where `{host}*` would expand to several words.
-        let fixture = tempfile::tempdir().expect("private fixture directory");
+        let fixture =
+            pohunek_test_support::tempdir_with_prefix("pgc").expect("private fixture directory");
         let dir = fixture.path().to_path_buf();
         std::fs::create_dir(dir.join("crates")).expect("fixture dir");
         for name in ["gui-a", "gui-b"] {

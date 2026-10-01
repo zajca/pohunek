@@ -241,11 +241,9 @@ mod tests {
     use crate::{CoreError, HostId};
     use protocol::SessionId;
 
-    fn temp_config_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "pohunek-gui-core-review-dispatch-{tag}-{}",
-            std::process::id()
-        ))
+    /// Random, owner-private fixture root; removed when the guard drops.
+    fn fixture_root() -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix("pgc-rd").expect("private fixture root")
     }
 
     fn sample_review() -> Review {
@@ -317,7 +315,8 @@ mod tests {
 
     #[test]
     fn render_review_prompt_succeeds_when_the_template_file_exists() {
-        let config_dir = temp_config_dir("template-present");
+        let root = fixture_root();
+        let config_dir = root.path().join("config");
         let prompts_dir = config_dir.join("prompts");
         std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
         std::fs::write(
@@ -343,7 +342,8 @@ mod tests {
         // `prompts` directory) — this is the "operator never ran `pohunek
         // setup`" case DoD item 7 requires a typed error for, with no silent
         // default template.
-        let config_dir = temp_config_dir("template-missing");
+        let root = fixture_root();
+        let config_dir = root.path().join("config");
         let review = sample_review();
 
         let err = render_review_prompt_from_config_dir(&review, "PR #42", &config_dir)

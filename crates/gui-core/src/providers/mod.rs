@@ -5,6 +5,7 @@
 /// Compatibility field shared by provider prompt JSON payloads.
 pub const COMPAT_BRANCH_FIELD: &str = "branch";
 
+mod credential_store;
 pub mod filters;
 pub mod github;
 pub mod linear;

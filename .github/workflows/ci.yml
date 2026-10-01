@@ -299,6 +299,13 @@ jobs:
           cargo check --locked -p pohunek-gui -p pohunek-hostcheck --all-targets
           cargo clippy --locked -p pohunek-gui -p pohunek-hostcheck --all-targets -- -D warnings
 
+      # GUI core: its keyring backend is `apple-native` only here.
+      - name: Check and lint GUI core
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check --locked -p pohunek-gui-core --all-targets
+          cargo clippy --locked -p pohunek-gui-core --all-targets -- -D warnings
+
       - name: Test GUI and host probes
         if: ${{ !cancelled() }}
         # A test waiting on a child process must fail with evidence, never hold
@@ -316,6 +323,93 @@ jobs:
         env:
           GUI_ACCEPT_BIN_DIR: ${{ github.workspace }}/target/debug
         run: scripts/acceptance/macos-gui-launch
+
+      # Throwaway keychain for tests/keychain_macos.rs. It becomes the only
+      # keychain in the user search list and the user default, so the real
+      # keyring backend never sees the runner's login keychain. The password
+      # exists only in this step's shell, is masked, and is never written to
+      # disk or the environment. The 3600 s auto-lock outlasts a cold build
+      # between this step and the test run; the test locks the keychain itself.
+      # Only the GUI core test runs while the keychain exists: that test deletes
+      # it, so no later step may see a default pointing at a deleted keychain.
+      - name: Create throwaway keychain
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The file-name marker is defined once, in the test that guards on it.
+          marker="$(sed -n 's/^const KEYCHAIN_MARKER: &str = "\(.*\)";$/\1/p' crates/gui-core/tests/keychain_macos.rs)"
+          [[ -n "$marker" ]] || { echo "KEYCHAIN_MARKER not found in keychain_macos.rs" >&2; exit 1; }
+          keychain="$RUNNER_TEMP/$marker.keychain-db"
+          # Exported before the keychain exists so the teardown step can always
+          # find it.
+          echo "GUI_CORE_TEST_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security list-keychains -d user > "$RUNNER_TEMP/keychains.orig"
+          security default-keychain -d user > "$RUNNER_TEMP/keychain-default.orig"
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::$password"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -t 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+
+      - name: Test GUI core
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        # Every test binary reports, so tests/keychain_macos.rs runs even when an
+        # earlier binary fails.
+        run: cargo test --locked --no-fail-fast -p pohunek-gui-core
+
+      # Deletes the throwaway keychain, restores the runner's keychain list and
+      # default, then re-reads both and fails the step when they differ from the
+      # saved originals. Each action runs even if an earlier one failed.
+      - name: Remove throwaway keychain
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          failures=0
+          fail() { echo "::error::$1"; failures=1; }
+          # Strips the indentation and quotes `security` prints around a path;
+          # spaces inside the path are kept.
+          normalize() {
+            sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' | sed -e '/^$/d'
+          }
+
+          keychain="${GUI_CORE_TEST_KEYCHAIN:-}"
+          if [[ -n "$keychain" && -e "$keychain" ]]; then
+            security delete-keychain "$keychain" || fail "could not delete $keychain"
+            rm -f "$keychain" || fail "could not remove $keychain"
+          fi
+
+          list_file="$RUNNER_TEMP/keychains.orig"
+          default_file="$RUNNER_TEMP/keychain-default.orig"
+          if [[ ! -f "$list_file" || ! -f "$default_file" ]]; then
+            echo "no saved keychain state: the create step did not change it"
+            exit "$failures"
+          fi
+
+          originals=()
+          while IFS= read -r line; do
+            originals+=("$line")
+          done < <(normalize < "$list_file")
+          default="$(normalize < "$default_file" | head -n 1)"
+
+          if (( ${#originals[@]} > 0 )); then
+            security list-keychains -d user -s "${originals[@]}" || fail "could not restore the keychain search list"
+          fi
+          if [[ -n "$default" ]]; then
+            security default-keychain -d user -s "$default" || fail "could not restore the default keychain"
+          fi
+
+          if ! diff <(security list-keychains -d user | normalize) <(normalize < "$list_file"); then
+            fail "keychain search list differs from the saved original"
+          fi
+          if ! diff <(security default-keychain -d user | normalize) <(normalize < "$default_file"); then
+            fail "default keychain differs from the saved original"
+          fi
+          exit "$failures"
 
   test:
     name: fmt + clippy

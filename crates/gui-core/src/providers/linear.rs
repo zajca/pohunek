@@ -3,7 +3,7 @@
 //! The client keeps secrets outside persistent state by reading the configured
 //! token reference through [`TokenSource`] immediately before each GraphQL call.
 
-// Rust guideline compliant 2026-07-05
+// Rust guideline compliant 2026-09-30
 
 use std::future::Future;
 use std::pin::Pin;
@@ -12,6 +12,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use thiserror::Error;
+
+use super::credential_store::{lookup, read_keyring};
 
 const DEFAULT_ISSUE_LIMIT: usize = 50;
 const MAX_ISSUE_LIMIT: usize = 100;
@@ -161,20 +163,57 @@ pub trait GraphqlTransport: Send + Sync {
     ) -> TransportFuture<'a>;
 }
 
+/// Why a credential lookup failed.
+///
+/// The kind is the stable contract; the message of a [`TokenError`] is for
+/// people and may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TokenErrorKind {
+    /// The store has no entry with the configured name.
+    NotFound,
+    /// The store is locked and cannot be read without an unlock.
+    Locked,
+    /// The store cannot be reached or reported a backend failure.
+    Unavailable,
+    /// The caller's lookup timeout elapsed before the store answered.
+    Timeout,
+    /// The entry exists but cannot be used, for example a non-UTF-8 value.
+    Invalid,
+    /// A failure that has no more specific kind.
+    Other,
+}
+
 /// Token lookup error with redacted details.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
 pub struct TokenError {
+    kind: TokenErrorKind,
     message: String,
 }
 
 impl TokenError {
-    /// Creates a token lookup error.
+    /// Creates a token lookup error of kind [`TokenErrorKind::Other`].
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
+        Self::with_kind(TokenErrorKind::Other, message)
+    }
+
+    /// Creates a token lookup error of a specific kind.
+    ///
+    /// `message` must not contain a token value.
+    #[must_use]
+    pub fn with_kind(kind: TokenErrorKind, message: impl Into<String>) -> Self {
         Self {
+            kind,
             message: message.into(),
         }
+    }
+
+    /// Returns why the lookup failed.
+    #[must_use]
+    pub fn kind(&self) -> TokenErrorKind {
+        self.kind
     }
 }
 
@@ -196,6 +235,13 @@ impl GraphqlTransportError {
 }
 
 /// Errors raised by the Linear provider client.
+///
+/// Credential failures come in two shapes: [`LinearError::TokenLookup`]
+/// carries the store's classified [`TokenError`], and
+/// [`LinearError::TokenLookupTimedOut`] is the caller-side timeout.
+/// [`LinearError::token_error_kind`] reports both through one
+/// [`TokenErrorKind`], so a consumer matches a single contract: the timeout is
+/// [`TokenErrorKind::Timeout`].
 #[derive(Debug, Error)]
 pub enum LinearError {
     /// The Linear config omitted the token key.
@@ -216,7 +262,10 @@ pub enum LinearError {
     #[error("invalid Linear token lookup timeout; expected a positive duration")]
     InvalidTokenLookupTimeout,
     /// The token reference lookup exceeded the configured timeout.
-    #[error("timed out looking up Linear token `{token_key}` after {timeout_ms} ms")]
+    #[error(
+        "timed out looking up Linear token `{token_key}` after {timeout_ms} ms; \
+         the credential store may be waiting for an unlock, unlock the login keychain and retry"
+    )]
     TokenLookupTimedOut {
         /// Keyring token reference, not a token value.
         token_key: String,
@@ -259,6 +308,19 @@ pub enum LinearError {
         /// Missing field name.
         field: &'static str,
     },
+}
+
+impl LinearError {
+    /// Returns the credential failure kind, `None` for errors that are not
+    /// credential lookups.
+    #[must_use]
+    pub fn token_error_kind(&self) -> Option<TokenErrorKind> {
+        match self {
+            Self::TokenLookupTimedOut { .. } => Some(TokenErrorKind::Timeout),
+            Self::TokenLookup { source, .. } => Some(source.kind()),
+            _ => None,
+        }
+    }
 }
 
 /// Linear provider client.
@@ -367,6 +429,12 @@ where
 }
 
 /// Keyring-backed Linear token source.
+///
+/// Every call reads the platform store afresh: nothing is cached or persisted.
+/// At most one blocking lookup runs at a time across the whole store (a locked
+/// keychain blocks every entry); others wait for it asynchronously, so the
+/// caller's timeout bounds them, and a lookup stuck on an unlock prompt makes
+/// later ones time out until it ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyringTokenSource {
     service: String,
@@ -391,19 +459,8 @@ impl KeyringTokenSource {
 impl TokenSource for KeyringTokenSource {
     fn token<'a>(&'a self, token_key: &'a str) -> TokenFuture<'a> {
         let service = self.service.clone();
-        let token_key = token_key.to_owned();
-        Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let entry = keyring::Entry::new(&service, &token_key).map_err(|source| {
-                    TokenError::new(format!("failed to open keyring entry: {source}"))
-                })?;
-                entry.get_password().map_err(|source| {
-                    TokenError::new(format!("failed to read keyring entry: {source}"))
-                })
-            })
-            .await
-            .map_err(|source| TokenError::new(format!("keyring lookup task failed: {source}")))?
-        })
+        let key = token_key.to_owned();
+        Box::pin(lookup(move || read_keyring(&service, &key)))
     }
 }
 

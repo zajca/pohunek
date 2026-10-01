@@ -5405,16 +5405,15 @@ mod tests {
             .is_some_and(|host| host.review.dispatch.is_none()));
     }
 
-    fn review_resume_store_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "pohunek-gui-core-state-review-resume-{tag}-{}",
-            std::process::id()
-        ))
+    /// Random, owner-private fixture root; removed when the guard drops.
+    fn review_resume_root() -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix("pgc-st").expect("private fixture root")
     }
 
     #[test]
     fn begin_review_from_session_resumes_a_persisted_draft_for_the_same_source() {
-        let store = ReviewStore::new(review_resume_store_dir("same-source"));
+        let root = review_resume_root();
+        let store = ReviewStore::new(root.path().join("reviews"));
         let host_id = HostId::new("local");
         let mut source_session = session("s-1", None);
         source_session.branch = Some("feature/x".to_owned());
@@ -5473,7 +5472,8 @@ mod tests {
 
     #[test]
     fn begin_review_from_pull_request_resumes_a_persisted_draft_for_the_same_pr() {
-        let store = ReviewStore::new(review_resume_store_dir("same-pr"));
+        let root = review_resume_root();
+        let store = ReviewStore::new(root.path().join("reviews"));
         let host_id = HostId::new("local");
 
         let mut workspace = Workspace::default();
@@ -5538,7 +5538,8 @@ mod tests {
 
     #[test]
     fn begin_review_from_session_ignores_a_dispatched_draft_and_mints_a_fresh_one() {
-        let store = ReviewStore::new(review_resume_store_dir("dispatched-not-resumed"));
+        let root = review_resume_root();
+        let store = ReviewStore::new(root.path().join("reviews"));
         let host_id = HostId::new("local");
         let mut source_session = session("s-1", None);
         source_session.branch = Some("feature/x".to_owned());
