@@ -44,8 +44,8 @@ if [ "$#" -ne 0 ]; then
     exit 2
 fi
 
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-archive_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+archive_dir=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
 service_config="$config_home/pohunek/service.toml"
 legacy_unit_dir="$config_home/systemd/user"
@@ -235,7 +235,7 @@ if [ -z "${POHUNEK_SERVICE_LOCK_TOKEN:-}" ]; then
     if [ "$accept_runtime_loss" -eq 1 ]; then
         set -- --accept-runtime-loss
     fi
-    exec "$archive_dir/pohunek" service lock -- sh "$0" "$@"
+    exec "$archive_dir/pohunek" service lock -- sh "$script_dir/install-daemon.sh" "$@"
 fi
 
 # Asked before anything changes, so a failing query leaves the host untouched.
