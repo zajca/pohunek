@@ -23,6 +23,14 @@ pub struct LeaseGuard {
     expires_at: OffsetDateTime,
 }
 
+/// The statement [`Store::renew_lease`] sends to renew the fence.
+///
+/// Tests match `pg_stat_activity.query` against this exact text to find a
+/// renewal that is still running in `PostgreSQL`.
+pub(crate) const RENEW_LEASE_SQL: &str = "UPDATE relay_lease SET expires_at = clock_timestamp() + make_interval(secs => $5), heartbeat_sequence = heartbeat_sequence + 1, updated_at = clock_timestamp() \
+     WHERE relay_id = $1 AND process_instance_id = $2 AND fence_token = $3 AND recovery_generation = $4 AND expires_at > clock_timestamp() \
+     RETURNING expires_at";
+
 impl Store {
     /// Locks one relay identity for a transition that excludes lease acquisition.
     ///
@@ -131,13 +139,15 @@ impl Store {
 
     /// Renews the fence only while its previous deadline is current.
     pub async fn renew_lease(&self, guard: &LeaseGuard) -> Result<LeaseGuard, StoreError> {
-        let row = sqlx::query(
-            "UPDATE relay_lease SET expires_at = clock_timestamp() + make_interval(secs => $5), heartbeat_sequence = heartbeat_sequence + 1, updated_at = clock_timestamp() \
-             WHERE relay_id = $1 AND process_instance_id = $2 AND fence_token = $3 AND recovery_generation = $4 AND expires_at > clock_timestamp() \
-             RETURNING expires_at",
-        ).bind(&guard.relay_id).bind(guard.process_instance_id).bind(guard.fence_token).bind(guard.recovery_generation)
+        let row = sqlx::query(RENEW_LEASE_SQL)
+            .bind(&guard.relay_id)
+            .bind(guard.process_instance_id)
+            .bind(guard.fence_token)
+            .bind(guard.recovery_generation)
             .bind(LEASE_DURATION.as_secs_f64())
-            .fetch_optional(&self.fence_pool).await.map_err(StoreError::Database)?
+            .fetch_optional(&self.fence_pool)
+            .await
+            .map_err(StoreError::Database)?
             .ok_or(StoreError::StaleState)?;
         Ok(LeaseGuard {
             relay_id: guard.relay_id.clone(),
