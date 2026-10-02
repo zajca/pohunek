@@ -101,14 +101,14 @@ mod tests {
     #[test]
     fn a_fresh_script_runs_while_a_sibling_thread_keeps_spawning() {
         let dir = fixture();
-        while_a_sibling_spawns(dir.path(), |_sibling| {
-            for run in 0..SCRIPT_RUNS {
+        while_a_sibling_spawns(dir.path(), |sibling| {
+            sibling.repeat_while_spawning(SCRIPT_RUNS, |run| {
                 let path = script(dir.path(), &format!("fresh-{run}"), "exit 0");
                 let status = Command::new(&path)
                     .status()
                     .unwrap_or_else(|error| panic!("run {run}: {error}"));
                 assert!(status.success());
-            }
+            });
         });
     }
 }

@@ -14,6 +14,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use pohunek_test_support::wait::HANG_GUARD;
 
@@ -26,12 +27,47 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// Spawns that must complete during a body that repeats its operation through
+/// [`Sibling::repeat_while_spawning`].
+///
+/// One completed spawn already proves an overlap with the body; a few make the
+/// proof independent of which single spawn the scheduler happened to run.
+const MIN_OVERLAPPING_SPAWNS: usize = 3;
+
 /// Handle given to the body of [`while_a_sibling_spawns`].
 pub(crate) struct Sibling<'a> {
     spawns: &'a AtomicUsize,
+    at_start: usize,
 }
 
 impl Sibling<'_> {
+    /// Returns how many spawns completed since the body started.
+    pub(crate) fn spawns_since_start(&self) -> usize {
+        self.spawns.load(Ordering::Relaxed) - self.at_start
+    }
+
+    /// Runs `cycle` with the cycle number until at least `min_cycles` cycles ran
+    /// and the spawner completed [`MIN_OVERLAPPING_SPAWNS`] spawns since the
+    /// body started, so the repeated operation overlaps spawning whatever the
+    /// scheduler does.
+    ///
+    /// # Panics
+    ///
+    /// Panics naming the spawner when it completes too few spawns within the
+    /// hang guard.
+    pub(crate) fn repeat_while_spawning(&self, min_cycles: usize, mut cycle: impl FnMut(usize)) {
+        let started = Instant::now();
+        let mut number = 0;
+        while number < min_cycles || self.spawns_since_start() < MIN_OVERLAPPING_SPAWNS {
+            assert!(
+                started.elapsed() < HANG_GUARD,
+                "hang guard elapsed: the sibling spawner completed {} of {MIN_OVERLAPPING_SPAWNS} spawns",
+                self.spawns_since_start()
+            );
+            cycle(number);
+            number += 1;
+        }
+    }
     /// Blocks until the spawner completes one more spawn than it had when this
     /// was called, so a short body can stay active across a spawn.
     ///
@@ -51,7 +87,8 @@ impl Sibling<'_> {
 /// The spawner's children start from an empty environment in the private
 /// directory `cwd`. `body` starts after the spawner completed its first spawn.
 /// When `body` returns normally, the helper asserts that the spawner completed
-/// at least one more spawn while `body` ran; a body too short for that calls
+/// at least one more spawn while `body` ran; a body that repeats an operation
+/// uses [`Sibling::repeat_while_spawning`] and a body too short for either calls
 /// [`Sibling::wait_for_next_spawn`]. A panic in `body` stops the spawner and
 /// propagates without that assertion.
 ///
@@ -91,7 +128,7 @@ pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce(&Sibling<'
             }
         }
         let at_start = spawns.load(Ordering::Relaxed);
-        let result = body(&Sibling { spawns });
+        let result = body(&Sibling { spawns, at_start });
         assert!(
             spawns.load(Ordering::Relaxed) > at_start,
             "no sibling spawn completed while the body ran"

@@ -3803,8 +3803,8 @@ mod tests {
     #[test]
     fn a_dropped_lock_is_free_while_a_sibling_thread_keeps_spawning() {
         let (temporary, root) = trusted_root();
-        crate::test_spawn::while_a_sibling_spawns(temporary.path(), |_sibling| {
-            for cycle in 0..SPAWN_RACE_CYCLES {
+        crate::test_spawn::while_a_sibling_spawns(temporary.path(), |sibling| {
+            sibling.repeat_while_spawning(SPAWN_RACE_CYCLES, |cycle| {
                 let outcome = root
                     .acquire_lock("race.lock", FILE_MODE)
                     .map(drop)
@@ -3818,7 +3818,7 @@ mod tests {
                 if let Err(error) = outcome {
                     panic!("cycle {cycle}: a dropped lock was still held: {error:?}");
                 }
-            }
+            });
         });
     }
 
