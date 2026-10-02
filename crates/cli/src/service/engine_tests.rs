@@ -3034,7 +3034,7 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
     let token = handoff.token().clone();
     handoff.release().expect("remove the holder record");
     drop(holder);
-    assert_refused_once_free(&harness.engine().store, &token, NO_HOLDER).await;
+    assert_no_holder_once_free(&harness.engine().store, &token).await;
     // An adopter that outlives its holder still keeps every other
     // transaction out until it ends.
     let refused = harness
@@ -3155,18 +3155,26 @@ async fn adopt_once_free(
 /// The refusal of a token while no process holds the transaction lock.
 const NO_HOLDER: &str = "no process holds the transaction lock";
 
-/// Asserts that adopting `token` is refused with `detail` once the holder's
-/// descriptors are gone.
+/// The refusal of a token while the lock is held but no holder record exists.
+const NO_RECORD: &str = "no `pohunek service lock` holds the lock";
+
+/// Asserts that adopting `token` is refused with [`NO_HOLDER`] once the
+/// holder's descriptors are gone, for a state directory without a holder
+/// record.
 ///
 /// While a copy of the dropped lock descriptor lingers in a spawned process,
-/// the lock still looks held and the adoption proceeds; it is retried until
-/// the lock is free. Any other refusal is final.
-async fn assert_refused_once_free(store: &record::Store, token: &Token, detail: &str) {
+/// the lock still looks held, and with no record to validate the adoption is
+/// refused with [`NO_RECORD`] instead. That refusal is retried until the lock
+/// is free; every other outcome is final.
+async fn assert_no_holder_once_free(store: &record::Store, token: &Token) {
     let error = until_released("the transaction lock", || {
-        store.adopt(token, record::Adoption::Transaction).err()
+        match store.adopt(token, record::Adoption::Transaction) {
+            Err(Error::InheritedLock { detail }) if detail == NO_RECORD => None,
+            result => Some(result),
+        }
     })
     .await;
-    assert_refused(Err(error), detail);
+    assert_refused(error, NO_HOLDER);
 }
 
 fn assert_refused(result: Result<TransactionLock, Error>, detail: &str) {
@@ -3180,6 +3188,35 @@ fn assert_refused(result: Result<TransactionLock, Error>, detail: &str) {
         error.to_string().contains("POHUNEK_SERVICE_LOCK_TOKEN"),
         "{error}"
     );
+}
+
+/// A copy of the lock descriptor held elsewhere, as a sibling's pre-`exec`
+/// child holds it, keeps the lock looking held after its owner dropped it. The
+/// helper rides out that refusal and still asserts the final one.
+#[tokio::test]
+async fn a_lingering_copy_of_the_lock_is_waited_out_before_the_final_refusal() {
+    let harness = Harness::new();
+    let store = harness.engine().store;
+    let token = Token::generate().expect("token");
+    drop(store.lock().await.expect("create the state directory"));
+
+    let lingering = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(harness.context.paths().state_dir.join(record::LOCK_NAME))
+        .expect("open the lock file");
+    lingering.try_lock().expect("hold a copy of the lock");
+
+    // The helper is polled first, so its first adoption meets the held lock;
+    // the second future confirms that refusal, then ends the copy's life.
+    let release = async {
+        assert_refused(
+            store.adopt(&token, record::Adoption::Transaction),
+            NO_RECORD,
+        );
+        drop(lingering);
+    };
+    tokio::join!(assert_no_holder_once_free(&store, &token), release);
 }
 
 /// Writes a holder record naming `pid` with start identity `start`.
@@ -3208,13 +3245,13 @@ async fn a_token_that_proves_no_live_holder_is_refused() {
         "the state directory does not exist",
     );
     drop(store.lock().await.expect("create the state directory"));
-    assert_refused_once_free(&store, &token, NO_HOLDER).await;
+    assert_no_holder_once_free(&store, &token).await;
 
     // The lock is held, but by a transaction that published no record.
     let holder = store.lock().await.expect("hold the lock");
     assert_refused(
         store.adopt(&token, record::Adoption::Transaction),
-        "no `pohunek service lock` holds the lock",
+        NO_RECORD,
     );
 
     // A record of this holder with another token.

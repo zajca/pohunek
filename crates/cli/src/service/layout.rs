@@ -906,6 +906,10 @@ pub(crate) mod tests {
     /// A descriptor open for writing, the state a sibling's pre-`exec` child
     /// leaves on a freshly written executable, makes `exec` fail with the
     /// error [`is_exec_busy`] recognizes.
+    ///
+    /// Linux only: Darwin lets `exec` succeed on a file that is still open for
+    /// writing, so there is no busy state to report there.
+    #[cfg(target_os = "linux")]
     #[test]
     fn exec_of_a_file_open_for_writing_is_reported_as_busy() {
         let (_root, root) = temp_root();
@@ -931,9 +935,11 @@ pub(crate) mod tests {
         assert!(child.wait().expect("wait").success());
     }
 
-    /// The probe outlasts a writer that closes after its first attempt: the
-    /// join polls the probe first, so it meets the busy file before the
-    /// writer is dropped.
+    /// The probe succeeds once a writer that was open at its first attempt
+    /// closes: the join polls the probe first, so it meets the open writer
+    /// before the writer is dropped. Where `exec` of such a file is refused as
+    /// busy (Linux) the probe retries; elsewhere (Darwin) its first attempt
+    /// already succeeds.
     #[tokio::test]
     async fn the_version_probe_waits_for_a_descriptor_that_is_still_open_for_writing() {
         let (_root, root) = temp_root();
