@@ -10,10 +10,14 @@ export type {
 export {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
   DEFAULT_STATIC_ASSETS_DIR,
+  DEFAULT_LOG_MAX_FILES,
+  DEFAULT_LOG_MAX_FILE_BYTES,
   BackendConfigError,
   loadBackendConfig,
 } from "./config";
-export type { BackendConfig, DerivedRuntime } from "./config";
+export type { BackendConfig, BackendLogFileConfig, DerivedRuntime } from "./config";
+export { LOG_FILE_NAME, LogFileError, rotatingFileLogger } from "./log-files";
+export type { ClosableBackendLogger, RotatingLogOptions } from "./log-files";
 export {
   APP_DIR,
   MACOS_DEFAULT_RUNTIME_PREFIX,

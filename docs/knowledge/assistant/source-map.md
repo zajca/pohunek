@@ -103,6 +103,7 @@ Web control center client:
 - `web/sdk/src/transport.ts`
 - `web/backend/src/config.ts`
 - `web/backend/src/runtime-paths.ts`
+- `web/backend/src/log-files.ts`
 - `web/testkit/src/runtime-root.ts`
 - `web/scripts/node-executable.ts`
 - `web/backend/src/hosts.ts`

@@ -100,7 +100,7 @@ Vite frontend. It needs neither a Rust daemon nor NetBird. Bun remains the
 workspace runtime and orchestrates the fixture daemons and backend. The command
 also requires Node: Vite runs in a managed Node child process because
 Vite 8's WebSocket proxy relies on Node `net.Socket` APIs that Bun 1.3 does not
-provide. The orchestrator finds Node itself (see "Runtime paths and macOS");
+provide. The orchestrator finds Node itself (see "Runtime paths, logs and macOS");
 set `POHUNEK_NODE_BIN` to an absolute path to override.
 Structured output is also written under the gitignored `web/logs/` directory.
 
@@ -129,7 +129,7 @@ Browser code imports `Client` from `@pohunek/sdk/browser` and calls
 Unix sockets directly. The backend only tunnels the public newline-delimited
 JSON control frames and raw attach bytes; it does not define a second protocol.
 
-## Runtime paths and macOS
+## Runtime paths, logs and macOS
 
 The backend resolves the daemon socket with the same contract as the Rust
 host components (`crates/paths/fixtures/runtime-paths.json` drives both
@@ -152,6 +152,23 @@ exists and is a real directory, without symlinked components, owned by the
 current user with mode exactly `0700`, and a present socket is a socket of the
 same user: the macOS default lives under the shared `/private/tmp`, where
 another local user could pre-create the predictable path.
+
+By default the backend writes one JSON object per line to standard output
+(journald keeps it under systemd). A launchd job has no journal, so setting
+`POHUNEK_BACKEND_LOG_DIR` makes the backend write an owner-private (`0700`
+directory, `0600` file) rotating family `pohunek-backend.jsonl[.N]` instead.
+`POHUNEK_BACKEND_LOG_MAX_FILE_BYTES` (default 32 MiB) and
+`POHUNEK_BACKEND_LOG_MAX_FILES` (default 8, including the active file) bound it
+like the daemon's own log family; the two limits are rejected without a log
+directory. A symlinked directory or file, a directory open to group or others,
+or a foreign owner stops startup. Files left by an earlier run are brought inside
+the bound when the backend starts: oversize ones are removed (the active one is
+emptied) and loose modes are forced to `0600`. An event larger than one file is
+replaced by a fixed notice, so total disk use stays within the product of the two
+limits. A failing write or rotation (a full disk, an I/O error) never fails a
+request: the event goes to standard output, one `log_file_failed` event reports
+it, and the next event tries the files again. The backend closes the files with
+its own shutdown.
 
 The backend runs natively on Apple Silicon, both from the Bun workspace and as
 the compiled release executable. `bun run dev` locates Node itself: it uses

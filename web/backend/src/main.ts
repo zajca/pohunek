@@ -2,6 +2,7 @@ import { BackendConfigError, ENV_XDG_RUNTIME_DIR, loadBackendConfig, type Backen
 import { RuntimePathError, verifyDaemonRuntime } from "./runtime-paths";
 import { BackendStartupError, startHostsPipeline, type HostsPipelineHandle } from "./hosts";
 import { errorClass, stdoutLogger, type BackendLogger } from "./log";
+import { rotatingFileLogger } from "./log-files";
 import { startBackendServer, type BackendServerHandle } from "./server";
 
 export interface BackendHandle {
@@ -37,14 +38,20 @@ export async function startBackend(
     throw error;
   }
 
-  logger.log({
-    level: "info",
-    event: "backend_server",
-    lifecycle: "listening",
-    status: "ok",
-    port: server.port,
-    url: server.url,
-  });
+  try {
+    logger.log({
+      level: "info",
+      event: "backend_server",
+      lifecycle: "listening",
+      status: "ok",
+      port: server.port,
+      url: server.url,
+    });
+  } catch (error: unknown) {
+    await server.close();
+    await hosts.close();
+    throw error;
+  }
 
   return {
     url: server.url,
@@ -82,11 +89,40 @@ function verifyDerivedRuntime(config: BackendConfig): void {
   }
 }
 
-export function startBackendFromEnv(
+/**
+ * Starts the backend from its environment. Without an explicit logger the
+ * destination follows the configuration: a rotating owner-private file family
+ * when `POHUNEK_BACKEND_LOG_DIR` is set (launchd keeps no journal), else
+ * standard output. A file logger created here is closed with the backend, and
+ * on a failed start.
+ */
+export async function startBackendFromEnv(
   env: NodeJS.ProcessEnv = process.env,
-  logger: BackendLogger = stdoutLogger,
+  logger?: BackendLogger,
 ): Promise<BackendHandle> {
-  return startBackend(loadBackendConfig(env), logger);
+  const config = loadBackendConfig(env);
+  const owned = logger === undefined && config.logFiles !== undefined
+    ? rotatingFileLogger(config.logFiles)
+    : undefined;
+  try {
+    const handle = await startBackend(config, logger ?? owned ?? stdoutLogger);
+    if (owned === undefined) {
+      return handle;
+    }
+    return {
+      ...handle,
+      close: async (): Promise<void> => {
+        try {
+          await handle.close();
+        } finally {
+          owned.close();
+        }
+      },
+    };
+  } catch (error: unknown) {
+    owned?.close();
+    throw error;
+  }
 }
 
 export function runBackend(): void {
