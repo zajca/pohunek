@@ -8,51 +8,32 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Output;
 use std::thread;
 
+use pohunek_test_support::env::TestEnv;
 use protocol::{Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
-
-static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Mode of every private fixture directory.
 const PRIVATE_MODE: u32 = 0o700;
 
 struct Fixture {
+    env: TestEnv,
     root: PathBuf,
 }
 
 impl Fixture {
-    fn new(tag: &str) -> Self {
-        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        // A short canonical base keeps the fixture daemon socket within the
-        // macOS 103-byte `sun_path` limit.
-        let root = fs::canonicalize("/tmp")
-            .expect("canonical /tmp")
-            .join(format!(
-                "pohunek-hooks-{tag}-{}-{sequence}",
-                std::process::id()
-            ));
-        fs::create_dir(&root).expect("create fixture root");
-        let fixture = Self { root };
-        for directory in [
-            "",
-            "home",
-            "state",
-            "run",
-            "run/pohunek",
-            "data",
-            "config",
-            "cache",
-        ] {
-            let path = fixture.root.join(directory);
-            fs::create_dir_all(&path).expect("create fixture directory");
-            fs::set_permissions(&path, fs::Permissions::from_mode(PRIVATE_MODE))
-                .expect("private fixture directory");
-        }
-        fixture
+    fn new(_tag: &str) -> Self {
+        // `TestEnv` keeps the root short and canonical, so the fixture daemon
+        // socket stays within the macOS 103-byte `sun_path` limit.
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let root = env.root().to_path_buf();
+        let path = root.join("run/pohunek");
+        fs::create_dir_all(&path).expect("create fixture directory");
+        fs::set_permissions(&path, fs::Permissions::from_mode(PRIVATE_MODE))
+            .expect("private fixture directory");
+        Self { env, root }
     }
 
     fn socket(&self) -> PathBuf {
@@ -60,23 +41,11 @@ impl Fixture {
     }
 
     fn run(&self, arguments: &[&str]) -> Output {
-        Command::new(pohunek_test_support::bin_exe("pohunek"))
-            .env_clear()
-            .env("HOME", self.root.join("home"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_CACHE_HOME", self.root.join("cache"))
+        self.env
+            .command(pohunek_test_support::bin_exe("pohunek"))
             .args(arguments)
             .output()
             .expect("run pohunek binary")
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _result = fs::remove_dir_all(&self.root);
     }
 }
 

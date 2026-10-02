@@ -768,12 +768,8 @@ mod tests {
 
     #[test]
     fn managed_completion_write_is_idempotent_and_updates_mode() {
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-completion-test-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
-        ));
-        let path = root.join("nested/pohunek");
+        let guard = pohunek_test_support::tempdir().expect("create completion fixture");
+        let path = guard.path().join("nested/pohunek");
         write_script(&path, CompletionShell::Bash, false).expect("write static completion");
         let static_script = std::fs::read_to_string(&path).expect("read static completion");
         assert!(static_script.contains("complete"));
@@ -799,7 +795,6 @@ mod tests {
                 assert_eq!(mode & 0o777, COMPLETION_FILE_MODE);
             }
         }
-        std::fs::remove_dir_all(&root).expect("remove completion fixture");
     }
 
     #[test]

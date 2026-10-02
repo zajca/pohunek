@@ -1,8 +1,12 @@
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
+/// The built `pohunek` binary with an empty environment: `prompt link` renders
+/// from stdin and arguments and reads none of it.
 fn pohunek() -> Command {
-    Command::new(pohunek_test_support::bin_exe("pohunek"))
+    let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
+    command.env_clear();
+    command
 }
 
 fn run_prompt_link(provider: &str, item_id: &str, url: &str, context_json: &str) -> String {

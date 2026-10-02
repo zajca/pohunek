@@ -75,7 +75,8 @@ fn embedded_artifact_covers_required_sections() {
 
 fn agent_skill_command() -> Command {
     let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
-    command.arg("agent-skill");
+    // `agent-skill` prints an embedded artifact and reads no environment.
+    command.env_clear().arg("agent-skill");
     command
 }
 

@@ -3164,7 +3164,7 @@ mod tests {
         session.active_agent_base = Some(protocol::AgentKind::Codex);
         session.active_agent_pid = Some(9001);
         session.active_agent_session_id = Some("codex-native".to_owned());
-        session.active_agent_session_path = Some("/tmp/codex/session.json".to_owned());
+        session.active_agent_session_path = Some("/work/codex/session.json".to_owned());
 
         let output = render_inspect_human(&session);
 
@@ -3176,7 +3176,7 @@ mod tests {
         assert!(has_row(
             &output,
             "active_native_session_path",
-            "/tmp/codex/session.json"
+            "/work/codex/session.json"
         ));
         assert!(has_row(&output, "native_session_id", "<none>"));
     }

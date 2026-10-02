@@ -13,8 +13,9 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use pohunek_test_support::env::TestEnv;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 
 /// The real CLI under test.
@@ -22,12 +23,6 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 fn pohunek_bin() -> std::path::PathBuf {
     pohunek_test_support::bin_exe("pohunek")
 }
-
-/// Bound on waiting for a process to reach an observable state.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Poll interval of that wait.
-const POLL: Duration = Duration::from_millis(20);
 
 /// How long a second, unwanted signal delivery gets to show up.
 const SETTLE: Duration = Duration::from_millis(300);
@@ -68,13 +63,9 @@ echo $? > "$d/lock.status"
 while [ ! -e "$d/end" ]; do sleep 0.05; done
 "#;
 
-/// Waits until `check` holds.
+/// Waits until `check` holds; the hang guard names the wait if it never does.
 fn wait_until(what: &str, mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    while !check() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(POLL);
-    }
+    pohunek_test_support::wait::poll_until(what, || check().then_some(()));
 }
 
 /// Reads the first line of `path` once it is complete.
@@ -101,7 +92,7 @@ fn stopped(pid: i32) -> bool {
 
 /// A shell on its own pseudo-terminal running `service lock`.
 struct Session {
-    _temp: tempfile::TempDir,
+    _env: TestEnv,
     dir: PathBuf,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn std::io::Write + Send>,
@@ -110,15 +101,14 @@ struct Session {
 
 impl Session {
     fn start() -> Self {
-        let temp = tempfile::tempdir().expect("temp dir");
-        // Canonical, so no symlinked ancestor (macOS `/var`) is refused.
-        let root = fs::canonicalize(temp.path()).expect("canonical temp dir");
+        // `TestEnv` roots are canonical, so no symlinked ancestor (macOS `/var`)
+        // is refused.
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let root = env.root().to_path_buf();
         let dir = root.join("d");
-        for private in ["home", "run", "d"] {
-            fs::create_dir(root.join(private)).expect("create directory");
-            fs::set_permissions(root.join(private), fs::Permissions::from_mode(0o700))
-                .expect("make directory private");
-        }
+        fs::create_dir(&dir).expect("create directory");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+            .expect("make directory private");
         fs::write(dir.join("inner.sh"), INNER).expect("write inner script");
         fs::write(dir.join("outer.sh"), OUTER).expect("write outer script");
 
@@ -126,18 +116,11 @@ impl Session {
         let mut command = CommandBuilder::new("sh");
         command.args([dir.join("outer.sh"), dir.clone()]);
         command.env_clear();
-        command.env("PATH", std::env::var_os("PATH").expect("PATH"));
-        command.env("POHUNEK", pohunek_bin());
-        command.env("HOME", root.join("home"));
-        for (var, sub) in [
-            ("XDG_CONFIG_HOME", "config"),
-            ("XDG_STATE_HOME", "state"),
-            ("XDG_DATA_HOME", "data"),
-            ("XDG_CACHE_HOME", "cache"),
-            ("XDG_RUNTIME_DIR", "run"),
-        ] {
-            command.env(var, root.join(sub));
+        for (name, value) in env.environment() {
+            command.env(name, value);
         }
+        command.env("POHUNEK", pohunek_bin());
+        command.cwd(env.cwd());
         let shell = pair.slave.spawn_command(command).expect("start the shell");
         drop(pair.slave);
         // Drain the terminal's output so echoes never fill its buffer.
@@ -148,7 +131,7 @@ impl Session {
         });
         let writer = pair.master.take_writer().expect("pty writer");
         Self {
-            _temp: temp,
+            _env: env,
             dir,
             master: pair.master,
             writer,

@@ -11,36 +11,27 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 #[path = "support/interpreter.rs"]
 mod interpreter;
 
+use pohunek_test_support::env::TestEnv;
 use protocol::{AgentKind, Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
-static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 struct Fixture {
+    env: TestEnv,
     root: PathBuf,
 }
 
 impl Fixture {
-    fn new(tag: &str) -> Self {
-        let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        // A short canonical base keeps the fixture daemon socket within the
-        // macOS 103-byte `sun_path` limit; the per-user macOS temporary
-        // directory is too long and sits below the `/var` symlink.
-        let root = fs::canonicalize("/tmp")
-            .expect("canonical /tmp")
-            .join(format!(
-                "pohunek-hermes-process-{tag}-{}-{sequence}",
-                std::process::id()
-            ));
-        fs::create_dir(&root).expect("create fixture root");
-        set_mode(&root, 0o700);
-        Self { root }
+    fn new(_tag: &str) -> Self {
+        // `TestEnv` keeps the root short and canonical, so the fixture daemon
+        // socket stays within the macOS 103-byte `sun_path` limit.
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let root = env.root().to_path_buf();
+        Self { env, root }
     }
 
     fn private_directory(&self, relative: &str) -> PathBuf {
@@ -55,23 +46,9 @@ impl Fixture {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
+        let mut command = self.env.command(pohunek_test_support::bin_exe("pohunek"));
+        command.env("HERMES_HOME", self.root.join("ambient-must-not-be-read"));
         command
-            .env_clear()
-            .env("HOME", self.root.join("home"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_CACHE_HOME", self.root.join("cache"))
-            .env("HERMES_HOME", self.root.join("ambient-must-not-be-read"));
-        command
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _result = fs::remove_dir_all(&self.root);
     }
 }
 

@@ -1,34 +1,23 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Stdio;
 
 use pohunek_gui_core::{
     preview_prompt_content, PromptContext, PromptProvider, SessionLinkKind, SessionLinkMetadata,
     SessionLinkProvider,
 };
+use pohunek_test_support::env::TestEnv;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-cli-gui-parity-{tag}-{}-{nanos}-{n}",
-        std::process::id(),
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-fn run_prompt_link(provider: &str, item_id: &str, url: &str, context_json: &str) -> String {
-    let mut child = Command::new(pohunek_test_support::bin_exe("pohunek"))
+fn run_prompt_link(
+    env: &TestEnv,
+    provider: &str,
+    item_id: &str,
+    url: &str,
+    context_json: &str,
+) -> String {
+    let mut child = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
         .args([
             "prompt",
             "link",
@@ -78,8 +67,8 @@ fn parse_metadata(output: &str) -> BTreeMap<String, String> {
 
 #[test]
 fn gui_prompt_preview_is_byte_identical_to_pohunek_prompt_render() {
-    let dir = temp_dir("linear");
-    let template = dir.join("issue.tmpl");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let template = env.cwd().join("issue.tmpl");
     let template_content = "Issue ${id}: ${title}\n${body}\nbranch=${branch}\n";
     let context_json = r#"{"identifier":"LIN-123","title":"Fix launcher","description":"Issue body","branchName":"lin-123-fix-launcher","url":"https://linear.test/LIN-123"}"#;
     fs::write(&template, template_content).expect("write template");
@@ -95,7 +84,8 @@ fn gui_prompt_preview_is_byte_identical_to_pohunek_prompt_render() {
     )
     .expect("render GUI preview");
 
-    let mut child = Command::new(pohunek_test_support::bin_exe("pohunek"))
+    let mut child = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
         .args([
             "prompt",
             "render",
@@ -138,8 +128,8 @@ fn gui_prompt_preview_is_byte_identical_to_pohunek_prompt_render() {
 
 #[test]
 fn gui_github_pr_preview_is_byte_identical_to_pohunek_prompt_render() {
-    let dir = temp_dir("github-pr");
-    let template = dir.join("pr.tmpl");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let template = env.cwd().join("pr.tmpl");
     let template_content = "PR ${number}: ${title}\n${body}\nbranch=${branch}\nurl=${url}\n";
     let context_json = r#"{"number":7,"title":"Fix filters","body":"Body text","headRefName":"feature/filters","url":"https://github.example/repo/pull/7"}"#;
     fs::write(&template, template_content).expect("write template");
@@ -155,7 +145,8 @@ fn gui_github_pr_preview_is_byte_identical_to_pohunek_prompt_render() {
     )
     .expect("render GUI preview");
 
-    let mut child = Command::new(pohunek_test_support::bin_exe("pohunek"))
+    let mut child = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
         .args([
             "prompt",
             "render",
@@ -198,8 +189,10 @@ fn gui_github_pr_preview_is_byte_identical_to_pohunek_prompt_render() {
 
 #[test]
 fn gui_link_metadata_is_byte_identical_to_pohunek_prompt_link() {
+    let env = TestEnv::new().expect("hermetic test environment");
     let linear_json = r#"{"identifier":"LIN-123","title":"Fix launcher","description":"Issue body","branchName":"lin-123-fix-launcher","url":"https://linear.test/LIN-123"}"#;
     let linear_cli = parse_metadata(&run_prompt_link(
+        &env,
         "linear_issue",
         "LIN-123",
         "https://linear.test/LIN-123",
@@ -218,6 +211,7 @@ fn gui_link_metadata_is_byte_identical_to_pohunek_prompt_link() {
 
     let github_json = r#"{"number":7,"title":"Fix filters","body":"Body text","headRefName":"feature/filters","url":"https://example.test/pr/7"}"#;
     let github_cli = parse_metadata(&run_prompt_link(
+        &env,
         "github_pr",
         "7",
         "https://example.test/pr/7",

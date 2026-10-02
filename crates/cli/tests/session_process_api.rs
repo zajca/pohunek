@@ -16,20 +16,19 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
+use pohunek_test_support::env::TestEnv;
 use protocol::{Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
 const SESSION_ID: &str = "s-fixture-1";
 const SESSION_NAME: &str = "fixture-session";
 const SLOW_RESPONSE_DELAY: Duration = Duration::from_millis(300);
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 enum Scenario {
@@ -88,20 +87,18 @@ impl RedactedRequestLog {
 }
 
 struct TestHome {
+    env: TestEnv,
     root: PathBuf,
     worker: PathBuf,
 }
 
 impl TestHome {
     fn new() -> Self {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        // A short canonical base keeps the longest worker socket path
-        // (`run/pohunek/workers/<session>/control.sock`) within the macOS
-        // 103-byte `sun_path` limit; the per-user macOS temporary directory is
-        // too long and sits below the `/var` symlink.
-        let root = fs::canonicalize("/tmp")
-            .expect("canonical /tmp")
-            .join(format!("pcpa-{}-{sequence}", std::process::id()));
+        // `TestEnv` keeps the root short and canonical, so the longest worker
+        // socket path (`run/pohunek/workers/<session>/control.sock`) stays
+        // within the macOS 103-byte `sun_path` limit.
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let root = env.root().to_path_buf();
         for directory in [
             "run/pohunek",
             "state/pohunek/logs",
@@ -128,7 +125,7 @@ impl TestHome {
         fs::write(&worker, b"#!/bin/sh\nexit 0\n").expect("write worker stand-in");
         fs::set_permissions(&worker, fs::Permissions::from_mode(0o755))
             .expect("make the worker stand-in executable");
-        Self { root, worker }
+        Self { env, root, worker }
     }
 
     fn socket(&self) -> PathBuf {
@@ -136,24 +133,9 @@ impl TestHome {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
+        let mut command = self.env.command(pohunek_test_support::bin_exe("pohunek"));
+        command.env("POHUNEK_WORKER_BIN", &self.worker);
         command
-            .env("XDG_RUNTIME_DIR", self.root.join("run"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_CACHE_HOME", self.root.join("cache"))
-            .env("HOME", self.root.join("home"))
-            .env("POHUNEK_WORKER_BIN", &self.worker)
-            .env_remove(protocol::ENV_SESSION_ID)
-            .env_remove(protocol::ENV_DAEMON_ID);
-        command
-    }
-}
-
-impl Drop for TestHome {
-    fn drop(&mut self) {
-        let _result = fs::remove_dir_all(&self.root);
     }
 }
 

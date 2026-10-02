@@ -6,7 +6,8 @@
 // Rust guideline compliant 2026-08-07
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use pohunek_test_support::env::TestEnv;
 
 #[path = "support/interpreter.rs"]
 mod interpreter;
@@ -30,11 +31,13 @@ fn repository_root() -> PathBuf {
 #[test]
 fn embedded_plugin_runtime_suite_passes() {
     let suite = manifest_dir().join("src/hermes_integration/assets/tests/test_plugin_runtime.py");
-    let output = Command::new(interpreter::python())
+    // The suite creates its scratch directories through `tempfile`, which follows
+    // the private `TMPDIR` of the environment.
+    let env = TestEnv::new().expect("hermetic test environment");
+    let output = env
+        .command(interpreter::python())
         .args(["-I", "-B"])
         .arg(&suite)
-        .current_dir("/")
-        .env_clear()
         .env("LANG", LOCALE)
         .output()
         .expect("start controlled local Python for the Hermes plugin runtime suite");
@@ -51,10 +54,10 @@ fn embedded_plugin_runtime_suite_passes() {
 #[test]
 fn release_plugin_smoke_self_test_passes() {
     let suite = repository_root().join("scripts/tests/smoke-hermes-plugin-release.sh");
-    let output = Command::new(interpreter::bash())
+    let env = TestEnv::new().expect("hermetic test environment");
+    let output = env
+        .command(interpreter::bash())
         .arg(&suite)
-        .current_dir("/")
-        .env_clear()
         .env("LANG", LOCALE)
         .env("LC_ALL", LOCALE)
         .env("PATH", SYSTEM_PATH)

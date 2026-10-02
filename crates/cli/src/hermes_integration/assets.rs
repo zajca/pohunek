@@ -252,35 +252,15 @@ where
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::process::Command;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pohunek_test_support::env::TestEnv;
 
     use super::*;
     use crate::hermes_integration::test_python;
 
-    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-
-    struct TempDir(std::path::PathBuf);
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_dir() -> TempDir {
-        let path = crate::hermes_integration::target::isolated_test_temp_root().join(format!(
-            "pohunek-hermes-assets-{}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("create isolated test directory");
-        TempDir(path)
-    }
-
     #[test]
     fn renderer_replaces_exactly_one_policy_token_and_owns_every_asset() {
-        let policy_path = Path::new("/tmp/policy\\\"quoted-á.json");
+        let policy_path = Path::new("/work/policy\\\"quoted-á.json");
         let assets = render(policy_path).expect("rendered assets");
         let init = assets
             .iter()
@@ -292,8 +272,8 @@ mod tests {
             .expect("policy literal");
         assert!(init.contains(&format!("POLICY_PATH = {literal}")));
         let ownership = ownership(
-            Path::new("/tmp/hermes"),
-            Path::new("/tmp/policy.json"),
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
             &assets,
         )
         .expect("ownership");
@@ -307,23 +287,22 @@ mod tests {
 
     #[test]
     fn rendered_init_is_valid_python_for_escaped_absolute_paths() {
-        let temp = temp_dir();
-        let assets = render(Path::new("/tmp/policy\\\"quoted-á.json")).expect("rendered assets");
+        let env = TestEnv::new().expect("hermetic test environment");
+        let assets = render(Path::new("/work/policy\\\"quoted-á.json")).expect("rendered assets");
         let init = assets
             .iter()
             .find(|asset| asset.path() == "__init__.py")
             .expect("init asset");
-        let path = temp.0.join("__init__.py");
+        let path = env.root().join("__init__.py");
         fs::write(&path, init.bytes()).expect("write isolated source");
-        let status = Command::new(test_python::interpreter())
+        let status = env
+            .command(test_python::interpreter())
             .args([
                 "-I",
                 "-c",
                 "import ast, pathlib; source = pathlib.Path(__import__('sys').argv[1]).read_text(encoding='utf-8'); tree = ast.parse(source); compile(tree, '<asset>', 'exec')",
             ])
             .arg(&path)
-            .env_clear()
-            .env("LANG", "C")
             .status()
             .expect("start controlled local Python");
         assert!(status.success(), "rendered init must parse and compile");
@@ -334,7 +313,7 @@ mod tests {
     /// source tree.
     #[test]
     fn start_identity_suite_passes_on_the_host_interpreter() {
-        let temp = temp_dir();
+        let env = TestEnv::new().expect("hermetic test environment");
         let hooks = ASSETS
             .iter()
             .find(|(path, _)| *path == "hooks.py")
@@ -347,16 +326,14 @@ mod tests {
                 include_bytes!("assets/tests/test_start_identity.py").as_slice(),
             ),
         ] {
-            let path = temp.0.join(relative);
+            let path = env.root().join(relative);
             fs::create_dir_all(path.parent().expect("suite parent")).expect("suite directory");
             fs::write(&path, bytes).expect("write suite file");
         }
-        let output = Command::new(test_python::interpreter())
+        let output = env
+            .command(test_python::interpreter())
             .args(["-I", "-B"])
-            .arg(temp.0.join("tests/test_start_identity.py"))
-            .current_dir("/")
-            .env_clear()
-            .env("LANG", "C")
+            .arg(env.root().join("tests/test_start_identity.py"))
             .output()
             .expect("start controlled host Python");
         assert!(
@@ -396,10 +373,10 @@ mod tests {
 
     #[test]
     fn marker_rejects_unknown_missing_duplicate_and_malformed_checksums() {
-        let assets = render(Path::new("/tmp/policy.json")).expect("rendered assets");
+        let assets = render(Path::new("/work/policy.json")).expect("rendered assets");
         let ownership = ownership(
-            Path::new("/tmp/hermes"),
-            Path::new("/tmp/policy.json"),
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
             &assets,
         )
         .expect("ownership");
@@ -409,8 +386,8 @@ mod tests {
             document.replacen("plugin.yaml", "./plugin.yaml", 1),
             document.replacen("plugin.yaml", "../plugin.yaml", 1),
             document.replacen("plugin.yaml", "/plugin.yaml", 1),
-            document.replacen("\"hermes_home\": \"/tmp/hermes\"", "\"hermes_home\": \"relative\"", 1),
-            document.replacen("\"policy_path\": \"/tmp/policy.json\"", "\"policy_path\": \"relative\"", 1),
+            document.replacen("\"hermes_home\": \"/work/hermes\"", "\"hermes_home\": \"relative\"", 1),
+            document.replacen("\"policy_path\": \"/work/policy.json\"", "\"policy_path\": \"relative\"", 1),
             document.replacen(&ownership.assets["plugin.yaml"], "not-a-checksum", 1),
             document.replacen("\"assets\": {", "\"assets\": {\n    \"plugin.yaml\": \"0000000000000000000000000000000000000000000000000000000000000000\",", 1),
         ];
@@ -422,10 +399,10 @@ mod tests {
     #[test]
     fn marker_accepts_absolute_trailing_slash_target_metadata() {
         for (hermes_home, policy_path) in [
-            ("/tmp/hermes/", "/tmp/config/policy.json"),
+            ("/work/hermes/", "/work/config/policy.json"),
             (
-                "/tmp/pohunek-hermes-lifecycle-x/pohunek/hermes/",
-                "/tmp/pohunek-hermes-lifecycle-x/config/policy.json",
+                "/work/pohunek-hermes-lifecycle-x/pohunek/hermes/",
+                "/work/pohunek-hermes-lifecycle-x/config/policy.json",
             ),
         ] {
             let assets = render(Path::new(policy_path)).expect("rendered assets");
@@ -438,8 +415,8 @@ mod tests {
 
     #[test]
     fn embedded_skill_checksum_is_deterministic_and_owned_as_exact_bytes() {
-        let first = render(Path::new("/tmp/policy.json")).expect("render first assets");
-        let second = render(Path::new("/tmp/policy.json")).expect("render second assets");
+        let first = render(Path::new("/work/policy.json")).expect("render first assets");
+        let second = render(Path::new("/work/policy.json")).expect("render second assets");
         let first_skill = first
             .iter()
             .find(|asset| asset.path() == SKILL_PATH)
@@ -453,8 +430,8 @@ mod tests {
         assert_eq!(first_skill.checksum(), second_skill.checksum());
 
         let ownership = ownership(
-            Path::new("/tmp/hermes"),
-            Path::new("/tmp/policy.json"),
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
             &first,
         )
         .expect("ownership");

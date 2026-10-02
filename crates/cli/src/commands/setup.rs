@@ -645,32 +645,20 @@ fn render_sway_human(paths: &Paths, result: &SwayResult) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use super::*;
 
-    /// Per-test counter so concurrently running tests never share a temp dir.
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    /// A `Paths` rooted in a unique temp dir, plus the root for cleanup.
+    /// A `Paths` rooted in a private temp dir, which the guard removes when it
+    /// drops, also when a test fails.
     struct TempPaths {
         paths: Paths,
-        root: PathBuf,
-    }
-
-    impl Drop for TempPaths {
-        fn drop(&mut self) {
-            // Best-effort cleanup; a leftover temp dir is harmless.
-            let _ = fs::remove_dir_all(&self.root);
-        }
+        _guard: tempfile::TempDir,
     }
 
     /// Build a `Paths` whose dirs all live under a fresh temp directory, so tests
     /// write real files without touching the user's environment.
     fn temp_paths() -> TempPaths {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root =
-            std::env::temp_dir().join(format!("pohunek-setup-test-{}-{}", std::process::id(), n));
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let root = guard.path().to_path_buf();
         let config_home = root.join("config");
         let data_dir = root.join("data");
         let paths = Paths {
@@ -683,7 +671,10 @@ mod tests {
             config_dir: config_home.join("pohunek"),
             origin_source: pohunek_client::OriginSource::Omitted,
         };
-        TempPaths { paths, root }
+        TempPaths {
+            paths,
+            _guard: guard,
+        }
     }
 
     #[test]

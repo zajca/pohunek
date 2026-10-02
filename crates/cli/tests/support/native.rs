@@ -23,7 +23,6 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -57,15 +56,10 @@ pub(crate) struct Installation {
 impl Installation {
     pub(crate) fn new() -> Self {
         require_manager();
-        // `/var` is a symlink on macOS and socket paths are bounded, so the
-        // root is a short path below the canonical `/tmp`.
-        let temporary = tempfile::Builder::new()
-            .prefix("phk")
-            .tempdir_in(std::fs::canonicalize("/tmp").expect("canonical /tmp"))
-            .expect("temporary root");
+        // The test-support root is symlink-free and short enough for socket
+        // paths on macOS and Linux.
+        let temporary = pohunek_test_support::tempdir_with_prefix("phk-").expect("temporary root");
         let root = temporary.path().to_path_buf();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-            .expect("private root");
         let dir = |name: &str| {
             let path = root.join(name);
             std::fs::create_dir_all(&path).expect("create XDG root");

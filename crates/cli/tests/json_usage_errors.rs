@@ -13,12 +13,21 @@
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
+use pohunek_test_support::env::TestEnv;
+
 /// Mirrors the documented CLI stdin ceiling derived from the 1 MiB control frame.
 const MAX_STDIN_INPUT_BYTES: usize = 256 * 1024;
 
-/// A `Command` for the built `pohunek` binary under test.
+thread_local! {
+    /// The hermetic environment of the current test thread: private HOME, XDG
+    /// and working directories, removed when the thread ends.
+    static TEST_ENV: TestEnv = TestEnv::new().expect("create the hermetic test environment");
+}
+
+/// A `Command` for the built `pohunek` binary under test, with the test
+/// thread's scrubbed environment and private working directory.
 fn pohunek() -> Command {
-    Command::new(pohunek_test_support::bin_exe("pohunek"))
+    TEST_ENV.with(|env| env.command(pohunek_test_support::bin_exe("pohunek")))
 }
 
 #[test]
