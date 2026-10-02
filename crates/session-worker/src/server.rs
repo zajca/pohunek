@@ -538,7 +538,7 @@ impl State {
             pty: None,
             initialize_transaction: None,
             launch_agent_base: None,
-            stop_grace: Duration::from_millis(500),
+            stop_grace: crate::config::DEFAULT_STOP_GRACE,
             terminal_retention: Duration::from_hours(24),
             exit: None,
             stop_requested: false,

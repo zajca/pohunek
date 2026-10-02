@@ -132,6 +132,26 @@ pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// a wedged operation from the operator.
 pub const MAX_DEADLINE: Duration = MAX_JOB_TIMEOUT;
 
+/// Default PTY stop grace of daemon and session workers.
+///
+/// The grace is how long a worker waits for the PTY to reach EOF after it
+/// signals the session's process group with `SIGTERM`, and then once more after
+/// `SIGKILL`, before it force-closes the PTY; a stop therefore waits at most
+/// two graces for a process that ignores both signals. 500 ms is long enough for
+/// a shell or an agent CLI on a loaded host to handle `SIGTERM` and flush its
+/// final output, and short enough that an explicit stop returns in about a
+/// second. Raising it delays every stop of a stuck process; lowering it risks a
+/// final screen cut short by the force-close.
+///
+/// This is not a `service.toml` key. The daemon is the single authority: it
+/// sends its grace to each worker in the `Initialize` stop policy (the wire
+/// value is a non-zero number of milliseconds), and a worker only falls back to
+/// this value before it has been initialized. Both sides take their default from
+/// this constant, so they cannot drift apart, and tests that need another value
+/// set the `stop_grace` field of the registry or worker configuration. The value
+/// stays below [`MAX_DEADLINE`].
+pub const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
+
 /// Longest accepted path in bytes.
 ///
 /// Equal to the supervisor's job value limit, because the prefix and roots
@@ -1063,5 +1083,13 @@ mod tests {
         assert!(!message.contains("PH-TOKEN-sentinel"));
         let utf8 = format!("{error:?}");
         assert!(!utf8.contains("PH-TOKEN-sentinel"));
+    }
+
+    #[test]
+    fn default_stop_grace_is_a_valid_nonzero_deadline() {
+        assert!(!DEFAULT_STOP_GRACE.is_zero());
+        assert!(DEFAULT_STOP_GRACE <= MAX_DEADLINE);
+        assert_eq!(DEFAULT_STOP_GRACE.subsec_nanos() % NANOS_PER_MILLI, 0);
+        validate_duration("stop_grace", DEFAULT_STOP_GRACE).expect("valid deadline");
     }
 }

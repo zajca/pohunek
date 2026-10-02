@@ -20,8 +20,8 @@ pub(crate) const DEFAULT_CONTROL_LINE_BYTES: usize = 64 * 1024;
 pub(crate) const DEFAULT_DATA_TOKEN_TTL: Duration = Duration::from_secs(10);
 /// Default number of completed input plans retained for exact deduplication.
 pub(crate) const DEFAULT_INPUT_DEDUP_ENTRIES: usize = 4_096;
-/// Default graceful stop window before hard termination.
-pub(crate) const DEFAULT_STOP_GRACE: Duration = Duration::from_millis(500);
+/// Default graceful stop window before hard termination, shared with the daemon.
+pub(crate) const DEFAULT_STOP_GRACE: Duration = pohunek_service_config::DEFAULT_STOP_GRACE;
 /// Default window for descendants to finish writing after the root exits.
 pub(crate) const DEFAULT_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default wait for a durable terminal commit before acknowledging stop.
@@ -277,6 +277,14 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         WorkerConfig::new().validate().expect("valid defaults");
+    }
+
+    #[test]
+    fn default_stop_grace_is_the_service_config_definition() {
+        assert_eq!(
+            WorkerConfig::new().stop_grace,
+            pohunek_service_config::DEFAULT_STOP_GRACE
+        );
     }
 
     #[test]
