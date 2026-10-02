@@ -292,6 +292,8 @@ const MAX_USER_TURN_PREVIEW_BYTES: usize = 1024;
 const SHORT_RESPONSE: &str = "HERMES_COMPAT_OK";
 const MULTILINE_RESPONSE: &str = "HERMES_MULTILINE_OK";
 const INTERRUPT_MARKER: &str = "Interrupting agent";
+/// Pinned Hermes shows this tick in its status line once the interrupted turn has finished.
+const COMPLETION_MARKER: &str = "\u{2713}";
 const TUI_UNAVAILABLE_MARKERS: [&str; 4] = [
     "not found \u{2014} install Node.js to use the TUI",
     "Error: the TUI workspace is missing from this Hermes checkout",
@@ -2857,15 +2859,17 @@ fn evidence_matches(evidence: &Evidence, output: &[u8]) -> bool {
     }
 }
 
-/// Reports whether the screen shows the idle prompt after an acknowledged interrupt.
+/// Reports whether the screen shows the idle prompt once the interrupted turn is done.
 ///
-/// Hermes shows `⚕ ❯ msg=interrupt ...` while the agent is still unwinding and a
-/// bare `❯` line once it is idle again. The prompt is judged on the rendered
-/// screen: its most recent prompt-bearing line, below the interrupt
-/// acknowledgement when that is still on screen, must be exactly the prompt
+/// Hermes shows `⚕ ❯ msg=interrupt ...` while the agent is still unwinding. When
+/// the turn has finished its status line carries `✓`, and a bare `❯` line
+/// follows. Both are judged on the rendered screen, below the interrupt
+/// acknowledgement when that is still on screen: a completion tick must be
+/// followed by a most recent prompt-bearing line that is exactly the prompt
 /// glyph. A bare prompt that a later repaint replaced with the busy status
-/// therefore does not count. The acknowledgement itself is read from the raw
-/// transcript, because a repaint may already have erased it from the screen.
+/// therefore does not count, and neither does one drawn before completion. The
+/// acknowledgement itself is read from the raw transcript, because a repaint
+/// may already have erased it from the screen.
 fn has_idle_prompt_after_interrupt(raw: &str, rendered: &str) -> bool {
     if !raw.contains(INTERRUPT_MARKER) {
         return false;
@@ -2873,10 +2877,17 @@ fn has_idle_prompt_after_interrupt(raw: &str, rendered: &str) -> bool {
     let after_interrupt = rendered
         .rfind(INTERRUPT_MARKER)
         .map_or(rendered, |start| &rendered[start..]);
-    after_interrupt
-        .lines()
-        .rfind(|line| line.contains(PROMPT_READY_MARKER))
-        .is_some_and(|line| line.trim() == PROMPT_READY_MARKER)
+    let lines = after_interrupt.lines().collect::<Vec<_>>();
+    let Some(prompt) = lines
+        .iter()
+        .rposition(|line| line.contains(PROMPT_READY_MARKER))
+    else {
+        return false;
+    };
+    lines[prompt].trim() == PROMPT_READY_MARKER
+        && lines[..prompt]
+            .iter()
+            .any(|line| line.contains(COMPLETION_MARKER))
 }
 
 /// Returns the prefix of raw PTY output that ends at its last `\n`.
@@ -4092,13 +4103,13 @@ mod tests {
         validate_classic_transcript, validate_golden_manifest, validate_safe_fixture,
         with_pty_diagnostic, GoldenManifest, GoldenStatus, IntegrationAction, IntegrationState,
         IntegrationStep, Isolation, Limits, ProcessOutput, PtyCapture, TerminalCapture,
-        APPROVAL_PROMPT_TEXT, ASSISTANT_PANEL_SECTION, GOLDEN_MANIFEST, GOLDEN_ROOT,
-        INTERRUPTION_PROMPT_TEXT, INTERRUPT_MARKER, LOCK_PATH, MAX_PTY_DIAGNOSTIC_BYTES,
-        MAX_PTY_DIAGNOSTIC_LINES, MULTILINE_PREVIEW, MULTILINE_RESPONSE, PLUGIN_RUNTIME_MARKERS,
-        PLUGIN_RUNTIME_SMOKE, PRODUCTION_PLUGIN_RUNTIME_MARKER, PRODUCTION_PLUGIN_RUNTIME_SMOKE,
-        PROMPT_READY_MARKER, PTY_COLS, PTY_DIAGNOSTIC_WITHHELD, PTY_SCROLLBACK_ROWS,
-        SHORT_PROMPT_TEXT, SHORT_RESPONSE, USER_TURN_MARKER, USER_TURN_SEPARATOR,
-        WORKING_PROMPT_TEXT,
+        APPROVAL_PROMPT_TEXT, ASSISTANT_PANEL_SECTION, COMPLETION_MARKER, GOLDEN_MANIFEST,
+        GOLDEN_ROOT, INTERRUPTION_PROMPT_TEXT, INTERRUPT_MARKER, LOCK_PATH,
+        MAX_PTY_DIAGNOSTIC_BYTES, MAX_PTY_DIAGNOSTIC_LINES, MULTILINE_PREVIEW, MULTILINE_RESPONSE,
+        PLUGIN_RUNTIME_MARKERS, PLUGIN_RUNTIME_SMOKE, PRODUCTION_PLUGIN_RUNTIME_MARKER,
+        PRODUCTION_PLUGIN_RUNTIME_SMOKE, PROMPT_READY_MARKER, PTY_COLS, PTY_DIAGNOSTIC_WITHHELD,
+        PTY_SCROLLBACK_ROWS, SHORT_PROMPT_TEXT, SHORT_RESPONSE, USER_TURN_MARKER,
+        USER_TURN_SEPARATOR, WORKING_PROMPT_TEXT,
     };
     use super::{
         isolation_root_budget, COMMAND_TIMEOUT, DAEMON_SOCKET_RELATIVE_PATH,
@@ -4123,7 +4134,17 @@ mod tests {
         let _turn = PTY_SCENARIOS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        super::refresh_with(repo, hermes_bin, limits)
+        let result = super::refresh_with(repo, hermes_bin, limits);
+        if result.is_err() {
+            // The fake Hermes logs its loop events next to itself; showing them
+            // names whether a stuck run ever read the exit command.
+            let mut trace = hermes_bin.as_os_str().to_owned();
+            trace.push(".trace");
+            if let Ok(events) = fs::read_to_string(PathBuf::from(trace)) {
+                eprintln!("fake Hermes trace:\n{events}");
+            }
+        }
+        result
     }
 
     /// Limits for the controlled fixtures.
@@ -4529,7 +4550,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_prompt_evidence_requires_a_bare_prompt_after_the_interrupt() {
+    fn idle_prompt_evidence_requires_completion_and_a_bare_prompt_after_the_interrupt() {
         let interrupt = INTERRUPT_MARKER;
         let before = format!("{PROMPT_READY_MARKER} \r\nRunning sleep 30\r\n");
 
@@ -4540,9 +4561,13 @@ mod tests {
             "{acknowledged}\u{2695} {PROMPT_READY_MARKER} msg=interrupt \u{b7} Ctrl+C cancel\r\n"
         );
         assert!(!idle_prompt_matches(busy.as_bytes()));
-        let ready = format!("{acknowledged}{PROMPT_READY_MARKER} ");
+        let bare_before_completion = format!("{acknowledged}{PROMPT_READY_MARKER} ");
+        assert!(!idle_prompt_matches(bare_before_completion.as_bytes()));
+        let done = format!("{acknowledged}\u{23f2} \u{2502} {COMPLETION_MARKER} 0s\r\n");
+        assert!(!idle_prompt_matches(done.as_bytes()));
+        let ready = format!("{done}{PROMPT_READY_MARKER} ");
         assert!(idle_prompt_matches(ready.as_bytes()));
-        let repainted = format!("{busy}\r\n{PROMPT_READY_MARKER}\r\n");
+        let repainted = format!("{busy}\r\n{done}\r\n{PROMPT_READY_MARKER}\r\n");
         assert!(idle_prompt_matches(repainted.as_bytes()));
     }
 
@@ -4556,10 +4581,40 @@ mod tests {
         let repainted = format!(
             "{acknowledged}{PROMPT_READY_MARKER}\r\u{2695} {PROMPT_READY_MARKER} msg=interrupt \u{b7} /queue \u{b7} Ctrl+C cancel"
         );
-        let settled = format!("{repainted}\r\n\r\n{PROMPT_READY_MARKER} ");
+        let settled = format!(
+            "{repainted}\r\n\u{23f2} \u{2502} {COMPLETION_MARKER} 0s\r\n{PROMPT_READY_MARKER} "
+        );
 
         assert!(!idle_prompt_matches(repainted.as_bytes()));
         assert!(idle_prompt_matches(settled.as_bytes()));
+    }
+
+    #[test]
+    fn idle_prompt_evidence_ignores_a_transient_prompt_repainted_in_a_later_chunk() {
+        let mut screen = TerminalCapture::new();
+        let mut output = Vec::new();
+        let mut idle_after = |chunk: &str| {
+            output.extend_from_slice(chunk.as_bytes());
+            screen.feed_snapshot(&output);
+            super::has_idle_prompt_after_interrupt(
+                &raw_terminal_transcript(&output),
+                &screen.transcript(),
+            )
+        };
+
+        assert!(!idle_after(&format!(
+            "Running sleep 30\r\n^C\r\n{INTERRUPT_MARKER}...\r\n"
+        )));
+        // A bare prompt appears first and is repainted as the busy status in a
+        // separate chunk; neither state completes the interrupt.
+        assert!(!idle_after(PROMPT_READY_MARKER));
+        assert!(!idle_after(&format!(
+            "\r\u{2695} {PROMPT_READY_MARKER} msg=interrupt \u{b7} Ctrl+C cancel"
+        )));
+        assert!(!idle_after(&format!(
+            "\r\n\u{23f2} \u{2502} {COMPLETION_MARKER} 0s\r\n"
+        )));
+        assert!(idle_after(&format!("{PROMPT_READY_MARKER} ")));
     }
 
     #[test]
@@ -4658,6 +4713,9 @@ mod tests {
 
     #[cfg(unix)]
     const FAKE_HERMES_TEMPLATE: &str = r#"#!/bin/sh
+trace() {
+  printf '%s\n' "$*" >> "$0.trace"
+}
 user_turn() {
   echo '__SEPARATOR__'
   printf '__MARKER__ %s\n' "$1"
@@ -4755,32 +4813,36 @@ case "$*" in
     ;;
   'chat --tui')
     copilot_probe
-    trap 'exit 0' INT
-    printf '\033[?1049hHermes TUI\n'
-    while IFS= read -r _line; do :; done
+    "__PYTHON__" "${0%/*}/__FRONT__" "$0" tui
+    exit $?
     ;;
   chat\ --resume\ *)
     copilot_probe
-    trap 'printf "\nInterrupting agent...\n❯ "' INT
-    echo "↻ Resumed session $3"
-    printf '❯ '
+    "__PYTHON__" "${0%/*}/__FRONT__" "$0" resume "$3"
+    exit $?
+    ;;
+  __resume_loop\ *)
     while :; do
-      if ! IFS= read -r line; then continue; fi
+      if ! IFS= read -r line; then exit 0; fi
       case "$line" in
-        /exit*) echo "Session:        $3"; exit 0 ;;
+        /exit*) echo "Session:        $2"; exit 0 ;;
       esac
     done
     ;;
   chat)
     copilot_probe
-    trap 'printf "\nInterrupting agent...\n❯ "' INT
-    printf '❯ '
+    "__PYTHON__" "${0%/*}/__FRONT__" "$0" chat
+    exit $?
+    ;;
+  __chat_loop)
+    trace "chat-start"
     had_turn=0
     in_paste=0
     split_paste=0
     wrap_approval=0
     while :; do
-      if ! IFS= read -r line; then continue; fi
+      if ! IFS= read -r line; then trace "input-closed"; exit 0; fi
+      trace "read line=$line"
       case "$line" in
         *'Treat all three lines as one prompt.'*) in_paste=1; continue ;;
       esac
@@ -4845,6 +4907,7 @@ Reply with exactly HERMES_MULTILINE_OK.' text
           else
             echo 'Session:        20260804_120000_abcdef12'
           fi
+          trace "exit-requested"
           exit 0
           ;;
       esac
@@ -4852,6 +4915,119 @@ Reply with exactly HERMES_MULTILINE_OK.' text
     ;;
   *) exit 2 ;;
 esac
+"#;
+
+    /// File name of the terminal front end that sits next to the fake Hermes.
+    #[cfg(unix)]
+    const FAKE_FRONT_NAME: &str = "hermes-front.py";
+
+    /// Terminal front end of the fake Hermes chat.
+    ///
+    /// Like prompt-toolkit it puts the terminal in raw mode with signal keys
+    /// off, so Ctrl-C arrives as the byte `\x03` and never as SIGINT, and it
+    /// echoes the typed bytes itself. It hands complete lines to the shell loop
+    /// of the fake over a pipe and exits with that loop's status.
+    #[cfg(unix)]
+    const FAKE_FRONT_TEMPLATE: &str = r#"import os
+import select
+import subprocess
+import sys
+import termios
+import time
+
+hermes = sys.argv[1]
+mode = sys.argv[2]
+TRACE = hermes + ".trace"
+IN = 0
+OUT = 1
+
+
+def trace(event):
+    with open(TRACE, "a", encoding="utf-8") as log:
+        log.write(event + "\n")
+
+
+def say(text):
+    os.write(OUT, text.encode("utf-8"))
+
+
+def acknowledge_interrupt():
+    trace("key ^C")
+    say("\nInterrupting agent...\n")
+    # busy-window
+    say("  ⏲ │ ✓ 0s\n❯ ")
+
+
+def echo(byte):
+    if byte in (10, 13):
+        say("\n")
+    elif byte < 0x20 or byte == 0x7F:
+        say("^" + chr(byte ^ 0x40))
+    else:
+        os.write(OUT, bytes([byte]))
+
+
+saved = termios.tcgetattr(IN)
+raw = termios.tcgetattr(IN)
+raw[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR | termios.IXON)
+raw[3] &= ~(termios.ICANON | termios.ECHO | termios.ISIG | termios.IEXTEN)
+raw[6][termios.VMIN] = 1
+raw[6][termios.VTIME] = 0
+termios.tcsetattr(IN, termios.TCSANOW, raw)
+trace("front-start " + mode)
+
+TUI_INTERRUPT_STATUS = 0
+if mode == "tui":
+    # The alternate-screen app owns the terminal and leaves on Ctrl-C.
+    say("\033[?1049hHermes TUI\n")
+    while True:
+        data = os.read(IN, 4096)
+        if not data or 3 in data:
+            break
+    trace("key ^C")
+    termios.tcsetattr(IN, termios.TCSANOW, saved)
+    sys.exit(TUI_INTERRUPT_STATUS)
+
+if mode == "resume":
+    loop = [hermes, "__resume_loop", sys.argv[3]]
+    opening = "↻ Resumed session " + sys.argv[3] + "\n❯ "
+else:
+    loop = [hermes, "__chat_loop"]
+    opening = "❯ "
+child = subprocess.Popen(loop, stdin=subprocess.PIPE)
+line = bytearray()
+try:
+    say(opening)
+    while child.poll() is None:
+        ready, _, _ = select.select([IN], [], [], 0.02)
+        if not ready:
+            continue
+        data = os.read(IN, 4096)
+        if not data:
+            break
+        for byte in data:
+            if byte == 3:
+                line.clear()
+                acknowledge_interrupt()
+            elif byte in (10, 13):
+                echo(byte)
+                child.stdin.write(bytes(line) + b"\n")
+                child.stdin.flush()
+                line.clear()
+            else:
+                echo(byte)
+                line.append(byte)
+except BrokenPipeError:
+    pass
+finally:
+    termios.tcsetattr(IN, termios.TCSANOW, saved)
+    try:
+        child.stdin.close()
+    except BrokenPipeError:
+        pass
+code = child.wait()
+trace("front-exit " + str(code))
+sys.exit(code)
 "#;
 
     #[cfg(unix)]
@@ -4930,6 +5106,27 @@ print("plugin api skill pohunek:pohunek")
 PY
 "#;
 
+    /// Absolute path of the host `python3`.
+    ///
+    /// The TUI scenario runs with an empty `PATH`, so the fake cannot look the
+    /// interpreter up when it starts.
+    #[cfg(unix)]
+    fn python3_path() -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set for the tests"))
+            .map(|directory| directory.join("python3"))
+            .find(|candidate| candidate.is_file())
+            .expect("the fake Hermes front end needs python3 on PATH")
+    }
+
+    /// Shell lines that start the fake's terminal front end in `mode`.
+    #[cfg(unix)]
+    fn front_invocation(mode: &str) -> String {
+        format!(
+            "    \"{}\" \"${{0%/*}}/{FAKE_FRONT_NAME}\" \"$0\" {mode}\n    exit $?",
+            python3_path().display()
+        )
+    }
+
     #[cfg(unix)]
     fn fake_hermes(root: &Path, version: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4940,8 +5137,11 @@ PY
             .replace("__SEPARATOR__", super::USER_TURN_SEPARATOR)
             .replace("__MARKER__", super::USER_TURN_MARKER)
             .replace("__PANEL_TOP__", &super::assistant_panel_top())
-            .replace("__PANEL_BOTTOM__", &super::assistant_panel_bottom());
+            .replace("__PANEL_BOTTOM__", &super::assistant_panel_bottom())
+            .replace("__FRONT__", FAKE_FRONT_NAME)
+            .replace("__PYTHON__", &python3_path().to_string_lossy());
         fs::write(&path, script_content).expect("write fake Hermes");
+        fs::write(root.join(FAKE_FRONT_NAME), FAKE_FRONT_TEMPLATE).expect("write fake front end");
         let mut permissions = fs::metadata(&path).expect("fake metadata").permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&path, permissions).expect("make fake executable");
@@ -6083,14 +6283,10 @@ PY
         let binary = fake_hermes(repo.path(), "0.20.0");
         let pid_file = repo.path().join("held-pty-child.pid");
         let replacement = format!(
-            "  chat)\n    copilot_probe\n    /bin/sleep 30 &\n    echo $! > '{}'\n    trap",
+            "  chat)\n    copilot_probe\n    /bin/sleep 30 &\n    echo $! > '{}'\n",
             pid_file.display()
         );
-        rewrite_script(
-            &binary,
-            "  chat)\n    copilot_probe\n    trap",
-            &replacement,
-        );
+        rewrite_script(&binary, "  chat)\n    copilot_probe\n", &replacement);
 
         refresh_with(repo.path(), &binary, fast_limits())
             .expect("PTY refresh cleans up descendants after every scenario");
@@ -6108,10 +6304,10 @@ PY
     fn tui_unsupported_requires_recognized_local_diagnostic() {
         let repo = fixture_repo();
         let unavailable = fake_hermes(repo.path(), "0.20.0");
-        let tui_loop = "    trap 'exit 0' INT\n    printf '\\033[?1049hHermes TUI\\n'\n    while IFS= read -r _line; do :; done";
+        let tui_arm = front_invocation("tui");
         rewrite_script(
             &unavailable,
-            tui_loop,
+            &tui_arm,
             "    echo 'node not found \u{2014} install Node.js to use the TUI.'\n    exit 1",
         );
         let summary = refresh_with(repo.path(), &unavailable, fast_limits())
@@ -6122,7 +6318,7 @@ PY
         let crash = fake_hermes(crash_repo.path(), "0.20.0");
         rewrite_script(
             &crash,
-            tui_loop,
+            &tui_arm,
             "    echo 'authentication failed'\n    exit 1",
         );
         let error = refresh_with(crash_repo.path(), &crash, fast_limits())
@@ -6137,16 +6333,16 @@ PY
         let alt_crash_repo = fixture_repo();
         let alt_crash = fake_hermes(alt_crash_repo.path(), "0.20.0");
         rewrite_script(
-            &alt_crash,
-            tui_loop,
-            "    trap 'exit 2' INT\n    printf '\\033[?1049hHermes TUI\\n'\n    while IFS= read -r _line; do :; done",
+            &alt_crash_repo.path().join(FAKE_FRONT_NAME),
+            "TUI_INTERRUPT_STATUS = 0\n",
+            "TUI_INTERRUPT_STATUS = 2\n",
         );
         let error = refresh_with(alt_crash_repo.path(), &alt_crash, fast_limits())
             .expect_err("alternate-screen entry does not hide a subsequent crash");
         assert_eq!(
             error.to_string(),
             "Hermes alternate-screen TUI crashed after entering alternate-screen mode",
-            "the shell must exit by itself; a killed child bypasses the crash check"
+            "the TUI must exit by itself; a killed child bypasses the crash check"
         );
     }
 
@@ -6471,6 +6667,13 @@ PY
     #[cfg(unix)]
     fn split_command_line_fake_hermes(root: &Path) -> PathBuf {
         let binary = fake_hermes(root, "0.20.0");
+        // A front end that echoes the interrupt key inline, as a cooked
+        // terminal does, so an early Ctrl-C joins the unterminated line.
+        rewrite_script(
+            &root.join(FAKE_FRONT_NAME),
+            "    trace(\"key ^C\")\n",
+            "    trace(\"key ^C\")\n    say(\"^C\")\n",
+        );
         for command in ["sleep 8", "sleep 30"] {
             rewrite_script(
                 &binary,
@@ -6521,10 +6724,10 @@ PY
     fn busy_after_interrupt_fake_hermes(root: &Path) -> PathBuf {
         let binary = fake_hermes(root, "0.20.0");
         rewrite_script(
-            &binary,
-            "trap 'printf \"\\nInterrupting agent...\\n\u{276f} \"' INT",
+            &root.join(FAKE_FRONT_NAME),
+            "    # busy-window\n",
             &format!(
-                "trap 'printf \"\\nInterrupting agent...\\n\"; sleep {FIXTURE_STALL}; python3 -c \"import termios; termios.tcflush(0, termios.TCIFLUSH)\"; printf \"\u{276f} \"' INT"
+                "    time.sleep({FIXTURE_STALL})\n    termios.tcflush(IN, termios.TCIFLUSH)\n"
             ),
         );
         binary
