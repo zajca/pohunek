@@ -1759,7 +1759,8 @@ Public exports:
 - `OriginSource`: where a connection takes its request origin from.
   `Environment` (the default) reads `POHUNEK_SESSION_ID` and
   `POHUNEK_DAEMON_ID` from the calling process and rejects a partial or invalid
-  pair; `Omitted` sends no origin and never reads the environment.
+  pair; `Omitted` attaches no origin of the connection's own and never reads
+  the environment (a request built with an explicit origin keeps it).
   `DiscoveryOptions::with_origin_source` selects it for discovery probes.
 - `Subscription`: raw event-line stream after a successful `subscribe`.
 - `RawStream`: local Unix or remote TCP raw byte stream for attach.

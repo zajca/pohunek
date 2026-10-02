@@ -184,7 +184,10 @@ pub enum OriginSource {
     /// origin; exactly one present or an invalid value is an error.
     #[default]
     Environment,
-    /// Send no origin and never read the process environment.
+    /// Attach no origin of the connection's own and never read the process
+    /// environment. A request the caller built with an explicit origin
+    /// (`Request::with_origin`) keeps it, as with an environment that holds
+    /// neither variable.
     Omitted,
 }
 
@@ -1743,6 +1746,61 @@ mod tests {
             Some(&SessionId("s-origin".to_owned()))
         );
         assert_eq!(received.origin_daemon_id(), Some("daemon-origin"));
+    }
+
+    #[tokio::test]
+    async fn omitted_origin_source_keeps_an_explicit_request_origin() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fixture daemon");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            stream.read_line(&mut line).await.expect("read request");
+            let request: Request = serde_json::from_str(&line).expect("decode request");
+            let response = Response::ok(
+                request.version_range().maximum(),
+                request.id().to_owned(),
+                serde_json::json!({"healthy": true}),
+            )
+            .expect("response");
+            let mut encoded = serde_json::to_vec(&response).expect("encode response");
+            encoded.push(b'\n');
+            stream
+                .get_mut()
+                .write_all(&encoded)
+                .await
+                .expect("write response");
+            request
+        });
+
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
+        assert!(
+            client.origin.is_none(),
+            "Omitted attaches no origin of its own"
+        );
+        let request = Request::new("request-1", "daemon.health", Value::Null)
+            .expect("request")
+            .with_origin(
+                Some(SessionId("s-explicit".to_owned())),
+                Some("daemon-explicit".to_owned()),
+            )
+            .expect("explicit origin");
+        client.request(&request).await.expect("request succeeds");
+        let received = server.await.expect("fixture task");
+        assert_eq!(
+            received.origin_session_id(),
+            Some(&SessionId("s-explicit".to_owned()))
+        );
+        assert_eq!(received.origin_daemon_id(), Some("daemon-explicit"));
     }
 
     #[tokio::test]
