@@ -5764,9 +5764,10 @@ PY
         // hermetic-allowed: #334 the selection under test refuses Git-marked ancestors, so the fixture needs a parent that is outside `/tmp`
         let parent = fs::canonicalize("/var/tmp").expect("canonicalize /var/tmp");
         // hermetic-allowed: #334 same fixed parent as above
-        tempfile::Builder::new()
-            .tempdir_in(parent)
-            .expect("create short fixture root")
+        let builder = tempfile::Builder::new();
+        // hermetic-allowed: #334 same fixed parent as above
+        let created = builder.tempdir_in(parent);
+        created.expect("create short fixture root")
     }
 
     /// A directory whose canonical path is longer than any platform budget
