@@ -1,8 +1,8 @@
 import { BackendConfigError, ENV_XDG_RUNTIME_DIR, loadBackendConfig, type BackendConfig } from "./config";
 import { RuntimePathError, verifyDaemonRuntime } from "./runtime-paths";
 import { BackendStartupError, startHostsPipeline, type HostsPipelineHandle } from "./hosts";
-import { errorClass, stdoutLogger, type BackendLogger } from "./log";
-import { rotatingFileLogger } from "./log-files";
+import { errorClass, stdoutLogger, type BackendLogEvent, type BackendLogger } from "./log";
+import { LogFileError, rotatingFileLogger } from "./log-files";
 import { startBackendServer, type BackendServerHandle } from "./server";
 
 export interface BackendHandle {
@@ -93,8 +93,9 @@ function verifyDerivedRuntime(config: BackendConfig): void {
  * Starts the backend from its environment. Without an explicit logger the
  * destination follows the configuration: a rotating owner-private file family
  * when `POHUNEK_BACKEND_LOG_DIR` is set (launchd keeps no journal), else
- * standard output. A file logger created here is closed with the backend, and
- * on a failed start.
+ * standard output. A file logger created here is closed with the backend; a
+ * failed start is recorded in it before it is closed, since launchd discards
+ * standard output.
  */
 export async function startBackendFromEnv(
   env: NodeJS.ProcessEnv = process.env,
@@ -120,24 +121,31 @@ export async function startBackendFromEnv(
       },
     };
   } catch (error: unknown) {
-    owned?.close();
+    if (owned !== undefined) {
+      owned.log(startupFailedEvent(error));
+      owned.close();
+    }
     throw error;
   }
+}
+
+function startupFailedEvent(error: unknown): BackendLogEvent {
+  return {
+    level: "error",
+    event: "backend_startup",
+    lifecycle: "failed",
+    status: "failed",
+    error_class: errorClass(error),
+  };
 }
 
 export function runBackend(): void {
   void Promise.resolve()
     .then((): Promise<BackendHandle> => startBackendFromEnv())
     .catch((error: unknown): void => {
-      stdoutLogger.log({
-        level: "error",
-        event: "backend_startup",
-        lifecycle: "failed",
-        status: "failed",
-        error_class: errorClass(error),
-      });
+      stdoutLogger.log(startupFailedEvent(error));
       console.error(
-        error instanceof BackendStartupError || error instanceof BackendConfigError
+        error instanceof BackendStartupError || error instanceof BackendConfigError || error instanceof LogFileError
           ? error.message
           : `Cannot start @pohunek/backend (${errorClass(error)}). Check the backend configuration.`,
       );

@@ -160,7 +160,8 @@ directory, `0600` file) rotating family `pohunek-backend.jsonl[.N]` instead.
 `POHUNEK_BACKEND_LOG_MAX_FILE_BYTES` (default 32 MiB) and
 `POHUNEK_BACKEND_LOG_MAX_FILES` (default 8, including the active file) bound it
 like the daemon's own log family; the two limits are rejected without a log
-directory. A symlinked directory or active file, a non-regular file such as a
+directory, and a file limit too small to hold the fixed oversize notice stops
+startup. A symlinked directory or active file, a non-regular file such as a
 FIFO in any log slot, a directory open to group or others, or a foreign owner
 stops startup; a symlink in a rotated slot is removed without being followed.
 Files left by an earlier run are brought inside
@@ -169,8 +170,10 @@ emptied) and loose modes are forced to `0600`. An event larger than one file is
 replaced by a fixed notice, so total disk use stays within the product of the two
 limits. A failing write or rotation (a full disk, an I/O error) never fails a
 request: the event goes to standard output, one `log_file_failed` event reports
-it, and the next event tries the files again. The backend closes the files with
-its own shutdown.
+it, and the next event tries the files again. A partly written line is cut back
+off; if that fails, the next event starts a fresh active file. A failed start is
+recorded in the files as `backend_startup` `failed` before they are closed. The
+backend closes the files with its own shutdown.
 
 The backend runs natively on Apple Silicon, both from the Bun workspace and as
 the compiled release executable. `bun run dev` locates Node itself: it uses

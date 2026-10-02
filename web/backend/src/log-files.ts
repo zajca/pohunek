@@ -44,23 +44,49 @@ export class LogFileError extends Error {
   public override readonly name = "LogFileError";
 }
 
+/** File operations the logger writes through; tests substitute failing ones. */
+export interface LogFileIo {
+  write(descriptor: number, bytes: Buffer, offset: number): number;
+  truncate(descriptor: number, length: number): void;
+}
+
+const NODE_LOG_FILE_IO: LogFileIo = {
+  write: (descriptor, bytes, offset) => writeSync(descriptor, bytes, offset),
+  truncate: (descriptor, length) => ftruncateSync(descriptor, length),
+};
+
+const DROPPED_NOTICE: BackendLogEvent = { level: "warn", event: "log_event_dropped", status: "oversize" };
+const ROTATED_SUFFIX = /^[1-9][0-9]*$/;
+
 /**
  * Appends one JSON object per line to a size-bounded, owner-private file family.
  *
  * Total disk use stays within `maxFileBytes * maxFiles`: files left by an
  * earlier run above the bound are removed (the active one is emptied) when the
  * logger opens. A single event larger than `maxFileBytes` is replaced by a
- * fixed notice. Writes are synchronous so ordering matches the event order.
+ * fixed notice, so a limit below the notice size is refused. Writes are
+ * synchronous so ordering matches the event order.
  *
  * A failing write or rotation (full disk, I/O error) never reaches the caller:
  * the event goes to the fallback logger, one `log_file_failed` event reports the
- * failure, and the next event tries the files again.
+ * failure, and the next event tries the files again. A partly written line is
+ * truncated away; when that fails too, the next event starts a new active file
+ * so no event is appended to a torn line.
  */
 export function rotatingFileLogger(options: RotatingLogOptions): ClosableBackendLogger {
+  return createRotatingFileLogger(options, NODE_LOG_FILE_IO);
+}
+
+/** {@link rotatingFileLogger} over explicit file operations. */
+export function createRotatingFileLogger(options: RotatingLogOptions, io: LogFileIo): ClosableBackendLogger {
   const { dir, maxFileBytes, maxFiles } = options;
   const fallback = options.fallback ?? stdoutLogger;
   if (!Number.isInteger(maxFileBytes) || maxFileBytes <= 0 || !Number.isInteger(maxFiles) || maxFiles <= 0) {
     throw new LogFileError("log limits must be positive integers");
+  }
+  const noticeBytes = encodeLine(DROPPED_NOTICE).byteLength;
+  if (maxFileBytes < noticeBytes) {
+    throw new LogFileError(`log file limit must be at least ${String(noticeBytes)} bytes`);
   }
   prepareDirectory(dir);
   const active = join(dir, LOG_FILE_NAME);
@@ -69,6 +95,15 @@ export function rotatingFileLogger(options: RotatingLogOptions): ClosableBackend
   let size = fstatSync(descriptor).size;
   let closed = false;
   let failing = false;
+  let torn = false;
+
+  // Forgets the descriptor before closing it, so a failing close never leaves
+  // a stale number behind for the next write.
+  const releaseDescriptor = (): void => {
+    const previous = descriptor;
+    descriptor = NO_DESCRIPTOR;
+    closeSync(previous);
+  };
 
   const ensureOpen = (): void => {
     if (descriptor === NO_DESCRIPTOR) {
@@ -77,36 +112,58 @@ export function rotatingFileLogger(options: RotatingLogOptions): ClosableBackend
     }
   };
 
+  // Shifts only the rotated files that exist, so the work is bounded by the
+  // directory contents rather than by `maxFiles`.
   const rotate = (): void => {
-    closeSync(descriptor);
-    descriptor = NO_DESCRIPTOR;
-    if (maxFiles > 1) {
-      removeIfPresent(rotatedName(dir, maxFiles - 1));
-      for (let index = maxFiles - 2; index >= 1; index -= 1) {
-        renameIfPresent(rotatedName(dir, index), rotatedName(dir, index + 1));
+    releaseDescriptor();
+    for (const file of rotatedFiles(dir).sort((left, right) => right.index - left.index)) {
+      if (file.index + 1 >= maxFiles) {
+        removeIfPresent(file.path);
+      } else {
+        renameIfPresent(file.path, rotatedName(dir, file.index + 1));
       }
+    }
+    if (maxFiles > 1) {
       renameSync(active, rotatedName(dir, 1));
     } else {
       removeIfPresent(active);
     }
     descriptor = openActive(active, maxFileBytes);
     size = 0;
+    torn = false;
+  };
+
+  const write = (line: Buffer): void => {
+    const before = size;
+    try {
+      writeAll(io, descriptor, line);
+    } catch (error: unknown) {
+      try {
+        io.truncate(descriptor, before);
+      } catch {
+        // The original write error is the one reported; the torn line is
+        // left behind in a rotated file instead of being appended to.
+        torn = true;
+        releaseDescriptor();
+      }
+      throw error;
+    }
+    size += line.byteLength;
   };
 
   const append = (event: BackendLogEvent): void => {
     let line = encodeLine(event);
     if (line.byteLength > maxFileBytes) {
-      line = encodeLine({ level: "warn", event: "log_event_dropped", status: "oversize" });
+      line = encodeLine(DROPPED_NOTICE);
       if (line.byteLength > maxFileBytes) {
-        return;
+        throw new LogFileError("log file limit is below the dropped-event notice");
       }
     }
     ensureOpen();
-    if (size > 0 && size + line.byteLength > maxFileBytes) {
+    if (torn || (size > 0 && size + line.byteLength > maxFileBytes)) {
       rotate();
     }
-    writeAll(descriptor, line);
-    size += line.byteLength;
+    write(line);
   };
 
   return {
@@ -137,8 +194,7 @@ export function rotatingFileLogger(options: RotatingLogOptions): ClosableBackend
       }
       closed = true;
       if (descriptor !== NO_DESCRIPTOR) {
-        closeSync(descriptor);
-        descriptor = NO_DESCRIPTOR;
+        releaseDescriptor();
       }
     },
   };
@@ -154,10 +210,10 @@ function encodeLine(event: BackendLogEvent): Buffer {
   );
 }
 
-function writeAll(descriptor: number, bytes: Buffer): void {
+function writeAll(io: LogFileIo, descriptor: number, bytes: Buffer): void {
   let offset = 0;
   while (offset < bytes.byteLength) {
-    offset += writeSync(descriptor, bytes, offset);
+    offset += io.write(descriptor, bytes, offset);
   }
 }
 
@@ -220,14 +276,8 @@ function openActive(path: string, maxFileBytes: number): number {
  * checked for ownership and forced to mode 0600.
  */
 function sanitizeRotated(dir: string, maxFiles: number, maxFileBytes: number): void {
-  const prefix = `${LOG_FILE_NAME}.`;
-  for (const name of readdirSync(dir)) {
-    const suffix = name.startsWith(prefix) ? name.slice(prefix.length) : "";
-    if (!/^[1-9][0-9]*$/.test(suffix)) {
-      continue;
-    }
-    const path = join(dir, name);
-    if (Number(suffix) >= maxFiles) {
+  for (const { index, path } of rotatedFiles(dir)) {
+    if (index >= maxFiles) {
       removeIfPresent(path);
       continue;
     }
@@ -261,6 +311,25 @@ function sanitizeRotated(dir: string, maxFiles: number, maxFileBytes: number): v
       closeSync(descriptor);
     }
   }
+}
+
+interface RotatedFile {
+  readonly index: number;
+  /** Path as listed, since a huge suffix does not survive `Number` round trips. */
+  readonly path: string;
+}
+
+/** Rotated files present in `dir`, in directory order. */
+function rotatedFiles(dir: string): RotatedFile[] {
+  const prefix = `${LOG_FILE_NAME}.`;
+  const files: RotatedFile[] = [];
+  for (const name of readdirSync(dir)) {
+    const suffix = name.startsWith(prefix) ? name.slice(prefix.length) : "";
+    if (ROTATED_SUFFIX.test(suffix)) {
+      files.push({ index: Number(suffix), path: join(dir, name) });
+    }
+  }
+  return files;
 }
 
 function removeIfPresent(path: string): void {

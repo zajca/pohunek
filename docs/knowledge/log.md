@@ -3,7 +3,8 @@
 ## Unreleased (2026-09-29)
 
 - Documented the owner backend's optional rotating owner-private log files
-  (`POHUNEK_BACKEND_LOG_DIR` and its limits, failure fallback, repair at open).
+  (`POHUNEK_BACKEND_LOG_DIR` and its limits, failure fallback, torn-line
+  recovery, repair at open, startup failures recorded in the files).
 - Documented that the Bun owner backend resolves the daemon socket with the shared
   runtime-path contract (including the macOS default and the native socket path
   limit) and Node discovery for the dev stack.
