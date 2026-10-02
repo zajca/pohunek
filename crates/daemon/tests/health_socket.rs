@@ -2959,9 +2959,12 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
 
     let first = attach_session(&mut control, &created.id).await;
     let second = attach_session(&mut control, &created.id).await;
+    // Each stream is served by its own task, so the two opened events can
+    // arrive in either order; the wait skips other events, so each stream is
+    // confirmed open before the next one is opened.
     let mut raw_one = open_attach_stream(&socket, &first.stream_id).await;
-    let mut raw_two = open_attach_stream(&socket, &second.stream_id).await;
     wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &first.stream_id).await;
+    let mut raw_two = open_attach_stream(&socket, &second.stream_id).await;
     wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &second.stream_id).await;
 
     raw_one
