@@ -1164,7 +1164,7 @@ mod tests {
 
     /// Spawns a shell that stays alive until it is killed.
     fn spawn_idle_shell() -> Fixture {
-        spawn_shell("trap '' TERM; while :; do sleep 1; done", &[], None)
+        spawn_shell("trap '' TERM; while :; do /bin/sleep 1; done", &[], None)
     }
 
     /// Spawns `/bin/sh` with an explicit script, environment, and directory.
@@ -1440,7 +1440,7 @@ mod tests {
     #[test]
     fn descendants_follow_a_spawned_subtree() {
         let inspector = DarwinInspector::new();
-        let fixture = spawn_shell("sleep 60 & wait", &[], None);
+        let fixture = spawn_shell("/bin/sleep 60 & wait", &[], None);
         let root = live_identity(inspector, fixture.pid());
 
         let descendant = wait_for("the fixture to create its descendant", || {
@@ -1533,7 +1533,7 @@ mod tests {
             .canonicalize()
             .expect("canonicalize the working directory");
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done",
+            "trap '' TERM; while :; do /bin/sleep 1; done",
             &[],
             Some(&expected),
         );
@@ -1577,7 +1577,7 @@ mod tests {
         )));
         std::fs::create_dir(&expected).expect("create a multi-byte directory");
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done",
+            "trap '' TERM; while :; do /bin/sleep 1; done",
             &[],
             Some(&expected),
         );
@@ -1634,7 +1634,7 @@ mod tests {
     fn ownership_markers_describe_each_process_environment() {
         let inspector = DarwinInspector::new();
         let outer = spawn_shell(
-            "POHUNEK_SESSION_ID=inner-session /bin/sh -c 'trap \"\" TERM; while :; do sleep 1; done' & wait",
+            "POHUNEK_SESSION_ID=inner-session /bin/sh -c 'trap \"\" TERM; while :; do /bin/sleep 1; done' & wait",
             &[("POHUNEK_SESSION_ID", "outer-session"), ("POHUNEK_DAEMON_ID", "outer-daemon")],
             None,
         );
@@ -1673,7 +1673,7 @@ mod tests {
     fn an_argument_that_looks_like_a_marker_is_not_a_marker() {
         let inspector = DarwinInspector::new();
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done # POHUNEK_SESSION_ID=argv-only",
+            "trap '' TERM; while :; do /bin/sleep 1; done # POHUNEK_SESSION_ID=argv-only",
             &[],
             None,
         );
@@ -1700,7 +1700,7 @@ mod tests {
     fn no_secret_environment_value_reaches_facts_or_errors() {
         let inspector = DarwinInspector::new();
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done",
+            "trap '' TERM; while :; do /bin/sleep 1; done",
             &[("POHUNEK_TEST_SECRET", SECRET_SENTINEL)],
             None,
         );
@@ -1745,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn exit_watch_completes_after_the_process_exits() {
         let inspector = DarwinInspector::new();
-        let mut fixture = spawn_shell("sleep 60", &[], None);
+        let mut fixture = spawn_shell("/bin/sleep 60", &[], None);
         let identity = live_identity(inspector, fixture.pid());
 
         let watch = inspector.exit_watch(identity).expect("arm the exit watch");
@@ -1758,7 +1758,7 @@ mod tests {
     #[tokio::test]
     async fn every_watch_on_one_identity_completes_once_it_exits() {
         let inspector = DarwinInspector::new();
-        let mut fixture = spawn_shell("sleep 60", &[], None);
+        let mut fixture = spawn_shell("/bin/sleep 60", &[], None);
         let identity = live_identity(inspector, fixture.pid());
 
         let first = inspector.exit_watch(identity).expect("arm the first watch");
@@ -1841,7 +1841,7 @@ mod tests {
     #[tokio::test]
     async fn many_idle_watches_stay_pending_and_then_all_complete() {
         let inspector = DarwinInspector::new();
-        let mut fixture = spawn_shell("sleep 60", &[], None);
+        let mut fixture = spawn_shell("/bin/sleep 60", &[], None);
         let identity = live_identity(inspector, fixture.pid());
 
         let mut watches = Vec::with_capacity(IDLE_WATCH_COUNT);
@@ -1937,7 +1937,7 @@ mod tests {
             "an idle job-control shell owns its own terminal"
         );
 
-        std::io::Write::write_all(&mut writer, b"sleep 60 &\nsleep 60\n")
+        std::io::Write::write_all(&mut writer, b"/bin/sleep 60 &\n/bin/sleep 60\n")
             .expect("start a background and a foreground job");
         std::io::Write::flush(&mut writer).expect("flush the terminal writer");
 

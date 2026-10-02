@@ -664,9 +664,9 @@ mod host {
     const READY_POLL: Duration = Duration::from_millis(10);
 
     /// Ignores hangup and termination, like an agent that outlives its PTY.
-    const STUBBORN: &str = "trap '' HUP TERM; exec sleep 300";
+    const STUBBORN: &str = "trap '' HUP TERM; exec /bin/sleep 300";
     /// Exits on the default `SIGTERM` disposition.
-    const COMPLIANT: &str = "exec sleep 300";
+    const COMPLIANT: &str = "exec /bin/sleep 300";
 
     /// Spawned fixture that is killed and reaped when dropped.
     #[derive(Debug)]
