@@ -2261,17 +2261,16 @@ fn terminal_size(fd: RawFd) -> Option<(u16, u16)> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use pohunek_test_support::env::TestEnv;
     use protocol::Response;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream};
     use tokio::net::{UnixListener, UnixStream};
 
     use super::*;
-
-    static NEXT_BANNER_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug)]
     struct BannerConnectionControl {
@@ -2285,18 +2284,13 @@ mod tests {
         controls: mpsc::UnboundedReceiver<BannerConnectionControl>,
         active: Arc<AtomicUsize>,
         task: JoinHandle<()>,
-        socket: PathBuf,
+        _env: TestEnv,
     }
 
+    /// Keeps the private test root, and the socket inside it, alive.
     #[derive(Debug)]
     struct StdinTestSocket {
-        path: PathBuf,
-    }
-
-    impl Drop for StdinTestSocket {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        _env: TestEnv,
     }
 
     #[derive(Debug)]
@@ -2350,20 +2344,14 @@ mod tests {
     }
 
     async fn connect_stdin_test_client() -> (Client, UnixStream, Paths, StdinTestSocket) {
-        let path = test_socket_path("pohunek-cli-stdin");
-        let _ = std::fs::remove_file(&path);
+        let (env, path) = test_socket();
         let listener = UnixListener::bind(&path).expect("bind stdin test daemon");
-        let paths = banner_test_paths(path.clone());
+        let paths = banner_test_paths(path);
         let client = Client::connect("local", &paths)
             .await
             .expect("connect stdin test client");
         let (server, _) = listener.accept().await.expect("accept stdin test client");
-        (
-            client,
-            server,
-            paths,
-            StdinTestSocket { path: path.clone() },
-        )
+        (client, server, paths, StdinTestSocket { _env: env })
     }
 
     #[tokio::test]
@@ -2564,12 +2552,6 @@ mod tests {
         assert_eq!(enter_effects, vec![MenuEffect::RunRename("a".to_owned())]);
     }
 
-    impl Drop for BannerTestDaemon {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.socket);
-        }
-    }
-
     fn banner_test_paths(socket: PathBuf) -> Paths {
         let root = socket
             .parent()
@@ -2588,8 +2570,7 @@ mod tests {
     }
 
     fn spawn_banner_test_daemon(connection_count: usize) -> BannerTestDaemon {
-        let socket = test_socket_path("pohunek-cli-banner");
-        let _ = std::fs::remove_file(&socket);
+        let (env, socket) = test_socket();
         let listener = UnixListener::bind(&socket).expect("bind banner test daemon");
         let (controls_tx, controls) = mpsc::unbounded_channel();
         let active = Arc::new(AtomicUsize::new(0));
@@ -2615,15 +2596,18 @@ mod tests {
             controls,
             active,
             task,
-            socket,
+            _env: env,
         }
     }
 
-    fn test_socket_path(prefix: &str) -> PathBuf {
-        let id = NEXT_BANNER_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir()
-            .join(format!("{prefix}-{}-{id}.sock", std::process::id()))
-            .with_extension("sock")
+    /// A private test root and a socket path inside it that fits the `sun_path`
+    /// limit; the root is removed with its socket when the value drops.
+    fn test_socket() -> (TestEnv, PathBuf) {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let path = env
+            .socket_path("banner.sock")
+            .expect("socket path fits the sun_path limit");
+        (env, path)
     }
 
     async fn handle_banner_test_connection(
@@ -2897,12 +2881,8 @@ mod tests {
 
     #[test]
     fn attach_config_reads_reconnect_values() {
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-attach-banner-config-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create config dir");
+        let guard = pohunek_test_support::tempdir().expect("create config dir");
+        let root = guard.path().to_path_buf();
         std::fs::write(
             root.join("launcher.conf"),
             "attach_reconnect_seconds=12\n\
@@ -2923,12 +2903,8 @@ mod tests {
 
     #[test]
     fn attach_config_rejects_zero_reconnect_attempts() {
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-attach-reconnect-attempts-config-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create config dir");
+        let guard = pohunek_test_support::tempdir().expect("create config dir");
+        let root = guard.path().to_path_buf();
         std::fs::write(
             root.join("launcher.conf"),
             "attach_reconnect_max_attempts=0\n",

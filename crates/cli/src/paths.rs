@@ -164,12 +164,12 @@ mod tests {
         }
     }
 
-    /// Returns a short base below `/tmp` that is only resolved, never created.
+    /// Returns a short base that is only resolved, never created or read.
     ///
-    /// The macOS per-user temporary directory is long enough to push the
-    /// derived daemon socket past the 103-byte `sun_path` limit.
+    /// It stays short so the derived daemon socket path fits the 103-byte
+    /// `sun_path` limit of macOS.
     fn tmp_base(tag: &str) -> PathBuf {
-        Path::new("/tmp").join(format!("pohunek-cli-paths-{tag}-{}", std::process::id()))
+        Path::new("/work").join(format!("pohunek-cli-paths-{tag}-{}", std::process::id()))
     }
 
     fn set_all_present(base: &Path) {

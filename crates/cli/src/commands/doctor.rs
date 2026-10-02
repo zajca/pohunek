@@ -394,17 +394,14 @@ fn print_human(report: &Report) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU32, Ordering};
-
     use super::*;
 
-    /// Per-test unique temp dir, namespaced by pid + a monotonic counter so
-    /// parallel tests never collide.
-    fn unique_temp_dir() -> PathBuf {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id();
-        std::env::temp_dir().join(format!("pohunek-doctor-test-{pid}-{n}"))
+    /// A private fixture directory guard and a not-yet-created child path of
+    /// it; the guard removes the directory when it drops, also when a test fails.
+    fn unique_temp_dir() -> (tempfile::TempDir, PathBuf) {
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let base = guard.path().join("base");
+        (guard, base)
     }
 
     /// Build a `Paths` rooted at `base` (same-crate `pub(crate)` fields).
@@ -427,15 +424,13 @@ mod tests {
     /// error.
     #[tokio::test]
     async fn run_assembles_report_without_error() {
-        let base = unique_temp_dir();
+        let (_guard, base) = unique_temp_dir();
         let paths = paths_at(&base);
 
         let healthy = run(&paths, true).await.expect("doctor run resolves");
         // We assert only that the run completed and produced a boolean verdict;
         // the exact value depends on which binaries exist on the test host.
         let _ = healthy;
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     fn job(state: &'static str) -> crate::service::report::JobReport {
@@ -558,13 +553,12 @@ mod tests {
 
     #[test]
     fn the_supervision_mode_needs_an_installed_service_config() {
-        let base = unique_temp_dir();
+        let (_guard, base) = unique_temp_dir();
         std::fs::create_dir_all(&base).expect("create config dir");
 
         assert_eq!(supervision_mode(&base), Supervision::Unknown);
         std::fs::write(base.join("service.toml"), "x").expect("write service.toml");
         assert_eq!(supervision_mode(&base), Supervision::Native);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -604,7 +598,7 @@ mod tests {
 
     #[test]
     fn worker_candidate_without_service_config_prefers_the_override_then_the_sibling() {
-        let base = unique_temp_dir();
+        let (_guard, base) = unique_temp_dir();
         std::fs::create_dir_all(&base).expect("create config dir");
         let exe_dir = Path::new("/opt/pohunek/bin");
 
@@ -619,13 +613,11 @@ mod tests {
         let sibling = worker_candidate_from(&base, None, Some(exe_dir)).expect("sibling candidate");
         assert_eq!(sibling.source, hostcheck::WorkerSource::Sibling);
         assert_eq!(sibling.path, exe_dir.join("pohunek-sessiond"));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn worker_candidate_ignores_an_unloadable_service_config() {
-        let base = unique_temp_dir();
+        let (_guard, base) = unique_temp_dir();
         std::fs::create_dir_all(&base).expect("create config dir");
         std::fs::write(base.join("service.toml"), "not = [valid").expect("write service.toml");
 
@@ -633,7 +625,6 @@ mod tests {
             .expect("falls back to the sibling");
 
         assert_eq!(candidate.source, hostcheck::WorkerSource::Sibling);
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -725,7 +716,7 @@ mod tests {
         );
 
         assert!(working_directory_check(Platform::Linux, &error).is_none());
-        let ok: std::io::Result<PathBuf> = Ok(PathBuf::from("/tmp"));
+        let ok: std::io::Result<PathBuf> = Ok(PathBuf::from("/work"));
         assert!(working_directory_check(Platform::MacOs, &ok).is_none());
     }
 

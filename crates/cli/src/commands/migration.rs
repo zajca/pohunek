@@ -204,10 +204,8 @@ mod tests {
 
     #[test]
     fn empty_store_fingerprint_is_stable() {
-        let path = std::env::temp_dir().join(format!(
-            "pohunek-missing-migration-store-{}",
-            std::process::id()
-        ));
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let path = guard.path().join("missing-migration-store");
         assert_eq!(
             fingerprint(&path).expect("fingerprint"),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -260,11 +258,8 @@ mod tests {
 
     #[test]
     fn manifest_write_is_owner_private_and_replaces_atomically() {
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-migration-manifest-{}-{}",
-            std::process::id(),
-            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let root = guard.path().join("manifest");
         let path = root.join("migration.json");
         let manifest = MigrationManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
@@ -291,7 +286,6 @@ mod tests {
                 .all(|entry| entry.expect("entry").path() == path),
             "atomic temporary file must not remain"
         );
-        fs::remove_dir_all(root).expect("remove fixture");
     }
 
     fn session(id: &str, state: SessionState) -> SessionInfo {
