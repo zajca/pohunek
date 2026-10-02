@@ -1740,9 +1740,7 @@ fn terminate_process_group(child: &mut Child) {
 /// Returns the not-found-or-untrusted message of `trusted_program`, prefixed
 /// like a failed spawn.
 pub(crate) fn git_command(repo: &Path) -> Result<Command, String> {
-    let program =
-        crate::agent::trusted_program("git").map_err(|err| format!("failed to run git: {err}"))?;
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::git::command()?;
     cmd.arg("-C").arg(repo);
     Ok(cmd)
 }
@@ -1936,3 +1934,6 @@ fn store_error(what: &str, err: &io::Error) -> ProtocolError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod git_env_tests;
