@@ -2791,9 +2791,14 @@ mod tests {
         (authority, directory)
     }
 
+    /// The statement `cleanup` sends to drop `schema`.
+    fn drop_schema_statement(schema: &str) -> String {
+        format!("DROP SCHEMA {schema} CASCADE")
+    }
+
     async fn cleanup(store: &Store, schema: &str) {
         test_lease::stop_renewals(schema).await;
-        sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        sqlx::query(AssertSqlSafe(drop_schema_statement(schema)))
             .execute(store.pool())
             .await
             .expect("drop schema");
@@ -2960,14 +2965,20 @@ mod tests {
         pohunek_test_support::wait::guard("schema cleanup", cleanup(&store, &schema)).await;
     }
 
-    /// Waits until a `DROP SCHEMA` is queued on a lock and returns the backends it waits for.
-    async fn wait_for_blocked_schema_drop(store: &Store) -> Vec<i32> {
+    /// Waits until the drop of `schema` is queued on a lock and returns the backends it waits for.
+    ///
+    /// Matches the exact statement `cleanup` sends for `schema`, whose name is
+    /// unique per fixture, so schema drops of fixtures running in parallel on the
+    /// same server never contribute a blocker.
+    async fn wait_for_blocked_schema_drop(store: &Store, schema: &str) -> Vec<i32> {
+        let statement = drop_schema_statement(schema);
         pohunek_test_support::wait::wait_until("the schema drop to queue on a lock", || async {
             let blockers: Option<Vec<i32>> = sqlx::query_scalar(
                 "SELECT array_agg(DISTINCT blocker ORDER BY blocker) FROM pg_stat_activity a, \
                  unnest(pg_blocking_pids(a.pid)) AS blocker \
-                 WHERE a.query LIKE 'DROP SCHEMA%' AND a.wait_event_type = 'Lock'",
+                 WHERE a.query = $1 AND a.wait_event_type = 'Lock'",
             )
+            .bind(&statement)
             .fetch_one(store.pool())
             .await
             .expect("read the sessions the schema drop waits for");
@@ -3007,7 +3018,7 @@ mod tests {
             async move { cleanup(&store, &schema).await }
         });
         assert_eq!(
-            wait_for_blocked_schema_drop(&store).await,
+            wait_for_blocked_schema_drop(&store, &schema).await,
             vec![holder],
             "only the lock holder keeps the schema drop waiting"
         );
