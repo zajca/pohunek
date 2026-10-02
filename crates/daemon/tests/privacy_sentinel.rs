@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +50,9 @@ use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_paths::WORKER_SOCKET_NAME;
 use pohunek_test_support::worker_binary;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Sessions use the production stop grace, `SessionRegistryConfig::default()`:
+// a shorter grace reaches the forced-stop path on a loaded host, and no test
+// here is about the grace.
 
 struct Request;
 
@@ -61,21 +62,11 @@ impl Request {
     }
 }
 
-/// A unique temp directory for one test, so parallel `#[tokio::test]` runs
-/// (and repeated runs of this file) never collide on disk.
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = pohunek_test_support::temp_root().join(format!(
-        "pohunek-test-{tag}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create test dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .expect("make test directory private");
-    dir
+/// A private directory for one test, removed with its contents when the
+/// returned guard drops, so parallel `#[tokio::test]` runs never collide.
+fn temp_dir(tag: &str) -> tempfile::TempDir {
+    pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
+        .expect("create the test directory")
 }
 
 async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
@@ -275,16 +266,18 @@ async fn spawn_worker_backed_server(
     socket: &Path,
     version: &str,
     mut config: SessionRegistryConfig,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>, PathBuf) {
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    tempfile::TempDir,
+) {
     let event_log_dir = config.event_log_dir.clone();
     // Short prefix: the worker's own control socket nests several directories
     // below this home (`<runtime_home>/pohunek/workers/<session>/control.sock`),
     // and `AF_UNIX` paths are capped at ~108 bytes.
-    let worker_home = pohunek_test_support::temp_root().join(format!(
-        "pw-h-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let worker_home_dir =
+        pohunek_test_support::tempdir_with_prefix("pw-h-").expect("create the worker home");
+    let worker_home = worker_home_dir.path().to_path_buf();
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: worker_home.join("runtime"),
         state_home: worker_home.join("state"),
@@ -329,14 +322,15 @@ async fn spawn_worker_backed_server(
             })
             .await;
     });
-    (tx, handle, worker_home)
+    (tx, handle, worker_home_dir)
 }
 
 #[tokio::test]
 async fn host_governance_inspect_never_exposes_private_governance_coordinates() {
-    let socket = temp_dir("governance-privacy-sentinel").join("daemon.sock");
+    let socket_dir = temp_dir("governance-privacy-sentinel");
+    let socket = socket_dir.path().join("daemon.sock");
     let (shutdown, handle, _worker_home) =
-        spawn_worker_backed_server(&socket, "0.0.0", SessionRegistryConfig::default()).await;
+        spawn_worker_backed_server(&socket, "0.0.0", support::hermetic_registry_config()).await;
     let mut client = connect(&socket).await;
     let request = Request::make(
         "governance-privacy-sentinel",
@@ -352,9 +346,10 @@ async fn host_governance_inspect_never_exposes_private_governance_coordinates() 
 
 #[tokio::test]
 async fn daemon_doctor_governance_checks_remain_structurally_redacted() {
-    let socket = temp_dir("daemon-doctor-privacy-sentinel").join("daemon.sock");
+    let socket_dir = temp_dir("daemon-doctor-privacy-sentinel");
+    let socket = socket_dir.path().join("daemon.sock");
     let (shutdown, handle, _worker_home) =
-        spawn_worker_backed_server(&socket, "0.0.0", SessionRegistryConfig::default()).await;
+        spawn_worker_backed_server(&socket, "0.0.0", support::hermetic_registry_config()).await;
     let mut client = connect(&socket).await;
     let request = Request::make(
         "daemon-doctor-privacy-sentinel",
@@ -734,8 +729,11 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // not reach any artifact, including the rejection event itself.
     const REJECTED_HOOK: &str = "SENTINEL_REJECTED_HOOK_4c71";
 
-    let root = temp_dir("privacy-sentinel");
+    let root_dir = temp_dir("privacy-sentinel");
+    let root = root_dir.path().to_path_buf();
     let data_dir = root.join("data");
+    let session_cwd = root.join("work");
+    std::fs::create_dir(&session_cwd).expect("create the session working directory");
     let store_path = data_dir.join("metadata.jsonl");
     let events_dir = data_dir.join("events");
     let agents_dir = root.join("agents");
@@ -774,9 +772,10 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     let log_guard =
         pohunek_daemon::logging::init(&daemon_log_dir).expect("daemon logging initializes");
 
-    let socket = temp_dir("privacy-sentinel-sock").join("daemon.sock");
+    let socket_dir = temp_dir("privacy-sentinel-sock");
+    let socket = socket_dir.path().join("daemon.sock");
     let config = SessionRegistryConfig {
-        stop_grace: Duration::from_millis(50),
+        shell_command: support::hermetic_shell(),
         store_path: Some(store_path.clone()),
         event_log_dir: Some(events_dir.clone()),
         agents_dir: Some(agents_dir.clone()),
@@ -784,8 +783,8 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     };
     let (shutdown, handle, worker_home) =
         spawn_worker_backed_server(&socket, "0.0.0", config).await;
-    let worker_state_root = worker_home.join("state/pohunek/workers");
-    let worker_log_dir = worker_home.join("state/pohunek/logs");
+    let worker_state_root = worker_home.path().join("state/pohunek/workers");
+    let worker_log_dir = worker_home.path().join("state/pohunek/logs");
 
     let mut control = connect(&socket).await;
 
@@ -795,7 +794,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         serde_json::to_value(SessionNewParams {
             name: None,
             agent: "sentinelclaude".to_owned(),
-            cwd: Some(pohunek_test_support::temp_root()),
+            cwd: Some(session_cwd.clone()),
             cols: 80,
             rows: 24,
             project: None,
@@ -892,7 +891,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // so the worker rejects the claim on its kernel peer identity and logs a
     // reason code; the native reference it carried must reach no artifact.
     let rejected = send_worker_identity_hook(
-        &worker_home.join("runtime/pohunek/workers"),
+        &worker_home.path().join("runtime/pohunek/workers"),
         &created.id.0,
         serde_json::json!({
             "type": "identity_report",

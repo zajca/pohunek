@@ -14,10 +14,8 @@
 mod support;
 
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,8 +40,6 @@ use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLaunc
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::worker_binary;
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 struct Request;
 
 impl Request {
@@ -52,33 +48,26 @@ impl Request {
     }
 }
 
-/// Stop grace for remote TCP integration tests.
-///
-/// Loaded CI runners can need more than 50 ms to reap a PTY-backed shell, and
-/// these tests assert remote protocol behavior rather than minimum stop timing.
-const REMOTE_TEST_STOP_GRACE: Duration = Duration::from_millis(500);
+// Sessions use the production stop grace, `SessionRegistryConfig::default()`:
+// a shorter grace reaches the forced-stop path on a loaded host, and no test
+// here is about the grace.
 
-/// A unique temp directory inside the test temp root.
-///
-/// The Unix server enforces its directory's mode on bind, so the socket must
-/// live in a directory we own (not `/tmp` itself). Mirrors `health_socket.rs`.
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = pohunek_test_support::temp_root().join(format!(
-        "pohunek-test-{tag}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create test dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .expect("make test directory private");
-    dir
+/// Directory name, next to the socket, that sessions of a fixture work in.
+const WORK_DIR_NAME: &str = "work";
+
+/// The working directory of the sessions served next to `socket`.
+fn work_dir(socket: &Path) -> PathBuf {
+    socket.with_file_name(WORK_DIR_NAME)
 }
 
-fn temp_socket(tag: &str) -> PathBuf {
-    temp_dir(tag).join("daemon.sock")
+/// Creates the private directory a fixture binds its Unix socket in.
+///
+/// The Unix server enforces its directory's mode on bind, so the socket must
+/// live in a directory we own (not `/tmp` itself). The directory is removed
+/// when the returned guard drops.
+fn temp_dir(tag: &str) -> tempfile::TempDir {
+    pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
+        .expect("create the socket directory")
 }
 
 async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
@@ -96,8 +85,7 @@ async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
 /// Build a shell session config with bounded test stop grace.
 fn shell_config() -> SessionRegistryConfig {
     SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: REMOTE_TEST_STOP_GRACE,
+        shell_command: support::hermetic_shell(),
         ..SessionRegistryConfig::default()
     }
 }
@@ -115,12 +103,14 @@ async fn spawn_dual_servers(
     oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let socket = temp_socket(tag);
-    let worker_home = pohunek_test_support::temp_root().join(format!(
-        "pw-r-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let socket_dir = temp_dir(tag);
+    std::fs::create_dir(socket_dir.path().join(WORK_DIR_NAME))
+        .expect("create the session working directory");
+    let socket = socket_dir.path().join("daemon.sock");
+    // Short, because the worker nests its control socket below it.
+    let worker_home_dir =
+        pohunek_test_support::tempdir_with_prefix("pw-r-").expect("create the worker home");
+    let worker_home = worker_home_dir.path().to_path_buf();
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: worker_home.join("runtime"),
         state_home: worker_home.join("state"),
@@ -160,6 +150,8 @@ async fn spawn_dual_servers(
     let (tx, rx) = oneshot::channel::<()>();
     let (unix_rx, remote_rx) = oneshot_fanout(rx);
     let handle = tokio::spawn(async move {
+        // Removed after both servers and the registry are gone.
+        let _fixture_dirs = (socket_dir, worker_home_dir);
         let unix_serve = unix.serve(async move {
             let _ = unix_rx.await;
         });
@@ -239,11 +231,11 @@ fn ok_payload(response: Response) -> Value {
         .unwrap_or_else(|error| panic!("expected ok, got error: {error}"))
 }
 
-fn session_params() -> SessionNewParams {
+fn session_params(socket: &Path) -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: "shell".to_owned(),
-        cwd: Some(pohunek_test_support::temp_root()),
+        cwd: Some(work_dir(socket)),
         cols: 80,
         rows: 24,
         project: None,
@@ -255,14 +247,14 @@ fn session_params() -> SessionNewParams {
     }
 }
 
-async fn create_session<S>(framed: &mut Framed<S, LinesCodec>) -> SessionInfo
+async fn create_session<S>(framed: &mut Framed<S, LinesCodec>, socket: &Path) -> SessionInfo
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let req = Request::make(
         "session-new",
         method::SESSION_NEW,
-        serde_json::to_value(session_params()).expect("serialize params"),
+        serde_json::to_value(session_params(socket)).expect("serialize params"),
     );
     serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("session info")
 }
@@ -393,11 +385,11 @@ async fn assert_raw_stream_closes(stream: &mut TcpStream) {
 
 #[tokio::test]
 async fn session_lifecycle_over_tcp() {
-    let (addr, _socket, shutdown, handle) =
+    let (addr, socket, shutdown, handle) =
         spawn_dual_servers("remote-lifecycle", "0.0.0", shell_config()).await;
 
     let mut client = connect_tcp(addr).await;
-    let created = create_session(&mut client).await;
+    let created = create_session(&mut client, &socket).await;
     assert_eq!(created.agent, "shell");
     assert_eq!(created.state, SessionState::Running);
     assert!(created.pid > 0);
@@ -412,7 +404,7 @@ async fn session_lifecycle_over_tcp() {
         "created session should appear in list over TCP: {list:?}"
     );
 
-    let second = create_session(&mut client).await;
+    let second = create_session(&mut client, &socket).await;
     let filtered_list_req = Request::make(
         "session-list-filtered",
         method::SESSION_LIST,
@@ -477,14 +469,13 @@ async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
                 "IFS= read -r line; printf 'got:%s\\n' \"$line\"; sleep 30",
             ],
         ),
-        stop_grace: REMOTE_TEST_STOP_GRACE,
         ..SessionRegistryConfig::default()
     };
-    let (addr, _socket, shutdown, handle) =
+    let (addr, socket, shutdown, handle) =
         spawn_dual_servers("remote-session-new-input", "0.0.0", config).await;
 
     let mut control = connect_tcp(addr).await;
-    let mut params = session_params();
+    let mut params = session_params(&socket);
     params.input = Some("hello from tcp create".to_owned());
     let ok = ok_payload(create_session_with_params(&mut control, params).await);
     assert!(
@@ -525,11 +516,11 @@ async fn session_new_with_input_over_tcp_writes_text_to_shell_pty() {
 
 #[tokio::test]
 async fn attach_over_tcp_round_trips_and_detach_keeps_session_running() {
-    let (addr, _socket, shutdown, handle) =
+    let (addr, socket, shutdown, handle) =
         spawn_dual_servers("remote-attach", "0.0.0", shell_config()).await;
 
     let mut control = connect_tcp(addr).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
 
     let attach = attach_session(&mut control, &created.id).await;
     assert!(!attach.stream_id.is_empty());
@@ -760,9 +751,10 @@ async fn bind_rejects_non_netbird_address() {
     // A loopback address is never a NetBird address; bind must fail closed BEFORE
     // opening any socket. Deterministic without a NetBird interface present.
     let root = temp_dir("remote-bind-rejection");
+    let root = root.path();
     let state = DaemonState::new(
         HealthInfo::new("0.0.0"),
-        SessionRegistry::new(SessionRegistryConfig::default()),
+        SessionRegistry::new(support::hermetic_registry_config()),
         Arc::new(
             HostGovernanceService::open(root.join("state"))
                 .await

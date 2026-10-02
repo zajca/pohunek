@@ -46,7 +46,7 @@ struct Live {
 }
 
 fn record(session_id: &str) -> String {
-    format!("{{\"session_id\":\"{session_id}\",\"cwd\":\"/tmp\"}}\n")
+    format!("{{\"session_id\":\"{session_id}\",\"cwd\":\"/work\"}}\n")
 }
 
 fn write_transcript(path: &Path, session_id: &str) {

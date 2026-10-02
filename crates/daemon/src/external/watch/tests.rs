@@ -1021,7 +1021,7 @@ fn prepare_transcript(root: &Path) {
     std::fs::create_dir_all(root.join("p")).expect("project");
     std::fs::write(
         root.join("p/s.jsonl"),
-        "{\"session_id\":\"stale\",\"cwd\":\"/tmp\"}\n",
+        "{\"session_id\":\"stale\",\"cwd\":\"/work\"}\n",
     )
     .expect("transcript");
 }

@@ -302,10 +302,10 @@ mod tests {
         let mut parser = OscParser::new();
 
         assert!(parser.advance(b"\x1b]7;file://").is_empty());
-        assert!(parser.advance(b"localhost/tmp/proj").is_empty());
+        assert!(parser.advance(b"localhost/work/proj").is_empty());
         assert_eq!(
             parser.advance(b"ect\x07"),
-            vec![OscEvidence::Cwd("/tmp/project".to_string())]
+            vec![OscEvidence::Cwd("/work/project".to_string())]
         );
     }
 
@@ -314,8 +314,8 @@ mod tests {
         let mut parser = OscParser::new();
 
         assert_eq!(
-            parser.advance(b"\x1b]7;file:///tmp/has%20space\x1b\\"),
-            vec![OscEvidence::Cwd("/tmp/has space".to_string())]
+            parser.advance(b"\x1b]7;file:///work/has%20space\x1b\\"),
+            vec![OscEvidence::Cwd("/work/has space".to_string())]
         );
     }
 
@@ -324,7 +324,7 @@ mod tests {
         let mut parser = OscParser::new();
 
         assert!(parser
-            .advance(b"\x1b]7;ssh://host/tmp/project\x07")
+            .advance(b"\x1b]7;ssh://host/work/project\x07")
             .is_empty());
     }
 

@@ -17,7 +17,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -60,20 +59,20 @@ use pohunek_paths::{
     APP_DIR, HOST_APPROVAL_KEY_NAME, HOST_GOVERNANCE_NAME, HOST_IDENTITY_NAME,
     HOST_STATE_LOCK_NAME, HOST_STATE_SUBDIR, LOGS_SUBDIR, WORKERS_SUBDIR,
 };
+use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::{self, wait_until, HANG_GUARD};
 use pohunek_test_support::{bin_exe, worker_binary};
 
 static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static XDG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Bounds startup readiness while still allowing a freshly spawned daemon to bind its socket.
-const DAEMON_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Avoids busy-spinning while waiting for the child daemon's Unix listener.
-const DAEMON_STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+// Sessions use the production stop grace, `SessionRegistryConfig::default()`:
+// a shorter grace reaches the forced-stop path on a loaded host, and no test
+// here is about the grace.
 /// Bounds every control request and socket operation in the real-daemon regression.
-const DAEMON_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_CONTROL_REQUEST_TIMEOUT: Duration = HANG_GUARD;
 /// Bounds child cleanup so a failed regression test cannot stall the suite indefinitely.
-const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = HANG_GUARD;
 
 struct Request;
 
@@ -86,6 +85,8 @@ impl Request {
 struct PathGuard {
     _guard: MutexGuard<'static, ()>,
     old_path: Option<OsString>,
+    /// The isolated `PATH` directory, kept until `PATH` is restored.
+    _isolated: Option<TestDir>,
 }
 
 impl PathGuard {
@@ -101,6 +102,7 @@ impl PathGuard {
         Self {
             _guard: guard,
             old_path,
+            _isolated: None,
         }
     }
 
@@ -133,10 +135,11 @@ impl PathGuard {
                 }
             }
         }
-        std::env::set_var("PATH", &dir);
+        std::env::set_var("PATH", &*dir);
         Self {
             _guard: guard,
             old_path,
+            _isolated: Some(dir),
         }
     }
 }
@@ -161,7 +164,7 @@ impl Drop for PathGuard {
 struct XdgGuard {
     _guard: MutexGuard<'static, ()>,
     saved: Vec<(&'static str, Option<String>)>,
-    root: PathBuf,
+    root: TestDir,
 }
 
 impl XdgGuard {
@@ -218,14 +221,65 @@ impl Drop for XdgGuard {
     }
 }
 
-/// A unique temp socket path inside a dedicated per-test directory.
+/// A per-test directory, removed with its contents when dropped.
+struct TestDir(tempfile::TempDir);
+
+impl std::ops::Deref for TestDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<Path> for TestDir {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+/// A unique socket path inside a dedicated per-test directory.
 ///
 /// The server enforces the directory's mode on bind, so the socket must live in
 /// a directory we own (not `/tmp` itself, which is root-owned with the sticky
 /// bit). This mirrors the real daemon, which always binds inside its own
-/// `pohunek` runtime subdir.
-fn temp_socket(tag: &str) -> std::path::PathBuf {
-    temp_dir(tag).join("daemon.sock")
+/// `pohunek` runtime subdir. The directory is removed when the value drops.
+struct TestSocket {
+    path: PathBuf,
+    dir: TestDir,
+}
+
+impl std::ops::Deref for TestSocket {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TestSocket {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl TestSocket {
+    /// A private directory next to the socket, for sessions to work in.
+    fn work_dir(&self) -> PathBuf {
+        self.dir.join(WORK_DIR_NAME)
+    }
+}
+
+/// Directory name of [`TestSocket::work_dir`].
+const WORK_DIR_NAME: &str = "work";
+
+fn temp_socket(tag: &str) -> TestSocket {
+    let dir = temp_dir(tag);
+    std::fs::create_dir(dir.join(WORK_DIR_NAME)).expect("create the session working directory");
+    TestSocket {
+        path: dir.join("daemon.sock"),
+        dir,
+    }
 }
 
 async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
@@ -240,12 +294,13 @@ async fn governance_service(socket: &Path) -> Arc<HostGovernanceService> {
     )
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
+fn temp_dir(tag: &str) -> TestDir {
     // Owner-private, uniquely named, and short enough for the daemon socket
-    // below it on macOS; kept so the socket outlives the helper.
-    pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
-        .expect("create test socket dir")
-        .keep()
+    // below it on macOS.
+    TestDir(
+        pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
+            .expect("create test socket dir"),
+    )
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -498,15 +553,17 @@ fn tree_snapshot(root: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
 /// built `pohunek-sessiond`), rooted under a unique per-call worker home, so
 /// `session.new` can actually launch a durable worker instead of failing with
 /// `worker_backend_required`.
+///
+/// The returned directory is the worker home; the caller keeps it alive for as
+/// long as the registry runs.
 fn worker_backed_registry(
     socket: &std::path::Path,
     mut config: SessionRegistryConfig,
-) -> SessionRegistry {
-    let worker_home = pohunek_test_support::temp_root().join(format!(
-        "pw-h-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+) -> (SessionRegistry, tempfile::TempDir) {
+    // Short, because the worker nests its control socket below it.
+    let worker_home_dir =
+        pohunek_test_support::tempdir_with_prefix("pw-h-").expect("create the worker home");
+    let worker_home = worker_home_dir.path().to_path_buf();
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: worker_home.join("runtime"),
         state_home: worker_home.join("state"),
@@ -521,11 +578,12 @@ fn worker_backed_registry(
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
     config.supervision = Some(worker_environment.supervision(worker_binary()));
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
-    SessionRegistry::new_with_launcher_and_inspector(
+    let registry = SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,
         Arc::new(readable_host::ReadableHost::new()),
-    )
+    );
+    (registry, worker_home_dir)
 }
 
 /// Spawn the control server with a custom shell command.
@@ -535,7 +593,7 @@ async fn spawn_server_with_config(
     config: SessionRegistryConfig,
 ) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
     let event_log_dir = config.event_log_dir.clone();
-    let registry = worker_backed_registry(socket, config);
+    let (registry, worker_home) = worker_backed_registry(socket, config);
     let notifications = NotificationService::open(&notification_data_dir(socket))
         .expect("notification service opens");
     if let Some(event_log_dir) = event_log_dir {
@@ -563,6 +621,8 @@ async fn spawn_server_with_config(
         .expect("server binds");
     let (tx, rx) = oneshot::channel();
     let handle = tokio::spawn(async move {
+        // Removed after the server and its registry are gone.
+        let _worker_home = worker_home;
         server
             .serve(async move {
                 let _ = rx.await;
@@ -581,15 +641,15 @@ fn notification_data_dir(socket: &std::path::Path) -> PathBuf {
 
 /// Connect a raw line-framed client to `socket`.
 async fn connect(socket: &std::path::Path) -> Framed<UnixStream, LinesCodec> {
-    // Brief retry: bind returns before the listener is necessarily accepting in
-    // all timing scenarios.
-    for _ in 0..50 {
-        if let Ok(stream) = UnixStream::connect(socket).await {
-            return Framed::new(stream, LinesCodec::new());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("could not connect to test socket {}", socket.display());
+    // Bind returns before the listener is necessarily accepting in all timing
+    // scenarios.
+    wait_until("the test socket to accept a connection", || async {
+        UnixStream::connect(socket)
+            .await
+            .ok()
+            .map(|stream| Framed::new(stream, LinesCodec::new()))
+    })
+    .await
 }
 
 /// Waits for a spawned daemon to expose its Unix control listener.
@@ -597,19 +657,17 @@ async fn wait_for_daemon_socket(
     child: &mut tokio::process::Child,
     socket: &Path,
 ) -> Framed<UnixStream, LinesCodec> {
-    tokio::time::timeout(DAEMON_STARTUP_TIMEOUT, async {
-        loop {
-            if let Some(status) = child.try_wait().expect("inspect daemon child") {
-                panic!("daemon exited before readiness with status {status}");
-            }
-            if let Ok(stream) = UnixStream::connect(socket).await {
-                return Framed::new(stream, LinesCodec::new());
-            }
-            tokio::time::sleep(DAEMON_STARTUP_RETRY_INTERVAL).await;
+    let child = std::cell::RefCell::new(child);
+    wait_until("the daemon to expose its Unix control listener", || async {
+        if let Some(status) = child.borrow_mut().try_wait().expect("inspect daemon child") {
+            panic!("daemon exited before readiness with status {status}");
         }
+        UnixStream::connect(socket)
+            .await
+            .ok()
+            .map(|stream| Framed::new(stream, LinesCodec::new()))
     })
     .await
-    .expect("daemon reaches Unix-socket readiness before timeout")
 }
 
 fn assert_mode(path: &Path, expected_mode: u32) {
@@ -626,13 +684,10 @@ fn assert_mode(path: &Path, expected_mode: u32) {
 
 /// Connect a raw client to `socket` for attach-stream tests.
 async fn connect_raw(socket: &std::path::Path) -> UnixStream {
-    for _ in 0..50 {
-        if let Ok(stream) = UnixStream::connect(socket).await {
-            return stream;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("could not connect raw test socket {}", socket.display());
+    wait_until("the raw test socket to accept a connection", || async {
+        UnixStream::connect(socket).await.ok()
+    })
+    .await
 }
 
 /// Send a request line and read one response line.
@@ -673,11 +728,15 @@ fn agent_name(agent: &AgentKind) -> &'static str {
     }
 }
 
-fn session_params() -> SessionNewParams {
+fn session_params(socket: &TestSocket) -> SessionNewParams {
+    session_params_in(socket.work_dir())
+}
+
+fn session_params_in(cwd: PathBuf) -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: "shell".to_owned(),
-        cwd: Some(pohunek_test_support::temp_root()),
+        cwd: Some(cwd),
         cols: 80,
         rows: 24,
         project: None,
@@ -738,47 +797,33 @@ async fn create_worktree_session(
     exchange(framed, &req).await
 }
 
-/// Initialize a throwaway git repo on branch `main` with one commit.
-fn init_git_repo(tag: &str) -> PathBuf {
-    let dir = temp_dir(tag);
-    let init = std::process::Command::new("git")
-        .args(["-c", "init.defaultBranch=main", "init", "-q"])
-        .arg(&dir)
-        .output()
-        .expect("git init");
-    assert!(
-        init.status.success(),
-        "git init failed: {}",
-        String::from_utf8_lossy(&init.stderr)
-    );
-    for args in [
-        vec!["config", "user.email", "test@example.com"],
-        vec!["config", "user.name", "Test"],
-        vec!["config", "commit.gpgsign", "false"],
-    ] {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(&args)
+/// Initializes a throwaway git repo on branch `main` with one commit in the
+/// working directory of a hermetic environment.
+///
+/// Git runs with the scrubbed environment, so host `GIT_*` variables and the
+/// developer's global configuration cannot reach it.
+fn init_git_repo() -> TestEnv {
+    let env = TestEnv::new().expect("create the repository environment");
+    let git = |args: &[&str]| {
+        let out = env
+            .command("git")
+            .args(args)
             .output()
-            .expect("git config");
-        assert!(out.status.success(), "git {args:?} failed");
-    }
-    std::fs::write(dir.join("README.md"), "init\n").expect("write README");
-    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "init"]] {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&dir)
-            .args(&args)
-            .output()
-            .expect("git commit");
+            .expect("run git in the repository environment");
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-    }
-    dir
+    };
+    git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(env.cwd().join("README.md"), "init\n").expect("write README");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    env
 }
 
 fn ok_payload(response: Response) -> Value {
@@ -791,11 +836,14 @@ fn err_payload(response: Response) -> protocol::ProtocolError {
     response.into_result().expect_err("expected error response")
 }
 
-async fn create_session(framed: &mut Framed<UnixStream, LinesCodec>) -> SessionInfo {
+async fn create_session(
+    framed: &mut Framed<UnixStream, LinesCodec>,
+    socket: &TestSocket,
+) -> SessionInfo {
     let req = Request::make(
         "session-new",
         method::SESSION_NEW,
-        serde_json::to_value(session_params()).expect("serialize params"),
+        serde_json::to_value(session_params(socket)).expect("serialize params"),
     );
     serde_json::from_value(ok_payload(exchange(framed, &req).await)).expect("session info")
 }
@@ -1022,7 +1070,7 @@ fn all_enabled_notification_policy() -> NotificationPolicy {
 }
 
 async fn read_file_until(path: &Path, marker: &[u8]) -> Vec<u8> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    wait::guard("file marker arrives before timeout", async {
         loop {
             if let Ok(bytes) = tokio::fs::read(path).await {
                 if bytes.windows(marker.len()).any(|window| window == marker) {
@@ -1033,7 +1081,6 @@ async fn read_file_until(path: &Path, marker: &[u8]) -> Vec<u8> {
         }
     })
     .await
-    .expect("file marker arrives before timeout")
 }
 
 async fn open_attach_stream(socket: &std::path::Path, stream_id: &str) -> UnixStream {
@@ -1050,7 +1097,7 @@ async fn open_attach_stream(socket: &std::path::Path, stream_id: &str) -> UnixSt
 }
 
 async fn read_until_marker(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    wait::guard("marker arrives before timeout", async {
         let mut collected = Vec::new();
         let mut buf = [0_u8; 1024];
         loop {
@@ -1066,11 +1113,10 @@ async fn read_until_marker(stream: &mut UnixStream, marker: &[u8]) -> Vec<u8> {
         }
     })
     .await
-    .expect("marker arrives before timeout")
 }
 
 async fn assert_raw_stream_closes(stream: &mut UnixStream) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    wait::guard("raw stream closes before timeout", async {
         let mut buf = [0_u8; 256];
         loop {
             let n = stream.read(&mut buf).await.expect("read raw stream");
@@ -1079,8 +1125,7 @@ async fn assert_raw_stream_closes(stream: &mut UnixStream) {
             }
         }
     })
-    .await
-    .expect("raw stream closes before timeout");
+    .await;
 }
 
 async fn inspect_session(
@@ -1100,14 +1145,48 @@ async fn wait_for_state(
     id: &SessionId,
     state: SessionState,
 ) -> SessionInfo {
-    for _ in 0..100 {
-        let info = inspect_session(framed, id).await;
-        if info.state == state {
-            return info;
+    let framed = tokio::sync::Mutex::new(framed);
+    wait_until("the session to reach the awaited state", || async {
+        let mut framed = framed.lock().await;
+        let info = inspect_session(&mut framed, id).await;
+        (info.state == state).then_some(info)
+    })
+    .await
+}
+
+/// Subscribes a new connection to the daemon's events.
+async fn subscribe_events(socket: &Path) -> Framed<UnixStream, LinesCodec> {
+    let mut subscriber = connect(socket).await;
+    let request = Request::make("subscribe-events", method::SUBSCRIBE, Value::Null);
+    let ack = exchange(&mut subscriber, &request).await;
+    assert!(ack.is_ok(), "subscribe should ack");
+    subscriber
+}
+
+/// Waits for the attach lifecycle event `expected` of the stream `stream_id`:
+/// `attach_opened` once the daemon has bound the raw stream, `attach_closed`
+/// once it has deregistered it.
+async fn wait_for_attach_event(
+    subscriber: &mut Framed<UnixStream, LinesCodec>,
+    expected: &str,
+    stream_id: &str,
+) {
+    wait::guard("the attach lifecycle event", async {
+        loop {
+            let line = subscriber
+                .next()
+                .await
+                .expect("a streamed event line")
+                .expect("event framing ok");
+            let streamed: Event = serde_json::from_str(&line).expect("parse event");
+            if streamed.event() == expected
+                && streamed.payload()["stream_id"].as_str() == Some(stream_id)
+            {
+                return;
+            }
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("session {} did not reach state {state:?}", id.0);
+    })
+    .await;
 }
 
 async fn wait_for_agent_state_event(
@@ -1118,7 +1197,7 @@ async fn wait_for_agent_state_event(
 ) -> Event {
     let expected_activity = serde_json::to_value(activity).expect("serialize activity");
     let expected_source = serde_json::to_value(source).expect("serialize source");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
     let mut seen = Vec::new();
     loop {
         let now = tokio::time::Instant::now();
@@ -1160,7 +1239,7 @@ async fn wait_for_notification_event(
         .map(serde_json::to_value)
         .transpose()
         .expect("serialize status");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + HANG_GUARD;
     let mut seen = Vec::new();
     loop {
         let now = tokio::time::Instant::now();
@@ -1227,29 +1306,18 @@ async fn wait_for_persisted_resume_and_worktree(
     store: &Store,
     id: &SessionId,
 ) -> (Vec<ResumeBinding>, Vec<WorktreeBinding>) {
-    for _ in 0..100 {
+    wait_until("the resume and worktree bindings to persist", || async {
         let resume = store.load_resume().expect("load resume");
         let worktrees = store.load_worktrees().expect("load worktrees");
-        if resume
+        let resume_bound = resume
             .iter()
-            .any(|binding| binding.session_id == id.0.as_str())
-            && worktrees
-                .iter()
-                .any(|binding| binding.session_id == id.0.as_str())
-        {
-            return (resume, worktrees);
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    let resume = store.load_resume().expect("load resume after timeout");
-    let worktrees = store
-        .load_worktrees()
-        .expect("load worktrees after timeout");
-    panic!(
-        "resume and worktree bindings did not persist for {}: resume={resume:?}, worktrees={worktrees:?}",
-        id.0
-    );
+            .any(|binding| binding.session_id == id.0.as_str());
+        let worktree_bound = worktrees
+            .iter()
+            .any(|binding| binding.session_id == id.0.as_str());
+        (resume_bound && worktree_bound).then_some((resume, worktrees))
+    })
+    .await
 }
 
 #[tokio::test]
@@ -1260,17 +1328,13 @@ async fn wait_for_persisted_resume_and_worktree(
 async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home() {
     use std::os::unix::fs::PermissionsExt;
 
-    let xdg = XdgGuard::set_all("daemon-startup-private-state").await;
-    let guard_root = xdg.root.clone();
+    let _xdg = XdgGuard::set_all("daemon-startup-private-state").await;
     // The real worker nests its control socket below the XDG runtime root, and
     // `sockaddr_un` imposes a small platform path bound. Keep this fixture short
     // while retaining an isolated complete XDG environment.
-    let root = pohunek_test_support::temp_root().join(format!(
-        "pw-s-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir(&root).expect("create short isolated XDG root");
+    let root_dir =
+        pohunek_test_support::tempdir_with_prefix("pw-s-").expect("create short isolated XDG root");
+    let root = root_dir.path().to_path_buf();
     let runtime_home = root.join("r");
     let data_home = root.join("d");
     let state_home = root.join("s");
@@ -1291,13 +1355,20 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
         .expect("make XDG state home ordinary owner-readable");
     assert_mode(&state_home, 0o755);
 
-    let daemon = bin_exe("pohunekd");
-    let mut child = tokio::process::Command::new(daemon)
+    let daemon_env = TestEnv::new().expect("create the daemon child environment");
+    let mut child = daemon_env
+        .tokio_command(bin_exe("pohunekd"))
+        .env("XDG_RUNTIME_DIR", &runtime_home)
+        .env("XDG_DATA_HOME", &data_home)
+        .env("XDG_STATE_HOME", &state_home)
+        .env("XDG_CACHE_HOME", &cache_home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("HOME", &home)
+        .env("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .env("CODEX_HOME", home.join(".codex"))
         .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
         .env("POHUNEK_WORKER_BIN", worker_binary())
         .env("SHELL", "/bin/sh")
-        .env_remove("POHUNEK_DAEMON_ID")
-        .env_remove("POHUNEK_SESSION_ID")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1320,7 +1391,8 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     let session_request = Request::make(
         "startup-private-state-session-new",
         method::SESSION_NEW,
-        serde_json::to_value(session_params()).expect("serialize bounded shell session request"),
+        serde_json::to_value(session_params_in(home.clone()))
+            .expect("serialize bounded shell session request"),
     );
     let created: SessionInfo = serde_json::from_value(ok_payload(
         tokio::time::timeout(
@@ -1405,9 +1477,6 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     ] {
         assert_mode(&host_state.join(name), 0o600);
     }
-
-    std::fs::remove_dir_all(&root).expect("remove short isolated daemon state");
-    std::fs::remove_dir_all(guard_root).expect("remove XDG guard state");
 }
 
 #[tokio::test]
@@ -1611,10 +1680,10 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
     // session's own worker id back off the wire to build the self-feeding request.
     let socket = temp_socket("attach-self-feedback");
     let (shutdown, handle) =
-        spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
+        spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
     let mut control = connect(&socket).await;
 
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
     let worker_id = created
         .runtime
         .as_ref()
@@ -1685,7 +1754,7 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
     // on) rather than a generic spawn failure.
     let resp = {
         let _path = PathGuard::isolated_without_agents("missing-agent-path").await;
-        create_session_with_agent(&mut control, AgentKind::Claude, cwd).await
+        create_session_with_agent(&mut control, AgentKind::Claude, cwd.to_path_buf()).await
     };
 
     let err = err_payload(resp);
@@ -1717,16 +1786,18 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
 /// before invoking the daemon's own recovery path removes that race without
 /// touching the daemon's connect-based liveness check itself.
 async fn wait_until_connect_refused(socket: &Path) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if UnixStream::connect(socket).await.is_err() {
-                return;
+    wait::guard(
+        "dropped listener never stopped accepting connections",
+        async {
+            loop {
+                if UnixStream::connect(socket).await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("dropped listener never stopped accepting connections");
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1813,13 +1884,12 @@ async fn session_lifecycle_over_socket() {
     let socket = temp_socket("session-lifecycle");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
-    let created = create_session(&mut client).await;
+    let created = create_session(&mut client, &socket).await;
     assert_eq!(created.agent, "shell");
     assert_eq!(created.state, SessionState::Running);
     assert_eq!(created.cols, 80);
@@ -1836,7 +1906,7 @@ async fn session_lifecycle_over_socket() {
         "created session should appear in list: {list:?}"
     );
 
-    let second = create_session(&mut client).await;
+    let second = create_session(&mut client, &socket).await;
     let filtered_list_req = Request::make(
         "session-list-filtered",
         method::SESSION_LIST,
@@ -1914,13 +1984,12 @@ async fn session_input_writes_text_to_shell_pty() {
                 "IFS= read -r line; printf 'got:%s\\n' \"$line\"; sleep 30",
             ],
         ),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
-    let created = create_session(&mut client).await;
+    let created = create_session(&mut client, &socket).await;
     let input = input_session(&mut client, &created.id, "hello from control").await;
     assert!(input.accepted);
 
@@ -1959,13 +2028,12 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
                 "IFS= read -r line; printf 'got:%s\\n' \"$line\"; sleep 30",
             ],
         ),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut client = connect(&socket).await;
-    let mut params = session_params();
+    let mut params = session_params(&socket);
     params.input = Some("hello from create".to_owned());
     let ok = ok_payload(create_session_with_params(&mut client, params).await);
     assert!(
@@ -2006,8 +2074,10 @@ async fn session_new_with_input_writes_text_to_shell_pty() {
 async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
     let bin_dir = temp_dir("codex-stub-bin");
     let cwd = temp_dir("codex-stub-cwd");
-    let input_log = temp_dir("codex-stub-input").join("input.bin");
-    let cwd_log = temp_dir("codex-stub-pwd").join("pwd.txt");
+    let input_log_dir = temp_dir("codex-stub-input");
+    let input_log = input_log_dir.join("input.bin");
+    let cwd_log_dir = temp_dir("codex-stub-pwd");
+    let cwd_log = cwd_log_dir.join("pwd.txt");
     write_executable(
         &bin_dir.join("codex"),
         &format!(
@@ -2019,7 +2089,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
 
     let socket = temp_socket("codex-stub");
     let (shutdown, handle) =
-        spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
+        spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make("subscribe-codex-stub", method::SUBSCRIBE, Value::Null);
@@ -2030,7 +2100,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
     let created: SessionInfo = {
         let _path = PathGuard::prepend(&bin_dir).await;
         serde_json::from_value(ok_payload(
-            create_session_with_agent(&mut control, AgentKind::Codex, cwd.clone()).await,
+            create_session_with_agent(&mut control, AgentKind::Codex, cwd.to_path_buf()).await,
         ))
         .expect("codex session info")
     };
@@ -2073,7 +2143,8 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
 async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input() {
     let bin_dir = temp_dir("claude-stub-bin");
     let cwd = temp_dir("claude-stub-cwd");
-    let input_log = temp_dir("claude-stub-input").join("input.bin");
+    let input_log_dir = temp_dir("claude-stub-input");
+    let input_log = input_log_dir.join("input.bin");
     write_executable(
         &bin_dir.join("claude"),
         &format!(
@@ -2084,7 +2155,7 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
 
     let socket = temp_socket("claude-stub");
     let (shutdown, handle) =
-        spawn_server_with_config(&socket, "0.0.0", SessionRegistryConfig::default()).await;
+        spawn_server_with_config(&socket, "0.0.0", support::hermetic_registry_config()).await;
 
     let mut subscriber = connect(&socket).await;
     let subscribe_req = Request::make("subscribe-claude-stub", method::SUBSCRIBE, Value::Null);
@@ -2095,7 +2166,7 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     let created: SessionInfo = {
         let _path = PathGuard::prepend(&bin_dir).await;
         serde_json::from_value(ok_payload(
-            create_session_with_agent(&mut control, AgentKind::Claude, cwd).await,
+            create_session_with_agent(&mut control, AgentKind::Claude, cwd.to_path_buf()).await,
         ))
         .expect("claude session info")
     };
@@ -2134,14 +2205,13 @@ async fn session_survives_requesting_client_exit() {
     let socket = temp_socket("session-client-independence");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let created = {
         let mut first_client = connect(&socket).await;
-        create_session(&mut first_client).await
+        create_session(&mut first_client, &socket).await
     };
 
     let mut fresh_client = connect(&socket).await;
@@ -2173,13 +2243,12 @@ async fn session_exit_detection_reports_done_and_failed() {
     let success_socket = temp_socket("session-exit-success");
     let success_config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 0"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (success_shutdown, success_handle) =
         spawn_server_with_config(&success_socket, "0.0.0", success_config).await;
     let mut success_client = connect(&success_socket).await;
-    let success = create_session(&mut success_client).await;
+    let success = create_session(&mut success_client, &success_socket).await;
     let done = wait_for_state(&mut success_client, &success.id, SessionState::Done).await;
     assert_eq!(done.exit_code, Some(0));
     let _ = success_shutdown.send(());
@@ -2188,13 +2257,12 @@ async fn session_exit_detection_reports_done_and_failed() {
     let failure_socket = temp_socket("session-exit-failure");
     let failure_config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 7"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (failure_shutdown, failure_handle) =
         spawn_server_with_config(&failure_socket, "0.0.0", failure_config).await;
     let mut failure_client = connect(&failure_socket).await;
-    let failure = create_session(&mut failure_client).await;
+    let failure = create_session(&mut failure_client, &failure_socket).await;
     let failed = wait_for_state(&mut failure_client, &failure.id, SessionState::Failed).await;
     assert_eq!(failed.exit_code, Some(7));
     let _ = failure_shutdown.send(());
@@ -2206,7 +2274,6 @@ async fn subscribe_streams_session_created_event() {
     let socket = temp_socket("subscribe-events");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2221,13 +2288,12 @@ async fn subscribe_streams_session_created_event() {
 
     // A second, independent connection creates a session.
     let mut creator = connect(&socket).await;
-    let created = create_session(&mut creator).await;
+    let created = create_session(&mut creator, &socket).await;
 
     // The subscriber must receive a `session_created` event for that session.
     // Bound the read so the test cannot hang if streaming is broken.
-    let event_line = tokio::time::timeout(Duration::from_secs(5), subscriber.next())
+    let event_line = wait::guard("the session_created event", subscriber.next())
         .await
-        .expect("event arrives before timeout")
         .expect("a streamed event line")
         .expect("event framing ok");
     let streamed: Event = serde_json::from_str(&event_line).expect("parse event");
@@ -2248,7 +2314,6 @@ async fn notification_api_crud_policy_methods_work() {
     let socket = temp_socket("notification-api");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2325,7 +2390,6 @@ async fn notification_retention_prune_dry_run_and_apply_methods_work() {
     let socket = temp_socket("notification-retention");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2400,7 +2464,6 @@ async fn notification_update_returns_typed_errors_for_missing_invalid_and_malfor
     let socket = temp_socket("notification-errors");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2478,12 +2541,11 @@ async fn notification_create_enriches_live_session_context() {
     let socket = temp_socket("notification-session-context");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
-    let session = create_session(&mut control).await;
+    let session = create_session(&mut control, &socket).await;
 
     let created =
         create_notification(&mut control, notification_params(Some(session.id.clone()))).await;
@@ -2500,7 +2562,6 @@ async fn notification_create_keeps_missing_session_reference() {
     let socket = temp_socket("notification-missing-session");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2522,7 +2583,6 @@ async fn subscribe_streams_notification_created_event() {
     let socket = temp_socket("notification-created-event");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2560,7 +2620,6 @@ async fn subscribe_streams_notification_updated_events_for_read_ack_and_archive(
     let socket = temp_socket("notification-updated-events");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2612,7 +2671,6 @@ async fn subscribe_streams_notification_deleted_event() {
     let socket = temp_socket("notification-deleted-event");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2658,7 +2716,6 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
     let socket = temp_socket("report-agent-api");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -2669,7 +2726,7 @@ async fn report_agent_api_records_active_agent_and_streams_report_state() {
     assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
     let report_req = Request::make(
         "session-report-agent",
         method::SESSION_REPORT_AGENT,
@@ -2717,13 +2774,12 @@ async fn attach_raw_stream_round_trips_resizes_detaches_and_reattaches() {
     let socket = temp_socket("attach-roundtrip");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
 
     let attach = attach_session(&mut control, &created.id).await;
     assert!(!attach.stream_id.is_empty());
@@ -2812,13 +2868,12 @@ async fn reattach_starts_from_current_snapshot_after_historical_resizes() {
     let socket = temp_socket("attach-current-snapshot");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
 
     // Produce full-screen output at several historical geometries. Replaying
     // these bytes into a differently sized client is the regression: cursor
@@ -2894,20 +2949,21 @@ async fn multiple_attach_clients_receive_output_and_disconnect_independently() {
     let socket = temp_socket("attach-multi");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
+    let mut subscriber = subscribe_events(&socket).await;
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
 
     let first = attach_session(&mut control, &created.id).await;
     let second = attach_session(&mut control, &created.id).await;
     let mut raw_one = open_attach_stream(&socket, &first.stream_id).await;
     let mut raw_two = open_attach_stream(&socket, &second.stream_id).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &first.stream_id).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &second.stream_id).await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
     raw_one
         .write_all(b"printf 'm4-multi\n'\n")
         .await
@@ -2955,22 +3011,22 @@ async fn dropping_an_attach_connection_detaches_without_stopping_the_session() {
     let socket = temp_socket("attach-drop-detaches");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
+    let mut subscriber = subscribe_events(&socket).await;
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
 
     // Attach, then drop the raw stream the way a closed window / SIGHUP would —
     // no `session.detach` is ever sent.
     let attach = attach_session(&mut control, &created.id).await;
     let raw = open_attach_stream(&socket, &attach.stream_id).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &attach.stream_id).await;
     drop(raw);
-    // Let the daemon's attach bridge observe the EOF and deregister the stream.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The daemon's attach bridge observes the EOF and deregisters the stream.
+    wait_for_attach_event(&mut subscriber, event::ATTACH_CLOSED, &attach.stream_id).await;
 
     // The session must still be running and listed: a dropped attach is a detach,
     // not a stop.
@@ -2994,7 +3050,7 @@ async fn dropping_an_attach_connection_detaches_without_stopping_the_session() {
     // same live session survived the window close.
     let reattach = attach_session(&mut control, &created.id).await;
     let mut raw2 = open_attach_stream(&socket, &reattach.stream_id).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &reattach.stream_id).await;
     raw2.write_all(b"printf 're-attached\n'\n")
         .await
         .expect("send marker after reattach");
@@ -3030,21 +3086,18 @@ async fn detector_publishes_osc_title_activity_while_attach_receives_output() {
                 "stty -echo; read trigger; printf '\\033]0;working\\007m5-detector-attach\\n'; sleep 30",
             ],
         ),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
-    let mut subscriber = connect(&socket).await;
-    let subscribe_req = Request::make("subscribe-detector", method::SUBSCRIBE, Value::Null);
-    let ack = exchange(&mut subscriber, &subscribe_req).await;
-    assert!(ack.is_ok(), "subscribe should ack");
+    let mut subscriber = subscribe_events(&socket).await;
 
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
     let attach = attach_session(&mut control, &created.id).await;
     let mut raw = open_attach_stream(&socket, &attach.stream_id).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The terminal buffers the trigger line until the shell reads it.
+    wait_for_attach_event(&mut subscriber, event::ATTACH_OPENED, &attach.stream_id).await;
     raw.write_all(b"\n")
         .await
         .expect("trigger detector marker command");
@@ -3097,7 +3150,6 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
             "/bin/sh",
             ["-c", "sleep 0.2; printf '\\033]0;blocked\\007'; sleep 30"],
         ),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
@@ -3112,7 +3164,7 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
     assert!(ack.is_ok(), "subscribe should ack");
 
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
 
     let streamed = wait_for_agent_state_event(
         &mut subscriber,
@@ -3144,18 +3196,22 @@ async fn detector_tick_publishes_debounced_static_osc_title_activity() {
 /// Milestone-8 checkpoint: two sessions on one repository with different
 /// branches get two distinct worktrees and each launches inside its own.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "The two-session worktree scenario is clearer as one sequence."
+)]
 async fn two_sessions_on_one_repo_get_distinct_worktrees() {
-    let repo = init_git_repo("two-wt-repo");
+    let repo = init_git_repo();
     let worktree_root = temp_dir("two-wt-root");
-    let store_path = temp_dir("two-wt-store").join("metadata.jsonl");
+    let store_path_dir = temp_dir("two-wt-store");
+    let store_path = store_path_dir.join("metadata.jsonl");
     let socket = temp_socket("two-worktrees");
 
     let config = SessionRegistryConfig {
         // Each shell records its working directory into its own worktree, which
         // proves the process was launched *inside* the bound tree.
         shell_command: ShellCommand::new("/bin/sh", ["-c", "pwd > pohunek-pwd.txt; exec sleep 30"]),
-        stop_grace: Duration::from_millis(50),
-        worktree_root: Some(worktree_root.clone()),
+        worktree_root: Some(worktree_root.to_path_buf()),
         store_path: Some(store_path.clone()),
         ..SessionRegistryConfig::default()
     };
@@ -3166,14 +3222,20 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
         create_worktree_session(
             &mut control,
             AgentKind::Shell,
-            repo.clone(),
+            repo.cwd().to_path_buf(),
             "feature/alpha",
         )
         .await,
     ))
     .expect("alpha session info");
     let beta: SessionInfo = serde_json::from_value(ok_payload(
-        create_worktree_session(&mut control, AgentKind::Shell, repo.clone(), "feature/beta").await,
+        create_worktree_session(
+            &mut control,
+            AgentKind::Shell,
+            repo.cwd().to_path_buf(),
+            "feature/beta",
+        )
+        .await,
     ))
     .expect("beta session info");
 
@@ -3269,7 +3331,8 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
 #[tokio::test]
 async fn event_log_records_lifecycle_and_never_terminal_bytes() {
     const SENTINEL: &str = "SENTINEL_TERMINAL_OUTPUT_DEADBEEF";
-    let events_dir = temp_dir("eventlog-data").join("events");
+    let events_parent = temp_dir("eventlog-data");
+    let events_dir = events_parent.join("events");
     let socket = temp_socket("eventlog");
 
     // The shell prints a unique sentinel to its PTY; that raw output must never
@@ -3277,14 +3340,13 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
     let shell_cmd = format!("printf '{SENTINEL}\\n'; exec sleep 30");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c".to_owned(), shell_cmd]),
-        stop_grace: Duration::from_millis(50),
         event_log_dir: Some(events_dir.clone()),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
 
     let mut control = connect(&socket).await;
-    let created = create_session(&mut control).await;
+    let created = create_session(&mut control, &socket).await;
     // Drive a second lifecycle event, then stop to produce session_stopped.
     let _ = resize_session(&mut control, &created.id, 100, 40).await;
     let stop_req = Request::make(
@@ -3330,11 +3392,11 @@ async fn event_log_records_lifecycle_and_never_terminal_bytes() {
 /// event log records them just like session lifecycle events.
 #[tokio::test]
 async fn event_log_records_notification_control_events() {
-    let events_dir = temp_dir("notification-eventlog-data").join("events");
+    let events_parent = temp_dir("notification-eventlog-data");
+    let events_dir = events_parent.join("events");
     let socket = temp_socket("notification-eventlog");
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
         event_log_dir: Some(events_dir.clone()),
         ..SessionRegistryConfig::default()
     };
@@ -3374,19 +3436,20 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let bin_name = "claude";
     let native_id = "native-claude-wt-1";
 
-    let repo = init_git_repo("wt-resume-repo");
+    let repo = init_git_repo();
     let bin_dir = temp_dir("wt-resume-bin");
     let data_dir = temp_dir("wt-resume-state");
     let store_path = data_dir.join("metadata.jsonl");
     let worktree_root = data_dir.join("worktrees");
-    let argv_log = temp_dir("wt-resume-argv").join("argv.log");
+    let argv_log_dir = temp_dir("wt-resume-argv");
+    let argv_log = argv_log_dir.join("argv.log");
     write_executable(&bin_dir.join(bin_name), &stub_agent_script(&argv_log));
 
     let socket = temp_socket("wt-resume");
     let config = SessionRegistryConfig {
+        shell_command: support::hermetic_shell(),
         store_path: Some(store_path.clone()),
         worktree_root: Some(worktree_root.clone()),
-        stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     };
 
@@ -3396,7 +3459,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
     let mut control = connect(&socket).await;
     let created: SessionInfo = serde_json::from_value(ok_payload(
-        create_worktree_session(&mut control, agent, repo.clone(), "feat/x").await,
+        create_worktree_session(&mut control, agent, repo.cwd().to_path_buf(), "feat/x").await,
     ))
     .expect("worktree stub session info");
     let worktree_path = created.worktree_path.clone().expect("worktree bound");

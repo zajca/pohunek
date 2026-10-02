@@ -285,7 +285,7 @@ mod tests {
         set_all_present(&base);
         let paths = Paths::resolve().expect("resolve with all base vars set");
 
-        for id in ["", "/tmp/launch", "../launch", "launch/child", "launch/.."] {
+        for id in ["", "/work/launch", "../launch", "launch/child", "launch/.."] {
             assert_eq!(
                 paths.assistant_runtime_dir(id),
                 None,

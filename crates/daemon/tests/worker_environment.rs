@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use pohunek_daemon::runtime::Worker;
+use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
     is_denylisted, BaseEnv, Dimensions, Initialize, InitializeLimits, LaunchIdentity, RuntimePhase,
@@ -28,8 +30,6 @@ use pohunek_worker_protocol::{
 
 /// Bounds waiting for the worker socket and the child's exit.
 const DEADLINE: Duration = Duration::from_secs(15);
-/// Pause between readiness and exit polls.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Output page size; an environment listing fits in a few pages.
 const PAGE_BYTES: u32 = 16 * 1024;
 /// Short observation wait, because the child has already exited.
@@ -64,6 +64,8 @@ struct Fixture {
     session_id: String,
     notify: UnixDatagram,
     worker: tokio::process::Child,
+    /// Owns `root`, which it removes when the fixture drops.
+    _env: TestEnv,
 }
 
 impl Fixture {
@@ -76,9 +78,8 @@ impl Fixture {
             binary.display()
         );
         let sequence = FIXTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let root = pohunek_test_support::temp_root()
-            .join(format!("pohunek-env-{}-{sequence}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let env = TestEnv::new().expect("create the fixture environment");
+        let root = env.root().to_path_buf();
         for directory in [
             "runtime/pohunek/workers",
             "state/pohunek/workers",
@@ -126,6 +127,7 @@ impl Fixture {
             session_id,
             notify,
             worker,
+            _env: env,
         }
     }
 
@@ -141,31 +143,33 @@ impl Fixture {
             .join("runtime/pohunek/workers")
             .join(&self.session_id)
             .join(pohunek_paths::WORKER_SOCKET_NAME);
-        let started = tokio::time::Instant::now();
-        loop {
+        let child = std::cell::RefCell::new(&mut self.worker);
+        let session_id = &self.session_id;
+        wait_until("the worker to accept a controller", || async {
             match Worker::connect_with_range(
                 &socket,
-                &self.session_id,
+                session_id,
                 DAEMON_ID,
                 PREVIOUS_VERSION,
                 maximum_version,
             )
             .await
             {
-                Ok(worker) => return worker,
+                Ok(worker) => Some(worker),
                 Err(error) => {
                     assert!(
-                        self.worker.try_wait().expect("inspect worker").is_none(),
+                        child
+                            .borrow_mut()
+                            .try_wait()
+                            .expect("inspect worker")
+                            .is_none(),
                         "worker exited before accepting a controller: {error}"
                     );
-                    assert!(
-                        started.elapsed() < DEADLINE,
-                        "worker never accepted: {error}"
-                    );
-                    tokio::time::sleep(POLL_INTERVAL).await;
+                    None
                 }
             }
-        }
+        })
+        .await
     }
 
     fn initialize(&self, worker_id: pohunek_worker_protocol::WorkerId) -> Initialize {
@@ -218,23 +222,18 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self.worker.start_kill();
-        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
 /// Runs `/usr/bin/env` in the worker's PTY and returns the child environment.
 async fn child_environment(worker: &Worker, initialize: Initialize) -> BTreeMap<String, String> {
     worker.initialize(initialize).await.expect("initialize");
-    let started = tokio::time::Instant::now();
-    loop {
+    let exited = wait_until("the child to exit", || async {
         let snapshot = worker.inspect().await.expect("inspect worker");
-        if snapshot.phase == RuntimePhase::Exited {
-            assert_eq!(snapshot.exit.and_then(|exit| exit.code), Some(0));
-            break;
-        }
-        assert!(started.elapsed() < DEADLINE, "child never exited");
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
+        (snapshot.phase == RuntimePhase::Exited).then_some(snapshot)
+    })
+    .await;
+    assert_eq!(exited.exit.and_then(|exit| exit.code), Some(0));
 
     let mut output = Vec::new();
     let mut after_offset = None;

@@ -655,13 +655,13 @@ mod tests {
 
         for (pid, comm, cmdline) in [
             (107, "hermes-helper", vec!["/usr/bin/hermes-helper", "chat"]),
-            (108, "python3", vec!["python3", "/tmp/cli.py", "chat"]),
+            (108, "python3", vec!["python3", "/work/cli.py", "chat"]),
             (
                 109,
                 "python3",
                 vec!["python3", "-m", "not_hermes_cli.main", "chat"],
             ),
-            (110, "cat", vec!["cat", "/tmp/hermes"]),
+            (110, "cat", vec!["cat", "/work/hermes"]),
             (
                 111,
                 "echo",
@@ -756,11 +756,11 @@ mod tests {
         let mut detector = Detector::new(3, 80, started_at, config());
 
         assert!(detector
-            .feed(started_at, b"\x1b]7;file:///tmp/pohunek-cwd\x07")
+            .feed(started_at, b"\x1b]7;file:///work/pohunek-cwd\x07")
             .is_empty());
         assert_eq!(
             detector.take_cwd_hint(),
-            Some("/tmp/pohunek-cwd".to_owned())
+            Some("/work/pohunek-cwd".to_owned())
         );
         assert_eq!(detector.take_cwd_hint(), None);
     }
@@ -771,7 +771,7 @@ mod tests {
         let mut detector = Detector::new(3, 80, started_at, config());
 
         assert!(detector
-            .feed(started_at, b"\x1b]7;file:///tmp/pohunek-cwd\x07")
+            .feed(started_at, b"\x1b]7;file:///work/pohunek-cwd\x07")
             .is_empty());
         detector.resync_after_lag();
 

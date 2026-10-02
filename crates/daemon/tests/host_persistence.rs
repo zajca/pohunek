@@ -7,20 +7,37 @@ use std::os::unix::{
     net::{UnixListener, UnixStream},
 };
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use pohunek_daemon::host_state::{HostStateDir, HostStateError};
+use pohunek_test_support::env::TestEnv;
 
 /// Bounds readiness, release, and child-process reaping for lock tests.
 const LOCK_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn temp_root(tag: &str) -> PathBuf {
-    tempfile::Builder::new()
-        .prefix(&format!("pohunek-host-state-{tag}-"))
-        .tempdir_in(pohunek_test_support::temp_root())
-        .expect("create isolated root")
-        .keep()
+/// A fresh, empty, owner-private root, removed with its contents when dropped.
+struct Root(tempfile::TempDir);
+
+impl std::ops::Deref for Root {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl AsRef<Path> for Root {
+    fn as_ref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+fn temp_root(tag: &str) -> Root {
+    Root(
+        pohunek_test_support::tempdir_with_prefix(&format!("ph-hs-{tag}-"))
+            .expect("create isolated root"),
+    )
 }
 
 fn state_dir(root: &Path) -> PathBuf {
@@ -87,8 +104,8 @@ fn rejects_symlink_host_parent_and_record_without_touching_referents() {
     ));
     assert!(referent.is_dir(), "host symlink referent remains untouched");
 
-    let safe = HostStateDir::open_or_create(&state_dir(&temp_root("record-link")))
-        .expect("open safe host");
+    let safe_root = temp_root("record-link");
+    let safe = HostStateDir::open_or_create(&state_dir(&safe_root)).expect("open safe host");
     let target = root.join("record-target");
     fs::write(&target, b"keep").expect("write target");
     symlink(&target, safe.path().join("identity.json")).expect("record symlink");
@@ -216,6 +233,8 @@ fn replacing_a_held_lock_marker_cannot_create_a_second_process_writer() {
 struct LockHolder {
     child: Option<Child>,
     release: Option<UnixStream>,
+    /// The scrubbed environment and working directory of the helper process.
+    _env: TestEnv,
 }
 
 impl LockHolder {
@@ -248,7 +267,9 @@ fn spawn_lock_holder(root: &Path, state: &Path) -> LockHolder {
     let release = root.join("holder-release.sock");
     let ready_listener = UnixListener::bind(&ready).expect("bind lock-holder readiness socket");
     let release_listener = UnixListener::bind(&release).expect("bind lock-holder release socket");
-    let child = Command::new(std::env::current_exe().expect("test executable"))
+    let env = TestEnv::new().expect("create the lock holder environment");
+    let child = env
+        .command(std::env::current_exe().expect("test executable"))
         .args(["--exact", "lock_holder_process", "--nocapture"])
         .env("POHUNEK_HOST_LOCK_HELPER_STATE", state)
         .env("POHUNEK_HOST_LOCK_HELPER_READY", &ready)
@@ -258,6 +279,7 @@ fn spawn_lock_holder(root: &Path, state: &Path) -> LockHolder {
     let mut holder = LockHolder {
         child: Some(child),
         release: None,
+        _env: env,
     };
     let mut ready_stream = accept_with_timeout(&ready_listener, "lock-holder readiness");
     match ready_stream.set_read_timeout(Some(LOCK_HELPER_TIMEOUT)) {

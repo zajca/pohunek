@@ -684,12 +684,7 @@ mod tests {
 
     /// The policy store requires an owner-private directory, so fixtures create one.
     fn private_policy_root() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = pohunek_test_support::tempdir().expect("create policy fixture root");
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("set owner-private fixture mode");
-        root
+        pohunek_test_support::tempdir().expect("create policy fixture root")
     }
 
     /// Fixed reference instant so every age in these tests is exact.
@@ -709,7 +704,7 @@ mod tests {
             name: None,
             agent: "shell".to_owned(),
             agent_base: AgentKind::Shell,
-            cwd: PathBuf::from("/tmp"),
+            cwd: PathBuf::from("/work"),
             cwd_source: None,
             pid: 1,
             runtime: None,

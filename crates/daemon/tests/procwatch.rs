@@ -5,20 +5,24 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Child;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
+use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use protocol::{
     AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
     SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
+// Sessions use the production stop grace, `SessionRegistryConfig::default()`:
+// a shorter grace reaches the forced-stop path on a loaded host, and no test
+// here is about the grace.
 const TEST_COLS: u16 = 80;
 const TEST_ROWS: u16 = 24;
 /// Poll interval used by the integration test.
@@ -26,15 +30,6 @@ const TEST_ROWS: u16 = 24;
 /// It is intentionally long enough that a clear observed well below this bound
 /// proves the pidfd exit path fired instead of waiting for the next poll tick.
 const TEST_PROCWATCH_POLL: Duration = Duration::from_secs(2);
-/// Upper bound for the initial process-discovery wait.
-///
-/// The watcher ticks immediately after spawn; this timeout leaves room for
-/// subprocess-worker spawn plus PTY startup on a heavily loaded parallel test
-/// run while still bounding a broken descendant walk. It is a liveness bound
-/// only (the event-driven `EXIT_EVENT_TIMEOUT` below is what proves pidfd-driven
-/// behavior), so a generous value costs nothing on success and only absorbs
-/// scheduling latency when the whole workspace runs concurrently.
-const OBSERVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Upper bound for pidfd-driven release after `kill -9`.
 ///
 /// This is below [`TEST_PROCWATCH_POLL`], so success demonstrates event-driven
@@ -42,24 +37,13 @@ const OBSERVE_TIMEOUT: Duration = Duration::from_secs(20);
 const EXIT_EVENT_TIMEOUT: Duration = Duration::from_millis(900);
 /// Poll interval for the cwd-tracking integration test.
 const CWD_PROCWATCH_POLL: Duration = Duration::from_millis(150);
-/// Upper bound for observing a shell `cd` through procwatch.
-///
-/// A liveness bound: procwatch reflects the new cwd on its next poll, so this
-/// only needs to exceed a poll interval plus scheduling latency. Kept generous
-/// so a heavily loaded parallel test run cannot starve the poll tick.
-const CWD_UPDATE_TIMEOUT: Duration = Duration::from_secs(4);
-/// Lightweight inspect polling cadence while waiting for cwd updates.
-const CWD_WAIT_POLL: Duration = Duration::from_millis(20);
 /// Poll interval for the external observer integration test.
 const EXTERNAL_PROCWATCH_POLL: Duration = Duration::from_secs(2);
-/// Upper bound for observing an external agent process.
-const EXTERNAL_OBSERVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Lightweight polling cadence while waiting for external entries.
 const EXTERNAL_WAIT_POLL: Duration = Duration::from_millis(20);
 
 static EXTERNAL_ENV_LOCK: Mutex<()> = Mutex::new(());
 static POHUNEK_ENV_LOCK: Mutex<()> = Mutex::new(());
-static WORKER_HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Clears `POHUNEK_DAEMON_ID`/`POHUNEK_SESSION_ID` for the scope of spawning a
 /// worker-backed test session.
@@ -118,20 +102,18 @@ impl Drop for PohunekEnvGuard {
 /// process's real `PATH`, so `sh`/`sleep`/`stty` resolve normally; this file
 /// never narrows `PATH` (unlike `health_socket.rs`'s `PathGuard`), so there is
 /// no PATH-isolation race to guard against here.
-fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry {
-    let worker_home = pohunek_test_support::temp_root().join(format!(
-        "pw-p-{}-{}",
-        std::process::id(),
-        WORKER_HOME_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+///
+/// The worker's directories are the private ones of `env`, whose short root
+/// leaves room for the worker's nested control socket.
+fn worker_backed_registry(env: &TestEnv, mut config: SessionRegistryConfig) -> SessionRegistry {
     let worker_environment = SubprocessWorkerEnvironment {
-        runtime_home: worker_home.join("runtime"),
-        state_home: worker_home.join("state"),
-        data_home: worker_home.join("data"),
-        config_home: worker_home.join("config"),
-        cache_home: worker_home.join("cache"),
-        home: worker_home.clone(),
-        daemon_socket: worker_home.join("daemon.sock"),
+        runtime_home: env.runtime_dir().to_path_buf(),
+        state_home: env.state_home().to_path_buf(),
+        data_home: env.data_home().to_path_buf(),
+        config_home: env.config_home().to_path_buf(),
+        cache_home: env.cache_home().to_path_buf(),
+        home: env.home().to_path_buf(),
+        daemon_socket: env.root().join("daemon.sock"),
     };
     config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
@@ -150,7 +132,8 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
         return;
     }
 
-    let dir = temp_dir("procwatch-real-child");
+    let env = TestEnv::new().expect("create the test environment");
+    let dir = env.cwd();
     let fake_codex = dir.join("codex");
     let pid_file = dir.join("agent.pid");
     symlink_sleep_as(&fake_codex);
@@ -159,19 +142,21 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
         fake_codex.display(),
         pid_file.display()
     );
-    let registry = worker_backed_registry(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
-        stop_grace: Duration::from_millis(50),
-        procwatch_poll: TEST_PROCWATCH_POLL,
-        ..SessionRegistryConfig::default()
-    });
+    let registry = worker_backed_registry(
+        &env,
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+            procwatch_poll: TEST_PROCWATCH_POLL,
+            ..SessionRegistryConfig::default()
+        },
+    );
     let created = {
         let _env = PohunekEnvGuard::clear();
         registry
             .create(SessionNewParams {
                 name: Some("procwatch-real-child".to_owned()),
                 agent: "shell".to_owned(),
-                cwd: Some(dir.clone()),
+                cwd: Some(dir.to_path_buf()),
                 cols: TEST_COLS,
                 rows: TEST_ROWS,
                 project: None,
@@ -196,14 +181,13 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     assert_eq!(child.pgid, created.pid);
     assert_eq!(foreground_group, Some(created.pid));
 
-    let observed =
-        wait_for_active_pid(&registry, &created.id, Some(child_pid), OBSERVE_TIMEOUT).await;
+    let observed = wait_for_observed_pid(&registry, &created.id, child_pid).await;
     assert_eq!(observed.active_agent.as_deref(), Some("codex"));
     assert_eq!(observed.active_agent_base, Some(AgentKind::Codex));
 
     kill9(child_pid);
     let started = Instant::now();
-    let cleared = wait_for_active_pid(&registry, &created.id, None, EXIT_EVENT_TIMEOUT).await;
+    let cleared = wait_for_cleared_agent(&registry, &created.id, EXIT_EVENT_TIMEOUT).await;
 
     assert_eq!(cleared.active_agent, None);
     assert!(
@@ -215,14 +199,18 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
 
 #[tokio::test]
 async fn procwatch_updates_cwd_after_shell_cd() {
-    let start_dir = temp_dir("procwatch-cwd-start");
-    let target_dir = temp_dir("procwatch-cwd-target");
-    let registry = worker_backed_registry(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<String>()),
-        stop_grace: Duration::from_millis(50),
-        procwatch_poll: CWD_PROCWATCH_POLL,
-        ..SessionRegistryConfig::default()
-    });
+    let env = TestEnv::new().expect("create the test environment");
+    let start_dir = env.cwd().to_path_buf();
+    let target_dir = env.data_home().join("cd-target");
+    fs::create_dir(&target_dir).expect("create the cd target");
+    let registry = worker_backed_registry(
+        &env,
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<String>()),
+            procwatch_poll: CWD_PROCWATCH_POLL,
+            ..SessionRegistryConfig::default()
+        },
+    );
     let created = registry
         .create(SessionNewParams {
             name: Some("procwatch-cwd".to_owned()),
@@ -249,7 +237,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
         .await
         .expect("send cd command");
 
-    let updated = wait_for_cwd(&registry, &created.id, &target_dir, CWD_UPDATE_TIMEOUT).await;
+    let updated = wait_for_cwd(&registry, &created.id, &target_dir).await;
     assert_eq!(updated.cwd_source, Some(CwdSource::Procwatch));
 
     let _ = registry.stop(&created.id).await;
@@ -266,8 +254,9 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     }
 
     let _env = ExternalEnvGuard::set();
-    let claude_config = temp_dir("external-claude-config");
-    let codex_home = temp_dir("external-codex-home");
+    let env = TestEnv::new().expect("create the test environment");
+    let claude_config = env.config_home().join("claude");
+    let codex_home = env.config_home().join("codex");
     let claude_projects = claude_config.join("projects").join("work");
     let codex_sessions = codex_home.join("sessions");
     fs::create_dir_all(&claude_projects).expect("create claude projects");
@@ -275,15 +264,17 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config);
     std::env::set_var("CODEX_HOME", &codex_home);
 
-    let work_dir = temp_dir("external-agent-cwd");
-    let fake_claude = temp_dir("external-bin").join("claude");
+    let work_dir = env.cwd().to_path_buf();
+    let bin_dir = env.data_home().join("bin");
+    fs::create_dir(&bin_dir).expect("create the fake agent directory");
+    let fake_claude = bin_dir.join("claude");
     symlink_sleep_as(&fake_claude);
     let registry = SessionRegistry::new(SessionRegistryConfig {
         observe_external_agents: true,
         procwatch_poll: EXTERNAL_PROCWATCH_POLL,
         ..SessionRegistryConfig::default()
     });
-    let mut child = spawn_fake_agent(&fake_claude, &work_dir);
+    let mut child = spawn_fake_agent(&env, &fake_claude);
     let child_pid = child.id();
     let transcript = claude_projects.join("session.jsonl");
     fs::write(
@@ -296,7 +287,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     )
     .expect("write transcript");
 
-    let observed = wait_for_external_pid(&registry, child_pid, EXTERNAL_OBSERVE_TIMEOUT).await;
+    let observed = wait_for_external_pid(&registry, child_pid).await;
     assert_eq!(observed.id.0, format!("ext-{child_pid}"));
     assert_eq!(observed.external, Some(true));
     assert_eq!(observed.agent, "claude");
@@ -383,38 +374,18 @@ fn native_exit_watch_is_available() -> bool {
     }
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let dir = pohunek_test_support::temp_root().join(format!(
-        "pohunek-{tag}-{}-{}",
-        std::process::id(),
-        unix_nanos()
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-fn unix_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos()
-}
-
 fn symlink_sleep_as(path: &Path) {
     let sleep = which_sleep();
     std::os::unix::fs::symlink(sleep, path).expect("symlink fake codex");
 }
 
-fn spawn_fake_agent(program: &Path, cwd: &Path) -> Child {
-    Command::new(program)
+/// Starts a fake agent as a genuinely external process: it runs in the
+/// scrubbed environment of `env`, so it carries none of the pohunek ownership
+/// markers the test runner may itself have (a marked process is treated as
+/// another daemon's agent and would never surface as external).
+fn spawn_fake_agent(env: &TestEnv, program: &Path) -> Child {
+    env.command(program)
         .arg("60")
-        .current_dir(cwd)
-        // Scrub the pohunek ownership markers the test runner may itself carry
-        // (e.g. when the suite runs inside a pohunek-managed session): a marked
-        // process is treated as another daemon's agent and would never surface
-        // as external. The fake agent models a genuinely external process.
-        .env_remove(ENV_DAEMON_ID)
-        .env_remove(ENV_SESSION_ID)
         .spawn()
         .expect("spawn fake agent")
 }
@@ -429,81 +400,69 @@ fn which_sleep() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/bin/sleep"))
 }
 
-async fn wait_for_cwd(
-    registry: &SessionRegistry,
-    id: &SessionId,
-    expected: &Path,
-    timeout: Duration,
-) -> SessionInfo {
+async fn wait_for_cwd(registry: &SessionRegistry, id: &SessionId, expected: &Path) -> SessionInfo {
     let expected = fs::canonicalize(expected).expect("canonical expected cwd");
-    let deadline = Instant::now() + timeout;
-    loop {
+    wait_until("the session cwd to follow the shell cd", || async {
         let info = registry.inspect(id).await.expect("inspect session");
-        if info.cwd == expected {
-            return info;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for cwd {}",
-            expected.display()
-        );
-        tokio::time::sleep(CWD_WAIT_POLL).await;
-    }
+        (info.cwd == expected).then_some(info)
+    })
+    .await
 }
 
 async fn wait_for_pid_file(path: &Path) -> u32 {
-    for _ in 0..100 {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Ok(pid) = contents.trim().parse::<u32>() {
-                return pid;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for {}", path.display());
+    wait_until("the fake agent pid file", || async {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<u32>().ok())
+    })
+    .await
 }
 
-async fn wait_for_active_pid(
+/// Waits until the registry reports `pid` as the active agent of the session.
+async fn wait_for_observed_pid(
     registry: &SessionRegistry,
     id: &SessionId,
-    expected: Option<u32>,
+    pid: u32,
+) -> SessionInfo {
+    wait_until("the watcher to observe the agent", || async {
+        let info = registry.inspect(id).await.expect("inspect session");
+        (info.active_agent_pid == Some(pid)).then_some(info)
+    })
+    .await
+}
+
+/// Waits until the registry reports no active agent, within `timeout`.
+///
+/// The bound is the contract under test: the release must come from the exit
+/// watch, which is faster than the poll interval.
+async fn wait_for_cleared_agent(
+    registry: &SessionRegistry,
+    id: &SessionId,
     timeout: Duration,
 ) -> SessionInfo {
     let deadline = Instant::now() + timeout;
     loop {
         let info = registry.inspect(id).await.expect("inspect session");
-        if info.active_agent_pid == expected {
+        if info.active_agent_pid.is_none() {
             return info;
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for active_agent_pid {expected:?}"
+            "timed out waiting for the active agent to clear"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
-async fn wait_for_external_pid(
-    registry: &SessionRegistry,
-    pid: u32,
-    timeout: Duration,
-) -> SessionInfo {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(info) = registry
+async fn wait_for_external_pid(registry: &SessionRegistry, pid: u32) -> SessionInfo {
+    wait_until("the external observer to list the fake agent", || async {
+        registry
             .list()
             .await
             .into_iter()
             .find(|session| session.pid == pid)
-        {
-            return info;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for external pid {pid}"
-        );
-        tokio::time::sleep(EXTERNAL_WAIT_POLL).await;
-    }
+    })
+    .await
 }
 
 async fn assert_external_detection_unavailable(registry: &SessionRegistry, id: &SessionId) {
