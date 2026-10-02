@@ -371,6 +371,8 @@ impl Server {
             lease_epoch_tx,
             state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
+            #[cfg(test)]
+            starting_gate: Mutex::new(None),
         });
         Ok(Self {
             listener,
@@ -471,6 +473,20 @@ struct Shared {
     lease_epoch_tx: watch::Sender<u64>,
     state_changed: Notify,
     shutdown: CancellationToken,
+    /// Pauses `initialize` between the `Starting` commit and the child spawn.
+    #[cfg(test)]
+    starting_gate: Mutex<Option<StartingGate>>,
+}
+
+/// Test-only pause point that makes the transient `Starting` phase observable.
+///
+/// `initialize` sends on `reached` once `Starting` is committed and the state
+/// lock is released, then waits on `proceed` before it spawns the child.
+#[cfg(test)]
+#[derive(Debug)]
+struct StartingGate {
+    reached: oneshot::Sender<()>,
+    proceed: oneshot::Receiver<()>,
 }
 
 impl Shared {
@@ -1097,6 +1113,8 @@ async fn initialize_request(
         state.journal.updated_at = timestamp();
         persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
+    #[cfg(test)]
+    pause_after_starting(shared).await;
 
     let command = command_from_initialize(shared, &initialize, &runtime_id);
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
@@ -1173,6 +1191,20 @@ async fn spawn_running(
         return Err(control_error(ControlCode::RuntimeFault, error, false));
     }
     Ok((pty, child_process))
+}
+
+/// Waits at the installed [`StartingGate`], if any, with the state lock free.
+#[cfg(test)]
+async fn pause_after_starting(shared: &Shared) {
+    let gate = shared
+        .starting_gate
+        .lock()
+        .expect("starting gate lock")
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.proceed.await;
+    }
 }
 
 fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, ControlError> {
@@ -4433,6 +4465,12 @@ mod tests {
     /// Worker-to-client buffering of the partial-input regression stream.
     const CLIENT_BUFFER: usize = 4096;
 
+    /// The production stop grace: a stop under test never escalates early because
+    /// a loaded host was slow, and a child that dies on SIGTERM does not wait it out.
+    fn server_stop_grace() -> Duration {
+        crate::WorkerConfig::new().stop_grace
+    }
+
     /// A private fixture directory removed when the guard drops, also when the
     /// test fails.
     struct BarrierDirectory(tempfile::TempDir);
@@ -5029,9 +5067,11 @@ mod tests {
     #[tokio::test]
     async fn natural_exit_bounds_a_descendant_that_never_closes_the_pty() {
         let directory = BarrierDirectory::new();
+        // The descendant never closes the PTY, so the drain always expires; its
+        // short bound only keeps the test fast. The stop that follows uses the
+        // production grace.
         let config = crate::WorkerConfig {
             post_exit_drain_timeout: Duration::from_millis(50),
-            stop_grace: Duration::from_millis(50),
             ..crate::WorkerConfig::new()
         };
         let server = super::Server::bind(super::ServerArgs {
@@ -5082,16 +5122,11 @@ mod tests {
             runtime_id,
         );
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        pohunek_test_support::wait::wait_until("the natural drain to complete", || async {
+            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited)
+                .then_some(())
         })
-        .await
-        .expect("bounded natural drain completion");
+        .await;
         let state = server.shared.state.lock().await;
         assert_eq!(
             state
@@ -5118,6 +5153,9 @@ mod tests {
     async fn forced_output_completion_does_not_wait_for_the_output_monitor() {
         let directory = BarrierDirectory::new();
         let ready = directory.path().join("held-monitor-ready");
+        // The escaped holder never closes the PTY, so the drain expires and the
+        // stop force-closes the output whatever these windows are; they only keep
+        // the test fast.
         let config = crate::WorkerConfig {
             post_exit_drain_timeout: Duration::from_millis(50),
             stop_grace: Duration::from_millis(50),
@@ -5161,18 +5199,18 @@ mod tests {
         )
         .expect("spawn PTY");
         server.shared.state.lock().await.stop_grace = config.stop_grace;
-        tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+        pohunek_test_support::wait::guard("the root to exit", pty.wait_exit())
             .await
-            .expect("root exit deadline")
             .expect("root exit");
 
         let (_output_eof_tx, mut output_eof_rx) = tokio::sync::oneshot::channel();
-        let completion = tokio::time::timeout(
-            Duration::from_secs(1),
+        // A completion that waited for the held output monitor would never
+        // return, which the hang guard reports by name.
+        let completion = pohunek_test_support::wait::guard(
+            "forced output completion",
             super::wait_for_output_completion(&server.shared, &pty, &mut output_eof_rx),
         )
         .await
-        .expect("forced completion deadline")
         .expect("forced completion");
 
         assert!(matches!(
@@ -5190,6 +5228,8 @@ mod tests {
     async fn escaped_pty_holder_faults_with_the_exact_final_output_offset() {
         let directory = BarrierDirectory::new();
         let ready = directory.path().join("escaped-ready");
+        // The escaped holder never closes the PTY, so the runtime always faults at
+        // the same final offset; these windows only keep the test fast.
         let config = crate::WorkerConfig {
             post_exit_drain_timeout: Duration::from_millis(50),
             stop_grace: Duration::from_millis(50),
@@ -5249,16 +5289,11 @@ mod tests {
             runtime_id,
         );
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if server.shared.state.lock().await.phase == super::WireRuntimePhase::Faulted {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        pohunek_test_support::wait::wait_until("the forced-close fault", || async {
+            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Faulted)
+                .then_some(())
         })
-        .await
-        .expect("bounded forced-close fault");
+        .await;
         let final_offset = pty.output().next_offset();
         let journal = server.shared.journal.load().expect("load fault journal");
         assert_eq!(journal.phase, super::JournalPhase::Faulted);
@@ -5314,10 +5349,10 @@ mod tests {
         );
 
         std::fs::remove_dir(&journal_path).expect("restore writable journal path");
-        let retention = tokio::time::timeout(Duration::from_secs(2), &mut completion)
-            .await
-            .expect("terminal commit retry deadline")
-            .expect("completion remains active until commit");
+        let retention =
+            pohunek_test_support::wait::guard("the terminal commit to be retried", &mut completion)
+                .await
+                .expect("completion remains active until commit");
         assert!(!retention.is_zero());
         assert_eq!(
             server.shared.state.lock().await.phase,
@@ -5327,10 +5362,12 @@ mod tests {
         assert_eq!(journal.phase, super::JournalPhase::Terminal);
         assert_eq!(journal.next_output_offset, 42);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), &mut terminal_confirmation)
-                .await
-                .expect("terminal confirmation deadline")
-                .expect("terminal confirmation"),
+            pohunek_test_support::wait::guard(
+                "the terminal confirmation",
+                &mut terminal_confirmation
+            )
+            .await
+            .expect("terminal confirmation"),
             status
         );
         let () = {
@@ -5342,7 +5379,7 @@ mod tests {
             assert_eq!(retry_status, status);
             assert_eq!(state.phase, super::WireRuntimePhase::Exited);
         };
-        pty.stop("test-cleanup", Duration::from_millis(100))
+        pty.stop("test-cleanup", server_stop_grace())
             .await
             .expect("stop fixture PTY");
         drop(server);
@@ -5673,7 +5710,7 @@ mod tests {
             .await
             .expect("stream task")
             .expect("client EOF ends the stream cleanly");
-        pty.stop("test-cleanup", Duration::from_millis(100))
+        pty.stop("test-cleanup", server_stop_grace())
             .await
             .expect("stop fixture PTY");
     }
@@ -6679,10 +6716,10 @@ mod tests {
         assert!(!directory.path().join("fixture").exists());
     }
 
-    /// How long a lock holder observing `Starting` watches for the child.
+    /// How long the lock holder watches for a child while `Starting`.
     ///
-    /// Long enough for `/bin/sh` to start and write its marker when the child
-    /// is spawned outside the lock; a shorter wait only lowers the test's
+    /// Long enough for `/bin/sh` to start and write its marker if the child
+    /// were spawned outside the lock; a shorter wait only lowers the test's
     /// sensitivity, never makes it fail spuriously.
     const STARTING_CHILD_WATCH: Duration = Duration::from_millis(500);
 
@@ -6727,42 +6764,58 @@ mod tests {
         connection.lease_id = Some(lease_id.clone());
         connection.selected_version = Some(CURRENT_VERSION);
 
-        let shared = std::sync::Arc::clone(&server.shared);
-        let observer_marker = marker.clone();
-        let observer = tokio::spawn(async move {
-            loop {
-                let state = shared.state.lock().await;
-                match state.phase {
-                    super::WireRuntimePhase::Uninitialized => {
-                        drop(state);
-                        tokio::task::yield_now().await;
-                    }
-                    super::WireRuntimePhase::Starting => {
-                        let deadline = tokio::time::Instant::now() + STARTING_CHILD_WATCH;
-                        while tokio::time::Instant::now() < deadline {
-                            if observer_marker.exists() {
-                                return Some(true);
-                            }
-                            tokio::time::sleep(MARKER_POLL).await;
-                        }
-                        drop(state);
-                        return Some(false);
-                    }
-                    _ => return None,
-                }
-            }
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+        *server
+            .shared
+            .starting_gate
+            .lock()
+            .expect("starting gate lock") = Some(super::StartingGate {
+            reached: reached_tx,
+            proceed: proceed_rx,
         });
-        let initialized =
-            super::initialize_request(&server.shared, &connection, &lease_id, initialize)
-                .await
-                .expect("initialize runtime");
+        let shared = std::sync::Arc::clone(&server.shared);
+        let initializing = tokio::spawn(async move {
+            super::initialize_request(&shared, &connection, &lease_id, initialize).await
+        });
 
+        // `initialize` is now between the durable `Starting` commit and the
+        // child spawn, with the state lock free.
+        pohunek_test_support::wait::guard("initialize to commit Starting", reached_rx)
+            .await
+            .expect("initialize reaches the Starting gate");
+        let starting = server.shared.state.lock().await;
+        assert_eq!(starting.phase, super::WireRuntimePhase::Starting);
+        assert!(starting.pty.is_none(), "no child exists while `Starting`");
+        assert!(!marker.exists(), "no child has run while `Starting`");
+        proceed_tx.send(()).expect("resume initialize");
+        // `initialize` now waits for the state lock this test holds, and the
+        // child can only be spawned under that lock.
+        let deadline = tokio::time::Instant::now() + STARTING_CHILD_WATCH;
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                !marker.exists(),
+                "the child ran while the worker was observably `Starting`"
+            );
+            tokio::time::sleep(MARKER_POLL).await;
+        }
+        drop(starting);
+
+        let initialized = pohunek_test_support::wait::guard("initialize to finish", initializing)
+            .await
+            .expect("initialize task")
+            .expect("initialize runtime");
         assert!(matches!(initialized, ResponseKind::Initialized { .. }));
+        // The `Running` commit and the spawn shared one lock hold: once the
+        // lock is free, the worker is `Running` and the child starts.
         assert_eq!(
-            observer.await.expect("observer task"),
-            Some(false),
-            "the observer must see `Starting` and no child while it holds the lock"
+            server.shared.state.lock().await.phase,
+            super::WireRuntimePhase::Running
         );
+        pohunek_test_support::wait::wait_until("the child to start", || async {
+            marker.exists().then_some(())
+        })
+        .await;
         let pty = server
             .shared
             .state
@@ -6771,7 +6824,7 @@ mod tests {
             .pty
             .clone()
             .expect("running PTY");
-        pty.stop("test-cleanup", Duration::from_millis(500))
+        pty.stop("test-cleanup", server_stop_grace())
             .await
             .expect("stop child");
         // The runtime monitors journal the terminal state in the background;
