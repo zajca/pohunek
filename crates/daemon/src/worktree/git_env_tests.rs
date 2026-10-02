@@ -424,3 +424,188 @@ fn exec_path_does_not_reach_daemon_git() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Persistent user choices the parent exports; each must reach the subprocesses
+/// of a daemon fetch and checkout. None points at a file Git needs.
+const KEPT_USER_VARS: [(&str, &str); 6] = [
+    ("GIT_SSL_CERT", "/nonexistent/pohunek/client.pem"),
+    ("GIT_SSL_KEY", "/nonexistent/pohunek/client.key"),
+    ("GIT_SSL_CAINFO", "/nonexistent/pohunek/ca.pem"),
+    ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
+    ("GIT_LFS_SKIP_SMUDGE", "1"),
+    ("GIT_HTTP_LOW_SPEED_LIMIT", "1"),
+];
+
+/// Variable naming the file the parent set as `GIT_TRACE`, which a Git child
+/// that inherits it creates.
+const TRACE_FILE_VAR: &str = "GIT_TRACE";
+
+/// Per-invocation or unsafe variables the parent exports next to
+/// [`KEPT_USER_VARS`]; none may reach a subprocess of a daemon git child.
+const DROPPED_USER_VARS: [(&str, &str); 3] = [
+    ("GIT_SSL_NO_VERIFY", "1"),
+    ("GIT_CURL_VERBOSE", "1"),
+    ("GIT_PROTOCOL_PROBE", "1"),
+];
+
+/// Writes an executable script that appends the sorted names of its `GIT_*`
+/// environment variables to `record`; a `passthrough` script then copies stdin to
+/// stdout, as a smudge filter does, and any other script fails, as a transport
+/// that cannot connect does.
+fn write_env_recorder(root: &Path, name: &str, record: &Path, passthrough: bool) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = root.join(name);
+    let tail = if passthrough { "cat\n" } else { "exit 1\n" };
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv | cut -d= -f1 | grep '^GIT_' | sort >> '{}'\n{tail}",
+            record.display()
+        ),
+    )
+    .expect("write recorder");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("make recorder executable");
+    script
+}
+
+/// Names recorded in `record`, one per line.
+fn recorded_names(record: &Path) -> Vec<String> {
+    std::fs::read_to_string(record)
+        .expect("the helper recorded its environment")
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Child half of [`persistent_user_variables_reach_daemon_git_subprocesses`]: the
+/// environment holds [`KEPT_USER_VARS`] and [`DROPPED_USER_VARS`], and the
+/// repository's transport and smudge filter record the variables they receive.
+#[test]
+#[ignore = "child process of persistent_user_variables_reach_daemon_git_subprocesses"]
+fn daemon_git_subprocesses_under_user_variables() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let repo = env.root().join("repo");
+    let fetch_record = env.root().join("fetch-record");
+    let filter_record = env.root().join("filter-record");
+    let control_record = env.root().join("control-record");
+    let trace = PathBuf::from(std::env::var_os(TRACE_FILE_VAR).expect("trace file path"));
+    let ssh = write_env_recorder(env.root(), "ssh-recorder", &fetch_record, false);
+    let control_ssh = write_env_recorder(env.root(), "ssh-control", &control_record, false);
+    let smudge = write_env_recorder(env.root(), "smudge-recorder", &filter_record, true);
+
+    std::fs::create_dir(&repo).expect("create repository directory");
+    fixture_git(&env, &repo, &["init", "-q", "-b", "main"]);
+    fixture_git(&env, &repo, &["config", "user.email", "test@example.com"]);
+    fixture_git(&env, &repo, &["config", "user.name", "Test"]);
+    fixture_git(&env, &repo, &["config", "commit.gpgsign", "false"]);
+    fixture_git(
+        &env,
+        &repo,
+        &["remote", "add", "origin", "ssh://127.0.0.1/pohunek.git"],
+    );
+    fixture_git(
+        &env,
+        &repo,
+        &["config", "core.sshCommand", &ssh.display().to_string()],
+    );
+    fixture_git(
+        &env,
+        &repo,
+        &[
+            "config",
+            "filter.record.smudge",
+            &smudge.display().to_string(),
+        ],
+    );
+    std::fs::write(repo.join(".gitattributes"), "*.txt filter=record\n").expect("write attributes");
+    std::fs::write(repo.join("file.txt"), "content\n").expect("write file");
+    fixture_git(&env, &repo, &["add", "."]);
+    fixture_git(&env, &repo, &["commit", "-q", "-m", "init"]);
+
+    // Control: a git child that inherits the environment hands every variable
+    // to its transport, so the recorder observes them for this Git.
+    let control = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["fetch", "--no-tags", "origin", "main"])
+        .env("GIT_SSH_COMMAND", &control_ssh)
+        .output()
+        .expect("run control git");
+    assert!(!control.status.success());
+    let control_names = recorded_names(&control_record);
+    for (name, _) in KEPT_USER_VARS.iter().chain(&DROPPED_USER_VARS) {
+        assert!(
+            control_names.iter().any(|n| n == name),
+            "the inherited environment reaches the transport: {name}"
+        );
+    }
+    assert!(trace.is_file(), "the inherited trace variable is effective");
+    std::fs::remove_file(&trace).expect("remove trace file");
+
+    // The daemon's fetch reaches the same transport with the persistent
+    // variables only.
+    assert!(fetch_origin(&repo, "main").is_err());
+    let fetch_names = recorded_names(&fetch_record);
+    for (name, _) in KEPT_USER_VARS {
+        assert!(
+            fetch_names.iter().any(|n| n == name),
+            "{name} must reach the daemon's fetch transport"
+        );
+    }
+    for (name, _) in DROPPED_USER_VARS {
+        assert!(
+            !fetch_names.iter().any(|n| n == name),
+            "{name} reached the daemon's fetch transport"
+        );
+    }
+    assert!(
+        !fetch_names.iter().any(|n| n == TRACE_FILE_VAR),
+        "GIT_TRACE reached the daemon's fetch transport"
+    );
+    assert!(!trace.exists(), "the daemon's fetch wrote the trace file");
+
+    // The checkout of a new worktree runs the smudge filter with the same set.
+    worktree_add_new(&repo, &env.root().join("checkout"), "feature", "main").expect("add worktree");
+    let filter_names = recorded_names(&filter_record);
+    for (name, _) in KEPT_USER_VARS {
+        assert!(
+            filter_names.iter().any(|n| n == name),
+            "{name} must reach the daemon's smudge filter"
+        );
+    }
+    for (name, _) in DROPPED_USER_VARS {
+        assert!(
+            !filter_names.iter().any(|n| n == name),
+            "{name} reached the daemon's smudge filter"
+        );
+    }
+}
+
+/// Persistent transport, TLS, LFS and discovery settings of the daemon's
+/// environment reach the subprocesses of its fetches and checkouts, while
+/// per-invocation and diagnostic variables do not.
+#[test]
+fn persistent_user_variables_reach_daemon_git_subprocesses() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let output = env
+        .command(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "worktree::git_env_tests::daemon_git_subprocesses_under_user_variables",
+        ])
+        .envs(ISOLATED_GIT_CONFIG)
+        .envs(KEPT_USER_VARS)
+        .envs(DROPPED_USER_VARS)
+        .env(TRACE_FILE_VAR, env.root().join("trace"))
+        .output()
+        .expect("run scenario child");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
