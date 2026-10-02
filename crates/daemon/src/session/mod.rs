@@ -371,7 +371,7 @@ impl Default for SessionRegistryConfig {
     fn default() -> Self {
         Self {
             shell_command: ShellCommand::default(),
-            stop_grace: Duration::from_millis(500),
+            stop_grace: pohunek_service_config::DEFAULT_STOP_GRACE,
             attach_token_ttl: DEFAULT_ATTACH_TOKEN_TTL,
             attach_result_ttl: DEFAULT_ATTACH_RESULT_TTL,
             attach_result_capacity: DEFAULT_ATTACH_RESULT_CAPACITY,
