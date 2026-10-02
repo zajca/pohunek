@@ -4091,6 +4091,8 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
+    use pohunek_test_support::fs::{write_executable, write_file};
+
     use super::{
         assistant_panel_bottom, assistant_panel_count, assistant_panel_top, check_cli,
         classic_scenarios, compatibility_summary, compatibility_with, fail, finish_mocked_pty,
@@ -4168,14 +4170,13 @@ mod tests {
         }
     }
 
-    /// Temporary directory below a symlink-free parent, so paths handed to the
-    /// harness pass its canonical-path checks where `$TMPDIR` is a symlink
-    /// (macOS `/var/folders` resolves to `/private/var/folders`).
+    /// Temporary directory below an absolute, symlink-free parent.
+    ///
+    /// `pohunek_test_support::tempdir` guarantees that parent whatever `$TMPDIR`
+    /// holds, so paths handed to the harness pass its absolute and
+    /// canonical-path checks.
     fn canonical_tempdir() -> tempfile::TempDir {
-        let parent = fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp dir");
-        tempfile::Builder::new()
-            .tempdir_in(parent)
-            .expect("create canonical temporary directory")
+        pohunek_test_support::tempdir().expect("create canonical temporary directory")
     }
 
     fn fixture_repo() -> tempfile::TempDir {
@@ -4185,12 +4186,12 @@ mod tests {
         fs::create_dir_all(lock.parent().expect("lock parent")).expect("create lock parent");
         fs::create_dir_all(manifest.parent().expect("manifest parent"))
             .expect("create manifest parent");
-        fs::write(
+        write_file(
             lock,
             include_bytes!("../../../compat/hermes/compatibility-lock.json"),
         )
         .expect("write lock");
-        fs::write(
+        write_file(
             manifest,
             include_bytes!("../../../compat/hermes/goldens/manifest.json"),
         )
@@ -4202,9 +4203,9 @@ mod tests {
             .iter()
             .filter_map(|record| record.file.as_deref())
         {
-            fs::copy(
-                source_goldens.join(file),
+            write_file(
                 repo.path().join(GOLDEN_ROOT).join(file),
+                fs::read(source_goldens.join(file)).expect("read committed golden fixture"),
             )
             .expect("copy committed golden fixture");
         }
@@ -5134,8 +5135,6 @@ PY
 
     #[cfg(unix)]
     fn fake_hermes(root: &Path, version: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let path = root.join("hermes");
         let script_content = FAKE_HERMES_TEMPLATE
             .replace("__VERSION__", version)
@@ -5145,26 +5144,16 @@ PY
             .replace("__PANEL_BOTTOM__", &super::assistant_panel_bottom())
             .replace("__FRONT__", FAKE_FRONT_NAME)
             .replace("__PYTHON__", &python3_path().to_string_lossy());
-        fs::write(&path, script_content).expect("write fake Hermes");
-        fs::write(root.join(FAKE_FRONT_NAME), FAKE_FRONT_TEMPLATE).expect("write fake front end");
-        let mut permissions = fs::metadata(&path).expect("fake metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions).expect("make fake executable");
+        write_executable(&path, script_content).expect("write fake Hermes");
+        write_file(root.join(FAKE_FRONT_NAME), FAKE_FRONT_TEMPLATE).expect("write fake front end");
         script(root, "python", FAKE_PLUGIN_RUNTIME_TEMPLATE);
         path
     }
 
     #[cfg(unix)]
     fn script(root: &Path, name: &str, content: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let path = root.join(name);
-        fs::write(&path, content).expect("write controlled executable");
-        let mut permissions = fs::metadata(&path)
-            .expect("controlled executable metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&path, permissions).expect("make controlled executable runnable");
+        write_executable(&path, content).expect("write controlled executable");
         path
     }
 
@@ -5285,7 +5274,7 @@ PY
             content.contains(from),
             "controlled executable rewrite must match"
         );
-        fs::write(path, content.replace(from, to)).expect("rewrite controlled executable");
+        write_executable(path, content.replace(from, to)).expect("rewrite controlled executable");
     }
 
     #[cfg(unix)]
@@ -5418,10 +5407,10 @@ PY
         let root = canonical_tempdir();
         let package = root.path().join("hermes_cli");
         fs::create_dir(&package).expect("create stub package");
-        fs::write(package.join("__init__.py"), "").expect("write stub package marker");
+        write_file(package.join("__init__.py"), "").expect("write stub package marker");
         let skill = root.path().join("SKILL.md");
-        fs::write(&skill, "skill").expect("write stub skill");
-        fs::write(
+        write_file(&skill, "skill").expect("write stub skill");
+        write_file(
             package.join("plugins.py"),
             format!(
                 "from pathlib import Path\nclass _Manifest:\n    kind = {kind:?}\nclass _Loaded:\n    enabled = True\n    error = None\n    manifest = _Manifest()\n    module = None\n    tools_registered = {tools:?}\n    hooks_registered = {hooks:?}\nclass PluginManager:\n    def __init__(self):\n        self._plugins = {{'operators/pohunek': _Loaded()}}\n        self._plugin_skills = {{'pohunek:pohunek': {{'path': Path({skill:?})}}}}\n    def discover_and_load(self, force=False):\n        pass\n",
@@ -5551,7 +5540,7 @@ PY
             "#!/bin/sh\necho \"doctor $* PATH=$PATH HOME=$HOME extra=${POHUNEK_TEST_NOT_FORWARDED:-unset}\"\nexit 1\n",
         );
         let hermes = root.path().join("hermes");
-        fs::write(&hermes, "").expect("write hermes placeholder");
+        write_file(&hermes, "").expect("write hermes placeholder");
         let error = super::run_production_plugin_runtime(
             &pohunek,
             &hermes,
@@ -5599,7 +5588,7 @@ PY
             "#!/bin/sh\necho 'api_key=abcdefghijklmnop1234' >&2\nexit 1\n",
         );
         let hermes = root.path().join("hermes");
-        fs::write(&hermes, "").expect("write hermes placeholder");
+        write_file(&hermes, "").expect("write hermes placeholder");
         let error = super::run_production_plugin_runtime(
             &hermes,
             &hermes,
@@ -5738,7 +5727,8 @@ PY
         use std::os::unix::fs::symlink;
 
         let fixture = canonical_tempdir();
-        let safe_parent = PathBuf::from("/var/tmp");
+        let safe_root = short_fixture_root();
+        let safe_parent = safe_root.path().to_path_buf();
         let safe_alias = fixture.path().join("safe-alias");
         symlink(&safe_parent, &safe_alias).expect("create safe parent alias");
         let canonical_safe_parent =
@@ -5752,7 +5742,7 @@ PY
                 fs::create_dir(workspace.join(".git"))
                     .expect("create controlled Git directory marker");
             } else {
-                fs::write(workspace.join(".git"), "gitdir: controlled\n")
+                write_file(workspace.join(".git"), "gitdir: controlled\n")
                     .expect("create controlled Git file marker");
             }
 
@@ -5767,12 +5757,17 @@ PY
     }
 
     /// Short fixture root outside `$TMPDIR` and `/tmp`: hosts may keep a Git
-    /// marker in `/tmp`, which the parent selection rightly refuses.
+    /// marker in `/tmp`, which the parent selection rightly refuses, and the
+    /// test-support temp root is `$TMPDIR` or `/tmp`, so it cannot give that
+    /// guarantee.
     fn short_fixture_root() -> tempfile::TempDir {
+        // hermetic-allowed: #334 the selection under test refuses Git-marked ancestors, so the fixture needs a parent that is outside `/tmp`
         let parent = fs::canonicalize("/var/tmp").expect("canonicalize /var/tmp");
-        tempfile::Builder::new()
-            .tempdir_in(parent)
-            .expect("create short fixture root")
+        // hermetic-allowed: #334 same fixed parent as above
+        let builder = tempfile::Builder::new();
+        // hermetic-allowed: #334 same fixed parent as above
+        let created = builder.tempdir_in(parent);
+        created.expect("create short fixture root")
     }
 
     /// A directory whose canonical path is longer than any platform budget
@@ -6031,7 +6026,7 @@ PY
             .split_once(&format!("\n\n{ASSISTANT_PANEL_SECTION}\n"))
             .expect("captured model golden has derived panel evidence");
         let forged = format!("{header}\n\n{raw_transcript}\n");
-        fs::write(&golden_path, &forged).expect("write forged captured golden");
+        write_file(&golden_path, &forged).expect("write forged captured golden");
 
         let manifest_path = repo.path().join(GOLDEN_ROOT).join(GOLDEN_MANIFEST);
         let mut manifest = load_golden_manifest(repo.path()).expect("load refreshed manifest");
@@ -6048,7 +6043,7 @@ PY
         record.sha256 = Some(super::sha256(forged.as_bytes()));
         let mut rendered = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
         rendered.push('\n');
-        fs::write(manifest_path, rendered).expect("write rehashed manifest");
+        write_file(manifest_path, rendered).expect("write rehashed manifest");
 
         let pohunek = fake_pohunek(repo.path());
         let error = compatibility_with(repo.path(), &binary, &pohunek, fast_limits())
@@ -6165,7 +6160,7 @@ PY
         pending.note = Some("Controlled pending record.".to_owned());
         let mut rendered = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
         rendered.push('\n');
-        fs::write(manifest_path, rendered).expect("write pending manifest");
+        write_file(manifest_path, rendered).expect("write pending manifest");
 
         let pohunek = fake_pohunek(repo.path());
         let error = compatibility_with(repo.path(), &binary, &pohunek, fast_limits())
@@ -6214,7 +6209,7 @@ PY
         let lock = repo.path().join(LOCK_PATH);
         let mut bytes = fs::read(&lock).expect("read lock");
         bytes.push(b'\n');
-        fs::write(lock, bytes).expect("modify lock");
+        write_file(lock, bytes).expect("modify lock");
 
         let pohunek = fake_pohunek(repo.path());
         let error = compatibility_with(repo.path(), &hermes, &pohunek, fast_limits())
