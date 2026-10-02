@@ -1,5 +1,6 @@
-//! Daemon `git` children ignore repository-location variables of the
-//! environment they inherit, as in a daemon started from a git hook.
+//! Daemon `git` children ignore repository-location variables and
+//! command-scoped configuration of the environment they inherit, as in a daemon
+//! started from a git hook.
 //!
 //! The variables are set on a child process, because mutating this process's
 //! environment would race every other test.
@@ -195,5 +196,138 @@ fn ambient_git_variables_do_not_redirect_daemon_git() {
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Variable naming the hooks directory the parent configured as
+/// `core.hooksPath` through command-scoped configuration.
+const HOOKS_DIR_VAR: &str = "POHUNEK_TEST_GIT_HOOKS_DIR";
+
+/// File a `post-checkout` hook in the hooks directory creates when it runs.
+const HOOK_MARKER: &str = "ran";
+
+/// Writes an executable `post-checkout` hook that creates [`HOOK_MARKER`] next to
+/// itself and returns its directory.
+fn write_marker_hook(root: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hooks = root.join(name);
+    std::fs::create_dir(&hooks).expect("create hooks directory");
+    let hook = hooks.join("post-checkout");
+    std::fs::write(
+        &hook,
+        format!("#!/bin/sh\n: > '{}'\n", hooks.join(HOOK_MARKER).display()),
+    )
+    .expect("write hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+        .expect("make hook executable");
+    hooks
+}
+
+/// Child half of the command-scoped configuration tests: the environment holds
+/// a `core.hooksPath` override for [`HOOKS_DIR_VAR`], and a worktree the daemon
+/// adds must not run the hook.
+fn daemon_worktree_add_ignores_command_scoped_hooks_path() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let repo = env.root().join("repo");
+    let hooks = PathBuf::from(std::env::var_os(HOOKS_DIR_VAR).expect("hooks directory"));
+    let marker = hooks.join(HOOK_MARKER);
+    std::fs::create_dir(&repo).expect("create repository directory");
+    fixture_git(&env, &repo, &["init", "-q", "-b", "main"]);
+    fixture_git(&env, &repo, &["config", "user.email", "test@example.com"]);
+    fixture_git(&env, &repo, &["config", "user.name", "Test"]);
+    fixture_git(&env, &repo, &["config", "commit.gpgsign", "false"]);
+    fixture_git(
+        &env,
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+
+    // Control: a git child that inherits the environment runs the hook, so the
+    // override is effective for a Git that honors it.
+    let control = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "add", "-q", "--detach"])
+        .arg(env.root().join("control"))
+        .output()
+        .expect("run control git");
+    assert!(
+        control.status.success(),
+        "{}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+    assert!(marker.is_file(), "the inherited override runs the hook");
+    std::fs::remove_file(&marker).expect("remove marker");
+
+    let checkout = env.root().join("checkout");
+    worktree_add_new(&repo, &checkout, "feature", "main").expect("add worktree");
+    assert!(checkout.is_dir());
+    assert!(
+        !marker.exists(),
+        "the daemon's worktree add ran a hook from command-scoped configuration"
+    );
+}
+
+/// Child half of [`command_scoped_config_parameters_do_not_reach_daemon_git`].
+#[test]
+#[ignore = "child process of command_scoped_config_parameters_do_not_reach_daemon_git"]
+fn daemon_git_under_config_parameters() {
+    daemon_worktree_add_ignores_command_scoped_hooks_path();
+}
+
+/// Child half of [`command_scoped_config_entries_do_not_reach_daemon_git`].
+#[test]
+#[ignore = "child process of command_scoped_config_entries_do_not_reach_daemon_git"]
+fn daemon_git_under_config_entries() {
+    daemon_worktree_add_ignores_command_scoped_hooks_path();
+}
+
+/// Runs the ignored child test `name` with `configure` applied to its
+/// environment and asserts that it passes.
+fn run_hooks_path_child(name: &str, configure: impl FnOnce(&mut std::process::Command, &Path)) {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let hooks = write_marker_hook(env.root(), "hooks");
+    let mut command = env.command(std::env::current_exe().expect("test executable"));
+    command
+        .args(["--ignored", "--exact", name])
+        .envs(ISOLATED_GIT_CONFIG)
+        .env(HOOKS_DIR_VAR, &hooks);
+    configure(&mut command, &hooks);
+    let output = command.output().expect("run scenario child");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// `git -c core.hooksPath=<dir>` exports `GIT_CONFIG_PARAMETERS` to a hook.
+#[test]
+fn command_scoped_config_parameters_do_not_reach_daemon_git() {
+    run_hooks_path_child(
+        "worktree::git_env_tests::daemon_git_under_config_parameters",
+        |command, hooks| {
+            command.env(
+                "GIT_CONFIG_PARAMETERS",
+                format!("'core.hooksPath'='{}'", hooks.display()),
+            );
+        },
+    );
+}
+
+/// `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`
+/// carries the same override.
+#[test]
+fn command_scoped_config_entries_do_not_reach_daemon_git() {
+    run_hooks_path_child(
+        "worktree::git_env_tests::daemon_git_under_config_entries",
+        |command, hooks| {
+            command
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+                .env("GIT_CONFIG_VALUE_0", hooks);
+        },
     );
 }

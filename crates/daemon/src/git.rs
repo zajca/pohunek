@@ -5,10 +5,13 @@
 //! variables of the environment: a daemon started from a git hook, or from a
 //! shell that exported `GIT_DIR`, would otherwise address that repository for
 //! every project it manages, or refuse every ref update because a
-//! `git receive-pack` hook left its quarantine marker behind.
+//! `git receive-pack` hook left its quarantine marker behind. Configuration
+//! that `git -c` handed to a hook through the environment is dropped for the
+//! same reason: it describes one command, not the daemon's life.
 
 // Rust guideline compliant 2026-10-02
 
+use std::ffi::OsString;
 use std::process::Command;
 
 /// Variables that move Git to another repository, index or object store than
@@ -25,15 +28,18 @@ use std::process::Command;
 /// apply; each changes the commits `rev-list`, `rev-parse <commit>^` and
 /// `fetch` see. `GIT_IMPLICIT_WORK_TREE` stays: it only qualifies an explicit
 /// `GIT_DIR`, which is removed. `GIT_PREFIX` stays: Git only exports it to
-/// aliases and hooks and never reads it. `GIT_CONFIG`, `GIT_CONFIG_COUNT` and
-/// `GIT_CONFIG_PARAMETERS` stay because they are configuration input, like the
-/// other `GIT_CONFIG_*` variables. `GIT_DISCOVERY_ACROSS_FILESYSTEM` stays:
+/// aliases and hooks and never reads it. `GIT_CONFIG` stays: only `git config`
+/// reads it, and no daemon child is that command. The command-scoped
+/// configuration variables are in [`COMMAND_SCOPED_CONFIG_VARS`], while
+/// `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` stay
+/// because they are the user's persistent choice of configuration files.
+/// `GIT_DISCOVERY_ACROSS_FILESYSTEM` stays:
 /// unset is Git's default (stop at a filesystem boundary) and a set value only
 /// widens discovery, so removing it could hide a repository across a mount.
 /// `GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT` and `GIT_INDEX_VERSION` stay
 /// because they only shape a repository or index while Git creates it and never
 /// redirect a command at an existing repository. The user's configuration and
-/// identity variables (`GIT_CONFIG_*`, `GIT_AUTHOR_*`, `GIT_COMMITTER_*`,
+/// identity variables (`GIT_CONFIG_GLOBAL`, `GIT_AUTHOR_*`, `GIT_COMMITTER_*`,
 /// `GIT_SSH_COMMAND`, ...) stay because they are legitimate input.
 ///
 /// `xtask` keeps this list for its changed-file queries
@@ -90,9 +96,44 @@ pub(crate) const DISCOVERY_RESTRICTING_VARS: &[&str] = &["GIT_CEILING_DIRECTORIE
 /// `GIT_WORK_TREE`) are in [`REPOSITORY_REDIRECTING_VARS`].
 pub(crate) const WRITE_RESTRICTING_VARS: &[&str] = &["GIT_QUARANTINE_PATH"];
 
+/// Variables through which Git hands the configuration of one command to the
+/// processes it starts.
+///
+/// `git -c key=value` exports `GIT_CONFIG_PARAMETERS` to hooks and aliases, and
+/// `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` carry
+/// the same kind of override. A daemon started from such a hook would apply it
+/// to every repository it manages for its whole life, for example a
+/// `core.hooksPath` that runs the original repository's hooks in other
+/// checkouts or a `protocol.file.allow=never` that breaks fetches from local
+/// remotes, so a command-scoped override must not outlive the command that set
+/// it. Without `GIT_CONFIG_COUNT` the key and value variables are inert; they
+/// are still dropped by name (see [`command`]) so no later count can revive
+/// them. `xtask` is a one-shot developer command where such an override is the
+/// invoking user's intent, so it keeps them.
+pub(crate) const COMMAND_SCOPED_CONFIG_VARS: &[&str] =
+    &["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+
+/// Prefixes of the indexed `GIT_CONFIG_COUNT` entries.
+const COMMAND_SCOPED_CONFIG_ENTRY_PREFIXES: [&str; 2] = ["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
+
+/// Names among `names` that are indexed command-scoped configuration entries.
+fn command_scoped_config_entries(
+    names: impl IntoIterator<Item = OsString>,
+) -> impl Iterator<Item = OsString> {
+    names.into_iter().filter(|name| {
+        name.to_str().is_some_and(|name| {
+            COMMAND_SCOPED_CONFIG_ENTRY_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+    })
+}
+
 /// Builds a command for the trusted `git` executable that drops the
-/// [`REPOSITORY_REDIRECTING_VARS`], [`DISCOVERY_RESTRICTING_VARS`] and
-/// [`WRITE_RESTRICTING_VARS`] it would inherit.
+/// [`REPOSITORY_REDIRECTING_VARS`], [`DISCOVERY_RESTRICTING_VARS`],
+/// [`WRITE_RESTRICTING_VARS`] and [`COMMAND_SCOPED_CONFIG_VARS`] it would
+/// inherit, plus every `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` present
+/// in the daemon's environment.
 ///
 /// The executable is resolved once through
 /// [`trusted_program`](crate::agent::trusted_program), so no second `PATH`
@@ -110,8 +151,12 @@ pub(crate) fn command() -> Result<Command, String> {
         .iter()
         .chain(DISCOVERY_RESTRICTING_VARS)
         .chain(WRITE_RESTRICTING_VARS)
+        .chain(COMMAND_SCOPED_CONFIG_VARS)
     {
         command.env_remove(var);
+    }
+    for entry in command_scoped_config_entries(std::env::vars_os().map(|(name, _)| name)) {
+        command.env_remove(entry);
     }
     Ok(command)
 }
@@ -134,18 +179,55 @@ mod tests {
         let mut expected = REPOSITORY_REDIRECTING_VARS.to_vec();
         expected.extend(DISCOVERY_RESTRICTING_VARS);
         expected.extend(WRITE_RESTRICTING_VARS);
+        expected.extend(COMMAND_SCOPED_CONFIG_VARS);
+        // Indexed configuration entries present in this process's environment
+        // are dropped as well.
+        let entries: Vec<String> =
+            command_scoped_config_entries(std::env::vars_os().map(|(name, _)| name))
+                .filter_map(|name| name.into_string().ok())
+                .collect();
+        expected.extend(entries.iter().map(String::as_str));
         expected.sort_unstable();
+        expected.dedup();
         assert_eq!(removed, expected);
         assert_eq!(command.get_envs().count(), expected.len());
+    }
+
+    #[test]
+    fn indexed_configuration_entries_are_selected_by_prefix_only() {
+        let names = [
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_17",
+            "GIT_CONFIG_VALUE_17",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "PATH",
+        ]
+        .map(OsString::from);
+        let selected: Vec<OsString> = command_scoped_config_entries(names).collect();
+        assert_eq!(
+            selected,
+            [
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "GIT_CONFIG_KEY_17",
+                "GIT_CONFIG_VALUE_17"
+            ]
+            .map(OsString::from)
+        );
     }
 
     #[test]
     fn the_list_names_only_repository_location_variables() {
         for kept in [
             "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_CONFIG_NOSYSTEM",
             "GIT_CONFIG",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_PARAMETERS",
             "GIT_PREFIX",
             "GIT_IMPLICIT_WORK_TREE",
             "GIT_AUTHOR_NAME",
@@ -163,10 +245,15 @@ mod tests {
             assert!(!REPOSITORY_REDIRECTING_VARS.contains(&kept), "{kept}");
             assert!(!DISCOVERY_RESTRICTING_VARS.contains(&kept), "{kept}");
             assert!(!WRITE_RESTRICTING_VARS.contains(&kept), "{kept}");
+            assert!(!COMMAND_SCOPED_CONFIG_VARS.contains(&kept), "{kept}");
         }
         assert_eq!(REPOSITORY_REDIRECTING_VARS.len(), 12);
         assert_eq!(DISCOVERY_RESTRICTING_VARS, ["GIT_CEILING_DIRECTORIES"]);
         assert_eq!(WRITE_RESTRICTING_VARS, ["GIT_QUARANTINE_PATH"]);
+        assert_eq!(
+            COMMAND_SCOPED_CONFIG_VARS,
+            ["GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"]
+        );
     }
 
     /// Names in the string-literal list that follows `marker` in `source`.
@@ -184,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn the_list_contains_every_xtask_variable_and_only_hook_and_ceiling_variables_are_daemon_only()
+    fn the_list_contains_every_xtask_variable_and_only_session_and_hook_variables_are_daemon_only()
     {
         let xtask = pohunek_test_support::workspace_root().join("crates/xtask/src/affected.rs");
         let source = std::fs::read_to_string(xtask).expect("read the xtask affected module");
@@ -194,6 +281,7 @@ mod tests {
             .iter()
             .chain(DISCOVERY_RESTRICTING_VARS)
             .chain(WRITE_RESTRICTING_VARS)
+            .chain(COMMAND_SCOPED_CONFIG_VARS)
             .copied()
             .collect();
         for name in &theirs {
@@ -201,8 +289,9 @@ mod tests {
         }
         // The daemon runs git from nested session directories, where an
         // inherited ceiling hides the project, and writes refs, which a
-        // quarantine marker forbids; xtask runs from the repository root and
-        // only reads.
+        // quarantine marker forbids, and outlives the hook whose command-scoped
+        // configuration it could inherit; xtask runs once from the repository
+        // root, only reads, and honors the invoking user's `git -c`.
         let daemon_only: Vec<&str> = ours
             .iter()
             .copied()
@@ -210,7 +299,12 @@ mod tests {
             .collect();
         assert_eq!(
             daemon_only,
-            ["GIT_CEILING_DIRECTORIES", "GIT_QUARANTINE_PATH"]
+            [
+                "GIT_CEILING_DIRECTORIES",
+                "GIT_QUARANTINE_PATH",
+                "GIT_CONFIG_PARAMETERS",
+                "GIT_CONFIG_COUNT"
+            ]
         );
     }
 
