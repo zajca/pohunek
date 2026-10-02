@@ -24,7 +24,7 @@ pub use transport::{
     attach_raw_tcp_addr_with_options, attach_raw_with_options, connect_raw, connect_raw_local,
     connect_raw_local_with_options, connect_raw_tcp_addr, connect_raw_tcp_addr_with_options,
     connect_raw_with_options, is_local_host, next_request_id, remote_host_with_port, Client,
-    ClientOptions, RawStream, Subscription, LOCAL_HOST,
+    ClientOptions, OriginSource, RawStream, Subscription, LOCAL_HOST,
 };
 
 /// Load the production overlay registry from fail-fast provider configuration.

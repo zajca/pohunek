@@ -10,7 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use pohunek_client::Client;
+use no_origin::{
+    add_project, inspect_host_governance, inspect_session, list_project_actions, list_projects,
+    load_host_snapshot, read_session_output, read_session_screen, remove_project, rename_project,
+    resolve_project_action, resolve_project_prompt, set_session_metadata, show_project,
+    stop_session as stop_gui_session, wait_for_session,
+};
+use pohunek_client::{Client, ClientOptions, OriginSource};
 use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::NotificationService;
@@ -20,20 +26,16 @@ use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::store::Store;
 use pohunek_gui_core::assistant::{self, AssistantPaths, Intent, LaunchParams};
 use pohunek_gui_core::{
-    add_project, dispatch_review, host_subscription_stream, inspect_host_governance,
-    inspect_session, launch_action_prompt_with_options, launch_provider_item_with_options,
-    list_project_actions, list_projects, load_host_snapshot, parse_unified_diff,
-    preview_action_prompt, preview_prompt_content, read_session_output, read_session_screen,
-    remove_project, rename_project, render_review_prompt, resolve_project_action,
-    resolve_project_prompt, session_link_metadata, session_metadata_rows,
-    set_notification_policy_with_options, set_session_metadata, show_project, spawn_attach_command,
-    stop_session as stop_gui_session, wait_for_session, workspace_connection_stream,
-    AgentStateEvent, AttachCommandSpawner, AttachSpawnIntent, AttachTemplateValues, ConnState,
-    ConnectionOptions, CoreError, DiffFileStatus, DomainEvent, HealthSummary, HostConfig,
-    HostEvent, HostId, HostSnapshot, HostView, PromptContext, PromptLaunchParams, PromptPreview,
-    ProviderLaunchItem, ProviderLaunchParams, Review, ReviewComment, ReviewDispatchParams,
-    ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection, SessionLinkKind,
-    SessionLinkProvider, UiState, WindowSize, Workspace,
+    dispatch_review, launch_action_prompt_with_options, launch_provider_item_with_options,
+    parse_unified_diff, preview_action_prompt, preview_prompt_content, render_review_prompt,
+    session_link_metadata, session_metadata_rows, set_notification_policy_with_options,
+    spawn_attach_command, workspace_connection_stream, AgentStateEvent, AttachCommandSpawner,
+    AttachSpawnIntent, AttachTemplateValues, ConnState, ConnectionOptions, CoreError,
+    DiffFileStatus, DomainEvent, HealthSummary, HostConfig, HostEvent, HostId, HostSnapshot,
+    HostView, PromptContext, PromptLaunchParams, PromptPreview, ProviderLaunchItem,
+    ProviderLaunchParams, Review, ReviewComment, ReviewDispatchParams, ReviewSide, ReviewSource,
+    ReviewStatus, ReviewStore, Selection, SessionLinkKind, SessionLinkProvider, UiState,
+    WindowSize, Workspace,
 };
 use pohunek_test_support::{wait, worker_binary};
 use protocol::{
@@ -60,6 +62,8 @@ const GUI_TEST_OUTPUT_BYTES: u32 = 1_024;
 
 // The state predicate is already true, so this only bounds a regression hang.
 const GUI_TEST_WAIT_MS: u32 = 100;
+
+mod no_origin;
 
 static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -111,7 +115,10 @@ async fn loopback_hosts_seed_and_stream_agent_state() {
         .iter()
         .any(|provider| provider == "codex"));
 
-    let mut events = Box::pin(host_subscription_stream(host_a.clone()));
+    let mut events = Box::pin(workspace_connection_stream(
+        vec![host_a.clone()],
+        test_connection_options(),
+    ));
     assert!(matches!(
         events.next().await.expect("connecting message"),
         DomainEvent::HostConnecting { .. }
@@ -338,7 +345,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     ));
     wait_for_host_connected(&mut workspace, &mut stream, &host).await;
 
-    let created = pohunek_gui_core::create_session(
+    let created = no_origin::create_session(
         &host,
         SessionNewParams {
             agent: agent_name(&AgentKind::Codex).to_owned(),
@@ -493,7 +500,7 @@ async fn session_metadata_merge_and_clear_round_trips() {
 
     let daemon = LoopbackDaemon::spawn("m2-metadata", "0.2.0-metadata").await;
     let host = HostConfig::tcp("host-metadata", daemon.addr);
-    let created = pohunek_gui_core::create_session(
+    let created = no_origin::create_session(
         &host,
         SessionNewParams {
             agent: agent_name(&AgentKind::Codex).to_owned(),
@@ -642,7 +649,7 @@ async fn worktree_creation_is_session_new_with_branch_and_visible_in_project_sho
     .await
     .expect("project.add for worktree");
 
-    let created = pohunek_gui_core::create_session(
+    let created = no_origin::create_session(
         &host,
         SessionNewParams {
             agent: agent_name(&AgentKind::Codex).to_owned(),
@@ -1471,7 +1478,7 @@ fn install_review_template(tag: &str) -> EnvGuard {
 }
 
 async fn create_worktree_session(host: &HostConfig, project_id: &str, branch: &str) -> SessionInfo {
-    pohunek_gui_core::create_session(
+    no_origin::create_session(
         host,
         SessionNewParams {
             agent: agent_name(&AgentKind::Codex).to_owned(),
@@ -1523,7 +1530,7 @@ async fn review_session_diff_is_parsed_into_added_and_modified_files() {
     std::fs::write(worktree_path.join("new_file.txt"), "brand new content\n")
         .expect("write new file");
 
-    let diff_result = pohunek_gui_core::diff_session(
+    let diff_result = no_origin::diff_session(
         &host,
         SessionDiffParams {
             session_id: session.id.clone(),
@@ -1917,7 +1924,7 @@ async fn review_state_never_contains_diff_content_or_embedded_secrets() {
         session_id: session.id.clone(),
         base: None,
     };
-    let diff_result = pohunek_gui_core::diff_session(&host, diff_params.clone())
+    let diff_result = no_origin::diff_session(&host, diff_params.clone())
         .await
         .expect("session.diff");
     // Sanity: the secret really is present in the fetched diff text, so the
@@ -2241,6 +2248,7 @@ fn test_connection_options() -> ConnectionOptions {
         reconcile_interval: Duration::from_millis(100),
         backoff_initial: Duration::from_millis(10),
         backoff_max: Duration::from_millis(50),
+        origin_source: OriginSource::Omitted,
     }
 }
 
@@ -2712,9 +2720,13 @@ async fn stop_session(host: &HostConfig, id: &SessionId) {
 async fn client(host: &HostConfig) -> Client {
     match host.transport {
         pohunek_gui_core::HostTransport::Tcp { addr, .. } => {
-            Client::connect_trusted_tcp_addr(host.id.as_str(), addr)
-                .await
-                .expect("connect tcp")
+            Client::connect_trusted_tcp_addr_with_options(
+                host.id.as_str(),
+                addr,
+                ClientOptions::default().with_origin_source(OriginSource::Omitted),
+            )
+            .await
+            .expect("connect tcp")
         }
         pohunek_gui_core::HostTransport::Local { .. } => {
             panic!("loopback harness expects TCP hosts")

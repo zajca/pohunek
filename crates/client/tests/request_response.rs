@@ -8,7 +8,7 @@ use std::time::Duration;
 use pohunek_client::protocol::{
     self, ErrorClass, ProtocolError, Request, Response, MAX_CONTROL_LINE_BYTES,
 };
-use pohunek_client::{next_request_id, Client, ClientError, ClientOptions};
+use pohunek_client::{next_request_id, Client, ClientError, ClientOptions, OriginSource};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -16,6 +16,12 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const HOST: &str = "build-box";
+
+/// Options that send no request origin, so a test result never depends on the
+/// `POHUNEK_*` variables of the developer's own session.
+fn no_origin_options() -> ClientOptions {
+    ClientOptions::default().with_origin_source(OriginSource::Omitted)
+}
 const LEGACY_PROTOCOL_VERSION: u32 = 1;
 const DISCOVERED_HOST_PORT: u16 = 18_722;
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
@@ -272,7 +278,7 @@ async fn waiting_output_uses_a_dedicated_connection() {
         (first_request, second_request)
     });
 
-    let mut client = Client::connect_local(&socket_path)
+    let mut client = Client::connect_local_with_options(&socket_path, no_origin_options())
         .await
         .expect("connect test daemon");
     client.handshake().await.expect("negotiate protocol");
@@ -353,7 +359,7 @@ async fn waiting_output_uses_a_dedicated_remote_tcp_connection() {
         (handshake, output_request)
     });
 
-    let mut client = Client::connect_trusted_tcp_addr(HOST, addr)
+    let mut client = Client::connect_trusted_tcp_addr_with_options(HOST, addr, no_origin_options())
         .await
         .expect("connect tcp daemon");
     client.handshake().await.expect("negotiate protocol");
@@ -438,7 +444,7 @@ async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
         (handshake, input, follow_up)
     });
 
-    let options = ClientOptions::default().with_request_timeout(Duration::from_millis(20));
+    let options = no_origin_options().with_request_timeout(Duration::from_millis(20));
     let mut client = Client::connect_local_with_options(&socket_path, options)
         .await
         .expect("connect test daemon");
@@ -520,7 +526,7 @@ async fn cancelling_session_wait_keeps_the_shared_connection_usable() {
         follow_up
     });
 
-    let mut client = Client::connect_local(&socket_path)
+    let mut client = Client::connect_local_with_options(&socket_path, no_origin_options())
         .await
         .expect("connect test daemon");
     client.handshake().await.expect("negotiate protocol");
@@ -659,7 +665,7 @@ async fn request_response_typed_call_sends_method_params_and_decodes_output() {
             "classification": "candidate"
         }
     ]));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local test daemon");
 
@@ -716,7 +722,7 @@ async fn integration_status_sdk_helper_sends_typed_read_only_request() {
             "warnings": []
         }]
     }));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local test daemon");
 
@@ -754,7 +760,7 @@ async fn request_response_typed_call_reports_output_deserialization_errors() {
         "daemon_version": "0.15.1",
         "protocol_version": "not-a-number"
     }));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local test daemon");
 
@@ -780,7 +786,7 @@ async fn request_response_handshake_returns_daemon_protocol_version() {
         "daemon_version": "0.15.1",
         "protocol_version": protocol::PROTOCOL_VERSION
     }));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local test daemon");
 
@@ -904,7 +910,7 @@ async fn request_response_timeout_poisons_connection_before_late_response_can_be
         response_ok_line_for(&first_request, json!({"request": 1})),
         Duration::from_millis(60),
     );
-    let options = ClientOptions::default().with_request_timeout(Duration::from_millis(20));
+    let options = no_origin_options().with_request_timeout(Duration::from_millis(20));
     let mut client = Client::connect_local_with_options(&daemon.socket_path, options)
         .await
         .expect("connect local test daemon");
@@ -979,7 +985,7 @@ async fn request_response_id_mismatch_poisons_connection_before_it_can_be_reused
     let second_request = request_with_id("req-id-mismatch-2");
     let wrong_id_reply = response_ok_line_for(&request_with_id("wrong-response-id"), ok_payload());
     let daemon = spawn_reusable_daemon(wrong_id_reply);
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local reusable daemon");
 
@@ -1033,7 +1039,7 @@ async fn request_response_create_notification_sends_method_and_returns_typed_res
         record: sample_notification_record(),
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1063,7 +1069,7 @@ async fn request_response_list_notifications_sends_method_and_returns_typed_resu
         next_cursor: Some("cursor-1".to_owned()),
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1092,7 +1098,7 @@ async fn request_response_update_notification_sends_method_and_returns_typed_res
         record: sample_notification_record(),
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1121,7 +1127,7 @@ async fn request_response_delete_notification_sends_method_and_returns_typed_res
         deleted: true,
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1146,7 +1152,7 @@ async fn request_response_get_notification_policy_sends_null_params_and_returns_
         policy: sample_policy(),
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1175,7 +1181,7 @@ async fn host_governance_inspect_sends_null_params_and_returns_safe_status() {
     )
     .expect("valid never-enrolled safe status");
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize status"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1201,7 +1207,7 @@ async fn daemon_doctor_sends_null_params_and_returns_typed_report() {
         )]),
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize report"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1223,7 +1229,7 @@ async fn daemon_doctor_preserves_typed_daemon_errors() {
         Some("reload or restart the daemon, then retry".to_owned()),
     );
     let daemon = spawn_echo_error_daemon(source.clone());
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1246,7 +1252,7 @@ async fn request_response_set_notification_policy_sends_method_and_returns_polic
         policy: sample_policy(),
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1278,7 +1284,7 @@ async fn request_response_prune_notifications_sends_method_and_returns_typed_res
         pruned: vec![protocol::NotificationId("n-1".to_owned())],
     };
     let daemon = spawn_echo_ok_daemon(serde_json::to_value(&expected).expect("serialize result"));
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local echo daemon");
 
@@ -1302,7 +1308,7 @@ async fn request_response_prune_notifications_sends_method_and_returns_typed_res
 
 async fn run_local(reply: Reply) -> (Result<Value, ClientError>, String) {
     let daemon = spawn_unix_daemon(reply);
-    let mut client = Client::connect_local(&daemon.socket_path)
+    let mut client = Client::connect_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local test daemon");
     let result = client.request(&test_request()).await;
@@ -1316,9 +1322,10 @@ async fn run_local(reply: Reply) -> (Result<Value, ClientError>, String) {
 
 async fn run_remote(reply: Reply) -> (Result<Value, ClientError>, String) {
     let daemon = spawn_tcp_daemon(reply).await;
-    let mut client = Client::connect_trusted_tcp_addr(HOST, daemon.addr)
-        .await
-        .expect("connect tcp test daemon");
+    let mut client =
+        Client::connect_trusted_tcp_addr_with_options(HOST, daemon.addr, no_origin_options())
+            .await
+            .expect("connect tcp test daemon");
     let result = client.request(&test_request()).await;
     let request_line = daemon
         .request_line

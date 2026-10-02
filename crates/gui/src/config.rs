@@ -223,6 +223,7 @@ impl RawGuiConfig {
                 "gui.backoff_max_ms",
                 defaults.backoff_max,
             )?,
+            origin_source: defaults.origin_source,
         })
     }
 

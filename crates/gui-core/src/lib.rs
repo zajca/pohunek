@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pohunek_client::ClientOptions;
+use pohunek_client::{ClientOptions, OriginSource};
 use protocol::{
     AgentKind, AgentRuntime, DaemonHealthResult, NotificationRecord, ProjectInfo, ProtocolVersion,
     SessionInfo,
@@ -66,17 +66,17 @@ pub use sdk::{
     inspect_session_with_options, integration_status, integration_status_with_options,
     launch_action_prompt_with_options, launch_provider_item_with_options, list_notifications,
     list_notifications_with_options, list_project_actions, list_project_actions_with_options,
-    list_projects, list_projects_with_options, load_host, load_host_snapshot, read_session_output,
-    read_session_output_with_options, read_session_screen, read_session_screen_with_options,
-    remove_project, remove_project_with_options, remove_session, remove_session_with_options,
-    remove_worktree, remove_worktree_with_options, rename_project, rename_project_with_options,
-    rename_session, rename_session_with_options, resolve_project_action,
-    resolve_project_action_with_options, resolve_project_prompt,
-    resolve_project_prompt_with_options, resume_session, resume_session_with_options,
-    set_notification_policy_with_options, set_session_metadata, set_session_metadata_with_options,
-    show_project, show_project_with_options, stop_session, stop_session_with_options,
-    update_notification, update_notification_with_options, wait_for_session,
-    wait_for_session_with_options,
+    list_projects, list_projects_with_options, load_host, load_host_snapshot,
+    load_host_snapshot_with_options, read_session_output, read_session_output_with_options,
+    read_session_screen, read_session_screen_with_options, remove_project,
+    remove_project_with_options, remove_session, remove_session_with_options, remove_worktree,
+    remove_worktree_with_options, rename_project, rename_project_with_options, rename_session,
+    rename_session_with_options, resolve_project_action, resolve_project_action_with_options,
+    resolve_project_prompt, resolve_project_prompt_with_options, resume_session,
+    resume_session_with_options, set_notification_policy_with_options, set_session_metadata,
+    set_session_metadata_with_options, show_project, show_project_with_options, stop_session,
+    stop_session_with_options, update_notification, update_notification_with_options,
+    wait_for_session, wait_for_session_with_options,
 };
 #[doc(inline)]
 pub use state::{
@@ -119,6 +119,10 @@ pub struct ConnectionOptions {
     pub reconcile_interval: Duration,
     pub backoff_initial: Duration,
     pub backoff_max: Duration,
+    /// Where SDK requests take their origin from. Process-local policy, not
+    /// part of the serialized form.
+    #[serde(skip)]
+    pub origin_source: OriginSource,
 }
 
 impl Default for ConnectionOptions {
@@ -129,6 +133,7 @@ impl Default for ConnectionOptions {
             reconcile_interval: DEFAULT_RECONCILE_INTERVAL,
             backoff_initial: DEFAULT_BACKOFF_INITIAL,
             backoff_max: DEFAULT_BACKOFF_MAX,
+            origin_source: OriginSource::default(),
         }
     }
 }
@@ -138,6 +143,7 @@ impl ConnectionOptions {
         ClientOptions::default()
             .with_connect_timeout(self.connect_timeout)
             .with_request_timeout(self.request_timeout)
+            .with_origin_source(self.origin_source)
     }
 }
 

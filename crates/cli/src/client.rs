@@ -62,10 +62,18 @@ impl Client {
         host: &str,
         registry: pohunek_client::OverlayRegistry,
     ) -> Result<Self, CliError> {
-        let inner =
-            pohunek_client::Client::connect_with_registry(host, "/unused/local.sock", registry)
-                .await
-                .map_err(map_connect_error)?;
+        // No origin: the test result must not depend on the `POHUNEK_*`
+        // variables of the developer's own session.
+        let options = pohunek_client::ClientOptions::default()
+            .with_origin_source(pohunek_client::OriginSource::Omitted);
+        let inner = pohunek_client::Client::connect_with_registry_and_options(
+            host,
+            "/unused/local.sock",
+            registry,
+            options,
+        )
+        .await
+        .map_err(map_connect_error)?;
         Ok(Self { inner })
     }
 

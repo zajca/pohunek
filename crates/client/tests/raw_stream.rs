@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pohunek_client::protocol::AttachHeader;
 use pohunek_client::{
-    attach_raw, attach_raw_local, attach_raw_tcp_addr, connect_raw, connect_raw_local,
-    connect_raw_tcp_addr, RawStream,
+    attach_raw_local_with_options, attach_raw_tcp_addr_with_options, attach_raw_with_options,
+    connect_raw_local_with_options, connect_raw_tcp_addr_with_options, connect_raw_with_options,
+    ClientOptions, OriginSource, RawStream,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -14,6 +15,12 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 const HOST: &str = "build-box";
+
+/// Options that send no request origin, so a test result never depends on the
+/// `POHUNEK_*` variables of the developer's own session.
+fn no_origin_options() -> ClientOptions {
+    ClientOptions::default().with_origin_source(OriginSource::Omitted)
+}
 
 static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -52,7 +59,7 @@ async fn raw_stream_connect_raw_local_carries_attach_header_and_unframed_bytes()
     let daemon = spawn_unix_raw_daemon();
     let body = vec![0x00, b'p', b't', b'y', b'\n', 0xff, b'x'];
 
-    let raw = connect_raw_local(&daemon.socket_path)
+    let raw = connect_raw_local_with_options(&daemon.socket_path, no_origin_options())
         .await
         .expect("connect local raw daemon");
     match raw {
@@ -79,9 +86,10 @@ async fn raw_stream_attach_raw_local_writes_attach_header_before_unframed_bytes(
     let daemon = spawn_unix_raw_daemon();
     let body = vec![0x00, b'p', b't', b'y', b'\n', 0xff, b'x'];
 
-    let raw = attach_raw_local(&daemon.socket_path, "stream-local")
-        .await
-        .expect("connect local attach stream");
+    let raw =
+        attach_raw_local_with_options(&daemon.socket_path, "stream-local", no_origin_options())
+            .await
+            .expect("connect local attach stream");
     match raw {
         RawStream::Local(mut stream) => {
             stream.write_all(&body).await.expect("write raw body");
@@ -107,7 +115,7 @@ async fn raw_stream_connect_raw_routes_local_host_to_unix_socket() {
     let daemon = spawn_unix_raw_daemon();
     let body = b"local-routing-bytes".to_vec();
 
-    let raw = connect_raw("local", &daemon.socket_path)
+    let raw = connect_raw_with_options("local", &daemon.socket_path, no_origin_options())
         .await
         .expect("connect routed local raw daemon");
     match raw {
@@ -134,9 +142,14 @@ async fn raw_stream_attach_raw_routes_local_host_to_unix_socket_and_writes_attac
     let daemon = spawn_unix_raw_daemon();
     let body = b"local-routing-bytes".to_vec();
 
-    let raw = attach_raw("local", &daemon.socket_path, "stream-routed-local")
-        .await
-        .expect("connect routed local attach stream");
+    let raw = attach_raw_with_options(
+        "local",
+        &daemon.socket_path,
+        "stream-routed-local",
+        no_origin_options(),
+    )
+    .await
+    .expect("connect routed local attach stream");
     match raw {
         RawStream::Local(mut stream) => {
             stream.write_all(&body).await.expect("write raw body");
@@ -162,7 +175,7 @@ async fn raw_stream_connect_raw_tcp_addr_carries_attach_header_and_unframed_byte
     let daemon = spawn_tcp_raw_daemon().await;
     let body = vec![b'r', b'e', b'm', b'o', b't', b'e', 0x00, 0xfe, b'\n'];
 
-    let raw = connect_raw_tcp_addr(HOST, daemon.addr)
+    let raw = connect_raw_tcp_addr_with_options(HOST, daemon.addr, no_origin_options())
         .await
         .expect("connect tcp raw daemon");
     match raw {
@@ -189,9 +202,10 @@ async fn raw_stream_attach_raw_tcp_addr_writes_attach_header_before_unframed_byt
     let daemon = spawn_tcp_raw_daemon().await;
     let body = vec![b'r', b'e', b'm', b'o', b't', b'e', 0x00, 0xfe, b'\n'];
 
-    let raw = attach_raw_tcp_addr(HOST, daemon.addr, "stream-remote")
-        .await
-        .expect("connect tcp attach stream");
+    let raw =
+        attach_raw_tcp_addr_with_options(HOST, daemon.addr, "stream-remote", no_origin_options())
+            .await
+            .expect("connect tcp attach stream");
     match raw {
         RawStream::Remote(mut stream) => {
             stream.write_all(&body).await.expect("write raw body");
