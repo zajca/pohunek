@@ -3529,12 +3529,14 @@ async fn session_start_hook_runs_after_spawn_without_blocking_create() {
     let _ = registry.stop(&created.id).await;
 }
 
-/// Creates a FIFO at `path` and opens its write end for reading and writing.
+/// Creates a FIFO at `path` and opens it for reading and writing.
 ///
-/// A hook that does `read _ < <path>` blocks on the returned handle until the
-/// test writes to it or drops it, so the test decides exactly when the hook may
-/// finish. Opening read-write never blocks, and dropping the handle on a failing
-/// test releases the hook instead of leaving it parked.
+/// A hook that opens the FIFO for reading and then does `read _` blocks until
+/// the test releases it with [`release_hook_gate`]. The test's own handle is a
+/// writer for as long as it lives, so the hook never sees end-of-file while the
+/// test holds it, and opening read-write never blocks. Keep the handle alive
+/// until the hook has acknowledged the release: a FIFO with no open descriptor
+/// discards its buffered data, and a later reader-open would block.
 fn hook_gate(path: &std::path::Path) -> fs::File {
     nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).expect("create hook gate fifo");
     fs::OpenOptions::new()
@@ -3542,6 +3544,14 @@ fn hook_gate(path: &std::path::Path) -> fs::File {
         .write(true)
         .open(path)
         .expect("open hook gate")
+}
+
+/// Writes one line into the gate so a hook parked in `read _` on it continues.
+fn release_hook_gate(gate: &fs::File) {
+    let mut writer = gate;
+    writer
+        .write_all(b"release\n")
+        .expect("write the hook gate release line");
 }
 
 #[tokio::test]
@@ -3556,9 +3566,9 @@ async fn session_start_hook_runs_detached_from_create() {
         &config_dir,
         "session-start",
         &format!(
-            "#!/bin/sh\necho started > '{}'\nread _ < '{}'\necho released > '{}'\n",
-            started.display(),
+            "#!/bin/sh\nexec 3< '{}'\necho started > '{}'\nread _ <&3\necho released > '{}'\n",
             gate_path.display(),
+            started.display(),
             released.display(),
         ),
     );
@@ -3571,8 +3581,10 @@ async fn session_start_hook_runs_detached_from_create() {
         ..SessionRegistryConfig::default()
     });
 
-    // The hook cannot finish until the gate is written, so a `create` that
-    // waited for it would never return.
+    // The hook opens the gate before it writes `started`, so `started` implies
+    // it holds a reader on a FIFO whose only writer is the test's handle and
+    // that carries no data. It cannot pass `read` until the test writes a line,
+    // so a `create` that waited for it would never return.
     let created = registry
         .create(SessionNewParams {
             cwd: Some(cwd),
@@ -3581,13 +3593,24 @@ async fn session_start_hook_runs_detached_from_create() {
         .await
         .expect("create session returns while the session-start hook is still running");
 
-    wait_for_file_contains(&started, "started").await;
+    pohunek_test_support::wait::wait_until("the hook to report started", || async {
+        fs::read_to_string(&started)
+            .ok()
+            .filter(|contents| contents.contains("started"))
+    })
+    .await;
     assert!(
         !released.exists(),
         "the hook is parked on its gate after create returned"
     );
+    release_hook_gate(&gate);
+    pohunek_test_support::wait::wait_until("the hook to report released", || async {
+        fs::read_to_string(&released)
+            .ok()
+            .filter(|contents| contents.contains("released"))
+    })
+    .await;
     drop(gate);
-    wait_for_file_contains(&released, "released").await;
 
     let _ = registry.stop(&created.id).await;
 }
@@ -3619,9 +3642,9 @@ async fn session_start_hook_is_terminated_after_hook_timeout() {
         activity: None,
     };
 
-    // The hook is parked on the gate until the test drops it, so `run_hook`
+    // The hook is parked on the gate until the test releases it, so `run_hook`
     // returns only if it enforces the timeout.
-    let warnings = tokio::task::spawn_blocking(move || {
+    let mut runner = tokio::task::spawn_blocking(move || {
         let mut warnings = Vec::new();
         crate::worktree::run_hook(
             crate::worktree::HookEvent::SessionStart,
@@ -3632,10 +3655,22 @@ async fn session_start_hook_is_terminated_after_hook_timeout() {
             &mut warnings,
         );
         warnings
-    })
-    .await
-    .expect("hook runner joins");
-    drop(gate);
+    });
+    // Without timeout enforcement the runner blocks for as long as the hook
+    // does, so the hang guard releases the gate to let it finish before the
+    // test fails with an explicit message.
+    let outcome = tokio::time::timeout(pohunek_test_support::wait::HANG_GUARD, &mut runner).await;
+    let Ok(joined) = outcome else {
+        release_hook_gate(&gate);
+        pohunek_test_support::wait::guard("the hook runner to return after the release", runner)
+            .await
+            .expect("hook runner joins after the release");
+        panic!(
+            "run_hook did not terminate the gated hook within the hang guard of {:?}",
+            pohunek_test_support::wait::HANG_GUARD
+        );
+    };
+    let warnings = joined.expect("hook runner joins");
 
     assert_eq!(
         warnings.len(),
