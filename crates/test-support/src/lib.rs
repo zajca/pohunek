@@ -29,6 +29,10 @@
 //! with a message naming the awaited condition instead of hanging until nextest
 //! terminates the test.
 //!
+//! The [`time`] module holds [`time::AutoAdvanceInhibitor`] and
+//! [`time::TIMER_TICK`], which let a test on tokio's paused clock await real
+//! I/O without the clock racing ahead of it.
+//!
 //! This crate is a development dependency only; production code never picks
 //! its paths from here.
 //!
@@ -40,9 +44,10 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-// Rust guideline compliant 2026-10-01
+// Rust guideline compliant 2026-10-02
 
 pub mod env;
+pub mod time;
 pub mod wait;
 
 use std::ffi::OsString;
