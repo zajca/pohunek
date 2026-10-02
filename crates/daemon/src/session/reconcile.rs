@@ -3998,7 +3998,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use pohunek_test_support::wait::{guard, wait_until, HANG_GUARD};
+    use pohunek_test_support::wait::{wait_until, HANG_GUARD};
 
     #[cfg(target_os = "linux")]
     use base64::Engine as _;
@@ -5106,7 +5106,7 @@ while os.getppid() == parent:
             "output wait must be registered before descendant release"
         );
         std::fs::write(&descendant_release, b"release").expect("release descendant");
-        let page = guard("the late output page", &mut output)
+        let page = pohunek_test_support::wait::guard("the late output page", &mut output)
             .await
             .expect("late output page");
         let decoded = base64::prelude::BASE64_STANDARD
