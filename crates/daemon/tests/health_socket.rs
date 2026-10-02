@@ -87,9 +87,9 @@ struct PathGuard {
     old_path: Option<OsString>,
 }
 
-/// Name of the agent-free `PATH` directory under Cargo's per-target test
-/// scratch directory.
-const AGENTLESS_PATH_DIR: &str = "agentless-path";
+/// Name prefix of the agent-free `PATH` directories under Cargo's per-target
+/// test scratch directory.
+const AGENTLESS_PATH_PREFIX: &str = "agentless-path";
 
 /// Tools sibling tests resolve through `PATH` while it is isolated: `git`,
 /// `python3` and `sh` for stub agents, `sleep` and `stty` inside worker-backed
@@ -125,18 +125,19 @@ impl PathGuard {
     /// elsewhere in the suite. The isolated directory therefore holds links to
     /// [`AGENTLESS_PATH_TOOLS`], and it is never removed: a sibling process
     /// started under it keeps a valid `PATH` after this guard restores the
-    /// variable. It lives under Cargo's per-target test scratch directory, not
-    /// the system temporary directory, and is reused by every run. PATH is
+    /// variable. Each call creates a fresh directory, so no earlier content can
+    /// put an agent on the isolated `PATH`; it lives under Cargo's per-target
+    /// test scratch directory, not the system temporary directory. PATH is
     /// restored on drop.
     async fn isolated_without_agents() -> Self {
         let guard = PATH_LOCK.lock().await;
         let old_path = std::env::var_os("PATH");
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(AGENTLESS_PATH_DIR);
-        std::fs::create_dir_all(&dir).expect("create the agent-free PATH directory");
+        let dir = fresh_agentless_dir();
         if let Some(old_path) = &old_path {
             for tool in AGENTLESS_PATH_TOOLS {
                 if let Some(real) = which_in(old_path, tool) {
-                    link_tool(&dir, tool, &real);
+                    std::os::unix::fs::symlink(&real, dir.join(tool))
+                        .expect("link a tool into the agent-free PATH directory");
                 }
             }
         }
@@ -148,17 +149,25 @@ impl PathGuard {
     }
 }
 
-/// Points `dir/tool` at `real`, replacing a link to anything else in one
-/// rename so a concurrent reader never sees the name missing.
-fn link_tool(dir: &Path, tool: &str, real: &Path) {
-    let link = dir.join(tool);
-    if std::fs::read_link(&link).is_ok_and(|target| target == real) {
-        return;
+/// Creates a new, empty agent-free `PATH` directory.
+///
+/// `create_dir` fails on an existing name, so the returned directory is always
+/// one this call created; the name carries the process id and a per-process
+/// counter.
+fn fresh_agentless_dir() -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = root.join(format!(
+        "{AGENTLESS_PATH_PREFIX}-{}-{number}",
+        std::process::id()
+    ));
+    if dir.exists() {
+        // A previous run's process had this pid; its directory may hold anything.
+        std::fs::remove_dir_all(&dir).expect("remove a stale agent-free PATH directory");
     }
-    let staged = dir.join(format!(".{tool}.{}", std::process::id()));
-    let _ = std::fs::remove_file(&staged);
-    std::os::unix::fs::symlink(real, &staged).expect("stage the tool link");
-    std::fs::rename(&staged, &link).expect("install the tool link");
+    std::fs::create_dir(&dir).expect("create the agent-free PATH directory");
+    dir
 }
 
 /// Resolve `name` to its first existing entry across the directories in a PATH
