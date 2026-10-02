@@ -218,7 +218,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use protocol::event;
     use serde_json::{json, Value};
@@ -228,14 +228,9 @@ mod tests {
     use super::{spawn_drain, EventLog};
 
     fn temp_events_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        pohunek_test_support::temp_root().join(format!(
-            "pohunek-events-{tag}-{}-{nanos}",
-            std::process::id()
-        ))
+        // The directory lives until the test's thread ends; the path below it
+        // does not exist yet.
+        crate::test_support::thread_scoped_dir(&format!("pohunek-events-{tag}-")).join("events")
     }
 
     fn read_lines(path: &std::path::Path) -> Vec<String> {

@@ -335,8 +335,8 @@ fn priority_rank(source: &NotificationSource) -> u8 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use std::time::Duration;
 
     use protocol::{
         event, Event, NotificationCreateParams, NotificationKind, NotificationKindPolicy,
@@ -348,21 +348,14 @@ mod tests {
     use super::AttentionCoordinator;
     use crate::notifications::{default_policy, NotificationService};
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     /// Debounce window used by the tests, advanced past to force a flush.
     const TEST_DEBOUNCE_SECS: u64 = 5;
 
     fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        pohunek_test_support::temp_root().join(format!(
-            "pohunek-attention-coordinator-{tag}-{}-{nanos}-{counter}",
-            std::process::id()
-        ))
+        // The directory lives until the test's thread ends; the path below it
+        // does not exist yet.
+        crate::test_support::thread_scoped_dir(&format!("pohunek-attention-coordinator-{tag}-"))
+            .join("data")
     }
 
     fn service(tag: &str) -> NotificationService {

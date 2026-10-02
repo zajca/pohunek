@@ -518,16 +518,8 @@ mod tests {
     use crate::host_state::approval_key::fail_next_entropy;
 
     fn state_dir() -> TempDir {
-        let temp = tempfile::Builder::new()
-            .prefix("pohunek-host-state-")
-            .tempdir_in(pohunek_test_support::temp_root())
-            .expect("create isolated host-state directory");
-        std::fs::set_permissions(
-            temp.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .expect("make isolated state directory owner-private");
-        temp
+        pohunek_test_support::tempdir_with_prefix("pohunek-host-state-")
+            .expect("create isolated host-state directory")
     }
 
     fn records() -> (IdentityRecord, ApprovalKeyRecord, GovernanceState) {

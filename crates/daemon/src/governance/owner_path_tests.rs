@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,8 +35,9 @@ use crate::procwatch::HostInspector;
 use crate::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use crate::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 
-/// Allows PTY-backed shells enough time to leave their process group during cleanup.
-const STOP_GRACE: Duration = Duration::from_millis(500);
+// Sessions use the production stop grace, `SessionRegistryConfig::default()`:
+// a shorter grace reaches the forced-stop path on a loaded host, and no test
+// here is about the grace.
 /// Bounds each control request write and response read to avoid a wedged test client.
 const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bounds a real raw attach read without relying on an unbounded test hang.
@@ -104,7 +104,8 @@ impl GovernanceCondition {
 }
 
 struct Servers {
-    _root: TempDir,
+    /// Working directory of the sessions; removed when the servers drop.
+    root: TempDir,
     socket: PathBuf,
     tcp_addr: SocketAddr,
     sessions: SessionRegistry,
@@ -175,12 +176,8 @@ async fn with_servers(condition: GovernanceCondition, transport: OwnerTransport)
 }
 
 async fn start_servers(condition: GovernanceCondition) -> Servers {
-    let root = tempfile::Builder::new()
-        .prefix("po-")
-        .tempdir_in(pohunek_test_support::temp_root())
-        .expect("create isolated owner-path root");
-    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
-        .expect("secure isolated owner-path root");
+    let root =
+        pohunek_test_support::tempdir_with_prefix("po-").expect("create isolated owner-path root");
     let socket = root.path().join("daemon.sock");
     let governance = Arc::new(
         HostGovernanceService::open(root.path().join("host-state"))
@@ -221,7 +218,7 @@ async fn start_servers(condition: GovernanceCondition) -> Servers {
     });
 
     Servers {
-        _root: root,
+        root,
         socket,
         tcp_addr,
         sessions,
@@ -313,7 +310,6 @@ fn worker_backed_registry(socket: &Path, root: &Path) -> SessionRegistry {
     };
     let config = SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
-        stop_grace: STOP_GRACE,
         socket_path: Some(socket.to_path_buf()),
         worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
         worker_state_root: Some(environment.state_home.join("pohunek/workers")),
@@ -377,7 +373,7 @@ async fn exercise_owner_transport(servers: &Servers, transport: OwnerTransport) 
         OwnerTransport::Unix => {
             let mut control = connect_unix(&servers.socket).await?;
             let socket = servers.socket.clone();
-            exercise_owner_control(&mut control, move |stream_id| {
+            exercise_owner_control(&mut control, servers.root.path(), move |stream_id| {
                 let socket = socket.clone();
                 let stream_id = stream_id.to_owned();
                 async move { open_unix_attach(&socket, &stream_id).await }
@@ -387,7 +383,7 @@ async fn exercise_owner_transport(servers: &Servers, transport: OwnerTransport) 
         OwnerTransport::Tcp => {
             let mut control = connect_tcp(servers.tcp_addr).await?;
             let tcp_addr = servers.tcp_addr;
-            exercise_owner_control(&mut control, move |stream_id| {
+            exercise_owner_control(&mut control, servers.root.path(), move |stream_id| {
                 let stream_id = stream_id.to_owned();
                 async move { open_tcp_attach(tcp_addr, &stream_id).await }
             })
@@ -424,6 +420,7 @@ async fn connect_tcp(addr: SocketAddr) -> TestResult<Framed<TcpStream, LinesCode
 
 async fn exercise_owner_control<S, Open, Future, Raw>(
     control: &mut Framed<S, LinesCodec>,
+    cwd: &Path,
     open_attach: Open,
 ) -> TestResult<()>
 where
@@ -432,7 +429,7 @@ where
     Future: std::future::Future<Output = TestResult<Raw>>,
     Raw: AsyncRead + AsyncWrite + Unpin,
 {
-    let created = create_session(control).await?;
+    let created = create_session(control, cwd).await?;
     if created.state != SessionState::Running {
         return cleanup_after_error(
             control,
@@ -518,7 +515,10 @@ where
     Err(error)
 }
 
-async fn create_session<S>(control: &mut Framed<S, LinesCodec>) -> TestResult<SessionInfo>
+async fn create_session<S>(
+    control: &mut Framed<S, LinesCodec>,
+    cwd: &Path,
+) -> TestResult<SessionInfo>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -528,7 +528,7 @@ where
         serde_json::to_value(SessionNewParams {
             name: None,
             agent: "shell".to_owned(),
-            cwd: Some(pohunek_test_support::temp_root()),
+            cwd: Some(cwd.to_path_buf()),
             cols: 80,
             rows: 24,
             project: None,

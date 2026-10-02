@@ -1183,6 +1183,7 @@ mod tests {
         let (_state_root, governance) = governance_service().await;
         let first_ip = "127.0.0.1".parse().expect("first IP");
         let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
+        // hermetic-allowed: #408 bind_remote_server binds the configured port itself, so the probe port must be released first; needs a product seam
         let probe = TcpListener::bind((first_ip, 0)).await.expect("port probe");
         let port = probe.local_addr().expect("probe address").port();
         drop(probe);

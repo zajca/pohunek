@@ -473,6 +473,10 @@ mod tests {
             .collect()
     }
 
+    // Sessions use the production stop grace, `SessionRegistryConfig::default()`:
+    // a shorter grace reaches the forced-stop path on a loaded host, and no test
+    // here is about the grace.
+
     fn daemon_state(health: HealthInfo, sessions: SessionRegistry) -> DaemonState {
         DaemonState::new(
             health,
@@ -587,14 +591,14 @@ mod tests {
     async fn session_set_metadata_dispatch_updates_session() {
         let sessions = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-            stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         });
+        let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
         let created = sessions
             .create(SessionNewParams {
                 agent: "shell".to_owned(),
                 name: None,
-                cwd: Some(PathBuf::from("/tmp")),
+                cwd: Some(cwd.path().to_path_buf()),
                 cols: 80,
                 rows: 24,
                 project: None,
@@ -645,14 +649,14 @@ mod tests {
     async fn session_fork_dispatch_returns_canonical_error_without_child_session() {
         let sessions = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-            stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         });
+        let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
         let created = sessions
             .create(SessionNewParams {
                 agent: "shell".to_owned(),
                 name: None,
-                cwd: Some(PathBuf::from("/tmp")),
+                cwd: Some(cwd.path().to_path_buf()),
                 cols: 80,
                 rows: 24,
                 project: None,
@@ -694,14 +698,14 @@ mod tests {
     async fn session_detection_dispatch_returns_active_manifest_previews() {
         let sessions = SessionRegistry::new(SessionRegistryConfig {
             shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-            stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         });
+        let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
         let created = sessions
             .create(SessionNewParams {
                 agent: "shell".to_owned(),
                 name: None,
-                cwd: Some(PathBuf::from("/tmp")),
+                cwd: Some(cwd.path().to_path_buf()),
                 cols: 80,
                 rows: 24,
                 project: None,
@@ -763,21 +767,6 @@ mod tests {
         );
 
         assert_eq!(error.code, "session_not_found");
-    }
-
-    fn notification_temp_dir(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        pohunek_test_support::temp_root().join(format!(
-            "pohunek-handler-notifications-{tag}-{}-{nanos}-{counter}",
-            std::process::id()
-        ))
     }
 
     fn attention_create_request(id: &str) -> Request {
@@ -897,8 +886,10 @@ mod tests {
         use crate::notifications::{AttentionCoordinator, NotificationService};
         use protocol::NotificationKind;
 
-        let notifications = NotificationService::open(&notification_temp_dir("defer"))
-            .expect("notification service opens");
+        let notification_dir =
+            pohunek_test_support::tempdir_with_prefix("ph-notify-").expect("notification dir");
+        let notifications =
+            NotificationService::open(notification_dir.path()).expect("notification service opens");
         enable_all_notification_kinds(&notifications);
         let (attention, _task) = AttentionCoordinator::spawn(notifications.clone());
         let state = daemon_state(
@@ -1186,6 +1177,8 @@ mod tests {
     struct EnvGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         saved: Vec<(&'static str, Option<String>)>,
+        /// Removed after the saved variables are restored.
+        _root: tempfile::TempDir,
     }
 
     impl EnvGuard {
@@ -1206,16 +1199,20 @@ mod tests {
                 .map(|&key| (key, std::env::var(key).ok()))
                 .collect::<Vec<_>>();
             // Short enough for the daemon socket below it on macOS.
-            let root = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
-                .expect("create isolated XDG root")
-                .keep();
+            let root_dir = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
+                .expect("create isolated XDG root");
+            let root = root_dir.path();
             std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
             std::env::set_var("XDG_STATE_HOME", root.join("state"));
             std::env::set_var("XDG_DATA_HOME", root.join("data"));
             std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
             std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
             std::env::set_var("HOME", root.join("home"));
-            Self { _lock: lock, saved }
+            Self {
+                _lock: lock,
+                saved,
+                _root: root_dir,
+            }
         }
     }
 

@@ -36,6 +36,7 @@ use pohunek_platform::supervisor::{
     ServiceId, ServiceObservation, Supervisor, WorkerKey,
 };
 use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
+use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::{bin_exe, worker_binary};
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 use protocol::{
@@ -167,7 +168,7 @@ pub(crate) struct Installation {
     inspector: HostInspector,
     /// Jobs planted outside the namespace or the daemon, removed on drop.
     extra: backend::Extra,
-    _temporary: tempfile::TempDir,
+    _temporary: TestEnv,
 }
 
 impl Installation {
@@ -175,16 +176,11 @@ impl Installation {
     pub(crate) async fn new(settings: Settings) -> Self {
         backend::require();
         let (daemon_binary, worker_binary) = binaries();
-        // `/var` and `$TMPDIR` are symlinked or long on macOS; trusted
-        // directories never follow a symlink and socket paths are bounded.
-        let base = std::fs::canonicalize("/tmp").expect("canonical /tmp");
-        let temporary = tempfile::Builder::new()
-            .prefix("phk")
-            .tempdir_in(&base)
-            .expect("temporary root");
-        let root = temporary.path().to_path_buf();
-        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
-            .expect("private root");
+        // The environment's root is canonical and short, which trusted
+        // directories (they never follow a symlink) and bounded socket paths
+        // need.
+        let temporary = TestEnv::new().expect("temporary root");
+        let root = temporary.root().to_path_buf();
         let dir = |name: &str| {
             let path = root.join(name);
             std::fs::create_dir_all(&path).expect("create fixture directory");

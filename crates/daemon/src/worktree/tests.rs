@@ -5,11 +5,10 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use protocol::{SessionRetentionHold, SessionWarningKind};
 
@@ -23,16 +22,9 @@ use crate::store::{Store, WorktreeStatus};
 /// enough that it never trips on a slow CI box.
 const TEST_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A fresh directory that is removed when the test's thread ends.
 fn unique_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let dir = pohunek_test_support::temp_root()
-        .join(format!("pohunek-wt-{tag}-{}-{nanos}", std::process::id()));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("secure temp directory");
-    dir
+    crate::test_support::thread_scoped_dir(&format!("pohunek-wt-{tag}-"))
 }
 
 fn git_in(dir: &Path, args: &[&str]) {

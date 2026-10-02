@@ -1319,18 +1319,14 @@ fn response_error<T>(response: ResponseKind) -> Result<T, WorkerError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::Ordering as AtomicOrdering;
 
     use pohunek_session_worker::{Server, ServerArgs, WorkerConfig};
 
     use super::*;
 
-    static TEST_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-    fn test_root(name: &str) -> PathBuf {
-        let sequence = TEST_PATH_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-        pohunek_test_support::temp_root()
-            .join(format!("pohunek-{name}-{}-{sequence}", std::process::id()))
+    /// A private root for one test, removed when dropped.
+    fn test_root(name: &str) -> crate::test_support::ScopedDir {
+        crate::test_support::scoped_dir(&format!("ph-{name}-"))
     }
 
     fn observation_initialize(root: &Path, output_bytes: usize) -> Initialize {
@@ -1365,7 +1361,15 @@ mod tests {
                 10_000,
             )
             .expect("initialize limits"),
-            stop_policy: pohunek_worker_protocol::StopPolicy::new(500).expect("stop policy"),
+            stop_policy: pohunek_worker_protocol::StopPolicy::new(
+                u64::try_from(
+                    crate::session::SessionRegistryConfig::default()
+                        .stop_grace
+                        .as_millis(),
+                )
+                .expect("stop grace fits u64"),
+            )
+            .expect("stop policy"),
             hook_protocol_version: pohunek_worker_protocol::CURRENT_VERSION,
             public_protocol_version: protocol::PROTOCOL_VERSION.get(),
         }
@@ -1637,7 +1641,6 @@ mod tests {
         ));
 
         server_task.abort();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Size of the `initialize` argument that forces a partial send in the
@@ -1717,7 +1720,6 @@ mod tests {
         ));
 
         server_task.abort();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -1806,7 +1808,6 @@ mod tests {
         ));
 
         server_task.await.expect("fake worker task");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Accepts one daemon connection and completes the scripted handshake
@@ -1939,7 +1940,6 @@ mod tests {
         ));
 
         server_task.await.expect("fake worker task");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2010,7 +2010,6 @@ mod tests {
         assert_eq!(snapshot.watermark, 0);
 
         server_task.await.expect("fake worker task");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2057,7 +2056,6 @@ mod tests {
         assert!(matches!(reserved, Err(WorkerError::TornStream)));
 
         server_task.abort();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2127,7 +2125,6 @@ mod tests {
             .await
             .expect("release controller");
         server_task.abort();
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -2286,7 +2283,6 @@ mod tests {
             .expect("next request remains synchronized");
         assert_eq!(snapshot.watermark, 0);
         server_task.await.expect("fake worker task");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

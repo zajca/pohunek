@@ -325,7 +325,7 @@ mod tests {
             ppid: 1,
             start_identity: crate::procwatch::StartIdentity::new(101),
             comm: "sleep".to_owned(),
-            cmdline: vec!["/tmp/tools/codex".to_owned(), "30".to_owned()],
+            cmdline: vec!["/work/tools/codex".to_owned(), "30".to_owned()],
         }));
         assert!(!matchers.matches(&ProcessFact {
             pid: 102,
@@ -333,7 +333,7 @@ mod tests {
             ppid: 1,
             start_identity: crate::procwatch::StartIdentity::new(102),
             comm: "sleep".to_owned(),
-            cmdline: vec!["/tmp/tools/not-codex".to_owned(), "30".to_owned()],
+            cmdline: vec!["/work/tools/not-codex".to_owned(), "30".to_owned()],
         }));
     }
 

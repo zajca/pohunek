@@ -7,6 +7,7 @@ use overlay::{
     BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
     OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
 };
+use pohunek_daemon::session::{SessionRegistryConfig, ShellCommand};
 
 #[derive(Debug)]
 struct EmptyTransport {
@@ -51,6 +52,23 @@ impl OverlayTransport for EmptyTransport {
 
     fn discover_peers(&self) -> OverlayFuture<'_, Vec<DiscoveredPeer>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+}
+
+/// Shell that a registry fixture pins instead of the host user's `$SHELL`.
+///
+/// A login shell of the host runs its startup files, which can start helpers
+/// that keep the PTY open past a kill.
+pub(crate) fn hermetic_shell() -> ShellCommand {
+    ShellCommand::new("/bin/sh", std::iter::empty::<&str>())
+}
+
+/// Registry configuration that pins [`hermetic_shell`] and leaves every other
+/// field at its default.
+pub(crate) fn hermetic_registry_config() -> SessionRegistryConfig {
+    SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        ..SessionRegistryConfig::default()
     }
 }
 

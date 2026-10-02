@@ -902,21 +902,20 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn state_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        let path = pohunek_test_support::temp_root().join(format!(
-            "pohunek-host-state-unit-{tag}-{}-{nanos}/state/pohunek",
-            std::process::id()
-        ));
-        path
+    /// A fresh owner-private root, removed with its contents when dropped.
+    fn state_root() -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix("ph-hsu-").expect("create isolated root")
+    }
+
+    /// The host-state directory below `root`, which the test creates.
+    fn state_dir(root: &tempfile::TempDir) -> PathBuf {
+        root.path().join("state/pohunek")
     }
 
     #[test]
     fn precommit_faults_preserve_the_previous_record() {
-        let host = HostStateDir::open_or_create(&state_dir("precommit")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         host.replace_record("identity.json", b"old")
             .expect("seed record");
         host.inject_write(io::ErrorKind::StorageFull);
@@ -952,7 +951,8 @@ mod tests {
 
     #[test]
     fn postrename_fault_is_reported_as_durability_uncertain() {
-        let host = HostStateDir::open_or_create(&state_dir("postrename")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         host.replace_record("governance.json", b"old")
             .expect("seed record");
         host.inject_directory_sync(io::ErrorKind::Other);
@@ -970,8 +970,8 @@ mod tests {
     fn temporary_symlink_is_never_followed_or_removed() {
         use std::os::unix::fs::symlink;
 
-        let host =
-            HostStateDir::open_or_create(&state_dir("temporary-symlink")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         let target = host.path().join("target");
         std::fs::write(&target, b"keep").expect("write target");
         host.inject_next_temp_suffix("predictable");
@@ -989,7 +989,8 @@ mod tests {
 
     #[test]
     fn secret_read_is_bounded_even_when_a_record_grows_after_metadata_inspection() {
-        let host = HostStateDir::open_or_create(&state_dir("read-bound")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         host.replace_record("approval.key", b"small")
             .expect("seed record");
         host.inject_grow_after_stat();
@@ -1002,8 +1003,8 @@ mod tests {
 
     #[test]
     fn secret_read_growth_never_reallocates_its_zeroizing_buffer() {
-        let host = HostStateDir::open_or_create(&state_dir("secret-read-growth"))
-            .expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         host.replace_record("approval.key", b"small")
             .expect("seed secret record");
         let record = host
@@ -1028,8 +1029,8 @@ mod tests {
 
     #[test]
     fn secret_read_returns_zeroizing_record_ownership() {
-        let host =
-            HostStateDir::open_or_create(&state_dir("secret-read")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         host.replace_record("approval.key", b"private record")
             .expect("seed secret record");
 
@@ -1043,8 +1044,8 @@ mod tests {
 
     #[test]
     fn rejects_existing_oversized_record_before_allocating_its_contents() {
-        let host =
-            HostStateDir::open_or_create(&state_dir("oversized-record")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         let record = host.path().join("identity.json");
         std::fs::write(&record, vec![0_u8; MAX_RECORD_BYTES + 1]).expect("write oversized record");
         std::fs::set_permissions(&record, std::fs::Permissions::from_mode(FILE_MODE))
@@ -1058,8 +1059,8 @@ mod tests {
 
     #[test]
     fn postrename_failure_never_removes_a_reoccupied_temporary_name() {
-        let host =
-            HostStateDir::open_or_create(&state_dir("postrename-temp")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         host.inject_next_temp_suffix("reoccupied");
         host.inject_reoccupy_temp_after_rename();
         host.inject_directory_sync(io::ErrorKind::Other);
@@ -1077,8 +1078,8 @@ mod tests {
 
     #[test]
     fn temporary_name_collision_limit_preserves_the_old_record_and_collision_files() {
-        let host = HostStateDir::open_or_create(&state_dir("temporary-collisions"))
-            .expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         host.replace_record("identity.json", b"old")
             .expect("seed record");
         let suffixes: Vec<_> = (0..TEMP_NAME_ATTEMPTS)
@@ -1118,8 +1119,8 @@ mod tests {
 
     #[test]
     fn data_record_apis_reserve_the_state_lock_name() {
-        let host =
-            HostStateDir::open_or_create(&state_dir("reserved-lock")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         let lock = host.acquire_lock().expect("hold state lock");
 
         assert!(matches!(
@@ -1139,7 +1140,8 @@ mod tests {
 
     #[test]
     fn replacing_the_lock_marker_cannot_split_directory_lock_authority() {
-        let state = state_dir("replaced-lock-marker");
+        let root = state_root();
+        let state = state_dir(&root);
         let holder = HostStateDir::open_or_create(&state).expect("open lock holder directory");
         let first = holder.acquire_lock().expect("acquire first lock");
         let marker = holder.path().join(pohunek_paths::HOST_STATE_LOCK_NAME);
@@ -1165,11 +1167,11 @@ mod tests {
     #[test]
     fn absolute_state_paths_reject_noncanonical_components() {
         for path in [
-            Path::new("/tmp/../pohunek-host-state"),
+            Path::new("/work/../pohunek-host-state"),
             Path::new("/"),
-            Path::new("/tmp//pohunek-host-state"),
-            Path::new("/tmp/./pohunek-host-state"),
-            Path::new("/tmp/pohunek-host-state/"),
+            Path::new("/work//pohunek-host-state"),
+            Path::new("/work/./pohunek-host-state"),
+            Path::new("/work/pohunek-host-state/"),
         ] {
             assert!(matches!(
                 TrustedDir::open_or_create_absolute(path, DIRECTORY_MODE),
@@ -1180,8 +1182,8 @@ mod tests {
 
     #[test]
     fn errors_do_not_render_record_contents() {
-        let host =
-            HostStateDir::open_or_create(&state_dir("error-redaction")).expect("open host state");
+        let root = state_root();
+        let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host state");
         let sentinel = b"host-state-secret-sentinel";
         let bytes = sentinel
             .iter()

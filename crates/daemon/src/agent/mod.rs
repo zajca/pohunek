@@ -639,9 +639,9 @@ mod tests {
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-    fn launch_opts(cwd: PathBuf) -> LaunchOpts {
+    fn launch_opts(cwd: impl AsRef<Path>) -> LaunchOpts {
         LaunchOpts {
-            cwd,
+            cwd: cwd.as_ref().to_path_buf(),
             cols: 120,
             rows: 40,
             env_extra: vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())],
@@ -649,12 +649,8 @@ mod tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        // Exclusive creation under a random name; the directory is left behind
-        // like the fixture it replaces.
-        pohunek_test_support::tempdir_with_prefix(&format!("pohunek-agent-test-{tag}-"))
-            .expect("create temp dir")
-            .keep()
+    fn temp_dir(tag: &str) -> crate::test_support::ScopedDir {
+        crate::test_support::scoped_dir(&format!("pohunek-agent-test-{tag}-"))
     }
 
     fn write_executable(dir: &Path, name: &str) -> PathBuf {
@@ -717,7 +713,7 @@ mod tests {
 
         assert_eq!(command.program, codex.display().to_string());
         assert!(command.args.is_empty());
-        assert_eq!(command.cwd, cwd);
+        assert_eq!(command.cwd, *cwd);
         assert_eq!(command.cols, 120);
         assert_eq!(command.rows, 40);
         assert_eq!(
@@ -740,7 +736,7 @@ mod tests {
 
         assert_eq!(command.program, claude.display().to_string());
         assert!(command.args.is_empty());
-        assert_eq!(command.cwd, cwd);
+        assert_eq!(command.cwd, *cwd);
         assert_eq!(command.cols, 120);
         assert_eq!(command.rows, 40);
         assert_eq!(
@@ -763,7 +759,7 @@ mod tests {
 
         assert_eq!(command.program, hermes.display().to_string());
         assert_eq!(command.args, vec!["chat"]);
-        assert_eq!(command.cwd, cwd);
+        assert_eq!(command.cwd, *cwd);
         assert_eq!((command.cols, command.rows), (120, 40));
         assert_eq!(
             command.env,
@@ -812,7 +808,8 @@ mod tests {
                 .expect("an absolute program needs no PATH");
         assert_eq!(by_absolute.as_path(), expected);
 
-        let mut opts = launch_opts(temp_dir("validated-cwd"));
+        let cwd = temp_dir("validated-cwd");
+        let mut opts = launch_opts(&cwd);
         opts.validated_program = Some(validated);
         let command = build_pty_command("must-not-be-resolved", vec!["chat".to_owned()], &opts)
             .expect("build from validated program");
@@ -1008,7 +1005,7 @@ mod tests {
 
         assert_eq!(command.program, shell.display().to_string());
         assert!(command.args.is_empty());
-        assert_eq!(command.cwd, cwd);
+        assert_eq!(command.cwd, *cwd);
         assert_eq!(command.cols, 120);
         assert_eq!(command.rows, 40);
         assert_eq!(
@@ -1194,7 +1191,7 @@ mod tests {
                     mode: ForkMode::ClaudeSession,
                 },
                 &session,
-                &launch_opts(cwd),
+                &launch_opts(&cwd),
             )
             .expect("fork command")
         });
@@ -1297,7 +1294,7 @@ mod tests {
                     ref_kind: SessionRefKind::Path,
                 },
                 &session,
-                &launch_opts(cwd),
+                &launch_opts(&cwd),
             )
             .expect("path resume command")
         });
@@ -1320,7 +1317,7 @@ mod tests {
                     ref_kind: SessionRefKind::Id,
                 },
                 &session,
-                &launch_opts(cwd),
+                &launch_opts(&cwd),
             )
             .expect("resume command")
         });
@@ -1339,7 +1336,7 @@ mod tests {
 
         let err = with_path(&empty_path, || {
             CodexAdapter
-                .launch(&launch_opts(cwd))
+                .launch(&launch_opts(&cwd))
                 .expect_err("missing codex binary")
         });
 

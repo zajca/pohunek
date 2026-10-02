@@ -2972,10 +2972,8 @@ mod tests {
     use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
     use std::time::Duration;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::method;
     use protocol::AgentKind;
@@ -3025,21 +3023,11 @@ mod tests {
     #[cfg(unix)]
     const CLAUDE_HOOKS_UMASK_CHILD_ENV: &str = "POHUNEK_TEST_CLAUDE_HOOKS_UMASK_CHILD";
 
-    /// Per-process sequence that keeps parallel temp paths collision-free.
-    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    pub(super) use crate::test_support::ScopedDir as TestDir;
 
-    pub(super) fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let dir = pohunek_test_support::temp_root().join(format!(
-            "pohunek-integration-{tag}-{}-{nanos}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// Creates a per-test directory that is removed when the guard drops.
+    pub(super) fn scoped_dir(tag: &str) -> TestDir {
+        crate::test_support::scoped_dir(&format!("ph-int-{tag}-"))
     }
 
     pub(super) fn read_json(path: &Path) -> Value {
@@ -3123,7 +3111,7 @@ mod tests {
         expected_requests: usize,
         cwd: Option<&Path>,
     ) -> (std::process::ExitStatus, String, String, Vec<Value>) {
-        let temp = temp_dir(&format!("{agent}-state-run"));
+        let temp = scoped_dir(&format!("{agent}-state-run"));
         let socket_path = temp.join("daemon.sock");
         run_state_asset_at(
             agent,
@@ -3157,7 +3145,7 @@ mod tests {
             asset_path.display()
         );
 
-        let temp = temp_dir(&format!("{agent}-state-run"));
+        let temp = scoped_dir(&format!("{agent}-state-run"));
         let socket_path = env_socket_path;
         let handle = listener_path.map(|listener_path| {
             let listener = UnixListener::bind(listener_path).expect("bind hook socket");
@@ -3198,13 +3186,13 @@ mod tests {
             })
         });
 
-        let mut command = Command::new("sh");
+        let mut command = Command::new("/bin/sh");
         command
             .arg(&asset_path)
             .args(args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("TMPDIR", &temp)
+            .env("TMPDIR", &*temp)
             .env(ENV_FLAG, "1")
             .env(ENV_SOCKET_PATH, socket_path)
             .env(ENV_SESSION_ID, "session-123")
@@ -3249,13 +3237,13 @@ mod tests {
         usize,
         Vec<PathBuf>,
     ) {
-        let temp = temp_dir(&format!("{agent}-state-bounded-input"));
-        let mut child = Command::new("sh")
+        let temp = scoped_dir(&format!("{agent}-state-bounded-input"));
+        let mut child = Command::new("/bin/sh")
             .arg(state_asset(agent))
             .arg(action)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("TMPDIR", &temp)
+            .env("TMPDIR", &*temp)
             .env(ENV_FLAG, "1")
             .env(
                 "POHUNEK_WORKER_SOCKET_PATH",
@@ -3365,7 +3353,7 @@ mod tests {
         expected_public_requests: usize,
     ) -> (Value, Vec<Value>) {
         let asset_path = state_asset(agent);
-        let temp = temp_dir(&format!("{agent}-worker-state-run"));
+        let temp = scoped_dir(&format!("{agent}-worker-state-run"));
         let worker_socket = temp.join("worker.sock");
         let daemon_socket = temp.join("daemon.sock");
         let capture = capture_worker_hook(&worker_socket, worker_response);
@@ -3406,12 +3394,12 @@ mod tests {
             requests
         });
 
-        let mut child = Command::new("sh")
+        let mut child = Command::new("/bin/sh")
             .arg(asset_path)
             .arg(action)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("TMPDIR", &temp)
+            .env("TMPDIR", &*temp)
             .env(ENV_FLAG, "1")
             .env("POHUNEK_WORKER_SOCKET_PATH", &worker_socket)
             .env("POHUNEK_NATIVE_REFERENCE_KIND", "id")
@@ -3506,7 +3494,7 @@ mod tests {
             asset_path.display()
         );
 
-        let temp = temp_dir(&format!("{agent}-notify-run"));
+        let temp = scoped_dir(&format!("{agent}-notify-run"));
         let socket_path = temp.join("daemon.sock");
         let tmpdir = tmpdir_override.unwrap_or(&temp);
         let handle = socket_available.then(|| {
@@ -3549,7 +3537,7 @@ mod tests {
             })
         });
 
-        let mut command = Command::new("sh");
+        let mut command = Command::new("/bin/sh");
         command
             .arg(&asset_path)
             .args(args)
@@ -3809,7 +3797,7 @@ mod tests {
             ("codex", vec!["permission_request"]),
             ("claude", vec!["notification", "permission_prompt"]),
         ] {
-            let temp = temp_dir(&format!("{agent}-broken-tmpdir"));
+            let temp = scoped_dir(&format!("{agent}-broken-tmpdir"));
             let missing_tmpdir = temp.join("missing");
             let (status, stdout, stderr, requests, _bytes_written) = run_notification_asset_custom(
                 agent,
@@ -3837,6 +3825,7 @@ mod tests {
     fn codex_hook_trust_hash_matches_codex_normalized_identity() {
         let hash = codex_command_hook_trusted_hash(
             CODEX_SESSION_START_TRUST_EVENT,
+            // hermetic-allowed: #363 the command text is hashed into a golden Codex trust vector
             "sh '/tmp/pohunek-agent-state.sh' session",
             10,
             None,
@@ -3957,7 +3946,7 @@ mod tests {
     #[test]
     fn state_hooks_ignore_modules_in_the_working_directory() {
         for agent in ["claude", "codex"] {
-            let workdir = temp_dir(&format!("{agent}-shadowed-cwd"));
+            let workdir = scoped_dir(&format!("{agent}-shadowed-cwd"));
             let marker = workdir.join("shadow-imported");
             for module in ["json", "os", "socket", "time", "datetime"] {
                 fs::write(
@@ -3968,7 +3957,7 @@ mod tests {
             }
             let input = json!({
                 "session_id": format!("{agent}-native"),
-                "transcript_path": format!("/tmp/{agent}-transcript.jsonl"),
+                "transcript_path": format!("/work/{agent}-transcript.jsonl"),
             });
 
             let (status, _stdout, stderr, requests) = run_state_asset_in(
@@ -4000,7 +3989,7 @@ mod tests {
     #[test]
     fn notification_hooks_ignore_modules_in_the_working_directory() {
         for agent in ["claude", "codex"] {
-            let workdir = temp_dir(&format!("{agent}-notify-shadowed-cwd"));
+            let workdir = scoped_dir(&format!("{agent}-notify-shadowed-cwd"));
             let marker = workdir.join("shadow-imported");
             for module in ["json", "os", "socket", "time", "datetime"] {
                 fs::write(
@@ -4042,7 +4031,7 @@ mod tests {
         for agent in ["claude", "codex"] {
             let input = json!({
                 "session_id": format!("{agent}-native"),
-                "transcript_path": format!("/tmp/{agent}-transcript.jsonl"),
+                "transcript_path": format!("/work/{agent}-transcript.jsonl"),
             });
 
             let (status, stdout, stderr, requests) = run_state_asset(
@@ -4080,7 +4069,7 @@ mod tests {
             );
             assert_eq!(
                 report["params"]["agent_session_path"],
-                json!(format!("/tmp/{agent}-transcript.jsonl"))
+                json!(format!("/work/{agent}-transcript.jsonl"))
             );
 
             let native = &requests[1];
@@ -4105,7 +4094,7 @@ mod tests {
             );
             assert_eq!(
                 native["params"]["transcript_path"],
-                json!(format!("/tmp/{agent}-transcript.jsonl"))
+                json!(format!("/work/{agent}-transcript.jsonl"))
             );
         }
     }
@@ -4119,7 +4108,7 @@ mod tests {
                 STATE_SESSION_ACTION,
                 &json!({
                     "session_id": native,
-                    "transcript_path": format!("/tmp/{agent}.jsonl"),
+                    "transcript_path": format!("/work/{agent}.jsonl"),
                 }),
             );
             assert_eq!(report["type"], "identity_report");
@@ -4317,7 +4306,7 @@ mod tests {
 
     #[test]
     fn install_claude_into_fresh_dir_writes_executable_hook_and_session_start() {
-        let claude_dir = temp_dir("claude-fresh");
+        let claude_dir = scoped_dir("claude-fresh");
         let paths = install_claude(&claude_dir).expect("install claude");
 
         assert!(paths.hook_path.is_file(), "hook script must be written");
@@ -4361,7 +4350,7 @@ mod tests {
 
     #[test]
     fn status_reports_missing_config_without_mutation() {
-        let root = temp_dir("status-missing");
+        let root = scoped_dir("status-missing");
         fs::create_dir_all(&root).expect("create temp root");
         let claude = root.join(".claude");
         let codex = root.join(".codex");
@@ -4411,7 +4400,7 @@ mod tests {
 
     #[test]
     fn bounded_status_read_accepts_limit_and_rejects_next_byte() {
-        let root = temp_dir("status-bounded-read");
+        let root = scoped_dir("status-bounded-read");
         fs::create_dir_all(&root).expect("create bounded read root");
         let path = root.join("settings.json");
         fs::write(
@@ -4443,7 +4432,7 @@ mod tests {
 
     #[test]
     fn status_reports_complete_installs_current_without_mutation() {
-        let root = temp_dir("status-current");
+        let root = scoped_dir("status-current");
         let claude = root.join("claude");
         let codex = root.join("codex");
         fs::create_dir_all(&claude).expect("create Claude dir");
@@ -4479,7 +4468,7 @@ mod tests {
             ("Codex hooks.json", AgentKind::Codex, "hooks.json"),
             ("Codex config.toml", AgentKind::Codex, "config.toml"),
         ] {
-            let config_dir = temp_dir(&format!("status-registration-mode-{name}"));
+            let config_dir = scoped_dir(&format!("status-registration-mode-{name}"));
             match agent {
                 AgentKind::Claude => {
                     install_claude(&config_dir).expect("install Claude fixture");
@@ -4531,7 +4520,7 @@ mod tests {
             ("Codex hooks.json", AgentKind::Codex, "hooks.json"),
             ("Codex config.toml", AgentKind::Codex, "config.toml"),
         ] {
-            let config_dir = temp_dir(&format!("status-registration-symlink-{name}"));
+            let config_dir = scoped_dir(&format!("status-registration-symlink-{name}"));
             match agent {
                 AgentKind::Claude => {
                     install_claude(&config_dir).expect("install Claude fixture");
@@ -4575,7 +4564,7 @@ mod tests {
     fn installer_rejects_untrusted_parents_before_any_mutation() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let claude = temp_dir("install-untrusted-claude-hooks-parent");
+        let claude = scoped_dir("install-untrusted-claude-hooks-parent");
         install_claude(&claude).expect("install trusted Claude fixture");
         fs::set_permissions(claude.join("hooks"), fs::Permissions::from_mode(0o775))
             .expect("make Claude hooks parent unsafe");
@@ -4586,7 +4575,7 @@ mod tests {
         assert_eq!(claude_error.code, "integration_path_untrusted");
         assert_eq!(tree_snapshot(&claude), claude_before);
 
-        let codex = temp_dir("install-untrusted-codex-config-parent");
+        let codex = scoped_dir("install-untrusted-codex-config-parent");
         install_codex(&codex).expect("install trusted Codex fixture");
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o775))
             .expect("make Codex config parent unsafe");
@@ -4601,10 +4590,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn installer_rejects_an_extended_acl_on_the_owner_safe_trust_root() {
-        let codex = temp_dir("install-untrusted-codex-acl-parent");
+        let codex = scoped_dir("install-untrusted-codex-acl-parent");
         let status = Command::new("/bin/chmod")
             .args(["+a", WRITABLE_INHERITABLE_ACL])
-            .arg(&codex)
+            .arg(&*codex)
             .status()
             .expect("run native ACL fixture command");
         assert!(status.success(), "native ACL fixture command must succeed");
@@ -4621,9 +4610,10 @@ mod tests {
     fn trusted_dir_replace_is_anchored_against_parent_name_swap() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = temp_dir("trusted-dir-name-swap");
+        let root = scoped_dir("trusted-dir-name-swap");
         let trusted = super::TrustedDir::open(&root, "test root").expect("open trusted dirfd");
-        let moved = root.with_extension("opened");
+        let holder = scoped_dir("trusted-dir-name-moved");
+        let moved = holder.join("opened");
         fs::rename(&root, &moved).expect("move opened directory");
         fs::create_dir(&root).expect("create replacement directory at original name");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
@@ -4659,7 +4649,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         if std::env::var_os(CLAUDE_HOOKS_UMASK_CHILD_ENV).is_none() {
-            let output = Command::new(std::env::current_exe().expect("current test executable"))
+            let env =
+                pohunek_test_support::env::TestEnv::new().expect("create the child environment");
+            let output = env
+                .command(std::env::current_exe().expect("current test executable"))
                 .arg("--exact")
                 .arg(
                     "integration::tests::install_claude_creates_private_hooks_under_owner_masking_umask",
@@ -4678,8 +4671,8 @@ mod tests {
             return;
         }
 
-        let new_config = temp_dir("claude-hooks-new-under-umask");
-        let existing_config = temp_dir("claude-hooks-existing-under-umask");
+        let new_config = scoped_dir("claude-hooks-new-under-umask");
+        let existing_config = scoped_dir("claude-hooks-existing-under-umask");
         let existing_hooks = existing_config.join("hooks");
         fs::create_dir(&existing_hooks).expect("create existing hooks directory");
         fs::set_permissions(&existing_hooks, fs::Permissions::from_mode(0o750))
@@ -4722,7 +4715,7 @@ mod tests {
 
     #[test]
     fn missing_claude_hooks_directory_is_reinstallable_not_installed() {
-        let claude = temp_dir("status-missing-claude-hooks-parent");
+        let claude = scoped_dir("status-missing-claude-hooks-parent");
 
         let report = explicit_status(&claude, AgentKind::Claude);
 
@@ -4739,7 +4732,7 @@ mod tests {
 
     #[test]
     fn relative_provider_config_roots_are_rejected_before_cwd_can_diverge() {
-        let home = temp_dir("relative-provider-root-home");
+        let home = scoped_dir("relative-provider-root-home");
         let relative = Path::new("relative-agent-config");
 
         let claude_error = with_status_env(Some(relative), None, Some(&home), || {
@@ -4761,7 +4754,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt as _;
 
-        let mut bytes = b"/tmp/pohunek-non-utf8-".to_vec();
+        let mut bytes = b"/work/pohunek-non-utf8-".to_vec();
         bytes.push(0xff);
         let path = PathBuf::from(OsString::from_vec(bytes));
         let error = with_status_env(Some(&path), None, None, || {
@@ -4794,7 +4787,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_trust_anchor_does_not_reject_safe_config_below_system_temp() {
-        let codex = temp_dir("status-safe-config-trust-anchor");
+        let codex = scoped_dir("status-safe-config-trust-anchor");
         install_codex(&codex).expect("install Codex fixture");
 
         let report = explicit_status(&codex, AgentKind::Codex);
@@ -4813,7 +4806,7 @@ mod tests {
             ("codex config root", AgentKind::Codex, 0o775),
             ("claude hooks directory", AgentKind::Claude, 0o757),
         ] {
-            let config_dir = temp_dir(&format!("status-writable-parent-{name}"));
+            let config_dir = scoped_dir(&format!("status-writable-parent-{name}"));
             let parent = match agent {
                 AgentKind::Codex => {
                     install_codex(&config_dir).expect("install Codex fixture");
@@ -4873,7 +4866,7 @@ mod tests {
             ("state missing", "pohunek-agent-state.sh", None),
             ("notification missing", "pohunek-agent-notify.sh", None),
         ] {
-            let codex = temp_dir(&format!("status-asset-{name}"));
+            let codex = scoped_dir(&format!("status-asset-{name}"));
             install_codex(&codex).expect("install Codex fixture");
             let path = codex.join(relative_path);
             match mutation {
@@ -4909,7 +4902,7 @@ mod tests {
 
     #[test]
     fn installed_version_is_unknown_when_one_readable_asset_has_no_valid_marker() {
-        let codex = temp_dir("status-invalid-version-marker");
+        let codex = scoped_dir("status-invalid-version-marker");
         install_codex(&codex).expect("install Codex fixture");
         let notify_path = codex.join(NOTIFY_HOOK_INSTALL_NAME);
         let invalid_asset = CODEX_NOTIFY_HOOK_ASSET.replacen(
@@ -4928,7 +4921,7 @@ mod tests {
 
     #[test]
     fn status_classifies_oversized_asset_as_reinstallable_outdated() {
-        let codex = temp_dir("status-oversized-asset");
+        let codex = scoped_dir("status-oversized-asset");
         install_codex(&codex).expect("install Codex fixture");
         fs::write(
             codex.join(STATE_HOOK_INSTALL_NAME),
@@ -4948,7 +4941,7 @@ mod tests {
 
     #[test]
     fn status_classifies_oversized_provider_config_as_manual_repair() {
-        let codex = temp_dir("status-oversized-config");
+        let codex = scoped_dir("status-oversized-config");
         install_codex(&codex).expect("install Codex fixture");
         fs::write(
             codex.join("config.toml"),
@@ -4972,25 +4965,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn status_rejects_provider_config_fifo_without_blocking() {
-        let codex = temp_dir("status-config-fifo");
+        let codex = scoped_dir("status-config-fifo");
         install_codex(&codex).expect("install Codex fixture");
         let config_path = codex.join("config.toml");
         fs::remove_file(&config_path).expect("remove regular Codex config");
-        let output = Command::new("mkfifo")
-            .arg(&config_path)
-            .output()
-            .expect("run mkfifo");
-        assert!(
-            output.status.success(),
-            "mkfifo failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        nix::unistd::mkfifo(&config_path, nix::sys::stat::Mode::S_IRWXU)
+            .expect("create the provider config FIFO");
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let inspected = codex.clone();
         thread::spawn(move || {
             let report = super::status_at(
                 super::StatusAgent::Codex,
-                &codex,
+                &inspected,
                 CODEX_HOOK_ASSET,
                 CODEX_NOTIFY_HOOK_ASSET,
             );
@@ -5016,7 +5003,7 @@ mod tests {
     fn managed_asset_symlink_requires_repair_and_reinstall_preserves_target() {
         use std::os::unix::fs::symlink;
 
-        let codex = temp_dir("status-asset-symlink");
+        let codex = scoped_dir("status-asset-symlink");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
         let sentinel_path = codex.join("sentinel-target");
@@ -5056,7 +5043,7 @@ mod tests {
     fn managed_asset_parent_symlink_requires_manual_repair() {
         use std::os::unix::fs::symlink;
 
-        let claude = temp_dir("status-asset-parent-symlink");
+        let claude = scoped_dir("status-asset-parent-symlink");
         install_claude(&claude).expect("install Claude fixture");
         let hooks_path = claude.join("hooks");
         let real_hooks_path = claude.join("hooks-real");
@@ -5079,7 +5066,7 @@ mod tests {
 
     #[test]
     fn managed_asset_metadata_error_requires_manual_repair() {
-        let claude = temp_dir("status-asset-metadata-error");
+        let claude = scoped_dir("status-asset-metadata-error");
         fs::write(claude.join("hooks"), "not a directory\n")
             .expect("replace managed asset parent with a file");
 
@@ -5101,7 +5088,7 @@ mod tests {
     fn status_rejects_unsafe_managed_hook_permissions_with_repair_hint() {
         use std::os::unix::fs::PermissionsExt;
 
-        let codex = temp_dir("status-unsafe-hook-permissions");
+        let codex = scoped_dir("status-unsafe-hook-permissions");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
         let mut permissions = fs::metadata(&hook_path)
@@ -5134,7 +5121,7 @@ mod tests {
     fn status_detects_special_managed_hook_mode_bits() {
         use std::os::unix::fs::PermissionsExt;
 
-        let codex = temp_dir("status-special-hook-mode");
+        let codex = scoped_dir("status-special-hook-mode");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
         fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o4755))
@@ -5156,7 +5143,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         for (index, drifted_mode) in [0o600, 0o777, 0o4755].into_iter().enumerate() {
-            let codex = temp_dir(&format!("reinstall-hook-mode-{index}"));
+            let codex = scoped_dir(&format!("reinstall-hook-mode-{index}"));
             install_codex(&codex).expect("install Codex fixture");
             let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
             fs::set_permissions(&hook_path, fs::Permissions::from_mode(drifted_mode))
@@ -5181,7 +5168,7 @@ mod tests {
 
     #[test]
     fn status_detects_broken_claude_registration() {
-        let claude = temp_dir("status-claude-registration");
+        let claude = scoped_dir("status-claude-registration");
         install_claude(&claude).expect("install Claude fixture");
         let settings_path = claude.join("settings.json");
         let mut settings = read_json(&settings_path);
@@ -5203,7 +5190,7 @@ mod tests {
 
     #[test]
     fn status_rejects_managed_registration_under_an_extra_event() {
-        let codex = temp_dir("status-extra-registration-event");
+        let codex = scoped_dir("status-extra-registration-event");
         install_codex(&codex).expect("install Codex fixture");
         let hooks_path = codex.join("hooks.json");
         let mut hooks = read_json(&hooks_path);
@@ -5232,7 +5219,7 @@ mod tests {
 
     #[test]
     fn codex_managed_hook_group_with_sibling_handler_is_not_current() {
-        let codex = temp_dir("status-codex-sibling-handler");
+        let codex = scoped_dir("status-codex-sibling-handler");
         install_codex(&codex).expect("install Codex fixture");
         let hooks_path = codex.join("hooks.json");
         let mut hooks = read_json(&hooks_path);
@@ -5277,7 +5264,7 @@ mod tests {
 
     #[test]
     fn stale_codex_managed_trust_keys_are_reinstalled_to_the_exact_set() {
-        let codex = temp_dir("status-codex-stale-trust-key");
+        let codex = scoped_dir("status-codex-stale-trust-key");
         install_codex(&codex).expect("install Codex fixture");
         let hooks_path = codex.join("hooks.json");
         let config_path = codex.join("config.toml");
@@ -5317,7 +5304,7 @@ mod tests {
 
     #[test]
     fn invalid_hook_event_structure_requires_manual_repair_before_install() {
-        let codex = temp_dir("status-invalid-hook-event");
+        let codex = scoped_dir("status-invalid-hook-event");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
         let sentinel = "# managed asset sentinel\n";
@@ -5349,7 +5336,7 @@ mod tests {
     #[test]
     fn non_object_registration_root_requires_manual_repair_for_each_provider() {
         for agent in [AgentKind::Claude, AgentKind::Codex] {
-            let config_dir = temp_dir(&format!("status-non-object-root-{}", agent.as_wire()));
+            let config_dir = scoped_dir(&format!("status-non-object-root-{}", agent.as_wire()));
             let registration_path = match &agent {
                 AgentKind::Claude => {
                     install_claude(&config_dir).expect("install Claude fixture");
@@ -5384,7 +5371,7 @@ mod tests {
     #[test]
     fn missing_hooks_object_is_reinstallable_for_each_provider() {
         for agent in [AgentKind::Claude, AgentKind::Codex] {
-            let config_dir = temp_dir(&format!("status-missing-hooks-{}", agent.as_wire()));
+            let config_dir = scoped_dir(&format!("status-missing-hooks-{}", agent.as_wire()));
             let registration_path = match &agent {
                 AgentKind::Claude => {
                     install_claude(&config_dir).expect("install Claude fixture");
@@ -5418,7 +5405,7 @@ mod tests {
     #[test]
     fn reinstall_replaces_owned_command_with_missing_type_for_each_provider() {
         for agent in [AgentKind::Claude, AgentKind::Codex] {
-            let config_dir = temp_dir(&format!("status-owned-command-{}", agent.as_wire()));
+            let config_dir = scoped_dir(&format!("status-owned-command-{}", agent.as_wire()));
             let registration_path = match &agent {
                 AgentKind::Claude => {
                     install_claude(&config_dir).expect("install Claude fixture");
@@ -5458,7 +5445,7 @@ mod tests {
 
     #[test]
     fn invalid_codex_config_structure_requires_manual_repair_before_install() {
-        let codex = temp_dir("status-invalid-config-structure");
+        let codex = scoped_dir("status-invalid-config-structure");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
         let sentinel = "# managed asset sentinel\n";
@@ -5483,7 +5470,7 @@ mod tests {
 
     #[test]
     fn scalar_managed_trust_key_requires_manual_repair_before_install() {
-        let codex = temp_dir("status-scalar-trust-key");
+        let codex = scoped_dir("status-scalar-trust-key");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
         let sentinel = "# managed asset sentinel\n";
@@ -5520,7 +5507,7 @@ mod tests {
 
     #[test]
     fn scalar_future_trust_key_with_hook_drift_requires_manual_repair() {
-        let codex = temp_dir("status-scalar-future-trust-key");
+        let codex = scoped_dir("status-scalar-future-trust-key");
         install_codex(&codex).expect("install Codex fixture");
         let hook_path = codex.join(STATE_HOOK_INSTALL_NAME);
         let sentinel = "# managed asset sentinel\n";
@@ -5573,7 +5560,7 @@ mod tests {
     #[test]
     fn status_detects_broken_codex_registration_trust_and_read_errors() {
         for failure in ["registration", "trust", "read", "malformed-config"] {
-            let codex = temp_dir(&format!("status-codex-{failure}"));
+            let codex = scoped_dir(&format!("status-codex-{failure}"));
             install_codex(&codex).expect("install Codex fixture");
             match failure {
                 "registration" => {
@@ -5626,7 +5613,7 @@ mod tests {
 
     #[test]
     fn aggregate_status_degrades_one_resolution_failure_without_aborting() {
-        let codex = temp_dir("status-aggregate-resolve");
+        let codex = scoped_dir("status-aggregate-resolve");
         install_codex(&codex).expect("install Codex fixture");
 
         let result = with_status_env(None, Some(&codex), None, || {
@@ -5689,7 +5676,7 @@ mod tests {
         let original_claude = std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV);
         let original_codex = std::env::var_os(super::CODEX_HOME_ENV);
         let original_home = std::env::var_os("HOME");
-        let root = temp_dir("status-env-isolation");
+        let root = scoped_dir("status-env-isolation");
         let claude = root.join("claude");
         let codex = root.join("codex");
         let home = root.join("home");
@@ -5836,7 +5823,7 @@ mod tests {
 
     #[test]
     fn install_claude_preserves_unrelated_hooks_and_is_idempotent() {
-        let claude_dir = temp_dir("claude-merge");
+        let claude_dir = scoped_dir("claude-merge");
         // Pre-existing, unrelated user settings and hooks.
         let settings_path = claude_dir.join("settings.json");
         fs::write(
@@ -5903,7 +5890,7 @@ mod tests {
 
     #[test]
     fn install_codex_writes_hook_hooks_json_and_enables_feature() {
-        let codex_dir = temp_dir("codex-fresh");
+        let codex_dir = scoped_dir("codex-fresh");
         let paths = install_codex(&codex_dir).expect("install codex");
 
         assert!(paths.hook_path.is_file());
@@ -5953,7 +5940,7 @@ mod tests {
 
     #[test]
     fn install_codex_is_idempotent_in_config_toml() {
-        let codex_dir = temp_dir("codex-idem");
+        let codex_dir = scoped_dir("codex-idem");
         // Pre-existing config with an unrelated key.
         fs::write(
             codex_dir.join("config.toml"),
@@ -5978,7 +5965,7 @@ mod tests {
 
     #[test]
     fn install_codex_updates_dotted_feature_config_toml() {
-        let codex_dir = temp_dir("codex-dotted");
+        let codex_dir = scoped_dir("codex-dotted");
         fs::write(
             codex_dir.join("config.toml"),
             "model = \"gpt-5\"\nfeatures.hooks = false\n",
@@ -5998,7 +5985,7 @@ mod tests {
 
     #[test]
     fn install_codex_fails_closed_on_inline_feature_table() {
-        let codex_dir = temp_dir("codex-inline");
+        let codex_dir = scoped_dir("codex-inline");
         fs::write(
             codex_dir.join("config.toml"),
             "features = { hooks = false }\n",
@@ -6021,7 +6008,7 @@ mod tests {
 
     #[test]
     fn install_claude_preserves_user_hook_that_mentions_managed_notify_path() {
-        let claude_dir = temp_dir("claude-substring-owned");
+        let claude_dir = scoped_dir("claude-substring-owned");
         let notify_path = claude_dir.join("hooks/pohunek-agent-notify.sh");
         let user_command = format!(
             "test -x {} && echo ok",
@@ -6068,7 +6055,7 @@ mod tests {
 
     #[test]
     fn install_codex_preserves_user_hook_that_mentions_managed_notify_path() {
-        let codex_dir = temp_dir("codex-substring-owned");
+        let codex_dir = scoped_dir("codex-substring-owned");
         let notify_path = codex_dir.join("pohunek-agent-notify.sh");
         let user_command = format!(
             "test -x {} && echo ok",
@@ -6112,7 +6099,7 @@ mod tests {
 
     #[test]
     fn install_claude_writes_notification_hook_and_modern_events() {
-        let claude_dir = temp_dir("claude-notify-install");
+        let claude_dir = scoped_dir("claude-notify-install");
         let settings_path = claude_dir.join("settings.json");
         fs::write(
             &settings_path,
@@ -6214,7 +6201,7 @@ mod tests {
 
     #[test]
     fn install_codex_writes_notification_hook_modern_events_and_trust_without_notify() {
-        let codex_dir = temp_dir("codex-notify-install");
+        let codex_dir = scoped_dir("codex-notify-install");
         let hooks_path = codex_dir.join("hooks.json");
         fs::write(
             &hooks_path,
@@ -6449,7 +6436,8 @@ mod tests {
 
     #[test]
     fn install_into_missing_dir_fails_fast() {
-        let missing = temp_dir("missing-parent").join("does-not-exist");
+        let parent = scoped_dir("missing-parent");
+        let missing = parent.join("does-not-exist");
         let err = install_claude(&missing).expect_err("missing claude dir");
         assert_eq!(err.code, "agent_config_dir_missing");
         let err = install_codex(&missing).expect_err("missing codex dir");

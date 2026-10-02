@@ -7,23 +7,19 @@
 
 use pohunek_daemon::error::DaemonError;
 use pohunek_daemon::lock::InstanceLock;
-use std::os::unix::fs::PermissionsExt as _;
 
-fn temp_lock(tag: &str) -> std::path::PathBuf {
-    let mut p = pohunek_test_support::temp_root();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    p.push(format!("pohunek-test-{tag}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir(&p).expect("create owner-private lock directory");
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
-        .expect("set owner-private lock directory mode");
-    p.join("daemon.lock")
+/// An owner-private directory and the lock path inside it; the directory is
+/// removed when the guard drops.
+fn temp_lock() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = pohunek_test_support::tempdir_with_prefix("ph-lock-")
+        .expect("create owner-private lock directory");
+    let path = dir.path().join("daemon.lock");
+    (dir, path)
 }
 
 #[test]
 fn second_acquire_is_refused_while_held() {
-    let path = temp_lock("lock");
+    let (_dir, path) = temp_lock();
 
     let first = InstanceLock::acquire(&path).expect("first lock acquires");
     assert_eq!(first.path(), path.as_path());
@@ -38,7 +34,4 @@ fn second_acquire_is_refused_while_held() {
     drop(first);
     let third = InstanceLock::acquire(&path).expect("acquire succeeds after release");
     drop(third);
-
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_dir(path.parent().expect("lock has a parent"));
 }

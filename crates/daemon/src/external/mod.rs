@@ -1021,10 +1021,10 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{self, Write};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::mpsc;
     use std::thread;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     use protocol::AgentKind;
 
@@ -1040,8 +1040,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn parse_transcript_returns_when_oversized_line_has_no_newline() {
-        let dir = temp_dir("oversized-transcript");
-        let fifo = dir.join("transcript.jsonl");
+        let dir = pohunek_test_support::tempdir().expect("transcript directory");
+        let fifo = dir.path().join("transcript.jsonl");
         create_fifo(&fifo);
 
         let (result_tx, result_rx) = mpsc::channel();
@@ -1096,19 +1096,6 @@ mod tests {
             io::Error::last_os_error()
         );
     }
-
-    fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        let dir = pohunek_test_support::temp_root().join(format!(
-            "pohunek-external-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -1133,8 +1120,6 @@ mod observer_tests {
 
     /// Sweep interval short enough to observe several sweeps quickly.
     const SWEEP_INTERVAL: Duration = Duration::from_millis(20);
-    /// Bound on waiting for the observer's periodic sweeps.
-    const SWEEP_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Host inspector that counts process sweeps.
     #[derive(Debug, Default)]
@@ -1193,7 +1178,7 @@ mod observer_tests {
         std::fs::write(
             &transcript,
             format!(
-                "{{\"session_id\":\"native-observer\",\"cwd\":\"/tmp\",\"transcript_path\":\"{}\"}}\n",
+                "{{\"session_id\":\"native-observer\",\"cwd\":\"/work\",\"transcript_path\":\"{}\"}}\n",
                 transcript.display()
             ),
         )
@@ -1238,13 +1223,10 @@ mod observer_tests {
                 sweep_interval: SWEEP_INTERVAL,
             },
         );
-        tokio::time::timeout(SWEEP_TIMEOUT, async {
-            while inspector.sweeps.load(Ordering::SeqCst) < 2 {
-                tokio::time::sleep(SWEEP_INTERVAL).await;
-            }
+        pohunek_test_support::wait::wait_until("the process sweep to keep running", || async {
+            (inspector.sweeps.load(Ordering::SeqCst) >= 2).then_some(())
         })
-        .await
-        .expect("the process sweep keeps running");
+        .await;
         sessions.shutdown();
     }
 }
@@ -1266,7 +1248,7 @@ mod scan_tests {
         fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
         fs::write(
             path,
-            format!("{{\"session_id\":\"{session_id}\",\"cwd\":\"/tmp\"}}\n"),
+            format!("{{\"session_id\":\"{session_id}\",\"cwd\":\"/work\"}}\n"),
         )
         .expect("write transcript");
     }
@@ -1597,7 +1579,9 @@ mod scan_tests {
         fs::rename(&staged, &path).expect("replace atomically");
         assert_eq!(
             fs::metadata(&path).map(|metadata| metadata.len()).ok(),
-            Some(u64::try_from("{\"session_id\":\"aaaa\",\"cwd\":\"/tmp\"}\n".len()).expect("len")),
+            Some(
+                u64::try_from("{\"session_id\":\"aaaa\",\"cwd\":\"/work\"}\n".len()).expect("len")
+            ),
             "the replacement has the same size"
         );
 

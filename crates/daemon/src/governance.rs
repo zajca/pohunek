@@ -580,14 +580,8 @@ pub(crate) enum RelayProjection {
 impl HostGovernanceService {
     #[cfg(test)]
     pub(crate) fn open_test() -> Self {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let root = tempfile::Builder::new()
-            .prefix("pohunek-governance-test-")
-            .tempdir_in(pohunek_test_support::temp_root())
+        let root = pohunek_test_support::tempdir_with_prefix("pohunek-governance-test-")
             .expect("create isolated host-governance root");
-        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700))
-            .expect("make host-governance root owner-private");
         let state_root = root.path().to_path_buf();
         Self {
             inner: Arc::new(Inner {

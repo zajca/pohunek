@@ -5,11 +5,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use protocol::{
     method, AgentActivity, AgentKind, CwdSource, DetectionRegionKind, DetectionRegionPreview,
     ErrorClass, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity, ProjectSource,
@@ -167,7 +168,7 @@ fn params() -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: "shell".to_owned(),
-        cwd: Some(PathBuf::from("/tmp")),
+        cwd: Some(crate::test_support::thread_scoped_dir("pohunek-cwd-")),
         cols: 80,
         rows: 24,
         project: None,
@@ -1233,20 +1234,28 @@ async fn mutations_fail_closed_for_an_unsupported_persisted_agent_kind() {
     let _ = registry.stop(&created.id).await;
 }
 
+/// Returns the metadata store path inside a fresh private directory that is
+/// removed when the calling test thread ends.
 fn temp_store_path(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = pohunek_test_support::temp_root().join(format!(
-        "pohunek-session-{tag}-{}-{nanos}-{n}",
-        std::process::id(),
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .expect("secure temp directory");
-    dir.join("metadata.jsonl")
+    crate::test_support::thread_scoped_dir(&format!("pohunek-session-{tag}-"))
+        .join("metadata.jsonl")
+}
+
+std::thread_local! {
+    /// Worker roots of the fixtures built on the current test thread, removed
+    /// when it ends.
+    static WORKER_ROOT_DIRS: std::cell::RefCell<Vec<tempfile::TempDir>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Resolves the worker roots of a fixture that builds its own launcher.
+///
+/// Roots the config does not name are fresh directories that live until the
+/// calling test thread ends, because the fixture outlives any one registry.
+fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
+    let (runtime_root, state_root, owned) = super::owned_test_worker_roots(config);
+    WORKER_ROOT_DIRS.with(|dirs| dirs.borrow_mut().extend(owned));
+    (runtime_root, state_root)
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -1407,7 +1416,7 @@ impl MockInspector {
             inner
                 .cwd
                 .entry(fact.pid)
-                .or_insert_with(|| PathBuf::from("/tmp"));
+                .or_insert_with(|| PathBuf::from("/work"));
         }
         inner.descendants.insert(root, facts);
     }
@@ -1974,7 +1983,7 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
             seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
             pid: Some(created.pid),
             agent_session_id: Some("stale-codex-native".to_owned()),
-            agent_session_path: Some("/tmp/stale-codex.jsonl".to_owned()),
+            agent_session_path: Some("/work/stale-codex.jsonl".to_owned()),
         })
         .await;
     assert!(report.recorded);
@@ -2023,7 +2032,7 @@ async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() 
             seq: Some(ReportSequence::new(DIRECT_AGENT_REPORT_SEQ)),
             pid: Some(observed.pid),
             agent_session_id: Some("hook-native-id".to_owned()),
-            agent_session_path: Some("/tmp/hook-native.jsonl".to_owned()),
+            agent_session_path: Some("/work/hook-native.jsonl".to_owned()),
         })
         .await;
     assert!(report.recorded);
@@ -2048,7 +2057,7 @@ async fn first_foreground_scan_binds_hook_identity_without_replacing_metadata() 
     );
     assert_eq!(
         inspected.active_agent_session_path.as_deref(),
-        Some("/tmp/hook-native.jsonl")
+        Some("/work/hook-native.jsonl")
     );
     assert_eq!(inspected.activity, Some(AgentActivity::Working));
     assert_eq!(inspected.state_source, StateSource::Report);
@@ -2135,7 +2144,7 @@ fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> La
         program: program.to_owned(),
         args: args.into_iter().map(str::to_owned).collect(),
         env: Vec::new(),
-        cwd: PathBuf::from("/tmp"),
+        cwd: crate::test_support::thread_scoped_dir("pohunek-cwd-"),
         cols: 80,
         rows: 24,
     }
@@ -2901,15 +2910,7 @@ async fn session_new_in_a_non_git_cwd_records_no_project() {
     // A plain shell in a non-git directory: no project, no stamping, today's
     // behavior unchanged.
     let (registry, _repo) = project_registry("non-git");
-    let non_git = pohunek_test_support::temp_root().join(format!(
-        "pohunek-nongit-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&non_git).expect("create non-git dir");
+    let non_git = crate::test_support::thread_scoped_dir("pohunek-nongit-");
 
     let info = registry
         .create(SessionNewParams {
@@ -3241,15 +3242,7 @@ async fn session_new_with_explicit_non_git_repo_errors() {
     // An explicitly named --repo that is not a git work tree must error, not
     // silently launch a plain shell somewhere else (no silent defaults).
     let (registry, _repo) = project_registry("explicit-nonrepo");
-    let nonrepo = pohunek_test_support::temp_root().join(format!(
-        "pohunek-nonrepo-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&nonrepo).expect("create non-git dir");
+    let nonrepo = crate::test_support::thread_scoped_dir("pohunek-nonrepo-");
 
     let err = registry
         .create(SessionNewParams {
@@ -5505,36 +5498,6 @@ const PLAN_DEADLINE: Duration = Duration::from_millis(50);
 /// to it.
 const PLAN_ACK_DELAY: Duration = Duration::from_millis(250);
 
-/// Margin added to every `advance` of the paused clock: tokio rounds a timer
-/// up to the next millisecond, so advancing by exactly a timer's duration can
-/// leave it one tick short.
-const TIMER_TICK: Duration = Duration::from_millis(1);
-
-/// Keeps tokio's paused clock from auto-advancing while real I/O is awaited.
-///
-/// A blocking task in flight inhibits auto-advance, so the paused clock moves
-/// only through `tokio::time::advance`, even when the runtime is idle waiting
-/// for the PTY or a worker socket. Dropping it lets the blocking task end.
-struct AutoAdvanceInhibitor {
-    release: std::sync::mpsc::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl AutoAdvanceInhibitor {
-    fn new() -> Self {
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        let task = tokio::task::spawn_blocking(move || {
-            let _ = released.recv();
-        });
-        Self { release, task }
-    }
-
-    async fn release(self) {
-        drop(self.release);
-        self.task.await.expect("auto-advance inhibitor task joins");
-    }
-}
-
 #[tokio::test]
 async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
     let agents_dir = temp_agents_dir_with(
@@ -6036,11 +5999,7 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .parent()
         .expect("store parent")
         .join("worker-state");
-    let worker_runtime_root = pohunek_test_support::temp_root().join(format!(
-        "pw-hook-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
+    let worker_runtime_root = crate::test_support::thread_scoped_dir("pw-hook-");
     let hook_path = pohunek_test_support::manifest_dir()
         .join("src/integration/assets/codex/pohunek-agent-state.sh");
     let payload = serde_json::json!({
@@ -6577,12 +6536,12 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
     entry.procwatch_cancel.cancel();
     entry.cwd_observed_at = crate::time::now();
     entry.info.subagents.clear();
-    entry.info.cwd = PathBuf::from("/tmp/concurrent-cwd");
+    entry.info.cwd = PathBuf::from("/work/concurrent-cwd");
     entry.info.project_id = Some("p-concurrent".to_owned());
     entry.info.is_linked_worktree = Some(true);
-    entry.info.repo = Some(PathBuf::from("/tmp/concurrent-repo"));
+    entry.info.repo = Some(PathBuf::from("/work/concurrent-repo"));
     entry.info.branch = Some("concurrent-branch".to_owned());
-    entry.info.worktree_path = Some(PathBuf::from("/tmp/concurrent-cwd"));
+    entry.info.worktree_path = Some(PathBuf::from("/work/concurrent-cwd"));
     entry.info.updated_at = newer_timestamp.to_owned();
     drop(sessions);
 
@@ -6595,7 +6554,7 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
     );
     let retried = registry.inspect(&created.id).await.expect("inspect retry");
     assert_eq!(retried.updated_at, newer_timestamp);
-    assert_eq!(retried.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(retried.cwd, PathBuf::from("/work/concurrent-cwd"));
     assert_eq!(retried.project_id.as_deref(), Some("p-concurrent"));
     assert_eq!(retried.branch.as_deref(), Some("concurrent-branch"));
     assert_eq!(
@@ -6611,20 +6570,20 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
         .pop()
         .expect("rebased session record");
     assert_eq!(durable.info.updated_at, newer_timestamp);
-    assert_eq!(durable.info.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(durable.info.cwd, PathBuf::from("/work/concurrent-cwd"));
     assert_eq!(durable.info.project_id.as_deref(), Some("p-concurrent"));
     assert_eq!(durable.info.is_linked_worktree, Some(true));
     assert_eq!(
         durable.info.repo,
-        Some(PathBuf::from("/tmp/concurrent-repo"))
+        Some(PathBuf::from("/work/concurrent-repo"))
     );
     assert_eq!(durable.info.branch.as_deref(), Some("concurrent-branch"));
     assert_eq!(
         durable.info.worktree_path,
-        Some(PathBuf::from("/tmp/concurrent-cwd"))
+        Some(PathBuf::from("/work/concurrent-cwd"))
     );
     let recovery = durable.recovery.expect("durable recovery binding");
-    assert_eq!(recovery.cwd, PathBuf::from("/tmp/concurrent-cwd"));
+    assert_eq!(recovery.cwd, PathBuf::from("/work/concurrent-cwd"));
     assert_eq!(recovery.project_id.as_deref(), Some("p-concurrent"));
     assert_eq!(recovery.is_linked_worktree, Some(true));
     let _ = registry.stop(&created.id).await;
@@ -6679,7 +6638,7 @@ async fn durable_launch_identity_survives_worker_metadata_rebase() {
         .as_mut()
         .expect("recovery binding")
         .native_session_id = None;
-    rebased.info.cwd = PathBuf::from("/tmp/concurrent-launch-cwd");
+    rebased.info.cwd = PathBuf::from("/work/concurrent-launch-cwd");
 
     preserve_durable_worker_metadata(&durable, &mut rebased);
 
@@ -6696,7 +6655,7 @@ async fn durable_launch_identity_survives_worker_metadata_rebase() {
     );
     assert_eq!(
         rebased.info.cwd,
-        PathBuf::from("/tmp/concurrent-launch-cwd")
+        PathBuf::from("/work/concurrent-launch-cwd")
     );
     let _ = registry.stop(&created.id).await;
 }
@@ -8539,7 +8498,7 @@ async fn report_agent_active_metadata_is_cleared_on_terminal_session() {
             seq: Some(ReportSequence::new(1)),
             pid: None,
             agent_session_id: Some("codex-native".to_owned()),
-            agent_session_path: Some("/tmp/codex-session.jsonl".to_owned()),
+            agent_session_path: Some("/work/codex-session.jsonl".to_owned()),
         })
         .await;
     assert!(report.recorded);
@@ -10530,7 +10489,7 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         .clone()
         .expect("durable runtime id");
     durable_before_exit.info.native_session_id = Some("durable-native-newer".to_owned());
-    durable_before_exit.info.native_session_path = Some("/tmp/durable-native-newer".to_owned());
+    durable_before_exit.info.native_session_path = Some("/work/durable-native-newer".to_owned());
     durable_before_exit.native_identity_ordering = Some(crate::store::NativeIdentityOrdering {
         runtime_id,
         pid: 4242,
@@ -10577,7 +10536,7 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
     );
     assert_eq!(
         durable.info.native_session_path.as_deref(),
-        Some("/tmp/durable-native-newer")
+        Some("/work/durable-native-newer")
     );
     let registry_info = registry
         .inspect(&created.id)
@@ -14298,7 +14257,7 @@ fn scripted_registry(
     Arc<crate::runtime::lifecycle::tests::ScriptedSupervisor>,
 ) {
     let mut config = config;
-    let (runtime_root, state_root) = super::test_worker_roots(&config);
+    let (runtime_root, state_root) = test_worker_roots(&config);
     config.worker_runtime_root = Some(runtime_root.clone());
     config.worker_state_root = Some(state_root.clone());
     config.supervision = Some(super::test_supervision(&runtime_root, &state_root));
@@ -14808,7 +14767,7 @@ impl RestartableDaemon {
             worktree_root: Some(worktree_root),
             ..SessionRegistryConfig::default()
         };
-        let (runtime_root, state_root) = super::test_worker_roots(&config);
+        let (runtime_root, state_root) = test_worker_roots(&config);
         config.supervision = Some(super::test_supervision(&runtime_root, &state_root));
         config.worker_runtime_root = Some(runtime_root);
         config.worker_state_root = Some(state_root);
@@ -15021,7 +14980,7 @@ fn exiting_worker_registry(
         create_drain_timeout: NEVER,
         ..SessionRegistryConfig::default()
     };
-    let (runtime_root, state_root) = super::test_worker_roots(&config);
+    let (runtime_root, state_root) = test_worker_roots(&config);
     let executable = crate::runtime::lifecycle::tests::write_exiting_worker(
         store_path.parent().expect("store directory"),
     );
@@ -16001,13 +15960,7 @@ const COMMIT_FAILURE_KILL_DELAY: Duration = Duration::from_millis(300);
 async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
     // Short, unique root: worker socket paths stay inside the `sun_path`
     // bound, like the reconciliation subprocess fixtures.
-    let root = pohunek_test_support::temp_root().join(format!(
-        "cf-{}-{}",
-        std::process::id(),
-        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
-    ));
-    fs::create_dir_all(&root).expect("create fixture root");
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("secure fixture root");
+    let root = crate::test_support::thread_scoped_dir("cf-");
     let store_path = root.join("data/metadata.jsonl");
     let data_dir = root.join("data");
     let pid_file = root.join("child.pid");

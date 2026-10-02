@@ -4,10 +4,10 @@
 
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::os::unix::{
-    fs::{MetadataExt as _, PermissionsExt as _},
+    fs::MetadataExt as _,
     net::{UnixListener, UnixStream},
 };
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -15,6 +15,7 @@ use std::time::Duration;
 use pohunek_daemon::host_state::{
     HostStateDir, HostStateError, HostStateRepository, HostStateRepositoryError,
 };
+use pohunek_test_support::env::TestEnv;
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt as _;
 
@@ -44,7 +45,11 @@ enum ChildEvent {
     },
 }
 
-struct Children(Vec<Child>);
+/// Bootstrap helper processes plus the scrubbed environment they run in.
+struct Children(
+    Vec<Child>,
+    #[expect(dead_code, reason = "keeps the helpers' environment alive")] TestEnv,
+);
 
 fn terminate_and_reap(child: &mut Child) {
     if child.try_wait().ok().flatten().is_some() {
@@ -75,16 +80,7 @@ impl Children {
 }
 
 fn state_dir() -> tempfile::TempDir {
-    let temp = tempfile::Builder::new()
-        .prefix("pohunek-host-bootstrap-")
-        .tempdir_in(pohunek_test_support::temp_root())
-        .expect("create isolated state directory");
-    std::fs::set_permissions(
-        temp.path(),
-        std::fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
-    )
-    .expect("make isolated state directory owner-private");
-    temp
+    pohunek_test_support::tempdir_with_prefix("ph-hb-").expect("create isolated state directory")
 }
 
 fn send_event(socket: std::ffi::OsString, event: &ChildEvent) {
@@ -178,21 +174,21 @@ fn spawn_concurrent_bootstrap_children(
     permit_socket: &std::path::Path,
     result_socket: &std::path::Path,
 ) -> Children {
-    Children(
-        (0..2)
-            .map(|_child_index| {
-                Command::new(std::env::current_exe().expect("test executable"))
-                    .arg("--exact")
-                    .arg("concurrent_first_start_waits_for_the_locked_bootstrap_then_converges")
-                    .env(CHILD_STATE_DIR_ENV, temp.path())
-                    .env(CHILD_ATTEMPT_SOCKET_ENV, attempt_socket)
-                    .env(CHILD_PERMIT_SOCKET_ENV, permit_socket)
-                    .env(CHILD_RESULT_SOCKET_ENV, result_socket)
-                    .spawn()
-                    .expect("spawn concurrent bootstrap child")
-            })
-            .collect(),
-    )
+    let env = TestEnv::new().expect("create the bootstrap child environment");
+    let children = (0..2)
+        .map(|_child_index| {
+            env.command(std::env::current_exe().expect("test executable"))
+                .arg("--exact")
+                .arg("concurrent_first_start_waits_for_the_locked_bootstrap_then_converges")
+                .env(CHILD_STATE_DIR_ENV, temp.path())
+                .env(CHILD_ATTEMPT_SOCKET_ENV, attempt_socket)
+                .env(CHILD_PERMIT_SOCKET_ENV, permit_socket)
+                .env(CHILD_RESULT_SOCKET_ENV, result_socket)
+                .spawn()
+                .expect("spawn concurrent bootstrap child")
+        })
+        .collect();
+    Children(children, env)
 }
 
 fn assert_lock_contention(listener: &UnixListener) {
