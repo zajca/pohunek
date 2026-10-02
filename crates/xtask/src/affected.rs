@@ -623,7 +623,7 @@ fn shell_quote(arg: &str) -> String {
 
 /// Fails unless the Git top level is the Cargo workspace root, so Git paths map onto packages.
 fn ensure_git_toplevel(workspace_root: &Path) -> Result<(), XtaskError> {
-    let output = command_output(workspace_root, "git", &["rev-parse", "--show-toplevel"])?;
+    let output = command_output(workspace_root, GIT, &["rev-parse", "--show-toplevel"])?;
     let toplevel = PathBuf::from(String::from_utf8_lossy(&output).trim_end_matches('\n'));
     let canonical = |path: &Path| {
         path.canonicalize().map_err(|source| XtaskError::Io {
@@ -646,8 +646,7 @@ fn ensure_git_toplevel(workspace_root: &Path) -> Result<(), XtaskError> {
 fn resolve_base(root: &Path, explicit: Option<&str>) -> Result<String, XtaskError> {
     let names_commit = |candidate: &str| -> Result<bool, XtaskError> {
         let revision = format!("{candidate}^{{commit}}");
-        let status = Command::new("git")
-            .current_dir(root)
+        let status = command_in(root, GIT)
             .args([
                 "rev-parse",
                 "--verify",
@@ -693,17 +692,17 @@ fn changed_files(root: &Path, base: &str) -> Result<BTreeSet<String>, XtaskError
     let listings = [
         command_output(
             root,
-            "git",
+            GIT,
             &["diff", "--name-only", "--no-renames", "-z", &range, "--"],
         )?,
         command_output(
             root,
-            "git",
+            GIT,
             &["diff", "--name-only", "--no-renames", "-z", "HEAD", "--"],
         )?,
         command_output(
             root,
-            "git",
+            GIT,
             &["ls-files", "--others", "--exclude-standard", "-z"],
         )?,
     ];
@@ -724,10 +723,45 @@ fn parse_nul_list(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
         .map(|entry| String::from_utf8_lossy(entry).into_owned())
 }
 
+/// The Git executable the changed-file queries run.
+const GIT: &str = "git";
+
+/// Variables that move Git to another repository, index or object store than
+/// the one in the working directory.
+///
+/// These are the repository-location variables of git(1) "ENVIRONMENT
+/// VARIABLES" ("The Git Repository"). Git sets `GIT_DIR` and `GIT_INDEX_FILE`
+/// itself while it runs a hook, so a loop started from a hook would otherwise
+/// ask about the hook's repository instead of the workspace. The discovery
+/// limits (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) stay
+/// because the commands start at the workspace root itself, and the developer's
+/// configuration and identity variables stay because they are legitimate input.
+const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+];
+
+/// Builds a command for `program` that runs in `dir`; a Git command also drops
+/// the [`REPOSITORY_REDIRECTING_VARS`] it would inherit.
+fn command_in(dir: &Path, program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.current_dir(dir);
+    if program == GIT {
+        for var in REPOSITORY_REDIRECTING_VARS {
+            command.env_remove(var);
+        }
+    }
+    command
+}
+
 /// Runs `program` with `args` in `dir` and returns stdout, failing on a non-zero exit.
 fn command_output(dir: &Path, program: &str, args: &[&str]) -> Result<Vec<u8>, XtaskError> {
-    let output = Command::new(program)
-        .current_dir(dir)
+    let output = command_in(dir, program)
         .args(args)
         .output()
         .map_err(|source| XtaskError::Io {
@@ -1210,6 +1244,66 @@ mod tests {
 
     #[test]
     fn changed_files_unite_committed_staged_unstaged_and_untracked_paths() {
+        changed_files_scenario();
+    }
+
+    /// Variables the child of the ambient-redirect test starts with: each
+    /// points Git at a repository, index or worktree that does not exist.
+    const AMBIENT_GIT_VARS: [(&str, &str); 3] = [
+        ("GIT_DIR", "/nonexistent/pohunek/.git"),
+        ("GIT_WORK_TREE", "/nonexistent/pohunek"),
+        ("GIT_INDEX_FILE", "/nonexistent/pohunek/index"),
+    ];
+
+    /// Child half of [`ambient_git_repository_variables_do_not_redirect_the_queries`].
+    #[test]
+    #[ignore = "child process of ambient_git_repository_variables_do_not_redirect_the_queries"]
+    fn changed_files_scenario_under_ambient_git_variables() {
+        changed_files_scenario();
+    }
+
+    /// The queries run in a process whose environment points Git elsewhere, as
+    /// in a git hook. The environment is set on a child process because
+    /// mutating this process's environment would race the other tests.
+    #[test]
+    fn ambient_git_repository_variables_do_not_redirect_the_queries() {
+        let env = TestEnv::new().expect("hermetic test environment");
+        let exe = std::env::current_exe().expect("test executable");
+        let output = env
+            .command(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "affected::tests::changed_files_scenario_under_ambient_git_variables",
+            ])
+            .envs(AMBIENT_GIT_VARS)
+            .output()
+            .expect("run scenario child");
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn git_queries_drop_repository_redirecting_variables_and_nothing_else() {
+        let command = command_in(Path::new("."), GIT);
+        let mut removed: Vec<&str> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .filter_map(|(name, _)| name.to_str())
+            .collect();
+        removed.sort_unstable();
+        let mut expected = REPOSITORY_REDIRECTING_VARS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(removed, expected);
+        let other = command_in(Path::new("."), "cargo");
+        assert_eq!(other.get_envs().count(), 0);
+    }
+
+    fn changed_files_scenario() {
         let env = TestEnv::new().expect("hermetic test environment");
         let dir = env.cwd();
         let write = |path: &str, content: &str| {
