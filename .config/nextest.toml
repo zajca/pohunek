@@ -57,6 +57,8 @@ not (
   or (package(=pohunek-gui-core) and binary(=loopback))
   or (package(=pohunek-platform) and
     test(/^(shell_env::test_support::tests::|filesystem::tests::a_dropped_lock_is_free_while_|test_spawn::)/))
+  or (package(=pohunek-test-support) and
+    test(=fs::tests::a_fresh_executable_runs_while_sibling_threads_keep_spawning))
   or (package(=xtask) and (test(/^hermes(::|_mock::)/) or kind(test)))
 )
 '''
