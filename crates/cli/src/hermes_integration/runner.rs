@@ -4,7 +4,7 @@
 //! clears the inherited environment, owns each child process group, and never
 //! retains subprocess output in an error.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-02
 
 #![expect(
     clippy::map_err_ignore,
@@ -1625,10 +1625,36 @@ mod tests {
     }
 
     fn script(root: &Path, body: &str) -> PathBuf {
-        let path = root.join("hermes");
-        fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write script");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("executable script");
-        path
+        write_executable(&root.join("hermes"), body)
+    }
+
+    /// Writes `content` to `path` through a `sh` child that owns the write
+    /// descriptor.
+    ///
+    /// While this process held a writable descriptor, a sibling test thread
+    /// that spawned a process would give its child a copy until the child's
+    /// own `exec`, and executing the file meanwhile would fail with `ETXTBSY`.
+    /// The writer exits before this returns, so no descriptor open for writing
+    /// remains anywhere.
+    fn write_without_local_writer(path: &Path, content: &[u8]) {
+        use std::io::Write as _;
+
+        let mut writer = Command::new("/bin/sh")
+            .args(["-c", "cat > \"$1\"", "sh"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn file writer");
+        writer
+            .stdin
+            .take()
+            .expect("file writer stdin")
+            .write_all(content)
+            .expect("send file content");
+        assert!(
+            writer.wait().expect("wait for file writer").success(),
+            "the file writer failed"
+        );
     }
 
     fn runner(root: &Path, body: &str) -> HermesRunner {
@@ -1748,7 +1774,7 @@ mod tests {
     }
 
     fn write_executable(path: &Path, body: &str) -> PathBuf {
-        fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write executable");
+        write_without_local_writer(path, format!("#!/bin/sh\nset -eu\n{body}\n").as_bytes());
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("executable mode");
         path.to_owned()
     }
@@ -2375,13 +2401,13 @@ mod tests {
         let root = fixture("inherited-fd");
         let selected = target(&root.0, TargetSelection::Profile(ProfileName::default()));
         let inherited_path = root.0.join("inherited");
-        let inherited = OpenOptions::new()
+        let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(inherited_path)
             .expect("open controlled descriptor");
+        let inherited = duplicate_inheritable_low(&file);
         let descriptor = inherited.as_raw_fd();
-        make_inheritable(descriptor);
         let result = root.0.join("fd-result");
         let body = format!(
             "if test -e /dev/fd/{descriptor}; then state=inherited; else state=closed; fi\nprintf '%s' \"$state\" > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'",
@@ -2420,18 +2446,16 @@ mod tests {
         format!("if test -e /dev/fd/{descriptor}; then printf 'open '; else printf 'closed '; fi;")
     }
 
-    #[test]
-    fn pre_exec_closes_low_and_high_inherited_descriptors() {
-        let root = fixture("inherited-fds-many");
-        let selected = target(&root.0, TargetSelection::Profile(ProfileName::default()));
-        let low = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(root.0.join("low"))
-            .expect("open low descriptor");
-        make_inheritable(low.as_raw_fd());
-        let high = duplicate_inheritable_from(&low, high_descriptor_floor());
-        let result = root.0.join("fd-result");
+    /// Runs the version probe with an inheritable low and an inheritable high
+    /// descriptor and asserts that the child sees both closed.
+    ///
+    /// Both descriptors are duplicates this test created, so the probe never
+    /// reports a descriptor another test thread holds.
+    fn assert_pre_exec_closes_low_and_high(file: &fs::File, root: &Path) {
+        let selected = target(root, TargetSelection::Profile(ProfileName::default()));
+        let low = duplicate_inheritable_low(file);
+        let high = duplicate_inheritable_from(file, high_descriptor_floor());
+        let result = root.join("fd-result");
         let body = format!(
             "{{ {} {} {} }} > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'",
             descriptor_state(low.as_raw_fd()),
@@ -2440,7 +2464,7 @@ mod tests {
             descriptor_state(1),
             result.display()
         );
-        runner(&root.0, &body)
+        runner(root, &body)
             .verify_version(&selected)
             .expect("fixed version after descriptor checks");
         assert!(high.as_raw_fd() >= high_descriptor_floor());
@@ -2448,6 +2472,47 @@ mod tests {
             fs::read_to_string(result).expect("descriptor result"),
             "closed closed open "
         );
+    }
+
+    #[test]
+    fn pre_exec_closes_low_and_high_inherited_descriptors() {
+        let root = fixture("inherited-fds-many");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.0.join("low"))
+            .expect("open descriptor source");
+        assert_pre_exec_closes_low_and_high(&file, &root.0);
+    }
+
+    /// With every low number taken, as when sibling test threads hold
+    /// descriptors, the lowest free number lands where the probe shell keeps
+    /// its own descriptors.
+    #[test]
+    fn pre_exec_closes_the_low_descriptor_when_the_low_range_is_crowded() {
+        let root = fixture("inherited-fds-crowded");
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(root.0.join("low"))
+            .expect("open descriptor source");
+        let mut crowd = Vec::new();
+        while crowd.last().map_or(0, |file: &fs::File| file.as_raw_fd())
+            < SHELL_DESCRIPTORS.start - 1
+        {
+            crowd.push(fs::File::open("/dev/null").expect("open a crowding descriptor"));
+        }
+        assert_pre_exec_closes_low_and_high(&file, &root.0);
+    }
+
+    #[test]
+    fn shell_descriptor_numbers_are_the_ones_a_shell_keeps_for_itself() {
+        for descriptor in [10, 11, 15, SHELL_SCRIPT_DESCRIPTOR] {
+            assert!(is_shell_descriptor(descriptor), "{descriptor}");
+        }
+        for descriptor in [3, 9, 16, 100, 254] {
+            assert!(!is_shell_descriptor(descriptor), "{descriptor}");
+        }
     }
 
     #[test]
@@ -2623,6 +2688,45 @@ mod tests {
         let high = duplicate_inheritable_from(&file, high_descriptor_floor());
         let highest = highest_open_descriptor().expect("descriptor table listing");
         assert!(highest >= high.as_raw_fd());
+    }
+
+    /// Descriptor numbers a shell moves its own state to: the script input, a
+    /// saved standard stream behind a redirection, and here-documents.
+    ///
+    /// `dash` and `bash` allocate these from 10 upward, so a probe that
+    /// reports a descriptor in this range would report the shell's own.
+    const SHELL_DESCRIPTORS: std::ops::Range<libc::c_int> = 10..16;
+
+    /// The descriptor `bash` keeps its script open on.
+    const SHELL_SCRIPT_DESCRIPTOR: libc::c_int = 255;
+
+    fn is_shell_descriptor(descriptor: libc::c_int) -> bool {
+        SHELL_DESCRIPTORS.contains(&descriptor) || descriptor == SHELL_SCRIPT_DESCRIPTOR
+    }
+
+    /// Duplicates `file` to the lowest free inheritable number from
+    /// [`FIRST_INHERITED_FD`] that the probe shell does not use itself.
+    ///
+    /// The number is allocated atomically and then belongs to this test, so
+    /// no other thread can hold it. `dup2` onto a fixed slot is deliberately
+    /// avoided: it would silently replace a descriptor a sibling test thread
+    /// holds there.
+    fn duplicate_inheritable_low(file: &fs::File) -> std::os::fd::OwnedFd {
+        let mut skipped = Vec::new();
+        let mut minimum = FIRST_INHERITED_FD;
+        loop {
+            let duplicate = duplicate_inheritable_from(file, minimum);
+            let number = duplicate.as_raw_fd();
+            if !is_shell_descriptor(number) {
+                return duplicate;
+            }
+            minimum = if SHELL_DESCRIPTORS.contains(&number) {
+                SHELL_DESCRIPTORS.end
+            } else {
+                number + 1
+            };
+            skipped.push(duplicate);
+        }
     }
 
     #[expect(
