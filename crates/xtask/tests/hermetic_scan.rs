@@ -398,8 +398,11 @@ fn env_mutation_candidates(skeleton: &str) -> Vec<usize> {
     found
 }
 
-/// Names that `use .. env as <name>` binds to a module named `env`, such as
-/// `use std::env as process_env;` or `use std::{env as e, fs};`.
+/// Names that a `use` rooted at `std` binds to `std::env`: `use std::env as
+/// e;`, `use std::{env as e, fs};` and `use std::env::{self as e};`.
+///
+/// An import rooted elsewhere (`use crate::fixture::env as e;`) names another
+/// module and binds nothing here.
 fn env_module_aliases(skeleton: &str) -> Vec<&str> {
     let bytes = skeleton.as_bytes();
     let mut aliases = Vec::new();
@@ -408,26 +411,55 @@ fn env_module_aliases(skeleton: &str) -> Vec<&str> {
             continue;
         }
         let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+        let squeezed: String = skeleton[at..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if !(squeezed.starts_with("usestd::") || squeezed.starts_with("use::std::")) {
+            continue;
+        }
         for (offset, _) in skeleton[at..end].match_indices("env") {
             let offset = at + offset;
             let name_end = offset + "env".len();
             if !starts_word(bytes, offset) || end_of_ident(bytes, offset) != name_end {
                 continue;
             }
-            let Some(after_as) = expect_token(bytes, name_end, "as") else {
-                continue;
-            };
-            if bytes.get(after_as).copied().is_some_and(is_ident) {
+            if let Some(alias) = alias_after(skeleton, name_end, end) {
+                aliases.push(alias);
                 continue;
             }
-            let alias_start = skip_whitespace(bytes, after_as);
-            let alias_end = end_of_ident(bytes, alias_start);
-            if alias_end > alias_start && alias_end <= end {
-                aliases.push(&skeleton[alias_start..alias_end]);
+            // `env::{self as e, ..}` binds `e` to the module itself.
+            let Some(group) = expect_token(bytes, name_end, "::")
+                .and_then(|after| expect_token(bytes, after, "{"))
+            else {
+                continue;
+            };
+            let close = skeleton[group..end].find('}').map_or(end, |n| group + n);
+            for (self_at, _) in skeleton[group..close].match_indices("self") {
+                let self_at = group + self_at;
+                let self_end = self_at + "self".len();
+                if starts_word(bytes, self_at) && end_of_ident(bytes, self_at) == self_end {
+                    if let Some(alias) = alias_after(skeleton, self_end, close) {
+                        aliases.push(alias);
+                    }
+                }
             }
         }
     }
     aliases
+}
+
+/// The identifier in `as <ident>` right after `from`, when it ends before
+/// `limit`.
+fn alias_after(skeleton: &str, from: usize, limit: usize) -> Option<&str> {
+    let bytes = skeleton.as_bytes();
+    let after_as = expect_token(bytes, from, "as")?;
+    if bytes.get(after_as).copied().is_some_and(is_ident) {
+        return None;
+    }
+    let alias_start = skip_whitespace(bytes, after_as);
+    let alias_end = end_of_ident(bytes, alias_start);
+    (alias_end > alias_start && alias_end <= limit).then(|| &skeleton[alias_start..alias_end])
 }
 
 /// Whether the host temp path at `at` in `text` stands alone.
@@ -1607,6 +1639,9 @@ fn a_mutator_called_through_an_env_module_alias_is_flagged() {
         ),
         ("use std::env as e;", "e::remove_var(\"K\");"),
         ("use std::{env as e, fs};", "e::set_var(\"K\", \"v\");"),
+        ("use std::env::{self as e};", "e::set_var(\"K\", \"v\");"),
+        ("use std::env::{self as e, var};", "e::remove_var(\"K\");"),
+        ("use ::std::env as e;", "e::set_var(\"K\", \"v\");"),
     ] {
         let text = format!("{import}\n#[test]\nfn f() {{\n    {call}\n}}\n");
         assert_eq!(
@@ -1617,6 +1652,9 @@ fn a_mutator_called_through_an_env_module_alias_is_flagged() {
     }
     let unrelated = "use std::env as e;\n#[test]\nfn f() {\n    other::set_var(\"K\", \"v\");\n    let v = e::var(\"K\");\n}\n";
     assert!(rules_of(&scan_one(DEMO, unrelated)).is_empty());
+    let custom =
+        "use crate::fixture::env as e;\n#[test]\nfn f() {\n    e::set_var(\"K\", \"v\");\n}\n";
+    assert!(rules_of(&scan_one(DEMO, custom)).is_empty());
 }
 
 #[test]

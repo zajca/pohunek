@@ -160,9 +160,10 @@ impl Drop for ProcessEnv {
 /// Builds a [`Command`] for `program`, resolved against the current `PATH`
 /// while holding the environment lock.
 ///
-/// The returned command carries an absolute path and sets the captured `PATH`
-/// on the child, so neither the spawn nor the child's own lookups observe a
-/// `PATH` another test sets between this call and the spawn. A `program` that
+/// The returned command carries an absolute path and pins the captured `PATH`
+/// on the child (removed when it was unset), so neither the spawn nor the
+/// child's own lookups observe a `PATH` another test sets between this call
+/// and the spawn. A `program` that
 /// is not a bare name, or that is not found, is passed through unchanged and
 /// fails or resolves at spawn like [`Command::new`].
 ///
@@ -174,11 +175,18 @@ pub fn command(program: &str) -> Command {
         let _env = ProcessEnv::lock();
         std::env::var_os("PATH")
     };
+    command_with_path(program, path)
+}
+
+/// [`command`] for a `PATH` already captured under the lock (`None` when it
+/// was unset).
+fn command_with_path(program: &str, path: Option<std::ffi::OsString>) -> Command {
     let resolved = path.as_deref().and_then(|path| resolve_in(program, path));
     let mut command = Command::new(resolved.unwrap_or_else(|| PathBuf::from(program)));
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
+    match path {
+        Some(path) => command.env("PATH", path),
+        None => command.env_remove("PATH"),
+    };
     command
 }
 
@@ -370,5 +378,26 @@ mod tests {
         };
         assert!(output.status.success());
         assert_eq!(std::ffi::OsStr::from_bytes(&output.stdout), captured);
+    }
+
+    #[test]
+    fn a_command_built_from_an_unset_path_keeps_it_unset_when_another_test_sets_it() {
+        let mut command = super::command_with_path("/bin/sh", None);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "PATH" && value.is_none()),
+            "the command removes PATH from the child environment"
+        );
+        // `sh` substitutes its own default PATH when none is inherited, so the
+        // check is that the override never reaches the child.
+        command.args(["-c", "printf %s \"$PATH\""]);
+        let output = {
+            let mut env = ProcessEnv::lock();
+            env.set("PATH", "/test-support-overridden-path");
+            command.output().expect("run sh")
+        };
+        assert!(output.status.success());
+        assert_ne!(output.stdout, b"/test-support-overridden-path");
     }
 }
