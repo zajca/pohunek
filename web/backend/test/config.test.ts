@@ -111,7 +111,7 @@ describe("backend configuration", () => {
   });
 
   test("invalid or orphaned log settings fail instead of defaulting", () => {
-    for (const dir of ["", "relative/logs", "/var/../logs"]) {
+    for (const dir of ["", "relative/logs", "/var/../logs", "/var/log/pk/", "/var/log/./pk", "/var//log"]) {
       expectConfigError({ ...baseEnv(), POHUNEK_BACKEND_LOG_DIR: dir }, "POHUNEK_BACKEND_LOG_DIR");
     }
     for (const bad of ["0", "-1", "1.5", "many", ""]) {

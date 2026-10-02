@@ -168,7 +168,11 @@ Files left by an earlier run are brought inside
 the bound when the backend starts: oversize ones are removed (the active one is
 emptied) and loose modes are forced to `0600`. An event larger than one file is
 replaced by a fixed notice, so total disk use stays within the product of the two
-limits. A failing write or rotation (a full disk, an I/O error) never fails a
+limits. The bound assumes one backend owns the directory, which the single
+launchd job or systemd unit guarantees; two backends sharing one log directory do
+not coordinate. The directory must be a normalized absolute path (no trailing
+slash, `.` or `..`), and a setup failure such as a permission error stops
+startup with a message naming the directory and the cause. A failing write or rotation (a full disk, an I/O error) never fails a
 request: the event goes to standard output, one `log_file_failed` event reports
 it, and the next event tries the files again. A partly written line is cut back
 off; if that fails, the next event starts a fresh active file. A failed start is

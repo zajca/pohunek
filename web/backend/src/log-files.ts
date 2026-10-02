@@ -12,7 +12,7 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { errorClass, stdoutLogger, type BackendLogEvent, type BackendLogger } from "./log";
 
 /** Active log file; rotated files carry a numeric suffix (`.1` newest). */
@@ -72,6 +72,13 @@ const ROTATED_SUFFIX = /^[1-9][0-9]*$/;
  * failure, and the next event tries the files again. A partly written line is
  * truncated away; when that fails too, the next event starts a new active file
  * so no event is appended to a torn line.
+ *
+ * One process owns a log directory: the bound holds for a single writer, and
+ * the service manager (one launchd job or systemd unit) keeps the backend to a
+ * single instance. Two loggers on the same directory do not coordinate.
+ *
+ * Setup failures, including file-system errors, surface as `LogFileError`
+ * naming the directory and the underlying cause.
  */
 export function rotatingFileLogger(options: RotatingLogOptions): ClosableBackendLogger {
   return createRotatingFileLogger(options, NODE_LOG_FILE_IO);
@@ -88,11 +95,25 @@ export function createRotatingFileLogger(options: RotatingLogOptions, io: LogFil
   if (maxFileBytes < noticeBytes) {
     throw new LogFileError(`log file limit must be at least ${String(noticeBytes)} bytes`);
   }
-  prepareDirectory(dir);
+  // A trailing slash or `.` component would make `lstat` follow a symlinked
+  // final component, so only the normalized absolute form is accepted.
+  if (!isAbsolute(dir) || resolve(dir) !== dir) {
+    throw new LogFileError(`log directory must be a normalized absolute path: ${dir}`);
+  }
   const active = join(dir, LOG_FILE_NAME);
-  sanitizeRotated(dir, maxFiles, maxFileBytes);
-  let descriptor = openActive(active, maxFileBytes);
-  let size = fstatSync(descriptor).size;
+  const opened = withSetupContext(dir, () => {
+    prepareDirectory(dir);
+    sanitizeRotated(dir, maxFiles, maxFileBytes);
+    const initial = openActive(active, maxFileBytes);
+    try {
+      return { descriptor: initial, size: fstatSync(initial).size };
+    } catch (error: unknown) {
+      closeSync(initial);
+      throw error;
+    }
+  });
+  let descriptor = opened.descriptor;
+  let size = opened.size;
   let closed = false;
   let failing = false;
   let torn = false;
@@ -198,6 +219,19 @@ export function createRotatingFileLogger(options: RotatingLogOptions, io: LogFil
       }
     },
   };
+}
+
+/** Rethrows a setup failure as `LogFileError` so startup reports its cause. */
+function withSetupContext<T>(dir: string, setup: () => T): T {
+  try {
+    return setup();
+  } catch (error: unknown) {
+    if (error instanceof LogFileError) {
+      throw error;
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new LogFileError(`cannot open backend log files in ${dir}: ${detail}`, { cause: error });
+  }
 }
 
 function encodeLine(event: BackendLogEvent): Buffer {

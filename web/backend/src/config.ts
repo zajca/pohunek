@@ -189,10 +189,12 @@ function resolveLogFiles(env: NodeJS.ProcessEnv): BackendLogFileConfig | undefin
     }
     return undefined;
   }
-  if (!isAbsolute(dir) || dir.includes("\0") || dir.split("/").includes("..")) {
+  // `resolve` equality rejects a trailing slash and `.`/`..` components, which
+  // would make the final-component symlink check follow a symlink.
+  if (!isAbsolute(dir) || dir.includes("\0") || resolve(dir) !== dir) {
     throw new BackendConfigError(
       ENV_LOG_DIR,
-      "must be an absolute path without parent-directory components",
+      "must be a normalized absolute path (no trailing slash, `.` or `..` components)",
     );
   }
   return {

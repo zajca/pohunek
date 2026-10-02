@@ -162,13 +162,7 @@ describe("rotating backend log files", () => {
       await mkdir(linked, { mode: 0o700 });
       await writeFile(join(root, "elsewhere"), "", { mode: 0o600 });
       await symlink(join(root, "elsewhere"), join(linked, LOG_FILE_NAME));
-      let failed = false;
-      try {
-        rotatingFileLogger({ dir: linked, maxFileBytes: 4096, maxFiles: 2 });
-      } catch {
-        failed = true;
-      }
-      expect(failed).toBe(true);
+      expectLogFileError(() => rotatingFileLogger({ dir: linked, maxFileBytes: 4096, maxFiles: 2 }));
       expect(await readFile(join(root, "elsewhere"), "utf8")).toBe("");
 
       expectLogFileError(() => rotatingFileLogger({ dir: join(root, "limits"), maxFileBytes: 0, maxFiles: 2 }));
@@ -188,18 +182,34 @@ describe("non-regular files in log slots", () => {
       const rotatedPeer = makeFifoWithLatePeer(join(rotatedDir, `${LOG_FILE_NAME}.1`));
       try {
         const started = performance.now();
-        let activeFailed = false;
-        try {
-          rotatingFileLogger({ dir: activeDir, maxFileBytes: 4096, maxFiles: 2 });
-        } catch {
-          activeFailed = true;
-        }
+        const activeError = expectLogFileError(() =>
+          rotatingFileLogger({ dir: activeDir, maxFileBytes: 4096, maxFiles: 2 }),
+        );
         expectLogFileError(() => rotatingFileLogger({ dir: rotatedDir, maxFileBytes: 4096, maxFiles: 3 }));
-        expect(activeFailed).toBe(true);
         expect(performance.now() - started < FIFO_PEER_DELAY_MS).toBe(true);
+        // The setup error carries the system cause, so a launchd start failure is actionable.
+        expect(activeError.message.includes(activeDir)).toBe(true);
+        expect(activeError.message.includes("ENXIO")).toBe(true);
       } finally {
         await Promise.all([stopPeer(activePeer), stopPeer(rotatedPeer)]);
       }
+    });
+  });
+
+  test("a symlinked directory is refused behind a trailing slash or dot component", async () => {
+    await withRoot(async (root) => {
+      const target = join(root, "target");
+      await mkdir(target, { mode: 0o700 });
+      const big = "x".repeat(SMALL_FILE_BYTES * 3);
+      await writeFile(join(target, LOG_FILE_NAME), big, { mode: 0o600 });
+      await writeFile(join(target, `${LOG_FILE_NAME}.5`), "stale\n", { mode: 0o600 });
+      await symlink(target, join(root, "link"));
+
+      for (const dir of [`${join(root, "link")}/`, `${join(root, "link")}/.`, "relative/logs"]) {
+        expectLogFileError(() => rotatingFileLogger({ dir, maxFileBytes: SMALL_FILE_BYTES, maxFiles: 2 }));
+      }
+      expect((await readdir(target)).sort()).toEqual([LOG_FILE_NAME, `${LOG_FILE_NAME}.5`]);
+      expect(await readFile(join(target, LOG_FILE_NAME), "utf8")).toBe(big);
     });
   });
 
@@ -461,7 +471,7 @@ async function stopPeer(peer: ChildProcess): Promise<void> {
   await exited;
 }
 
-function expectLogFileError(action: () => unknown): void {
+function expectLogFileError(action: () => unknown): LogFileError {
   let failure: unknown;
   try {
     action();
@@ -469,6 +479,7 @@ function expectLogFileError(action: () => unknown): void {
     failure = error;
   }
   expect(failure).toBeInstanceOf(LogFileError);
+  return failure as LogFileError;
 }
 
 async function withRoot(run: (root: string) => Promise<void>): Promise<void> {
