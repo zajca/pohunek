@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   currentRuntimePathContext,
@@ -13,6 +13,10 @@ import {
 export { ENV_XDG_RUNTIME_DIR };
 
 export const DEFAULT_DISCOVER_INTERVAL_SECONDS = 30;
+/** Size of one backend log file; matches the daemon's log family (`crates/logging`). */
+export const DEFAULT_LOG_MAX_FILE_BYTES = 32 * 1024 * 1024;
+/** Backend log files kept including the active one; matches the daemon's log family. */
+export const DEFAULT_LOG_MAX_FILES = 8;
 export const DEFAULT_STATIC_ASSETS_DIR = fileURLToPath(
   new URL("../../frontend/dist", import.meta.url),
 );
@@ -29,6 +33,16 @@ const MAX_PORT = 65_535;
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_ENV_VALUES = new Set(["0", "false", "no", "off"]);
 
+export const ENV_LOG_DIR = "POHUNEK_BACKEND_LOG_DIR";
+export const ENV_LOG_MAX_FILE_BYTES = "POHUNEK_BACKEND_LOG_MAX_FILE_BYTES";
+export const ENV_LOG_MAX_FILES = "POHUNEK_BACKEND_LOG_MAX_FILES";
+
+export interface BackendLogFileConfig {
+  readonly dir: string;
+  readonly maxFileBytes: number;
+  readonly maxFiles: number;
+}
+
 export interface DerivedRuntime {
   readonly dir: string;
   readonly effectiveUid: number;
@@ -43,6 +57,8 @@ export interface BackendConfig {
   readonly derivedRuntime: DerivedRuntime | undefined;
   readonly discoverIntervalSeconds: number;
   readonly staticAssetsDir: string;
+  /** Rotating file logging; without it events go to standard output. */
+  readonly logFiles: BackendLogFileConfig | undefined;
 }
 
 export class BackendConfigError extends Error {
@@ -69,6 +85,7 @@ export function loadBackendConfig(
       : undefined,
     discoverIntervalSeconds: parseDiscoverInterval(env[ENV_DISCOVER_INTERVAL]),
     staticAssetsDir: resolveStaticAssetsDir(env[ENV_STATIC_ASSETS_DIR]),
+    logFiles: resolveLogFiles(env),
   };
 }
 
@@ -158,4 +175,43 @@ function resolveStaticAssetsDir(raw: string | undefined): string {
     throw new BackendConfigError(ENV_STATIC_ASSETS_DIR, "must not be empty when present");
   }
   return resolve(raw);
+}
+
+function resolveLogFiles(env: NodeJS.ProcessEnv): BackendLogFileConfig | undefined {
+  const dir = env[ENV_LOG_DIR];
+  const sizeRaw = env[ENV_LOG_MAX_FILE_BYTES];
+  const countRaw = env[ENV_LOG_MAX_FILES];
+  if (dir === undefined) {
+    for (const [name, value] of [[ENV_LOG_MAX_FILE_BYTES, sizeRaw], [ENV_LOG_MAX_FILES, countRaw]] as const) {
+      if (value !== undefined) {
+        throw new BackendConfigError(name, `is only valid together with ${ENV_LOG_DIR}`);
+      }
+    }
+    return undefined;
+  }
+  // `resolve` equality rejects a trailing slash and `.`/`..` components, which
+  // would make the final-component symlink check follow a symlink.
+  if (!isAbsolute(dir) || dir.includes("\0") || resolve(dir) !== dir) {
+    throw new BackendConfigError(
+      ENV_LOG_DIR,
+      "must be a normalized absolute path (no trailing slash, `.` or `..` components)",
+    );
+  }
+  return {
+    dir,
+    maxFileBytes: parsePositiveInteger(sizeRaw, ENV_LOG_MAX_FILE_BYTES, DEFAULT_LOG_MAX_FILE_BYTES),
+    maxFiles: parsePositiveInteger(countRaw, ENV_LOG_MAX_FILES, DEFAULT_LOG_MAX_FILES),
+  };
+}
+
+function parsePositiveInteger(raw: string | undefined, variable: string, fallback: number): number {
+  if (raw === undefined) {
+    return fallback;
+  }
+  const trimmed = raw.trim();
+  const value = Number(trimmed);
+  if (!/^\d+$/.test(trimmed) || !Number.isSafeInteger(value) || value <= 0) {
+    throw new BackendConfigError(variable, "must be a positive integer");
+  }
+  return value;
 }

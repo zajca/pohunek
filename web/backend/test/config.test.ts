@@ -7,6 +7,8 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import {
   DEFAULT_DISCOVER_INTERVAL_SECONDS,
+  DEFAULT_LOG_MAX_FILES,
+  DEFAULT_LOG_MAX_FILE_BYTES,
   BackendConfigError,
   loadBackendConfig,
   startBackend,
@@ -89,6 +91,39 @@ describe("backend configuration", () => {
     expect(config.daemonSocketPath).toBe(`${runtime}/pohunek/daemon.sock`);
     expect(config.daemonSocketPath.length).toBe(105);
     expectConfigError({ ...baseEnv(), XDG_RUNTIME_DIR: runtime }, "XDG_RUNTIME_DIR", MACOS);
+  });
+
+  test("file logging is off by default and carries documented limits when enabled", () => {
+    expect(loadBackendConfig(baseEnv(), LINUX).logFiles).toBeUndefined();
+    const config = loadBackendConfig({ ...baseEnv(), POHUNEK_BACKEND_LOG_DIR: "/var/log/pk" }, LINUX);
+    expect(config.logFiles).toEqual({
+      dir: "/var/log/pk",
+      maxFileBytes: DEFAULT_LOG_MAX_FILE_BYTES,
+      maxFiles: DEFAULT_LOG_MAX_FILES,
+    });
+    const tuned = loadBackendConfig({
+      ...baseEnv(),
+      POHUNEK_BACKEND_LOG_DIR: "/var/log/pk",
+      POHUNEK_BACKEND_LOG_MAX_FILE_BYTES: "1048576",
+      POHUNEK_BACKEND_LOG_MAX_FILES: "3",
+    }, LINUX);
+    expect(tuned.logFiles).toEqual({ dir: "/var/log/pk", maxFileBytes: 1_048_576, maxFiles: 3 });
+  });
+
+  test("invalid or orphaned log settings fail instead of defaulting", () => {
+    for (const dir of ["", "relative/logs", "/var/../logs", "/var/log/pk/", "/var/log/./pk", "/var//log"]) {
+      expectConfigError({ ...baseEnv(), POHUNEK_BACKEND_LOG_DIR: dir }, "POHUNEK_BACKEND_LOG_DIR");
+    }
+    for (const bad of ["0", "-1", "1.5", "many", ""]) {
+      expectConfigError(
+        { ...baseEnv(), POHUNEK_BACKEND_LOG_DIR: "/var/log/pk", POHUNEK_BACKEND_LOG_MAX_FILES: bad },
+        "POHUNEK_BACKEND_LOG_MAX_FILES",
+      );
+    }
+    expectConfigError(
+      { ...baseEnv(), POHUNEK_BACKEND_LOG_MAX_FILE_BYTES: "1024" },
+      "POHUNEK_BACKEND_LOG_MAX_FILE_BYTES",
+    );
   });
 
   test("an explicit socket override follows the same path rules", () => {
