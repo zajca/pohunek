@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -113,10 +114,16 @@ struct LastSeen {
 /// it runs, can then notice the death. `exit_watch` still arms a real pidfd, so
 /// the only way left for the registry to drop the process is the exit watch
 /// that the test is about.
+///
+/// [`PollBlindInspector::thaw`] ends the freeze: every method then reports host
+/// truth, so a later scan sees the process as gone. Every process listing
+/// (`same_user_processes`, `descendants`) is counted, which lets a test wait
+/// for scans that ran after the thaw.
 #[derive(Debug)]
 struct PollBlindInspector {
     host: HostInspector,
     frozen: Mutex<Option<LastSeen>>,
+    listings: AtomicUsize,
 }
 
 impl PollBlindInspector {
@@ -124,7 +131,18 @@ impl PollBlindInspector {
         Arc::new(Self {
             host: HostInspector::new(),
             frozen: Mutex::new(None),
+            listings: AtomicUsize::new(0),
         })
+    }
+
+    /// Ends the freeze; every method reports host truth from here on.
+    fn thaw(&self) {
+        *self.lock() = None;
+    }
+
+    /// Number of process listings taken so far.
+    fn listings(&self) -> usize {
+        self.listings.load(Ordering::SeqCst)
     }
 
     /// Captures `pid` as it is now and keeps reporting it that way.
@@ -218,11 +236,13 @@ impl ProcessInspector for PollBlindInspector {
     }
 
     fn same_user_processes(&self) -> Result<Vec<ProcessFact>, ProcwatchError> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
         let facts = self.host.same_user_processes()?;
         Ok(self.with_frozen(facts, |_, _| true))
     }
 
     fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, ProcwatchError> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
         let facts = self.host.descendants(root)?;
         Ok(self.with_frozen(facts, |frozen, listed| {
             frozen.ppid == root || listed.iter().any(|fact| fact.pid == frozen.ppid)
@@ -366,9 +386,20 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     poll_blind.freeze(child_pid);
     let mut events = registry.subscribe();
     kill9(child_pid);
-    let cleared = wait_for_cleared_agent(&registry, &created.id, &mut events).await;
-
+    let cleared = wait_for_cleared_agent(&created.id, &mut events).await;
     assert_eq!(cleared.active_agent, None);
+
+    // The cleared event arrived while every poll still reported the agent alive,
+    // so the exit watch produced it. From here the host truth (the agent is
+    // gone) applies, and a later scan must keep the agent cleared.
+    poll_blind.thaw();
+    wait_for_scans_after_thaw(&poll_blind).await;
+    let after_scan = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(after_scan.active_agent_pid, None);
+    assert_eq!(after_scan.active_agent, None);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -536,8 +567,22 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     inspector.freeze(child_pid);
     let mut events = registry.subscribe();
     kill9(child_pid);
-    wait_for_external_gone(&registry, &observed.id, &mut events).await;
+    wait_for_external_gone(&observed.id, &mut events).await;
     let _ = child.wait();
+
+    // The removal event arrived while every sweep still listed the agent, so the
+    // exit watch produced it. A later sweep, on host truth, must not list it
+    // again.
+    inspector.thaw();
+    wait_for_scans_after_thaw(&inspector).await;
+    assert!(
+        registry
+            .list()
+            .await
+            .into_iter()
+            .all(|session| session.id != observed.id),
+        "a sweep after the exit re-listed the external agent"
+    );
 }
 
 fn native_exit_watch_is_available() -> bool {
@@ -610,44 +655,66 @@ async fn wait_for_observed_pid(
     .await
 }
 
-/// Waits until the registry reports no active agent for the session.
+/// Waits for the lifecycle event that reports no active agent for session `id`.
 ///
-/// Waits on lifecycle events, never on a timer; `events` must be subscribed
-/// before the exit is triggered.
+/// The proof comes from the event itself, never from a state read that a later
+/// scan could overwrite; `events` must be subscribed before the exit is
+/// triggered.
 async fn wait_for_cleared_agent(
-    registry: &SessionRegistry,
     id: &SessionId,
     events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
 ) -> SessionInfo {
-    guard("the session to report no active agent", async {
+    guard("the event reporting no active agent", async {
         loop {
-            let info = registry.inspect(id).await.expect("inspect session");
-            if info.active_agent_pid.is_none() {
+            let info = next_session_event(events, event::SESSION_UPDATED).await;
+            if info.id == *id && info.active_agent_pid.is_none() {
                 return info;
             }
-            wait_for_event(events, event::SESSION_UPDATED).await;
         }
     })
     .await
 }
 
-/// Waits for the next event named `name`, tolerating a lagged receiver.
-async fn wait_for_event(
-    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
-    name: &str,
-) {
-    guard("the next lifecycle event", async {
-        loop {
-            match events.recv().await {
-                Ok(event) if event.event() == name => return,
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    panic!("the registry event channel closed")
-                }
-            }
-        }
+/// Waits until the process listings show that a complete scan ran on host truth
+/// after [`PollBlindInspector::thaw`].
+///
+/// Each session runs its scans one after another, and a scan takes one listing.
+/// Listing number 1 after the thaw is therefore a post-thaw scan, and listing
+/// number 2 starting means that scan has finished.
+async fn wait_for_scans_after_thaw(inspector: &PollBlindInspector) {
+    let thawed_at = inspector.listings();
+    wait_until("a procwatch scan to complete after the thaw", || async {
+        (inspector.listings() >= thawed_at + 2).then_some(())
     })
     .await;
+}
+
+/// Waits for the next event named `name` and returns the session it carries.
+///
+/// A lagged receiver panics: a skipped event could be the one being awaited.
+async fn next_session_event(
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+    name: &str,
+) -> SessionInfo {
+    loop {
+        match events.recv().await {
+            Ok(event) if event.event() == name => {
+                let session = event
+                    .payload()
+                    .get("session")
+                    .cloned()
+                    .expect("the lifecycle event carries a session");
+                return serde_json::from_value(session).expect("decode the event session");
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                panic!("the event receiver lagged and skipped {skipped} events")
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                panic!("the registry event channel closed")
+            }
+        }
+    }
 }
 
 async fn wait_for_external_pid(registry: &SessionRegistry, pid: u32) -> SessionInfo {
@@ -672,26 +739,21 @@ async fn assert_external_detection_unavailable(registry: &SessionRegistry, id: &
     );
 }
 
-/// Waits until the external session `id` is absent from the listing.
+/// Waits for the removal event of the external session `id`.
 ///
-/// Waits on lifecycle events, never on a timer; `events` must be subscribed
-/// before the exit is triggered.
+/// The proof comes from the event itself, never from a listing that a later
+/// sweep could overwrite; `events` must be subscribed before the exit is
+/// triggered.
 async fn wait_for_external_gone(
-    registry: &SessionRegistry,
     id: &SessionId,
     events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
 ) {
-    guard("the external session to leave the listing", async {
+    guard("the removal event of the external session", async {
         loop {
-            let present = registry
-                .list()
-                .await
-                .into_iter()
-                .any(|session| session.id == *id);
-            if !present {
+            let removed = next_session_event(events, event::SESSION_REMOVED).await;
+            if removed.id == *id {
                 return;
             }
-            wait_for_event(events, event::SESSION_REMOVED).await;
         }
     })
     .await;
