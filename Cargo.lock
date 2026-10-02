@@ -4278,6 +4278,7 @@ dependencies = [
  "pohunek-netbird",
  "pohunek-overlay",
  "pohunek-protocol",
+ "pohunek-test-support",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

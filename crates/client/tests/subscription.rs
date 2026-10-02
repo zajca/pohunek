@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 
 use pohunek_client::protocol::{self, ErrorClass, ProtocolError, Request, Response};
 use pohunek_client::{Client, ClientError, ClientOptions, OriginSource};
+use pohunek_test_support::env::TestEnv;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -20,8 +19,6 @@ const LEGACY_PROTOCOL_VERSION: u32 = 1;
 fn no_origin_options() -> ClientOptions {
     ClientOptions::default().with_origin_source(OriginSource::Omitted)
 }
-
-static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 struct UnixSubscriptionDaemon {
@@ -38,12 +35,29 @@ struct TcpSubscriptionDaemon {
     task: JoinHandle<()>,
 }
 
+/// A Unix socket path inside a private test root, which is removed with its
+/// socket when the value drops.
+///
+/// [`TestEnv::socket_path`] checks the path against the 104-byte Darwin
+/// `sun_path` limit, which a path below macOS's per-user temporary directory
+/// would exceed.
 #[derive(Debug)]
-struct SocketFile(PathBuf);
+struct SocketFile {
+    path: PathBuf,
+    _env: TestEnv,
+}
 
-impl Drop for SocketFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+impl SocketFile {
+    fn new() -> Self {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let path = env
+            .socket_path("daemon.sock")
+            .expect("socket path fits the sun_path limit");
+        Self { path, _env: env }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -388,8 +402,8 @@ fn spawn_unix_subscription_daemon(
     ack_line: String,
     event_lines: Vec<String>,
 ) -> UnixSubscriptionDaemon {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix subscription test daemon");
     let (request_tx, request_line) = oneshot::channel();
 
@@ -402,7 +416,7 @@ fn spawn_unix_subscription_daemon(
         socket_path: socket_path.clone(),
         request_line,
         task,
-        _socket_file: SocketFile(socket_path),
+        _socket_file: socket_file,
     }
 }
 
@@ -532,12 +546,4 @@ fn sample_notification_record() -> protocol::NotificationRecord {
 
 fn trim_line_end(line: &str) -> &str {
     line.trim_end_matches('\n').trim_end_matches('\r')
-}
-
-fn unique_socket_path() -> PathBuf {
-    let id = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "pohunek-client-subscription-{}-{id}.sock",
-        process::id()
-    ))
 }
