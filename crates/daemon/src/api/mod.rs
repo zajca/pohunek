@@ -286,6 +286,43 @@ impl ControlServer {
     }
 }
 
+/// A listening socket produced by the opener passed to [`RemoteServer::bind_with`].
+///
+/// The constructor records how much [`RemoteServer::bind_with`] may trust the
+/// socket's address.
+#[derive(Debug)]
+pub struct OpenedListener {
+    listener: TcpListener,
+    verify: bool,
+}
+
+impl OpenedListener {
+    /// Wrap a socket the OS bound for exactly the requested address.
+    ///
+    /// The address is not compared again: the kernel (or a libc-level test
+    /// interposer standing in for an overlay interface) owns the mapping from
+    /// the requested address to the bound one.
+    #[must_use]
+    pub fn os_bound(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            verify: false,
+        }
+    }
+
+    /// Wrap a socket the caller bound earlier.
+    ///
+    /// [`RemoteServer::bind_with`] requires its local address to equal the
+    /// validated address exactly and rejects it otherwise.
+    #[must_use]
+    pub fn held(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            verify: true,
+        }
+    }
+}
+
 /// The bound remote (overlay TCP) control server, ready to accept connections.
 ///
 /// Identical protocol and attach semantics to [`ControlServer`]; only the
@@ -316,6 +353,40 @@ impl RemoteServer {
         state: DaemonState,
         transport: &dyn OverlayTransport,
     ) -> Result<Self, DaemonError> {
+        Self::bind_with(addr, state, transport, |addr| async move {
+            TcpListener::bind(addr).await.map(OpenedListener::os_bound)
+        })
+        .await
+    }
+
+    /// Bind a TCP control listener at `addr` using a caller-supplied socket opener.
+    ///
+    /// Runs the same fail-closed overlay validation as [`bind`](Self::bind)
+    /// before `open` is called, so the opener only ever sees validated
+    /// addresses. `open` supplies the listening socket for that address, which
+    /// lets a caller that already holds a bound socket hand it over instead of
+    /// releasing and re-binding the port. An [`OpenedListener::held`] listener
+    /// must be bound to exactly `addr` (IP and port); any other socket is
+    /// dropped unserved so the control port cannot leave the validated overlay
+    /// address. An [`OpenedListener::os_bound`] listener comes straight from
+    /// the OS bind of `addr` and is trusted to match it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::OverlayBind`] when the address is not a valid
+    /// member of the overlay's range or when `open` returns a listener bound
+    /// to a different address or port, or [`DaemonError::Socket`] when `open`
+    /// fails or the listener's local address cannot be read.
+    pub async fn bind_with<F, Fut>(
+        addr: SocketAddr,
+        state: DaemonState,
+        transport: &dyn OverlayTransport,
+        open: F,
+    ) -> Result<Self, DaemonError>
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<OpenedListener>>,
+    {
         if let Err(err) = transport.validate_bind_addr(addr.ip()) {
             return Err(DaemonError::OverlayBind {
                 addr: addr.ip(),
@@ -323,9 +394,8 @@ impl RemoteServer {
             });
         }
 
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|source| DaemonError::Socket {
+        let OpenedListener { listener, verify } =
+            open(addr).await.map_err(|source| DaemonError::Socket {
                 path: PathBuf::from(addr.to_string()),
                 source,
             })?;
@@ -335,6 +405,15 @@ impl RemoteServer {
                 path: PathBuf::from(addr.to_string()),
                 source,
             })?;
+
+        if verify && local_addr != addr {
+            return Err(DaemonError::OverlayBind {
+                addr: local_addr.ip(),
+                reason: format!(
+                    "opener returned a listener bound to {local_addr} instead of the validated {addr}"
+                ),
+            });
+        }
 
         info!(addr = %local_addr, "remote control listener bound");
         Ok(Self {
