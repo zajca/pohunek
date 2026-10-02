@@ -6,6 +6,7 @@
 //! and lives below a temporary root.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -16,6 +17,7 @@ use pohunek_platform::process::{
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
 use pohunek_session_worker::RuntimePhase;
+use pohunek_test_support::wait::wait_until;
 use protocol::{
     AgentKind, DaemonHealthResult, RuntimeGeneration, SessionCapabilities, SessionId,
     SessionRuntime, StateSource,
@@ -2913,14 +2915,11 @@ async fn a_second_command_is_refused_while_a_transaction_holds_the_lock() {
     harness.assert_installed(V1);
 
     drop(held);
-    await_lock_released(&harness.engine().store).await;
-    let status = harness
-        .engine()
-        .status(config.as_ref())
-        .await
-        .expect("status after release");
+    let status = status_once_free(&harness, config.as_ref()).await;
     assert!(!status.transaction_in_progress);
-    harness.upgrade(V2).await.expect("upgrade after release");
+    once_free("the transaction lock", || harness.upgrade(V2))
+        .await
+        .expect("upgrade after release");
     harness.assert_installed(V2);
 }
 
@@ -2963,8 +2962,7 @@ async fn a_record_left_by_a_crashed_holder_is_resumed_under_a_fresh_lock() {
         .await
         .expect_err("interrupted");
     // The interrupted engine released its lock like a crashed process would.
-    await_lock_released(&harness.engine().store).await;
-    let status = harness.engine().status(None).await.expect("status");
+    let status = status_once_free(&harness, None).await;
     assert!(!status.transaction_in_progress);
     assert_eq!(
         status.pending_transaction.map(|pending| pending.step),
@@ -3043,9 +3041,7 @@ async fn transactions_run_under_an_inherited_lock_while_others_are_refused() {
         .expect_err("an adopter still runs");
     assert_eq!(refused.code(), "service_transaction_in_progress");
     drop(adopted);
-    await_adopters_released(&harness.engine().store).await;
-    harness
-        .install(V1)
+    once_free("the adopters' locks", || harness.install(V1))
         .await
         .expect("install after the release");
 }
@@ -3086,54 +3082,37 @@ fn inherited_lock(harness: &Harness, handoff: &record::Handoff) -> TransactionLo
         .expect("adopt the held lock")
 }
 
-/// Hang guard for a released lock to become free; expiry means it never was.
+/// Runs `operation` until it is no longer refused for a held transaction lock.
 ///
-/// A dropped guard closes its descriptor at once, but a process another test
-/// thread spawned while it was open keeps a copy, and with it the `flock`,
-/// until that process's own `exec`. That takes microseconds; the bound only
-/// absorbs a spawned process the scheduler holds back on a loaded host.
-const LOCK_RELEASE_GUARD: Duration = Duration::from_secs(30);
-
-/// Poll interval while a released lock is awaited.
-const LOCK_RELEASE_POLL: Duration = Duration::from_millis(2);
-
-/// Polls `observe` until it yields a value, failing after [`LOCK_RELEASE_GUARD`].
-async fn until_released<T>(what: &str, mut observe: impl FnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + LOCK_RELEASE_GUARD;
-    loop {
-        if let Some(value) = observe() {
-            return value;
+/// A dropped lock guard closes its descriptor at once, but a process another
+/// test thread spawned while it was open keeps a copy, and with it the
+/// `flock`, until that process's own `exec`. Probing the lock for freedom
+/// first would open one more descriptor that a spawn can inherit, so the real
+/// operation is retried on its expected transient refusal instead; any other
+/// outcome is returned as it is. Expiry of the hang guard means the lock was
+/// never released.
+async fn once_free<T, Op, Fut>(what: &str, operation: Op) -> Result<T, Error>
+where
+    Op: Fn() -> Fut,
+    Fut: Future<Output = Result<T, Error>>,
+{
+    let operation = &operation;
+    wait_until(what, || async move {
+        match operation().await {
+            Err(Error::TransactionInProgress { .. }) => None,
+            result => Some(result),
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{what} was not released"
-        );
-        tokio::time::sleep(LOCK_RELEASE_POLL).await;
-    }
+    })
+    .await
 }
 
-/// Waits until the transaction lock itself is free.
-///
-/// Call it after dropping the last guard of the lock and before asserting
-/// anything that needs it free, such as a status report or an adoption that
-/// must find no holder. Adopters may still run.
-async fn await_lock_released(store: &record::Store) {
-    until_released("the transaction lock", || {
-        (!store.in_progress().expect("probe the transaction lock")).then_some(())
+/// Reads the engine status once the transaction lock no longer reports as held.
+async fn status_once_free(harness: &Harness, config: Option<&ServiceConfig>) -> StatusReport {
+    wait_until("the transaction lock", || async {
+        let status = harness.engine().status(config).await.expect("status");
+        (!status.transaction_in_progress).then_some(status)
     })
-    .await;
-}
-
-/// Waits until the transaction lock and every adopter's lock are free.
-async fn await_adopters_released(store: &record::Store) {
-    await_lock_released(store).await;
-    until_released("the adopters' locks", || {
-        store
-            .exclude_adopters()
-            .expect("probe the adopters")
-            .map(|_probe| ())
-    })
-    .await;
+    .await
 }
 
 /// Adopts the lock as soon as the previous adopter's descriptors are gone.
@@ -3142,7 +3121,7 @@ async fn adopt_once_free(
     token: &Token,
     adoption: record::Adoption,
 ) -> TransactionLock {
-    until_released("the adopted transaction lock", || {
+    wait_until("the adopted transaction lock", || async {
         match store.adopt(token, adoption) {
             Ok(lock) => Some(lock),
             Err(Error::TransactionInProgress { .. }) => None,
@@ -3167,7 +3146,7 @@ const NO_RECORD: &str = "no `pohunek service lock` holds the lock";
 /// refused with [`NO_RECORD`] instead. That refusal is retried until the lock
 /// is free; every other outcome is final.
 async fn assert_no_holder_once_free(store: &record::Store, token: &Token) {
-    let error = until_released("the transaction lock", || {
+    let error = wait_until("the transaction lock", || async {
         match store.adopt(token, record::Adoption::Transaction) {
             Err(Error::InheritedLock { detail }) if detail == NO_RECORD => None,
             result => Some(result),
@@ -3190,6 +3169,18 @@ fn assert_refused(result: Result<TransactionLock, Error>, detail: &str) {
     );
 }
 
+/// Opens a second descriptor on the transaction lock file and locks it, as a
+/// sibling's pre-`exec` child holds a copy of a dropped guard's descriptor.
+fn lingering_copy(harness: &Harness) -> std::fs::File {
+    let copy = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .open(harness.context.paths().state_dir.join(record::LOCK_NAME))
+        .expect("open the lock file");
+    copy.try_lock().expect("hold a copy of the lock");
+    copy
+}
+
 /// A copy of the lock descriptor held elsewhere, as a sibling's pre-`exec`
 /// child holds it, keeps the lock looking held after its owner dropped it. The
 /// helper rides out that refusal and still asserts the final one.
@@ -3199,13 +3190,7 @@ async fn a_lingering_copy_of_the_lock_is_waited_out_before_the_final_refusal() {
     let store = harness.engine().store;
     let token = Token::generate().expect("token");
     drop(store.lock().await.expect("create the state directory"));
-
-    let lingering = std::fs::File::options()
-        .read(true)
-        .write(true)
-        .open(harness.context.paths().state_dir.join(record::LOCK_NAME))
-        .expect("open the lock file");
-    lingering.try_lock().expect("hold a copy of the lock");
+    let lingering = lingering_copy(&harness);
 
     // The helper is polled first, so its first adoption meets the held lock;
     // the second future confirms that refusal, then ends the copy's life.
@@ -3217,6 +3202,64 @@ async fn a_lingering_copy_of_the_lock_is_waited_out_before_the_final_refusal() {
         drop(lingering);
     };
     tokio::join!(assert_no_holder_once_free(&store, &token), release);
+}
+
+/// The status helper keeps reading until the lingering copy is gone and
+/// returns the report that shows the lock free.
+#[tokio::test]
+async fn the_status_is_reread_while_a_lingering_copy_holds_the_lock() {
+    let harness = Harness::new();
+    drop(
+        harness
+            .engine()
+            .store
+            .lock()
+            .await
+            .expect("create the state directory"),
+    );
+    let lingering = lingering_copy(&harness);
+
+    let release = async {
+        let status = harness.engine().status(None).await.expect("status");
+        assert!(status.transaction_in_progress);
+        drop(lingering);
+    };
+    let (status, ()) = tokio::join!(status_once_free(&harness, None), release);
+    assert!(!status.transaction_in_progress);
+}
+
+fn in_progress() -> Error {
+    Error::TransactionInProgress {
+        path: PathBuf::from("service-install.lock"),
+    }
+}
+
+/// An operation is retried on the lock refusal alone and its result is the
+/// first outcome that is not that refusal.
+#[tokio::test(start_paused = true)]
+async fn an_operation_is_retried_only_while_the_lock_refuses_it() {
+    let attempts = std::cell::Cell::new(0_u32);
+    let outcome = once_free("a released lock", || async {
+        attempts.set(attempts.get() + 1);
+        if attempts.get() < 3 {
+            Err(in_progress())
+        } else {
+            Ok(attempts.get())
+        }
+    })
+    .await;
+    assert_eq!(outcome.expect("free on the third attempt"), 3);
+
+    let attempts = std::cell::Cell::new(0_u32);
+    let outcome = once_free("a released lock", || async {
+        attempts.set(attempts.get() + 1);
+        Err::<(), _>(Error::InheritedLock {
+            detail: NO_HOLDER.to_owned(),
+        })
+    })
+    .await;
+    assert_refused(outcome.map(|()| unreachable!("refused")), NO_HOLDER);
+    assert_eq!(attempts.get(), 1, "another refusal is final");
 }
 
 /// Writes a holder record naming `pid` with start identity `start`.
