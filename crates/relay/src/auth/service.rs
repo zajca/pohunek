@@ -3101,9 +3101,15 @@ pub(crate) mod tests {
     }
 
     /// Opens an authority whose fence a background renewer keeps alive.
-    pub(crate) async fn authority(store: Store) -> (Arc<Authority>, tempfile::TempDir) {
+    pub(crate) async fn authority(
+        store: Store,
+    ) -> (
+        Arc<Authority>,
+        crate::admission::test_lease::WitnessDirectory,
+    ) {
         let (authority, directory) = unrenewed_authority(store).await;
-        crate::admission::test_lease::spawn_renewal(&authority);
+        let directory =
+            crate::admission::test_lease::WitnessDirectory::renewed(directory, &authority);
         (authority, directory)
     }
 

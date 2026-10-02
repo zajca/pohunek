@@ -131,10 +131,10 @@ async fn unrenewed_authority(store: Store) -> (Authority, TempDir) {
 }
 
 /// Opens an authority whose fence a background renewer keeps alive.
-async fn authority(store: Store) -> (Arc<Authority>, TempDir) {
+async fn authority(store: Store) -> (Arc<Authority>, test_lease::WitnessDirectory) {
     let (authority, directory) = unrenewed_authority(store).await;
     let authority = Arc::new(authority);
-    test_lease::spawn_renewal(&authority);
+    let directory = test_lease::WitnessDirectory::renewed(directory, &authority);
     (authority, directory)
 }
 

@@ -956,7 +956,7 @@ mod tests {
             .await,
             Err(OperatorError::Lifecycle(LifecycleError::InvalidState))
         ));
-        renewal.abort();
+        renewal.stop().await;
         store
             .release_lease(&lease)
             .await
@@ -1059,7 +1059,7 @@ mod tests {
             .await,
             Err(OperatorError::Lifecycle(LifecycleError::InvalidState))
         ));
-        renewal.abort();
+        renewal.stop().await;
         store
             .release_lease(&lease)
             .await
