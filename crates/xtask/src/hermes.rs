@@ -4170,9 +4170,11 @@ mod tests {
         }
     }
 
-    /// Temporary directory below a symlink-free parent, so paths handed to the
-    /// harness pass its canonical-path checks where `$TMPDIR` is a symlink
-    /// (macOS `/var/folders` resolves to `/private/var/folders`).
+    /// Temporary directory below an absolute, symlink-free parent.
+    ///
+    /// `pohunek_test_support::tempdir` guarantees that parent whatever `$TMPDIR`
+    /// holds, so paths handed to the harness pass its absolute and
+    /// canonical-path checks.
     fn canonical_tempdir() -> tempfile::TempDir {
         pohunek_test_support::tempdir().expect("create canonical temporary directory")
     }

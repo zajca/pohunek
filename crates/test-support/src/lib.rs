@@ -107,21 +107,46 @@ pub(crate) fn make_private(path: &Path) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
 }
 
+/// Resolves `raw` to an absolute path without symlinked components.
+///
+/// A relative `raw` is taken relative to `cwd`; an absolute one ignores it.
+/// Takes the working directory as a parameter so callers and tests do not
+/// depend on process-global state.
+///
+/// # Errors
+///
+/// Returns the I/O error when the resolved path does not exist or cannot be
+/// canonicalized.
+fn resolve_root(raw: &Path, cwd: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(cwd.join(raw))
+}
+
 /// Returns the base directory test fixtures create their roots under.
 ///
-/// On macOS this is `/private/tmp`: symlink-free and short enough for socket
-/// paths nested several levels below it. Elsewhere it is
-/// [`std::env::temp_dir`], which already satisfies both constraints.
+/// The result is always absolute and free of symlinked components, whatever
+/// `TMPDIR` holds: a relative `TMPDIR` is resolved against the working
+/// directory and a symlinked one is replaced by its target. On macOS the base
+/// is `/private/tmp`, short enough for socket paths nested several levels
+/// below it. Elsewhere it is [`std::env::temp_dir`].
+///
+/// # Panics
+///
+/// Panics when the base directory does not exist or cannot be resolved, since
+/// no fixture can be created beneath it.
 #[must_use]
 pub fn temp_root() -> PathBuf {
     #[cfg(target_os = "macos")]
-    {
-        PathBuf::from(MACOS_TEMP_ROOT)
-    }
+    let raw = PathBuf::from(MACOS_TEMP_ROOT);
     #[cfg(not(target_os = "macos"))]
-    {
-        std::env::temp_dir()
-    }
+    let raw = std::env::temp_dir();
+    let cwd = std::env::current_dir()
+        .unwrap_or_else(|error| panic!("cannot determine the working directory: {error}"));
+    resolve_root(&raw, &cwd).unwrap_or_else(|error| {
+        panic!(
+            "temporary root {} cannot be resolved to a canonical path: {error}",
+            raw.display()
+        )
+    })
 }
 
 /// Creates a private fixture directory under [`temp_root`].
@@ -297,8 +322,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        profile_dir_of, require_var, resolve_worker, temp_root, tempdir, tempdir_with_prefix,
-        workspace_root_of,
+        profile_dir_of, require_var, resolve_root, resolve_worker, temp_root, tempdir,
+        tempdir_with_prefix, workspace_root_of,
     };
 
     #[test]
@@ -376,6 +401,49 @@ mod tests {
         let root = temp_root();
         let canonical = std::fs::canonicalize(&root).expect("canonicalize temp root");
         assert_eq!(root, canonical);
+    }
+
+    #[test]
+    fn resolve_root_makes_a_relative_root_absolute_and_canonical() {
+        let fixture = tempdir().expect("create fixture");
+        let base = std::fs::canonicalize(fixture.path()).expect("canonicalize fixture");
+        std::fs::create_dir_all(base.join("a/b")).expect("create nested directory");
+        let resolved = resolve_root(Path::new("b/../b"), &base.join("a")).expect("resolve");
+        assert!(resolved.is_absolute(), "{}", resolved.display());
+        assert_eq!(resolved, base.join("a/b"));
+    }
+
+    #[test]
+    fn resolve_root_follows_a_symlinked_root_to_the_real_path() {
+        let fixture = tempdir().expect("create fixture");
+        let base = std::fs::canonicalize(fixture.path()).expect("canonicalize fixture");
+        let real = base.join("real");
+        std::fs::create_dir(&real).expect("create real directory");
+        std::os::unix::fs::symlink(&real, base.join("link")).expect("create symlink");
+        let resolved = resolve_root(&base.join("link"), &base).expect("resolve absolute link");
+        assert_eq!(resolved, real);
+        let relative = resolve_root(Path::new("link"), &base).expect("resolve relative link");
+        assert_eq!(relative, real);
+    }
+
+    #[test]
+    fn resolve_root_keeps_a_canonical_root_unchanged() {
+        let fixture = tempdir().expect("create fixture");
+        let base = std::fs::canonicalize(fixture.path()).expect("canonicalize fixture");
+        let resolved = resolve_root(&base, Path::new("/irrelevant")).expect("resolve");
+        assert_eq!(resolved, base);
+    }
+
+    #[test]
+    fn resolve_root_reports_a_missing_root() {
+        let fixture = tempdir().expect("create fixture");
+        let error = resolve_root(Path::new("missing"), fixture.path()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn temp_root_is_absolute() {
+        assert!(temp_root().is_absolute());
     }
 
     #[test]
