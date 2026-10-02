@@ -456,24 +456,23 @@ mod tests {
     use super::{InputError, InputFragment, InputPlan, WriteCoordinator};
     use std::fs::{self, OpenOptions};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     const PRODUCER: &str = "daemon-a";
 
-    fn output_file(tag: &str) -> (PathBuf, fs::File) {
-        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "pohunek-worker-input-{tag}-{}-{sequence}",
-            std::process::id()
-        ));
+    /// Creates an empty output file in a private fixture directory.
+    ///
+    /// The returned guard removes the directory when it drops, also when a test
+    /// fails.
+    fn output_file(tag: &str) -> (tempfile::TempDir, PathBuf, fs::File) {
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let path = guard.path().join(tag);
         let file = OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&path)
             .expect("create output file");
-        (path, file)
+        (guard, path, file)
     }
 
     fn plan(write_id: &str, bytes: &[u8]) -> InputPlan {
@@ -488,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn ordered_fragments_are_written_once() {
-        let (path, writer) = output_file("ordered");
+        let (_guard, path, writer) = output_file("ordered");
         let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
         let operation = InputPlan {
             write_id: "write-1".to_owned(),
@@ -514,12 +513,11 @@ mod tests {
             .expect("duplicate");
 
         assert_eq!(fs::read(&path).expect("read"), b"first-second");
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn concurrent_duplicate_joins_same_result() {
-        let (path, writer) = output_file("concurrent");
+        let (_guard, path, writer) = output_file("concurrent");
         let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
         let operation = InputPlan {
             write_id: "write-1".to_owned(),
@@ -537,12 +535,11 @@ mod tests {
         second.expect("second");
 
         assert_eq!(fs::read(&path).expect("read"), b"once");
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn conflicting_duplicate_is_rejected_without_writing() {
-        let (path, writer) = output_file("conflict");
+        let (_guard, path, writer) = output_file("conflict");
         let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
         coordinator
             .execute_control(PRODUCER, 1, plan("write-1", b"a"))
@@ -556,12 +553,11 @@ mod tests {
             Err(InputError::Conflict { .. })
         ));
         assert_eq!(fs::read(&path).expect("read"), b"a");
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn evicted_write_returns_unknown_instead_of_replaying() {
-        let (path, writer) = output_file("evicted");
+        let (_guard, path, writer) = output_file("evicted");
         let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
         coordinator
             .execute_control(PRODUCER, 1, plan("write-1", b"a"))
@@ -579,12 +575,11 @@ mod tests {
             Err(InputError::OutcomeUnknown { .. })
         ));
         assert_eq!(fs::read(&path).expect("read"), b"ab");
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn same_daemon_new_lease_restarts_sequence_in_fresh_namespace() {
-        let (path, writer) = output_file("lease-rotation");
+        let (_guard, path, writer) = output_file("lease-rotation");
         let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
         coordinator
             .execute_control("lease-a", 1, plan("input-lease-a-1", b"a"))
@@ -596,12 +591,11 @@ mod tests {
             .expect("same daemon replacement lease");
 
         assert_eq!(fs::read(&path).expect("read"), b"ab");
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn legacy_fresh_ids_may_arrive_out_of_order() {
-        let (path, writer) = output_file("legacy-out-of-order");
+        let (_guard, path, writer) = output_file("legacy-out-of-order");
         let coordinator = WriteCoordinator::new(writer, 8).expect("coordinator");
         coordinator
             .execute_legacy(PRODUCER, plan("input-2", b"two"))
@@ -613,14 +607,13 @@ mod tests {
             .expect("lower fresh legacy id");
 
         assert_eq!(fs::read(&path).expect("read"), b"twoone");
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[tokio::test]
     async fn ordered_attach_input_exceeds_control_dedup_capacity() {
         const ATTACH_INPUTS: usize = 8_192;
 
-        let (path, writer) = output_file("attach-volume");
+        let (_guard, path, writer) = output_file("attach-volume");
         let coordinator = WriteCoordinator::new(writer, 1).expect("coordinator");
         for row in 0..ATTACH_INPUTS {
             let report = format!("\x1b[<35;1;{}M", row % 80 + 1);
@@ -637,7 +630,6 @@ mod tests {
             fs::metadata(&path).expect("metadata").len()
                 > u64::try_from(ATTACH_INPUTS).expect("input count fits u64")
         );
-        fs::remove_file(path).expect("cleanup");
     }
 
     #[test]

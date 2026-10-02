@@ -120,6 +120,7 @@ mod tests {
 
     use pohunek_paths::{PathEnv, Platform};
     use pohunek_service_config::{ConfigSpec, Deadlines};
+    use pohunek_test_support::env::TestEnv;
 
     use super::*;
 
@@ -127,7 +128,7 @@ mod tests {
     const OLD_VERSION: &str = "1.2.2";
 
     struct Installation {
-        _root: tempfile::TempDir,
+        _env: TestEnv,
         paths: BasePaths,
         config_path: PathBuf,
         prefix: PathBuf,
@@ -150,30 +151,25 @@ mod tests {
     }
 
     fn installation() -> Installation {
-        let root = tempfile::tempdir_in(crate::test_support::temp_root()).expect("root");
-        let base = fs::canonicalize(root.path()).expect("canonical root");
-        let env = |name: &str| {
-            let path = base.join(name);
-            private_dir(&path);
-            Some(path.into_os_string())
-        };
+        let test_env = TestEnv::new().expect("hermetic test environment");
+        let os = |path: &Path| Some(path.as_os_str().to_owned());
         let paths = BasePaths::resolve_for(
             Platform::current().expect("platform"),
             rustix::process::geteuid().as_raw(),
             &PathEnv {
-                xdg_runtime_dir: env("run"),
-                xdg_data_home: env("data"),
-                xdg_state_home: env("state"),
-                xdg_cache_home: env("cache"),
-                xdg_config_home: env("config"),
-                home: env("home"),
+                xdg_runtime_dir: os(test_env.runtime_dir()),
+                xdg_data_home: os(test_env.data_home()),
+                xdg_state_home: os(test_env.state_home()),
+                xdg_cache_home: os(test_env.cache_home()),
+                xdg_config_home: os(test_env.config_home()),
+                home: os(test_env.home()),
             },
         )
         .expect("resolve paths");
         for path in [&paths.runtime_dir, &paths.state_dir, &paths.config_dir] {
             private_dir(path);
         }
-        let prefix = base.join("prefix");
+        let prefix = test_env.root().join("prefix");
         let uid = rustix::process::geteuid().as_raw();
         let deadline = Duration::from_secs(1);
         let config = ServiceConfig::new(ConfigSpec {
@@ -199,7 +195,7 @@ mod tests {
         let config_path = pohunek_service_config::file_path(&paths);
         config.write(&config_path).expect("write configuration");
         Installation {
-            _root: root,
+            _env: test_env,
             paths,
             config_path,
             prefix,
@@ -327,7 +323,8 @@ mod tests {
             .join(VERSION)
             .join("pohunekd");
         fs::write(&renamed, b"#!/bin/sh\n").expect("write misnamed worker");
-        let elsewhere = tempfile::tempdir_in(crate::test_support::temp_root()).expect("dir");
+        let elsewhere =
+            pohunek_test_support::tempdir().expect("directory outside the installation");
         let foreign = install_worker(elsewhere.path(), VERSION);
 
         for executable in [&stray, &renamed, &foreign] {
