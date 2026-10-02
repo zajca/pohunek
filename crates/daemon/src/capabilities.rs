@@ -570,6 +570,7 @@ mod tests {
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 
     use super::*;
+    use crate::procwatch::{Error as ProcError, HostInspector, Pid, ProcessInspector};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -932,26 +933,31 @@ mod tests {
             &hermes,
             &format!(
                 "#!/bin/sh\n\
-                 sh -c 'echo $$ > {pid_file}; exec sleep {hold}' &\n\
+                 sh -c 'echo \"$$ $PPID\" > {pid_file}; exec sleep {hold}' &\n\
                  sleep {hold}\n",
                 pid_file = pid_file.display(),
                 hold = FIXTURE_HOLD.as_secs(),
             ),
         );
 
-        // One `HANG_GUARD` budget covers recording the pid and the descendant's
-        // termination. Each poll runs one probe attempt until the descendant has
-        // recorded its pid; a deadline that fires before the script got that far
-        // proves nothing, so the attempt deadline doubles, capped by the budget
-        // left. Once the pid is known each poll checks whether it is gone.
+        // One `HANG_GUARD` budget covers recording the descendant's identity and
+        // its termination. Each poll runs one probe attempt until the descendant
+        // has recorded its pid and process group; a deadline that fires before the
+        // script got that far proves nothing, so the attempt deadline doubles,
+        // capped by the budget left. Once the identity is known each poll checks
+        // whether the descendant is gone.
+        let inspector = HostInspector::new();
+        let own_group = process_group_of(inspector, std::process::id());
         let started = Instant::now();
         let mut attempt_timeout = Duration::from_millis(50);
         let mut descendant: Option<DescendantGuard> = None;
         poll_until(
-            "the probe's descendant to record its pid and be terminated",
+            "the probe's descendant to record its identity and be terminated",
             || {
                 if let Some(known) = &descendant {
-                    return process_gone(known.0).then_some(());
+                    let present = descendant_present(&inspector, known.pid, known.group)
+                        .expect("inspect the descendant");
+                    return (!present).then_some(());
                 }
                 let _ = std::fs::remove_file(&pid_file);
                 let budget_left = HANG_GUARD.saturating_sub(started.elapsed());
@@ -960,30 +966,78 @@ mod tests {
                 attempt_timeout = attempt_timeout.saturating_mul(2);
                 descendant = std::fs::read_to_string(&pid_file)
                     .ok()
-                    .and_then(|text| text.trim().parse::<i32>().ok())
-                    .map(DescendantGuard);
+                    .and_then(|text| parse_descendant_marker(&text, own_group));
                 None
             },
         );
         descendant
-            .expect("the poll succeeds only after the pid is recorded")
+            .expect("the poll succeeds only after the identity is recorded")
             .disarm();
     }
 
-    /// True when no process with `pid` exists.
-    fn process_gone(pid: i32) -> bool {
-        // SAFETY: signal 0 only checks that the pid exists; nothing is sent.
-        #[expect(unsafe_code, reason = "kill(pid, 0) is the portable liveness check")]
-        let alive = unsafe { libc::kill(pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
-        !alive
+    /// Parses the fixture's `<pid> <group>` marker, rejecting a group that is the
+    /// test's own so cleanup can never signal the test run.
+    fn parse_descendant_marker(text: &str, own_group: Pid) -> Option<DescendantGuard> {
+        let (pid, group) = text.trim().split_once(' ')?;
+        let (pid, group) = (pid.parse::<Pid>().ok()?, group.parse::<Pid>().ok()?);
+        assert_ne!(
+            group, own_group,
+            "the probe must run its child in its own process group"
+        );
+        Some(DescendantGuard { pid, group })
     }
 
-    /// Kills a fixture descendant on drop, so a failed wait does not leak it.
-    struct DescendantGuard(i32);
+    fn process_group_of(inspector: HostInspector, pid: Pid) -> Pid {
+        inspector
+            .process(pid)
+            .expect("inspect process")
+            .expect("process is live")
+            .pgid
+    }
+
+    /// True while `pid` is a running process in group `group`.
+    ///
+    /// A pid that no longer exists, is a zombie, or was recycled into another
+    /// group is not the descendant that recorded `group`.
+    fn descendant_present(
+        inspector: &impl ProcessInspector,
+        pid: Pid,
+        group: Pid,
+    ) -> Result<bool, ProcError> {
+        let observation = match inspector.process(pid) {
+            Ok(Some(fact)) if fact.pgid == group => inspector.is_running(fact.identity()),
+            Ok(_) => Ok(false),
+            Err(error) => Err(error),
+        };
+        match observation {
+            Err(error) if error.is_race() => Ok(false),
+            other => other,
+        }
+    }
+
+    #[test]
+    fn descendant_identity_requires_the_recorded_process_group() {
+        let inspector = HostInspector::new();
+        let pid = std::process::id();
+        let group = process_group_of(inspector, pid);
+
+        assert!(descendant_present(&inspector, pid, group).expect("inspect own process"));
+        assert!(
+            !descendant_present(&inspector, pid, group.wrapping_add(1))
+                .expect("inspect own process"),
+            "a live pid in a different process group is a recycled pid, not the descendant"
+        );
+    }
+
+    /// Kills a fixture descendant's process group on drop, so a failed wait does
+    /// not leak it.
+    struct DescendantGuard {
+        pid: Pid,
+        group: Pid,
+    }
 
     impl DescendantGuard {
-        /// Call once the descendant is confirmed gone: its pid may be reused.
+        /// Call once the descendant is confirmed gone.
         fn disarm(self) {
             std::mem::forget(self);
         }
@@ -991,11 +1045,24 @@ mod tests {
 
     impl Drop for DescendantGuard {
         fn drop(&mut self) {
-            // SAFETY: the pid was recorded by the fixture's own descendant and
-            // the guard is disarmed as soon as that process is confirmed gone.
-            #[expect(unsafe_code, reason = "cleanup of a leaked test descendant")]
+            // Fails closed: the group is signalled only while the recorded pid
+            // is still a running member of it. The group id cannot be recycled
+            // while that member lives; the window between this check and the
+            // signal is the only residual race.
+            if !matches!(
+                descendant_present(&HostInspector::new(), self.pid, self.group),
+                Ok(true)
+            ) {
+                return;
+            }
+            let Ok(group) = i32::try_from(self.group) else {
+                return;
+            };
+            // SAFETY: `group` is the group the probe created for the fixture and
+            // `parse_descendant_marker` rejected the test's own group.
+            #[expect(unsafe_code, reason = "cleanup of a leaked test process group")]
             unsafe {
-                libc::kill(self.0, libc::SIGKILL);
+                libc::kill(-group, libc::SIGKILL);
             }
         }
     }
