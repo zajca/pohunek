@@ -18,7 +18,8 @@ use pohunek_platform::filesystem::{
     AdvisoryLock, EntryIdentity, EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir,
 };
 use pohunek_platform::process::{
-    HostInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
+    sweep_runtime, HostInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector,
+    SkipReason, StartIdentity, SweepRequest, MAX_SWEEP_GRACE,
 };
 use pohunek_worker_protocol as protocol;
 use protocol::{
@@ -73,6 +74,18 @@ const TERMINAL_SUBAGENT_CAPACITY: usize = 32;
 /// A quarter second keeps the runtime publicly draining without either a busy
 /// loop or a long recovery delay once the journal becomes writable again.
 const TERMINAL_JOURNAL_RETRY_DELAY: Duration = Duration::from_millis(250);
+/// Upper bound on marker-sweep passes for one force-closed runtime.
+///
+/// A pass selects its targets before signalling, so a process forked during
+/// the pass is only found by the next one. Three passes absorb a short fork
+/// chain; a runtime that still yields targets after that is unconfirmed
+/// instead of being swept forever.
+const MAX_RUNTIME_SWEEP_PASSES: usize = 3;
+/// Liveness polling interval inside one sweep's grace windows.
+///
+/// Clamped to the grace. 50 ms notices an exit promptly without busy-reading
+/// the process table.
+const RUNTIME_SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Maximum accepted provider-native subagent identifier length.
 const MAX_SUBAGENT_ID_BYTES: usize = 256;
 /// Maximum accepted provider-defined subagent type length.
@@ -371,6 +384,7 @@ impl Server {
             lease_epoch_tx,
             state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
+            inspector: Arc::new(HostInspector::new()),
             #[cfg(test)]
             starting_gate: Mutex::new(None),
         });
@@ -473,6 +487,8 @@ struct Shared {
     lease_epoch_tx: watch::Sender<u64>,
     state_changed: Notify,
     shutdown: CancellationToken,
+    /// Process table the runtime-cleanup sweep reads.
+    inspector: Arc<dyn ProcessInspector>,
     /// Pauses `initialize` between the `Starting` commit and the child spawn.
     #[cfg(test)]
     starting_gate: Mutex<Option<StartingGate>>,
@@ -1864,6 +1880,26 @@ async fn coordinate_runtime_completion(
             return;
         }
     }
+    // A forced close means a process outside the root's group still holds the
+    // PTY slave and was never signalled. The runtime only ends once every
+    // process carrying its marker is proven gone; otherwise it is faulted and
+    // the daemon's lost-runtime handling takes over.
+    if output_forced_closed {
+        let grace = shared.state.lock().await.stop_grace;
+        let cleanup = confirm_runtime_cleanup(
+            shared.inspector.as_ref(),
+            &runtime_id,
+            StartIdentity::new(shared.worker_process.start_identity),
+            grace,
+        )
+        .await;
+        if let Err(error) = cleanup {
+            mark_runtime_faulted_at_offset(&shared, runtime_id, error, Some(next_output_offset))
+                .await;
+            shared.shutdown.cancel();
+            return;
+        }
+    }
     let status = ExitStatus {
         output_forced_closed,
         ..status
@@ -1888,6 +1924,89 @@ async fn coordinate_runtime_completion(
         () = tokio::time::sleep(retention) => shared.shutdown.cancel(),
         () = shared.shutdown.cancelled() => {}
     }
+}
+
+/// Sweeps every process marked with `runtime_id` and confirms none is left.
+///
+/// Runs [`sweep_runtime`] until a pass attributes no process to the runtime,
+/// at most [`MAX_RUNTIME_SWEEP_PASSES`] times; `grace` bounds each wait
+/// between `SIGTERM` and `SIGKILL` and is capped at [`MAX_SWEEP_GRACE`].
+/// `worker_start` lets the sweep prove an unreadable-marker process that
+/// started before this worker foreign to the runtime; any other
+/// unreadable-marker process keeps the cleanup unconfirmed.
+///
+/// Only processes that carry the runtime marker can be found. A process that
+/// scrubs its environment carries none and is invisible to this sweep, the
+/// same limit the daemon's lost-runtime sweep has.
+///
+/// # Errors
+///
+/// Returns [`WorkerError::RuntimeCleanup`] when the sweep cannot run, aborts,
+/// leaves a signalled process running, skips the worker itself, or still
+/// selects processes after the last pass.
+async fn confirm_runtime_cleanup(
+    inspector: &dyn ProcessInspector,
+    runtime_id: &RuntimeId,
+    worker_start: StartIdentity,
+    grace: Duration,
+) -> Result<(), WorkerError> {
+    let unconfirmed = |detail: String| WorkerError::RuntimeCleanup {
+        runtime_id: runtime_id.to_string(),
+        detail,
+    };
+    let grace = grace.min(MAX_SWEEP_GRACE);
+    let request = SweepRequest::new(
+        runtime_id.to_string(),
+        rustix::process::geteuid().as_raw(),
+        grace,
+        RUNTIME_SWEEP_POLL_INTERVAL.min(grace),
+    )
+    .map_err(|error| unconfirmed(error.to_string()))?
+    .with_worker_start_identity(Some(worker_start));
+    for pass in 1..=MAX_RUNTIME_SWEEP_PASSES {
+        let report = sweep_runtime(inspector, &request)
+            .await
+            .map_err(|error| unconfirmed(format!("sweep pass {pass} aborted: {error}")))?;
+        event!(
+            name: "worker.runtime.sweep.pass",
+            Level::INFO,
+            sweep.pass = pass,
+            sweep.terminated = report.terminated.len(),
+            sweep.killed = report.killed.len(),
+            sweep.unconfirmed = report.unconfirmed.len(),
+            sweep.skipped = report.skipped.len(),
+            "swept the processes of a force-closed runtime",
+        );
+        if !report.is_complete() {
+            return Err(unconfirmed(format!(
+                "{} signalled process(es) were still running after pass {pass}",
+                report.unconfirmed.len()
+            )));
+        }
+        if report
+            .skipped
+            .iter()
+            .any(|skipped| skipped.reason == SkipReason::CurrentProcess)
+        {
+            return Err(unconfirmed(
+                "the sweep selected the worker process itself".to_owned(),
+            ));
+        }
+        // An unreadable-marker process that could still belong to the runtime
+        // counts as selected, so the sweep repeats: a process caught between
+        // images reads its markers on a later pass, while one that stays
+        // unreadable leaves the cleanup unconfirmed below.
+        let selected = report.terminated.len()
+            + report.killed.len()
+            + report.unconfirmed.len()
+            + report.skipped.len();
+        if selected == 0 {
+            return Ok(());
+        }
+    }
+    Err(unconfirmed(format!(
+        "marked or unreadable processes remained after {MAX_RUNTIME_SWEEP_PASSES} sweep passes"
+    )))
 }
 
 async fn wait_for_output_completion(
@@ -4451,12 +4570,16 @@ mod tests {
         ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
         ATTACH_INPUT_PREFIX,
     };
+    use pohunek_platform::process::{
+        HostInspector, ProcessIdentity as OsProcessIdentity, ProcessInspector, StartIdentity,
+    };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
         ControlResponse, Cursor, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
         FrameKind, LeaseId, RequestId, ResponseKind, RuntimeId, StreamId, StreamMode, Version,
         WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
+    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
@@ -5319,6 +5442,302 @@ mod tests {
         let state = server.shared.state.lock().await;
         let exit = state.exit.as_ref().expect("the exit is published");
         assert!(exit.output_forced_closed);
+    }
+
+    /// Inspector that reads the real process table but cannot read any
+    /// process's ownership markers, so no process is provably foreign.
+    #[derive(Debug, Default)]
+    struct UnreadableMarkers(HostInspector);
+
+    impl ProcessInspector for UnreadableMarkers {
+        fn identity(
+            &self,
+            pid: pohunek_platform::process::Pid,
+        ) -> Result<Option<OsProcessIdentity>, pohunek_platform::process::Error> {
+            self.0.identity(pid)
+        }
+
+        fn is_running(
+            &self,
+            identity: OsProcessIdentity,
+        ) -> Result<bool, pohunek_platform::process::Error> {
+            self.0.is_running(identity)
+        }
+
+        fn parent_pid(
+            &self,
+            pid: pohunek_platform::process::Pid,
+        ) -> Result<Option<pohunek_platform::process::Pid>, pohunek_platform::process::Error>
+        {
+            self.0.parent_pid(pid)
+        }
+
+        fn process(
+            &self,
+            pid: pohunek_platform::process::Pid,
+        ) -> Result<Option<pohunek_platform::process::ProcessFact>, pohunek_platform::process::Error>
+        {
+            self.0.process(pid)
+        }
+
+        fn same_user_processes(
+            &self,
+        ) -> Result<Vec<pohunek_platform::process::ProcessFact>, pohunek_platform::process::Error>
+        {
+            self.0.same_user_processes()
+        }
+
+        fn descendants(
+            &self,
+            root: pohunek_platform::process::Pid,
+        ) -> Result<Vec<pohunek_platform::process::ProcessFact>, pohunek_platform::process::Error>
+        {
+            self.0.descendants(root)
+        }
+
+        fn cwd(
+            &self,
+            pid: pohunek_platform::process::Pid,
+        ) -> Result<PathBuf, pohunek_platform::process::Error> {
+            self.0.cwd(pid)
+        }
+
+        fn executable(
+            &self,
+            pid: pohunek_platform::process::Pid,
+        ) -> Result<Option<PathBuf>, pohunek_platform::process::Error> {
+            self.0.executable(pid)
+        }
+
+        fn exit_watch(
+            &self,
+            identity: OsProcessIdentity,
+        ) -> Result<pohunek_platform::process::ExitWatch, pohunek_platform::process::Error>
+        {
+            self.0.exit_watch(identity)
+        }
+
+        fn ownership_markers(
+            &self,
+            _pid: pohunek_platform::process::Pid,
+        ) -> Result<pohunek_platform::process::OwnershipMarkers, pohunek_platform::process::Error>
+        {
+            Err(pohunek_platform::process::Error::from_io(
+                "test_markers",
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ))
+        }
+
+        fn foreground_process_group(
+            &self,
+            root_pid: pohunek_platform::process::Pid,
+        ) -> Result<Option<pohunek_platform::process::Pid>, pohunek_platform::process::Error>
+        {
+            self.0.foreground_process_group(root_pid)
+        }
+    }
+
+    /// Spawns a `sleep` carrying the ownership marker of `runtime_id`.
+    fn spawn_marked_sleeper(runtime_id: &RuntimeId) -> std::process::Child {
+        let mut command = std::process::Command::new("sleep");
+        command
+            .arg("30")
+            .env_clear()
+            .envs(crate::test_support::child_env())
+            .env("POHUNEK_RUNTIME_ID", runtime_id.as_str());
+        command.spawn().expect("spawn the marked process")
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_terminates_the_marked_processes() {
+        let runtime_id = RuntimeId::new("runtime-cleanup-sweep").expect("runtime id");
+        let mut marked = spawn_marked_sleeper(&runtime_id);
+        let worker_start = StartIdentity::new(super::process_start(std::process::id()).unwrap());
+
+        super::confirm_runtime_cleanup(
+            &HostInspector::new(),
+            &runtime_id,
+            worker_start,
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("a marked process that dies on SIGTERM confirms the cleanup");
+
+        let status = marked.wait().expect("reap the marked process");
+        assert!(!status.success(), "the sweep signalled the marked process");
+    }
+
+    #[tokio::test]
+    async fn cleanup_confirmation_fails_while_markers_stay_unreadable() {
+        let runtime_id = RuntimeId::new("runtime-cleanup-unreadable").expect("runtime id");
+        let mut marked = spawn_marked_sleeper(&runtime_id);
+
+        // A worker start of zero makes every process a possible runtime
+        // member, so an unreadable marker can never be dismissed as foreign.
+        let outcome = super::confirm_runtime_cleanup(
+            &UnreadableMarkers::default(),
+            &runtime_id,
+            StartIdentity::new(0),
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let still_running = marked.try_wait().expect("poll the marked process");
+        marked.kill().expect("kill the marked process");
+        marked.wait().expect("reap the marked process");
+        assert!(
+            matches!(outcome, Err(crate::WorkerError::RuntimeCleanup { .. })),
+            "unreadable markers leave the cleanup unconfirmed: {outcome:?}"
+        );
+        assert!(
+            still_running.is_none(),
+            "an unreadable marker is never a signal permit"
+        );
+    }
+
+    /// Escaped PTY holder fixture whose descendants carry the runtime marker.
+    ///
+    /// The holder publishes its PID in `ready`. `inspector` replaces the
+    /// worker's process table when present. Returns once the monitors run.
+    #[cfg(target_os = "linux")]
+    async fn marked_forced_close_worker(
+        session_id: &str,
+        runtime_name: &str,
+        inspector: Option<std::sync::Arc<dyn ProcessInspector>>,
+    ) -> (super::Server, BarrierDirectory, OsProcessIdentity) {
+        let directory = BarrierDirectory::new();
+        let ready = directory.path().join("escaped-ready");
+        let config = crate::WorkerConfig {
+            post_exit_drain_timeout: Duration::from_millis(50),
+            stop_grace: Duration::from_millis(50),
+            ..crate::WorkerConfig::new()
+        };
+        let mut server = super::Server::bind(super::ServerArgs {
+            session_id: session_id.to_owned(),
+            worker_id: format!("worker-{session_id}"),
+            generation: "abcd2345".to_owned(),
+            socket_path: directory.path().join("worker.sock"),
+            journal_path: directory.path().join("journal.json"),
+            daemon_socket_path: directory.path().join("daemon.sock"),
+            config: config.clone(),
+        })
+        .await
+        .expect("bind worker");
+        if let Some(inspector) = inspector {
+            std::sync::Arc::get_mut(&mut server.shared)
+                .expect("the worker is not shared before it serves")
+                .inspector = inspector;
+        }
+        let runtime_id = RuntimeId::new(runtime_name).expect("runtime id");
+        let mut env = crate::test_support::child_env();
+        env.push((
+            "POHUNEK_RUNTIME_ID".to_owned(),
+            runtime_id.as_str().to_owned(),
+        ));
+        let pty = super::spawn_pty(
+            crate::Command {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "trap '' HUP; ",
+                        "setsid sh -c 'trap \"\" HUP TERM; printf \"$$\" > \"$2\"; ",
+                        "while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"$1\" \"$2\" & ",
+                        "while [ ! -s \"$2\" ]; do sleep 0.01; done; ",
+                        "printf 'root-exited\\n'"
+                    )
+                    .to_owned(),
+                    "pohunek-marked-escape".to_owned(),
+                    directory.path().to_string_lossy().into_owned(),
+                    ready.to_string_lossy().into_owned(),
+                ],
+                base: crate::EnvBase::Empty,
+                env,
+                cwd: directory.path().to_path_buf(),
+                cols: 80,
+                rows: 24,
+            },
+            &config,
+        )
+        .expect("spawn PTY");
+        let escapee_pid: u32 =
+            pohunek_test_support::wait::poll_until("the escaped holder to publish its PID", || {
+                std::fs::read_to_string(&ready).ok()?.trim().parse().ok()
+            });
+        let escapee = HostInspector::new()
+            .identity(escapee_pid)
+            .expect("inspect the escaped holder")
+            .expect("the escaped holder runs");
+        let () = {
+            let mut state = server.shared.state.lock().await;
+            state.phase = super::WireRuntimePhase::Running;
+            state.runtime_id = Some(runtime_id.clone());
+            state.pty = Some(pty.clone());
+            state.stop_grace = config.stop_grace;
+            state.journal.phase = super::JournalPhase::Live;
+            state.journal.runtime_id = Some(runtime_id.as_str().to_owned());
+            state.journal.child = Some(super::journal_identity(pty.identity()));
+        };
+        super::spawn_runtime_monitors(std::sync::Arc::clone(&server.shared), pty, runtime_id);
+        (server, directory, escapee)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forced_close_ends_the_runtime_only_after_its_marked_holder_is_swept() {
+        let (server, _directory, escapee) =
+            marked_forced_close_worker("s-116", "runtime-marked-swept", None).await;
+
+        pohunek_test_support::wait::wait_until("the forced-close terminal commit", || async {
+            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited)
+                .then_some(())
+        })
+        .await;
+
+        assert!(
+            !HostInspector::new()
+                .is_running(escapee)
+                .expect("inspect the escaped holder"),
+            "the terminal commit proves the marked holder is gone"
+        );
+        let journal = server.shared.journal.load().expect("load terminal journal");
+        assert_eq!(journal.phase, super::JournalPhase::Terminal);
+        assert!(journal.outcome.expect("outcome").output_forced_closed);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn forced_close_faults_the_runtime_when_the_cleanup_is_unconfirmed() {
+        let (server, _directory, escapee) = marked_forced_close_worker(
+            "s-117",
+            "runtime-marked-unconfirmed",
+            Some(std::sync::Arc::new(UnreadableMarkers::default())),
+        )
+        .await;
+
+        pohunek_test_support::wait::wait_until("the runtime fault", || async {
+            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Faulted)
+                .then_some(())
+        })
+        .await;
+
+        let journal = server.shared.journal.load().expect("load faulted journal");
+        assert_eq!(journal.phase, super::JournalPhase::Faulted);
+        assert!(
+            journal.outcome.is_none(),
+            "an unconfirmed cleanup records no exit outcome"
+        );
+        assert!(server.shared.state.lock().await.exit.is_none());
+        assert!(
+            HostInspector::new()
+                .is_running(escapee)
+                .expect("inspect the escaped holder"),
+            "an unreadable marker is never a signal permit"
+        );
+        assert!(
+            server.shared.shutdown.is_cancelled(),
+            "a faulted worker shuts down so the daemon classifies the lost runtime"
+        );
     }
 
     #[tokio::test]

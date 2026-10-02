@@ -4,7 +4,10 @@
 //! A descendant outside the root's process group (a `setsid` child) keeps the
 //! PTY slave open after the root dies, so the worker has to force the output
 //! closed. The root's exit is known and reaped, so the session must reach its
-//! terminal state with that exit, and the forced close must stay visible.
+//! terminal state with that exit, and the forced close must stay visible. The
+//! worker ends the runtime only after it swept the escaped holder (which
+//! carries the runtime marker and ignores `SIGTERM`), so the session is never
+//! terminal while a process of its runtime can still write.
 
 #![cfg(target_os = "linux")]
 
@@ -12,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pohunek_daemon::procwatch::HostInspector;
+use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_test_support::wait::{guard, poll_until};
@@ -54,15 +57,16 @@ fn params(agent: &str, cwd: &Path) -> SessionNewParams {
 }
 
 /// Writes the agent script: it starts the escaped holder, waits until the
-/// holder reports ready, and then becomes a process that dies on `SIGTERM`.
+/// holder publishes its PID in `ready`, and then becomes a process that dies on
+/// `SIGTERM`.
 fn write_agent(root: &Path, barrier: &Path, ready: &Path) -> PathBuf {
     let script = root.join("escape.sh");
     std::fs::write(
         &script,
         format!(
             "trap '' HUP\n\
-             setsid sh -c 'trap \"\" HUP TERM; printf ready > \"$2\"; while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"{barrier}\" \"{ready}\" &\n\
-             while [ ! -e \"{ready}\" ]; do sleep 0.01; done\n\
+             setsid sh -c 'trap \"\" HUP TERM; printf \"%s\" \"$$\" > \"$2\"; while [ -d \"$1\" ]; do sleep 0.01; done' escaped \"{barrier}\" \"{ready}\" &\n\
+             while [ ! -s \"{ready}\" ]; do sleep 0.01; done\n\
              exec sleep {ROOT_SLEEP_SECONDS}\n",
             barrier = barrier.display(),
             ready = ready.display(),
@@ -122,9 +126,14 @@ async fn a_forced_output_close_ends_the_session_with_the_root_exit() {
         .create(params("escape", root.path()))
         .await
         .expect("create the session");
-    poll_until("the escaped descendant to hold the PTY", || {
-        ready.exists().then_some(())
+    let escapee_pid: u32 = poll_until("the escaped descendant to hold the PTY", || {
+        std::fs::read_to_string(&ready).ok()?.trim().parse().ok()
     });
+    let inspector = HostInspector::new();
+    let escapee = inspector
+        .identity(escapee_pid)
+        .expect("inspect the escaped descendant")
+        .expect("the escaped descendant runs");
 
     let stopped = guard(
         "the stop of a session with a forced output close",
@@ -133,6 +142,12 @@ async fn a_forced_output_close_ends_the_session_with_the_root_exit() {
     .await
     .expect("a forced output close must not fail the stop");
     assert!(stopped.stopped);
+    assert!(
+        !inspector
+            .is_running(escapee)
+            .expect("inspect the escaped descendant"),
+        "the stop returns only after the escaped descendant of the runtime was swept"
+    );
 
     let info = registry
         .inspect(&created.id)
@@ -166,6 +181,13 @@ async fn a_forced_output_close_ends_the_session_with_the_root_exit() {
             .expect("a repeated stop of a terminal session")
             .stopped
     );
+
+    // The runtime's marked processes are gone, so the terminal session's
+    // worker-side cleanup proof lets its removal sweep confirm and proceed.
+    registry
+        .remove(&created.id)
+        .await
+        .expect("a swept runtime's session can be removed");
 }
 
 /// Reads the single worker journal below `state_root`.

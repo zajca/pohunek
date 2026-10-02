@@ -297,8 +297,14 @@ outside the session's process group (for example a `setsid` helper) keeps the
 terminal open past the stop deadline, the worker force-closes the output,
 reaps the root, and records the root's exit. The session reaches `stopped`
 with that exit and its session info has `output_force_closed` set to `true`, because output the
-helper wrote after the close is not retained. If the root's exit cannot be
-observed, nothing is invented and the stop fails.
+helper wrote after the close is not retained. Before the session ends, the
+worker terminates every process still marked with the runtime ID and waits
+until none is left (`SIGTERM`, then `SIGKILL` after the stop grace), so a
+helper cannot keep writing once the session is resumable or its worktree is
+released. A process that scrubs its environment carries no marker and cannot be
+found. If the root's exit cannot be observed, nothing is invented and the stop
+fails; if the marked processes cannot be proven gone, the runtime is faulted
+instead of ended and the daemon handles it as a lost runtime.
 
 `lost` means the worker or host runtime is gone and the PTY cannot be
 reattached. `conflict` means discovery found ambiguous or mismatched live
