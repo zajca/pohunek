@@ -215,6 +215,58 @@ fn run_hermes_version_probe_with_seeded_env(
     timeout: Duration,
     seeded_env: &[(&str, &str)],
 ) -> Option<String> {
+    match probe_hermes_version(path, timeout, seeded_env) {
+        ProbeOutcome::Output(output) => Some(output),
+        ProbeOutcome::Failed | ProbeOutcome::TimedOut | ProbeOutcome::Unavailable => None,
+    }
+}
+
+/// How a version probe ended.
+///
+/// Callers that only need the version text collapse every non-`Output` case to
+/// `None`; the distinction lets tests tell the output-limit termination apart
+/// from the probe's own deadline.
+#[derive(Debug)]
+enum ProbeOutcome {
+    /// The child exited successfully; carries the retained stdout.
+    Output(String),
+    /// The child exited unsuccessfully, including termination by a signal such
+    /// as the `SIGXFSZ` raised when it exceeds the output-file size limit.
+    Failed,
+    /// The deadline expired and the child's process group was terminated.
+    TimedOut,
+    /// The probe could not be set up, polled or read.
+    Unavailable,
+}
+
+fn probe_hermes_version(
+    path: &std::path::Path,
+    timeout: Duration,
+    seeded_env: &[(&str, &str)],
+) -> ProbeOutcome {
+    probe_hermes_version_with_clock(path, timeout, seeded_env, Instant::now)
+}
+
+/// [`probe_hermes_version`] reading time from `now`.
+///
+/// The clock drives only the deadline: it is read once to start the deadline and
+/// once per poll of the child. Tests inject a clock to prove the probe honors
+/// its `timeout` argument without measuring real time.
+fn probe_hermes_version_with_clock(
+    path: &std::path::Path,
+    timeout: Duration,
+    seeded_env: &[(&str, &str)],
+    now: impl Fn() -> Instant,
+) -> ProbeOutcome {
+    spawn_and_collect_probe(path, timeout, seeded_env, &now).unwrap_or(ProbeOutcome::Unavailable)
+}
+
+fn spawn_and_collect_probe(
+    path: &std::path::Path,
+    timeout: Duration,
+    seeded_env: &[(&str, &str)],
+    now: &impl Fn() -> Instant,
+) -> Option<ProbeOutcome> {
     let sandbox = VersionProbeSandbox::create()?;
     let output_file = OpenOptions::new()
         .write(true)
@@ -249,16 +301,20 @@ fn run_hermes_version_probe_with_seeded_env(
     configure_probe_process_group(&mut command);
 
     let mut child = command.spawn().ok()?;
-    let deadline = Instant::now() + timeout;
+    let deadline = now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
+            Ok(None) if now() < deadline => {
                 std::thread::sleep(VERSION_PROBE_POLL_INTERVAL);
             }
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 terminate_probe_process(&mut child);
-                return None;
+                return Some(ProbeOutcome::TimedOut);
+            }
+            Err(_) => {
+                terminate_probe_process(&mut child);
+                return Some(ProbeOutcome::Unavailable);
             }
         }
     };
@@ -269,9 +325,11 @@ fn run_hermes_version_probe_with_seeded_env(
         .take(u64::try_from(HERMES_VERSION_OUTPUT_LIMIT).ok()?)
         .read_to_end(&mut output)
         .ok()?;
-    status
-        .success()
-        .then(|| String::from_utf8_lossy(&output).into_owned())
+    Some(if status.success() {
+        ProbeOutcome::Output(String::from_utf8_lossy(&output).into_owned())
+    } else {
+        ProbeOutcome::Failed
+    })
 }
 
 /// Owner-private state and output paths for one version probe.
@@ -504,13 +562,21 @@ fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBu
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use pohunek_test_support::wait::{poll_until, HANG_GUARD};
+
     use super::*;
+    use crate::procwatch::{HostInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// How long fixture processes block; well beyond `HANG_GUARD` so a fixture
+    /// can only end through the probe, never by exiting on its own.
+    const FIXTURE_HOLD: Duration = Duration::from_secs(HANG_GUARD.as_secs() * 5);
 
     /// An empty profile registry (no host-config layer) for the base-kind tests.
     fn no_profiles() -> ProfileRegistry {
@@ -814,47 +880,242 @@ mod tests {
     fn hermes_version_probe_timeout_is_bounded() {
         let dir = temp_agents_dir();
         let hermes = dir.join("hermes");
-        write_test_executable(&hermes, "#!/bin/sh\nsleep 30\n");
-        let started = Instant::now();
-
-        assert!(
-            run_hermes_version_probe_with_timeout(&hermes, Duration::from_millis(50)).is_none()
+        write_test_executable(
+            &hermes,
+            &format!("#!/bin/sh\nsleep {}\n", FIXTURE_HOLD.as_secs()),
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // The child outlives any plausible test run, so the probe can only end
+        // through its own deadline; a probe that waited for the child would
+        // report `Output` instead.
+        let outcome = probe_hermes_version(&hermes, Duration::from_millis(50), &[]);
+
+        assert!(matches!(outcome, ProbeOutcome::TimedOut), "{outcome:?}");
+    }
+
+    #[test]
+    fn hermes_version_probe_honors_its_timeout_argument() {
+        const STEPS: u32 = 4;
+        let dir = temp_agents_dir();
+        let hermes = dir.join("hermes");
+        write_test_executable(
+            &hermes,
+            &format!("#!/bin/sh\nsleep {}\n", FIXTURE_HOLD.as_secs()),
+        );
+        // The fake clock advances by a quarter of the timeout on every read. The
+        // first read starts the deadline; the child never exits, so the probe
+        // must stop on exactly the read that reaches `start + timeout`.
+        let timeout = Duration::from_secs(8);
+        let start = Instant::now();
+        let reads = Cell::new(0_u32);
+        let clock = || {
+            let read = reads.get();
+            reads.set(read + 1);
+            start + (timeout / STEPS) * read
+        };
+
+        let outcome = probe_hermes_version_with_clock(&hermes, timeout, &[], clock);
+
+        assert!(matches!(outcome, ProbeOutcome::TimedOut), "{outcome:?}");
+        assert_eq!(
+            reads.get(),
+            STEPS + 1,
+            "the probe must expire when the clock reaches start + timeout"
+        );
     }
 
     #[test]
     fn hermes_version_probe_timeout_kills_descendants() {
         let dir = temp_agents_dir();
         let hermes = dir.join("hermes");
-        let descendant_marker = dir.join("descendant.txt");
+        let pid_file = dir.join("descendant.pid");
+        // Both sleepers are started before the descendant records its pid, so
+        // the whole tree exists when the test observes it.
         write_test_executable(
             &hermes,
             &format!(
-                "#!/bin/sh\n(sleep 0.2; printf 'escaped' > {}) &\nsleep 30\n",
-                descendant_marker.display()
+                "#!/bin/sh\n\
+                 sleep {hold} &\n\
+                 sh -c 'echo $$ > {pid_file}; exec sleep {hold}' &\n\
+                 wait\n",
+                pid_file = pid_file.display(),
+                hold = FIXTURE_HOLD.as_secs(),
             ),
         );
+        let inspector = HostInspector::new();
+        let own_group = process_group_of(inspector, std::process::id());
+        let tree = RefCell::new(Vec::new());
+        let _leak_guard = TreeGuard {
+            inspector,
+            tree: &tree,
+        };
 
-        assert!(
-            run_hermes_version_probe_with_timeout(&hermes, Duration::from_millis(50)).is_none()
+        // The deadline is driven by a clock that expires only once the test has
+        // observed the live process tree: the first read starts the deadline and
+        // the next one waits for the descendant's pid, records the tree with its
+        // start identities, checks the kernel's process groups, and then reports
+        // the deadline as reached. No attempt can time out before the tree exists.
+        let timeout = Duration::from_secs(1);
+        let start = Instant::now();
+        let reads = Cell::new(0_u32);
+        let clock = || {
+            let read = reads.get();
+            reads.set(read + 1);
+            if read == 0 {
+                return start;
+            }
+            if tree.borrow().is_empty() {
+                observe_probe_tree(inspector, &pid_file, own_group, &tree);
+            }
+            start + timeout
+        };
+        let outcome = probe_hermes_version_with_clock(&hermes, timeout, &[], clock);
+        assert!(matches!(outcome, ProbeOutcome::TimedOut), "{outcome:?}");
+
+        poll_until("the probe's process tree to be terminated", || {
+            let running = tree.borrow().iter().any(|identity| {
+                inspector
+                    .is_running(*identity)
+                    .expect("inspect the probe's process tree")
+            });
+            (!running).then_some(())
+        });
+    }
+
+    /// Waits for the fixture's descendant, records the probe child and every
+    /// process below it, then asserts the probe isolated them in a group of
+    /// their own.
+    ///
+    /// The tree is recorded before the assertions so a failed assertion still
+    /// leaves it to the caller's [`TreeGuard`].
+    fn observe_probe_tree(
+        inspector: HostInspector,
+        pid_file: &Path,
+        own_group: Pid,
+        tree: &RefCell<Vec<ProcessIdentity>>,
+    ) {
+        let descendant = poll_until("the descendant to record its pid", || {
+            std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<Pid>().ok())
+        });
+        let fact = inspector
+            .process(descendant)
+            .expect("inspect the descendant")
+            .expect("the descendant is live while the probe waits");
+        let leader = fact.ppid;
+        let mut identities = vec![inspector
+            .identity(leader)
+            .expect("inspect the probe child")
+            .expect("the probe child is live")];
+        identities.extend(
+            inspector
+                .descendants(leader)
+                .expect("inspect the probe child's descendants")
+                .iter()
+                .map(ProcessFact::identity),
         );
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            !descendant_marker.exists(),
-            "the timed-out probe process group must be terminated"
+        tree.replace(identities);
+        assert_probe_isolation(fact.pgid, leader, own_group);
+    }
+
+    /// Asserts the descendant runs in a group led by the probe child that is not
+    /// the test's own, so terminating the group cannot reach the test run.
+    fn assert_probe_isolation(group: Pid, leader: Pid, own_group: Pid) {
+        assert_ne!(
+            group, own_group,
+            "the probe must not leave its child in the caller's process group"
         );
+        assert_eq!(
+            group, leader,
+            "the probe must run its child as the leader of a new process group"
+        );
+    }
+
+    fn process_group_of(inspector: HostInspector, pid: Pid) -> Pid {
+        inspector
+            .process(pid)
+            .expect("inspect process")
+            .expect("process is live")
+            .pgid
+    }
+
+    #[test]
+    fn probe_isolation_accepts_a_group_led_by_the_probe_child() {
+        assert_probe_isolation(200, 200, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "must not leave its child in the caller's process group")]
+    fn probe_isolation_rejects_the_callers_group() {
+        assert_probe_isolation(100, 200, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "leader of a new process group")]
+    fn probe_isolation_rejects_a_group_the_probe_child_does_not_lead() {
+        assert_probe_isolation(300, 200, 100);
+    }
+
+    /// Kills the recorded probe tree on drop, so a failed assertion or wait does
+    /// not leak the fixture's long-running sleepers.
+    ///
+    /// Each process is signalled only while its exact identity (pid and start
+    /// identity) is still running, so a recycled pid is never signalled; the
+    /// check-then-kill gap is the only residual race. Signalling by pid never
+    /// reaches the test's own process group.
+    struct TreeGuard<'tree> {
+        inspector: HostInspector,
+        tree: &'tree RefCell<Vec<ProcessIdentity>>,
+    }
+
+    impl Drop for TreeGuard<'_> {
+        fn drop(&mut self) {
+            for identity in self.tree.borrow().iter() {
+                if !matches!(self.inspector.is_running(*identity), Ok(true)) {
+                    continue;
+                }
+                let Ok(pid) = i32::try_from(identity.pid) else {
+                    continue;
+                };
+                // SAFETY: the pid was observed as a member of the fixture's tree
+                // and its start identity was just re-verified.
+                #[expect(unsafe_code, reason = "cleanup of leaked test processes")]
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
     }
 
     #[test]
     fn hermes_version_probe_output_is_bounded() {
         let dir = temp_agents_dir();
         let hermes = dir.join("hermes");
-        write_test_executable(&hermes, "#!/bin/sh\nexec head -c 1048576 /dev/zero\n");
-        let started = Instant::now();
+        let marker = dir.join("writer-status.txt");
+        write_test_executable(
+            &hermes,
+            &format!(
+                "#!/bin/sh\n\
+                 head -c 1048576 /dev/zero\n\
+                 writer_status=$?\n\
+                 printf '%s' \"$writer_status\" > {marker}\n\
+                 exit \"$writer_status\"\n",
+                marker = marker.display(),
+            ),
+        );
 
-        assert!(run_hermes_version_probe(&hermes).is_none());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // The deadline is far beyond any plausible scheduling delay, so a
+        // `Failed` outcome can only come from the output limit terminating the
+        // writer, never from the probe's own timeout.
+        let outcome = probe_hermes_version(&hermes, HANG_GUARD, &[]);
+
+        assert!(matches!(outcome, ProbeOutcome::Failed), "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("writer status marker"),
+            (128 + libc::SIGXFSZ).to_string(),
+            "the writer must be terminated by SIGXFSZ at the output limit"
+        );
     }
 
     #[test]
