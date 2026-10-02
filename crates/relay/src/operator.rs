@@ -730,7 +730,7 @@ mod tests {
     fn credential_artifact_is_private_fsynced_and_never_overwritten() {
         use std::{fs, os::unix::fs::PermissionsExt};
 
-        let directory = tempfile::tempdir().expect("private output directory");
+        let directory = pohunek_test_support::tempdir().expect("private output directory");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("private output directory mode");
         let path = directory.path().join("service-credential.json");
@@ -760,7 +760,9 @@ mod tests {
             os::unix::fs::{symlink, PermissionsExt},
         };
 
-        let directory = tempfile::tempdir().expect("output directory");
+        let directory = pohunek_test_support::tempdir().expect("output directory");
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755))
+            .expect("public output directory");
         let expiry = OffsetDateTime::now_utc()
             .replace_nanosecond(0)
             .expect("whole-second expiry")
