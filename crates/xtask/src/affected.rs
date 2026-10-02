@@ -733,7 +733,9 @@ const GIT: &str = "git";
 /// VARIABLES" ("The Git Repository"). Git sets `GIT_DIR` and `GIT_INDEX_FILE`
 /// itself while it runs a hook, so a loop started from a hook would otherwise
 /// ask about the hook's repository instead of the workspace. The discovery
-/// limits (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) stay
+/// limits (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) and the
+/// variables that only shape a newly created repository or index
+/// (`GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT`, `GIT_INDEX_VERSION`) stay
 /// because the commands start at the workspace root itself, and the developer's
 /// configuration and identity variables stay because they are legitimate input.
 const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
@@ -744,6 +746,7 @@ const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
+    "GIT_REFERENCE_BACKEND",
 ];
 
 /// Builds a command for `program` that runs in `dir`; a Git command also drops
@@ -1249,10 +1252,11 @@ mod tests {
 
     /// Variables the child of the ambient-redirect test starts with: each
     /// points Git at a repository, index or worktree that does not exist.
-    const AMBIENT_GIT_VARS: [(&str, &str); 3] = [
+    const AMBIENT_GIT_VARS: [(&str, &str); 4] = [
         ("GIT_DIR", "/nonexistent/pohunek/.git"),
         ("GIT_WORK_TREE", "/nonexistent/pohunek"),
         ("GIT_INDEX_FILE", "/nonexistent/pohunek/index"),
+        ("GIT_REFERENCE_BACKEND", "bogus"),
     ];
 
     /// Child half of [`ambient_git_repository_variables_do_not_redirect_the_queries`].
