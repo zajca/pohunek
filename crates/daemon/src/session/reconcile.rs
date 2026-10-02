@@ -1903,7 +1903,7 @@ impl SessionRegistry {
         if let Some(outcome) = evidence.outcome {
             record.info.exit_code = outcome.exit_code;
             if outcome.output_forced_closed {
-                super::note_output_force_closed(&mut record.info.warnings);
+                super::note_output_force_closed(&mut record.info);
             }
             record.info.state = if stopped_by_intent {
                 SessionState::Stopped
@@ -2097,6 +2097,9 @@ impl SessionRegistry {
                 SessionState::Failed
             };
             record.info.state_source = StateSource::Process;
+            if exit.output_forced_closed {
+                super::note_output_force_closed(&mut record.info);
+            }
         }
         self.insert_unavailable_record(record, state, "worker_runtime_terminal")
             .await;
@@ -2715,7 +2718,7 @@ impl SessionRegistry {
                 terminal.info.state = SessionState::Stopped;
                 terminal.info.exit_code = exit.code;
                 if exit.output_forced_closed {
-                    super::note_output_force_closed(&mut terminal.info.warnings);
+                    super::note_output_force_closed(&mut terminal.info);
                 }
                 terminal
                     .info
@@ -5303,6 +5306,7 @@ while os.getppid() == parent:
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: created_at.clone(),
             updated_at: created_at,
@@ -6617,6 +6621,7 @@ while os.getppid() == parent:
                 branch: None,
                 worktree_path: None,
                 warnings: Vec::new(),
+                output_force_closed: false,
                 metadata: BTreeMap::new(),
                 created_at: created_at.clone(),
                 updated_at: created_at,
@@ -6942,6 +6947,40 @@ while os.getppid() == parent:
         assert_eq!(registry.list().await.len(), 1);
     }
 
+    /// A matching worker that already exited, restarted-over by the daemon:
+    /// the forced output close the worker recorded survives into the session.
+    #[tokio::test]
+    async fn an_exited_worker_import_carries_the_forced_output_close() {
+        for (output_forced_closed, expected) in [(true, true), (false, false)] {
+            let registry = SessionRegistry::new(SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                ..SessionRegistryConfig::default()
+            });
+            let mut snapshot = identity_snapshot("native-launch");
+            snapshot.phase = WorkerRuntimePhase::Exited;
+            snapshot.active_identity = None;
+            snapshot.exit = Some(pohunek_worker_protocol::ExitStatus {
+                code: None,
+                signal: Some(15),
+                stopped_by_user: true,
+                exited_at_ms: 1,
+                output_forced_closed,
+            });
+
+            registry
+                .import_ended_worker(identity_record(), &snapshot)
+                .await;
+
+            let info = registry
+                .inspect(&SessionId("s-identity".to_owned()))
+                .await
+                .expect("the imported session is listed");
+            assert_eq!(info.state, SessionState::Stopped);
+            assert_eq!(info.output_force_closed, expected);
+            assert!(info.warnings.is_empty());
+        }
+    }
+
     fn identity_snapshot(native_launch: &str) -> InspectSnapshot {
         InspectSnapshot {
             session_id: WorkerSessionId::new("s-identity").expect("session id"),
@@ -7058,6 +7097,7 @@ while os.getppid() == parent:
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: created_at.clone(),
             updated_at: created_at,

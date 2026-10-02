@@ -17,7 +17,7 @@ use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLaunc
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_test_support::wait::{guard, poll_until};
 use pohunek_test_support::worker_binary;
-use protocol::{RuntimeState, SessionNewParams, SessionState, SessionWarningKind};
+use protocol::{RuntimeState, SessionNewParams, SessionState};
 
 /// Stop grace short enough that both grace windows pass quickly; the stop is
 /// bounded by the hang guard, never by this value.
@@ -142,10 +142,12 @@ async fn a_forced_output_close_ends_the_session_with_the_root_exit() {
     let runtime = info.runtime.as_ref().expect("runtime");
     assert_eq!(runtime.state, RuntimeState::Terminal);
     assert!(
-        info.warnings
-            .iter()
-            .any(|warning| warning.kind == SessionWarningKind::OutputForceClosed),
-        "the forced close stays visible: {:?}",
+        info.output_force_closed,
+        "the forced close stays visible on the session"
+    );
+    assert!(
+        info.warnings.is_empty(),
+        "the forced close is no worktree-setup warning: {:?}",
         info.warnings
     );
     // The root was killed by the stop, so the exit is a signal death, not a

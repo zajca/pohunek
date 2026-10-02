@@ -760,25 +760,12 @@ impl ObservedExit {
     }
 }
 
-/// Adds the forced-output-close warning to `warnings` once.
+/// Marks a terminal session whose PTY output was force-closed.
 ///
-/// The warning rides on the terminal session so a client can tell that the
-/// final output was cut off even though the session ended with its exit.
-pub(super) fn note_output_force_closed(warnings: &mut Vec<protocol::SessionWarning>) {
-    if warnings
-        .iter()
-        .any(|warning| warning.kind == protocol::SessionWarningKind::OutputForceClosed)
-    {
-        return;
-    }
-    warnings.push(protocol::SessionWarning {
-        kind: protocol::SessionWarningKind::OutputForceClosed,
-        message: "the PTY output was force-closed after the stop deadline because a process \
-                  outside the session's process group kept the terminal open; output written \
-                  after the close is not retained"
-            .to_owned(),
-        detail: None,
-    });
+/// The flag rides on the session so a client can tell that the final output
+/// was cut off even though the session ended with its exit.
+pub(super) fn note_output_force_closed(info: &mut protocol::SessionInfo) {
+    info.output_force_closed = true;
 }
 
 /// Whether a removal may proceed when its marker sweep is unconfirmed only
@@ -915,7 +902,7 @@ fn exit_transition(
     candidate.observed_agents.clear();
     candidate.info.exit_code = exit.exit_code;
     if observed.output_forced_closed {
-        note_output_force_closed(&mut candidate.info.warnings);
+        note_output_force_closed(&mut candidate.info);
     }
     if let Some(runtime) = candidate.info.runtime.as_mut() {
         runtime.state = RuntimeState::Terminal;
@@ -4533,6 +4520,7 @@ fn external_session_info(
         branch: association.branch,
         worktree_path: association.worktree_path,
         warnings: Vec::new(),
+        output_force_closed: false,
         metadata: BTreeMap::new(),
         created_at: now.clone(),
         updated_at: now,
@@ -4699,6 +4687,7 @@ fn create_intent_record(
         worktree_path: None,
         metadata: params.metadata.clone(),
         warnings: Vec::new(),
+        output_force_closed: false,
         created_at: created_at.clone(),
         updated_at: created_at,
         exit_code: None,

@@ -320,6 +320,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             created_at: "2026-07-23T00:00:00Z".to_owned(),
             updated_at: "2026-07-23T00:00:00Z".to_owned(),
             exit_code: None,

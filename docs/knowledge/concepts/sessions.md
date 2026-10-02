@@ -296,7 +296,7 @@ A stop whose PTY output cannot drain still ends the session. When a process
 outside the session's process group (for example a `setsid` helper) keeps the
 terminal open past the stop deadline, the worker force-closes the output,
 reaps the root, and records the root's exit. The session reaches `stopped`
-with that exit and carries an `output_force_closed` warning, because output the
+with that exit and its session info has `output_force_closed` set to `true`, because output the
 helper wrote after the close is not retained. If the root's exit cannot be
 observed, nothing is invented and the stop fails.
 

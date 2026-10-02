@@ -2055,7 +2055,6 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
         SessionWarningKind::BaseBranchFallback => "base_branch_fallback",
         SessionWarningKind::SetupScript => "setup_script",
         SessionWarningKind::Hook => "hook",
-        SessionWarningKind::OutputForceClosed => "output_force_closed",
     }
 }
 
@@ -2099,6 +2098,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             created_at: "2026-06-17T10:00:00Z".to_owned(),
             updated_at: "2026-06-17T10:01:00Z".to_owned(),
             exit_code: None,
