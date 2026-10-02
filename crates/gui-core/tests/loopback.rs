@@ -21,7 +21,9 @@ use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::notifications::NotificationService;
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
-use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
+use pohunek_daemon::runtime::{
+    EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
+};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig};
 use pohunek_daemon::store::Store;
 use pohunek_gui_core::assistant::{self, AssistantPaths, Intent, LaunchParams};
@@ -414,6 +416,56 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
     )
     .await;
 
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_children_receive_the_fixture_environment_not_the_host_one() {
+    let _path_lock = PATH_LOCK.lock().await;
+    let bin_dir = temp_dir("gui-core-env-bin");
+    let record_dir = temp_dir("gui-core-env-record");
+    let env_out = record_dir.join("env.txt");
+    write_executable(
+        &bin_dir.join("codex"),
+        &environment_recorder_script(&env_out),
+    );
+    let _path = PathGuard::prepend(&bin_dir);
+
+    let daemon = LoopbackDaemon::spawn("env-scrub", "0.2.0-env-scrub").await;
+    let host = HostConfig::tcp("host-env-scrub", daemon.addr);
+    let created = no_origin::create_session(
+        &host,
+        SessionNewParams {
+            agent: agent_name(&AgentKind::Codex).to_owned(),
+            name: None,
+            cwd: Some(temp_dir("gui-core-env-cwd")),
+            cols: 100,
+            rows: 32,
+            project: None,
+            repo: None,
+            branch: None,
+            base_branch: None,
+            input: None,
+            metadata: std::collections::BTreeMap::new(),
+        },
+    )
+    .await
+    .expect("session.new through gui-core");
+
+    let recorded = wait_for_file(&env_out).await;
+    let fixture_home = TEST_ENV.with(|env| env.home().display().to_string());
+    assert!(
+        recorded
+            .lines()
+            .any(|line| line == format!("HOME={fixture_home}")),
+        "the child must see the fixture HOME, got:\n{recorded}"
+    );
+    assert!(
+        recorded.lines().any(|line| line == "SSH_AUTH_SOCK=<unset>"),
+        "the child must not see a host SSH agent socket, got:\n{recorded}"
+    );
+
+    stop_session(&host, &created.session.id).await;
     daemon.shutdown().await;
 }
 
@@ -1576,6 +1628,11 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
     let sleep_bin_dir = temp_dir("gui-core-review-dispatch-sleep-bin");
     write_executable(&sleep_bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
     let _sleep_path = PathGuard::prepend(&sleep_bin_dir);
+    // The recording directory is on `PATH` ahead of the plain one from the
+    // start, because the sessions' environment is fixed when the daemon is
+    // built. It holds no `codex` until the recording script is written below.
+    let record_bin_dir = temp_dir("gui-core-review-dispatch-record-bin");
+    let _record_path = PathGuard::prepend(&record_bin_dir);
 
     let daemon = LoopbackDaemon::spawn("review-dispatch", "0.1.0-review-dispatch").await;
     let host = HostConfig::tcp("host-review-dispatch", daemon.addr);
@@ -1596,14 +1653,12 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
     // Only now install the recording `codex` script, prepended in front of
     // the plain one above, so exactly one process — the one dispatch spawns
     // below — ever writes to `prompt_out`.
-    let record_bin_dir = temp_dir("gui-core-review-dispatch-record-bin");
     let record_dir = temp_dir("gui-core-review-dispatch-record");
     let prompt_out = record_dir.join("prompt.txt");
     write_executable(
         &record_bin_dir.join("codex"),
         &recording_script(&prompt_out),
     );
-    let _record_path = PathGuard::prepend(&record_bin_dir);
 
     set_session_metadata(
         &host,
@@ -2132,13 +2187,33 @@ fn worker_backed_registry(mut config: SessionRegistryConfig) -> SessionRegistry 
     };
     config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-    config.supervision = Some(worker_environment.supervision(worker_binary()));
+    config.supervision = Some(
+        worker_environment
+            .supervision(worker_binary())
+            .with_environment_source(hermetic_environment_source()),
+    );
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
     SessionRegistry::new_with_launcher_and_inspector(
         config,
         launcher,
         Arc::new(HostInspector::new()),
     )
+}
+
+/// The base environment session children receive: the test thread's scrubbed
+/// environment, with `PATH` taken from the process at call time.
+///
+/// Tests install their fake agent binaries by prepending to the process `PATH`
+/// (see [`PathGuard`]); every such guard must be in place before the registry
+/// is built, because the source is a snapshot. Every other variable comes from
+/// the fixture, so a child sees the fixture's `HOME` and none of the developer's
+/// session variables.
+fn hermetic_environment_source() -> EnvironmentSource {
+    let mut variables = TEST_ENV.with(|env| env.environment().clone());
+    if let Some(path) = std::env::var_os("PATH") {
+        variables.insert(OsString::from("PATH"), path);
+    }
+    EnvironmentSource::fixed(variables)
 }
 
 struct NotificationListErrorDaemon {
@@ -2843,6 +2918,21 @@ fn make_owner_private(dir: &Path) {
 
 #[cfg(not(unix))]
 fn make_owner_private(_dir: &Path) {}
+
+/// Builds an agent script that publishes the `HOME` and `SSH_AUTH_SOCK` it
+/// received to `env_out` (via a sibling `.partial` file renamed into place).
+fn environment_recorder_script(env_out: &Path) -> String {
+    let quote = |path: &Path| {
+        path.to_str()
+            .expect("UTF-8 script path")
+            .replace('\'', "'\\''")
+    };
+    let target = quote(env_out);
+    let partial = quote(&env_out.with_extension("partial"));
+    format!(
+        "#!/bin/sh\n{{ printf 'HOME=%s\\n' \"${{HOME-<unset>}}\"; printf 'SSH_AUTH_SOCK=%s\\n' \"${{SSH_AUTH_SOCK-<unset>}}\"; }} > '{partial}' && /bin/mv '{partial}' '{target}'\nexec /bin/sleep 30\n"
+    )
+}
 
 /// Returns a fake `codex` that records its first argument in `prompt_out`.
 ///
