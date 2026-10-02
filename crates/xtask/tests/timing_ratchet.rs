@@ -450,7 +450,7 @@ fn uses_only_tokio_instant(skeleton: &str) -> bool {
         let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
         let statement = &skeleton[at..end];
         if contains_word(statement, "Instant") || statement.contains("time::*") {
-            if contains_word(statement, "tokio") {
+            if imports_exactly_tokio_instant(statement) {
                 tokio = true;
             } else {
                 other = true;
@@ -464,6 +464,27 @@ fn uses_only_tokio_instant(skeleton: &str) -> bool {
         }
     }
     tokio && !other
+}
+
+/// Whether `statement` (a `use` up to its `;`) is `use tokio::time::Instant`
+/// or a single flat group `use tokio::time::{.., Instant, ..}`.
+///
+/// Any other shape that names `Instant`, such as a nested or mixed group or
+/// an alias, is not proven to import tokio's `Instant` and counts as another
+/// `Instant`.
+fn imports_exactly_tokio_instant(statement: &str) -> bool {
+    let squeezed: String = statement.chars().filter(|c| !c.is_whitespace()).collect();
+    let Some(path) = squeezed.strip_prefix("usetokio::time::") else {
+        return false;
+    };
+    if path == "Instant" {
+        return true;
+    }
+    path.strip_prefix('{')
+        .and_then(|group| group.strip_suffix('}'))
+        .is_some_and(|items| {
+            !items.contains(['{', '}', '*']) && items.split(',').any(|item| item == "Instant")
+        })
 }
 
 /// Whether an occurrence of `kind` waits on tokio's paused clock: only tokio
@@ -734,6 +755,9 @@ fn elapsed_in_a_paused_test_is_exempt_only_for_a_tokio_instant() {
         "use tokio::time::Instant;\nfn g() { std::time::Instant::now(); }\n".to_owned(),
         "use tokio::time::Instant;\nuse std::time;\nfn g() { time::Instant::now(); }\n".to_owned(),
         "use tokio::time::Duration;\n".to_owned(),
+        "use { std::time::{Duration, Instant}, tokio::sync::Mutex };\n".to_owned(),
+        "use tokio::{sync::Mutex, time::Duration};\nuse std::time::Instant;\n".to_owned(),
+        "use tokio::time::{Instant as Clock};\n".to_owned(),
     ];
     for prefix in counted {
         let scan = scan_one(DEMO, &format!("{prefix}{body}"));
