@@ -29,7 +29,6 @@ use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchCon
 use crate::external::{external_session_id, TranscriptIndex};
 use crate::integration::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
-    HOOK_TIMEOUT_SECS,
 };
 use crate::procwatch::readable_host::ReadableHost;
 use crate::procwatch::{
@@ -37,7 +36,7 @@ use crate::procwatch::{
 };
 use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
-use pohunek_test_support::wait::HANG_GUARD;
+use pohunek_test_support::wait::{guard, wait_until, HANG_GUARD};
 
 use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
@@ -155,6 +154,15 @@ macro_rules! native_report {
     };
 }
 
+/// Interactive shell for registries whose sessions run the default shell.
+///
+/// A fixed `/bin/sh` keeps the sessions independent of the host user's
+/// `$SHELL` and its startup files, whose background helpers can hold the PTY
+/// open past the stop deadline.
+fn hermetic_shell() -> ShellCommand {
+    ShellCommand::new("/bin/sh", std::iter::empty::<String>())
+}
+
 fn params() -> SessionNewParams {
     SessionNewParams {
         name: None,
@@ -231,6 +239,7 @@ fn production_registry_rejects_missing_durable_worker_backend() {
     assert_eq!(error.code, "worker_backend_required");
 
     let unsupervised = SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
         worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
         ..SessionRegistryConfig::default()
@@ -240,6 +249,7 @@ fn production_registry_rejects_missing_durable_worker_backend() {
     assert_eq!(error.code, "worker_backend_required");
 
     let configured = SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
         worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
         supervision: Some(production_supervision()),
@@ -254,6 +264,7 @@ fn registry_reports_the_active_supervision() {
     let supervision = production_supervision();
     let expected = supervision.worker_executable.clone();
     let supervised = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         supervision: Some(supervision),
         ..SessionRegistryConfig::default()
     });
@@ -268,6 +279,7 @@ fn registry_reports_the_active_supervision() {
 #[test]
 fn production_registry_rejects_invalid_observation_limits() {
     let config = SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
         worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
         supervision: Some(production_supervision()),
@@ -280,6 +292,7 @@ fn production_registry_rejects_invalid_observation_limits() {
 
     for config in [
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
             worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
             supervision: Some(production_supervision()),
@@ -289,6 +302,7 @@ fn production_registry_rejects_invalid_observation_limits() {
             ..SessionRegistryConfig::default()
         },
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             worker_runtime_root: Some(PathBuf::from("/run/user/1000/pohunek/workers")),
             worker_state_root: Some(PathBuf::from("/home/user/.local/state/pohunek/workers")),
             supervision: Some(production_supervision()),
@@ -483,14 +497,10 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
     )
     .expect("valid runtime identity");
 
-    let root_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !root_exited.exists() {
-        assert!(
-            tokio::time::Instant::now() < root_deadline,
-            "timed out waiting for root exit marker"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until("the root exit marker", || async {
+        root_exited.exists().then_some(())
+    })
+    .await;
     assert_eq!(
         registry
             .inspect(&created.id)
@@ -519,9 +529,8 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
     );
     fs::write(&release, b"release").expect("release descendant");
 
-    let output = tokio::time::timeout(Duration::from_secs(3), &mut output)
+    let output = guard("the descendant output page", &mut output)
         .await
-        .expect("descendant output deadline")
         .expect("public output page");
     let decoded = BASE64_STANDARD
         .decode(output.data_base64())
@@ -534,7 +543,7 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
     );
     assert_eq!(
         registry
-            .wait_for_exit(&created.id, Duration::from_secs(3))
+            .wait_for_exit(&created.id, HANG_GUARD)
             .await
             .expect("terminal session")
             .state,
@@ -578,19 +587,17 @@ async fn stop_after_root_exit_terminates_a_descendant_that_keeps_the_pty_open() 
         ..SessionRegistryConfig::default()
     });
     let created = registry.create(params()).await.expect("create session");
-    let root_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    while !root_exited.exists() {
-        assert!(
-            tokio::time::Instant::now() < root_deadline,
-            "timed out waiting for root exit"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until("the root exit marker", || async {
+        root_exited.exists().then_some(())
+    })
+    .await;
 
-    let stopped = tokio::time::timeout(Duration::from_secs(2), registry.stop(&created.id))
-        .await
-        .expect("bounded public stop deadline")
-        .expect("stop draining session");
+    let stopped = guard(
+        "the public stop of the draining session",
+        Box::pin(registry.stop(&created.id)),
+    )
+    .await
+    .expect("stop draining session");
     assert!(stopped.stopped);
     assert_eq!(
         registry
@@ -820,6 +827,21 @@ if reporter_pid != 0:
     raise SystemExit(0)
 
 pid = os.getpid()
+# The test releases each step after it observed the previous projection, so no
+# projected state depends on how long the test takes to look at it.
+gate = open(sys.argv[1], encoding="ascii")
+failure_path = sys.argv[1] + ".failure"
+
+def record_failure(kind, value, trace):
+    # The test reads this file, so the reporter never dies without a reason.
+    import traceback
+    with open(failure_path, "w", encoding="utf-8") as handle:
+        handle.write("".join(traceback.format_exception(kind, value, trace)))
+
+sys.excepthook = record_failure
+
+def wait_for_test():
+    gate.readline()
 
 def process_start_identity(pid):
     if sys.platform == "darwin":
@@ -844,7 +866,13 @@ def send(request):
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(os.environ["POHUNEK_WORKER_SOCKET_PATH"])
     client.sendall((json.dumps(request) + "\n").encode())
-    response = json.loads(client.recv(4096).splitlines()[0])
+    received = b""
+    while b"\n" not in received:
+        chunk = client.recv(4096)
+        if not chunk:
+            raise RuntimeError(f"worker closed the socket before a full response line: {received!r}")
+        received += chunk
+    response = json.loads(received.split(b"\n", 1)[0])
     client.close()
     return response["ok"] is True
 
@@ -872,7 +900,7 @@ duplicate = dict(report, native_reference="rejected-native")
 assert send(duplicate) is False
 stale = dict(report, sequence=sequence - 1, native_reference="rejected-stale")
 assert send(stale) is False
-time.sleep(1)
+wait_for_test()
 assert send({
     "type": "identity_release",
     "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
@@ -883,10 +911,10 @@ assert send({
 }) is True
 late_after_release = dict(report, sequence=sequence + 1, native_reference="rejected-after-release")
 assert send(late_after_release) is False
-time.sleep(1)
+wait_for_test()
 reasserted = dict(report, sequence=sequence + 2, native_reference="live-reasserted")
 assert send(reasserted) is True
-time.sleep(1)
+wait_for_test()
 assert send({
     "type": "identity_release",
     "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
@@ -904,15 +932,19 @@ async fn worker_identity_changes_project_live_into_the_logical_session() {
     let root = temp_dir("live-worker-identity-projection");
     let reporter = root.join("identity_reporter.py");
     std::fs::write(&reporter, LIVE_IDENTITY_REPORTER).expect("write identity reporter");
+    let gate_path = root.join("identity-steps.gate");
+    let mut gate = hook_gate(&gate_path);
     let agents_dir = temp_agents_dir_with(
         "live-worker-identity-projection",
         "identity-live",
         &format!(
-            "base = \"claude\"\nprogram = \"python3\"\nargs = [\"{}\"]\n",
-            reporter.display()
+            "base = \"claude\"\nprogram = \"python3\"\nargs = [\"{}\", \"{}\"]\n",
+            reporter.display(),
+            gate_path.display()
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
@@ -925,69 +957,76 @@ async fn worker_identity_changes_project_live_into_the_logical_session() {
         })
         .await
         .expect("create identity projection session");
+    // The reporter is not a recognizable agent process, so the session's live
+    // procwatch would clear the projected claim on its next tick and race the
+    // waits below. This test covers the worker-identity projection only.
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(&created.id)
+        .expect("created session entry")
+        .procwatch_cancel
+        .cancel();
 
-    let active_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let info = registry.inspect(&created.id).await.expect("inspect active");
-        if info.active_agent.as_deref() == Some("claude")
-            && info.active_agent_session_id.as_deref() == Some("live-native")
-        {
-            break;
+    // Each step of the reporter runs only after the test released it, so every
+    // projected state stays in place until the test observed it.
+    let assert_reporter_alive = || {
+        if let Ok(failure) = fs::read_to_string(format!("{}.failure", gate_path.display())) {
+            panic!("the identity reporter failed: {failure}");
         }
-        assert!(
-            tokio::time::Instant::now() < active_deadline,
-            "worker identity report was not projected: {info:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
+    wait_until("the worker identity report to be projected", || async {
+        assert_reporter_alive();
+        let info = registry.inspect(&created.id).await.expect("inspect active");
+        (info.active_agent.as_deref() == Some("claude")
+            && info.active_agent_session_id.as_deref() == Some("live-native"))
+        .then_some(())
+    })
+    .await;
 
-    let released_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
+    gate.write_all(b"release\n")
+        .expect("release the identity release step");
+    wait_until("the worker identity release to be projected", || async {
+        assert_reporter_alive();
         let info = registry
             .inspect(&created.id)
             .await
             .expect("inspect release");
-        if info.active_agent.is_none() && info.active_agent_session_id.is_none() {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < released_deadline,
-            "worker identity release was not projected: {info:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+        (info.active_agent.is_none() && info.active_agent_session_id.is_none()).then_some(())
+    })
+    .await;
 
-    let reasserted_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let info = registry
-            .inspect(&created.id)
-            .await
-            .expect("inspect reassertion");
-        if info.active_agent_session_id.as_deref() == Some("live-reasserted") {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < reasserted_deadline,
-            "higher-sequence worker identity was not reasserted: {info:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    gate.write_all(b"reassert\n")
+        .expect("release the identity reassertion step");
+    wait_until(
+        "the higher-sequence worker identity to be reasserted",
+        || async {
+            assert_reporter_alive();
+            let info = registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect reassertion");
+            (info.active_agent_session_id.as_deref() == Some("live-reasserted")).then_some(())
+        },
+    )
+    .await;
 
-    let final_release_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let info = registry
-            .inspect(&created.id)
-            .await
-            .expect("inspect final release");
-        if info.active_agent.is_none() {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < final_release_deadline,
-            "final worker identity release was not projected: {info:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    gate.write_all(b"final-release\n")
+        .expect("release the final identity release step");
+    wait_until(
+        "the final worker identity release to be projected",
+        || async {
+            assert_reporter_alive();
+            let info = registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect final release");
+            info.active_agent.is_none().then_some(())
+        },
+    )
+    .await;
 
     let _ = registry.stop(&created.id).await;
 }
@@ -1008,21 +1047,14 @@ async fn session_read_returns_visible_tail_and_truthful_source_fallbacks() {
         let id = created.id.clone();
         SessionReadParams::new(id, Some(source), lines, None).expect("valid read params")
     };
-    let visible_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let visible = loop {
+    let visible = wait_until("the shell output", || async {
         let visible = registry
             .session_read(&read(SessionReadSource::Visible, Some(2)))
             .await
             .expect("visible read");
-        if visible.text == "beta\ngamma" {
-            break visible;
-        }
-        assert!(
-            tokio::time::Instant::now() < visible_deadline,
-            "timed out waiting for the shell output: {visible:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+        (visible.text == "beta\ngamma").then_some(visible)
+    })
+    .await;
     assert_eq!(visible.text, "beta\ngamma");
     assert!(visible.truncated);
     assert_eq!(visible.source_used, SessionReadSource::Visible);
@@ -1091,21 +1123,14 @@ async fn session_read_preserves_alternate_screen_state_during_fallback() {
     )
     .expect("read params");
 
-    let read_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let result = loop {
+    let result = wait_until("the alternate-screen output", || async {
         let result = registry
             .session_read(&params)
             .await
             .expect("read alternate screen");
-        if result.alternate_screen && result.text == "TUI-one\nTUI-two" {
-            break result;
-        }
-        assert!(
-            tokio::time::Instant::now() < read_deadline,
-            "timed out waiting for alternate-screen output: {result:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+        (result.alternate_screen && result.text == "TUI-one\nTUI-two").then_some(result)
+    })
+    .await;
 
     assert_eq!(result.source_used, SessionReadSource::Visible);
     assert!(result.alternate_screen);
@@ -1278,37 +1303,31 @@ fn terminate_pid(pid: u32) {
 }
 
 async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
-    for _ in 0..500 {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if contents.contains(needle) {
-                return contents;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "timed out waiting for {} to contain {needle:?}",
-        path.display()
-    );
+    wait_until(
+        &format!("{} to contain {needle:?}", path.display()),
+        || async {
+            fs::read_to_string(path)
+                .ok()
+                .filter(|contents| contents.contains(needle))
+        },
+    )
+    .await
 }
 
 async fn wait_for_line_count(path: &std::path::Path, expected: usize) -> String {
-    for _ in 0..500 {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if contents.lines().count() >= expected {
-                return contents;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!(
-        "timed out waiting for {} to contain at least {expected} lines",
-        path.display()
-    );
+    wait_until(
+        &format!("{} to contain at least {expected} lines", path.display()),
+        || async {
+            fs::read_to_string(path)
+                .ok()
+                .filter(|contents| contents.lines().count() >= expected)
+        },
+    )
+    .await
 }
 
 async fn wait_for_resume_binding_removed(registry: &SessionRegistry, id: &SessionId) {
-    for _ in 0..500 {
+    wait_until(&format!("resume binding removal for {}", id.0), || async {
         let bindings = registry
             .inner
             .store
@@ -1316,12 +1335,12 @@ async fn wait_for_resume_binding_removed(registry: &SessionRegistry, id: &Sessio
             .expect("registry store")
             .load_resume()
             .expect("load resume bindings");
-        if bindings.iter().all(|binding| binding.session_id != id.0) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for resume binding removal for {}", id.0);
+        bindings
+            .iter()
+            .all(|binding| binding.session_id != id.0)
+            .then_some(())
+    })
+    .await;
 }
 
 fn transition(activity: AgentActivity) -> ActivityTransition {
@@ -2140,7 +2159,7 @@ fn pohunek_env_keys(env: &std::collections::HashMap<String, String>) -> Vec<Stri
 }
 
 async fn next_session_updated(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> SessionInfo {
-    let event = tokio::time::timeout(Duration::from_secs(1), async {
+    let event = guard("the session_updated event", async {
         loop {
             let event = rx.recv().await.expect("receive session event");
             if event.event() == protocol::event::SESSION_UPDATED {
@@ -2148,13 +2167,12 @@ async fn next_session_updated(rx: &mut tokio::sync::broadcast::Receiver<Event>) 
             }
         }
     })
-    .await
-    .expect("session_updated event");
+    .await;
     serde_json::from_value(event.payload()["session"].clone()).expect("session info payload")
 }
 
 async fn next_session_removed(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> SessionInfo {
-    let event = tokio::time::timeout(Duration::from_secs(1), async {
+    let event = guard("the session_removed event", async {
         loop {
             let event = rx.recv().await.expect("receive session event");
             if event.event() == protocol::event::SESSION_REMOVED {
@@ -2162,8 +2180,7 @@ async fn next_session_removed(rx: &mut tokio::sync::broadcast::Receiver<Event>) 
             }
         }
     })
-    .await
-    .expect("session_removed event");
+    .await;
     serde_json::from_value(event.payload()["session"].clone()).expect("session info payload")
 }
 
@@ -2173,19 +2190,14 @@ async fn wait_for_cwd_source(
     cwd: &std::path::Path,
     source: CwdSource,
 ) -> SessionInfo {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let info = registry.inspect(id).await.expect("inspect session");
-        if info.cwd == cwd && info.cwd_source == Some(source) {
-            return info;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for cwd {} from {source:?}",
-            cwd.display()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until(
+        &format!("cwd {} from {source:?}", cwd.display()),
+        || async {
+            let info = registry.inspect(id).await.expect("inspect session");
+            (info.cwd == cwd && info.cwd_source == Some(source)).then_some(info)
+        },
+    )
+    .await
 }
 
 /// Run git in `dir`, asserting success (test helper for the worktree path).
@@ -2646,6 +2658,7 @@ async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effe
             ),
         );
         let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             agents_dir: Some(agents_dir),
             store_path: Some(store_path.clone()),
             worktree_root: Some(worktree_root.clone()),
@@ -2706,6 +2719,7 @@ async fn failed_initial_input_rollback_frees_the_bound_worktree() {
     let store = temp_store_path("input-rollback");
     let worktree_root = store.parent().expect("store parent").join("worktrees");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         store_path: Some(store),
         worktree_root: Some(worktree_root.clone()),
         ..SessionRegistryConfig::default()
@@ -2763,6 +2777,7 @@ fn project_registry(tag: &str) -> (SessionRegistry, PathBuf) {
     let store = temp_store_path(tag);
     let worktree_root = store.parent().expect("store parent").join("worktrees");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         store_path: Some(store),
         worktree_root: Some(worktree_root),
         ..SessionRegistryConfig::default()
@@ -2781,6 +2796,7 @@ fn hint_registry(tag: &str) -> (SessionRegistry, PathBuf) {
     let worktree_root = store.parent().expect("store parent").join("worktrees");
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store),
             worktree_root: Some(worktree_root),
             ..SessionRegistryConfig::default()
@@ -3487,7 +3503,7 @@ async fn detects_successful_process_exit() {
 
     let created = registry.create(params()).await.expect("create session");
     let exit = registry
-        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
 
@@ -3735,6 +3751,7 @@ async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
                 ),
             );
         let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             config_dir: Some(config_dir),
             store_path: Some(store_path.clone()),
@@ -3771,7 +3788,7 @@ async fn session_stop_hook_reports_stopped_done_and_failed_reasons_once() {
             registry.stop(&created.id).await.expect("stop session");
         } else {
             registry
-                .wait_for_exit(&created.id, Duration::from_secs(2))
+                .wait_for_exit(&created.id, HANG_GUARD)
                 .await
                 .expect("session exits");
         }
@@ -4174,9 +4191,8 @@ async fn agent_state_hook_dispatcher_survives_lag_and_shutdown_cancellation() {
     wait_for_file_contains(&marker, "blocked").await;
 
     shutdown.cancel();
-    tokio::time::timeout(Duration::from_secs(1), handle)
+    guard("the dispatcher to join after cancellation", handle)
         .await
-        .expect("dispatcher joins after cancellation")
         .expect("dispatcher task succeeds");
 
     registry.stop(&created.id).await.expect("stop session");
@@ -4424,6 +4440,7 @@ async fn remove_refuses_a_conflicted_runtime_not_proven_to_be_its_own() {
 async fn delete_session_logs_removes_the_worker_log_family() {
     let log_dir = temp_dir("remove-worker-logs");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         log_dir: Some(log_dir.clone()),
         ..SessionRegistryConfig::default()
     });
@@ -4516,6 +4533,7 @@ async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
 #[tokio::test]
 async fn failed_attach_results_are_bounded_and_consumed_once() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         attach_result_capacity: 2,
         ..SessionRegistryConfig::default()
     });
@@ -4558,6 +4576,7 @@ async fn failed_attach_results_are_bounded_and_consumed_once() {
 #[tokio::test]
 async fn failed_attach_results_expire_before_lookup() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         attach_result_ttl: Duration::from_millis(1),
         ..SessionRegistryConfig::default()
     });
@@ -5098,6 +5117,7 @@ async fn session_input_wait_rejects_delayed_provider_framing_before_delivery() {
     )
     .expect("write Claude profile");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
@@ -5523,6 +5543,7 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
         "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
         claude_submit_delay: Duration::ZERO,
         stop_grace: Duration::from_millis(50),
@@ -5620,6 +5641,7 @@ async fn session_input_serializes_waited_transactions() {
         "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
         claude_submit_delay: Duration::ZERO,
         stop_grace: Duration::from_millis(50),
@@ -5690,6 +5712,7 @@ async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
         "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", 'while IFS= read -r line; do echo got:$line; done']\n",
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
         claude_submit_delay: Duration::ZERO,
         stop_grace: Duration::from_millis(50),
@@ -5758,6 +5781,7 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
         "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
         claude_submit_delay: Duration::ZERO,
         stop_grace: Duration::from_millis(50),
@@ -6043,22 +6067,14 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
     });
     let created = registry.create(params()).await.expect("create session");
 
-    // The hook interpreter starts under whatever load the host has, so the wait
-    // gets the budget the agent grants the hook, not a stricter literal.
-    let observed = tokio::time::timeout(Duration::from_secs(HOOK_TIMEOUT_SECS), async {
-        loop {
-            let info = registry
-                .inspect(&created.id)
-                .await
-                .expect("inspect session");
-            if let Some(subagent) = info.subagents.first() {
-                break subagent.clone();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    let observed = wait_until("the hook-reported subagent", || async {
+        let info = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session");
+        info.subagents.first().cloned()
     })
-    .await
-    .expect("hook observation deadline");
+    .await;
     assert_eq!(observed.id, "child-reconciled");
     assert_eq!(observed.lifecycle, SubagentLifecycle::Running);
 
@@ -6413,7 +6429,7 @@ async fn failed_worker_metadata_persistence_leaves_memory_retryable() {
             .map(|subagent| subagent.id.as_str()),
         Some("retry-child")
     );
-    let event = tokio::time::timeout(Duration::from_secs(1), async {
+    let event = guard("the subagent retry event", async {
         loop {
             let event = events.recv().await.expect("worker metadata event");
             if event.event() == protocol::event::SUBAGENT_STATE {
@@ -6421,8 +6437,7 @@ async fn failed_worker_metadata_persistence_leaves_memory_retryable() {
             }
         }
     })
-    .await
-    .expect("subagent retry event timeout");
+    .await;
     assert_eq!(event.event(), protocol::event::SUBAGENT_STATE);
     let _ = registry.stop(&created.id).await;
 }
@@ -6619,6 +6634,7 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
 async fn durable_launch_identity_survives_worker_metadata_rebase() {
     let store_path = temp_store_path("worker-launch-identity-rebase");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(temp_resumable_agents_dir("worker-launch-identity-rebase")),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
@@ -6904,6 +6920,7 @@ async fn natural_exit_keeps_an_authorized_attach_open_for_ordered_worker_close()
 async fn exit_transition_preserves_launch_identity_committed_ahead_of_memory() {
     let store_path = temp_store_path("worker-launch-identity-exit-race");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(temp_resumable_agents_dir(
             "worker-launch-identity-exit-race",
         )),
@@ -6990,6 +7007,7 @@ async fn exit_transition_preserves_launch_identity_committed_ahead_of_memory() {
 async fn lost_transition_preserves_worker_metadata_committed_ahead_of_memory() {
     let store_path = temp_store_path("worker-metadata-lost-race");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         agents_dir: Some(temp_resumable_agents_dir("worker-metadata-lost-race")),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
@@ -7658,14 +7676,17 @@ async fn wait_for_session_output(
     id: &SessionId,
     needles: &[&str],
 ) -> String {
-    for _ in 0..500 {
-        let output = read_session_output_after_rejection(registry, id).await;
-        if needles.iter().all(|needle| output.contains(needle)) {
-            return output;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for session output to contain {needles:?}");
+    wait_until(
+        &format!("session output to contain {needles:?}"),
+        || async {
+            let output = read_session_output_after_rejection(registry, id).await;
+            needles
+                .iter()
+                .all(|needle| output.contains(needle))
+                .then_some(output)
+        },
+    )
+    .await
 }
 
 fn observable_input_shell() -> ShellCommand {
@@ -7703,7 +7724,7 @@ async fn wait_for_session_waiters(
     session_id: &SessionId,
     expected: usize,
 ) {
-    for _ in 0..100 {
+    wait_until(&format!("{expected} session input waiters"), || async {
         let count = registry
             .inner
             .observation_session_waiters
@@ -7712,12 +7733,9 @@ async fn wait_for_session_waiters(
             .get(session_id)
             .copied()
             .unwrap_or_default();
-        if count == expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("timed out waiting for {expected} session input waiters");
+        (count == expected).then_some(())
+    })
+    .await;
 }
 
 #[test]
@@ -7814,6 +7832,7 @@ fn host_profile_launch_keeps_initial_input_for_pty_injection() {
 #[test]
 fn hook_env_injected_for_every_agent_kind_with_socket() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         socket_path: Some(PathBuf::from("/run/pohunek/daemon.sock")),
         ..SessionRegistryConfig::default()
     });
@@ -7852,6 +7871,7 @@ fn hook_env_absent_without_configured_socket() {
 #[test]
 fn session_pty_env_marks_session_id_for_every_agent_kind() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         socket_path: Some(PathBuf::from("/run/pohunek/daemon.sock")),
         ..SessionRegistryConfig::default()
     });
@@ -8677,9 +8697,11 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
         }),
     );
     rescan.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
-        .await
-        .expect("procwatch retires a reused root generation");
+    guard(
+        "procwatch to retire a reused root generation",
+        cancel.cancelled(),
+    )
+    .await;
 
     let inspected = registry
         .inspect(&created.id)
@@ -8871,6 +8893,7 @@ async fn mock_direct_codex_registry(
     );
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             procwatch_poll: Duration::from_mins(1),
             active_agent_claim_ttl: Duration::from_millis(50),
@@ -8895,14 +8918,11 @@ async fn wait_for_active_agent_pid(
     id: &SessionId,
     expected: Option<Pid>,
 ) -> SessionInfo {
-    for _ in 0..50 {
+    wait_until(&format!("active_agent_pid {expected:?}"), || async {
         let info = registry.inspect(id).await.expect("inspect session");
-        if info.active_agent_pid == expected {
-            return info;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("timed out waiting for active_agent_pid {expected:?}");
+        (info.active_agent_pid == expected).then_some(info)
+    })
+    .await
 }
 
 async fn report_release_matrix_agent(registry: &SessionRegistry, created: &SessionInfo) {
@@ -9258,6 +9278,7 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         },
@@ -9298,6 +9319,7 @@ async fn external_immediate_exit_is_published_after_creation() {
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         },
@@ -9313,14 +9335,12 @@ async fn external_immediate_exit_is_published_after_creation() {
         .rescan_external_agents(&TranscriptIndex::default())
         .await;
 
-    let created = tokio::time::timeout(Duration::from_secs(1), events.recv())
+    let created = guard("the created event", events.recv())
         .await
-        .expect("created event timeout")
         .expect("created event");
     assert_eq!(created.event(), protocol::event::SESSION_CREATED);
-    let removed = tokio::time::timeout(Duration::from_secs(1), events.recv())
+    let removed = guard("the removed event", events.recv())
         .await
-        .expect("removed event timeout")
         .expect("removed event");
     assert_eq!(removed.event(), protocol::event::SESSION_REMOVED);
     assert_eq!(
@@ -9339,6 +9359,7 @@ async fn external_rescan_discards_a_candidate_that_changes_generation_before_ups
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         },
@@ -9387,6 +9408,7 @@ async fn external_rescan_preserves_verified_entry_on_identity_inspection_failure
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         },
@@ -9426,6 +9448,7 @@ async fn session_read_rejects_external_observe_only_sessions() {
     let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
     let registry = SessionRegistry::new_with_inspector(
         SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             ..SessionRegistryConfig::default()
         },
@@ -9702,6 +9725,7 @@ async fn report_native_id_records_binding_and_updates_info() {
     let store_path = temp_store_path("report");
     let agents_dir = temp_resumable_agents_dir("report");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -9757,6 +9781,7 @@ async fn report_native_id_records_binding_and_updates_info() {
 async fn concurrent_session_writes_cannot_regress_native_ordering() {
     let store_path = temp_store_path("native-ordering-concurrent");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(temp_resumable_agents_dir("native-ordering-concurrent")),
@@ -9940,6 +9965,7 @@ fn assert_previous_runtime_cannot_overwrite(
 async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
     let store_path = temp_store_path("runtime-commit-race");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         ..SessionRegistryConfig::default()
@@ -10003,9 +10029,8 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
         outcomes => panic!("exactly one runtime commit must win: {outcomes:?}"),
     };
     assert_runtime_commit_winner(&registry, &store, &created.id, &winner).await;
-    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+    let event = guard("the winner event", events.recv())
         .await
-        .expect("winner event timeout")
         .expect("winner event");
     assert_eq!(event.event(), protocol::event::SESSION_UPDATED);
     assert!(
@@ -10110,6 +10135,7 @@ async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
 #[tokio::test]
 async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("reconnect-identity-mismatch")),
         ..SessionRegistryConfig::default()
@@ -10170,6 +10196,7 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
 #[tokio::test]
 async fn reconnect_persistence_failure_retries_without_orphaning_live_handle() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("reconnect-persist-retry")),
         ..SessionRegistryConfig::default()
@@ -10250,6 +10277,7 @@ const UNANSWERED_RECONNECT_BOUND: Duration = Duration::from_secs(20);
 #[tokio::test]
 async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("reconnect-unanswered")),
         ..SessionRegistryConfig::default()
@@ -10316,6 +10344,7 @@ async fn reconnect_classifies_a_worker_socket_that_accepts_and_never_answers() {
 #[tokio::test]
 async fn lost_transition_retries_precommit_failure_before_single_event() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("lost-persist-retry")),
         ..SessionRegistryConfig::default()
@@ -10386,6 +10415,7 @@ async fn lost_transition_retries_precommit_failure_before_single_event() {
 #[tokio::test]
 async fn exit_transition_retries_precommit_failure_before_single_event() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("exit-persist-retry")),
         ..SessionRegistryConfig::default()
@@ -10436,6 +10466,7 @@ async fn exit_transition_retries_precommit_failure_before_single_event() {
 #[tokio::test]
 async fn stop_retries_terminal_write_failure_before_canceling_watcher() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("stop-terminal-persist-retry")),
         ..SessionRegistryConfig::default()
@@ -10475,6 +10506,7 @@ async fn stop_retries_terminal_write_failure_before_canceling_watcher() {
 async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
     let store_path = temp_store_path("exit-after-uncaptured-resize");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         ..SessionRegistryConfig::default()
@@ -10521,21 +10553,15 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
 
     stop_test_worker(worker).await;
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let state = registry
-                .inspect(&created.id)
-                .await
-                .expect("inspect exited session")
-                .state;
-            if state.is_terminal() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+    wait_until("the exit watcher terminal commit", || async {
+        let state = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect exited session")
+            .state;
+        state.is_terminal().then_some(())
     })
-    .await
-    .expect("exit watcher terminal commit");
+    .await;
     let durable = store
         .load_sessions()
         .expect("load terminal session")
@@ -10841,6 +10867,7 @@ async fn report_native_id_ignores_reports_from_a_different_agent_base() {
     let store_path = temp_store_path("report-agent-mismatch");
     let agents_dir = temp_resumable_agents_dir("report-agent-mismatch");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -10901,6 +10928,7 @@ async fn report_native_id_ignores_reports_from_a_different_agent_base() {
 async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
     let agents_dir = temp_resumable_agents_dir("report-ordered-claims");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
@@ -11039,60 +11067,47 @@ fn temp_resumable_agents_dir(tag: &str) -> PathBuf {
     )
 }
 
+/// Resumable agent whose first run stays alive until the returned gate is
+/// written, and whose `--resume` run stays alive for the whole test.
+///
+/// The test decides when the first runtime ends (one line on the gate per
+/// running agent), so the exit never races a fixed agent lifetime against
+/// session creation and native-id capture. The gate handle must outlive the
+/// agents: dropping it releases every waiting agent. Each run appends its argv
+/// to `marker`.
 #[cfg(unix)]
-fn temp_agent_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> PathBuf {
+fn temp_agent_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> (PathBuf, fs::File) {
     let runtime = temp_dir(&format!("{tag}-runtime"));
     let script = runtime.join("resume-agent");
-    write_executable(
-            &script,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) sleep 0.2; exit 0 ;; esac\n",
-                marker.display()
-            ),
-        );
-    temp_agents_dir_with(
-        tag,
-        "resumable",
-        &format!(
-            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
-            script.display()
-        ),
-    )
-}
-
-/// Like [`temp_agent_that_exits_then_resumes`], but the first run stays alive
-/// until `exit_gate` (see [`hook_gate`]) is written, so the test decides when
-/// the runtime ends instead of racing a fixed lifetime against session creation.
-#[cfg(unix)]
-fn temp_agent_that_exits_when_released(
-    tag: &str,
-    marker: &std::path::Path,
-    exit_gate: &std::path::Path,
-) -> PathBuf {
-    let runtime = temp_dir(&format!("{tag}-runtime"));
-    let script = runtime.join("resume-agent");
+    let gate_path = runtime.join("exit.gate");
+    let gate = hook_gate(&gate_path);
     write_executable(
         &script,
         &format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
             marker.display(),
-            exit_gate.display(),
+            gate_path.display(),
         ),
     );
-    temp_agents_dir_with(
+    let agents_dir = temp_agents_dir_with(
         tag,
         "resumable",
         &format!(
             "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
             script.display()
         ),
-    )
+    );
+    (agents_dir, gate)
 }
 
 #[cfg(unix)]
-fn temp_hermes_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> (PathBuf, PathBuf) {
+fn temp_hermes_that_exits_then_resumes(
+    tag: &str,
+    marker: &std::path::Path,
+) -> (PathBuf, PathBuf, fs::File) {
     let runtime = temp_dir(&format!("{tag}-runtime"));
     let script = runtime.join("hermes");
+    let gate = hook_gate(&runtime.join(HERMES_EXIT_GATE));
     write_hermes_resume_executable(&script, marker, "Hermes Agent v0.20.0");
     let agents = temp_agents_dir_with(
         tag,
@@ -11102,20 +11117,33 @@ fn temp_hermes_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> (
             script.display()
         ),
     );
-    (agents, script)
+    (agents, script, gate)
 }
 
+/// Name of the FIFO, beside the Hermes test executable, that releases the first
+/// run's exit (see [`temp_agent_that_exits_then_resumes`]).
+#[cfg(unix)]
+const HERMES_EXIT_GATE: &str = "exit.gate";
+
+/// Writes the Hermes test executable: `--version` reports `version_output`, the
+/// first run waits for one line on the [`HERMES_EXIT_GATE`] FIFO beside it, and
+/// `--resume` runs stay alive.
 #[cfg(unix)]
 fn write_hermes_resume_executable(
     script: &std::path::Path,
     marker: &std::path::Path,
     version_output: &str,
 ) {
+    let gate = script
+        .parent()
+        .expect("script directory")
+        .join(HERMES_EXIT_GATE);
     write_executable(
         script,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{version_output}'\n  exit 0\nfi\nprintf '<%s>\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) sleep 0.2; exit 0 ;; esac\n",
-            marker.display()
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  printf '%s\\n' '{version_output}'\n  exit 0\nfi\nprintf '<%s>\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            marker.display(),
+            gate.display(),
         ),
     );
 }
@@ -11150,6 +11178,7 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
@@ -11251,6 +11280,7 @@ async fn fork_codex_session_reports_agent_fork_unsupported() {
         &format!("base = \"codex\"\nprogram = \"{}\"\n", script.display()),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
@@ -11298,6 +11328,7 @@ async fn fork_hermes_session_is_rejected_before_child_side_effects() {
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
@@ -11348,6 +11379,7 @@ async fn fork_only_claude_profile_records_its_required_native_reference() {
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         store_path: Some(store_path.clone()),
@@ -11410,6 +11442,7 @@ async fn fork_disable_is_frozen_across_profile_removal() {
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir.clone()),
         ..SessionRegistryConfig::default()
@@ -11453,6 +11486,7 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
             "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[resume]\nref_kind = \"path\"\n",
         );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -11530,6 +11564,7 @@ async fn non_resumable_profile_ignores_native_id_reports() {
             "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[resume]\nresumable = false\n",
         );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -11615,6 +11650,7 @@ async fn resume_binding_never_persists_profile_env_secrets() {
             "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[env]\nSECRET_TOKEN = \"supersecretvalue\"\n",
         );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -11653,6 +11689,7 @@ async fn stopping_a_session_drops_its_resume_binding() {
     let store_path = temp_store_path("drop-on-stop");
     let agents_dir = temp_resumable_agents_dir("drop-on-stop");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -11699,6 +11736,7 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
     let store_path = temp_store_path("shutdown-keeps-binding");
     let agents_dir = temp_resumable_agents_dir("shutdown-keeps-binding");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -11768,8 +11806,9 @@ async fn legacy_harness_exit_during_daemon_shutdown_keeps_recovery_binding() {
 async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_is_idempotent() {
     let store_path = temp_store_path("manual-resume");
     let marker = temp_dir("manual-resume-marker").join("argv.txt");
-    let agents_dir = temp_agent_that_exits_then_resumes("manual-resume", &marker);
+    let (agents_dir, mut exit_gate) = temp_agent_that_exits_then_resumes("manual-resume", &marker);
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path),
         agents_dir: Some(agents_dir),
@@ -11790,9 +11829,12 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         ))
         .await;
     assert!(recorded.recorded, "native id captured");
+    exit_gate
+        .write_all(b"go\n")
+        .expect("release the agent exit gate");
 
     let done = registry
-        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
     assert_eq!(done.state, SessionState::Done);
@@ -11844,7 +11886,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         "resume argv must target the captured native id: {argv:?}"
     );
 
-    let event = tokio::time::timeout(Duration::from_secs(1), async {
+    let event = guard("the session_native_recovered event", async {
         loop {
             let event = events.recv().await.expect("receive recovery event");
             if event.event() == protocol::event::SESSION_NATIVE_RECOVERED {
@@ -11852,8 +11894,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
             }
         }
     })
-    .await
-    .expect("session_native_recovered event");
+    .await;
     let recovered_event: SessionNativeRecoveredEvent =
         serde_json::from_value(event.payload().clone()).expect("recovery event payload");
     assert_eq!(recovered_event.session.id, created.id);
@@ -11895,8 +11936,10 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
 #[tokio::test]
 async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation() {
     let marker = temp_dir("hermes-resume-marker").join("argv.txt");
-    let (agents_dir, _script) = temp_hermes_that_exits_then_resumes("hermes-resume", &marker);
+    let (agents_dir, _script, mut exit_gate) =
+        temp_hermes_that_exits_then_resumes("hermes-resume", &marker);
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("hermes-resume")),
         agents_dir: Some(agents_dir),
@@ -11921,8 +11964,11 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
             .await
             .recorded
     );
+    exit_gate
+        .write_all(b"go\n")
+        .expect("release the Hermes exit gate");
     let terminal = registry
-        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("fresh Hermes process exits");
     let initial_generation = terminal
@@ -11963,9 +12009,11 @@ async fn hermes_resume_reuses_logical_session_with_exact_argv_and_new_generation
 #[tokio::test]
 async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
     let marker = temp_dir("hermes-policy-resume-marker").join("argv.txt");
-    let (agents_dir, script) = temp_hermes_that_exits_then_resumes("hermes-policy-resume", &marker);
+    let (agents_dir, script, mut exit_gate) =
+        temp_hermes_that_exits_then_resumes("hermes-policy-resume", &marker);
     let store_path = temp_store_path("hermes-policy-resume");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -11989,8 +12037,11 @@ async fn incompatible_hermes_resume_has_no_runtime_or_store_side_effects() {
             .await
             .recorded
     );
+    exit_gate
+        .write_all(b"go\n")
+        .expect("release the Hermes exit gate");
     let terminal = registry
-        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("fresh Hermes process exits");
     wait_for_resume_binding_removed(&registry, &created.id).await;
@@ -12032,6 +12083,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
     let sentinel = b"store must not be read or rewritten\n";
     fs::write(&store_path, sentinel).expect("seed untouched store sentinel");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         store_path: Some(store_path.clone()),
         ..SessionRegistryConfig::default()
     });
@@ -12093,8 +12145,10 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
 #[tokio::test]
 async fn hermes_resume_without_native_reference_fails_before_relaunch() {
     let marker = temp_dir("hermes-no-reference-marker").join("argv.txt");
-    let (agents_dir, _script) = temp_hermes_that_exits_then_resumes("hermes-no-reference", &marker);
+    let (agents_dir, _script, mut exit_gate) =
+        temp_hermes_that_exits_then_resumes("hermes-no-reference", &marker);
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
@@ -12106,8 +12160,11 @@ async fn hermes_resume_without_native_reference_fails_before_relaunch() {
         })
         .await
         .expect("create Hermes session");
+    exit_gate
+        .write_all(b"go\n")
+        .expect("release the Hermes exit gate");
     registry
-        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("fresh Hermes process exits");
     let before = fs::read_to_string(&marker).expect("fresh argv marker");
@@ -12128,12 +12185,10 @@ async fn hermes_resume_without_native_reference_fails_before_relaunch() {
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_native_recovery_accepts_terminal_runtime() {
-    let marker_dir = temp_dir("terminal-recovery-marker");
-    let marker = marker_dir.join("argv.txt");
-    let gate_path = marker_dir.join("exit.gate");
-    let mut gate = hook_gate(&gate_path);
-    let agents_dir = temp_agent_that_exits_when_released("terminal-recovery", &marker, &gate_path);
+    let marker = temp_dir("terminal-recovery-marker").join("argv.txt");
+    let (agents_dir, mut gate) = temp_agent_that_exits_then_resumes("terminal-recovery", &marker);
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
@@ -12182,6 +12237,7 @@ async fn explicit_native_recovery_accepts_terminal_runtime() {
 async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
     let agents_dir = temp_resumable_agents_dir("recovery-preconditions");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
@@ -12260,6 +12316,7 @@ async fn resize_after_capture_updates_persisted_binding() {
     let store_path = temp_store_path("resize-binding");
     let agents_dir = temp_resumable_agents_dir("resize-binding");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -12317,6 +12374,7 @@ async fn set_metadata_after_capture_updates_persisted_binding() {
     let store_path = temp_store_path("metadata-binding");
     let agents_dir = temp_resumable_agents_dir("metadata-binding");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -12396,6 +12454,7 @@ async fn resume_binding_restores_metadata_from_store() {
         .next()
         .expect("one binding");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path),
         ..SessionRegistryConfig::default()
@@ -12468,6 +12527,7 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         ),
     );
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir.clone()),
@@ -12519,6 +12579,7 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
     .expect("edit profile");
 
     let restarted = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path),
         agents_dir: Some(agents_dir),
@@ -12558,6 +12619,7 @@ async fn resume_binding_persists_project_context_for_restart() {
     let worktree_root = store.parent().expect("store parent").join("worktrees");
     let agents_dir = temp_resumable_agents_dir("resume-project-ctx");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         store_path: Some(store),
         worktree_root: Some(worktree_root),
         agents_dir: Some(agents_dir),
@@ -12609,6 +12671,7 @@ async fn concurrent_resize_and_recapture_keep_store_consistent_with_memory() {
     let store_path = temp_store_path("concurrent-persist");
     let agents_dir = temp_resumable_agents_dir("concurrent-persist");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -12678,6 +12741,7 @@ async fn resize_then_stop_leaves_no_binding() {
     let store_path = temp_store_path("resize-then-stop");
     let agents_dir = temp_resumable_agents_dir("resize-then-stop");
     let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(store_path.clone()),
         agents_dir: Some(agents_dir),
@@ -12773,6 +12837,7 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
 #[test]
 fn claude_input_rules_use_configured_submit_delay() {
     let config = SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         claude_submit_delay: Duration::from_millis(75),
         ..SessionRegistryConfig::default()
     };
@@ -13395,7 +13460,7 @@ async fn exited_session(registry: &SessionRegistry, repo: Option<&PathBuf>) -> S
     };
     let created = registry.create(create).await.expect("create session");
     registry
-        .wait_for_exit(&created.id, Duration::from_secs(10))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits")
 }
@@ -14261,8 +14326,8 @@ fn stored_record(store_path: &std::path::Path, id: &SessionId) -> crate::store::
         .expect("session record")
 }
 
-/// Bound on waiting for a detached registration to commit.
-const DETACHED_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on waiting for a detached registration to commit: a hang guard.
+const DETACHED_COMMIT_TIMEOUT: Duration = HANG_GUARD;
 
 #[tokio::test]
 async fn create_persists_the_generation_before_starting_its_job() {
@@ -14361,6 +14426,7 @@ async fn dropping_create_after_start_still_converges_to_one_generation() {
 async fn unavailable_supervision_during_create_leaves_a_reconnecting_session() {
     let store_path = temp_store_path("lifecycle-unavailable");
     let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         store_path: Some(store_path.clone()),
         ..SessionRegistryConfig::default()
     });
@@ -14949,6 +15015,7 @@ fn exiting_worker_registry(
 ) {
     let store_path = temp_store_path(tag);
     let mut config = SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         store_path: Some(store_path.clone()),
         worker_connect_deadline: NEVER,
         create_drain_timeout: NEVER,
@@ -15055,6 +15122,7 @@ async fn create_refuses_a_worker_socket_that_cannot_be_bound_before_writing_anyt
     let runtime_root =
         base.join("p".repeat(limit - base.as_os_str().len() - published_tail.len() - 1));
     let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         store_path: Some(store_path.clone()),
         worker_runtime_root: Some(runtime_root.clone()),
         ..SessionRegistryConfig::default()
@@ -16021,42 +16089,30 @@ async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
         let journal_dir = root.join("s/pohunek/workers").join(session_id.0.clone());
         let session = session_id.0.clone();
         async move {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-            loop {
-                let initialized = std::fs::read_dir(&journal_dir)
-                    .ok()
-                    .and_then(|entries| {
-                        entries.flatten().find_map(|entry| {
-                            let journal: Option<serde_json::Value> =
-                                std::fs::read_to_string(entry.path())
-                                    .ok()
-                                    .and_then(|text| serde_json::from_str(&text).ok());
-                            let named = journal
-                                .as_ref()
-                                .and_then(|journal| journal.get("runtime_id"))
-                                .is_some_and(serde_json::Value::is_string);
-                            named.then_some(())
-                        })
+            wait_until("the worker to journal its runtime", || async {
+                std::fs::read_dir(&journal_dir).ok().and_then(|entries| {
+                    entries.flatten().find_map(|entry| {
+                        let journal: Option<serde_json::Value> =
+                            std::fs::read_to_string(entry.path())
+                                .ok()
+                                .and_then(|text| serde_json::from_str(&text).ok());
+                        let named = journal
+                            .as_ref()
+                            .and_then(|journal| journal.get("runtime_id"))
+                            .is_some_and(serde_json::Value::is_string);
+                        named.then_some(())
                     })
-                    .is_some();
-                if initialized {
-                    tokio::time::sleep(COMMIT_FAILURE_KILL_DELAY).await;
-                    let _ = launcher.kill_worker(&session).await;
-                    return;
-                }
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the worker never journaled its runtime"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+                })
+            })
+            .await;
+            tokio::time::sleep(COMMIT_FAILURE_KILL_DELAY).await;
+            let _ = launcher.kill_worker(&session).await;
         }
     });
     gate.release.notify_one();
 
-    let error = tokio::time::timeout(Duration::from_secs(20), creating)
+    let error = guard("the create to finish", creating)
         .await
-        .expect("create finishes")
         .expect("create task joins")
         .expect_err("the registration cannot commit");
     kill.await.expect("kill task");
@@ -16101,7 +16157,10 @@ async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
     let _ = fs::remove_dir_all(&root);
 }
 
-async fn terminal_resumable_session(registry: &SessionRegistry) -> SessionInfo {
+async fn terminal_resumable_session(
+    registry: &SessionRegistry,
+    exit_gate: &mut fs::File,
+) -> SessionInfo {
     let created = registry
         .create(resumable_params())
         .await
@@ -16115,8 +16174,11 @@ async fn terminal_resumable_session(registry: &SessionRegistry) -> SessionInfo {
         ))
         .await;
     assert!(recorded.recorded, "native id captured");
+    exit_gate
+        .write_all(b"go\n")
+        .expect("release the agent exit gate");
     let done = registry
-        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
     assert_eq!(done.state, SessionState::Done);
@@ -16126,17 +16188,17 @@ async fn terminal_resumable_session(registry: &SessionRegistry) -> SessionInfo {
 #[tokio::test]
 async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
     let marker = temp_dir("lifecycle-concurrent-resume-marker").join("argv.txt");
+    let (agents_dir, mut exit_gate) =
+        temp_agent_that_exits_then_resumes("lifecycle-concurrent-resume", &marker);
     let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("lifecycle-concurrent-resume")),
-        agents_dir: Some(temp_agent_that_exits_then_resumes(
-            "lifecycle-concurrent-resume",
-            &marker,
-        )),
+        agents_dir: Some(agents_dir),
         socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
         ..SessionRegistryConfig::default()
     });
-    let done = terminal_resumable_session(&registry).await;
+    let done = terminal_resumable_session(&registry, &mut exit_gate).await;
     let [first_job] = supervisor.started().try_into().expect("one created job");
 
     let (left, right) = tokio::join!(registry.resume(&done.id), registry.resume(&done.id));
@@ -16173,18 +16235,18 @@ async fn concurrent_recoveries_of_one_session_start_exactly_one_generation() {
 #[tokio::test]
 async fn recoveries_of_different_sessions_are_not_serialized() {
     let marker = temp_dir("lifecycle-parallel-resume-marker").join("argv.txt");
+    let (agents_dir, mut exit_gate) =
+        temp_agent_that_exits_then_resumes("lifecycle-parallel-resume", &marker);
     let (registry, supervisor) = scripted_registry(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
         stop_grace: Duration::from_millis(50),
         store_path: Some(temp_store_path("lifecycle-parallel-resume")),
-        agents_dir: Some(temp_agent_that_exits_then_resumes(
-            "lifecycle-parallel-resume",
-            &marker,
-        )),
+        agents_dir: Some(agents_dir),
         socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
         ..SessionRegistryConfig::default()
     });
-    let held = terminal_resumable_session(&registry).await;
-    let free = terminal_resumable_session(&registry).await;
+    let held = terminal_resumable_session(&registry, &mut exit_gate).await;
+    let free = terminal_resumable_session(&registry, &mut exit_gate).await;
     let gate = crate::runtime::lifecycle::tests::StartGate {
         session_id: Some(held.id.0.clone()),
         entered: Arc::new(tokio::sync::Notify::new()),
