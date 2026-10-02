@@ -33,6 +33,10 @@
 //! [`time::TIMER_TICK`], which let a test on tokio's paused clock await real
 //! I/O without the clock racing ahead of it.
 //!
+//! The [`mod@fs`] module holds [`fs::write_executable`] and [`fs::write_file`],
+//! which write fixture files through a child process so that no write
+//! descriptor in this process can make a later `exec` fail with `ETXTBSY`.
+//!
 //! This crate is a development dependency only; production code never picks
 //! its paths from here.
 //!
@@ -47,6 +51,7 @@
 // Rust guideline compliant 2026-10-02
 
 pub mod env;
+pub mod fs;
 pub mod time;
 pub mod wait;
 
