@@ -2,11 +2,11 @@
 
 use ed25519_dalek::SigningKey;
 use pohunek_relay::recovery::{DenyIncident, WitnessEvent, WitnessStore};
+use pohunek_test_support::tempdir;
 use std::{
     os::unix::fs::PermissionsExt as _,
     sync::{Arc, Barrier},
 };
-use tempfile::tempdir;
 
 fn witness() -> (tempfile::TempDir, WitnessStore) {
     let directory = tempdir().expect("temporary witness directory");

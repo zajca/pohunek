@@ -2759,7 +2759,7 @@ mod tests {
 
     /// Opens an authority whose fence is never renewed, for tests that let it lapse.
     async fn unrenewed_authority(store: Store, limits: AuthorityLimits) -> (Authority, TempDir) {
-        let directory = tempfile::tempdir().expect("create witness directory");
+        let directory = pohunek_test_support::tempdir().expect("create witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make witness directory private");
         let witness = Arc::new(

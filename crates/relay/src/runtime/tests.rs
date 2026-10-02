@@ -40,7 +40,7 @@ impl Fixture {
             .await
             .expect("scoped pool");
         store.migrate().await.expect("embedded migrations");
-        let directory = tempfile::tempdir().expect("witness directory");
+        let directory = pohunek_test_support::tempdir().expect("witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private directory");
         let witness = Arc::new(

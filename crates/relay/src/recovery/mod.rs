@@ -1155,7 +1155,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use ed25519_dalek::SigningKey;
-    use tempfile::tempdir;
+    use pohunek_test_support::tempdir;
 
     use super::{DenyIncident, RecoveryError, WitnessStore, MAX_REVIEW_INCIDENTS};
 

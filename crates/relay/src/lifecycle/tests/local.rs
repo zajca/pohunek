@@ -116,7 +116,7 @@ async fn foundation_fixture() -> (
         .migrate_to_for_test(1)
         .await
         .expect("apply foundation prefix");
-    let directory = tempfile::tempdir().expect("witness directory");
+    let directory = pohunek_test_support::tempdir().expect("witness directory");
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
         .expect("private witness directory");
     let witness = Arc::new(
@@ -253,7 +253,7 @@ async fn bootstrap_commitment_is_keyed_redacted_and_exactly_replayable() {
             .bootstrap_commitment(&canonical)
             .expect("derive exact commitment")
     );
-    let other_directory = tempfile::tempdir().expect("independent witness directory");
+    let other_directory = pohunek_test_support::tempdir().expect("independent witness directory");
     std::fs::set_permissions(
         other_directory.path(),
         std::fs::Permissions::from_mode(0o700),

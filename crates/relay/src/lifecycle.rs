@@ -1372,7 +1372,7 @@ mod tests {
             .await
             .expect("connect scoped schema");
         store.migrate().await.expect("apply embedded migrations");
-        let directory = tempfile::tempdir().expect("witness directory");
+        let directory = pohunek_test_support::tempdir().expect("witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private witness directory");
         let witness = Arc::new(

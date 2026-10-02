@@ -782,7 +782,7 @@ pub(crate) mod tests {
     use super::{exact_https, issuer_https, require_private_file};
 
     pub(crate) fn config_fixture() -> (tempfile::TempDir, std::path::PathBuf, String) {
-        let directory = tempfile::tempdir().expect("configuration fixture");
+        let directory = pohunek_test_support::tempdir().expect("configuration fixture");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("private directory");
         let key = directory.path().join("fixture-key");
@@ -1116,7 +1116,7 @@ max_evidence_bytes = 16384
 
     #[test]
     fn private_file_rejects_a_symlink_after_opening_by_descriptor() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = pohunek_test_support::tempdir().expect("temporary directory");
         let target = directory.path().join("target");
         fs::write(&target, "private").expect("target contents");
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
@@ -1129,7 +1129,7 @@ max_evidence_bytes = 16384
 
     #[test]
     fn private_file_requires_owner_only_permissions() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = pohunek_test_support::tempdir().expect("temporary directory");
         let path = directory.path().join("public");
         fs::write(&path, "not private").expect("file contents");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("file permissions");

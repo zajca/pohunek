@@ -3110,7 +3110,7 @@ pub(crate) mod tests {
 
     /// Opens an authority whose fence is renewed only when a test calls `renew_once`.
     pub(crate) async fn unrenewed_authority(store: Store) -> (Arc<Authority>, tempfile::TempDir) {
-        let directory = tempfile::tempdir().expect("create witness directory");
+        let directory = pohunek_test_support::tempdir().expect("create witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make witness directory private");
         let witness = Arc::new(
