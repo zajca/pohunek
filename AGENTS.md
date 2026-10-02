@@ -245,9 +245,17 @@ Directories come from `pohunek_test_support::tempdir()` or
 `pohunek_test_support::env::TestEnv` (private root, cwd, HOME/XDG/TMPDIR, scrubbed
 child environment), never from `std::env::temp_dir()`, a host `/tmp` path or the
 `tempfile` constructors, and a socket stays bound instead of "bind port 0, drop,
-reuse the number". `crates/xtask/tests/hermetic_scan.rs` enforces this in test code
-with no baseline. A case where the host state is the subject carries
-`// hermetic-allowed: #<issue> <reason>` on or directly above its line.
+reuse the number". A test never calls `std::env::set_var`/`remove_var`: it passes the
+value to the code under test, or, where reading the process environment is the
+subject, changes it through `pohunek_test_support::process_env::ProcessEnv` (one
+binary-wide lock, restored on drop and on unwind; tests that only read
+environment-derived values hold `ProcessEnv::lock()` too, and a command that must not
+see another test's `PATH` is built with `process_env::command`).
+`crates/xtask/tests/hermetic_scan.rs` enforces all of this in test code with no
+baseline. A case where the host state is the subject carries
+`// hermetic-allowed: #<issue> <reason>` on or directly above its line; the
+environment-mutation rule takes no marker, because `ProcessEnv` is the one sanctioned
+mechanism.
 
 Rust:
 
