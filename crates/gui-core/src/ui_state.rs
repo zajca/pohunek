@@ -161,7 +161,8 @@ height = 640
 
     #[test]
     fn legacy_project_selection_is_rejected_with_a_parse_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir =
+            pohunek_test_support::tempdir_with_prefix("pgc-ui").expect("private fixture root");
         let raw = r#"
 [window_size]
 width = 960

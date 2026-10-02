@@ -1020,9 +1020,16 @@ where
 
 #[cfg(test)]
 mod attach_template_tests {
-    use std::process::Command;
+    use pohunek_test_support::env::TestEnv;
 
     use super::*;
+
+    /// A hermetic environment for the shells these tests start: scrubbed
+    /// variables and a private working directory. The host POSIX `sh` itself is
+    /// the subject of the quoting round-trips, so it is resolved through `PATH`.
+    fn shell_env() -> TestEnv {
+        TestEnv::new().expect("hermetic test environment")
+    }
 
     /// Values that break naive quoting or re-substitution.
     fn difficult_values() -> Vec<String> {
@@ -1057,8 +1064,9 @@ mod attach_template_tests {
     /// Runs `command` through a real `sh -c` and splits its NUL-terminated output.
     ///
     /// Injected `echo INJECTED` payloads would add output and break equality.
-    fn run_sh(command: &str) -> Vec<Vec<u8>> {
-        let output = Command::new("sh")
+    fn run_sh(env: &TestEnv, command: &str) -> Vec<Vec<u8>> {
+        let output = env
+            .command("sh")
             .arg("-c")
             .arg(command)
             .output()
@@ -1075,6 +1083,7 @@ mod attach_template_tests {
 
     #[test]
     fn shell_form_round_trips_difficult_values_through_a_real_shell() {
+        let env = shell_env();
         let template = "printf '%s\\0' {bin} {host} {id}";
         let values = difficult_values();
         for bin in &values {
@@ -1089,7 +1098,7 @@ mod attach_template_tests {
                     },
                 )
                 .expect("render");
-                let fields = run_sh(&command);
+                let fields = run_sh(&env, &command);
                 assert_eq!(
                     fields,
                     [bin.as_bytes(), host.as_bytes(), id.as_bytes()],
@@ -1149,6 +1158,7 @@ mod attach_template_tests {
     /// Renders `template` for every hostile value in each placeholder slot and
     /// checks a real shell hands exactly the values to `printf` as arguments.
     fn assert_recorded(template: &str) {
+        let env = shell_env();
         for hostile in hostile_values() {
             let values = AttachTemplateValues {
                 bin: "pohunek".to_owned(),
@@ -1157,7 +1167,7 @@ mod attach_template_tests {
             };
             let command = render_attach_command(template, &values).expect("render");
             assert_eq!(
-                run_sh(&command),
+                run_sh(&env, &command),
                 [
                     b"pohunek".to_vec(),
                     hostile.as_bytes().to_vec(),
@@ -1370,18 +1380,16 @@ mod attach_template_tests {
             render_attach_command("ls * {host}", &values).expect("render"),
             "ls * crates/gui"
         );
-        // A fixture directory where `{host}*` would expand to several words.
-        let fixture =
-            pohunek_test_support::tempdir_with_prefix("pgc").expect("private fixture directory");
-        let dir = fixture.path().to_path_buf();
-        std::fs::create_dir(dir.join("crates")).expect("fixture dir");
+        // A working directory where `{host}*` would expand to several words.
+        let env = shell_env();
+        std::fs::create_dir(env.cwd().join("crates")).expect("fixture dir");
         for name in ["gui-a", "gui-b"] {
-            std::fs::write(dir.join("crates").join(name), "").expect("fixture file");
+            std::fs::write(env.cwd().join("crates").join(name), "").expect("fixture file");
         }
-        let output = Command::new("sh")
+        let output = env
+            .command("sh")
             .arg("-c")
             .arg("printf '%s\\0' crates/gui*")
-            .current_dir(&dir)
             .output()
             .expect("run sh");
         assert_eq!(
@@ -1395,7 +1403,8 @@ mod attach_template_tests {
     #[test]
     fn a_tilde_after_an_equals_sign_cannot_expand_a_value() {
         // Real sh expands `~root` after `=` in an assignment word.
-        let output = Command::new("sh")
+        let output = shell_env()
+            .command("sh")
             .arg("-c")
             .arg("H=~root; printf %s \"$H\"")
             .output()
@@ -1458,7 +1467,8 @@ mod attach_template_tests {
             "echo a#b 'x' # it's",
         ] {
             // The real shell parses each one.
-            let status = Command::new("sh")
+            let status = shell_env()
+                .command("sh")
                 .args(["-n", "-c", template])
                 .status()
                 .expect("run sh");
@@ -1475,7 +1485,8 @@ mod attach_template_tests {
         }
         // A real unterminated quote is still refused, and sh agrees.
         let broken = "echo 'open # not a comment";
-        assert!(!Command::new("sh")
+        assert!(!shell_env()
+            .command("sh")
             .args(["-n", "-c", broken])
             .status()
             .expect("run sh")
@@ -1653,7 +1664,7 @@ mod attach_template_tests {
         let argv = render_attach_argv(template, &values).expect("argv");
         // The real shell agrees on the word boundaries; its `printf` builtin
         // prints each word NUL-terminated.
-        let shell_words = run_sh(template);
+        let shell_words = run_sh(&shell_env(), template);
         assert_eq!(
             argv[2..]
                 .iter()
