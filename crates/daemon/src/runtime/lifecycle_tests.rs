@@ -15,6 +15,7 @@ use pohunek_platform::process::HostInspector;
 use pohunek_platform::supervisor::{
     DefinitionFacts, Operation, Supervisor, BOOTSTRAP_ENV_ALLOWLIST,
 };
+use pohunek_test_support::wait::{self, HANG_GUARD};
 use tokio::sync::Notify;
 
 use super::*;
@@ -758,7 +759,7 @@ async fn start_failure_with_an_absent_job_cleans_only_its_definition() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_absent_job_ends_the_connect_wait_and_is_cleaned_up() {
     let harness = Harness::scripted(GENEROUS, INITIALIZE);
     harness.supervisor.script_inspects([InspectStep::NotFound]);
@@ -787,7 +788,7 @@ async fn an_absent_job_ends_the_connect_wait_and_is_cleaned_up() {
     assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_present_job_is_retired_by_exact_generation_only_after_its_initialize_deadline() {
     let harness = Harness::scripted(CONNECT, INITIALIZE);
     harness.supervisor.script_inspects([InspectStep::Present {
@@ -815,7 +816,7 @@ async fn a_present_job_is_retired_by_exact_generation_only_after_its_initialize_
     assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_job_that_ended_without_a_process_is_retired_immediately() {
     let harness = Harness::scripted(GENEROUS, GENEROUS);
     harness.supervisor.script_inspects([InspectStep::Present {
@@ -847,7 +848,7 @@ async fn a_job_that_ended_without_a_process_is_retired_immediately() {
     assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_loaded_job_without_a_process_is_retired_only_after_its_initialize_deadline() {
     let harness = Harness::scripted(CONNECT, INITIALIZE);
     harness.supervisor.script_inspects([InspectStep::Present {
@@ -1521,7 +1522,7 @@ async fn recovery_cleans_up_an_ended_previous_generation() {
     assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn one_session_is_serialized_and_different_sessions_are_not() {
     let locks = SessionLocks::default();
     let first = locks.acquire("s-1").await;
@@ -1572,7 +1573,7 @@ fn serve_gated_version_five_worker(
     worker_id: &str,
     gate: Option<AcquireGate>,
 ) -> tokio::task::JoinHandle<Vec<String>> {
-    serve_fake_version_five_worker(socket, session_id, worker_id, gate, 0).0
+    serve_fake_version_five_worker(socket, session_id, worker_id, gate, 0, None).0
 }
 
 /// Serves controller connections as a version-five worker, rejecting the
@@ -1581,12 +1582,15 @@ fn serve_gated_version_five_worker(
 ///
 /// Returns the task, which ends with the request kinds received after the
 /// lease of the first served connection, and the count of busy rejections.
+/// When `refusal_closed` is set, the worker sends one unit on it each time the
+/// daemon has closed a connection after receiving a busy rejection.
 fn serve_fake_version_five_worker(
     socket: &Path,
     session_id: &str,
     worker_id: &str,
     gate: Option<AcquireGate>,
     busy: usize,
+    refusal_closed: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> (tokio::task::JoinHandle<Vec<String>>, Arc<AtomicU64>) {
     use pohunek_worker_protocol::{
         Capability, ControlError, ControlMessage, ControlReader, ControlResponse, ControlWriter,
@@ -1614,6 +1618,7 @@ fn serve_fake_version_five_worker(
             let mut writer = ControlWriter::new(write_half);
             let five = Version::new(5).expect("version five");
             let mut after_lease = Vec::new();
+            let mut refused = false;
             // A client that saw a rejection closes its connection, which
             // ends this loop with an error or EOF.
             while let Ok(Some(message)) = reader.read::<ControlMessage>().await {
@@ -1638,6 +1643,7 @@ fn serve_fake_version_five_worker(
                     },
                     RequestKind::AcquireController { .. } if reject_busy => {
                         rejected.fetch_add(1, Ordering::Relaxed);
+                        refused = true;
                         ResponseKind::Error {
                             error: ControlError {
                                 code: ControlCode::ControllerBusy,
@@ -1671,6 +1677,12 @@ fn serve_fake_version_five_worker(
                     || writer.flush().await.is_err()
                 {
                     break;
+                }
+            }
+            if refused {
+                if let Some(closed) = &refusal_closed {
+                    // The receiver is gone once the test stopped listening.
+                    let _ = closed.send(());
                 }
             }
             if !reject_busy {
@@ -2079,6 +2091,7 @@ async fn a_busy_controller_lease_is_retried_until_the_worker_is_adopted() {
         "worker-v5",
         None,
         1,
+        None,
     );
 
     // One attempt, as after a job-end report, must outlast the busy lease.
@@ -2097,10 +2110,43 @@ async fn a_busy_controller_lease_is_retried_until_the_worker_is_adopted() {
         .expect("fake worker task");
 }
 
-#[tokio::test]
+/// Keeps tokio's paused clock from auto-advancing while real I/O is awaited.
+///
+/// A blocking task in flight inhibits auto-advance, so the paused clock moves
+/// only through `tokio::time::advance`, even while the runtime idles on a
+/// socket. The task ends when the inhibitor is dropped, or after
+/// [`HANG_GUARD`] of real time so that a stuck test then fails on its own
+/// virtual hang guards instead of waiting for nextest to terminate it.
+struct AutoAdvanceInhibitor {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+impl AutoAdvanceInhibitor {
+    fn new() -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        // Detached on purpose: dropping `release` wakes it, and the runtime
+        // joins it on shutdown.
+        drop(tokio::task::spawn_blocking(move || {
+            let _ = released.recv_timeout(HANG_GUARD);
+        }));
+        Self { _release: release }
+    }
+}
+
+/// The busy-lease retry timeline runs on a paused clock that moves only by the
+/// test's `advance` calls. The fake worker reports each refusal once the
+/// daemon has closed that connection, which in the daemon's single task
+/// happens strictly before it arms the retry sleep. The test therefore
+/// advances by one retry step only while the retry sleep is armed, so every
+/// retry slot before the deadline holds exactly one refusal and the attempt
+/// ends at the deadline whatever the host load, the socket latency or the
+/// scheduling.
+#[tokio::test(start_paused = true)]
 async fn a_controller_lease_busy_until_the_deadline_ends_with_the_deadline() {
+    let inhibitor = AutoAdvanceInhibitor::new();
     let harness = Harness::scripted(CONNECT, INITIALIZE);
     let generation = harness.generation("s-1");
+    let (refusal_closed, mut closed_refusals) = tokio::sync::mpsc::unbounded_channel();
     let (fake, rejections) = serve_fake_version_five_worker(
         &harness
             .runtime_root
@@ -2110,26 +2156,50 @@ async fn a_controller_lease_busy_until_the_deadline_ends_with_the_deadline() {
         "worker-v5",
         None,
         usize::MAX,
+        Some(refusal_closed),
     );
-    let started = Instant::now();
+    let lifecycle = harness.lifecycle();
+    let deadline = Instant::now() + CONNECT;
+    let attempt = async {
+        let outcome = lifecycle.try_connect(&generation, deadline, None).await;
+        (outcome, Instant::now())
+    };
+    let timeline = async {
+        while Instant::now() < deadline {
+            wait::guard("the busy refusal of a retry slot", closed_refusals.recv())
+                .await
+                .expect("the fake worker outlives the attempt");
+            tokio::time::advance(SUPERVISION_POLL_INTERVAL.min(deadline - Instant::now())).await;
+        }
+        // The clock is at the deadline. Any further wait of the attempt now
+        // auto-advances the clock past it, so an attempt that outlives its
+        // deadline fails the equality below instead of hanging.
+        drop(inhibitor);
+    };
 
-    let outcome = tokio::time::timeout(
-        GENEROUS,
-        harness
-            .lifecycle()
-            .try_connect(&generation, started + CONNECT, None),
-    )
-    .await
-    .expect("a busy lease never extends the attempt deadline");
+    let ((outcome, ended), ()) =
+        wait::guard("a busy lease never extends the attempt deadline", async {
+            tokio::join!(attempt, timeline)
+        })
+        .await;
 
     assert!(
         outcome.is_none(),
         "a lease busy until the deadline adopts nothing"
     );
-    assert!(started.elapsed() >= CONNECT, "{:?}", started.elapsed());
-    assert!(
-        rejections.load(Ordering::Relaxed) >= 2,
-        "the busy lease was retried within the deadline"
+    assert_eq!(
+        ended, deadline,
+        "the attempt ends exactly at its deadline while the lease stays busy"
+    );
+    // Every attempt that starts before the deadline is refused once; the one
+    // that would start at the deadline is cut off before it is answered.
+    let retry_slots = CONNECT
+        .as_millis()
+        .div_ceil(SUPERVISION_POLL_INTERVAL.as_millis());
+    assert_eq!(
+        u128::from(rejections.load(Ordering::Relaxed)),
+        retry_slots,
+        "the busy lease was retried every poll interval within the deadline"
     );
     fake.abort();
 }
@@ -2149,6 +2219,7 @@ async fn an_ended_job_stops_the_busy_lease_retries_after_the_first_refusal() {
         "worker-v5",
         None,
         usize::MAX,
+        None,
     );
 
     let outcome = tokio::time::timeout(
