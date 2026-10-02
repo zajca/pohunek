@@ -12,7 +12,10 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+
+use pohunek_test_support::wait::HANG_GUARD;
 
 /// Sets the flag when dropped, including while a panic unwinds.
 struct StopOnDrop<'a>(&'a AtomicBool);
@@ -26,12 +29,24 @@ impl Drop for StopOnDrop<'_> {
 /// Runs `body` while a sibling thread spawns `sh` children in a loop, then
 /// stops the spawner and returns the body's result.
 ///
-/// The spawner's children start from an empty environment in the private
-/// directory `cwd`. A panic in `body` stops the spawner before it propagates.
+/// `body` starts only after the spawner has completed its first spawn, so even
+/// a short body overlaps a spawning thread, and the helper asserts that the
+/// spawner completed at least one spawn. The spawner's children start from an
+/// empty environment in the private directory `cwd`. A panic in `body` stops
+/// the spawner before it propagates. If the spawner fails before its first
+/// spawn the wait ends at once, and a spawner that never reports fails the
+/// wait at the hang guard.
+///
+/// # Panics
+///
+/// Panics when the spawner fails or never completes a spawn.
 pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce() -> R) -> R {
     let stop = AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
+    let spawns = AtomicUsize::new(0);
+    let result = std::thread::scope(|scope| {
+        let (first_spawn, first_spawn_done) = mpsc::sync_channel::<()>(1);
+        let (stop, spawns) = (&stop, &spawns);
+        scope.spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 Command::new("/bin/sh")
                     .args(["-c", "exit 0"])
@@ -39,11 +54,29 @@ pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce() -> R) ->
                     .current_dir(cwd)
                     .status()
                     .expect("sibling spawn");
+                if spawns.fetch_add(1, Ordering::Relaxed) == 0 {
+                    // The receiver is gone only when the body already failed.
+                    let _ = first_spawn.send(());
+                }
             }
         });
-        let _stop = StopOnDrop(&stop);
+        let _stop = StopOnDrop(stop);
+        match first_spawn_done.recv_timeout(HANG_GUARD) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the sibling spawner stopped before completing a spawn")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("hang guard elapsed waiting for the sibling spawner's first spawn")
+            }
+        }
         body()
-    })
+    });
+    assert!(
+        spawns.load(Ordering::Relaxed) > 0,
+        "no sibling spawn overlapped the body"
+    );
+    result
 }
 
 #[cfg(test)]
