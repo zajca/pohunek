@@ -38,6 +38,8 @@ const RANDOM_SECRET_BYTES: usize = 32;
 const IDENTITY_ADVISORY_LOCK_SEED: i64 = 0;
 /// Retries absorb normal `PostgreSQL` serializable conflicts without unbounded ingress work.
 const IDENTITY_ISSUE_MAX_ATTEMPTS: usize = 3;
+/// Cause recorded when a bounded retry loop gives up on a serialization conflict.
+const RETRIES_EXHAUSTED: &str = "the serializable transaction conflicted on every attempt";
 /// Provider session coordinates are opaque and bounded before durable processing.
 const MAX_CALLBACK_SESSION_STATE_BYTES: usize = 4 * 1024;
 
@@ -446,11 +448,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let inserted = sqlx::query(
             "INSERT INTO browser_logins (login_id, state_digest, nonce_digest, pkce_verifier_digest, login_binding_digest, issuer, client_id, audience, redirect_uri, action, account_link_generation, recovery_generation, expires_at) \
              SELECT $1, $2, $3, $4, $5, $6, $7, $7, $8, 'login', 1, r.recovery_generation, clock_timestamp() + $9::interval \
@@ -464,7 +466,9 @@ impl AuthService {
         .bind(interval(self.limits.login_lifetime))
         .execute(&mut *transaction).await.map_err(database_error)?;
         if inserted.rows_affected() != 1 {
-            return Err(AuthError::Durable);
+            return Err(AuthError::durable_state(
+                "the browser login insert changed an unexpected number of rows",
+            ));
         }
         audit_auth(
             &mut transaction,
@@ -478,10 +482,9 @@ impl AuthService {
         self.commit_current(transaction).await?;
         let expires_at = Instant::now() + self.limits.login_lifetime;
         reservation.commit(login_id, expires_at)?;
-        let mut pending = self
-            .pending_browser_logins
-            .lock()
-            .map_err(|_error| AuthError::Durable)?;
+        let mut pending = self.pending_browser_logins.lock().map_err(|_error| {
+            AuthError::durable_state("the pending browser login lock is poisoned")
+        })?;
         pending.insert(
             login_id,
             PendingBrowserLogin {
@@ -510,11 +513,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let inserted = sqlx::query(
             "INSERT INTO device_logins (login_id, device_code_digest, poll_secret_digest, issuer, client_id, audience, action, account_link_generation, recovery_generation, expires_at, poll_interval_seconds, next_poll_at) \
              SELECT $1, $2, $3, $4, $5, $5, 'login', 1, r.recovery_generation, clock_timestamp() + $6::interval, $7, clock_timestamp() \
@@ -524,7 +527,9 @@ impl AuthService {
         .bind(i32::try_from(authorization.interval.as_secs()).map_err(|_error| AuthError::Malformed)?)
         .execute(&mut *transaction).await.map_err(database_error)?;
         if inserted.rows_affected() != 1 {
-            return Err(AuthError::Durable);
+            return Err(AuthError::durable_state(
+                "the device login insert changed an unexpected number of rows",
+            ));
         }
         audit_auth(
             &mut transaction,
@@ -658,11 +663,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let row = sqlx::query(
             "UPDATE browser_logins b SET consumed_at = clock_timestamp(), outcome = 'failed' \
              FROM relay_identity r WHERE b.state_digest = $1 AND b.login_binding_digest = $2 \
@@ -856,11 +861,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut claim_transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let claimed = sqlx::query("UPDATE device_logins d SET poll_lease_until = clock_timestamp() + $2::interval, poll_lease_token = $3 FROM relay_identity r WHERE d.login_id = $1 AND d.issuer = $4 AND d.client_id = $5 AND d.audience = $5 AND d.action = $6 AND d.link_id IS NOT DISTINCT FROM $7 AND d.account_link_generation = $8 AND d.consumed_at IS NULL AND d.expires_at > clock_timestamp() AND d.next_poll_at <= clock_timestamp() AND (d.poll_lease_until IS NULL OR d.poll_lease_until < clock_timestamp()) AND d.recovery_generation = r.recovery_generation AND r.state = 'normal' RETURNING d.recovery_generation")
             .bind(login_id).bind(interval(self.limits.device_poll_lease)).bind(poll_lease_token.as_slice()).bind(oidc.issuer()).bind(oidc.client_id())
             .bind(transaction_kind.action).bind(transaction_kind.link_id).bind(transaction_kind.account_link_generation)
@@ -884,11 +889,11 @@ impl AuthService {
                     .store
                     .begin_serializable()
                     .await
-                    .map_err(|_error| AuthError::Durable)?;
+                    .map_err(|error| AuthError::durable(&error))?;
                 self.authority
                     .verify_fence_in_transaction(&mut transaction)
                     .await
-                    .map_err(|_error| AuthError::Durable)?;
+                    .map_err(|error| AuthError::durable(&error))?;
                 let updated = sqlx::query("UPDATE device_logins SET poll_lease_until = NULL, poll_lease_token = NULL, next_poll_at = clock_timestamp() + make_interval(secs => poll_interval_seconds) WHERE login_id = $1 AND poll_lease_token = $2 AND consumed_at IS NULL AND expires_at > clock_timestamp() RETURNING poll_interval_seconds")
                     .bind(login_id).bind(poll_lease_token.as_slice()).fetch_optional(&mut *transaction).await.map_err(database_error)?;
                 self.commit_current(transaction).await?;
@@ -907,11 +912,11 @@ impl AuthService {
                     .store
                     .begin_serializable()
                     .await
-                    .map_err(|_error| AuthError::Durable)?;
+                    .map_err(|error| AuthError::durable(&error))?;
                 self.authority
                     .verify_fence_in_transaction(&mut transaction)
                     .await
-                    .map_err(|_error| AuthError::Durable)?;
+                    .map_err(|error| AuthError::durable(&error))?;
                 let updated = sqlx::query(
                     "UPDATE device_logins SET poll_lease_until = NULL, poll_lease_token = NULL, \
                      poll_interval_seconds = LEAST(poll_interval_seconds + $2, $3), \
@@ -1037,7 +1042,7 @@ impl AuthService {
         credential: RelayBearerCredential,
     ) -> Result<AuthenticatedActor, AuthError> {
         if self.authority.is_closed() {
-            return Err(AuthError::Durable);
+            return Err(AuthError::durable_state("the relay authority is closed"));
         }
         let (public_id, secret) = credential.parts()?;
         let digest = self.digest_key.digest(secret);
@@ -1086,11 +1091,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(|_error| AuthError::CredentialInvalid)?;
@@ -1141,11 +1146,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(|_error| AuthError::CredentialInvalid)?;
@@ -1190,11 +1195,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(|_error| AuthError::CredentialInvalid)?;
@@ -1212,7 +1217,7 @@ impl AuthService {
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_error| AuthError::Durable)?;
+                .map_err(|error| AuthError::durable(&error))?;
             return Ok(());
         }
         #[cfg(test)]
@@ -1273,11 +1278,11 @@ impl AuthService {
         .await
         {
             Ok(audit_id) => audit_id,
-            Err(_error) => {
+            Err(error) => {
                 let _ = self
                     .authority
                     .fail_stop_auth_revocation(AuthMutationTarget::Credential(credential_id));
-                return Err(AuthError::Durable);
+                return Err(AuthError::durable(&error));
             }
         };
         insert_receipt(
@@ -1297,7 +1302,7 @@ impl AuthService {
                 Some(AuthMutationTarget::Credential(credential_id)),
             )
             .await
-            .map_err(|_error| AuthError::Durable)
+            .map_err(|error| AuthError::durable(&error))
     }
 
     /// Revokes a service credential after a current team-administrator check.
@@ -1321,11 +1326,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(|_error| AuthError::CredentialInvalid)?;
@@ -1346,7 +1351,7 @@ impl AuthService {
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_error| AuthError::Durable)?;
+                .map_err(|error| AuthError::durable(&error))?;
             return Ok(());
         }
         #[cfg(test)]
@@ -1411,11 +1416,11 @@ impl AuthService {
         .await
         {
             Ok(audit_id) => audit_id,
-            Err(_error) => {
+            Err(error) => {
                 let _ = self
                     .authority
                     .fail_stop_auth_revocation(AuthMutationTarget::Credential(credential_id));
-                return Err(AuthError::Durable);
+                return Err(AuthError::durable(&error));
             }
         };
         insert_receipt(
@@ -1435,7 +1440,7 @@ impl AuthService {
                 Some(AuthMutationTarget::Credential(credential_id)),
             )
             .await
-            .map_err(|_error| AuthError::Durable)
+            .map_err(|error| AuthError::durable(&error))
     }
 
     /// Replaces a current account credential with a bounded overlap.
@@ -1501,7 +1506,7 @@ impl AuthService {
                 result => return result,
             }
         }
-        Err(AuthError::Durable)
+        Err(AuthError::durable_state(RETRIES_EXHAUSTED))
     }
 
     #[expect(
@@ -1529,11 +1534,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(rotation_store_error)?;
@@ -1709,7 +1714,7 @@ impl AuthService {
                 Some(AuthMutationTarget::Credential(old_id)),
             )
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         Ok(CredentialMutation {
             record: credential_record(row)?,
             credential: Some(DeviceCredential {
@@ -1750,11 +1755,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         crate::authorization::verify_current_actor(&mut transaction, context)
             .await
             .map_err(|_error| AuthError::CredentialInvalid)?;
@@ -1776,7 +1781,7 @@ impl AuthService {
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_error| AuthError::Durable)?;
+                .map_err(|error| AuthError::durable(&error))?;
             return Ok(replay);
         }
         let count: i64 = sqlx::query_scalar(
@@ -1786,7 +1791,7 @@ impl AuthService {
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if usize::try_from(count).map_err(|_error| AuthError::Durable)?
+        if usize::try_from(count).map_err(|error| AuthError::durable(&error))?
             >= self.limits.service_accounts_per_team
         {
             return Err(AuthError::Capacity);
@@ -1835,7 +1840,7 @@ impl AuthService {
                 Some(AuthMutationTarget::Principal(principal_id)),
             )
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         Ok(ServiceAccountCreated {
             account: ServiceAccountRecord {
                 principal_id: PrincipalId::from_uuid(principal_id),
@@ -1868,11 +1873,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         crate::authorization::rbac::require_team_admin(&mut transaction, context, team_id)
             .await
             .map_err(|_error| AuthError::CredentialInvalid)?;
@@ -1899,11 +1904,11 @@ impl AuthService {
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         transaction
             .commit()
             .await
-            .map_err(|_error| AuthError::Durable)
+            .map_err(|error| AuthError::durable(&error))
     }
 
     async fn commit_rotation_rejection(
@@ -1917,7 +1922,7 @@ impl AuthService {
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         transaction.commit().await.map_err(retryable_database_error)
     }
 
@@ -1932,7 +1937,7 @@ impl AuthService {
         self.authority
             .commit_auth_mutation(transaction, false, None)
             .await
-            .map_err(|_error| AuthError::Durable)
+            .map_err(|error| AuthError::durable(&error))
     }
 
     #[cfg(test)]
@@ -2015,11 +2020,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         sqlx::query(
             "UPDATE account_link_transactions SET state = 'expired', completed_at = clock_timestamp(), \
              revision = revision + 1 WHERE state = 'pending' AND expires_at <= clock_timestamp()",
@@ -2058,11 +2063,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let updated = sqlx::query(
             "UPDATE device_logins SET consumed_at = clock_timestamp(), outcome = $2, poll_lease_until = NULL, poll_lease_token = NULL \
              WHERE login_id = $1 AND consumed_at IS NULL AND ($3::bytea IS NULL OR (poll_lease_token = $3 AND expires_at > clock_timestamp()))",
@@ -2100,11 +2105,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         audit_auth(
             &mut transaction,
             action,
@@ -2152,7 +2157,7 @@ impl AuthService {
                 result => return result,
             }
         }
-        Err(AuthError::Durable)
+        Err(AuthError::durable_state(RETRIES_EXHAUSTED))
     }
 
     async fn issue_browser_session_once(
@@ -2171,11 +2176,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let bound = sqlx::query(
             "SELECT b.login_id FROM browser_logins b JOIN relay_identity r ON r.recovery_generation = b.recovery_generation \
              WHERE b.login_id = $1 AND b.issuer = $2 AND b.client_id = $3 AND b.audience = $3 AND b.redirect_uri = $4 \
@@ -2255,7 +2260,7 @@ impl AuthService {
                 result => return result,
             }
         }
-        Err(AuthError::Durable)
+        Err(AuthError::durable_state(RETRIES_EXHAUSTED))
     }
 
     async fn issue_human_credential_once(
@@ -2270,11 +2275,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let bound = sqlx::query(
             "SELECT d.login_id, d.poll_interval_seconds FROM device_logins d JOIN relay_identity r ON r.recovery_generation = d.recovery_generation \
              WHERE d.login_id = $1 AND d.poll_lease_token = $2 AND d.poll_lease_until > clock_timestamp() \
@@ -2358,11 +2363,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         touch_browser_session(
             &mut transaction,
             session_id,
@@ -2377,11 +2382,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         touch_credential(&mut transaction, credential_id).await?;
         self.commit_current(transaction).await
     }
@@ -2393,12 +2398,12 @@ fn random_secret() -> Result<String, AuthError> {
 
 fn random_token() -> Result<[u8; RANDOM_SECRET_BYTES], AuthError> {
     let mut bytes = [0_u8; RANDOM_SECRET_BYTES];
-    getrandom::getrandom(&mut bytes).map_err(|_error| AuthError::Durable)?;
+    getrandom::getrandom(&mut bytes).map_err(|error| AuthError::durable(&error))?;
     Ok(bytes)
 }
 
 fn interval_seconds(value: i32) -> Result<u32, AuthError> {
-    u32::try_from(value).map_err(|_error| AuthError::Durable)
+    u32::try_from(value).map_err(|error| AuthError::durable(&error))
 }
 
 #[expect(
@@ -2556,7 +2561,9 @@ async fn audit_actor_mutation(
         .map_err(map_error)?
     };
     if inserted.rows_affected() != 1 {
-        return Err(AuthError::Durable);
+        return Err(AuthError::durable_state(
+            "the audit insert changed an unexpected number of rows",
+        ));
     }
     Ok(audit_id)
 }
@@ -2611,7 +2618,7 @@ async fn exact_receipt(
     }
     receipt
         .get::<Option<Uuid>, _>("result_id")
-        .ok_or(AuthError::Durable)
+        .ok_or_else(|| AuthError::durable_state("the mutation receipt has no result"))
         .map(Some)
 }
 
@@ -2654,7 +2661,7 @@ async fn credential_row_for_owner(
     .fetch_optional(&mut **transaction)
     .await
     .map_err(retryable_database_error)?
-    .ok_or(AuthError::Durable)
+    .ok_or_else(|| AuthError::durable_state("the credential row is missing"))
 }
 
 async fn service_account_created_replay(
@@ -2671,7 +2678,7 @@ async fn service_account_created_replay(
     .fetch_optional(&mut **transaction)
     .await
     .map_err(database_error)?
-    .ok_or(AuthError::Durable)?;
+    .ok_or_else(|| AuthError::durable_state("the service account row is missing"))?;
     let credential = sqlx::query(
         "SELECT credential_id, principal_id, credential_kind, issued_at, expires_at, rotation_overlap_ends_at, last_used_at, revoked_at \
          FROM relay_credentials WHERE principal_id = $1 AND credential_kind = 'service' \
@@ -2681,7 +2688,7 @@ async fn service_account_created_replay(
     .fetch_optional(&mut **transaction)
     .await
     .map_err(database_error)?
-    .ok_or(AuthError::Durable)?;
+    .ok_or_else(|| AuthError::durable_state("the service credential row is missing"))?;
     Ok(ServiceAccountCreated {
         account: ServiceAccountRecord {
             principal_id: PrincipalId::from_uuid(account.get("principal_id")),
@@ -2774,9 +2781,11 @@ async fn audit_issued_credential(
     .bind(recovery_generation)
     .execute(&mut **transaction)
     .await
-    .map_err(|_error| AuthError::Durable)?;
+    .map_err(|error| AuthError::durable(&error))?;
     if inserted.rows_affected() != 1 {
-        return Err(AuthError::Durable);
+        return Err(AuthError::durable_state(
+            "the audit insert changed an unexpected number of rows",
+        ));
     }
     Ok(())
 }
@@ -2803,9 +2812,11 @@ async fn audit_auth(
     .bind(expected_recovery_generation)
     .execute(&mut **transaction)
     .await
-    .map_err(|_error| AuthError::Durable)?;
+    .map_err(|error| AuthError::durable(&error))?;
     if inserted.rows_affected() != 1 {
-        return Err(AuthError::Durable);
+        return Err(AuthError::durable_state(
+            "the audit insert changed an unexpected number of rows",
+        ));
     }
     Ok(())
 }
@@ -2834,7 +2845,7 @@ async fn enforce_credential_capacity(
     .fetch_one(&mut **transaction)
     .await
     .map_err(retryable_database_error)?;
-    let count = usize::try_from(count).map_err(|_error| AuthError::Durable)?;
+    let count = usize::try_from(count).map_err(|error| AuthError::durable(&error))?;
     if count >= limit && !replacing_without_overlap {
         return Err(AuthError::Capacity);
     }
@@ -2889,8 +2900,12 @@ async fn canonical_human_principal(
     })
 }
 
-fn database_error(_error: sqlx::Error) -> AuthError {
-    AuthError::Durable
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err transfers the SQLx failure by value; only its sanitized class is kept."
+)]
+fn database_error(error: sqlx::Error) -> AuthError {
+    AuthError::durable(&error)
 }
 
 #[expect(
@@ -2905,7 +2920,7 @@ fn retryable_database_error(error: sqlx::Error) -> AuthError {
     {
         AuthError::Retryable
     } else {
-        AuthError::Durable
+        AuthError::durable(&error)
     }
 }
 
@@ -2924,7 +2939,7 @@ fn retryable_receipt_database_error(error: sqlx::Error) -> AuthError {
 fn retryable_rotation_authority_error(error: AuthorityError) -> AuthError {
     match error {
         AuthorityError::Store(StoreError::Database(error)) => retryable_database_error(error),
-        _ => AuthError::Durable,
+        _ => AuthError::durable(&error),
     }
 }
 
@@ -2932,9 +2947,12 @@ fn rotation_store_error(error: StoreError) -> AuthError {
     match error {
         StoreError::Forbidden => AuthError::CredentialInvalid,
         StoreError::Database(error) => retryable_database_error(error),
-        _ => AuthError::Durable,
+        _ => AuthError::durable(&error),
     }
 }
+
+#[cfg(all(test, feature = "postgres-tests"))]
+mod durable_cause_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -3306,7 +3324,7 @@ pub(crate) mod tests {
                     "{target_credential_id}.{target_secret}"
                 )))
                 .await,
-            Err(AuthError::Durable)
+            Err(AuthError::Durable(_))
         ));
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events WHERE action = $1")
@@ -3380,7 +3398,7 @@ pub(crate) mod tests {
                     revoke_request(),
                 )
                 .await,
-            Err(AuthError::Durable)
+            Err(AuthError::Durable(_))
         ));
         assert_revocation_audit_failure(
             &service,
@@ -3430,7 +3448,7 @@ pub(crate) mod tests {
                     revoke_request(),
                 )
                 .await,
-            Err(AuthError::Durable)
+            Err(AuthError::Durable(_))
         ));
         assert_revocation_audit_failure(
             &service,
@@ -4459,7 +4477,7 @@ pub(crate) mod tests {
             service
                 .rotate_credential(actor, CredentialId::from_uuid(credential_id), request)
                 .await,
-            Err(AuthError::Durable)
+            Err(AuthError::Durable(_))
         ));
         let state: (Option<time::OffsetDateTime>, i64) = sqlx::query_as(
             "SELECT rotation_overlap_ends_at, credential_generation FROM relay_credentials WHERE credential_id = $1",
@@ -5223,7 +5241,7 @@ pub(crate) mod tests {
             )
             .await
             .expect_err("audit failure denies session issue");
-        assert!(matches!(error, AuthError::Durable));
+        assert!(matches!(error, AuthError::Durable(_)));
         let sessions: i64 = sqlx::query_scalar("SELECT count(*) FROM browser_sessions")
             .fetch_one(store.pool())
             .await
@@ -5550,7 +5568,7 @@ pub(crate) mod tests {
             )
             .await
             .expect_err("audit failure denies credential issue");
-        assert!(matches!(error, AuthError::Durable));
+        assert!(matches!(error, AuthError::Durable(_)));
         let credentials: i64 = sqlx::query_scalar("SELECT count(*) FROM relay_credentials")
             .fetch_one(store.pool())
             .await

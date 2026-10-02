@@ -300,7 +300,9 @@ impl AuthService {
             self.pending_transactions.release(login_id);
             self.cancel_link_after_start(actor, link_id, login_id)
                 .await?;
-            return Err(AuthError::Durable);
+            return Err(AuthError::durable_state(
+                "the link transaction could not be stored",
+            ));
         }
         Ok(BrowserLinkStart {
             record,
@@ -749,11 +751,11 @@ impl AuthService {
         if receipt.is_some() {
             let replay = removed_identity(&mut transaction, context.principal_id(), identity_id)
                 .await?
-                .ok_or(AuthError::Durable)?;
+                .ok_or_else(|| AuthError::durable_state("the removed identity row is missing"))?;
             self.authority
                 .commit_auth_mutation(transaction, false, None)
                 .await
-                .map_err(|_error| AuthError::Durable)?;
+                .map_err(|error| AuthError::durable(&error))?;
             return Ok(replay);
         }
         let generation = sqlx::query_scalar::<_, i64>(
@@ -867,7 +869,7 @@ impl AuthService {
         .await
         {
             Ok(audit_id) => audit_id,
-            Err(_error) => {
+            Err(error) => {
                 // Close active access before the durable removal rolls back so a
                 // missing audit can never leave the removed identity usable.
                 let _ = self
@@ -875,7 +877,7 @@ impl AuthService {
                     .fail_stop_auth_revocation(AuthMutationTarget::Principal(
                         context.principal_id(),
                     ));
-                return Err(AuthError::Durable);
+                return Err(AuthError::durable(&error));
             }
         };
         insert_receipt(
@@ -895,16 +897,16 @@ impl AuthService {
                 Some(AuthMutationTarget::Principal(context.principal_id())),
             )
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         Ok(IdentityRemoved {
             identity_id,
             principal_id: PrincipalId::from_uuid(context.principal_id()),
             removed_at,
             account_link_generation: advanced,
             revoked_credentials: u32::try_from(revoked_credentials)
-                .map_err(|_error| AuthError::Durable)?,
+                .map_err(|error| AuthError::durable(&error))?,
             revoked_sessions: u32::try_from(revoked_sessions)
-                .map_err(|_error| AuthError::Durable)?,
+                .map_err(|error| AuthError::durable(&error))?,
         })
     }
 
@@ -939,8 +941,9 @@ impl AuthService {
         outcome: &'static str,
         error: AuthError,
     ) -> AuthError {
-        let Ok(mut transaction) = self.store.begin_serializable().await else {
-            return AuthError::Durable;
+        let mut transaction = match self.store.begin_serializable().await {
+            Ok(transaction) => transaction,
+            Err(error) => return AuthError::durable(&error),
         };
         if let Err(durable) =
             audit_link_denial(&mut transaction, actor.actor(), action, target, outcome).await
@@ -949,7 +952,7 @@ impl AuthService {
         }
         match transaction.commit().await {
             Ok(()) => error,
-            Err(_error) => AuthError::Durable,
+            Err(error) => AuthError::durable(&error),
         }
     }
 
@@ -962,11 +965,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         let generation = sqlx::query_scalar::<_, i64>(
             "SELECT recovery_generation FROM relay_identity WHERE state = 'normal' FOR SHARE",
         )
@@ -1147,11 +1150,11 @@ impl AuthService {
             .store
             .begin_serializable()
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         self.authority
             .verify_fence_in_transaction(&mut transaction)
             .await
-            .map_err(|_error| AuthError::Durable)?;
+            .map_err(|error| AuthError::durable(&error))?;
         sqlx::query(
             "UPDATE account_link_transactions SET state = 'cancelled', \
              completed_at = clock_timestamp(), revision = revision + 1 \
@@ -1247,7 +1250,9 @@ impl AuthService {
                 result => return result,
             }
         }
-        Err(AuthError::Durable)
+        Err(AuthError::durable_state(
+            "the serializable transaction conflicted on every attempt",
+        ))
     }
 
     #[expect(
@@ -1629,9 +1634,11 @@ async fn audit_link_denial(
     .await
     // A denial has nothing to retry productively, and `Retryable` is an
     // internal signal that must not reach the caller, so this fails closed.
-    .map_err(|_error| AuthError::Durable)?;
+    .map_err(|error| AuthError::durable(&error))?;
     if inserted.rows_affected() != 1 {
-        return Err(AuthError::Durable);
+        return Err(AuthError::durable_state(
+            "the link denial insert changed an unexpected number of rows",
+        ));
     }
     Ok(())
 }
@@ -1706,9 +1713,9 @@ async fn removed_identity(
         removed_at: row.get("removed_at"),
         account_link_generation: row.get("account_link_generation"),
         revoked_credentials: u32::try_from(row.get::<i64, _>("credentials"))
-            .map_err(|_error| AuthError::Durable)?,
+            .map_err(|error| AuthError::durable(&error))?,
         revoked_sessions: u32::try_from(row.get::<i64, _>("sessions"))
-            .map_err(|_error| AuthError::Durable)?,
+            .map_err(|error| AuthError::durable(&error))?,
     }))
 }
 
@@ -1717,7 +1724,7 @@ fn link_page_cursor(
     records: &mut Vec<AccountLinkRecord>,
     limit: i64,
 ) -> Result<Option<Uuid>, AuthError> {
-    let limit = usize::try_from(limit).map_err(|_error| AuthError::Durable)?;
+    let limit = usize::try_from(limit).map_err(|error| AuthError::durable(&error))?;
     if records.len() <= limit {
         return Ok(None);
     }
@@ -1730,7 +1737,11 @@ fn link_record(row: &sqlx::postgres::PgRow) -> Result<AccountLinkRecord, AuthErr
     let channel = match row.get::<String, _>("channel").as_str() {
         "browser" => AccountLinkChannel::Browser,
         "device" => AccountLinkChannel::Device,
-        _ => return Err(AuthError::Durable),
+        _ => {
+            return Err(AuthError::durable_state(
+                "the link row holds an unknown channel",
+            ))
+        }
     };
     let state = match row.get::<String, _>("state").as_str() {
         "pending" => AccountLinkState::Pending,
@@ -1738,7 +1749,11 @@ fn link_record(row: &sqlx::postgres::PgRow) -> Result<AccountLinkRecord, AuthErr
         "cancelled" => AccountLinkState::Cancelled,
         "expired" => AccountLinkState::Expired,
         "failed" => AccountLinkState::Failed,
-        _ => return Err(AuthError::Durable),
+        _ => {
+            return Err(AuthError::durable_state(
+                "the link row holds an unknown state",
+            ))
+        }
     };
     Ok(AccountLinkRecord {
         link_id: row.get("link_id"),
