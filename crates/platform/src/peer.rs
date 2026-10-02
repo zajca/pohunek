@@ -228,7 +228,7 @@ mod tests {
     fn connecting_side_names_the_serving_process() {
         use std::io::{Read as _, Write as _};
 
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = pohunek_test_support::tempdir().expect("temporary directory");
         let path = directory.path().join("served.sock");
         let listening = UnixListener::bind(&path).expect("bind served socket");
         let mut client = UnixStream::connect(&path).expect("connect served socket");
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn binding_captures_the_connecting_process_and_stays_stable() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = pohunek_test_support::tempdir().expect("temporary directory");
         let path = directory.path().join("peer.sock");
         let listener = UnixListener::bind(&path).expect("bind peer socket");
         let client = UnixStream::connect(&path).expect("connect peer socket");
@@ -324,7 +324,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn listening_socket_reports_the_listener_itself() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = pohunek_test_support::tempdir().expect("temporary directory");
         let path = directory.path().join("listener.sock");
         let listener = UnixListener::bind(&path).expect("bind listener");
         let reported = credentials(&listener).expect("listener credentials");
@@ -341,7 +341,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn connecting_side_is_attested_too() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = pohunek_test_support::tempdir().expect("temporary directory");
         let path = directory.path().join("peer.sock");
         let listener = UnixListener::bind(&path).expect("bind peer socket");
         let client = UnixStream::connect(&path).expect("connect peer socket");

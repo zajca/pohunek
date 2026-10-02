@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn a_child_past_its_deadline_is_killed_and_reaped() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = pohunek_test_support::tempdir().expect("temporary directory");
         let pid_file = directory.path().join("pid");
         let script = format!("echo $$ > '{}'; exec /bin/sleep 30", pid_file.display());
         let started = std::time::Instant::now();

@@ -539,7 +539,7 @@ mod tests {
             .iter()
             .all(|dropped| !dropped.reason.is_empty()));
         assert_eq!(
-            trusted_directory(Path::new("/tmp")),
+            trusted_directory(&sticky),
             Err(TrustError::Refused("writable by group or others"))
         );
         let only_untrusted = SearchPath::sanitize(&group_writable.display().to_string(), true);

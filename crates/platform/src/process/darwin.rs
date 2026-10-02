@@ -1062,8 +1062,10 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
+
+    use pohunek_test_support::env::TestEnv;
 
     /// Bounds every poll for an observable operating-system state change.
     const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1091,7 +1093,13 @@ mod tests {
     const SECRET_SENTINEL: &str = "pohunek-darwin-secret-sentinel";
 
     /// Kills and reaps a spawned fixture even when an assertion fails.
-    struct Fixture(Child);
+    ///
+    /// The second field is the fixture's scrubbed environment and private
+    /// working directory; it is removed after the child is reaped.
+    struct Fixture(
+        Child,
+        #[expect(dead_code, reason = "held only so the directory outlives the child")] TestEnv,
+    );
 
     impl Fixture {
         fn pid(&self) -> Pid {
@@ -1156,7 +1164,7 @@ mod tests {
 
     /// Spawns a shell that stays alive until it is killed.
     fn spawn_idle_shell() -> Fixture {
-        spawn_shell("trap '' TERM; while :; do sleep 1; done", &[], None)
+        spawn_shell("trap '' TERM; while :; do /bin/sleep 1; done", &[], None)
     }
 
     /// Spawns `/bin/sh` with an explicit script, environment, and directory.
@@ -1165,7 +1173,8 @@ mod tests {
         environment: &[(&str, &str)],
         directory: Option<&Path>,
     ) -> Fixture {
-        let mut command = Command::new("/bin/sh");
+        let env = TestEnv::new().expect("test environment");
+        let mut command = env.command("/bin/sh");
         command
             .args(["-c", script])
             .stdin(Stdio::null())
@@ -1177,7 +1186,24 @@ mod tests {
         if let Some(directory) = directory {
             command.current_dir(directory);
         }
-        Fixture(command.spawn().expect("spawn shell fixture"))
+        Fixture(command.spawn().expect("spawn shell fixture"), env)
+    }
+
+    /// Terminal type of the pseudoterminal shells: `dumb` keeps the shell from
+    /// emitting host-dependent escape sequences around its prompt.
+    const PTY_TERM: &str = "dumb";
+
+    /// A pseudoterminal command for `program` with the scrubbed environment and
+    /// private working directory of `env`.
+    fn pty_command(env: &TestEnv, program: &str) -> portable_pty::CommandBuilder {
+        let mut command = portable_pty::CommandBuilder::new(program);
+        command.env_clear();
+        for (name, value) in env.environment() {
+            command.env(name, value);
+        }
+        command.env("TERM", PTY_TERM);
+        command.cwd(env.cwd());
+        command
     }
 
     /// Runs one observation on a helper thread and bounds how long it may take.
@@ -1299,8 +1325,9 @@ mod tests {
     ///
     /// Returns the number of reads and every failed observation.
     fn read_through_exec_chains(inspector: DarwinInspector) -> (usize, Vec<String>) {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use portable_pty::{native_pty_system, PtySize};
 
+        let env = TestEnv::new().expect("test environment");
         let mut failures = Vec::new();
         let mut reads = 0_usize;
         for _ in 0..EXEC_LAUNCHES {
@@ -1312,7 +1339,7 @@ mod tests {
                     pixel_height: 0,
                 })
                 .expect("open a pseudoterminal");
-            let mut command = CommandBuilder::new("/bin/sh");
+            let mut command = pty_command(&env, "/bin/sh");
             command.args(["-c", "/bin/sleep 30"]);
             let child = pair.slave.spawn_command(command).expect("spawn the root");
             let pid = child.process_id().expect("root process id");
@@ -1413,7 +1440,7 @@ mod tests {
     #[test]
     fn descendants_follow_a_spawned_subtree() {
         let inspector = DarwinInspector::new();
-        let fixture = spawn_shell("sleep 60 & wait", &[], None);
+        let fixture = spawn_shell("/bin/sleep 60 & wait", &[], None);
         let root = live_identity(inspector, fixture.pid());
 
         let descendant = wait_for("the fixture to create its descendant", || {
@@ -1464,7 +1491,9 @@ mod tests {
         use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions};
 
         let inspector = DarwinInspector::new();
-        let mut child = Command::new("/bin/sh")
+        let env = TestEnv::new().expect("test environment");
+        let mut child = env
+            .command("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
             .expect("spawn a process that exits immediately");
@@ -1498,13 +1527,13 @@ mod tests {
     #[test]
     fn cwd_reports_the_child_working_directory() {
         let inspector = DarwinInspector::new();
-        let directory = tempfile::tempdir().expect("create a working directory");
+        let directory = pohunek_test_support::tempdir().expect("create a working directory");
         let expected = directory
             .path()
             .canonicalize()
             .expect("canonicalize the working directory");
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done",
+            "trap '' TERM; while :; do /bin/sleep 1; done",
             &[],
             Some(&expected),
         );
@@ -1524,7 +1553,7 @@ mod tests {
     #[test]
     fn cwd_preserves_exact_directory_bytes() {
         let inspector = DarwinInspector::new();
-        let parent = tempfile::tempdir().expect("create a parent directory");
+        let parent = pohunek_test_support::tempdir().expect("create a parent directory");
         let parent = parent
             .path()
             .canonicalize()
@@ -1548,7 +1577,7 @@ mod tests {
         )));
         std::fs::create_dir(&expected).expect("create a multi-byte directory");
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done",
+            "trap '' TERM; while :; do /bin/sleep 1; done",
             &[],
             Some(&expected),
         );
@@ -1605,7 +1634,7 @@ mod tests {
     fn ownership_markers_describe_each_process_environment() {
         let inspector = DarwinInspector::new();
         let outer = spawn_shell(
-            "POHUNEK_SESSION_ID=inner-session /bin/sh -c 'trap \"\" TERM; while :; do sleep 1; done' & wait",
+            "POHUNEK_SESSION_ID=inner-session /bin/sh -c 'trap \"\" TERM; while :; do /bin/sleep 1; done' & wait",
             &[("POHUNEK_SESSION_ID", "outer-session"), ("POHUNEK_DAEMON_ID", "outer-daemon")],
             None,
         );
@@ -1644,7 +1673,7 @@ mod tests {
     fn an_argument_that_looks_like_a_marker_is_not_a_marker() {
         let inspector = DarwinInspector::new();
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done # POHUNEK_SESSION_ID=argv-only",
+            "trap '' TERM; while :; do /bin/sleep 1; done # POHUNEK_SESSION_ID=argv-only",
             &[],
             None,
         );
@@ -1671,7 +1700,7 @@ mod tests {
     fn no_secret_environment_value_reaches_facts_or_errors() {
         let inspector = DarwinInspector::new();
         let fixture = spawn_shell(
-            "trap '' TERM; while :; do sleep 1; done",
+            "trap '' TERM; while :; do /bin/sleep 1; done",
             &[("POHUNEK_TEST_SECRET", SECRET_SENTINEL)],
             None,
         );
@@ -1716,7 +1745,7 @@ mod tests {
     #[tokio::test]
     async fn exit_watch_completes_after_the_process_exits() {
         let inspector = DarwinInspector::new();
-        let mut fixture = spawn_shell("sleep 60", &[], None);
+        let mut fixture = spawn_shell("/bin/sleep 60", &[], None);
         let identity = live_identity(inspector, fixture.pid());
 
         let watch = inspector.exit_watch(identity).expect("arm the exit watch");
@@ -1729,7 +1758,7 @@ mod tests {
     #[tokio::test]
     async fn every_watch_on_one_identity_completes_once_it_exits() {
         let inspector = DarwinInspector::new();
-        let mut fixture = spawn_shell("sleep 60", &[], None);
+        let mut fixture = spawn_shell("/bin/sleep 60", &[], None);
         let identity = live_identity(inspector, fixture.pid());
 
         let first = inspector.exit_watch(identity).expect("arm the first watch");
@@ -1812,7 +1841,7 @@ mod tests {
     #[tokio::test]
     async fn many_idle_watches_stay_pending_and_then_all_complete() {
         let inspector = DarwinInspector::new();
-        let mut fixture = spawn_shell("sleep 60", &[], None);
+        let mut fixture = spawn_shell("/bin/sleep 60", &[], None);
         let identity = live_identity(inspector, fixture.pid());
 
         let mut watches = Vec::with_capacity(IDLE_WATCH_COUNT);
@@ -1854,7 +1883,7 @@ mod tests {
         reason = "the PTY ownership scenario is linear so each foreground transition stays ordered"
     )]
     fn foreground_group_tracks_the_terminal_owner() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use portable_pty::{native_pty_system, PtySize};
         use std::io::Read;
 
         let inspector = DarwinInspector::new();
@@ -1866,7 +1895,8 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("open a pseudoterminal");
-        let mut command = CommandBuilder::new("/bin/bash");
+        let env = TestEnv::new().expect("test environment");
+        let mut command = pty_command(&env, "/bin/bash");
         command.args(["--norc", "--noprofile", "-i"]);
         command.env("PS1", "READY>");
         let child = pair.slave.spawn_command(command).expect("spawn the shell");
@@ -1907,7 +1937,7 @@ mod tests {
             "an idle job-control shell owns its own terminal"
         );
 
-        std::io::Write::write_all(&mut writer, b"sleep 60 &\nsleep 60\n")
+        std::io::Write::write_all(&mut writer, b"/bin/sleep 60 &\n/bin/sleep 60\n")
             .expect("start a background and a foreground job");
         std::io::Write::flush(&mut writer).expect("flush the terminal writer");
 

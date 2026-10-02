@@ -68,7 +68,12 @@ fn uid() -> u32 {
 }
 
 fn launchctl(arguments: &[&str]) -> std::process::ExitStatus {
+    // Empty environment and `/` as the working directory, like the backend's
+    // own launchctl runner: the tool addresses launchd through the mach bootstrap
+    // port, not through any variable.
     Command::new("/bin/launchctl")
+        .env_clear()
+        .current_dir("/")
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -101,7 +106,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         require_gui_domain();
-        let temporary = tempfile::tempdir().expect("temporary directory");
+        let temporary = pohunek_test_support::tempdir().expect("temporary directory");
         // `/var` is a symlink on macOS; trusted directories never follow one.
         let root = std::fs::canonicalize(temporary.path()).expect("canonical root");
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))

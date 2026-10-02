@@ -158,6 +158,9 @@ impl Drop for Cleanup {
     }
 }
 
+// The systemd commands below keep the inherited environment on purpose: the
+// session bus address and `XDG_RUNTIME_DIR` select the real user manager that
+// these suites exercise, and the suites only run when explicitly enabled.
 fn systemctl(arguments: &[&str]) {
     match Command::new("systemctl")
         .arg("--user")
@@ -183,7 +186,7 @@ struct Installation {
 
 impl Installation {
     fn new() -> Self {
-        let root = tempfile::tempdir().expect("temporary installation root");
+        let root = pohunek_test_support::tempdir().expect("temporary installation root");
         let state = root.path().join("state");
         let runtime = root.path().join("runtime");
         std::fs::create_dir_all(&state).expect("state root");

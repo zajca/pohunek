@@ -648,7 +648,7 @@ async fn a_liveness_failure_after_sigterm_prevents_sigkill() {
 /// Sweeps against real processes through the host inspector and real signals.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod host {
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
 
     use crate::process::{HostInspector, ProcessIdentity, ProcessInspector};
@@ -664,15 +664,18 @@ mod host {
     const READY_POLL: Duration = Duration::from_millis(10);
 
     /// Ignores hangup and termination, like an agent that outlives its PTY.
-    const STUBBORN: &str = "trap '' HUP TERM; exec sleep 300";
+    const STUBBORN: &str = "trap '' HUP TERM; exec /bin/sleep 300";
     /// Exits on the default `SIGTERM` disposition.
-    const COMPLIANT: &str = "exec sleep 300";
+    const COMPLIANT: &str = "exec /bin/sleep 300";
 
     /// Spawned fixture that is killed and reaped when dropped.
     #[derive(Debug)]
     struct Fixture {
         child: Child,
         identity: ProcessIdentity,
+        /// Private working directory and scrubbed environment of the child;
+        /// removed after the child is reaped.
+        _env: pohunek_test_support::env::TestEnv,
     }
 
     impl Drop for Fixture {
@@ -684,10 +687,10 @@ mod host {
     }
 
     fn spawn(inspector: HostInspector, script: &str, runtime_id: Option<&str>) -> Fixture {
-        let mut command = Command::new("/bin/sh");
+        let env = pohunek_test_support::env::TestEnv::new().expect("test environment");
+        let mut command = env.command("/bin/sh");
         command
             .args(["-c", script])
-            .env_remove("POHUNEK_RUNTIME_ID")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -702,6 +705,7 @@ mod host {
                 pid,
                 start_identity: crate::process::StartIdentity::new(0),
             },
+            _env: env,
         };
         // The trap must be installed before any signal arrives, so wait until
         // the shell has replaced itself with `sleep`.
