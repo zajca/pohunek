@@ -149,6 +149,16 @@ mod tests {
 
     use super::*;
 
+    /// Sets the flag when dropped, including while a panic unwinds, so the
+    /// scoped spawn loops stop and `std::thread::scope` can return.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Scripts written and started while sibling threads keep spawning
     /// processes. With `fs::write` and `set_permissions` instead of the helper,
     /// this loop fails with `ETXTBSY` in nearly every run on a Linux host
@@ -178,16 +188,15 @@ mod tests {
                     }
                 });
             }
+            let _stop_siblings = StopOnDrop(&stop);
             for run in 0..SCRIPT_RUNS {
                 let path = dir.path().join(format!("fresh-{run}"));
                 write_executable(&path, "#!/bin/sh\nexit 0\n").expect("write script");
-                let status = Command::new(&path).status().unwrap_or_else(|error| {
-                    stop.store(true, Ordering::Relaxed);
-                    panic!("run {run}: {error}");
-                });
-                assert!(status.success());
+                let status = Command::new(&path)
+                    .status()
+                    .unwrap_or_else(|error| panic!("run {run}: {error}"));
+                assert!(status.success(), "run {run}: {status}");
             }
-            stop.store(true, Ordering::Relaxed);
         });
     }
 
