@@ -11,12 +11,22 @@
 use std::process::Command;
 
 /// Variables that move Git to another repository, index or object store than
-/// the one in the working directory.
+/// the one in the working directory, or that substitute the history it reads
+/// from that repository.
 ///
 /// These are the repository-location variables of git(1) "ENVIRONMENT
-/// VARIABLES" ("The Git Repository"). Git sets `GIT_DIR` and `GIT_INDEX_FILE`
-/// itself while it runs a hook, and `GIT_REFERENCE_BACKEND` overrides the
-/// repository's ref storage format. `GIT_DISCOVERY_ACROSS_FILESYSTEM` stays:
+/// VARIABLES" ("The Git Repository") and the repository-local variables that
+/// `git rev-parse --local-env-vars` lists. Git sets `GIT_DIR` and
+/// `GIT_INDEX_FILE` itself while it runs a hook, and `GIT_REFERENCE_BACKEND`
+/// overrides the repository's ref storage format. `GIT_SHALLOW_FILE` and
+/// `GIT_GRAFT_FILE` name another shallow boundary or graft list, and
+/// `GIT_REPLACE_REF_BASE` and `GIT_NO_REPLACE_OBJECTS` change which replace refs
+/// apply; each changes the commits `rev-list`, `rev-parse <commit>^` and
+/// `fetch` see. `GIT_IMPLICIT_WORK_TREE` stays: it only qualifies an explicit
+/// `GIT_DIR`, which is removed. `GIT_PREFIX` stays: Git only exports it to
+/// aliases and hooks and never reads it. `GIT_CONFIG`, `GIT_CONFIG_COUNT` and
+/// `GIT_CONFIG_PARAMETERS` stay because they are configuration input, like the
+/// other `GIT_CONFIG_*` variables. `GIT_DISCOVERY_ACROSS_FILESYSTEM` stays:
 /// unset is Git's default (stop at a filesystem boundary) and a set value only
 /// widens discovery, so removing it could hide a repository across a mount.
 /// `GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT` and `GIT_INDEX_VERSION` stay
@@ -39,6 +49,10 @@ pub(crate) const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
     "GIT_REFERENCE_BACKEND",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
 ];
 
 /// Variables that only restrict where Git looks for a repository.
@@ -101,6 +115,11 @@ mod tests {
     fn the_list_names_only_repository_location_variables() {
         for kept in [
             "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_PREFIX",
+            "GIT_IMPLICIT_WORK_TREE",
             "GIT_AUTHOR_NAME",
             "GIT_COMMITTER_EMAIL",
             "GIT_DISCOVERY_ACROSS_FILESYSTEM",
@@ -111,7 +130,7 @@ mod tests {
             assert!(!REPOSITORY_REDIRECTING_VARS.contains(&kept), "{kept}");
             assert!(!DISCOVERY_RESTRICTING_VARS.contains(&kept), "{kept}");
         }
-        assert_eq!(REPOSITORY_REDIRECTING_VARS.len(), 8);
+        assert_eq!(REPOSITORY_REDIRECTING_VARS.len(), 12);
         assert_eq!(DISCOVERY_RESTRICTING_VARS, ["GIT_CEILING_DIRECTORIES"]);
     }
 

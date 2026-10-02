@@ -730,7 +730,10 @@ const GIT: &str = "git";
 /// the one in the working directory.
 ///
 /// These are the repository-location variables of git(1) "ENVIRONMENT
-/// VARIABLES" ("The Git Repository"). Git sets `GIT_DIR` and `GIT_INDEX_FILE`
+/// VARIABLES" ("The Git Repository") and the variables that substitute the
+/// history Git reads (`GIT_SHALLOW_FILE`, `GIT_GRAFT_FILE`,
+/// `GIT_REPLACE_REF_BASE`, `GIT_NO_REPLACE_OBJECTS`), which would change the
+/// merge base of the changed-file query. Git sets `GIT_DIR` and `GIT_INDEX_FILE`
 /// itself while it runs a hook, so a loop started from a hook would otherwise
 /// ask about the hook's repository instead of the workspace. The discovery
 /// limits (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) and the
@@ -747,6 +750,10 @@ const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
     "GIT_REFERENCE_BACKEND",
+    "GIT_SHALLOW_FILE",
+    "GIT_GRAFT_FILE",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS",
 ];
 
 /// Builds a command for `program` that runs in `dir`; a Git command also drops
