@@ -87,15 +87,6 @@ struct PathGuard {
     old_path: Option<OsString>,
 }
 
-/// Name prefix of the agent-free `PATH` directories under Cargo's per-target
-/// test scratch directory.
-const AGENTLESS_PATH_PREFIX: &str = "agentless-path";
-
-/// Tools sibling tests resolve through `PATH` while it is isolated: `git`,
-/// `python3` and `sh` for stub agents, `sleep` and `stty` inside worker-backed
-/// shell commands.
-const AGENTLESS_PATH_TOOLS: [&str; 5] = ["git", "python3", "sh", "sleep", "stty"];
-
 impl PathGuard {
     async fn prepend(path: &Path) -> Self {
         let guard = PATH_LOCK.lock().await;
@@ -111,71 +102,6 @@ impl PathGuard {
             old_path,
         }
     }
-
-    /// Replace PATH with an isolated directory that contains NONE of the agent
-    /// binaries, so agent resolution deterministically fails regardless of what
-    /// is installed on the host (claude/codex may well be on the developer's
-    /// PATH).
-    ///
-    /// `PATH` is a process-wide environment variable (`std::env::set_var` has no
-    /// thread/task scoping), so while it is replaced here every OTHER concurrent
-    /// test's `fork`/`exec` of a worker-backed session's shell inherits this same
-    /// isolated `PATH` — `PATH_LOCK` only serializes this swap against other
-    /// PATH-*mutating* tests, not against ordinary session creation happening
-    /// elsewhere in the suite. The isolated directory therefore holds links to
-    /// [`AGENTLESS_PATH_TOOLS`], and it is never removed: a sibling process
-    /// started under it keeps a valid `PATH` after this guard restores the
-    /// variable. Each call creates a fresh directory, so no earlier content can
-    /// put an agent on the isolated `PATH`; it lives under Cargo's per-target
-    /// test scratch directory, not the system temporary directory. PATH is
-    /// restored on drop.
-    async fn isolated_without_agents() -> Self {
-        let guard = PATH_LOCK.lock().await;
-        let old_path = std::env::var_os("PATH");
-        let dir = fresh_agentless_dir();
-        if let Some(old_path) = &old_path {
-            for tool in AGENTLESS_PATH_TOOLS {
-                if let Some(real) = which_in(old_path, tool) {
-                    std::os::unix::fs::symlink(&real, dir.join(tool))
-                        .expect("link a tool into the agent-free PATH directory");
-                }
-            }
-        }
-        std::env::set_var("PATH", &dir);
-        Self {
-            _guard: guard,
-            old_path,
-        }
-    }
-}
-
-/// Creates a new, empty agent-free `PATH` directory.
-///
-/// `create_dir` fails on an existing name, so the returned directory is always
-/// one this call created; the name carries the process id and a per-process
-/// counter.
-fn fresh_agentless_dir() -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = root.join(format!(
-        "{AGENTLESS_PATH_PREFIX}-{}-{number}",
-        std::process::id()
-    ));
-    if dir.exists() {
-        // A previous run's process had this pid; its directory may hold anything.
-        std::fs::remove_dir_all(&dir).expect("remove a stale agent-free PATH directory");
-    }
-    std::fs::create_dir(&dir).expect("create the agent-free PATH directory");
-    dir
-}
-
-/// Resolve `name` to its first existing entry across the directories in a PATH
-/// value. A dependency-free `which` for [`PathGuard::isolated_without_agents`].
-fn which_in(path_var: &OsString, name: &str) -> Option<PathBuf> {
-    std::env::split_paths(path_var)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
 }
 
 impl Drop for PathGuard {
@@ -1346,6 +1272,24 @@ async fn wait_for_persisted_resume_and_worktree(
     .await
 }
 
+/// Closes the control connection, terminates the real daemon child and reaps
+/// it, each step bounded; returns the exit status.
+async fn stop_real_daemon(
+    mut client: Framed<UnixStream, LinesCodec>,
+    child: &mut tokio::process::Child,
+) -> std::process::ExitStatus {
+    tokio::time::timeout(DAEMON_CONTROL_REQUEST_TIMEOUT, client.get_mut().shutdown())
+        .await
+        .expect("close daemon health client before control timeout")
+        .expect("close daemon health client");
+
+    child.start_kill().expect("terminate real daemon");
+    tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, child.wait())
+        .await
+        .expect("real daemon stops before cleanup timeout")
+        .expect("wait for real daemon")
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -1477,16 +1421,7 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     ))
     .expect("deserialize worker-backed session stop result");
 
-    tokio::time::timeout(DAEMON_CONTROL_REQUEST_TIMEOUT, client.get_mut().shutdown())
-        .await
-        .expect("close daemon health client before control timeout")
-        .expect("close daemon health client");
-
-    child.start_kill().expect("terminate real daemon");
-    let status = tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, child.wait())
-        .await
-        .expect("real daemon stops before cleanup timeout")
-        .expect("wait for real daemon");
+    let status = stop_real_daemon(client, &mut child).await;
     assert!(!status.success(), "test termination stops the real daemon");
 
     let app_state = state_home.join(APP_DIR);
@@ -1767,21 +1702,68 @@ async fn attach_reporting_its_own_session_as_origin_is_rejected_over_the_socket(
     let _ = handle.await;
 }
 
+/// Programs a worker-backed session needs on the daemon's `PATH`; no agent
+/// binary is among them.
+const AGENTLESS_PATH_TOOLS: [&str; 1] = ["sh"];
+
+/// Owner-only name of the directory holding the child daemon's `PATH`.
+const AGENTLESS_PATH_DIR: &str = "bin";
+
+/// Creates an owner-only directory under `env`'s private root that holds links
+/// to [`AGENTLESS_PATH_TOOLS`] only, resolved from the test's own `PATH`.
+///
+/// The daemon rejects group- or world-writable `PATH` components, hence the
+/// explicit mode; the directory is removed with `env`.
+fn agentless_path_dir(env: &TestEnv) -> PathBuf {
+    use std::os::unix::fs::{symlink, DirBuilderExt as _};
+
+    let dir = env.root().join(AGENTLESS_PATH_DIR);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .expect("create the agent-free PATH directory");
+    let host_path = std::env::var_os("PATH").expect("the test process has a PATH");
+    for tool in AGENTLESS_PATH_TOOLS {
+        let real = std::env::split_paths(&host_path)
+            .map(|candidate| candidate.join(tool))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| panic!("`{tool}` is not on the test PATH"));
+        symlink(&real, dir.join(tool)).expect("link a tool into the agent-free PATH directory");
+    }
+    dir
+}
+
 #[tokio::test]
 async fn session_new_for_missing_agent_binary_returns_typed_error() {
-    let cwd = temp_dir("missing-agent-cwd");
-    let socket = temp_socket("missing-agent");
-    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
+    // The daemon runs as a child with a `PATH` of its own, so no agent binary
+    // is resolvable whatever the host has installed and no process-wide
+    // variable changes.
+    let env = TestEnv::new().expect("create the daemon child environment");
+    let path_dir = agentless_path_dir(&env);
+    let mut child = env
+        .tokio_command(bin_exe("pohunekd"))
+        .env("PATH", &path_dir)
+        .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
+        .env("POHUNEK_WORKER_BIN", worker_binary())
+        .env("SHELL", "/bin/sh")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn real daemon");
+    let socket = env.runtime_dir().join(APP_DIR).join("daemon.sock");
+    let mut client = wait_for_daemon_socket(&mut child, &socket).await;
 
-    let mut control = connect(&socket).await;
-    // Claude is resolved from PATH at launch. With PATH isolated so no `claude`
-    // binary is present, `session.new --agent claude` must fail with the typed,
-    // recoverable `agent_binary_missing` error (stable code a script can branch
-    // on) rather than a generic spawn failure.
-    let resp = {
-        let _path = PathGuard::isolated_without_agents().await;
-        create_session_with_agent(&mut control, AgentKind::Claude, cwd.to_path_buf()).await
-    };
+    // `session.new --agent claude` must fail with the typed, recoverable
+    // `agent_binary_missing` error (stable code a script can branch on)
+    // rather than a generic spawn failure.
+    let resp = tokio::time::timeout(
+        DAEMON_CONTROL_REQUEST_TIMEOUT,
+        create_session_with_agent(&mut client, AgentKind::Claude, env.cwd().to_path_buf()),
+    )
+    .await
+    .expect("session.new returns before control timeout");
 
     let err = err_payload(resp);
     assert_eq!(err.class, ErrorClass::Runtime);
@@ -1795,8 +1777,8 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
         "missing-binary error must carry a recover hint: {err:?}"
     );
 
-    let _ = shutdown.send(());
-    let _ = handle.await;
+    // The child is reaped before `env` drops and removes the PATH directory.
+    stop_real_daemon(client, &mut child).await;
 }
 
 /// Block until `socket` genuinely refuses connections, bounded by a timeout.
