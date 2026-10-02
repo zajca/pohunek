@@ -2,36 +2,21 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::process::Stdio;
 
 use pohunek_prompt::{render, Provider};
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-prompt-{tag}-{}-{nanos}-{n}",
-        std::process::id(),
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
+use pohunek_test_support::env::TestEnv;
 
 fn python_render(
+    env: &TestEnv,
     template_path: &Path,
     provider: &str,
     item_id: &str,
     context_json: &str,
 ) -> String {
-    let mut child = Command::new("python3")
+    let mut child = env
+        .command("python3")
         .args([
             "-",
             template_path.to_str().expect("utf8 template path"),
@@ -117,12 +102,12 @@ sys.stdout.write(rendered)
 }
 
 fn assert_matches_python(provider: Provider, provider_name: &str, item_id: &str, context: &str) {
-    let dir = temp_dir(provider_name);
-    let template_path = dir.join("prompt.tmpl");
+    let env = TestEnv::new().expect("private test environment");
+    let template_path = env.cwd().join("prompt.tmpl");
     let template = "provider=${provider}\nid=${id}\nnumber=${number}\ntitle=${title}\nbody=${body}\nbranch=${branch}\nurl=${url}\n";
     fs::write(&template_path, template).expect("write template");
 
-    let expected = python_render(&template_path, provider_name, item_id, context);
+    let expected = python_render(&env, &template_path, provider_name, item_id, context);
     let actual = render(template, provider, item_id, context).expect("render prompt");
 
     assert_eq!(actual, expected);

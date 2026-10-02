@@ -77,7 +77,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().expect("create temp dir");
+        let temp = pohunek_test_support::tempdir().expect("create temp dir");
         let root = fs::canonicalize(temp.path()).expect("canonicalize temp dir");
         let config_dir = root.join("config");
         fs::create_dir(&config_dir).expect("create config dir");
@@ -797,7 +797,7 @@ fn writable_by_others_directories_are_rejected() {
 
 /// Returns whether the tests run as root, which owns the system directories.
 fn running_as_root() -> bool {
-    let probe = tempfile::tempdir().expect("create temp dir");
+    let probe = pohunek_test_support::tempdir().expect("create temp dir");
     fs::metadata(probe.path()).expect("stat temp dir").uid() == 0
 }
 

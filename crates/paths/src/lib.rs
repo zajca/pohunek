@@ -1018,7 +1018,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // Keep synthetic runtime paths below the strictest supported Unix-socket limit.
-    const TEST_BASE_ROOT: &str = "/tmp";
+    const TEST_BASE_ROOT: &str = "/work";
     const CUSTOM_DATA_HOME: &str = "CUSTOM_DATA_HOME";
 
     const VARS: [&str; 7] = [

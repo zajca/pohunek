@@ -3445,7 +3445,7 @@ mod tests {
     fn lost_session_can_resume_but_remains_in_unavailable_group() {
         let mut lost = session_with_runtime("lost", "runtime-lost");
         lost.runtime.as_mut().expect("runtime").state = RuntimeState::Lost;
-        lost.native_session_path = Some("/tmp/native-session.json".to_owned());
+        lost.native_session_path = Some("/work/native-session.json".to_owned());
 
         let access = session_access(&lost);
         assert_eq!(access, SessionAccess::Resume);
@@ -5283,15 +5283,15 @@ mod tests {
             "{bin} attach --host {host} {id}",
             &AttachTemplateValues {
                 bin: "/opt/pohunek bin".to_owned(),
-                host: "devbox; touch /tmp/pwn".to_owned(),
-                id: "s-7'$(touch /tmp/pwn)".to_owned(),
+                host: "devbox; touch /work/pwn".to_owned(),
+                id: "s-7'$(touch /work/pwn)".to_owned(),
             },
         )
         .expect("render");
 
         assert_eq!(
             command,
-            "'/opt/pohunek bin' attach --host 'devbox; touch /tmp/pwn' 's-7'\\''$(touch /tmp/pwn)'"
+            "'/opt/pohunek bin' attach --host 'devbox; touch /work/pwn' 's-7'\\''$(touch /work/pwn)'"
         );
     }
 

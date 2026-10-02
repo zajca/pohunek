@@ -52,49 +52,56 @@ mod tests {
 
     #[test]
     fn non_executable_file_on_path_is_not_resolved() {
-        let dir = tempfile_dir("non-exec");
-        write_file(&dir, "tool", 0o644);
+        let dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-non-exec-")
+            .expect("private fixture directory");
+        let dir = dir_guard.path();
+        write_file(dir, "tool", 0o644);
         let path_var = OsString::from(dir.as_os_str());
 
         assert_eq!(resolve_executable("tool", Some(&path_var)), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn executable_file_on_path_is_resolved() {
-        let dir = tempfile_dir("exec");
-        let tool = write_file(&dir, "tool", 0o755);
+        let dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-exec-")
+            .expect("private fixture directory");
+        let dir = dir_guard.path();
+        let tool = write_file(dir, "tool", 0o755);
         let path_var = OsString::from(dir.as_os_str());
 
         assert_eq!(resolve_executable("tool", Some(&path_var)), Some(tool));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn execute_permission_is_decided_for_the_effective_user() {
-        let dir = tempfile_dir("owner-bits");
+        let dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-owner-bits-")
+            .expect("private fixture directory");
+        let dir = dir_guard.path();
         // Owner-only read and execute: executable for the owner running this
         // test. (An execute-only file cannot be opened for inspection and is
         // skipped like any candidate the shared check cannot vouch for.)
-        let owner_only = write_file(&dir, "owner-only", 0o500);
+        let owner_only = write_file(dir, "owner-only", 0o500);
         // Group/other execute without the owner bit: the kernel denies the
         // owner, unlike a check of "any execute bit".
-        let others_only = write_file(&dir, "others-only", 0o011);
+        let others_only = write_file(dir, "others-only", 0o011);
 
         assert!(is_executable_file(&owner_only));
         if !rustix::process::geteuid().is_root() {
             assert!(!is_executable_file(&others_only));
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_unexecutable_entry_does_not_stop_the_search() {
-        let first = tempfile_dir("eacces-a");
-        let second = tempfile_dir("eacces-b");
-        write_file(&first, "tool", 0o011);
-        let tool = write_file(&second, "tool", 0o755);
-        let path_var = std::env::join_paths([&first, &second]).unwrap();
+        let first_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-eacces-a-")
+            .expect("private fixture directory");
+        let first = first_guard.path();
+        let second_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-eacces-b-")
+            .expect("private fixture directory");
+        let second = second_guard.path();
+        write_file(first, "tool", 0o011);
+        let tool = write_file(second, "tool", 0o755);
+        let path_var = std::env::join_paths([first, second]).unwrap();
 
         let resolved = resolve_executable("tool", Some(&path_var));
 
@@ -103,63 +110,64 @@ mod tests {
         } else {
             assert_eq!(resolved, Some(tool));
         }
-        let _ = std::fs::remove_dir_all(&first);
-        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]
     fn earlier_non_executable_entry_does_not_shadow_a_later_executable() {
-        let first = tempfile_dir("shadow-a");
-        let second = tempfile_dir("shadow-b");
-        write_file(&first, "tool", 0o644);
-        let tool = write_file(&second, "tool", 0o755);
-        let path_var = std::env::join_paths([&first, &second]).unwrap();
+        let first_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-shadow-a-")
+            .expect("private fixture directory");
+        let first = first_guard.path();
+        let second_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-shadow-b-")
+            .expect("private fixture directory");
+        let second = second_guard.path();
+        write_file(first, "tool", 0o644);
+        let tool = write_file(second, "tool", 0o755);
+        let path_var = std::env::join_paths([first, second]).unwrap();
 
         assert_eq!(resolve_executable("tool", Some(&path_var)), Some(tool));
-        let _ = std::fs::remove_dir_all(&first);
-        let _ = std::fs::remove_dir_all(&second);
     }
 
     #[test]
     fn program_with_separator_is_checked_as_given_and_ignores_path() {
-        let dir = tempfile_dir("abs");
-        let tool = write_file(&dir, "tool", 0o755);
-        let plain = write_file(&dir, "plain", 0o600);
+        let dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-abs-")
+            .expect("private fixture directory");
+        let dir = dir_guard.path();
+        let tool = write_file(dir, "tool", 0o755);
+        let plain = write_file(dir, "plain", 0o600);
 
         assert_eq!(resolve_executable(tool.to_str().unwrap(), None), Some(tool));
         assert_eq!(resolve_executable(plain.to_str().unwrap(), None), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn directory_and_unset_path_resolve_nothing() {
-        let dir = tempfile_dir("dir");
+        let dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-dir-")
+            .expect("private fixture directory");
+        let dir = dir_guard.path();
         std::fs::create_dir(dir.join("tool")).unwrap();
         let path_var = OsString::from(dir.as_os_str());
 
         assert_eq!(resolve_executable("tool", Some(&path_var)), None);
         assert_eq!(resolve_executable("tool", None), None);
         assert_eq!(resolve_executable("", Some(&path_var)), None);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A private (0700) random directory below the temporary root.
-    fn tempfile_dir(tag: &str) -> PathBuf {
-        pohunek_test_support::tempdir_with_prefix(&format!("ph-hc-{tag}-"))
-            .expect("private fixture directory")
-            .keep()
     }
 
     #[test]
     fn a_writable_file_or_directory_never_resolves_and_a_safe_later_one_wins() {
-        let loose_file_dir = tempfile_dir("loose-file");
-        let loose_dir = tempfile_dir("loose-dir");
-        let safe_dir = tempfile_dir("safe");
-        write_file(&loose_file_dir, "git", 0o777);
-        std::fs::set_permissions(&loose_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        write_file(&loose_dir, "git", 0o755);
-        let safe = write_file(&safe_dir, "git", 0o755);
-        for unsafe_only in [&loose_file_dir, &loose_dir] {
+        let loose_file_dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-loose-file-")
+            .expect("private fixture directory");
+        let loose_file_dir = loose_file_dir_guard.path();
+        let loose_dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-loose-dir-")
+            .expect("private fixture directory");
+        let loose_dir = loose_dir_guard.path();
+        let safe_dir_guard = pohunek_test_support::tempdir_with_prefix("ph-hc-safe-")
+            .expect("private fixture directory");
+        let safe_dir = safe_dir_guard.path();
+        write_file(loose_file_dir, "git", 0o777);
+        std::fs::set_permissions(loose_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        write_file(loose_dir, "git", 0o755);
+        let safe = write_file(safe_dir, "git", 0o755);
+        for unsafe_only in [loose_file_dir, loose_dir] {
             let path_var = OsString::from(unsafe_only.as_os_str());
             assert_eq!(resolve_executable("git", Some(&path_var)), None);
             assert!(!is_executable_file(&unsafe_only.join("git")));
@@ -168,7 +176,7 @@ mod tests {
                 crate::DoctorStatus::Ok
             );
         }
-        let path_var = std::env::join_paths([&loose_file_dir, &loose_dir, &safe_dir]).unwrap();
+        let path_var = std::env::join_paths([loose_file_dir, loose_dir, safe_dir]).unwrap();
         assert_eq!(
             resolve_executable("git", Some(&path_var)),
             Some(safe.clone())

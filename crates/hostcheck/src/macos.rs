@@ -1254,6 +1254,7 @@ mod tests {
         // root; `runtime` is shorter. The check is made with the real path
         // validation for the macOS root `/private/tmp`, whatever the host is.
         let root =
+            // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
             Path::new("/private/tmp").join(fixture_name(MAX_FIXTURE_PID, MAX_FIXTURE_COUNTER));
         let workers = root.join("run").join("pohunek").join(WORKERS_SUBDIR);
 
@@ -1980,12 +1981,14 @@ mod tests {
 
     #[test]
     fn socket_path_length_accepts_the_default_darwin_runtime_dir() {
+        // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
         let check = check_socket_path_length(Path::new("/private/tmp/pohunek-501"));
         assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail);
     }
 
     #[test]
     fn socket_path_length_fails_for_overlong_runtime_dir() {
+        // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
         let long = format!("/private/tmp/{}", "x".repeat(90));
 
         let check = check_socket_path_length(Path::new(&long));
@@ -1997,6 +2000,7 @@ mod tests {
     #[test]
     fn socket_path_length_fails_when_only_the_worker_path_overflows() {
         // The daemon socket fits, but the workers/<id>/control.sock path does not.
+        // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
         let dir = format!("/private/tmp/{}", "y".repeat(40));
         validate_staged_socket_path(
             Path::new(&dir).join(SOCKET_NAME),
@@ -2339,7 +2343,7 @@ mod tests {
         ] {
             assert!(is_tcc_protected(Path::new(path), Some(home)), "{path}");
         }
-        for path in ["/Users/me/Code/p", "/Users/me/DocumentsOld/p", "/tmp/p"] {
+        for path in ["/Users/me/Code/p", "/Users/me/DocumentsOld/p", "/work/p"] {
             assert!(!is_tcc_protected(Path::new(path), Some(home)), "{path}");
         }
     }
@@ -2514,7 +2518,9 @@ mod tests {
     fn a_long_isolated_root_overflows_the_worker_socket_limit() {
         // Shape of a test fixture root on macOS: canonical /private/tmp plus a
         // descriptive directory name, with the runtime dir at run/pohunek.
+        // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
         let long = Path::new("/private/tmp/pohunek-cli-process-api-12345-0/run/pohunek");
+        // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
         let short = Path::new("/private/tmp/pcpa-12345-0/run/pohunek");
 
         let overflow = check_socket_path_length(long);

@@ -1406,8 +1406,8 @@ mod tests {
                     projects: vec![protocol::ProjectInfo {
                         id: "p-1".to_owned(),
                         label: "api".to_owned(),
-                        repo_root: "/tmp/api".into(),
-                        git_common_dir: "/tmp/api/.git".into(),
+                        repo_root: "/work/api".into(),
+                        git_common_dir: "/work/api/.git".into(),
                         origin_url: None,
                         default_base_branch: None,
                         source: protocol::ProjectSource::Manual,

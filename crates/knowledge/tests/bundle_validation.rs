@@ -162,25 +162,13 @@ fn parent_escape_markdown_link_fails_validation() {
 #[cfg(unix)]
 #[test]
 fn unsupported_file_type_fails_validation() {
-    let root = temp_dir("unsupported-file-type");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-unsupported-file-type-")
+        .expect("create temp dir");
+    let root = guard.path();
     std::fs::write(root.join("index.md"), "# Index\n").expect("write index");
     std::os::unix::fs::symlink("index.md", root.join("linked-index.md")).expect("create symlink");
 
-    let error = validate_bundle(&root).expect_err("fixture should fail");
+    let error = validate_bundle(root).expect_err("fixture should fail");
 
     assert!(has_issue(&error, "unsupported_file_type"));
-}
-
-#[cfg(unix)]
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-knowledge-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after unix epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
 }
