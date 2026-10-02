@@ -19,6 +19,10 @@ const AMBIENT_GIT_VARS: [(&str, &str); 4] = [
     ("GIT_REFERENCE_BACKEND", "bogus"),
 ];
 
+/// Variable naming the repository the child creates and the parent set as the
+/// ceiling, so the ceiling sits at the project root.
+const REPO_VAR: &str = "POHUNEK_TEST_GIT_REPO";
+
 /// Runs a setup `git` command with the test environment's scrubbed variables,
 /// so the ambient variables of the child never reach the fixture itself.
 fn fixture_git(env: &TestEnv, repo: &Path, args: &[&str]) {
@@ -41,7 +45,7 @@ fn fixture_git(env: &TestEnv, repo: &Path, args: &[&str]) {
 #[ignore = "child process of ambient_git_variables_do_not_redirect_daemon_git"]
 fn daemon_git_under_ambient_git_variables() {
     let env = TestEnv::new().expect("hermetic test environment");
-    let repo = env.root().join("repo");
+    let repo = std::path::PathBuf::from(std::env::var_os(REPO_VAR).expect("repository path"));
     std::fs::create_dir(&repo).expect("create repository directory");
     fixture_git(&env, &repo, &["init", "-q", "-b", "main"]);
     fixture_git(&env, &repo, &["config", "user.email", "test@example.com"]);
@@ -59,6 +63,17 @@ fn daemon_git_under_ambient_git_variables() {
         std::fs::canonicalize(&repo).expect("canonical repository")
     );
 
+    // `GIT_CEILING_DIRECTORIES` names the project root, and session directories
+    // are often nested inside the project: detection still finds it.
+    let nested = repo.join("crates/daemon/src");
+    std::fs::create_dir_all(&nested).expect("create nested directory");
+    let toplevel = crate::project::detect::git(&nested, &["rev-parse", "--show-toplevel"])
+        .expect("detection from a nested directory reaches the project repository");
+    assert_eq!(
+        std::fs::canonicalize(toplevel).expect("canonical toplevel"),
+        std::fs::canonicalize(&repo).expect("canonical repository")
+    );
+
     // A worktree operation addresses the same repository.
     let checkout = env.root().join("checkout");
     worktree_add_new(&repo, &checkout, "feature", "main").expect("add worktree");
@@ -71,6 +86,7 @@ fn daemon_git_under_ambient_git_variables() {
 #[test]
 fn ambient_git_variables_do_not_redirect_daemon_git() {
     let env = TestEnv::new().expect("hermetic test environment");
+    let repo = env.root().join("repo");
     let output = env
         .command(std::env::current_exe().expect("test executable"))
         .args([
@@ -79,6 +95,8 @@ fn ambient_git_variables_do_not_redirect_daemon_git() {
             "worktree::git_env_tests::daemon_git_under_ambient_git_variables",
         ])
         .envs(AMBIENT_GIT_VARS)
+        .env("GIT_CEILING_DIRECTORIES", &repo)
+        .env(REPO_VAR, &repo)
         .output()
         .expect("run scenario child");
     assert!(

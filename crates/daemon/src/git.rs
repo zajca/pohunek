@@ -16,19 +16,20 @@ use std::process::Command;
 /// These are the repository-location variables of git(1) "ENVIRONMENT
 /// VARIABLES" ("The Git Repository"). Git sets `GIT_DIR` and `GIT_INDEX_FILE`
 /// itself while it runs a hook, and `GIT_REFERENCE_BACKEND` overrides the
-/// repository's ref storage format. The discovery limits
-/// (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) stay because
-/// every daemon command starts at the repository it names. `GIT_DEFAULT_HASH`,
-/// `GIT_DEFAULT_REF_FORMAT` and `GIT_INDEX_VERSION` stay because they only shape
-/// a repository or index Git newly creates and never redirect a command at an
-/// existing repository. The user's configuration and identity variables
-/// (`GIT_CONFIG_*`, `GIT_AUTHOR_*`, `GIT_COMMITTER_*`, `GIT_SSH_COMMAND`, ...)
-/// stay because they are legitimate input.
+/// repository's ref storage format. `GIT_DISCOVERY_ACROSS_FILESYSTEM` stays:
+/// unset is Git's default (stop at a filesystem boundary) and a set value only
+/// widens discovery, so removing it could hide a repository across a mount.
+/// `GIT_DEFAULT_HASH`, `GIT_DEFAULT_REF_FORMAT` and `GIT_INDEX_VERSION` stay
+/// because they only shape a repository or index while Git creates it and never
+/// redirect a command at an existing repository. The user's configuration and
+/// identity variables (`GIT_CONFIG_*`, `GIT_AUTHOR_*`, `GIT_COMMITTER_*`,
+/// `GIT_SSH_COMMAND`, ...) stay because they are legitimate input.
 ///
-/// `xtask` keeps the same list for its changed-file queries
+/// `xtask` keeps this list for its changed-file queries
 /// (`REPOSITORY_REDIRECTING_VARS` in `crates/xtask/src/affected.rs`); a test
-/// here keeps the two equal, because no crate both depend on is a
-/// sensible home for a list of Git variable names.
+/// here keeps it equal, because no crate both depend on is a sensible home for
+/// a list of Git variable names. The daemon additionally drops
+/// [`DISCOVERY_RESTRICTING_VARS`].
 pub(crate) const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_DIR",
     "GIT_COMMON_DIR",
@@ -40,8 +41,18 @@ pub(crate) const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_REFERENCE_BACKEND",
 ];
 
+/// Variables that only restrict where Git looks for a repository.
+///
+/// `GIT_CEILING_DIRECTORIES` stops discovery at the listed directories. A daemon
+/// runs git with `-C <session cwd>`, often a nested directory of the project, so
+/// an inherited ceiling at the project root hides the project from detection;
+/// the daemon's own environment is incidental to the sessions it serves. `xtask`
+/// does not drop it because it always runs git from the repository root.
+pub(crate) const DISCOVERY_RESTRICTING_VARS: &[&str] = &["GIT_CEILING_DIRECTORIES"];
+
 /// Builds a command for the trusted `git` executable that drops the
-/// [`REPOSITORY_REDIRECTING_VARS`] it would inherit.
+/// [`REPOSITORY_REDIRECTING_VARS`] and [`DISCOVERY_RESTRICTING_VARS`] it would
+/// inherit.
 ///
 /// The executable is resolved once through
 /// [`trusted_program`](crate::agent::trusted_program), so no second `PATH`
@@ -55,7 +66,10 @@ pub(crate) fn command() -> Result<Command, String> {
     let program =
         crate::agent::trusted_program("git").map_err(|err| format!("failed to run git: {err}"))?;
     let mut command = Command::new(program);
-    for var in REPOSITORY_REDIRECTING_VARS {
+    for var in REPOSITORY_REDIRECTING_VARS
+        .iter()
+        .chain(DISCOVERY_RESTRICTING_VARS)
+    {
         command.env_remove(var);
     }
     Ok(command)
@@ -77,6 +91,7 @@ mod tests {
             .collect();
         removed.sort_unstable();
         let mut expected = REPOSITORY_REDIRECTING_VARS.to_vec();
+        expected.extend(DISCOVERY_RESTRICTING_VARS);
         expected.sort_unstable();
         assert_eq!(removed, expected);
         assert_eq!(command.get_envs().count(), expected.len());
@@ -88,10 +103,16 @@ mod tests {
             "GIT_CONFIG_GLOBAL",
             "GIT_AUTHOR_NAME",
             "GIT_COMMITTER_EMAIL",
+            "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+            "GIT_DEFAULT_HASH",
+            "GIT_DEFAULT_REF_FORMAT",
+            "GIT_INDEX_VERSION",
         ] {
             assert!(!REPOSITORY_REDIRECTING_VARS.contains(&kept), "{kept}");
+            assert!(!DISCOVERY_RESTRICTING_VARS.contains(&kept), "{kept}");
         }
         assert_eq!(REPOSITORY_REDIRECTING_VARS.len(), 8);
+        assert_eq!(DISCOVERY_RESTRICTING_VARS, ["GIT_CEILING_DIRECTORIES"]);
     }
 
     /// Names in the string-literal list that follows `marker` in `source`.
@@ -109,18 +130,28 @@ mod tests {
     }
 
     #[test]
-    fn the_list_equals_the_xtask_list() {
+    fn the_list_contains_every_xtask_variable_and_only_the_ceiling_is_daemon_only() {
         let xtask = pohunek_test_support::workspace_root().join("crates/xtask/src/affected.rs");
         let source = std::fs::read_to_string(xtask).expect("read the xtask affected module");
-        let mut theirs = literal_list(&source, "const REPOSITORY_REDIRECTING_VARS")
+        let theirs = literal_list(&source, "const REPOSITORY_REDIRECTING_VARS")
             .expect("xtask declares REPOSITORY_REDIRECTING_VARS");
-        let mut ours: Vec<String> = REPOSITORY_REDIRECTING_VARS
+        let ours: Vec<&str> = REPOSITORY_REDIRECTING_VARS
             .iter()
-            .map(|name| (*name).to_owned())
+            .chain(DISCOVERY_RESTRICTING_VARS)
+            .copied()
             .collect();
-        ours.sort_unstable();
-        theirs.sort_unstable();
-        assert_eq!(ours, theirs);
+        for name in &theirs {
+            assert!(ours.contains(&name.as_str()), "daemon list lacks {name}");
+        }
+        // The daemon runs git from nested session directories, where an
+        // inherited ceiling hides the project; xtask runs from the repository
+        // root, where it cannot.
+        let daemon_only: Vec<&str> = ours
+            .iter()
+            .copied()
+            .filter(|name| !theirs.iter().any(|theirs| theirs == name))
+            .collect();
+        assert_eq!(daemon_only, ["GIT_CEILING_DIRECTORIES"]);
     }
 
     /// Product code outside this module that resolves or spawns `git`.
