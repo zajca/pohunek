@@ -818,6 +818,14 @@ impl PtyOwner {
 
     /// Idempotently stops the retained process group.
     ///
+    /// Returns the root's exit once the root has been reaped. When a process
+    /// outside the group kept the PTY open past the stop deadline, the output
+    /// is force-closed and the exit is still returned: whether the output
+    /// reached EOF or was cut off is the immutable
+    /// [`output_completion`](Self::output_completion) of the sealed output.
+    /// When the root's exit is not known, the stop fails instead of inventing
+    /// one.
+    ///
     /// # Errors
     ///
     /// Returns [`PtyError`] for signal, identity, timeout, or join failures.
@@ -825,7 +833,7 @@ impl PtyOwner {
         let mut cleanup = self.cleanup.lock().await;
         match &*cleanup {
             CleanupState::Finished(exit) => return Ok(exit.clone()),
-            CleanupState::ForcedClosed => return Err(PtyError::OutputForcedClosed),
+            CleanupState::ForcedClosed => return self.known_root_exit(),
             CleanupState::ForcedClosing => {
                 let completion = self.seal_and_release_output(&mut cleanup)?;
                 return self.finish_sealed_cleanup(&mut cleanup, completion).await;
@@ -906,11 +914,17 @@ impl PtyOwner {
             CleanupState::ForcedClosed => return Err(PtyError::OutputForcedClosed),
             CleanupState::ForcedClosing => {
                 let completion = self.seal_and_release_output(&mut cleanup)?;
-                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+                return self
+                    .finish_sealed_cleanup(&mut cleanup, completion)
+                    .await
+                    .and_then(|exit| self.reject_forced_close(exit));
             }
             CleanupState::OutputAuthorityReleased(completion) => {
                 let completion = *completion;
-                return self.finish_sealed_cleanup(&mut cleanup, completion).await;
+                return self
+                    .finish_sealed_cleanup(&mut cleanup, completion)
+                    .await
+                    .and_then(|exit| self.reject_forced_close(exit));
             }
             CleanupState::ObservationAuthorityReleased(message)
             | CleanupState::ObservationFailed(message) => {
@@ -1019,8 +1033,32 @@ impl PtyOwner {
             OutputCompletion::ForcedClosed { .. } => {
                 self.reap_and_detach_reader().await?;
                 *cleanup = CleanupState::ForcedClosed;
-                Err(PtyError::OutputForcedClosed)
+                self.known_root_exit()
             }
+        }
+    }
+
+    /// Returns the root's exit when it has been observed, without waiting.
+    ///
+    /// The output was force-closed only after the root was seen exiting, so the
+    /// exit is normally present. A root whose exit is unknown, or whose
+    /// observation failed, is an error: no exit is assumed.
+    fn known_root_exit(&self) -> Result<Exit, PtyError> {
+        match &*self.exit_rx.borrow() {
+            Some(RootObservation::Exited(exit)) => Ok(exit.clone()),
+            Some(RootObservation::Failed(message)) => Err(PtyError::ChildObservation {
+                message: message.clone(),
+            }),
+            None => Err(PtyError::ExitTimeout),
+        }
+    }
+
+    /// Keeps the natural-finish contract: a forced close is an error there.
+    fn reject_forced_close(&self, exit: Exit) -> Result<Exit, PtyError> {
+        if self.output_forced_closed() {
+            Err(PtyError::OutputForcedClosed)
+        } else {
+            Ok(exit)
         }
     }
 
@@ -2636,7 +2674,7 @@ mod tests {
             cols: 80,
             rows: 24,
         });
-        pohunek_test_support::wait::guard("the root to exit", pty.wait_exit())
+        let root_exit = pohunek_test_support::wait::guard("the root to exit", pty.wait_exit())
             .await
             .expect("root exit");
         assert!(!pty.output().observe(None, 1).expect("output page").exited);
@@ -2644,16 +2682,21 @@ mod tests {
         // The escaped holder never closes the PTY, so the outcome is a forced close
         // whatever the grace is; the short grace only keeps the test fast, and the
         // hang guard replaces a wall-clock bound on the stop.
-        let error = pohunek_test_support::wait::guard(
+        let stopped = pohunek_test_support::wait::guard(
             "stop to force-close the escaped output",
             pty.stop("stop-escaped-descendant", Duration::from_millis(50)),
         )
         .await
-        .expect_err("escaped PTY holder requires forced close");
-        assert!(matches!(error, PtyError::OutputForcedClosed));
-        assert!(matches!(
+        .expect("a forced output close still returns the root exit");
+        assert_eq!(stopped, root_exit);
+        assert_eq!(
             pty.stop("stop-escaped-descendant-again", Duration::from_millis(50))
-                .await,
+                .await
+                .expect("a repeated stop returns the same exit"),
+            root_exit
+        );
+        assert!(matches!(
+            pty.finish_natural().await,
             Err(PtyError::OutputForcedClosed)
         ));
         assert!(pty.output_forced_closed());
@@ -2662,6 +2705,21 @@ mod tests {
             read_process_start(pty.identity().pid).is_err(),
             "root must be reaped after the final safe group signal"
         );
+    }
+
+    #[tokio::test]
+    async fn a_root_whose_exit_is_unknown_has_no_exit_to_report() {
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("sleep 30", cwd.path()));
+        assert!(
+            matches!(pty.known_root_exit(), Err(PtyError::ExitTimeout)),
+            "an unobserved root yields no exit"
+        );
+        let exit = pty
+            .stop("cleanup", Duration::from_millis(200))
+            .await
+            .expect("stop the root");
+        assert_eq!(pty.known_root_exit().expect("observed exit"), exit);
     }
 
     // Needs a descendant that keeps the PTY open after the root exits. Darwin

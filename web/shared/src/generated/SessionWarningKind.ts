@@ -12,4 +12,5 @@ export type SessionWarningKind =
   | "fetch"
   | "base_branch_fallback"
   | "setup_script"
-  | "hook";
+  | "hook"
+  | "output_force_closed";

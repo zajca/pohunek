@@ -2279,6 +2279,12 @@ pub enum SessionWarningKind {
     /// the warning's `message`/`detail`, not the kind (a **unit** variant, so the
     /// enum stays `Copy` and serializes to the bare string `"hook"`).
     Hook,
+    /// The session's PTY output was force-closed when it stopped: a process
+    /// outside the session's process group kept the terminal open past the
+    /// stop deadline. The session still ended with its root's exit; output the
+    /// holder wrote after the close is not retained. Set on the terminal
+    /// session, never invented when the exit is unknown.
+    OutputForceClosed,
 }
 
 /// A non-fatal warning surfaced while setting up a session's worktree.

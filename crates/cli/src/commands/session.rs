@@ -2055,6 +2055,7 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
         SessionWarningKind::BaseBranchFallback => "base_branch_fallback",
         SessionWarningKind::SetupScript => "setup_script",
         SessionWarningKind::Hook => "hook",
+        SessionWarningKind::OutputForceClosed => "output_force_closed",
     }
 }
 

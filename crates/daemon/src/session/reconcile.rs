@@ -165,6 +165,10 @@ struct JournalOutcome {
     exit_code: Option<i32>,
     signal: Option<String>,
     success: bool,
+    /// The worker force-closed the PTY output before it reached EOF; absent in
+    /// a journal written before the field existed.
+    #[serde(default)]
+    output_forced_closed: bool,
 }
 
 #[derive(Debug)]
@@ -1898,6 +1902,9 @@ impl SessionRegistry {
         let stopped_by_intent = record.desired_state != DesiredState::Running;
         if let Some(outcome) = evidence.outcome {
             record.info.exit_code = outcome.exit_code;
+            if outcome.output_forced_closed {
+                super::note_output_force_closed(&mut record.info.warnings);
+            }
             record.info.state = if stopped_by_intent {
                 SessionState::Stopped
             } else if outcome.success && outcome.signal.is_none() {
@@ -2707,6 +2714,9 @@ impl SessionRegistry {
                 terminal.transaction = None;
                 terminal.info.state = SessionState::Stopped;
                 terminal.info.exit_code = exit.code;
+                if exit.output_forced_closed {
+                    super::note_output_force_closed(&mut terminal.info.warnings);
+                }
                 terminal
                     .info
                     .runtime
@@ -4546,6 +4556,7 @@ while os.getppid() == parent:
                 exit_code: Some(0),
                 signal: None,
                 success: true,
+                output_forced_closed: false,
             }),
             subagents: Vec::new(),
         };
@@ -5904,6 +5915,7 @@ while os.getppid() == parent:
             success: true,
             exited_at: "2026-07-23T00:01:00Z".to_owned(),
             reason: "natural_exit".to_owned(),
+            output_forced_closed: false,
         });
         let mut journal_value = serde_json::to_value(&journal).expect("serialize journal fixture");
         journal_value["subagent_revision"] = serde_json::json!(4);
@@ -7776,6 +7788,7 @@ while os.getppid() == parent:
                         success: true,
                         exited_at: "2026-09-24T00:01:00Z".to_owned(),
                         reason: "natural_exit".to_owned(),
+                        output_forced_closed: false,
                     });
                 },
             );

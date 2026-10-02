@@ -133,6 +133,13 @@ pub struct RuntimeOutcome {
     pub exited_at: String,
     /// Worker-classified terminal reason.
     pub reason: String,
+    /// Whether the PTY output was force-closed before it reached EOF.
+    ///
+    /// Absent in a journal written before this field existed, which reads as
+    /// `false`. Old readers ignore it: the journal reader rejects only an
+    /// unknown schema version, never an unknown field.
+    #[serde(default)]
+    pub output_forced_closed: bool,
 }
 
 /// Immutable launch provider identity.
@@ -600,6 +607,15 @@ fn temp_path(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_outcome_without_the_forced_close_field_reads_as_not_forced() {
+        let outcome: super::RuntimeOutcome = serde_json::from_str(
+            r#"{"exit_code":0,"signal":null,"success":true,"exited_at":"2026-10-02T00:00:00Z","reason":"natural_exit"}"#,
+        )
+        .expect("an outcome written before the field existed");
+        assert!(!outcome.output_forced_closed);
+    }
+
     use pohunek_platform::filesystem::AtomicReplaceError;
 
     use super::{

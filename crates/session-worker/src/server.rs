@@ -1840,25 +1840,34 @@ async fn coordinate_runtime_completion(
             return;
         }
     };
-    let next_output_offset = match completion {
-        OutputCompletion::Eof { next_offset } => next_offset,
-        OutputCompletion::ForcedClosed { next_offset } => {
-            mark_runtime_faulted_at_offset(
-                &shared,
-                runtime_id,
-                WorkerError::Pty(PtyError::OutputForcedClosed),
-                Some(next_offset),
-            )
-            .await;
+    let (next_output_offset, output_forced_closed) = match completion {
+        OutputCompletion::Eof { next_offset } => (next_offset, false),
+        OutputCompletion::ForcedClosed { next_offset } => (next_offset, true),
+    };
+    if output_forced_closed {
+        event!(
+            name: "worker.pty.output.forced_close",
+            Level::WARN,
+            process.pid = pty.identity().pid,
+            "PTY output was force-closed; the runtime ends with the root's exit",
+        );
+    }
+    // The stop that sealed a forced close already reaped the root, so finishing
+    // it reports the forced close again; that is not a fault. The root exit is
+    // known here, so the runtime ends with it.
+    match pty.finish_natural().await {
+        Ok(_) => {}
+        Err(PtyError::OutputForcedClosed) if output_forced_closed => {}
+        Err(error) => {
+            mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
             shared.shutdown.cancel();
             return;
         }
-    };
-    if let Err(error) = pty.finish_natural().await {
-        mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
-        shared.shutdown.cancel();
-        return;
     }
+    let status = ExitStatus {
+        output_forced_closed,
+        ..status
+    };
     let Some(retention) = retry_runtime_completion(
         &shared,
         &exit,
@@ -1904,10 +1913,11 @@ async fn wait_for_output_completion(
                     let state = shared.state.lock().await;
                     state.stop_grace
                 };
-                match pty.stop("natural-drain-timeout", grace).await {
-                    Ok(_) | Err(PtyError::OutputForcedClosed) => {}
-                    Err(error) => return Err(WorkerError::Pty(error)),
-                }
+                // A forced close is not an error: the sealed completion read
+                // below records it and the root's exit is known.
+                pty.stop("natural-drain-timeout", grace)
+                    .await
+                    .map_err(WorkerError::Pty)?;
                 pty.output_completion().ok_or_else(|| {
                     WorkerError::Protocol(
                         "PTY cleanup returned without sealing output completion".to_owned(),
@@ -1991,6 +2001,7 @@ async fn commit_runtime_completion(
         } else {
             "natural_exit".to_owned()
         },
+        output_forced_closed: status.output_forced_closed,
     });
     journal.next_output_offset = next_output_offset;
     journal.updated_at = timestamp();
@@ -3924,6 +3935,7 @@ fn exit_status(exit: &Exit, stopped_by_user: bool) -> ExitStatus {
         signal: exit.signal.as_deref().and_then(signal_number),
         stopped_by_user,
         exited_at_ms: unix_ms(),
+        output_forced_closed: false,
     }
 }
 
@@ -5225,11 +5237,12 @@ mod tests {
     // leader exits, so this scenario exists only on Linux.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn escaped_pty_holder_faults_with_the_exact_final_output_offset() {
+    async fn escaped_pty_holder_ends_with_the_exit_and_the_exact_final_output_offset() {
         let directory = BarrierDirectory::new();
         let ready = directory.path().join("escaped-ready");
-        // The escaped holder never closes the PTY, so the runtime always faults at
-        // the same final offset; these windows only keep the test fast.
+        // The escaped holder never closes the PTY, so the runtime always ends with
+        // the root's exit at the same final offset; these windows only keep the
+        // test fast.
         let config = crate::WorkerConfig {
             post_exit_drain_timeout: Duration::from_millis(50),
             stop_grace: Duration::from_millis(50),
@@ -5289,16 +5302,23 @@ mod tests {
             runtime_id,
         );
 
-        pohunek_test_support::wait::wait_until("the forced-close fault", || async {
-            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Faulted)
+        pohunek_test_support::wait::wait_until("the forced-close terminal commit", || async {
+            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited)
                 .then_some(())
         })
         .await;
         let final_offset = pty.output().next_offset();
-        let journal = server.shared.journal.load().expect("load fault journal");
-        assert_eq!(journal.phase, super::JournalPhase::Faulted);
+        let journal = server.shared.journal.load().expect("load terminal journal");
+        assert_eq!(journal.phase, super::JournalPhase::Terminal);
         assert_eq!(journal.next_output_offset, final_offset);
         assert!(final_offset > 0);
+        let outcome = journal
+            .outcome
+            .expect("the terminal journal records the exit");
+        assert!(outcome.output_forced_closed);
+        let state = server.shared.state.lock().await;
+        let exit = state.exit.as_ref().expect("the exit is published");
+        assert!(exit.output_forced_closed);
     }
 
     #[tokio::test]
@@ -5317,6 +5337,7 @@ mod tests {
             signal: None,
             stopped_by_user: false,
             exited_at_ms: 100,
+            output_forced_closed: false,
         };
         let shared = std::sync::Arc::clone(&server.shared);
         let completion = super::retry_runtime_completion(

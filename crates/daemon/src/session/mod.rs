@@ -721,10 +721,64 @@ struct ObservedAgent {
     cwd: Option<PathBuf>,
 }
 
+#[cfg(test)]
+mod forced_close_tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RuntimeExit {
     exit_code: Option<i32>,
     success: bool,
+}
+
+/// A runtime exit together with how the PTY output ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ObservedExit {
+    exit: RuntimeExit,
+    /// The worker force-closed the PTY output before it reached EOF.
+    output_forced_closed: bool,
+}
+
+impl From<RuntimeExit> for ObservedExit {
+    fn from(exit: RuntimeExit) -> Self {
+        Self {
+            exit,
+            output_forced_closed: false,
+        }
+    }
+}
+
+impl ObservedExit {
+    /// Builds the exit from a worker's terminal status.
+    fn from_status(status: &pohunek_worker_protocol::ExitStatus) -> Self {
+        Self {
+            exit: RuntimeExit {
+                exit_code: status.code,
+                success: status.code == Some(0) && status.signal.is_none(),
+            },
+            output_forced_closed: status.output_forced_closed,
+        }
+    }
+}
+
+/// Adds the forced-output-close warning to `warnings` once.
+///
+/// The warning rides on the terminal session so a client can tell that the
+/// final output was cut off even though the session ended with its exit.
+pub(super) fn note_output_force_closed(warnings: &mut Vec<protocol::SessionWarning>) {
+    if warnings
+        .iter()
+        .any(|warning| warning.kind == protocol::SessionWarningKind::OutputForceClosed)
+    {
+        return;
+    }
+    warnings.push(protocol::SessionWarning {
+        kind: protocol::SessionWarningKind::OutputForceClosed,
+        message: "the PTY output was force-closed after the stop deadline because a process \
+                  outside the session's process group kept the terminal open; output written \
+                  after the close is not retained"
+            .to_owned(),
+        detail: None,
+    });
 }
 
 /// Whether a removal may proceed when its marker sweep is unconfirmed only
@@ -828,9 +882,10 @@ fn exit_transition(
     id: &SessionId,
     entry: &SessionEntry,
     expected: RuntimeWatchIdentity,
-    exit: RuntimeExit,
+    observed: ObservedExit,
     stopped_by_user: bool,
 ) -> ExitTransition {
+    let exit = observed.exit;
     let base = SessionRegistry::session_record(id, entry, entry.desired_state, None);
     let mut candidate = entry.clone();
     let stopped =
@@ -859,6 +914,9 @@ fn exit_transition(
     candidate.info.active_agent_session_path = None;
     candidate.observed_agents.clear();
     candidate.info.exit_code = exit.exit_code;
+    if observed.output_forced_closed {
+        note_output_force_closed(&mut candidate.info.warnings);
+    }
     if let Some(runtime) = candidate.info.runtime.as_mut() {
         runtime.state = RuntimeState::Terminal;
         runtime.loss_reason = None;
@@ -2978,10 +3036,7 @@ impl SessionRegistry {
                         return Err(worker_error_to_protocol(error));
                     }
                 };
-                RuntimeExit {
-                    exit_code: status.code,
-                    success: status.code == Some(0) && status.signal.is_none(),
-                }
+                ObservedExit::from_status(&status)
             }
             RuntimeHandle::Unavailable(state) => {
                 self.clear_stopping(id, &transaction_id, stop_runtime.as_ref())
@@ -3041,7 +3096,7 @@ impl SessionRegistry {
     async fn commit_user_stop_exit(
         &self,
         id: &SessionId,
-        exit: RuntimeExit,
+        exit: ObservedExit,
         terminal_base: &SessionRecord,
     ) -> Result<(), ProtocolError> {
         let mut use_terminal_base = true;
@@ -3449,15 +3504,12 @@ impl SessionRegistry {
                         if snapshot.phase == pohunek_worker_protocol::RuntimePhase::Exited
                             && metadata.is_complete(&worker_metadata)
                         {
-                            let exit = snapshot.exit.map_or(
-                                RuntimeExit {
+                            let exit = snapshot.exit.as_ref().map_or(
+                                ObservedExit::from(RuntimeExit {
                                     exit_code: None,
                                     success: false,
-                                },
-                                |status| RuntimeExit {
-                                    exit_code: status.code,
-                                    success: status.code == Some(0) && status.signal.is_none(),
-                                },
+                                }),
+                                ObservedExit::from_status,
                             );
                             if matches!(
                                 registry
@@ -3824,11 +3876,12 @@ impl SessionRegistry {
     async fn record_exit(
         &self,
         id: &SessionId,
-        exit: RuntimeExit,
+        exit: impl Into<ObservedExit>,
         stopped_by_user: bool,
         expected: Option<&RuntimeWatchIdentity>,
         expected_record: Option<&SessionRecord>,
     ) -> Result<bool, ProtocolError> {
+        let exit = exit.into();
         let updated = Box::new({
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
