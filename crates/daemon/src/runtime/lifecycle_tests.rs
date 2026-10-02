@@ -15,7 +15,8 @@ use pohunek_platform::process::HostInspector;
 use pohunek_platform::supervisor::{
     DefinitionFacts, Operation, Supervisor, BOOTSTRAP_ENV_ALLOWLIST,
 };
-use pohunek_test_support::wait::{self, HANG_GUARD};
+use pohunek_test_support::time::AutoAdvanceInhibitor;
+use pohunek_test_support::wait;
 use tokio::sync::Notify;
 
 use super::*;
@@ -2108,29 +2109,6 @@ async fn a_busy_controller_lease_is_retried_until_the_worker_is_adopted() {
         .await
         .expect("controller connection closed")
         .expect("fake worker task");
-}
-
-/// Keeps tokio's paused clock from auto-advancing while real I/O is awaited.
-///
-/// A blocking task in flight inhibits auto-advance, so the paused clock moves
-/// only through `tokio::time::advance`, even while the runtime idles on a
-/// socket. The task ends when the inhibitor is dropped, or after
-/// [`HANG_GUARD`] of real time so that a stuck test then fails on its own
-/// virtual hang guards instead of waiting for nextest to terminate it.
-struct AutoAdvanceInhibitor {
-    _release: std::sync::mpsc::Sender<()>,
-}
-
-impl AutoAdvanceInhibitor {
-    fn new() -> Self {
-        let (release, released) = std::sync::mpsc::channel::<()>();
-        // Detached on purpose: dropping `release` wakes it, and the runtime
-        // joins it on shutdown.
-        drop(tokio::task::spawn_blocking(move || {
-            let _ = released.recv_timeout(HANG_GUARD);
-        }));
-        Self { _release: release }
-    }
 }
 
 /// The busy-lease retry timeline runs on a paused clock that moves only by the
