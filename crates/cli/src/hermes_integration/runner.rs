@@ -730,8 +730,19 @@ impl HermesRunner {
 
     fn execute(
         &self,
+        command: Command,
+        environment: ChildEnvironment<'_>,
+    ) -> Result<ProcessOutput, Error> {
+        self.execute_with_lookup(command, environment, &|key| std::env::var_os(key))
+    }
+
+    /// Runs `command` with the fixed child environment, reading the installed
+    /// probe's path roots through `lookup` instead of the process environment.
+    fn execute_with_lookup(
+        &self,
         mut command: Command,
         environment: ChildEnvironment<'_>,
+        lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<ProcessOutput, Error> {
         let deadline = Instant::now() + self.timeout;
         command
@@ -751,7 +762,7 @@ impl HermesRunner {
             }
             ChildEnvironment::InstalledProbe => {
                 for key in PROBE_ENVIRONMENT_KEYS {
-                    if let Some(value) = absolute_environment_value(key) {
+                    if let Some(value) = absolute_environment_value(key, lookup) {
                         command.env(key, value);
                     }
                 }
@@ -799,8 +810,11 @@ enum ChildEnvironment<'a> {
     InstalledProbe,
 }
 
-fn absolute_environment_value(key: &str) -> Option<std::ffi::OsString> {
-    let value = std::env::var_os(key)?;
+fn absolute_environment_value(
+    key: &str,
+    lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<std::ffi::OsString> {
+    let value = lookup(key)?;
     (!value.is_empty() && Path::new(&value).is_absolute()).then_some(value)
 }
 
@@ -1521,7 +1535,8 @@ mod tests {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
+
+    use pohunek_test_support::process_env::ProcessEnv;
 
     use super::*;
     use crate::hermes_integration::assets;
@@ -1529,7 +1544,6 @@ mod tests {
     use crate::hermes_integration::test_python;
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     struct Fixture(PathBuf);
 
@@ -1545,11 +1559,6 @@ mod tests {
         }
     }
 
-    struct EnvironmentGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
     struct StageFixture {
         root: Fixture,
         target: ResolvedTarget,
@@ -1559,26 +1568,15 @@ mod tests {
         runtime: PathBuf,
     }
 
-    impl EnvironmentGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvironmentGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
+    /// Looks `key` up in a fixed table; `None` models an unset variable.
+    fn table_lookup<'a>(
+        table: &'a [(&'a str, Option<&'a str>)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+        move |key| {
+            table
+                .iter()
+                .find(|(name, _)| *name == key)
+                .and_then(|(_, value)| value.map(std::ffi::OsString::from))
         }
     }
 
@@ -1781,11 +1779,8 @@ mod tests {
 
     #[test]
     fn target_environment_and_arguments_are_fixed_for_default_named_and_custom_targets() {
-        let _environment = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock");
-        let _leaked = EnvironmentGuard::set("POHUNEK_HERMES_RUNNER_TEST_LEAK", "secret");
+        let mut environment = ProcessEnv::lock();
+        environment.set("POHUNEK_HERMES_RUNNER_TEST_LEAK", "secret");
         let root = fixture("targets");
         let log = root.0.join("log");
         let body = format!(
@@ -1844,26 +1839,18 @@ mod tests {
 
     #[test]
     fn installed_probe_forwards_only_non_secret_path_roots() {
-        let _environment = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock");
         let values = [
-            ("HOME", "/controlled/home"),
-            ("XDG_RUNTIME_DIR", "/controlled/runtime"),
-            ("XDG_STATE_HOME", "/controlled/state"),
-            ("XDG_CONFIG_HOME", "/controlled/config"),
-            ("XDG_DATA_HOME", "/controlled/data"),
-            ("XDG_CACHE_HOME", "/controlled/cache"),
-            ("HTTPS_PROXY", "https://credential.invalid"),
-            ("OPENAI_API_KEY", "secret"),
-            ("POHUNEK_SOCKET_PATH", "/controlled/override.sock"),
-            ("HERMES_HOME", "/controlled/ambient-hermes"),
+            ("HOME", Some("/controlled/home")),
+            ("XDG_RUNTIME_DIR", Some("/controlled/runtime")),
+            ("XDG_STATE_HOME", Some("/controlled/state")),
+            ("XDG_CONFIG_HOME", Some("/controlled/config")),
+            ("XDG_DATA_HOME", Some("/controlled/data")),
+            ("XDG_CACHE_HOME", Some("/controlled/cache")),
+            ("HTTPS_PROXY", Some("https://credential.invalid")),
+            ("OPENAI_API_KEY", Some("secret")),
+            ("POHUNEK_SOCKET_PATH", Some("/controlled/override.sock")),
+            ("HERMES_HOME", Some("/controlled/ambient-hermes")),
         ];
-        let _guards: Vec<_> = values
-            .into_iter()
-            .map(|(key, value)| EnvironmentGuard::set(key, value))
-            .collect();
         let root = fixture("probe-environment");
         let fixed_runner = runner(&root.0, "exit 0");
         let probe = write_executable(
@@ -1872,7 +1859,11 @@ mod tests {
         );
         let command = Command::new(probe);
         let output = fixed_runner
-            .execute(command, ChildEnvironment::InstalledProbe)
+            .execute_with_lookup(
+                command,
+                ChildEnvironment::InstalledProbe,
+                &table_lookup(&values),
+            )
             .expect("installed probe environment");
 
         assert_eq!(
@@ -1883,17 +1874,13 @@ mod tests {
 
     #[test]
     fn installed_probe_omits_missing_empty_and_relative_path_roots() {
-        let _environment = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("environment lock");
-        let _guards = [
-            EnvironmentGuard::remove("HOME"),
-            EnvironmentGuard::set("XDG_RUNTIME_DIR", ""),
-            EnvironmentGuard::set("XDG_STATE_HOME", "relative-state"),
-            EnvironmentGuard::remove("XDG_CONFIG_HOME"),
-            EnvironmentGuard::set("XDG_DATA_HOME", "./relative-data"),
-            EnvironmentGuard::set("XDG_CACHE_HOME", "../relative-cache"),
+        let values = [
+            ("HOME", None),
+            ("XDG_RUNTIME_DIR", Some("")),
+            ("XDG_STATE_HOME", Some("relative-state")),
+            ("XDG_CONFIG_HOME", None),
+            ("XDG_DATA_HOME", Some("./relative-data")),
+            ("XDG_CACHE_HOME", Some("../relative-cache")),
         ];
         let root = fixture("invalid-probe-environment");
         let fixed_runner = runner(&root.0, "exit 0");
@@ -1902,7 +1889,11 @@ mod tests {
             "printf '%s|%s|%s|%s|%s|%s' \"${HOME:-absent}\" \"${XDG_RUNTIME_DIR:-absent}\" \"${XDG_STATE_HOME:-absent}\" \"${XDG_CONFIG_HOME:-absent}\" \"${XDG_DATA_HOME:-absent}\" \"${XDG_CACHE_HOME:-absent}\"",
         );
         let output = fixed_runner
-            .execute(Command::new(probe), ChildEnvironment::InstalledProbe)
+            .execute_with_lookup(
+                Command::new(probe),
+                ChildEnvironment::InstalledProbe,
+                &table_lookup(&values),
+            )
             .expect("invalid path roots remain omitted");
 
         assert_eq!(
