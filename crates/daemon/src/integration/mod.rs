@@ -3023,44 +3023,11 @@ mod tests {
     #[cfg(unix)]
     const CLAUDE_HOOKS_UMASK_CHILD_ENV: &str = "POHUNEK_TEST_CLAUDE_HOOKS_UMASK_CHILD";
 
-    /// A per-test directory, removed with its contents when dropped.
-    ///
-    /// Dereferences to its path.
-    pub(super) struct TestDir {
-        path: PathBuf,
-        _guard: tempfile::TempDir,
-    }
-
-    impl std::ops::Deref for TestDir {
-        type Target = PathBuf;
-
-        fn deref(&self) -> &PathBuf {
-            &self.path
-        }
-    }
-
-    impl AsRef<Path> for TestDir {
-        fn as_ref(&self) -> &Path {
-            &self.path
-        }
-    }
+    pub(super) use crate::test_support::ScopedDir as TestDir;
 
     /// Creates a per-test directory that is removed when the guard drops.
     pub(super) fn scoped_dir(tag: &str) -> TestDir {
-        let guard = pohunek_test_support::tempdir_with_prefix(&format!("ph-int-{tag}-"))
-            .expect("create temp dir");
-        TestDir {
-            path: guard.path().to_path_buf(),
-            _guard: guard,
-        }
-    }
-
-    /// Creates a directory that outlives its guard, for the sibling test
-    /// modules whose fixtures return the path past the creating function.
-    pub(super) fn temp_dir(tag: &str) -> PathBuf {
-        pohunek_test_support::tempdir_with_prefix(&format!("ph-int-{tag}-"))
-            .expect("create temp dir")
-            .keep()
+        crate::test_support::scoped_dir(&format!("ph-int-{tag}-"))
     }
 
     pub(super) fn read_json(path: &Path) -> Value {
@@ -3858,6 +3825,7 @@ mod tests {
     fn codex_hook_trust_hash_matches_codex_normalized_identity() {
         let hash = codex_command_hook_trusted_hash(
             CODEX_SESSION_START_TRUST_EVENT,
+            // hermetic-allowed: #363 the command text is hashed into a golden Codex trust vector
             "sh '/tmp/pohunek-agent-state.sh' session",
             10,
             None,
@@ -4644,7 +4612,8 @@ mod tests {
 
         let root = scoped_dir("trusted-dir-name-swap");
         let trusted = super::TrustedDir::open(&root, "test root").expect("open trusted dirfd");
-        let moved = root.with_extension("opened");
+        let holder = scoped_dir("trusted-dir-name-moved");
+        let moved = holder.join("opened");
         fs::rename(&root, &moved).expect("move opened directory");
         fs::create_dir(&root).expect("create replacement directory at original name");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
@@ -5004,10 +4973,11 @@ mod tests {
             .expect("create the provider config FIFO");
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let inspected = codex.clone();
         thread::spawn(move || {
             let report = super::status_at(
                 super::StatusAgent::Codex,
-                &codex,
+                &inspected,
                 CODEX_HOOK_ASSET,
                 CODEX_NOTIFY_HOOK_ASSET,
             );

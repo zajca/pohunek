@@ -4053,11 +4053,9 @@ mod tests {
         crate::session::ShellCommand::new("/bin/sh", std::iter::empty::<String>())
     }
 
-    fn temp_root() -> PathBuf {
+    fn temp_root() -> crate::test_support::ScopedDir {
         // Short enough for worker sockets named by full session ids on macOS.
-        pohunek_test_support::tempdir_with_prefix("ph-rec-")
-            .expect("create reconciliation root")
-            .keep()
+        crate::test_support::scoped_dir("ph-rec-")
     }
 
     fn create_private_dir(path: &Path) {
@@ -4650,8 +4648,8 @@ while os.getppid() == parent:
                 "claude",
                 AgentKind::Claude,
                 SessionRefKind::Path,
-                "/tmp/claude-launch.jsonl",
-                "/tmp/claude-nested.jsonl",
+                "/work/claude-launch.jsonl",
+                "/work/claude-nested.jsonl",
             ),
             (
                 "hermes",
@@ -5721,7 +5719,7 @@ while os.getppid() == parent:
             .create(SessionNewParams {
                 name: None,
                 agent: "shell".to_owned(),
-                cwd: Some(root),
+                cwd: Some(root.to_path_buf()),
                 cols: 80,
                 rows: 24,
                 project: None,
@@ -6681,7 +6679,8 @@ while os.getppid() == parent:
 
     #[test]
     fn equal_native_ordering_fills_only_missing_durable_reference() {
-        let store = Store::new(temp_root().join("metadata.jsonl"));
+        let root = temp_root();
+        let store = Store::new(root.join("metadata.jsonl"));
         let mut existing = identity_record();
         existing.native_identity_ordering = Some(NativeIdentityOrdering {
             runtime_id: "runtime-identity".to_owned(),
@@ -6726,7 +6725,8 @@ while os.getppid() == parent:
 
     #[test]
     fn equal_native_ordering_preserves_conflicting_durable_reference() {
-        let store = Store::new(temp_root().join("metadata.jsonl"));
+        let root = temp_root();
+        let store = Store::new(root.join("metadata.jsonl"));
         let mut existing = identity_record();
         existing.native_identity_ordering = Some(NativeIdentityOrdering {
             runtime_id: "runtime-identity".to_owned(),
@@ -6771,7 +6771,8 @@ while os.getppid() == parent:
 
     #[test]
     fn runtime_record_identity_authorizes_reconciliation_normalization() {
-        let store = Store::new(temp_root().join("metadata.jsonl"));
+        let root = temp_root();
+        let store = Store::new(root.join("metadata.jsonl"));
         let mut inconsistent = identity_record();
         inconsistent.runtime.runtime_id = Some("runtime-journal".to_owned());
         store
@@ -7620,7 +7621,7 @@ while os.getppid() == parent:
         use pohunek_test_support::wait::HANG_GUARD;
 
         struct Fixture {
-            root: PathBuf,
+            root: crate::test_support::ScopedDir,
             registry: SessionRegistry,
             supervisor: Arc<ScriptedSupervisor>,
         }
@@ -10701,7 +10702,7 @@ while os.getppid() == parent:
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
         use pohunek_test_support::wait::HANG_GUARD;
         struct Fixture {
-            root: PathBuf,
+            root: crate::test_support::ScopedDir,
             registry: SessionRegistry,
             launcher: SubprocessWorkerLauncher,
             supervisor: Arc<ScriptedSupervisor>,

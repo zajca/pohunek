@@ -458,24 +458,9 @@ fn invalid_action(name: &str, reason: &str) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A unique empty temp dir for a test.
+    /// A unique empty temp dir for a test, removed when the test's thread ends.
     fn tmp(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = pohunek_test_support::temp_root().join(format!(
-            "pohunek-cfg-{tag}-{}-{nanos}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        crate::test_support::thread_scoped_dir(&format!("pohunek-cfg-{tag}-"))
     }
 
     fn write(path: &Path, content: &str) {

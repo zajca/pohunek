@@ -564,15 +564,11 @@ fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBu
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 
     use super::*;
     use crate::procwatch::{HostInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     /// How long fixture processes block; well beyond `HANG_GUARD` so a fixture
     /// can only end through the probe, never by exiting on its own.
@@ -583,16 +579,8 @@ mod tests {
         ProfileRegistry::default()
     }
 
-    fn temp_agents_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("after epoch")
-            .as_nanos();
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = pohunek_test_support::temp_root()
-            .join(format!("pohunek-caps-{}-{nanos}-{n}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create agents dir");
-        dir
+    fn temp_agents_dir() -> crate::test_support::ScopedDir {
+        crate::test_support::scoped_dir("pohunek-caps-")
     }
 
     #[test]
@@ -645,7 +633,7 @@ mod tests {
             "base = \"claude\"\nprogram = \"/bin/sh\"\n",
         )
         .expect("write profile");
-        let caps = host_capabilities("0.0.0", &ProfileRegistry::new(Some(dir)));
+        let caps = host_capabilities("0.0.0", &ProfileRegistry::new(Some(dir.clone())));
 
         assert!(
             caps.supported_agents.contains(&"my-claude".to_owned()),
@@ -1132,7 +1120,7 @@ mod tests {
         )
         .expect("write profile");
 
-        let caps = host_capabilities("0.0.0", &ProfileRegistry::new(Some(dir)));
+        let caps = host_capabilities("0.0.0", &ProfileRegistry::new(Some(dir.clone())));
         let runtime = caps
             .runtimes
             .iter()

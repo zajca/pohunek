@@ -64,6 +64,66 @@ pub(crate) mod test_support {
 
     pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A per-test directory, removed with its contents when dropped.
+    ///
+    /// Dereferences to its path, so callers that take a `&PathBuf` or a path
+    /// reference accept it directly.
+    #[derive(Debug)]
+    pub(crate) struct ScopedDir {
+        path: std::path::PathBuf,
+        _guard: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for ScopedDir {
+        type Target = std::path::PathBuf;
+
+        fn deref(&self) -> &std::path::PathBuf {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for ScopedDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for ScopedDir {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path.as_os_str()
+        }
+    }
+
+    std::thread_local! {
+        /// Directories of the current test thread, removed when it ends.
+        static THREAD_DIRS: std::cell::RefCell<Vec<tempfile::TempDir>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Creates a private directory that lives until the calling thread ends.
+    ///
+    /// For fixture helpers that return a bare path and are called from many
+    /// tests. The test harness runs every test on a thread of its own, so the
+    /// end of that thread is the end of the test.
+    pub(crate) fn thread_scoped_dir(prefix: &str) -> std::path::PathBuf {
+        let guard = pohunek_test_support::tempdir_with_prefix(prefix)
+            .expect("create the thread-scoped test directory");
+        let path = guard.path().to_path_buf();
+        THREAD_DIRS.with(|dirs| dirs.borrow_mut().push(guard));
+        path
+    }
+
+    /// Creates a private, short-named [`ScopedDir`] whose name starts with
+    /// `prefix`.
+    pub(crate) fn scoped_dir(prefix: &str) -> ScopedDir {
+        let guard = pohunek_test_support::tempdir_with_prefix(prefix)
+            .expect("create the scoped test directory");
+        ScopedDir {
+            path: guard.path().to_path_buf(),
+            _guard: guard,
+        }
+    }
+
     #[derive(Debug)]
     struct EmptyTransport {
         id: OverlayId,

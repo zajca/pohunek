@@ -629,8 +629,6 @@ fn session_agent_kind(session: &SessionInfo) -> AgentKind {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::{
         event, AgentActivity, AgentKind, Event, NotificationCreateParams, NotificationKind,
@@ -663,18 +661,11 @@ mod tests {
         .await;
     }
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     fn temp_data_dir(tag: &str) -> std::path::PathBuf {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        pohunek_test_support::temp_root().join(format!(
-            "pohunek-notification-projector-{tag}-{}-{nanos}-{counter}",
-            std::process::id()
-        ))
+        // The directory lives until the test's thread ends; the path below it
+        // does not exist yet.
+        crate::test_support::thread_scoped_dir(&format!("pohunek-notification-projector-{tag}-"))
+            .join("data")
     }
 
     fn service(tag: &str) -> NotificationService {

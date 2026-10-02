@@ -324,22 +324,13 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
     use super::{detect, project_id, run_bounded};
 
-    /// A fresh, unique temp directory (mirrors the worktree tests' convention).
+    /// A fresh directory that is removed when the test's thread ends.
     fn unique_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        let dir = pohunek_test_support::temp_root().join(format!(
-            "pohunek-detect-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        crate::test_support::thread_scoped_dir(&format!("pohunek-detect-{tag}-"))
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {

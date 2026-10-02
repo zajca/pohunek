@@ -205,14 +205,10 @@ mod tests {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        pohunek_test_support::temp_root().join(format!(
-            "pohunek-daemon-doctor-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ))
+        // The directory lives until the test's thread ends; the path below it
+        // does not exist yet.
+        crate::test_support::thread_scoped_dir(&format!("pohunek-daemon-doctor-{tag}-"))
+            .join("root")
     }
 
     #[test]

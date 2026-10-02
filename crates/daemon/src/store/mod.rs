@@ -1520,7 +1520,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::{AgentActivity, AgentKind, ProjectSource};
 
@@ -1530,21 +1529,9 @@ mod tests {
     };
 
     fn temp_store_path(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        let dir = pohunek_test_support::temp_root().join(format!(
-            "pohunek-store-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).expect("create temp dir");
-        fs::set_permissions(
-            &dir,
-            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-        )
-        .expect("make temp dir private");
-        dir.join("metadata.jsonl")
+        // The directory lives until the test's thread ends.
+        crate::test_support::thread_scoped_dir(&format!("pohunek-store-{tag}-"))
+            .join("metadata.jsonl")
     }
 
     fn write_private(path: &Path, bytes: impl AsRef<[u8]>) {

@@ -512,28 +512,18 @@ pub fn detect_at(path: &Path) -> Result<Option<DetectedProject>, ProtocolError> 
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use protocol::ProjectSource;
 
     use super::{parse_worktrees_porcelain, LiveSession, ProjectManager, RawWorktree};
     use crate::store::{Store, WorktreeBinding, WorktreeStatus};
 
+    /// A fresh directory that is removed when the test's thread ends.
     fn unique_dir(tag: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        let dir = pohunek_test_support::temp_root()
-            .join(format!("pohunek-pm-{tag}-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .expect("secure temp directory");
-        dir
+        crate::test_support::thread_scoped_dir(&format!("pohunek-pm-{tag}-"))
     }
 
     fn git_in(dir: &Path, args: &[&str]) {

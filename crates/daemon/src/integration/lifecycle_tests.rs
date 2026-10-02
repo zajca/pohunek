@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use super::commit::{DESTINATION_COLLISION_CODE, RECOVERY_REQUIRED_CODE};
 use super::removal_tests::RaceHook;
 use super::tests::{
-    capture_worker_hook, explicit_status, read_json, run_state_asset_at, temp_dir, tree_snapshot,
+    capture_worker_hook, explicit_status, read_json, run_state_asset_at, scoped_dir, tree_snapshot,
     with_config_dirs,
 };
 use super::{
@@ -126,7 +126,7 @@ fn status_of(dir: &Path, agent: AgentKind) -> protocol::IntegrationAgentStatus {
 #[test]
 fn installer_lock_rejects_a_second_installer_without_touching_the_tree() {
     for agent in [AgentKind::Claude, AgentKind::Codex] {
-        let dir = temp_dir("lock-contention");
+        let dir = scoped_dir("lock-contention");
         let install = |dir: &Path| match agent {
             AgentKind::Claude => install_claude(dir).map(|_paths| ()),
             _ => install_codex(dir).map(|_paths| ()),
@@ -148,7 +148,7 @@ fn installer_lock_rejects_a_second_installer_without_touching_the_tree() {
 
 #[test]
 fn concurrent_installers_neither_lose_user_hooks_nor_duplicate_registrations() {
-    let dir = temp_dir("lock-race");
+    let dir = scoped_dir("lock-race");
     write_json(&dir.join("settings.json"), &user_claude_settings());
     let barrier = Arc::new(Barrier::new(CONCURRENT_INSTALLERS));
     let workers: Vec<_> = (0..CONCURRENT_INSTALLERS)
@@ -195,7 +195,7 @@ fn concurrent_installers_neither_lose_user_hooks_nor_duplicate_registrations() {
 
 /// Step names committed by a successful install into a fresh directory.
 fn committed_step_names(agent: &AgentKind) -> Vec<String> {
-    let dir = temp_dir("step-names");
+    let dir = scoped_dir("step-names");
     let mut seen = Vec::new();
     let mut gate = |_index: usize, name: &str| {
         seen.push(name.to_owned());
@@ -252,7 +252,7 @@ fn injected_failure_at_every_commit_step_restores_the_exact_prior_tree() {
         let steps = committed_step_names(&agent).len();
         for existing in [false, true] {
             for fail_at in 0..steps {
-                let dir = temp_dir("rollback");
+                let dir = scoped_dir("rollback");
                 if existing {
                     prepare_existing(&agent, &dir);
                 }
@@ -284,7 +284,7 @@ fn injected_failure_at_every_commit_step_restores_the_exact_prior_tree() {
 
 #[test]
 fn a_provider_file_edited_during_the_install_is_a_collision_and_stays_intact() {
-    let dir = temp_dir("collision");
+    let dir = scoped_dir("collision");
     let concurrent_edit = json!({ "edited": "by someone else" });
     let mut gate = |index: usize, name: &str| {
         if name == "settings.json" {
@@ -304,7 +304,7 @@ fn a_provider_file_edited_during_the_install_is_a_collision_and_stays_intact() {
 
 #[test]
 fn a_directory_at_a_managed_hook_path_is_preserved_and_reported_untrusted() {
-    let dir = temp_dir("dir-at-hook");
+    let dir = scoped_dir("dir-at-hook");
     let notify = dir.join("hooks").join(NOTIFY_HOOK_INSTALL_NAME);
     let mut gate = |_index: usize, name: &str| {
         if name == NOTIFY_HOOK_INSTALL_NAME {
@@ -323,7 +323,7 @@ fn a_directory_at_a_managed_hook_path_is_preserved_and_reported_untrusted() {
 
 #[test]
 fn a_fifo_at_a_managed_hook_path_is_rejected_without_blocking_or_mutation() {
-    let dir = temp_dir("fifo-at-hook");
+    let dir = scoped_dir("fifo-at-hook");
     let hook = dir.join(STATE_HOOK_INSTALL_NAME);
     let output = std::process::Command::new("mkfifo")
         .arg(&hook)
@@ -345,7 +345,7 @@ fn a_fifo_at_a_managed_hook_path_is_rejected_without_blocking_or_mutation() {
 #[test]
 fn a_written_file_replaced_before_the_rollback_is_kept_and_reported_as_a_collision() {
     for existing in [false, true] {
-        let dir = temp_dir("recovery");
+        let dir = scoped_dir("recovery");
         if existing {
             prepare_existing(&AgentKind::Codex, &dir);
         }
@@ -381,7 +381,7 @@ fn a_written_file_replaced_before_the_rollback_is_kept_and_reported_as_a_collisi
 
 #[test]
 fn a_displaced_managed_symlink_is_restored_when_a_later_step_fails() {
-    let dir = temp_dir("symlink-rollback");
+    let dir = scoped_dir("symlink-rollback");
     install_codex(&dir).expect("seed install");
     let target = dir.join("sentinel-target");
     fs::write(&target, b"private-target").expect("write target");
@@ -406,7 +406,7 @@ fn a_displaced_managed_symlink_is_restored_when_a_later_step_fails() {
 #[test]
 fn reinstall_and_upgrade_are_idempotent_for_each_agent() {
     for agent in [AgentKind::Claude, AgentKind::Codex] {
-        let dir = temp_dir("idempotent");
+        let dir = scoped_dir("idempotent");
         prepare_existing(&agent, &dir);
         let install = |dir: &Path| match agent {
             AgentKind::Claude => install_claude(dir).map(|_paths| ()),
@@ -428,8 +428,8 @@ fn reinstall_and_upgrade_are_idempotent_for_each_agent() {
 
 #[test]
 fn installed_assets_match_the_embedded_scripts_with_owner_only_write_modes() {
-    let claude = temp_dir("modes-claude");
-    let codex = temp_dir("modes-codex");
+    let claude = scoped_dir("modes-claude");
+    let codex = scoped_dir("modes-codex");
     install_claude(&claude).expect("install Claude");
     install_codex(&codex).expect("install Codex");
 
@@ -464,8 +464,8 @@ fn installed_assets_match_the_embedded_scripts_with_owner_only_write_modes() {
 
 #[test]
 fn profiles_are_isolated_by_directory_and_exact_command_ownership() {
-    let profile_a = temp_dir("profile-a");
-    let profile_b = temp_dir("profile-b");
+    let profile_a = scoped_dir("profile-a");
+    let profile_b = scoped_dir("profile-b");
     let hook_a = profile_a.join("hooks").join(STATE_HOOK_INSTALL_NAME);
     let foreign_command = hook_command(&hook_a, HOOK_ACTION);
     let mut settings_b = user_claude_settings();
@@ -513,8 +513,8 @@ fn profiles_are_isolated_by_directory_and_exact_command_ownership() {
 
 #[test]
 fn explicit_agent_home_selects_exactly_the_targeted_directory() {
-    let claude = temp_dir("target-claude");
-    let codex = temp_dir("target-codex");
+    let claude = scoped_dir("target-claude");
+    let codex = scoped_dir("target-codex");
     let codex_before = tree_snapshot(&codex);
 
     let result = with_config_dirs(&claude, &codex, || super::install(Some(AgentKind::Claude)))
@@ -538,7 +538,7 @@ fn explicit_agent_home_selects_exactly_the_targeted_directory() {
         "absent agent dir is never created"
     );
 
-    let absent = temp_dir("target-absent");
+    let absent = scoped_dir("target-absent");
     let error = with_config_dirs(&absent.join("c"), &absent.join("x"), || {
         super::install(None)
     })
@@ -574,7 +574,7 @@ fn a_symlinked_config_root_is_rejected_and_its_canonical_path_installs() {
 
 #[test]
 fn a_missing_optional_agent_is_informational_and_a_broken_config_root_is_a_failure() {
-    let root = temp_dir("optional-agent");
+    let root = scoped_dir("optional-agent");
     let absent = root.join("absent");
     let not_a_directory = root.join("file");
     fs::write(&not_a_directory, "").expect("write file");
@@ -715,6 +715,7 @@ fn the_default_macos_runtime_socket_is_canonical_and_fits_darwin() {
             .expect("default macOS runtime resolves");
         assert_eq!(
             paths.socket,
+            // hermetic-allowed: #363 the macOS default runtime path under /private/tmp is the subject
             PathBuf::from(format!("/private/tmp/pohunek-{uid}/daemon.sock"))
         );
         assert!(paths.socket.as_os_str().len() <= DARWIN_SOCKET_PATH_MAX_BYTES);
@@ -819,8 +820,8 @@ fn error_text(error: &ProtocolError) -> String {
 
 #[test]
 fn provider_secrets_never_reach_install_status_or_error_output() {
-    let claude = temp_dir("secret-claude");
-    let codex = temp_dir("secret-codex");
+    let claude = scoped_dir("secret-claude");
+    let codex = scoped_dir("secret-codex");
     write_json(
         &claude.join("settings.json"),
         &json!({
@@ -931,7 +932,7 @@ fn state_hooks_forward_no_provider_payload_beyond_the_reported_identity() {
 #[test]
 fn a_failed_install_removes_the_hooks_directory_it_created_and_keeps_an_existing_one() {
     for fail_at in 0..3 {
-        let fresh = temp_dir("created-hooks");
+        let fresh = scoped_dir("created-hooks");
         let mut gate = |index: usize, _name: &str| {
             if index == fail_at {
                 Err(injected())
@@ -945,7 +946,7 @@ fn a_failed_install_removes_the_hooks_directory_it_created_and_keeps_an_existing
             "fail_at={fail_at}: the created hooks directory must be rolled back"
         );
 
-        let existing = temp_dir("existing-hooks");
+        let existing = scoped_dir("existing-hooks");
         fs::create_dir(existing.join("hooks")).expect("create user hooks dir");
         let mut gate = |index: usize, _name: &str| {
             if index == fail_at {
@@ -964,7 +965,7 @@ fn a_failed_install_removes_the_hooks_directory_it_created_and_keeps_an_existing
 
 #[test]
 fn a_hooks_directory_holding_another_file_survives_a_failed_install() {
-    let dir = temp_dir("created-hooks-busy");
+    let dir = scoped_dir("created-hooks-busy");
     let intruder = dir.join("hooks").join("user-script.sh");
     let mut gate = |index: usize, _name: &str| {
         if index == 2 {
@@ -987,7 +988,7 @@ fn a_hooks_directory_holding_another_file_survives_a_failed_install() {
 /// An unchanged Codex `config.toml` adds verification steps, so the indices
 /// differ per agent and are read from a dry run instead of assumed.
 fn reseed_steps(agent: &AgentKind) -> Vec<String> {
-    let dir = temp_dir("reseed-steps");
+    let dir = scoped_dir("reseed-steps");
     install_gated(agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
     let mut seen = Vec::new();
     install_gated(agent, &dir, &mut |_index, name| {
@@ -1037,7 +1038,7 @@ fn a_later_failure_restores_an_oversized_managed_script_exactly() {
     for agent in [AgentKind::Claude, AgentKind::Codex] {
         let steps = reseed_steps(&agent);
         for fail_at in (state_script_index(&steps) + 1)..steps.len() {
-            let dir = temp_dir("oversized-rollback");
+            let dir = scoped_dir("oversized-rollback");
             install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
             fs::write(state_script(&agent, &dir), oversized_script()).expect("oversize script");
             let before = tree_snapshot(&dir);
@@ -1064,7 +1065,7 @@ fn a_later_failure_restores_an_oversized_managed_script_exactly() {
 #[test]
 fn installing_over_an_oversized_managed_script_replaces_it_without_residue() {
     for agent in [AgentKind::Claude, AgentKind::Codex] {
-        let dir = temp_dir("oversized-replace");
+        let dir = scoped_dir("oversized-replace");
         install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
         fs::write(state_script(&agent, &dir), oversized_script()).expect("oversize script");
 
@@ -1090,7 +1091,7 @@ fn installing_over_an_oversized_managed_script_replaces_it_without_residue() {
 #[test]
 fn an_unrestorable_oversized_original_is_reported_and_kept_never_silently_lost() {
     for agent in [AgentKind::Claude, AgentKind::Codex] {
-        let dir = temp_dir("oversized-recovery");
+        let dir = scoped_dir("oversized-recovery");
         install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
         let script = state_script(&agent, &dir);
         fs::write(&script, oversized_script()).expect("oversize script");
@@ -1126,7 +1127,7 @@ fn an_unrestorable_oversized_original_is_reported_and_kept_never_silently_lost()
 #[test]
 fn a_rollback_that_cannot_put_an_original_back_requires_recovery_and_names_it() {
     for agent in [AgentKind::Claude, AgentKind::Codex] {
-        let dir = temp_dir("recovery-vanished");
+        let dir = scoped_dir("recovery-vanished");
         install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
         let script = state_script(&agent, &dir);
         let scripts_dir = script.parent().expect("script parent").to_path_buf();

@@ -520,6 +520,10 @@ struct SessionRegistryInner {
     #[cfg(test)]
     undelivered_conversion_hold:
         std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Default worker roots of a test registry, removed when the last clone
+    /// of the registry drops.
+    #[cfg(test)]
+    test_dirs: std::sync::Mutex<Vec<tempfile::TempDir>>,
 }
 
 /// The detached create transactions of one registry.
@@ -1220,7 +1224,7 @@ impl SessionRegistry {
         #[cfg(test)]
         {
             let mut config = config;
-            let (runtime_root, state_root) = test_worker_roots(&config);
+            let (runtime_root, state_root, test_dirs) = owned_test_worker_roots(&config);
             config.worker_runtime_root = Some(runtime_root.clone());
             config.worker_state_root = Some(state_root.clone());
             if config.supervision.is_none() {
@@ -1230,7 +1234,13 @@ impl SessionRegistry {
                 runtime_root,
                 state_root,
             ));
-            Self::new_with_launcher_and_inspector(config, launcher, inspector)
+            let registry = Self::new_with_launcher_and_inspector(config, launcher, inspector);
+            *registry
+                .inner
+                .test_dirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = test_dirs;
+            registry
         }
         #[cfg(not(test))]
         {
@@ -1335,6 +1345,8 @@ impl SessionRegistry {
                 initial_input_commit_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 undelivered_conversion_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                test_dirs: std::sync::Mutex::new(Vec::new()),
             }),
         };
         if let Some(config) = external_observer {
@@ -5210,20 +5222,39 @@ fn sort_subagents(subagents: &mut [SubagentInfo]) {
     });
 }
 
+/// Resolves the worker roots of a test fixture that builds its own launcher.
+///
+/// Roots the config does not name are fresh directories that stay on disk,
+/// because the fixture outlives any one registry.
 #[cfg(test)]
 fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let (runtime_root, state_root, owned) = owned_test_worker_roots(config);
+    for dir in owned {
+        let _ = dir.keep();
+    }
+    (runtime_root, state_root)
+}
+
+/// Resolves the worker roots of a test registry.
+///
+/// Roots the config does not name are fresh directories; the third value owns
+/// them and must live as long as the registry.
+#[cfg(test)]
+fn owned_test_worker_roots(
+    config: &SessionRegistryConfig,
+) -> (PathBuf, PathBuf, Vec<tempfile::TempDir>) {
+    let mut owned = Vec::new();
 
     // State root (journals) has no path-length limit, so it can keep sharing
     // the metadata store's temp directory when the caller did not override
     // it explicitly.
     let state_base = config.store_path.as_ref().map_or_else(
         || {
-            pohunek_test_support::temp_root().join(format!(
-                "pohunek-daemon-worker-test-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
-            ))
+            let dir = pohunek_test_support::tempdir_with_prefix("pohunek-daemon-worker-test-")
+                .expect("create the worker state base");
+            let path = dir.path().to_path_buf();
+            owned.push(dir);
+            path
         },
         |store| {
             store
@@ -5241,17 +5272,17 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
     // state root -- the default runtime root always uses a short, unique
     // path directly under the fixture temp root, independent of `store_path`.
     let runtime_root = config.worker_runtime_root.clone().unwrap_or_else(|| {
-        pohunek_test_support::temp_root().join(format!(
-            "pw-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ))
+        let dir = pohunek_test_support::tempdir_with_prefix("pw-")
+            .expect("create the worker runtime root");
+        let path = dir.path().to_path_buf();
+        owned.push(dir);
+        path
     });
     let state_root = config
         .worker_state_root
         .clone()
         .unwrap_or_else(|| state_base.join("state"));
-    (runtime_root, state_root)
+    (runtime_root, state_root, owned)
 }
 
 /// Supervision inputs for the in-process test launcher.
