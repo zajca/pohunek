@@ -1076,12 +1076,14 @@ mod credential_router_tests {
     }
 
     /// Sends one callback request to a router backed by a healthy database and
-    /// returns its response together with the structured log lines it emitted.
+    /// returns its response, the structured log lines it emitted, and the
+    /// bootstrap pool and schema name the caller must pass to
+    /// `auth_tests::cleanup`.
     async fn callback_with_log(
         close_ingress: bool,
         authorization: Option<&str>,
-    ) -> (Response, Vec<serde_json::Value>) {
-        let (store, _schema, _bootstrap) = auth_tests::fixture().await;
+    ) -> (Response, Vec<serde_json::Value>, sqlx::PgPool, String) {
+        let (store, schema, bootstrap) = auth_tests::fixture().await;
         let (authority, _directory) = auth_tests::authority(store.clone()).await;
         let auth = AuthService::new(
             store.clone(),
@@ -1124,7 +1126,7 @@ mod credential_router_tests {
             .lines()
             .map(|line| serde_json::from_str(line).expect("structured log"))
             .collect();
-        (response, rows)
+        (response, rows, bootstrap, schema)
     }
 
     fn durable_failure_events(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
@@ -1146,7 +1148,9 @@ mod credential_router_tests {
 
     #[tokio::test]
     async fn a_callback_carrying_an_authorization_header_is_not_a_durable_incident() {
-        let (response, rows) = callback_with_log(false, Some("Bearer anything")).await;
+        let (response, rows, bootstrap, schema) =
+            callback_with_log(false, Some("Bearer anything")).await;
+        auth_tests::cleanup(&bootstrap, &schema).await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let cleared = response
@@ -1168,7 +1172,8 @@ mod credential_router_tests {
 
     #[tokio::test]
     async fn a_closed_callback_gate_is_still_logged_as_a_durable_failure() {
-        let (response, rows) = callback_with_log(true, None).await;
+        let (response, rows, bootstrap, schema) = callback_with_log(true, None).await;
+        auth_tests::cleanup(&bootstrap, &schema).await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(error_code(response).await, "unavailable");
