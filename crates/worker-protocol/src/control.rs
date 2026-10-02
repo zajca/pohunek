@@ -620,6 +620,14 @@ pub struct ExitStatus {
     pub stopped_by_user: bool,
     /// Millisecond Unix timestamp recorded by the worker.
     pub exited_at_ms: u64,
+    /// Whether the PTY output was force-closed before it reached EOF.
+    ///
+    /// A process outside the root's process group held the PTY open past the
+    /// stop deadline, so output written after the close is not retained. The
+    /// exit itself is exact. Absent in a record written before this field
+    /// existed, which reads as `false`.
+    #[serde(default)]
+    pub output_forced_closed: bool,
 }
 
 /// Lifecycle of one provider-managed subagent in the worker snapshot.
@@ -1030,6 +1038,23 @@ pub enum ControlMessage {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exit_status_without_the_forced_close_field_reads_as_not_forced() {
+        let status: ExitStatus = serde_json::from_str(
+            r#"{"code":0,"signal":null,"stopped_by_user":true,"exited_at_ms":7}"#,
+        )
+        .expect("a status written before the field existed");
+        assert!(!status.output_forced_closed);
+        let forced = ExitStatus {
+            output_forced_closed: true,
+            ..status
+        };
+        let round_trip: ExitStatus =
+            serde_json::from_str(&serde_json::to_string(&forced).expect("serialize"))
+                .expect("round trip");
+        assert!(round_trip.output_forced_closed);
+    }
+
     use std::collections::BTreeMap;
 
     use super::*;

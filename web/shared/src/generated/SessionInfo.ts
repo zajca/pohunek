@@ -173,6 +173,15 @@ export type SessionInfo = {
    */
   warnings?: Array<SessionWarning>;
   /**
+   * Whether the session's PTY output was force-closed when it stopped: a
+   * process outside the session's process group kept the terminal open past
+   * the stop deadline. The session still ended with its root's exit; output
+   * the holder wrote after the close is not retained. Set only on a terminal
+   * session whose exit was observed, and omitted from the wire form when
+   * false so a peer that predates the field never sees it.
+   */
+  output_force_closed?: boolean;
+  /**
    * Metadata set at creation or updated via `session.set_metadata`.
    * Owner-controlled; must not contain secrets.
    */

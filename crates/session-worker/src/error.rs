@@ -65,6 +65,14 @@ pub enum WorkerError {
     /// Private protocol handling failed.
     #[error("worker protocol failed: {0}")]
     Protocol(String),
+    /// Processes marked with a runtime ID could not be proven gone.
+    #[error("runtime {runtime_id} cleanup is unconfirmed: {detail}")]
+    RuntimeCleanup {
+        /// Runtime whose marked processes were swept.
+        runtime_id: String,
+        /// Why the sweep could not confirm the cleanup.
+        detail: String,
+    },
     /// The connecting peer could not be bound to a trusted process identity.
     #[error("worker peer identity rejected: {reason}")]
     PeerIdentity {

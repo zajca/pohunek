@@ -728,6 +728,7 @@ mod tests {
             branch: None,
             worktree_path: None,
             warnings: Vec::new(),
+            output_force_closed: false,
             metadata: BTreeMap::new(),
             created_at: updated_at.clone(),
             updated_at,

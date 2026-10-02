@@ -133,6 +133,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         branch: None,
         worktree_path: None,
         warnings: Vec::new(),
+        output_force_closed: false,
         metadata: BTreeMap::new(),
         created_at: "2026-06-17T10:00:00Z".to_owned(),
         updated_at: "2026-06-17T10:01:00Z".to_owned(),
@@ -5093,4 +5094,87 @@ fn session_remove_accepting_unconfirmed_is_an_additive_method_with_the_remove_sh
     assert_eq!(remove.params_ts, "SessionId");
     assert_eq!(accepting.params_ts, remove.params_ts);
     assert_eq!(accepting.output_ts, remove.output_ts);
+}
+
+#[test]
+fn session_info_omits_output_force_closed_unless_set() {
+    let clean = running_shell_session(None);
+    let value = serde_json::to_value(&clean).expect("serialize session info");
+    assert!(
+        !value
+            .as_object()
+            .expect("session info object")
+            .contains_key("output_force_closed"),
+        "a clean session must not carry the flag: {value}"
+    );
+
+    let forced = SessionInfo {
+        output_force_closed: true,
+        ..running_shell_session(None)
+    };
+    let value = serde_json::to_value(&forced).expect("serialize session info");
+    assert_eq!(value["output_force_closed"], json!(true));
+    assert_eq!(line_roundtrip(&forced), forced);
+
+    let mut without_field = value;
+    without_field
+        .as_object_mut()
+        .expect("session info object")
+        .remove("output_force_closed");
+    let parsed: SessionInfo = serde_json::from_value(without_field).expect("peer without the flag");
+    assert!(!parsed.output_force_closed);
+}
+
+/// The summary a v3 client that predates `output_force_closed` reads from a
+/// session: only fields every v3 peer already knows, deserialized with serde's
+/// default unknown-field handling, exactly as `SessionInfo` itself is.
+#[derive(Debug, serde::Deserialize)]
+struct PreForcedCloseSessionSummary {
+    id: SessionId,
+    agent: String,
+    state: SessionState,
+    #[serde(default)]
+    warnings: Vec<SessionWarning>,
+}
+
+#[test]
+fn a_session_list_carrying_the_forced_close_flag_still_decodes_for_an_older_v3_client() {
+    let list = vec![
+        running_shell_session(None),
+        SessionInfo {
+            id: SessionId("s-43".to_owned()),
+            state: SessionState::Stopped,
+            output_force_closed: true,
+            ..running_shell_session(None)
+        },
+    ];
+    let wire = serde_json::to_string(&list).expect("serialize session.list result");
+    assert!(wire.contains("\"output_force_closed\":true"), "{wire}");
+
+    let older: Vec<PreForcedCloseSessionSummary> =
+        serde_json::from_str(&wire).expect("an older v3 client decodes the whole list");
+    assert_eq!(older.len(), 2);
+    assert_eq!(older[1].id, SessionId("s-43".to_owned()));
+    assert_eq!(older[1].agent, "shell");
+    assert_eq!(older[1].state, SessionState::Stopped);
+    assert!(older[1].warnings.is_empty());
+
+    let current: Vec<SessionInfo> = serde_json::from_str(&wire).expect("current client decodes");
+    assert_eq!(current, list);
+}
+
+#[test]
+fn session_info_ignores_unknown_fields_and_warning_kinds_stay_closed_to_the_four_setup_kinds() {
+    let mut value = serde_json::to_value(running_shell_session(None)).expect("serialize");
+    value["a_future_additive_field"] = json!({"nested": true});
+    let parsed: SessionInfo = serde_json::from_value(value).expect("unknown field is ignored");
+    assert_eq!(parsed, running_shell_session(None));
+
+    for kind in ["fetch", "base_branch_fallback", "setup_script", "hook"] {
+        serde_json::from_value::<SessionWarningKind>(json!(kind)).expect("known kind");
+    }
+    assert!(
+        serde_json::from_value::<SessionWarningKind>(json!("output_force_closed")).is_err(),
+        "the forced close is not a warning kind, so no v3 peer can meet an unknown kind"
+    );
 }
