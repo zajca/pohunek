@@ -301,8 +301,7 @@ async fn unreachable_host_marks_error_without_breaking_other_hosts() {
 
     let daemon = LoopbackDaemon::spawn("m1-live", "0.1.0-live").await;
     let live_host = HostConfig::tcp("host-live", daemon.addr);
-    let dead_address = UnreachableAddr::reserve();
-    let dead_host = HostConfig::tcp("host-dead", dead_address.addr);
+    let dead_host = HostConfig::tcp("host-dead", unused_loopback_addr().await);
     let session = create_agent_session(
         &live_host,
         AgentKind::Codex,
@@ -2367,44 +2366,16 @@ where
     }
 }
 
-/// A loopback TCP address that nothing accepts connections on.
-///
-/// The socket is bound but never listens, so the kernel refuses every connect
-/// to the address, and holding the socket keeps another process from claiming
-/// the port for as long as the test uses it.
-struct UnreachableAddr {
-    addr: SocketAddr,
-    _socket: socket2::Socket,
-}
-
-impl UnreachableAddr {
-    fn reserve() -> Self {
-        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
-            .expect("create the reserving socket");
-        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
-        socket
-            .bind(&loopback.into())
-            .expect("bind an unused loopback port");
-        let addr = socket
-            .local_addr()
-            .expect("read the reserved address")
-            .as_socket()
-            .expect("the reserved address is an IP address");
-        Self {
-            addr,
-            _socket: socket,
-        }
-    }
-}
-
-#[test]
-fn a_reserved_unreachable_address_refuses_connections_while_it_is_held() {
-    let reserved = UnreachableAddr::reserve();
-
-    let error = std::net::TcpStream::connect(reserved.addr)
-        .expect_err("nothing listens on a reserved address");
-
-    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+/// Returns a loopback address that nothing listens on: the port is bound once
+/// and released before the address is returned.
+async fn unused_loopback_addr() -> SocketAddr {
+    // hermetic-allowed: #415 gui-core leaves this repository; pohunek-work rewrites its loopback tests against real daemon binaries
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind unused loopback");
+    let addr = listener.local_addr().expect("unused local addr");
+    drop(listener);
+    addr
 }
 
 /// Returns a `git` command that reads neither the user's nor the system's
