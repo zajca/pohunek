@@ -3,6 +3,9 @@
 // Rust guideline compliant 2026-09-08
 
 mod limits;
+
+#[cfg(test)]
+mod durable_failure_tests;
 pub(crate) mod transport;
 
 use std::sync::{
@@ -32,8 +35,8 @@ use crate::{
     admission::Authority,
     auth::{
         AuthError, AuthService, BrowserCallback, BrowserCallbackOutcome, BrowserCallbackResult,
-        BrowserCookie, DevicePollSecret, LoginBindingCookie, OidcCallbackCode, OidcClient,
-        RelayBearerCredential,
+        BrowserCookie, DevicePollSecret, DurableCause, LoginBindingCookie, OidcCallbackCode,
+        OidcClient, RelayBearerCredential,
     },
     config::Config,
     store::{Store, StoreError},
@@ -197,7 +200,9 @@ async fn browser_callback(
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiFailure> {
     if gate(&state).is_err() || reject_mixed(&headers).is_err() {
-        return callback_failure_response(&AuthError::Durable);
+        return callback_failure_response(&AuthError::durable_state(
+            "the callback gate refused the request",
+        ));
     }
     let query = match parse_callback_query(raw_query.as_deref()) {
         Ok(query) => query,
@@ -917,6 +922,15 @@ impl ApiFailure {
         }
     }
     fn auth(error: &AuthError) -> Self {
+        // The one place a durable failure leaves the auth layer, so its private
+        // cause is recorded here. The chain holds sanitized descriptions only
+        // (see `DurableCause`) and never reaches the response.
+        if let AuthError::Durable(cause) = error {
+            let cause = cause
+                .as_deref()
+                .map_or_else(|| "none recorded".to_owned(), DurableCause::chain);
+            tracing::error!(name: "relay.auth.durable_failure", cause = %cause, "durable authentication state is unavailable");
+        }
         match error {
             AuthError::CredentialInvalid | AuthError::CsrfInvalid | AuthError::OriginInvalid => {
                 Self::unauthenticated()
@@ -926,7 +940,7 @@ impl ApiFailure {
             // still tell the client the attempt is worth retrying rather than
             // malformed, so it is explicit here instead of falling through.
             AuthError::Capacity
-            | AuthError::Durable
+            | AuthError::Durable(_)
             | AuthError::Retryable
             | AuthError::IssuerUnavailable
             // Recovery quarantine is a temporary refusal to change authority, so

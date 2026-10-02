@@ -55,7 +55,9 @@ pub(crate) struct PendingDeviceCodes {
 impl PendingDeviceCodes {
     /// Inserts one admitted device code.
     pub(crate) fn insert(&self, login_id: Uuid, code: PendingDeviceCode) -> Result<(), AuthError> {
-        let mut codes = self.codes.lock().map_err(|_error| AuthError::Durable)?;
+        let mut codes = self.codes.lock().map_err(|_error| {
+            AuthError::durable_state("the pending device-code lock is poisoned")
+        })?;
         if codes.insert(login_id, code).is_some() {
             return Err(AuthError::Malformed);
         }
@@ -143,7 +145,9 @@ impl PendingTransactions {
 
     /// Reserves capacity before a flow can make durable or issuer work.
     pub(crate) fn reserve(&self) -> Result<PendingTransactionReservation, AuthError> {
-        let mut state = self.state.lock().map_err(|_error| AuthError::Durable)?;
+        let mut state = self.state.lock().map_err(|_error| {
+            AuthError::durable_state("the pending transaction lock is poisoned")
+        })?;
         state.transactions.retain(|_, transaction| {
             !matches!(transaction, PendingTransaction::Pending { expires_at } if *expires_at <= Instant::now())
         });
@@ -170,7 +174,9 @@ impl PendingTransactions {
     /// claimed, local expiry pruning cannot free this capacity unit while the
     /// token exchange or session issuance remains in progress.
     pub(crate) fn claim(&self, login_id: Uuid) -> Result<PendingTransactionGuard, AuthError> {
-        let mut state = self.state.lock().map_err(|_error| AuthError::Durable)?;
+        let mut state = self.state.lock().map_err(|_error| {
+            AuthError::durable_state("the pending transaction lock is poisoned")
+        })?;
         let login_id = match state.transactions.get_mut(&login_id) {
             Some(transaction @ PendingTransaction::Pending { .. }) => {
                 *transaction = PendingTransaction::InFlight;
@@ -195,7 +201,9 @@ impl PendingTransactions {
 impl PendingTransactionReservation {
     /// Transfers one reservation to an active login until the supplied expiry.
     pub(crate) fn commit(mut self, login_id: Uuid, expires_at: Instant) -> Result<(), AuthError> {
-        let mut state = self.state.lock().map_err(|_error| AuthError::Durable)?;
+        let mut state = self.state.lock().map_err(|_error| {
+            AuthError::durable_state("the pending transaction lock is poisoned")
+        })?;
         if !self.active
             || state.reservations == 0
             || state

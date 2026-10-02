@@ -6,6 +6,7 @@
 
 // Rust guideline compliant 2026-09-08
 
+mod cause;
 mod oidc;
 mod pending;
 mod secret;
@@ -15,6 +16,9 @@ pub(crate) mod service;
 mod parent_integrity_tests;
 
 use secret::SecretValue;
+
+#[doc(inline)]
+pub use cause::DurableCause;
 
 #[doc(inline)]
 pub use secret::DigestKey;
@@ -73,8 +77,11 @@ pub enum AuthError {
     #[error("authentication transaction capacity is exhausted")]
     Capacity,
     /// A durable operation failed without exposing its database detail.
+    ///
+    /// The text stays fixed; the cause is only reachable as the
+    /// [`std::error::Error::source`] chain of [`DurableCause`].
     #[error("durable authentication state is unavailable")]
-    Durable,
+    Durable(#[source] Option<Box<DurableCause>>),
     /// A serializable identity transaction must be retried internally.
     #[error("durable authentication state is unavailable")]
     Retryable,
@@ -129,6 +136,20 @@ pub enum AuthError {
     /// No active linked identity matches the requested coordinate.
     #[error("linked identity was not found")]
     IdentityNotFound,
+}
+
+impl AuthError {
+    /// Maps a failure with an underlying error into [`AuthError::Durable`],
+    /// keeping a sanitized description of its chain as the source.
+    pub(crate) fn durable(error: &(dyn std::error::Error + 'static)) -> Self {
+        Self::Durable(Some(Box::new(DurableCause::from_error(error))))
+    }
+
+    /// Maps a durable failure that has no underlying error into
+    /// [`AuthError::Durable`], recording why as the source.
+    pub(crate) fn durable_state(reason: &'static str) -> Self {
+        Self::Durable(Some(Box::new(DurableCause::from_reason(reason))))
+    }
 }
 
 /// Identifies an opaque browser session cookie.

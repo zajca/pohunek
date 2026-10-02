@@ -1292,7 +1292,7 @@ async fn unlink_audit_outage_fails_closed_without_an_authority_change() {
                 },
             )
             .await,
-        Err(AuthError::Durable)
+        Err(AuthError::Durable(_))
     ));
 
     let still_active: Option<time::OffsetDateTime> =
@@ -1342,7 +1342,7 @@ async fn completion_audit_outage_links_no_identity() {
                 Some(account.bearer),
             )
             .await,
-        Err(AuthError::Durable | AuthError::Retryable)
+        Err(AuthError::Durable(_) | AuthError::Retryable)
     ));
     assert_eq!(identity_count(&store, account.principal_id).await, 1);
     assert_eq!(
@@ -2114,7 +2114,7 @@ async fn mutation_fails_past_the_original_lease_lifetime_without_renewal() {
     }
     let lapsed = open_link(&service, &store, owner.bearer, AccountLinkChannel::Device).await;
     assert!(
-        matches!(lapsed, Err(AuthError::Durable)),
+        matches!(lapsed, Err(AuthError::Durable(_))),
         "an unrenewed fence refuses the mutation, got {:?}",
         lapsed.as_ref().err()
     );
@@ -2562,7 +2562,7 @@ async fn racing_starts_open_exactly_one_transaction() {
                         AuthError::LinkPending
                             | AuthError::IdempotencyConflict
                             | AuthError::Retryable
-                            | AuthError::Durable
+                            | AuthError::Durable(_)
                     ),
                     "unexpected refusal for the losing start: {error:?} (shared_key={shared_key})"
                 );
