@@ -12,10 +12,11 @@ use super::{branch_exists, worktree_add_new, worktree_remove};
 
 /// Variables the child starts with: each points Git at a repository, index or
 /// worktree that does not exist.
-const AMBIENT_GIT_VARS: [(&str, &str); 3] = [
+const AMBIENT_GIT_VARS: [(&str, &str); 4] = [
     ("GIT_DIR", "/nonexistent/pohunek/.git"),
     ("GIT_WORK_TREE", "/nonexistent/pohunek"),
     ("GIT_INDEX_FILE", "/nonexistent/pohunek/index"),
+    ("GIT_REFERENCE_BACKEND", "bogus"),
 ];
 
 /// Runs a setup `git` command with the test environment's scrubbed variables,

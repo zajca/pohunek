@@ -15,12 +15,15 @@ use std::process::Command;
 ///
 /// These are the repository-location variables of git(1) "ENVIRONMENT
 /// VARIABLES" ("The Git Repository"). Git sets `GIT_DIR` and `GIT_INDEX_FILE`
-/// itself while it runs a hook. The discovery limits
+/// itself while it runs a hook, and `GIT_REFERENCE_BACKEND` overrides the
+/// repository's ref storage format. The discovery limits
 /// (`GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM`) stay because
-/// every daemon command starts at the repository it names, and the user's
-/// configuration and identity variables (`GIT_CONFIG_*`, `GIT_AUTHOR_*`,
-/// `GIT_COMMITTER_*`, `GIT_SSH_COMMAND`, ...) stay because they are legitimate
-/// input.
+/// every daemon command starts at the repository it names. `GIT_DEFAULT_HASH`,
+/// `GIT_DEFAULT_REF_FORMAT` and `GIT_INDEX_VERSION` stay because they only shape
+/// a repository or index Git newly creates and never redirect a command at an
+/// existing repository. The user's configuration and identity variables
+/// (`GIT_CONFIG_*`, `GIT_AUTHOR_*`, `GIT_COMMITTER_*`, `GIT_SSH_COMMAND`, ...)
+/// stay because they are legitimate input.
 ///
 /// `xtask` keeps the same list for its changed-file queries
 /// (`REPOSITORY_REDIRECTING_VARS` in `crates/xtask/src/affected.rs`); a test
@@ -34,6 +37,7 @@ pub(crate) const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_NAMESPACE",
+    "GIT_REFERENCE_BACKEND",
 ];
 
 /// Builds a command for the trusted `git` executable that drops the
@@ -87,7 +91,7 @@ mod tests {
         ] {
             assert!(!REPOSITORY_REDIRECTING_VARS.contains(&kept), "{kept}");
         }
-        assert_eq!(REPOSITORY_REDIRECTING_VARS.len(), 7);
+        assert_eq!(REPOSITORY_REDIRECTING_VARS.len(), 8);
     }
 
     /// Names in the string-literal list that follows `marker` in `source`.
