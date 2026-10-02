@@ -26,6 +26,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 pohunek-daemon = { workspace = true }
 pohunek-test-support = { workspace = true }
+# Reserves a loopback port without listening on it.
+socket2 = "0.6"
 tempfile = { workspace = true }
 time = { workspace = true, features = ["macros"] }
 

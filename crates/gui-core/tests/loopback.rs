@@ -37,6 +37,7 @@ use pohunek_gui_core::{
     ReviewStatus, ReviewStore, Selection, SessionLinkKind, SessionLinkProvider, UiState,
     WindowSize, Workspace,
 };
+use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::{wait, worker_binary};
 use protocol::{
     method, AgentActivity, AgentKind, ErrorClass, NotificationPolicyParams, ProcessStartIdentity,
@@ -300,7 +301,8 @@ async fn unreachable_host_marks_error_without_breaking_other_hosts() {
 
     let daemon = LoopbackDaemon::spawn("m1-live", "0.1.0-live").await;
     let live_host = HostConfig::tcp("host-live", daemon.addr);
-    let dead_host = HostConfig::tcp("host-dead", unused_loopback_addr().await);
+    let dead_address = UnreachableAddr::reserve();
+    let dead_host = HostConfig::tcp("host-dead", dead_address.addr);
     let session = create_agent_session(
         &live_host,
         AgentKind::Codex,
@@ -2054,7 +2056,6 @@ impl LoopbackDaemon {
                 "/bin/sh",
                 std::iter::empty::<String>(),
             ),
-            stop_grace: Duration::from_millis(50),
             store_path: Some(store_path),
             worktree_root: Some(temp_dir(&format!("{tag}-worktrees"))),
             config_dir,
@@ -2366,18 +2367,57 @@ where
     }
 }
 
-async fn unused_loopback_addr() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind unused loopback");
-    let addr = listener.local_addr().expect("unused local addr");
-    drop(listener);
-    addr
+/// A loopback TCP address that nothing accepts connections on.
+///
+/// The socket is bound but never listens, so the kernel refuses every connect
+/// to the address, and holding the socket keeps another process from claiming
+/// the port for as long as the test uses it.
+struct UnreachableAddr {
+    addr: SocketAddr,
+    _socket: socket2::Socket,
+}
+
+impl UnreachableAddr {
+    fn reserve() -> Self {
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+            .expect("create the reserving socket");
+        let loopback = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+        socket
+            .bind(&loopback.into())
+            .expect("bind an unused loopback port");
+        let addr = socket
+            .local_addr()
+            .expect("read the reserved address")
+            .as_socket()
+            .expect("the reserved address is an IP address");
+        Self {
+            addr,
+            _socket: socket,
+        }
+    }
+}
+
+#[test]
+fn a_reserved_unreachable_address_refuses_connections_while_it_is_held() {
+    let reserved = UnreachableAddr::reserve();
+
+    let error = std::net::TcpStream::connect(reserved.addr)
+        .expect_err("nothing listens on a reserved address");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+}
+
+/// Returns a `git` command that reads neither the user's nor the system's
+/// configuration: `HOME` is private, and the system file is switched off.
+fn git_command() -> std::process::Command {
+    let mut command = scrubbed_command("git");
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command
 }
 
 fn init_git_repo(tag: &str) -> PathBuf {
     let dir = temp_dir(tag);
-    let output = std::process::Command::new("git")
+    let output = git_command()
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&dir)
         .output()
@@ -2392,7 +2432,7 @@ fn init_git_repo(tag: &str) -> PathBuf {
         ["config", "user.name", "Test"],
         ["config", "commit.gpgsign", "false"],
     ] {
-        let output = std::process::Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(&dir)
             .args(args)
@@ -2406,7 +2446,7 @@ fn init_git_repo(tag: &str) -> PathBuf {
     }
     std::fs::write(dir.join("README.md"), "init\n").expect("write README");
     for args in [vec!["add", "."], vec!["commit", "-q", "-m", "init"]] {
-        let output = std::process::Command::new("git")
+        let output = git_command()
             .arg("-C")
             .arg(&dir)
             .args(&args)
@@ -2509,7 +2549,7 @@ impl Drop for RecorderGuard {
 }
 
 fn spawn_recorder(script: &Path, prompt: &str) -> RecorderGuard {
-    let child = std::process::Command::new("/bin/sh")
+    let child = scrubbed_command("/bin/sh")
         .arg(script)
         .arg(prompt)
         .stdin(std::process::Stdio::null())
@@ -2521,7 +2561,8 @@ fn spawn_recorder(script: &Path, prompt: &str) -> RecorderGuard {
 }
 
 fn make_fifo(path: &Path) {
-    let status = std::process::Command::new("mkfifo")
+    let status = scrubbed_command("mkfifo")
+        .env("PATH", SYSTEM_PATH)
         .arg(path)
         .status()
         .expect("run mkfifo");
@@ -2772,24 +2813,39 @@ fn agent_name(agent: &AgentKind) -> &'static str {
 }
 
 thread_local! {
-    /// Fixture directories of the current test thread; they are removed when
-    /// the thread ends, after the test body has finished.
-    static FIXTURES: std::cell::RefCell<Vec<tempfile::TempDir>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// The hermetic environment of the current test thread: one private root
+    /// holding every fixture directory, removed when the thread ends, after the
+    /// test body has finished.
+    static TEST_ENV: TestEnv = TestEnv::new().expect("create the hermetic test environment");
+    /// Numbers the fixture directories of the current test thread.
+    static NEXT_FIXTURE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Creates a random, owner-private, symlink-free directory under the shared
-/// fixture root and keeps it alive for the rest of the test thread.
+/// Creates an owner-private directory below the test thread's private root.
 ///
 /// Keep `prefix` short: it counts against the socket path limit of anything
 /// bound beneath the directory.
 fn fixture_dir(prefix: &str) -> PathBuf {
-    let fixture = pohunek_test_support::tempdir_with_prefix(prefix)
-        .expect("create private fixture directory");
-    let path = fixture.path().to_path_buf();
-    FIXTURES.with(|fixtures| fixtures.borrow_mut().push(fixture));
+    let number = NEXT_FIXTURE.with(|next| {
+        let number = next.get();
+        next.set(number + 1);
+        number
+    });
+    let path = TEST_ENV.with(|env| env.root().join(format!("{prefix}{number}")));
+    std::fs::create_dir(&path).expect("create private fixture directory");
+    make_owner_private(&path);
     path
 }
+
+/// Returns a command for `program` with the test thread's scrubbed environment
+/// and private working directory.
+fn scrubbed_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    TEST_ENV.with(|env| env.command(program))
+}
+
+/// `PATH` of helper tools started by the fixtures: the system directories on
+/// Linux and macOS, never the developer's toolchain directories.
+const SYSTEM_PATH: &str = "/usr/bin:/bin";
 
 fn temp_dir(tag: &str) -> PathBuf {
     fixture_dir(&format!("pgc-{tag}-"))
