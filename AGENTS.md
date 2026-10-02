@@ -228,6 +228,15 @@ flaky and failed tests in the job summary. A FLAKY result means opening a bug is
 the root cause. A per-test `flaky-result = "pass"` override is allowed only
 with a linked issue and a reason in a comment next to it.
 
+Hermetic tests: a test owns its fixtures and never touches host state.
+Directories come from `pohunek_test_support::tempdir()` or
+`pohunek_test_support::env::TestEnv` (private root, cwd, HOME/XDG/TMPDIR, scrubbed
+child environment), never from `std::env::temp_dir()`, a host `/tmp` path or the
+`tempfile` constructors, and a socket stays bound instead of "bind port 0, drop,
+reuse the number". `crates/xtask/tests/hermetic_scan.rs` enforces this in test code
+with no baseline. A case where the host state is the subject carries
+`// hermetic-allowed: #<issue> <reason>` on or directly above its line.
+
 Rust:
 
 ```bash
