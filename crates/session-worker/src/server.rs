@@ -371,6 +371,8 @@ impl Server {
             lease_epoch_tx,
             state_changed: Notify::new(),
             shutdown: CancellationToken::new(),
+            #[cfg(test)]
+            starting_gate: Mutex::new(None),
         });
         Ok(Self {
             listener,
@@ -471,6 +473,20 @@ struct Shared {
     lease_epoch_tx: watch::Sender<u64>,
     state_changed: Notify,
     shutdown: CancellationToken,
+    /// Pauses `initialize` between the `Starting` commit and the child spawn.
+    #[cfg(test)]
+    starting_gate: Mutex<Option<StartingGate>>,
+}
+
+/// Test-only pause point that makes the transient `Starting` phase observable.
+///
+/// `initialize` sends on `reached` once `Starting` is committed and the state
+/// lock is released, then waits on `proceed` before it spawns the child.
+#[cfg(test)]
+#[derive(Debug)]
+struct StartingGate {
+    reached: oneshot::Sender<()>,
+    proceed: oneshot::Receiver<()>,
 }
 
 impl Shared {
@@ -1097,6 +1113,8 @@ async fn initialize_request(
         state.journal.updated_at = timestamp();
         persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
+    #[cfg(test)]
+    pause_after_starting(shared).await;
 
     let command = command_from_initialize(shared, &initialize, &runtime_id);
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
@@ -1173,6 +1191,20 @@ async fn spawn_running(
         return Err(control_error(ControlCode::RuntimeFault, error, false));
     }
     Ok((pty, child_process))
+}
+
+/// Waits at the installed [`StartingGate`], if any, with the state lock free.
+#[cfg(test)]
+async fn pause_after_starting(shared: &Shared) {
+    let gate = shared
+        .starting_gate
+        .lock()
+        .expect("starting gate lock")
+        .take();
+    if let Some(gate) = gate {
+        let _ = gate.reached.send(());
+        let _ = gate.proceed.await;
+    }
 }
 
 fn spawn_pty(command: Command, config: &WorkerConfig) -> Result<PtyOwner, ControlError> {
@@ -6679,10 +6711,10 @@ mod tests {
         assert!(!directory.path().join("fixture").exists());
     }
 
-    /// How long a lock holder observing `Starting` watches for the child.
+    /// How long the lock holder watches for a child while `Starting`.
     ///
-    /// Long enough for `/bin/sh` to start and write its marker when the child
-    /// is spawned outside the lock; a shorter wait only lowers the test's
+    /// Long enough for `/bin/sh` to start and write its marker if the child
+    /// were spawned outside the lock; a shorter wait only lowers the test's
     /// sensitivity, never makes it fail spuriously.
     const STARTING_CHILD_WATCH: Duration = Duration::from_millis(500);
 
@@ -6727,42 +6759,58 @@ mod tests {
         connection.lease_id = Some(lease_id.clone());
         connection.selected_version = Some(CURRENT_VERSION);
 
-        let shared = std::sync::Arc::clone(&server.shared);
-        let observer_marker = marker.clone();
-        let observer = tokio::spawn(async move {
-            loop {
-                let state = shared.state.lock().await;
-                match state.phase {
-                    super::WireRuntimePhase::Uninitialized => {
-                        drop(state);
-                        tokio::task::yield_now().await;
-                    }
-                    super::WireRuntimePhase::Starting => {
-                        let deadline = tokio::time::Instant::now() + STARTING_CHILD_WATCH;
-                        while tokio::time::Instant::now() < deadline {
-                            if observer_marker.exists() {
-                                return Some(true);
-                            }
-                            tokio::time::sleep(MARKER_POLL).await;
-                        }
-                        drop(state);
-                        return Some(false);
-                    }
-                    _ => return None,
-                }
-            }
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+        *server
+            .shared
+            .starting_gate
+            .lock()
+            .expect("starting gate lock") = Some(super::StartingGate {
+            reached: reached_tx,
+            proceed: proceed_rx,
         });
-        let initialized =
-            super::initialize_request(&server.shared, &connection, &lease_id, initialize)
-                .await
-                .expect("initialize runtime");
+        let shared = std::sync::Arc::clone(&server.shared);
+        let initializing = tokio::spawn(async move {
+            super::initialize_request(&shared, &connection, &lease_id, initialize).await
+        });
 
+        // `initialize` is now between the durable `Starting` commit and the
+        // child spawn, with the state lock free.
+        pohunek_test_support::wait::guard("initialize to commit Starting", reached_rx)
+            .await
+            .expect("initialize reaches the Starting gate");
+        let starting = server.shared.state.lock().await;
+        assert_eq!(starting.phase, super::WireRuntimePhase::Starting);
+        assert!(starting.pty.is_none(), "no child exists while `Starting`");
+        assert!(!marker.exists(), "no child has run while `Starting`");
+        proceed_tx.send(()).expect("resume initialize");
+        // `initialize` now waits for the state lock this test holds, and the
+        // child can only be spawned under that lock.
+        let deadline = tokio::time::Instant::now() + STARTING_CHILD_WATCH;
+        while tokio::time::Instant::now() < deadline {
+            assert!(
+                !marker.exists(),
+                "the child ran while the worker was observably `Starting`"
+            );
+            tokio::time::sleep(MARKER_POLL).await;
+        }
+        drop(starting);
+
+        let initialized = pohunek_test_support::wait::guard("initialize to finish", initializing)
+            .await
+            .expect("initialize task")
+            .expect("initialize runtime");
         assert!(matches!(initialized, ResponseKind::Initialized { .. }));
+        // The `Running` commit and the spawn shared one lock hold: once the
+        // lock is free, the worker is `Running` and the child starts.
         assert_eq!(
-            observer.await.expect("observer task"),
-            Some(false),
-            "the observer must see `Starting` and no child while it holds the lock"
+            server.shared.state.lock().await.phase,
+            super::WireRuntimePhase::Running
         );
+        pohunek_test_support::wait::wait_until("the child to start", || async {
+            marker.exists().then_some(())
+        })
+        .await;
         let pty = server
             .shared
             .state

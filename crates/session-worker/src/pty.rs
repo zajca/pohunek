@@ -2580,19 +2580,18 @@ mod tests {
             "root must remain as the process-group authority during drain"
         );
 
-        let started = Instant::now();
-        let stopped = tokio::time::timeout(
-            Duration::from_secs(1),
-            pty.stop("stop-after-root-exit", Duration::from_millis(50)),
+        // The descendant ignores SIGTERM, so stop spends the first grace window
+        // and then needs the second one for the SIGKILLed group to close the PTY.
+        // The production grace keeps that second window wide enough for a loaded
+        // host; a stop that waited for descendant-held EOF instead of killing the
+        // group would never return, which the hang guard reports by name.
+        let stopped = pohunek_test_support::wait::guard(
+            "stop to terminate the descendant group",
+            pty.stop("stop-after-root-exit", WorkerConfig::new().stop_grace),
         )
         .await
-        .expect("bounded stop deadline")
         .expect("stop descendant group");
         assert_eq!(stopped, root_exit);
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "stop must not wait indefinitely for descendant-held PTY EOF"
-        );
 
         loop {
             match output.recv().await.expect("output closes after stop") {
