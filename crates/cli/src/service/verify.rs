@@ -17,7 +17,8 @@ use super::settings;
 /// environment. A different program or runtime directory is configuration of
 /// the same verification path: the units are rendered, written and handed to
 /// the program in the same way, and a program that is missing or rejects them
-/// still fails the install.
+/// still fails the install. Replacing the program is available only to tests
+/// (`test-util`), so a release build always verifies with `systemd-analyze`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnitVerifier {
     program: Option<PathBuf>,
@@ -27,6 +28,7 @@ pub struct UnitVerifier {
 impl UnitVerifier {
     /// Runs `program` instead of `systemd-analyze`, as
     /// `program --user verify <unit files>`.
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn with_program(mut self, program: impl Into<PathBuf>) -> Self {
         self.program = Some(program.into());

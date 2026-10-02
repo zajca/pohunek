@@ -235,7 +235,10 @@ impl<'a> Engine<'a> {
     ///
     /// The units are still rendered and verified before registration; only the
     /// program that checks them is configured.
-    #[cfg(target_os = "linux")]
+    ///
+    /// Test-only: a verifier that accepts everything would let a caller
+    /// register units nothing checked, so release builds cannot reach it.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-util")))]
     #[must_use]
     pub fn with_unit_verifier(mut self, verifier: UnitVerifier) -> Self {
         self.unit_verifier = verifier;
