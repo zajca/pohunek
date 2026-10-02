@@ -5222,19 +5222,6 @@ fn sort_subagents(subagents: &mut [SubagentInfo]) {
     });
 }
 
-/// Resolves the worker roots of a test fixture that builds its own launcher.
-///
-/// Roots the config does not name are fresh directories that stay on disk,
-/// because the fixture outlives any one registry.
-#[cfg(test)]
-fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
-    let (runtime_root, state_root, owned) = owned_test_worker_roots(config);
-    for dir in owned {
-        let _ = dir.keep();
-    }
-    (runtime_root, state_root)
-}
-
 /// Resolves the worker roots of a test registry.
 ///
 /// Roots the config does not name are fresh directories; the third value owns
