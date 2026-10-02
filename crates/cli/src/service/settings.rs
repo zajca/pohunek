@@ -4,7 +4,7 @@
 //! the file never depends on a serde default and each number carries its
 //! rationale in one place.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-01
 
 use std::time::Duration;
 
@@ -115,6 +115,22 @@ pub const UNIT_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Enough for a screenful of warnings while keeping errors bounded.
 pub const UNIT_VERIFY_OUTPUT: usize = 16 * 1024;
+
+/// Longest wait for `exec` of a file this process just wrote to stop failing
+/// with `ETXTBSY`.
+///
+/// While any thread of the process holds a file open for writing, a sibling
+/// thread's `fork` or `posix_spawn` gives its child a copy of that descriptor
+/// until the child's own `exec`, and executing the file fails meanwhile. The
+/// child execs within microseconds; the bound only absorbs a child that the
+/// scheduler holds back on a loaded host, and expiry means the file stayed
+/// open for writing.
+pub const EXEC_BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Interval between attempts to execute a file that is busy.
+///
+/// Short, because the busy window is the pre-`exec` gap of another child.
+pub const EXEC_BUSY_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Longest wait for the install transaction lock.
 ///

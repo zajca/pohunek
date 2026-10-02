@@ -22,7 +22,7 @@
 //! anything, every destructive operation verifies it first, and uninstall
 //! removes it after the prefix is emptied.
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-10-01
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, Permissions};
@@ -31,7 +31,7 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pohunek_paths::{
     valid_install_version, InstallLayout, DAEMON_EXECUTABLE_NAME, WORKER_EXECUTABLE_NAME,
@@ -41,7 +41,9 @@ use pohunek_platform::supervisor::Namespace;
 use tokio::io::AsyncReadExt as _;
 
 use super::error::{fs_error, io_error, Error};
-use super::settings::{VERSION_PROBE_OUTPUT, VERSION_PROBE_TIMEOUT};
+use super::settings::{
+    EXEC_BUSY_POLL, EXEC_BUSY_WAIT, VERSION_PROBE_OUTPUT, VERSION_PROBE_TIMEOUT,
+};
 
 /// File name of the CLI in a staging directory, a version directory, and `<prefix>/bin`.
 pub const CLI_NAME: &str = "pohunek";
@@ -626,20 +628,49 @@ fn copy_binary(source: &Path, destination: &Path) -> Result<(), Error> {
         .map_err(io_error("synchronize", destination))
 }
 
+/// Whether `error` is an `exec` of a file that is open for writing.
+pub(crate) fn is_exec_busy(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ExecutableFileBusy
+}
+
+/// Runs `attempt` until it stops failing with `ETXTBSY` or `wait` has passed.
+///
+/// Every other result, and the busy error once `wait` is exhausted, is
+/// returned unchanged. `poll` separates the attempts.
+async fn retry_while_exec_busy<T>(
+    wait: Duration,
+    poll: Duration,
+    mut attempt: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match attempt() {
+            Err(error) if is_exec_busy(&error) && tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(poll).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Runs `<binary> --version` with an empty environment and checks its answer.
 async fn probe(binary: &Path, name: &str, version: &str) -> Result<(), Error> {
     let failure = |detail: String| Error::VersionProbe {
         binary: binary.to_path_buf(),
         detail,
     };
-    let mut child = tokio::process::Command::new(binary)
+    let mut command = tokio::process::Command::new(binary);
+    command
         .arg("--version")
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    // The binary was written by this process moments ago, so another thread's
+    // child can still hold a copy of the write descriptor.
+    let mut child = retry_while_exec_busy(EXEC_BUSY_WAIT, EXEC_BUSY_POLL, || command.spawn())
+        .await
         .map_err(|error| failure(format!("cannot run it: {error}")))?;
     let stdout = child
         .stdout
@@ -823,6 +854,104 @@ pub(crate) mod tests {
         )
         .expect("write fake binary");
         std::fs::set_permissions(&path, Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    fn busy() -> io::Error {
+        io::ErrorKind::ExecutableFileBusy.into()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn exec_is_retried_while_the_file_is_busy_and_then_succeeds() {
+        let mut busy_results = 3;
+        let mut attempts = 0;
+        let result = retry_while_exec_busy(EXEC_BUSY_WAIT, EXEC_BUSY_POLL, || {
+            attempts += 1;
+            if busy_results > 0 {
+                busy_results -= 1;
+                Err(busy())
+            } else {
+                Ok(attempts)
+            }
+        })
+        .await;
+        assert_eq!(result.expect("retried until free"), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_file_that_stays_busy_fails_once_the_wait_is_exhausted() {
+        let mut attempts = 0_u32;
+        let error = retry_while_exec_busy(EXEC_BUSY_WAIT, EXEC_BUSY_POLL, || {
+            attempts += 1;
+            Err::<(), _>(busy())
+        })
+        .await
+        .expect_err("never free");
+        assert!(is_exec_busy(&error), "{error:?}");
+        assert!(attempts > 1, "{attempts}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exec_error_other_than_busy_is_not_retried() {
+        let mut attempts = 0_u32;
+        let error = retry_while_exec_busy(EXEC_BUSY_WAIT, EXEC_BUSY_POLL, || {
+            attempts += 1;
+            Err::<(), _>(io::ErrorKind::NotFound.into())
+        })
+        .await
+        .expect_err("not found");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
+    /// A descriptor open for writing, the state a sibling's pre-`exec` child
+    /// leaves on a freshly written executable, makes `exec` fail with the
+    /// error [`is_exec_busy`] recognizes.
+    ///
+    /// Linux only: Darwin lets `exec` succeed on a file that is still open for
+    /// writing, so there is no busy state to report there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exec_of_a_file_open_for_writing_is_reported_as_busy() {
+        let (_root, root) = temp_root();
+        write_fake(root.as_path(), "fake", "1.0.0");
+        let path = root.as_path().join("fake");
+        let writer = OpenOptions::new().write(true).open(&path).expect("open");
+
+        let error = std::process::Command::new(&path)
+            .arg("--version")
+            .spawn()
+            .expect_err("exec while a writer is open");
+        assert!(is_exec_busy(&error), "{error:?}");
+
+        // A sibling test thread's child can still hold a copy of the closed
+        // descriptor, so the exec is retried like the probe's.
+        drop(writer);
+        let mut child = crate::service::usage::tests::spawn_when_exec_free(
+            std::process::Command::new(&path)
+                .arg("--version")
+                .stdout(Stdio::null()),
+        )
+        .expect("exec once the writer is closed");
+        assert!(child.wait().expect("wait").success());
+    }
+
+    /// The probe succeeds once a writer that was open at its first attempt
+    /// closes: the join polls the probe first, so it meets the open writer
+    /// before the writer is dropped. Where `exec` of such a file is refused as
+    /// busy (Linux) the probe retries; elsewhere (Darwin) its first attempt
+    /// already succeeds.
+    #[tokio::test]
+    async fn the_version_probe_waits_for_a_descriptor_that_is_still_open_for_writing() {
+        let (_root, root) = temp_root();
+        write_fake(root.as_path(), "fake", "1.0.0");
+        let path = root.as_path().join("fake");
+        let writer = OpenOptions::new().write(true).open(&path).expect("open");
+
+        let (probed, ()) = tokio::join!(probe(&path, "fake", "1.0.0"), async move {
+            tokio::task::yield_now().await;
+            drop(writer);
+        });
+        probed.expect("the probe ran the binary after the writer closed");
     }
 
     pub(crate) fn stage_dir(root: &Path, version: &str) -> PathBuf {
