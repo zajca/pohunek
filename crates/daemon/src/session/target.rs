@@ -874,7 +874,7 @@ impl SessionRegistry {
             last_agent_report: None,
             last_native_report: None,
             observed_agents: Vec::new(),
-            cwd_observed_at: std::time::Instant::now(),
+            cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_pending
                 .then(|| self.daemon_instance_id().to_owned()),
         };
