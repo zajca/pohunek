@@ -944,6 +944,7 @@ mod tests {
             .acquire_lease(&config.relay_id, Uuid::now_v7(), 1)
             .await
             .expect("serving lease blocks provision replay");
+        let renewal = crate::admission::test_lease::spawn_lease_renewal(&store, &lease);
         assert!(matches!(
             execute(
                 &config,
@@ -955,6 +956,7 @@ mod tests {
             .await,
             Err(OperatorError::Lifecycle(LifecycleError::InvalidState))
         ));
+        renewal.stop().await;
         store
             .release_lease(&lease)
             .await
@@ -1035,6 +1037,7 @@ mod tests {
             .acquire_lease(&config.relay_id, Uuid::now_v7(), 1)
             .await
             .expect("serving lease");
+        let renewal = crate::admission::test_lease::spawn_lease_renewal(&store, &lease);
         assert!(matches!(
             execute(&config, Action::Migrate).await,
             Err(OperatorError::Lifecycle(LifecycleError::InvalidState))
@@ -1056,6 +1059,7 @@ mod tests {
             .await,
             Err(OperatorError::Lifecycle(LifecycleError::InvalidState))
         ));
+        renewal.stop().await;
         store
             .release_lease(&lease)
             .await

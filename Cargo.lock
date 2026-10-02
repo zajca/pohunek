@@ -4503,6 +4503,7 @@ dependencies = [
  "openidconnect",
  "pohunek-logging",
  "pohunek-relay-protocol",
+ "pohunek-test-support",
  "reqwest",
  "rustix 1.1.4",
  "serde",

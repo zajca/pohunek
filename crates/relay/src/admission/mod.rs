@@ -2453,6 +2453,211 @@ async fn ensure_effective_owner_remains(
     Ok(())
 }
 
+/// Keeps a test authority's relay fence alive the way the relay runtime does.
+#[cfg(test)]
+pub(crate) mod test_lease {
+    use std::{collections::HashMap, sync::Arc};
+
+    use tokio::time::MissedTickBehavior;
+
+    use sqlx::PgPool;
+
+    use super::{Authority, Store};
+    use crate::config::MAX_LEASE_RENEW;
+
+    /// Owns a background renewal task and ends it when dropped or stopped.
+    ///
+    /// The renewal awaits its database round trip without a deadline. In
+    /// production a renewal that overruns its period stops the relay
+    /// (`runtime::renew` maps the timeout to `RuntimeError::Shutdown`), so a
+    /// test helper that copied that bound would turn host load into the lease
+    /// loss the helper exists to prevent. The guard bounds teardown instead:
+    /// aborting the task drops its pending query future and the strong
+    /// `Arc<Authority>` that future holds. The backend that already received
+    /// the `UPDATE` keeps running it after the abort, so `stop` also cancels
+    /// that backend and waits until it is gone from `PostgreSQL`.
+    #[derive(Debug)]
+    pub(crate) struct RenewalGuard {
+        task: Option<tokio::task::JoinHandle<()>>,
+        pool: PgPool,
+    }
+
+    /// Cancels every active renewal backend that touches the pool's `relay_lease`.
+    ///
+    /// Returns how many were active before the cancel. Matching relies on the
+    /// fixture scoping its pool to one schema, so `relay_lease` names that
+    /// schema's table. A renewal waiting on a row lock already holds the
+    /// table's row-exclusive lock, which is what `DROP SCHEMA` queues behind.
+    async fn cancel_active_renewals(pool: &PgPool) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(pg_cancel_backend(pid)) FROM ( \
+                 SELECT DISTINCT a.pid FROM pg_stat_activity a \
+                 JOIN pg_locks l ON l.pid = a.pid \
+                 WHERE l.relation = 'relay_lease'::regclass \
+                   AND a.state = 'active' \
+                   AND a.pid <> pg_backend_pid() \
+                   AND a.query = $1 \
+             ) renewals",
+        )
+        .bind(crate::store::lease::RENEW_LEASE_SQL)
+        .fetch_one(pool)
+        .await
+        .expect("cancel active lease renewals")
+    }
+
+    impl RenewalGuard {
+        /// Aborts the renewal task and waits until no renewal of its schema runs in `PostgreSQL`.
+        ///
+        /// Every fixture `cleanup` calls it through [`stop_renewals`] before
+        /// dropping the schema, so no renewal is in flight against it. Aborting
+        /// the task leaves the backend executing its `UPDATE`, so the wait
+        /// cancels each such backend until a probe finds none. It covers every
+        /// renewal against the schema, which is the registry's granularity.
+        pub(crate) async fn stop(mut self) {
+            if let Some(task) = self.task.take() {
+                task.abort();
+                // The join result is the cancellation of the task aborted above.
+                let _cancelled = task.await;
+            }
+            pohunek_test_support::wait::wait_until(
+                "the aborted lease renewal to leave PostgreSQL",
+                || async { (cancel_active_renewals(&self.pool).await == 0).then_some(()) },
+            )
+            .await;
+        }
+    }
+
+    impl Drop for RenewalGuard {
+        fn drop(&mut self) {
+            if let Some(task) = &self.task {
+                task.abort();
+            }
+        }
+    }
+
+    /// Renewal guards of the fixtures still running, keyed by their schema.
+    ///
+    /// A fixture's `cleanup` drops its schema, and a renewal blocked in
+    /// `PostgreSQL` would hold the relation lock that drop waits for. Keying
+    /// the guards by schema lets every `cleanup` stop its renewers first, so a
+    /// test cannot reach `DROP SCHEMA` with a renewal still in flight.
+    static RENEWERS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<RenewalGuard>>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+    /// Starts renewing `authority`'s fence until its schema's `cleanup` stops it.
+    pub(crate) async fn keep_renewed(authority: &Arc<Authority>) {
+        let schema: String = sqlx::query_scalar("SELECT current_schema()")
+            .fetch_one(authority.store.pool())
+            .await
+            .expect("read the fixture schema");
+        let guard = spawn_renewal(authority);
+        RENEWERS
+            .lock()
+            .expect("renewer registry lock")
+            .entry(schema)
+            .or_default()
+            .push(guard);
+    }
+
+    /// Stops every renewer registered for `schema` and waits for each to finish.
+    pub(crate) async fn stop_renewals(schema: &str) {
+        let guards = RENEWERS
+            .lock()
+            .expect("renewer registry lock")
+            .remove(schema)
+            .unwrap_or_default();
+        for guard in guards {
+            guard.stop().await;
+        }
+    }
+
+    /// Renews the fence once per [`MAX_LEASE_RENEW`] while a test holds the authority.
+    ///
+    /// Runs the production renewal step, [`Authority::renew_once`], on the
+    /// relay runtime's cadence, so a test that outlasts the lease lifetime keeps
+    /// a valid fence. A failed renewal closes the authority and ends the task,
+    /// exactly as it stops the relay in production. The task holds only a weak
+    /// reference between renewals and ends when the authority is dropped.
+    pub(crate) fn spawn_renewal(authority: &Arc<Authority>) -> RenewalGuard {
+        let pool = authority.store.pool().clone();
+        let authority = Arc::downgrade(authority);
+        let task = tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(MAX_LEASE_RENEW);
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let Some(authority) = authority.upgrade() else {
+                    return;
+                };
+                if authority.renew_once().await.is_err() {
+                    return;
+                }
+            }
+        });
+        RenewalGuard {
+            task: Some(task),
+            pool,
+        }
+    }
+
+    /// Renews a lease held directly from the store, for tests that have no authority.
+    ///
+    /// Renews the same fence once per [`MAX_LEASE_RENEW`] until the guard is
+    /// stopped or dropped, or a renewal fails, so a test that holds the lease
+    /// across slow operations keeps it live. Stop the guard before releasing
+    /// the lease.
+    #[cfg(feature = "postgres-tests")]
+    pub(crate) fn spawn_lease_renewal(
+        store: &Store,
+        lease: &crate::store::lease::LeaseGuard,
+    ) -> RenewalGuard {
+        let pool = store.pool().clone();
+        let store = store.clone();
+        let mut lease = lease.clone();
+        let task = tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(MAX_LEASE_RENEW);
+            ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                match store.renew_lease(&lease).await {
+                    Ok(renewed) => lease = renewed,
+                    Err(_error) => return,
+                }
+            }
+        });
+        RenewalGuard {
+            task: Some(task),
+            pool,
+        }
+    }
+
+    /// Reads the fixture relay's lease heartbeat, which only a renewal advances.
+    pub(crate) async fn heartbeat(store: &Store) -> i64 {
+        sqlx::query_scalar(
+            "SELECT heartbeat_sequence FROM relay_lease WHERE relay_id = 'test-relay'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("read the lease heartbeat")
+    }
+
+    /// Waits until a renewal advances the lease heartbeat past `after`.
+    ///
+    /// # Panics
+    /// Panics, naming the heartbeat, when no renewal lands within the shared
+    /// hang guard.
+    pub(crate) async fn wait_for_renewal(store: &Store, after: i64) -> i64 {
+        pohunek_test_support::wait::wait_until(
+            "the background renewer to advance the lease heartbeat",
+            || async {
+                let current = heartbeat(store).await;
+                (current > after).then_some(current)
+            },
+        )
+        .await
+    }
+}
+
 #[cfg(all(test, feature = "postgres-tests"))]
 mod tests {
     use std::{env, os::unix::fs::PermissionsExt as _};
@@ -2552,7 +2757,8 @@ mod tests {
         )
     }
 
-    async fn authority(store: Store, limits: AuthorityLimits) -> (Authority, TempDir) {
+    /// Opens an authority whose fence is never renewed, for tests that let it lapse.
+    async fn unrenewed_authority(store: Store, limits: AuthorityLimits) -> (Authority, TempDir) {
         let directory = tempfile::tempdir().expect("create witness directory");
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("make witness directory private");
@@ -2577,8 +2783,22 @@ mod tests {
         )
     }
 
+    /// Opens an authority whose fence a background renewer keeps alive.
+    async fn authority(store: Store, limits: AuthorityLimits) -> (Arc<Authority>, TempDir) {
+        let (authority, directory) = unrenewed_authority(store, limits).await;
+        let authority = Arc::new(authority);
+        test_lease::keep_renewed(&authority).await;
+        (authority, directory)
+    }
+
+    /// The statement `cleanup` sends to drop `schema`.
+    fn drop_schema_statement(schema: &str) -> String {
+        format!("DROP SCHEMA {schema} CASCADE")
+    }
+
     async fn cleanup(store: &Store, schema: &str) {
-        sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        test_lease::stop_renewals(schema).await;
+        sqlx::query(AssertSqlSafe(drop_schema_statement(schema)))
             .execute(store.pool())
             .await
             .expect("drop schema");
@@ -2641,6 +2861,204 @@ mod tests {
         .expect("team list waits for concurrent team change");
     }
 
+    /// Holds the fixture lease row's lock so a renewal blocks until it is released.
+    ///
+    /// Returns the open transaction and the backend pid that owns the lock, so
+    /// a test can tell its own blocked renewal from any other session.
+    async fn lock_lease_row(store: &Store) -> (sqlx::Transaction<'static, Postgres>, i32) {
+        let mut blocker = store.pool().begin().await.expect("begin lock holder");
+        sqlx::query("SELECT relay_id FROM relay_lease WHERE relay_id = 'test-relay' FOR UPDATE")
+            .fetch_one(&mut *blocker)
+            .await
+            .expect("lock the lease row");
+        let pid = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *blocker)
+            .await
+            .expect("read the lock holder's backend pid");
+        (blocker, pid)
+    }
+
+    /// Waits until a session is blocked behind the lock held by backend `holder`.
+    async fn wait_for_session_blocked_by(store: &Store, holder: i32) {
+        pohunek_test_support::wait::wait_until(
+            "a renewal blocked behind the lease row lock",
+            || async {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))",
+                )
+                .bind(holder)
+                .fetch_one(store.pool())
+                .await
+                .expect("read blocked sessions");
+                blocked.then_some(())
+            },
+        )
+        .await;
+    }
+
+    /// Stopping the guard ends a renewal that is blocked in the database.
+    ///
+    /// The held row lock keeps the renewal's `UPDATE` from ever completing, so
+    /// the task owns a strong `Arc<Authority>` while it waits. `stop` aborts it,
+    /// which drops the pending query and the reference, and schema cleanup then
+    /// proceeds once the lock is released.
+    #[tokio::test]
+    async fn stopping_the_guard_ends_a_renewal_blocked_in_the_database() {
+        let (store, schema, ..) = fixture().await;
+        let (authority, _directory) = unrenewed_authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let (blocker, holder) = lock_lease_row(&store).await;
+
+        let guard = test_lease::spawn_renewal(&authority);
+        wait_for_session_blocked_by(&store, holder).await;
+        assert_eq!(
+            Arc::strong_count(&authority),
+            2,
+            "the blocked renewal holds the authority"
+        );
+
+        pohunek_test_support::wait::guard("the renewal task to stop", guard.stop()).await;
+        assert_eq!(
+            Arc::strong_count(&authority),
+            1,
+            "a stopped renewal releases the authority"
+        );
+
+        blocker.rollback().await.expect("release the lease row");
+        pohunek_test_support::wait::guard("schema cleanup", cleanup(&store, &schema)).await;
+    }
+
+    /// Dropping the guard also releases a renewal that is blocked in the database.
+    #[tokio::test]
+    async fn dropping_the_guard_releases_a_renewal_blocked_in_the_database() {
+        let (store, schema, ..) = fixture().await;
+        let (authority, _directory) = unrenewed_authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let authority = Arc::new(authority);
+        let (blocker, holder) = lock_lease_row(&store).await;
+
+        let guard = test_lease::spawn_renewal(&authority);
+        wait_for_session_blocked_by(&store, holder).await;
+        drop(guard);
+        pohunek_test_support::wait::wait_until("the aborted renewal to drop its authority", || {
+            let released = Arc::strong_count(&authority) == 1;
+            async move { released.then_some(()) }
+        })
+        .await;
+
+        blocker.rollback().await.expect("release the lease row");
+        pohunek_test_support::wait::guard("schema cleanup", cleanup(&store, &schema)).await;
+    }
+
+    /// Waits until the drop of `schema` is queued on a lock and returns the backends it waits for.
+    ///
+    /// Matches the exact statement `cleanup` sends for `schema`, whose name is
+    /// unique per fixture, so schema drops of fixtures running in parallel on the
+    /// same server never contribute a blocker.
+    async fn wait_for_blocked_schema_drop(store: &Store, schema: &str) -> Vec<i32> {
+        let statement = drop_schema_statement(schema);
+        pohunek_test_support::wait::wait_until("the schema drop to queue on a lock", || async {
+            let blockers: Option<Vec<i32>> = sqlx::query_scalar(
+                "SELECT array_agg(DISTINCT blocker ORDER BY blocker) FROM pg_stat_activity a, \
+                 unnest(pg_blocking_pids(a.pid)) AS blocker \
+                 WHERE a.query = $1 AND a.wait_event_type = 'Lock'",
+            )
+            .bind(&statement)
+            .fetch_one(store.pool())
+            .await
+            .expect("read the sessions the schema drop waits for");
+            blockers
+        })
+        .await
+    }
+
+    /// A fixture's `cleanup` ends a renewal blocked in the database before it drops the schema.
+    ///
+    /// The row lock held here keeps the renewal's `UPDATE` waiting through
+    /// `cleanup`. Once the renewal's backend is cancelled, the schema drop
+    /// waits for the lock holder alone; a backend that survived the task abort
+    /// would be a second blocker, and the drop would also wait for it.
+    #[tokio::test]
+    async fn cleanup_ends_a_renewal_blocked_in_the_database_before_dropping_the_schema() {
+        let (store, schema, ..) = fixture().await;
+        let (authority, _directory) = unrenewed_authority(
+            store.clone(),
+            AuthorityLimits {
+                global: 1,
+                per_team: 1,
+                per_principal: 1,
+            },
+        )
+        .await;
+        let authority = Arc::new(authority);
+        // The lock is held before the renewer registers, so its immediate first
+        // renewal is the one that blocks.
+        let (blocker, holder) = lock_lease_row(&store).await;
+        test_lease::keep_renewed(&authority).await;
+        wait_for_session_blocked_by(&store, holder).await;
+
+        let cleanup_task = tokio::spawn({
+            let store = store.clone();
+            let schema = schema.clone();
+            async move { cleanup(&store, &schema).await }
+        });
+        assert_eq!(
+            wait_for_blocked_schema_drop(&store, &schema).await,
+            vec![holder],
+            "only the lock holder keeps the schema drop waiting"
+        );
+        assert_eq!(
+            Arc::strong_count(&authority),
+            1,
+            "the stopped renewer released the authority"
+        );
+
+        blocker.rollback().await.expect("release the lease row");
+        pohunek_test_support::wait::guard("schema cleanup", cleanup_task)
+            .await
+            .expect("cleanup task");
+        let schema_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+                .bind(&schema)
+                .fetch_one(store.pool())
+                .await
+                .expect("read the schema catalog");
+        assert!(!schema_exists, "cleanup dropped the schema");
+    }
+
+    /// Stopping the store-level guard ends a renewal that is blocked in the database.
+    #[tokio::test]
+    async fn stopping_the_lease_guard_ends_a_renewal_blocked_in_the_database() {
+        let (store, schema, ..) = fixture().await;
+        let lease = store
+            .acquire_lease("test-relay", Uuid::now_v7(), 1)
+            .await
+            .expect("acquire lease");
+        let (blocker, holder) = lock_lease_row(&store).await;
+
+        let guard = test_lease::spawn_lease_renewal(&store, &lease);
+        wait_for_session_blocked_by(&store, holder).await;
+        pohunek_test_support::wait::guard("the renewal task to stop", guard.stop()).await;
+
+        blocker.rollback().await.expect("release the lease row");
+        pohunek_test_support::wait::guard("schema cleanup", cleanup(&store, &schema)).await;
+    }
+
     /// Fraction of the lease lifetime one virtual-time step covers.
     ///
     /// More than half, so two steps pass the original deadline while a single
@@ -2652,7 +3070,7 @@ mod tests {
     /// Opens one authority over a fresh fixture schema for the virtual-time tests.
     async fn authority_for_deadline_tests() -> (Store, String, Authority, TempDir) {
         let (store, schema, ..) = fixture().await;
-        let (authority, directory) = authority(
+        let (authority, directory) = unrenewed_authority(
             store.clone(),
             AuthorityLimits {
                 global: 1,
@@ -3027,7 +3445,7 @@ mod tests {
             .fetch_one(store.pool())
             .await
             .expect("read team");
-        let (authority, _directory) = authority(
+        let (authority, _directory) = unrenewed_authority(
             store.clone(),
             AuthorityLimits {
                 global: 1,
@@ -3104,7 +3522,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority.read_hook.lock().expect("read hook lock") = Some(AdmissionHook {
@@ -3233,7 +3650,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority.read_hook.lock().expect("read hook lock") = Some(AdmissionHook {
@@ -3554,7 +3970,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority
@@ -3621,7 +4036,6 @@ mod tests {
             },
         )
         .await;
-        let authority = Arc::new(authority);
         let entered = Arc::new(tokio::sync::Barrier::new(2));
         let release = Arc::new(tokio::sync::Barrier::new(2));
         *authority.mutation_hook.lock().expect("mutation hook lock") = Some(AdmissionHook {

@@ -15,7 +15,7 @@ use crate::store::{
     ActorKind, AuthenticationBinding, AuthorizationRequest, ResourceScope, Store, StoreError,
 };
 use crate::{
-    admission::{Authority, AuthorityLimits, RevocationCommand},
+    admission::{test_lease, Authority, AuthorityLimits, RevocationCommand},
     authorization::CreateTeam,
     recovery::WitnessStore,
 };
@@ -76,6 +76,7 @@ async fn fixture() -> (Store, String, Uuid, Uuid, Uuid) {
 }
 
 async fn cleanup(pool: &PgPool, schema: &str) {
+    test_lease::stop_renewals(schema).await;
     sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(pool)
         .await
@@ -93,7 +94,8 @@ fn owner_actor(owner: Uuid, credential: Uuid) -> crate::store::ActorContext {
     )
 }
 
-async fn authority(store: Store) -> (Authority, TempDir) {
+/// Opens an authority whose fence is never renewed, for tests that let it lapse.
+async fn unrenewed_authority(store: Store) -> (Authority, TempDir) {
     let directory = tempfile::tempdir().expect("create witness directory");
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
         .expect("make witness directory private");
@@ -127,6 +129,14 @@ async fn authority(store: Store) -> (Authority, TempDir) {
         .expect("create authority"),
         directory,
     )
+}
+
+/// Opens an authority whose fence a background renewer keeps alive.
+async fn authority(store: Store) -> (Arc<Authority>, TempDir) {
+    let (authority, directory) = unrenewed_authority(store).await;
+    let authority = Arc::new(authority);
+    test_lease::keep_renewed(&authority).await;
+    (authority, directory)
 }
 
 async fn team(store: &Store, owner: Uuid) -> Uuid {
@@ -251,7 +261,7 @@ async fn exact_replay_rejects_lost_local_authority(stop: impl FnOnce(&Authority)
     let (store, schema, owner, _member, credential) = fixture().await;
     let team_id = team(&store, owner).await;
     let actor = owner_actor(owner, credential);
-    let (authority, _witness_directory) = authority(store.clone()).await;
+    let (authority, _witness_directory) = unrenewed_authority(store.clone()).await;
     let command = CreateGroup {
         team_id,
         display_name: "receipt replay".into(),
@@ -437,7 +447,6 @@ async fn concurrent_group_create_replays_one_durable_mutation() {
     let unaffected_team_id = team(&store, owner).await;
     let actor = owner_actor(owner, credential);
     let (authority, _witness_directory) = authority(store.clone()).await;
-    let authority = Arc::new(authority);
     let unaffected_guard = authority
         .admit(AuthorizationRequest {
             actor,
@@ -532,7 +541,6 @@ async fn concurrent_group_create_with_different_payload_conflicts_without_closin
     let team_id = team(&store, owner).await;
     let actor = owner_actor(owner, credential);
     let (authority, _witness_directory) = authority(store.clone()).await;
-    let authority = Arc::new(authority);
     let key = Uuid::now_v7();
     let start = Arc::new(tokio::sync::Barrier::new(2));
     let first_authority = Arc::clone(&authority);
