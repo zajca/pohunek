@@ -355,11 +355,13 @@ fn env_mutators_imported(skeleton: &str) -> bool {
 fn env_mutation_candidates(skeleton: &str) -> Vec<usize> {
     let bytes = skeleton.as_bytes();
     let imported = env_mutators_imported(skeleton);
+    let aliases = env_module_aliases(skeleton);
     let mut found = Vec::new();
     for name in ENV_MUTATORS {
         for (offset, qualifier) in named_uses(skeleton, name, false) {
             let hit = match qualifier {
                 Qualifier::Path("env") => true,
+                Qualifier::Path(module) if aliases.contains(&module) => true,
                 Qualifier::Bare => imported && ident_before(bytes, offset) != "fn",
                 Qualifier::Path(_) | Qualifier::Method => false,
             };
@@ -394,6 +396,38 @@ fn env_mutation_candidates(skeleton: &str) -> Vec<usize> {
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// Names that `use .. env as <name>` binds to a module named `env`, such as
+/// `use std::env as process_env;` or `use std::{env as e, fs};`.
+fn env_module_aliases(skeleton: &str) -> Vec<&str> {
+    let bytes = skeleton.as_bytes();
+    let mut aliases = Vec::new();
+    for (at, _) in skeleton.match_indices("use ") {
+        if !starts_word(bytes, at) {
+            continue;
+        }
+        let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+        for (offset, _) in skeleton[at..end].match_indices("env") {
+            let offset = at + offset;
+            let name_end = offset + "env".len();
+            if !starts_word(bytes, offset) || end_of_ident(bytes, offset) != name_end {
+                continue;
+            }
+            let Some(after_as) = expect_token(bytes, name_end, "as") else {
+                continue;
+            };
+            if bytes.get(after_as).copied().is_some_and(is_ident) {
+                continue;
+            }
+            let alias_start = skip_whitespace(bytes, after_as);
+            let alias_end = end_of_ident(bytes, alias_start);
+            if alias_end > alias_start && alias_end <= end {
+                aliases.push(&skeleton[alias_start..alias_end]);
+            }
+        }
+    }
+    aliases
 }
 
 /// Whether the host temp path at `at` in `text` stands alone.
@@ -1562,6 +1596,27 @@ fn an_imported_bare_env_mutator_is_flagged_at_the_call() {
             "{import}"
         );
     }
+}
+
+#[test]
+fn a_mutator_called_through_an_env_module_alias_is_flagged() {
+    for (import, call) in [
+        (
+            "use std::env as process_env;",
+            "process_env::set_var(\"K\", \"v\");",
+        ),
+        ("use std::env as e;", "e::remove_var(\"K\");"),
+        ("use std::{env as e, fs};", "e::set_var(\"K\", \"v\");"),
+    ] {
+        let text = format!("{import}\n#[test]\nfn f() {{\n    {call}\n}}\n");
+        assert_eq!(
+            rules_of(&scan_one(DEMO, &text)),
+            [(4, Rule::EnvMutation)],
+            "{import}"
+        );
+    }
+    let unrelated = "use std::env as e;\n#[test]\nfn f() {\n    other::set_var(\"K\", \"v\");\n    let v = e::var(\"K\");\n}\n";
+    assert!(rules_of(&scan_one(DEMO, unrelated)).is_empty());
 }
 
 #[test]

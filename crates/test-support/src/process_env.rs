@@ -160,11 +160,11 @@ impl Drop for ProcessEnv {
 /// Builds a [`Command`] for `program`, resolved against the current `PATH`
 /// while holding the environment lock.
 ///
-/// The returned command carries an absolute path, so spawning it reads no
-/// environment variable and cannot observe a `PATH` another test has
-/// overridden. A `program` that is not a bare name, or that is not found, is
-/// passed through unchanged and fails or resolves at spawn like
-/// [`Command::new`].
+/// The returned command carries an absolute path and sets the captured `PATH`
+/// on the child, so neither the spawn nor the child's own lookups observe a
+/// `PATH` another test sets between this call and the spawn. A `program` that
+/// is not a bare name, or that is not found, is passed through unchanged and
+/// fails or resolves at spawn like [`Command::new`].
 ///
 /// Do not call it while holding a [`ProcessEnv`] on the same thread; the lock
 /// is not reentrant.
@@ -174,8 +174,12 @@ pub fn command(program: &str) -> Command {
         let _env = ProcessEnv::lock();
         std::env::var_os("PATH")
     };
-    let resolved = path.and_then(|path| resolve_in(program, &path));
-    Command::new(resolved.unwrap_or_else(|| PathBuf::from(program)))
+    let resolved = path.as_deref().and_then(|path| resolve_in(program, path));
+    let mut command = Command::new(resolved.unwrap_or_else(|| PathBuf::from(program)));
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    command
 }
 
 /// The first executable regular file named `program` in an absolute entry of
@@ -200,6 +204,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::Arc;
+
+    use std::os::unix::ffi::OsStrExt as _;
 
     use super::ProcessEnv;
     use crate::wait::{poll_until, HANG_GUARD};
@@ -350,5 +356,19 @@ mod tests {
     fn command_hands_back_an_absolute_program_for_a_name_on_path() {
         let command = super::command("sh");
         assert!(std::path::Path::new(command.get_program()).is_absolute());
+    }
+
+    #[test]
+    fn command_keeps_the_captured_path_when_another_test_changes_it_before_the_spawn() {
+        let captured = std::env::var_os("PATH").expect("the test process has a PATH");
+        let mut command = super::command("sh");
+        command.args(["-c", "printf %s \"$PATH\""]);
+        let output = {
+            let mut env = ProcessEnv::lock();
+            env.set("PATH", "/test-support-overridden-path");
+            command.output().expect("run sh")
+        };
+        assert!(output.status.success());
+        assert_eq!(std::ffi::OsStr::from_bytes(&output.stdout), captured);
     }
 }
