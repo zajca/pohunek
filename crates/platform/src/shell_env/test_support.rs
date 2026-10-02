@@ -57,10 +57,22 @@ pub(super) fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+/// Search path of the fixture's `sh` children: the system directories that
+/// hold `cat` on Linux and macOS, so no developer `PATH` entry is consulted.
+const CHILD_PATH: &str = "/usr/bin:/bin";
+
+/// A `sh` command with an empty environment apart from [`CHILD_PATH`], in the
+/// private directory `cwd`.
+fn scrubbed_command(cwd: &Path) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.env_clear().env("PATH", CHILD_PATH).current_dir(cwd);
+    command
+}
+
 /// Creates `path` with `content` through a `sh` child that owns the write
 /// descriptor.
 fn write_without_local_writer(path: &Path, content: &[u8]) {
-    let mut writer = Command::new("/bin/sh")
+    let mut writer = scrubbed_command(path.parent().expect("script path has a directory"))
         .args(["-c", "cat > \"$1\"", "sh"])
         .arg(path)
         .stdin(Stdio::piped())
@@ -80,9 +92,8 @@ fn write_without_local_writer(path: &Path, content: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     use super::*;
+    use crate::test_spawn::while_a_sibling_spawns;
 
     /// Scripts started while a sibling thread keeps spawning processes.
     const SCRIPT_RUNS: usize = 200;
@@ -90,25 +101,14 @@ mod tests {
     #[test]
     fn a_fresh_script_runs_while_a_sibling_thread_keeps_spawning() {
         let dir = fixture();
-        let stop = AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while !stop.load(Ordering::Relaxed) {
-                    Command::new("/bin/sh")
-                        .args(["-c", "exit 0"])
-                        .status()
-                        .expect("sibling spawn");
-                }
-            });
+        while_a_sibling_spawns(dir.path(), || {
             for run in 0..SCRIPT_RUNS {
                 let path = script(dir.path(), &format!("fresh-{run}"), "exit 0");
-                let status = Command::new(&path).status().unwrap_or_else(|error| {
-                    stop.store(true, Ordering::Relaxed);
-                    panic!("run {run}: {error}");
-                });
+                let status = Command::new(&path)
+                    .status()
+                    .unwrap_or_else(|error| panic!("run {run}: {error}"));
                 assert!(status.success());
             }
-            stop.store(true, Ordering::Relaxed);
         });
     }
 }

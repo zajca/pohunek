@@ -4450,6 +4450,7 @@ dependencies = [
  "nix 0.29.0",
  "plist",
  "pohunek-paths",
+ "pohunek-test-support",
  "portable-pty",
  "rustix 1.1.4",
  "sha2 0.10.9",

@@ -3802,17 +3802,8 @@ mod tests {
     /// lock held after the guard is dropped.
     #[test]
     fn a_dropped_lock_is_free_while_a_sibling_thread_keeps_spawning() {
-        let (_temporary, root) = trusted_root();
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::process::Command::new("/bin/sh")
-                        .args(["-c", "exit 0"])
-                        .status()
-                        .expect("sibling spawn");
-                }
-            });
+        let (temporary, root) = trusted_root();
+        crate::test_spawn::while_a_sibling_spawns(temporary.path(), || {
             for cycle in 0..SPAWN_RACE_CYCLES {
                 let outcome = root
                     .acquire_lock("race.lock", FILE_MODE)
@@ -3825,11 +3816,9 @@ mod tests {
                         root.lock_file("race-file.lock", FILE_MODE, LockKind::Exclusive)
                     });
                 if let Err(error) = outcome {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     panic!("cycle {cycle}: a dropped lock was still held: {error:?}");
                 }
             }
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
         });
     }
 
