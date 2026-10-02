@@ -562,7 +562,7 @@ fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBu
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -570,7 +570,7 @@ mod tests {
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 
     use super::*;
-    use crate::procwatch::{Error as ProcError, HostInspector, Pid, ProcessInspector};
+    use crate::procwatch::{HostInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -929,62 +929,107 @@ mod tests {
         let dir = temp_agents_dir();
         let hermes = dir.join("hermes");
         let pid_file = dir.join("descendant.pid");
+        // Both sleepers are started before the descendant records its pid, so
+        // the whole tree exists when the test observes it.
         write_test_executable(
             &hermes,
             &format!(
                 "#!/bin/sh\n\
-                 sh -c 'echo \"$$ $PPID\" > {pid_file}; exec sleep {hold}' &\n\
-                 sleep {hold}\n",
+                 sleep {hold} &\n\
+                 sh -c 'echo $$ > {pid_file}; exec sleep {hold}' &\n\
+                 wait\n",
                 pid_file = pid_file.display(),
                 hold = FIXTURE_HOLD.as_secs(),
             ),
         );
-
-        // One `HANG_GUARD` budget covers recording the descendant's identity and
-        // its termination. Each poll runs one probe attempt until the descendant
-        // has recorded its pid and process group; a deadline that fires before the
-        // script got that far proves nothing, so the attempt deadline doubles,
-        // capped by the budget left. Once the identity is known each poll checks
-        // whether the descendant is gone.
         let inspector = HostInspector::new();
         let own_group = process_group_of(inspector, std::process::id());
-        let started = Instant::now();
-        let mut attempt_timeout = Duration::from_millis(50);
-        let mut descendant: Option<DescendantGuard> = None;
-        poll_until(
-            "the probe's descendant to record its identity and be terminated",
-            || {
-                if let Some(known) = &descendant {
-                    let present = descendant_present(&inspector, known.pid, known.group)
-                        .expect("inspect the descendant");
-                    return (!present).then_some(());
-                }
-                let _ = std::fs::remove_file(&pid_file);
-                let budget_left = HANG_GUARD.saturating_sub(started.elapsed());
-                let outcome = probe_hermes_version(&hermes, attempt_timeout.min(budget_left), &[]);
-                assert!(matches!(outcome, ProbeOutcome::TimedOut), "{outcome:?}");
-                attempt_timeout = attempt_timeout.saturating_mul(2);
-                descendant = std::fs::read_to_string(&pid_file)
-                    .ok()
-                    .and_then(|text| parse_descendant_marker(&text, own_group));
-                None
-            },
-        );
-        descendant
-            .expect("the poll succeeds only after the identity is recorded")
-            .disarm();
+        let tree = RefCell::new(Vec::new());
+        let _leak_guard = TreeGuard {
+            inspector,
+            tree: &tree,
+        };
+
+        // The deadline is driven by a clock that expires only once the test has
+        // observed the live process tree: the first read starts the deadline and
+        // the next one waits for the descendant's pid, records the tree with its
+        // start identities, checks the kernel's process groups, and then reports
+        // the deadline as reached. No attempt can time out before the tree exists.
+        let timeout = Duration::from_secs(1);
+        let start = Instant::now();
+        let reads = Cell::new(0_u32);
+        let clock = || {
+            let read = reads.get();
+            reads.set(read + 1);
+            if read == 0 {
+                return start;
+            }
+            if tree.borrow().is_empty() {
+                observe_probe_tree(inspector, &pid_file, own_group, &tree);
+            }
+            start + timeout
+        };
+        let outcome = probe_hermes_version_with_clock(&hermes, timeout, &[], clock);
+        assert!(matches!(outcome, ProbeOutcome::TimedOut), "{outcome:?}");
+
+        poll_until("the probe's process tree to be terminated", || {
+            let running = tree.borrow().iter().any(|identity| {
+                inspector
+                    .is_running(*identity)
+                    .expect("inspect the probe's process tree")
+            });
+            (!running).then_some(())
+        });
     }
 
-    /// Parses the fixture's `<pid> <group>` marker, rejecting a group that is the
-    /// test's own so cleanup can never signal the test run.
-    fn parse_descendant_marker(text: &str, own_group: Pid) -> Option<DescendantGuard> {
-        let (pid, group) = text.trim().split_once(' ')?;
-        let (pid, group) = (pid.parse::<Pid>().ok()?, group.parse::<Pid>().ok()?);
+    /// Waits for the fixture's descendant, records the probe child and every
+    /// process below it, then asserts the probe isolated them in a group of
+    /// their own.
+    ///
+    /// The tree is recorded before the assertions so a failed assertion still
+    /// leaves it to the caller's [`TreeGuard`].
+    fn observe_probe_tree(
+        inspector: HostInspector,
+        pid_file: &Path,
+        own_group: Pid,
+        tree: &RefCell<Vec<ProcessIdentity>>,
+    ) {
+        let descendant = poll_until("the descendant to record its pid", || {
+            std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<Pid>().ok())
+        });
+        let fact = inspector
+            .process(descendant)
+            .expect("inspect the descendant")
+            .expect("the descendant is live while the probe waits");
+        let leader = fact.ppid;
+        let mut identities = vec![inspector
+            .identity(leader)
+            .expect("inspect the probe child")
+            .expect("the probe child is live")];
+        identities.extend(
+            inspector
+                .descendants(leader)
+                .expect("inspect the probe child's descendants")
+                .iter()
+                .map(ProcessFact::identity),
+        );
+        tree.replace(identities);
+        assert_probe_isolation(fact.pgid, leader, own_group);
+    }
+
+    /// Asserts the descendant runs in a group led by the probe child that is not
+    /// the test's own, so terminating the group cannot reach the test run.
+    fn assert_probe_isolation(group: Pid, leader: Pid, own_group: Pid) {
         assert_ne!(
             group, own_group,
-            "the probe must run its child in its own process group"
+            "the probe must not leave its child in the caller's process group"
         );
-        Some(DescendantGuard { pid, group })
+        assert_eq!(
+            group, leader,
+            "the probe must run its child as the leader of a new process group"
+        );
     }
 
     fn process_group_of(inspector: HostInspector, pid: Pid) -> Pid {
@@ -995,74 +1040,50 @@ mod tests {
             .pgid
     }
 
-    /// True while `pid` is a running process in group `group`.
-    ///
-    /// A pid that no longer exists, is a zombie, or was recycled into another
-    /// group is not the descendant that recorded `group`.
-    fn descendant_present(
-        inspector: &impl ProcessInspector,
-        pid: Pid,
-        group: Pid,
-    ) -> Result<bool, ProcError> {
-        let observation = match inspector.process(pid) {
-            Ok(Some(fact)) if fact.pgid == group => inspector.is_running(fact.identity()),
-            Ok(_) => Ok(false),
-            Err(error) => Err(error),
-        };
-        match observation {
-            Err(error) if error.is_race() => Ok(false),
-            other => other,
-        }
+    #[test]
+    fn probe_isolation_accepts_a_group_led_by_the_probe_child() {
+        assert_probe_isolation(200, 200, 100);
     }
 
     #[test]
-    fn descendant_identity_requires_the_recorded_process_group() {
-        let inspector = HostInspector::new();
-        let pid = std::process::id();
-        let group = process_group_of(inspector, pid);
-
-        assert!(descendant_present(&inspector, pid, group).expect("inspect own process"));
-        assert!(
-            !descendant_present(&inspector, pid, group.wrapping_add(1))
-                .expect("inspect own process"),
-            "a live pid in a different process group is a recycled pid, not the descendant"
-        );
+    #[should_panic(expected = "must not leave its child in the caller's process group")]
+    fn probe_isolation_rejects_the_callers_group() {
+        assert_probe_isolation(100, 200, 100);
     }
 
-    /// Kills a fixture descendant's process group on drop, so a failed wait does
-    /// not leak it.
-    struct DescendantGuard {
-        pid: Pid,
-        group: Pid,
+    #[test]
+    #[should_panic(expected = "leader of a new process group")]
+    fn probe_isolation_rejects_a_group_the_probe_child_does_not_lead() {
+        assert_probe_isolation(300, 200, 100);
     }
 
-    impl DescendantGuard {
-        /// Call once the descendant is confirmed gone.
-        fn disarm(self) {
-            std::mem::forget(self);
-        }
+    /// Kills the recorded probe tree on drop, so a failed assertion or wait does
+    /// not leak the fixture's long-running sleepers.
+    ///
+    /// Each process is signalled only while its exact identity (pid and start
+    /// identity) is still running, so a recycled pid is never signalled; the
+    /// check-then-kill gap is the only residual race. Signalling by pid never
+    /// reaches the test's own process group.
+    struct TreeGuard<'tree> {
+        inspector: HostInspector,
+        tree: &'tree RefCell<Vec<ProcessIdentity>>,
     }
 
-    impl Drop for DescendantGuard {
+    impl Drop for TreeGuard<'_> {
         fn drop(&mut self) {
-            // Fails closed: the group is signalled only while the recorded pid
-            // is still a running member of it. The group id cannot be recycled
-            // while that member lives; the window between this check and the
-            // signal is the only residual race.
-            if !matches!(
-                descendant_present(&HostInspector::new(), self.pid, self.group),
-                Ok(true)
-            ) {
-                return;
-            }
-            let Ok(group) = i32::try_from(self.group) else {
-                return;
-            };
-            // SAFETY: `group` is the group the probe created for the fixture and
-            // `parse_descendant_marker` rejected the test's own group.
-            #[expect(unsafe_code, reason = "cleanup of a leaked test process group")]
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
+            for identity in self.tree.borrow().iter() {
+                if !matches!(self.inspector.is_running(*identity), Ok(true)) {
+                    continue;
+                }
+                let Ok(pid) = i32::try_from(identity.pid) else {
+                    continue;
+                };
+                // SAFETY: the pid was observed as a member of the fixture's tree
+                // and its start identity was just re-verified.
+                #[expect(unsafe_code, reason = "cleanup of leaked test processes")]
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
             }
         }
     }
