@@ -487,6 +487,7 @@ pub(crate) mod tests {
         loop {
             match attempt() {
                 Err(error) if is_exec_busy(&error) && std::time::Instant::now() < deadline => {
+                    // timing-allowed: #362 bounded ETXTBSY retry; the kernel offers no readiness signal for it
                     std::thread::sleep(EXEC_BUSY_POLL);
                 }
                 result => return result,

@@ -141,6 +141,7 @@ mod tests {
         let start = Instant::now();
         let (fired, timer_fired) = channel::<()>();
         let sleeper = tokio::spawn(async move {
+            // timing-allowed: #362 a real-time timer that stays pending is the subject of the auto-advance test
             tokio::time::sleep(PENDING_TIMER).await;
             let _ = fired.send(());
         });

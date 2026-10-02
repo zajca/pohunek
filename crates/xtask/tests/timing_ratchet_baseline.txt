@@ -1,0 +1,52 @@
+# Ratchet baseline for tests/timing_ratchet.rs: occurrences of real-time
+# sleeps and real-time duration assertions in test code, per file.
+# Format: `<workspace-relative path> <count>`. Counts may only go down;
+# regenerate with the ignored `regenerate_timing_baseline` test.
+crates/cli/src/commands/discovery_cache.rs 1
+crates/cli/src/hermes_integration/runner.rs 1
+crates/cli/src/service/usage.rs 1
+crates/cli/tests/daemon_packaging.rs 1
+crates/cli/tests/service_lock.rs 2
+crates/cli/tests/service_lock_terminal.rs 1
+crates/cli/tests/session_process_api.rs 4
+crates/cli/tests/support/native.rs 1
+crates/client/src/discovery.rs 1
+crates/client/tests/request_response.rs 4
+crates/daemon/src/events/mod.rs 1
+crates/daemon/src/integration/mod.rs 4
+crates/daemon/src/project/detect.rs 1
+crates/daemon/src/runtime/client.rs 1
+crates/daemon/src/runtime/launcher.rs 2
+crates/daemon/src/runtime/lifecycle_tests.rs 1
+crates/daemon/src/session/reconcile.rs 23
+crates/daemon/src/session/supervision.rs 1
+crates/daemon/src/session/tests.rs 19
+crates/daemon/src/worktree/tests.rs 4
+crates/daemon/tests/health_socket.rs 2
+crates/daemon/tests/privacy_sentinel.rs 2
+crates/daemon/tests/remote_tcp.rs 2
+crates/daemon/tests/state_authority.rs 1
+crates/daemon/tests/supervised/mod.rs 3
+crates/daemon/tests/systemd_durable_worker.rs 6
+crates/gui-core/tests/loopback.rs 1
+crates/netbird/src/status.rs 1
+crates/platform/src/process/darwin.rs 3
+crates/platform/src/process/linux.rs 1
+crates/platform/src/process/sweep/tests.rs 1
+crates/platform/src/shell_env/login_shell.rs 4
+crates/platform/src/shell_env/policy.rs 1
+crates/platform/src/supervisor/launchd/launchctl.rs 1
+crates/platform/tests/launchd.rs 4
+crates/platform/tests/systemd.rs 9
+crates/relay/src/admission/mod.rs 6
+crates/relay/src/auth/service.rs 3
+crates/relay/src/authorization/admin_tests.rs 1
+crates/relay/src/runtime/tests.rs 3
+crates/relay/src/runtime/tests/ingress.rs 1
+crates/relay/src/server/limits.rs 1
+crates/relay/src/server/transport.rs 1
+crates/session-worker/src/identity.rs 1
+crates/session-worker/src/pty.rs 1
+crates/session-worker/src/server.rs 1
+crates/session-worker/tests/resources.rs 2
+crates/xtask/src/hermes.rs 2

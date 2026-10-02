@@ -288,6 +288,7 @@ mod tests {
     #[should_panic(expected = "waiting for a probe that blocks")]
     fn poll_until_rejects_a_single_probe_that_returns_after_the_ceiling() {
         poll_until_within(TINY_CEILING, TINY_INTERVAL, "a probe that blocks", || {
+            // timing-allowed: #362 blocks one poll past the ceiling on purpose to test the overrun check
             std::thread::sleep(TINY_CEILING * 2);
             Some(())
         });
@@ -356,6 +357,7 @@ mod tests {
     #[should_panic(expected = "hang guard of 30ms elapsed after")]
     async fn guard_rejects_a_future_whose_single_poll_blocks_past_the_ceiling() {
         guard_within(TINY_CEILING, "a blocking future", async {
+            // timing-allowed: #362 blocks one poll past the ceiling on purpose to test the overrun check
             std::thread::sleep(TINY_CEILING * 2);
         })
         .await;
@@ -365,6 +367,7 @@ mod tests {
     #[should_panic(expected = "waiting for a blocking probe")]
     async fn wait_until_rejects_a_probe_whose_single_poll_blocks_past_the_ceiling() {
         wait_until_within(TINY_CEILING, TINY_INTERVAL, "a blocking probe", || async {
+            // timing-allowed: #362 blocks one poll past the ceiling on purpose to test the overrun check
             std::thread::sleep(TINY_CEILING * 2);
             Some(())
         })
