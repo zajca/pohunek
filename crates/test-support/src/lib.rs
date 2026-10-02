@@ -19,6 +19,10 @@
 //! a path baked in at compile time. A nextest archive extracted at a different
 //! absolute path therefore finds its binaries and source files.
 //!
+//! The [`mod@env`] module holds [`env::TestEnv`], the per-test fixture that owns a
+//! private root, working directory, `HOME` and XDG directories, and builds a
+//! scrubbed environment for child processes.
+//!
 //! The [`wait`] module holds the readiness waits: [`wait::HANG_GUARD`], the
 //! single ceiling every incidental-deadline wait is bounded by, and
 //! [`wait::poll_until`], [`wait::wait_until`] and [`wait::guard`], which fail
@@ -38,6 +42,7 @@
 
 // Rust guideline compliant 2026-10-01
 
+pub mod env;
 pub mod wait;
 
 use std::ffi::OsString;
@@ -80,7 +85,17 @@ const WORKER_BUILD_HINT: &str = "cargo build -p pohunek-session-worker --bin poh
 ///
 /// The trusted filesystem layer rejects group- or world-accessible private
 /// roots, so fixtures start owner-only like production state directories.
-const PRIVATE_DIR_MODE: u32 = 0o700;
+pub(crate) const PRIVATE_DIR_MODE: u32 = 0o700;
+
+/// Sets `path` to [`PRIVATE_DIR_MODE`] exactly.
+///
+/// The mode passed when a directory is created is filtered by the process
+/// umask, which only removes bits: a mask such as `0o077` leaves `0o700`, but
+/// one that clears owner bits leaves a directory its owner cannot enter. An
+/// explicit `chmod` after creation makes the mode independent of the umask.
+pub(crate) fn make_private(path: &Path) -> std::io::Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+}
 
 /// Returns the base directory test fixtures create their roots under.
 ///
@@ -102,7 +117,7 @@ pub fn temp_root() -> PathBuf {
 /// Creates a private fixture directory under [`temp_root`].
 ///
 /// This is the drop-in replacement for [`tempfile::tempdir`]. The directory is
-/// owner-only (`0700`) and is removed with its contents when the returned
+/// owner-only (`0700`, whatever the process umask) and is removed with its contents when the returned
 /// guard drops.
 ///
 /// # Errors
@@ -122,10 +137,14 @@ pub fn tempdir() -> std::io::Result<tempfile::TempDir> {
 ///
 /// Returns the I/O error when the directory cannot be created.
 pub fn tempdir_with_prefix(prefix: &str) -> std::io::Result<tempfile::TempDir> {
-    tempfile::Builder::new()
+    // The mode requested at creation keeps the directory owner-only from the
+    // first instant; the explicit chmod makes it exactly 0700 under any umask.
+    let dir = tempfile::Builder::new()
         .prefix(prefix)
         .permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
-        .tempdir_in(temp_root())
+        .tempdir_in(temp_root())?;
+    make_private(dir.path())?;
+    Ok(dir)
 }
 
 /// Returns the value of a required variable or a message naming it.
@@ -383,5 +402,56 @@ mod tests {
             length + NESTED_SOCKET_SUFFIX < DARWIN_SUN_PATH_CAPACITY,
             "{length}"
         );
+    }
+
+    /// Prefix of the lines the umask probe child prints.
+    const UMASK_PROBE_LINE: &str = "umask-probe:";
+
+    /// Umask that removes every permission bit, the worst case for `mkdir`.
+    const OWNER_MASKING_UMASK: &str = "777";
+
+    /// Re-executes this test binary for `probe` under an owner-masking umask and
+    /// returns the probe's `umask-probe:` lines.
+    ///
+    /// The umask is process-global, so it is set in a child: POSIX `sh` has the
+    /// `umask` builtin and exists at `/bin/sh` on Linux and macOS.
+    fn run_probe_under_masking_umask(probe: &str) -> Vec<String> {
+        let exe = std::env::current_exe().expect("test executable");
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("umask {OWNER_MASKING_UMASK}; exec \"$0\" \"$@\""),
+            ])
+            .arg(exe)
+            .args(["--ignored", "--exact", probe, "--nocapture"])
+            .output()
+            .expect("run probe child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "probe {probe} failed: {stderr}");
+        String::from_utf8(output.stdout)
+            .expect("utf-8 stdout")
+            .lines()
+            .filter_map(|line| line.strip_prefix(UMASK_PROBE_LINE))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Child half of [`fixture_is_private_under_an_owner_masking_umask`].
+    #[test]
+    #[ignore = "child process of fixture_is_private_under_an_owner_masking_umask"]
+    fn umask_probe_tempdir() {
+        let fixture = tempdir().expect("create fixture under the masking umask");
+        std::fs::write(fixture.path().join("file"), b"x").expect("write into the fixture");
+        let mode = std::fs::metadata(fixture.path())
+            .expect("stat fixture")
+            .permissions()
+            .mode();
+        println!("{UMASK_PROBE_LINE}{:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn fixture_is_private_under_an_owner_masking_umask() {
+        let lines = run_probe_under_masking_umask("tests::umask_probe_tempdir");
+        assert_eq!(lines, [format!("{:o}", super::PRIVATE_DIR_MODE)]);
     }
 }
