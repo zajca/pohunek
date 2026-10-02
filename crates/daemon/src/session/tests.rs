@@ -42,7 +42,7 @@ use pohunek_test_support::wait::{guard, wait_until, HANG_GUARD};
 use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
     timestamp_now, worker_error_to_protocol, ActiveAgentReport, ExternalAssociationBlock,
-    InputSubmission, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry,
+    InputSubmission, ObservedExit, RuntimeExit, RuntimeHandle, RuntimeWatchIdentity, SessionEntry,
     SessionRegistry, SessionRegistryConfig, ShellCommand, WorkerMetadataApplyOutcome,
     WorkerMetadataProgress, WorkerMetadataRetryCause, WorkerMetadataTracker,
     MAX_SESSION_NAME_BYTES, MAX_WORKER_METADATA_RETRY_DELAY, WORKER_METADATA_RETRY_WARN_INTERVAL,
@@ -6935,6 +6935,97 @@ async fn natural_exit_keeps_an_authorized_attach_open_for_ordered_worker_close()
         .remove("natural-exit-attach");
     cancel.cancel();
     stop_test_worker(worker).await;
+}
+
+/// A root exit that lands after the stop request gave up waiting (stopping
+/// cleared, durable stop intent kept) ends the session Stopped, not Done or
+/// Failed; without a stop intent the same exit keeps its natural outcome.
+#[tokio::test]
+async fn a_late_root_exit_honours_a_durable_stop_intent_after_the_stop_gave_up() {
+    for (desired_state, success, forced, expected_state) in [
+        (
+            crate::store::DesiredState::Stopped,
+            true,
+            true,
+            SessionState::Stopped,
+        ),
+        (
+            crate::store::DesiredState::Stopped,
+            false,
+            false,
+            SessionState::Stopped,
+        ),
+        (
+            crate::store::DesiredState::Removed,
+            true,
+            false,
+            SessionState::Stopped,
+        ),
+        (
+            crate::store::DesiredState::Running,
+            true,
+            false,
+            SessionState::Done,
+        ),
+        (
+            crate::store::DesiredState::Running,
+            false,
+            false,
+            SessionState::Failed,
+        ),
+    ] {
+        let store_path = temp_store_path("late-exit-stop-intent");
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        });
+        let created = registry.create(params()).await.expect("create session");
+        let (worker, identity) = live_worker_and_identity(&registry, &created.id).await;
+        let mut sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get_mut(&created.id).expect("session entry");
+        entry.runtime_watch_cancel.cancel();
+        entry.desired_state = desired_state;
+        entry.stopping = false;
+        entry.stop_transaction_id = None;
+        drop(sessions);
+
+        assert!(
+            registry
+                .record_exit(
+                    &created.id,
+                    ObservedExit {
+                        exit: RuntimeExit {
+                            exit_code: Some(i32::from(!success)),
+                            success,
+                        },
+                        output_forced_closed: forced,
+                    },
+                    false,
+                    Some(&identity),
+                    None,
+                )
+                .await
+                .expect("record late exit"),
+            "the late exit must commit"
+        );
+
+        let terminal = registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect terminal");
+        assert_eq!(terminal.state, expected_state, "{desired_state:?}");
+        assert_eq!(terminal.output_force_closed, forced);
+        let durable = crate::store::Store::new(store_path)
+            .load_sessions()
+            .expect("reload terminal session")
+            .pop()
+            .expect("terminal record");
+        assert_eq!(durable.info.state, expected_state);
+        assert_eq!(durable.info.output_force_closed, forced);
+        stop_test_worker(worker).await;
+    }
 }
 
 #[tokio::test]

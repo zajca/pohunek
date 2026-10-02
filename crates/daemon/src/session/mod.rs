@@ -875,8 +875,12 @@ fn exit_transition(
     let exit = observed.exit;
     let base = SessionRegistry::session_record(id, entry, entry.desired_state, None);
     let mut candidate = entry.clone();
-    let stopped =
-        stopped_by_user || candidate.stopping || candidate.info.state == SessionState::Stopped;
+    // A durable stop or remove intent decides the outcome even when the stop
+    // request gave up waiting (clearing `stopping`) before the exit landed.
+    let stopped = stopped_by_user
+        || candidate.stopping
+        || candidate.desired_state != DesiredState::Running
+        || candidate.info.state == SessionState::Stopped;
     candidate.stopping = false;
     candidate.stop_transaction_id = None;
     let stop_reason = if stopped {

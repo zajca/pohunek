@@ -2109,6 +2109,14 @@ impl SessionRegistry {
             if exit.output_forced_closed {
                 super::note_output_force_closed(&mut record.info);
             }
+        } else if exited {
+            // The wire does not require an exit status with `Exited`.
+            record.info.state = if stopped_by_intent {
+                SessionState::Stopped
+            } else {
+                SessionState::Failed
+            };
+            record.info.state_source = StateSource::Process;
         }
         self.insert_unavailable_record(record, state, "worker_runtime_terminal")
             .await;
@@ -7044,6 +7052,37 @@ while os.getppid() == parent:
                 .expect("persisted record");
             assert_eq!(persisted.transaction, None);
             assert_eq!(persisted.info.state, expected_state);
+        }
+    }
+
+    /// An exited worker snapshot without an exit status still ends the
+    /// session: Stopped under a durable stop intent, Failed otherwise.
+    #[tokio::test]
+    async fn an_exited_worker_import_without_an_exit_status_is_terminal() {
+        for (desired_state, expected_state) in [
+            (DesiredState::Stopped, SessionState::Stopped),
+            (DesiredState::Removed, SessionState::Stopped),
+            (DesiredState::Running, SessionState::Failed),
+        ] {
+            let registry = SessionRegistry::new(SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                ..SessionRegistryConfig::default()
+            });
+            let mut snapshot = identity_snapshot("native-launch");
+            snapshot.phase = WorkerRuntimePhase::Exited;
+            snapshot.active_identity = None;
+            snapshot.exit = None;
+            let mut record = identity_record();
+            record.desired_state = desired_state;
+
+            registry.import_ended_worker(record, &snapshot).await;
+
+            let info = registry
+                .inspect(&SessionId("s-identity".to_owned()))
+                .await
+                .expect("the imported session is listed");
+            assert_eq!(info.state, expected_state, "{desired_state:?}");
+            assert_eq!(info.state_source, StateSource::Process);
         }
     }
 
