@@ -150,7 +150,9 @@ mod tests {
     use super::*;
 
     /// Sets the flag when dropped, including while a panic unwinds, so the
-    /// scoped spawn loops stop and `std::thread::scope` can return.
+    /// scoped spawn loops stop and `std::thread::scope` can return. It is
+    /// created before the first sibling spawns, so a failed `Scope::spawn`
+    /// also stops the siblings that already started.
     struct StopOnDrop<'a>(&'a AtomicBool);
 
     impl Drop for StopOnDrop<'_> {
@@ -178,6 +180,7 @@ mod tests {
         let dir = crate::tempdir().expect("fixture directory");
         let stop = AtomicBool::new(false);
         std::thread::scope(|scope| {
+            let _stop_siblings = StopOnDrop(&stop);
             for _ in 0..SIBLING_THREADS {
                 scope.spawn(|| {
                     while !stop.load(Ordering::Relaxed) {
@@ -188,7 +191,6 @@ mod tests {
                     }
                 });
             }
-            let _stop_siblings = StopOnDrop(&stop);
             for run in 0..SCRIPT_RUNS {
                 let path = dir.path().join(format!("fresh-{run}"));
                 write_executable(&path, "#!/bin/sh\nexit 0\n").expect("write script");
