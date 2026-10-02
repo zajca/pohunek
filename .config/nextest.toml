@@ -55,6 +55,8 @@ not (
   or (package(=pohunek-cli) and
     (test(/^hermes_integration::/) or binary(/^hermes_/) or binary(=session_process_api)))
   or (package(=pohunek-gui-core) and binary(=loopback))
+  or (package(=pohunek-platform) and
+    test(/^(shell_env::test_support::tests::|filesystem::tests::a_dropped_lock_is_free_while_|test_spawn::)/))
   or (package(=xtask) and (test(/^hermes(::|_mock::)/) or kind(test)))
 )
 '''

@@ -20,3 +20,6 @@ pub mod peer;
 pub mod process;
 pub mod shell_env;
 pub mod supervisor;
+
+#[cfg(test)]
+mod test_spawn;

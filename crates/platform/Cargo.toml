@@ -35,6 +35,8 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["signal"] }
+pohunek-test-support = { workspace = true }
+# `tempfile::TempDir` names the guard type that pohunek-test-support returns.
 tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]

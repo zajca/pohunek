@@ -3794,6 +3794,34 @@ mod tests {
             .expect("acquire released lock");
     }
 
+    /// Acquire-drop-reacquire cycles run while a sibling thread keeps spawning.
+    const SPAWN_RACE_CYCLES: usize = 300;
+
+    /// A process spawned while a lock descriptor is open holds a copy of it
+    /// until its own `exec`, so closing the descriptor alone would leave the
+    /// lock held after the guard is dropped.
+    #[test]
+    fn a_dropped_lock_is_free_while_a_sibling_thread_keeps_spawning() {
+        let (temporary, root) = trusted_root();
+        crate::test_spawn::while_a_sibling_spawns(temporary.path(), |sibling| {
+            sibling.repeat_while_spawning(SPAWN_RACE_CYCLES, |cycle| {
+                let outcome = root
+                    .acquire_lock("race.lock", FILE_MODE)
+                    .map(drop)
+                    .and_then(|()| root.lock_file("race-file.lock", FILE_MODE, LockKind::Exclusive))
+                    .map(drop)
+                    .and_then(|()| root.acquire_lock("race.lock", FILE_MODE))
+                    .and_then(|lock| {
+                        drop(lock);
+                        root.lock_file("race-file.lock", FILE_MODE, LockKind::Exclusive)
+                    });
+                if let Err(error) = outcome {
+                    panic!("cycle {cycle}: a dropped lock was still held: {error:?}");
+                }
+            });
+        });
+    }
+
     /// A duplicate of a lock descriptor shares its open file description, as a
     /// forked child's inherited copy does until it execs.
     #[test]
