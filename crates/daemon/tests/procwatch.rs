@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-09-01
+// Rust guideline compliant 2026-10-02
 
 #![cfg(target_os = "linux")]
 
@@ -6,19 +6,23 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
+use pohunek_daemon::procwatch::{
+    Error as ProcwatchError, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact,
+    ProcessIdentity, ProcessInspector,
+};
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::wait::wait_until;
+use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{
-    AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
+    event, AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
     SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
@@ -27,22 +31,22 @@ use protocol::{
 // here is about the grace.
 const TEST_COLS: u16 = 80;
 const TEST_ROWS: u16 = 24;
-/// Poll interval used by the integration test.
+/// Poll interval of the managed-session watcher in the pidfd test.
 ///
-/// It is intentionally long enough that a clear observed well below this bound
-/// proves the pidfd exit path fired instead of waiting for the next poll tick.
-const TEST_PROCWATCH_POLL: Duration = Duration::from_secs(2);
-/// Upper bound for pidfd-driven release after `kill -9`.
+/// Short, so that many poll ticks run while the exit watch is the only path
+/// that can still clear the agent; the polls cannot clear it, see
+/// [`PollBlindInspector`].
+const TEST_PROCWATCH_POLL: Duration = Duration::from_millis(100);
+/// Seconds the managed shell stays alive after its agent exits.
 ///
-/// This is below [`TEST_PROCWATCH_POLL`], so success demonstrates event-driven
-/// exit handling rather than poll cleanup.
-const EXIT_EVENT_TIMEOUT: Duration = Duration::from_millis(900);
+/// Longer than the hang guard, so the session cannot end, and clear the agent
+/// with it, before the exit watch has cleared the agent.
+const SHELL_LINGER_SECS: u64 = 600;
 /// Poll interval for the cwd-tracking integration test.
 const CWD_PROCWATCH_POLL: Duration = Duration::from_millis(150);
-/// Poll interval for the external observer integration test.
-const EXTERNAL_PROCWATCH_POLL: Duration = Duration::from_secs(2);
-/// Lightweight polling cadence while waiting for external entries.
-const EXTERNAL_WAIT_POLL: Duration = Duration::from_millis(20);
+/// Sweep interval of the external observer in the pidfd test, short for the same
+/// reason as [`TEST_PROCWATCH_POLL`].
+const EXTERNAL_PROCWATCH_POLL: Duration = Duration::from_millis(100);
 
 static EXTERNAL_ENV_LOCK: Mutex<()> = Mutex::new(());
 static POHUNEK_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -91,6 +95,190 @@ impl Drop for PohunekEnvGuard {
     }
 }
 
+/// What the poll path keeps reading about a process after it died.
+#[derive(Debug)]
+struct LastSeen {
+    identity: ProcessIdentity,
+    fact: ProcessFact,
+    cwd: PathBuf,
+    executable: Option<PathBuf>,
+    markers: OwnershipMarkers,
+}
+
+/// Process inspector that delegates to the host and can freeze one process in
+/// the view of every poll, sweep and rescan.
+///
+/// After [`PollBlindInspector::freeze`] the process stays listed, running and
+/// readable through every method the scans use, with the facts captured at
+/// that moment, even once it has exited. No scan, however late or however long
+/// it runs, can then notice the death. `exit_watch` still arms a real pidfd, so
+/// the only way left for the registry to drop the process is the exit watch
+/// that the test is about.
+///
+/// [`PollBlindInspector::thaw`] ends the freeze: every method then reports host
+/// truth, so a later scan sees the process as gone. Every process listing
+/// (`same_user_processes`, `descendants`) is counted, which lets a test wait
+/// for scans that ran after the thaw.
+#[derive(Debug)]
+struct PollBlindInspector {
+    host: HostInspector,
+    frozen: Mutex<Option<LastSeen>>,
+    listings: AtomicUsize,
+}
+
+impl PollBlindInspector {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            host: HostInspector::new(),
+            frozen: Mutex::new(None),
+            listings: AtomicUsize::new(0),
+        })
+    }
+
+    /// Ends the freeze; every method reports host truth from here on.
+    fn thaw(&self) {
+        *self.lock() = None;
+    }
+
+    /// Number of process listings taken so far.
+    fn listings(&self) -> usize {
+        self.listings.load(Ordering::SeqCst)
+    }
+
+    /// Captures `pid` as it is now and keeps reporting it that way.
+    fn freeze(&self, pid: Pid) {
+        let identity = self
+            .host
+            .identity(pid)
+            .expect("inspect the process to freeze")
+            .expect("the process to freeze is alive");
+        let last_seen = LastSeen {
+            identity,
+            fact: self
+                .host
+                .process(pid)
+                .expect("read the process to freeze")
+                .expect("the process to freeze is alive"),
+            cwd: self.host.cwd(pid).expect("read the process cwd"),
+            executable: self
+                .host
+                .executable(pid)
+                .expect("read the process executable"),
+            markers: self
+                .host
+                .ownership_markers(pid)
+                .expect("read the process ownership markers"),
+        };
+        *self.lock() = Some(last_seen);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Option<LastSeen>> {
+        self.frozen.lock().expect("frozen process lock")
+    }
+
+    /// Runs `view` on the frozen process when `pid` is it.
+    fn frozen_view<T>(&self, pid: Pid, view: impl FnOnce(&LastSeen) -> T) -> Option<T> {
+        self.lock()
+            .as_ref()
+            .filter(|last_seen| last_seen.fact.pid == pid)
+            .map(view)
+    }
+
+    /// Adds the frozen process to `facts` when the host no longer lists it and
+    /// `listed` says it belongs in this listing.
+    fn with_frozen(
+        &self,
+        mut facts: Vec<ProcessFact>,
+        listed: impl FnOnce(&ProcessFact, &[ProcessFact]) -> bool,
+    ) -> Vec<ProcessFact> {
+        if let Some(last_seen) = self.lock().as_ref() {
+            let missing = facts.iter().all(|fact| fact.pid != last_seen.fact.pid);
+            if missing && listed(&last_seen.fact, &facts) {
+                facts.push(last_seen.fact.clone());
+            }
+        }
+        facts
+    }
+}
+
+impl ProcessInspector for PollBlindInspector {
+    fn identity(&self, pid: Pid) -> Result<Option<ProcessIdentity>, ProcwatchError> {
+        match self.frozen_view(pid, |last_seen| last_seen.identity) {
+            Some(identity) => Ok(Some(identity)),
+            None => self.host.identity(pid),
+        }
+    }
+
+    fn is_running(&self, identity: ProcessIdentity) -> Result<bool, ProcwatchError> {
+        let frozen = self
+            .lock()
+            .as_ref()
+            .is_some_and(|last_seen| last_seen.identity == identity);
+        if frozen {
+            Ok(true)
+        } else {
+            self.host.is_running(identity)
+        }
+    }
+
+    fn parent_pid(&self, pid: Pid) -> Result<Option<Pid>, ProcwatchError> {
+        match self.frozen_view(pid, |last_seen| last_seen.fact.ppid) {
+            Some(parent) => Ok(Some(parent)),
+            None => self.host.parent_pid(pid),
+        }
+    }
+
+    fn process(&self, pid: Pid) -> Result<Option<ProcessFact>, ProcwatchError> {
+        match self.frozen_view(pid, |last_seen| last_seen.fact.clone()) {
+            Some(fact) => Ok(Some(fact)),
+            None => self.host.process(pid),
+        }
+    }
+
+    fn same_user_processes(&self) -> Result<Vec<ProcessFact>, ProcwatchError> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
+        let facts = self.host.same_user_processes()?;
+        Ok(self.with_frozen(facts, |_, _| true))
+    }
+
+    fn descendants(&self, root: Pid) -> Result<Vec<ProcessFact>, ProcwatchError> {
+        self.listings.fetch_add(1, Ordering::SeqCst);
+        let facts = self.host.descendants(root)?;
+        Ok(self.with_frozen(facts, |frozen, listed| {
+            frozen.ppid == root || listed.iter().any(|fact| fact.pid == frozen.ppid)
+        }))
+    }
+
+    fn cwd(&self, pid: Pid) -> Result<PathBuf, ProcwatchError> {
+        match self.frozen_view(pid, |last_seen| last_seen.cwd.clone()) {
+            Some(cwd) => Ok(cwd),
+            None => self.host.cwd(pid),
+        }
+    }
+
+    fn executable(&self, pid: Pid) -> Result<Option<PathBuf>, ProcwatchError> {
+        match self.frozen_view(pid, |last_seen| last_seen.executable.clone()) {
+            Some(executable) => Ok(executable),
+            None => self.host.executable(pid),
+        }
+    }
+
+    fn exit_watch(&self, identity: ProcessIdentity) -> Result<ExitWatch, ProcwatchError> {
+        self.host.exit_watch(identity)
+    }
+
+    fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, ProcwatchError> {
+        match self.frozen_view(pid, |last_seen| last_seen.markers.clone()) {
+            Some(markers) => Ok(markers),
+            None => self.host.ownership_markers(pid),
+        }
+    }
+
+    fn foreground_process_group(&self, root_pid: Pid) -> Result<Option<Pid>, ProcwatchError> {
+        self.host.foreground_process_group(root_pid)
+    }
+}
+
 /// Build a `SessionRegistry` wired to a real `SubprocessWorkerLauncher` (the
 /// built `pohunek-sessiond`), rooted under a unique per-call worker home, so
 /// `registry.create` can actually launch a durable worker instead of failing
@@ -107,7 +295,11 @@ impl Drop for PohunekEnvGuard {
 ///
 /// The worker's directories are the private ones of `env`, whose short root
 /// leaves room for the worker's nested control socket.
-fn worker_backed_registry(env: &TestEnv, mut config: SessionRegistryConfig) -> SessionRegistry {
+fn worker_backed_registry(
+    env: &TestEnv,
+    mut config: SessionRegistryConfig,
+    inspector: Arc<dyn ProcessInspector>,
+) -> SessionRegistry {
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: env.runtime_dir().to_path_buf(),
         state_home: env.state_home().to_path_buf(),
@@ -125,11 +317,7 @@ fn worker_backed_registry(env: &TestEnv, mut config: SessionRegistryConfig) -> S
             .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
     );
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
-    SessionRegistry::new_with_launcher_and_inspector(
-        config,
-        launcher,
-        Arc::new(HostInspector::new()),
-    )
+    SessionRegistry::new_with_launcher_and_inspector(config, launcher, inspector)
 }
 
 #[tokio::test]
@@ -144,10 +332,11 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     let pid_file = dir.join("agent.pid");
     symlink_sleep_as(&fake_codex);
     let script = format!(
-        "{} 60 & echo $! > {}; wait $!; sleep 30",
+        "{} 60 & echo $! > {}; wait $!; sleep {SHELL_LINGER_SECS}",
         fake_codex.display(),
         pid_file.display()
     );
+    let poll_blind = PollBlindInspector::new();
     let registry = worker_backed_registry(
         &env,
         SessionRegistryConfig {
@@ -155,6 +344,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
             procwatch_poll: TEST_PROCWATCH_POLL,
             ..SessionRegistryConfig::default()
         },
+        Arc::clone(&poll_blind) as Arc<dyn ProcessInspector>,
     );
     let created = {
         let _env = PohunekEnvGuard::clear();
@@ -191,15 +381,25 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     assert_eq!(observed.active_agent.as_deref(), Some("codex"));
     assert_eq!(observed.active_agent_base, Some(AgentKind::Codex));
 
+    // Every poll keeps seeing the agent alive, so only the pidfd exit watch can
+    // clear it.
+    poll_blind.freeze(child_pid);
+    let mut events = registry.subscribe();
     kill9(child_pid);
-    let started = Instant::now();
-    let cleared = wait_for_cleared_agent(&registry, &created.id, EXIT_EVENT_TIMEOUT).await;
-
+    let cleared = wait_for_cleared_agent(&created.id, &mut events).await;
     assert_eq!(cleared.active_agent, None);
-    assert!(
-        started.elapsed() < TEST_PROCWATCH_POLL,
-        "active agent cleared only after the poll interval"
-    );
+
+    // The cleared event arrived while every poll still reported the agent alive,
+    // so the exit watch produced it. From here the host truth (the agent is
+    // gone) applies, and a later scan must keep the agent cleared.
+    poll_blind.thaw();
+    wait_for_scans_after_thaw(&poll_blind).await;
+    let after_scan = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(after_scan.active_agent_pid, None);
+    assert_eq!(after_scan.active_agent, None);
     let _ = registry.stop(&created.id).await;
 }
 
@@ -216,6 +416,7 @@ async fn procwatch_updates_cwd_after_shell_cd() {
             procwatch_poll: CWD_PROCWATCH_POLL,
             ..SessionRegistryConfig::default()
         },
+        Arc::new(HostInspector::new()),
     );
     let created = registry
         .create(SessionNewParams {
@@ -275,11 +476,15 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     fs::create_dir(&bin_dir).expect("create the fake agent directory");
     let fake_claude = bin_dir.join("claude");
     symlink_sleep_as(&fake_claude);
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        observe_external_agents: true,
-        procwatch_poll: EXTERNAL_PROCWATCH_POLL,
-        ..SessionRegistryConfig::default()
-    });
+    let inspector = PollBlindInspector::new();
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            observe_external_agents: true,
+            procwatch_poll: EXTERNAL_PROCWATCH_POLL,
+            ..SessionRegistryConfig::default()
+        },
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
     let mut child = spawn_fake_agent(&env, &fake_claude);
     let child_pid = child.id();
     let transcript = claude_projects.join("session.jsonl");
@@ -357,14 +562,27 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
         .expect_err("external sessions cannot be resumed");
     assert_eq!(resumed.code, "session_external_read_only");
 
+    // Every sweep keeps seeing the agent alive, so only the pidfd exit watch can
+    // remove the entry.
+    inspector.freeze(child_pid);
+    let mut events = registry.subscribe();
     kill9(child_pid);
-    let started = Instant::now();
-    wait_for_external_gone(&registry, child_pid, EXIT_EVENT_TIMEOUT).await;
-    assert!(
-        started.elapsed() < EXTERNAL_PROCWATCH_POLL,
-        "external agent disappeared only after the poll interval"
-    );
+    wait_for_external_gone(&observed.id, &mut events).await;
     let _ = child.wait();
+
+    // The removal event arrived while every sweep still listed the agent, so the
+    // exit watch produced it. A later sweep, on host truth, must not list it
+    // again.
+    inspector.thaw();
+    wait_for_scans_after_thaw(&inspector).await;
+    assert!(
+        registry
+            .list()
+            .await
+            .into_iter()
+            .all(|session| session.id != observed.id),
+        "a sweep after the exit re-listed the external agent"
+    );
 }
 
 fn native_exit_watch_is_available() -> bool {
@@ -437,26 +655,65 @@ async fn wait_for_observed_pid(
     .await
 }
 
-/// Waits until the registry reports no active agent, within `timeout`.
+/// Waits for the lifecycle event that reports no active agent for session `id`.
 ///
-/// The bound is the contract under test: the release must come from the exit
-/// watch, which is faster than the poll interval.
+/// The proof comes from the event itself, never from a state read that a later
+/// scan could overwrite; `events` must be subscribed before the exit is
+/// triggered.
 async fn wait_for_cleared_agent(
-    registry: &SessionRegistry,
     id: &SessionId,
-    timeout: Duration,
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
 ) -> SessionInfo {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let info = registry.inspect(id).await.expect("inspect session");
-        if info.active_agent_pid.is_none() {
-            return info;
+    guard("the event reporting no active agent", async {
+        loop {
+            let info = next_session_event(events, event::SESSION_UPDATED).await;
+            if info.id == *id && info.active_agent_pid.is_none() {
+                return info;
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the active agent to clear"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    })
+    .await
+}
+
+/// Waits until the process listings show that a complete scan ran on host truth
+/// after [`PollBlindInspector::thaw`].
+///
+/// Each session runs its scans one after another, and a scan takes one listing.
+/// Listing number 1 after the thaw is therefore a post-thaw scan, and listing
+/// number 2 starting means that scan has finished.
+async fn wait_for_scans_after_thaw(inspector: &PollBlindInspector) {
+    let thawed_at = inspector.listings();
+    wait_until("a procwatch scan to complete after the thaw", || async {
+        (inspector.listings() >= thawed_at + 2).then_some(())
+    })
+    .await;
+}
+
+/// Waits for the next event named `name` and returns the session it carries.
+///
+/// A lagged receiver panics: a skipped event could be the one being awaited.
+async fn next_session_event(
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+    name: &str,
+) -> SessionInfo {
+    loop {
+        match events.recv().await {
+            Ok(event) if event.event() == name => {
+                let session = event
+                    .payload()
+                    .get("session")
+                    .cloned()
+                    .expect("the lifecycle event carries a session");
+                return serde_json::from_value(session).expect("decode the event session");
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                panic!("the event receiver lagged and skipped {skipped} events")
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                panic!("the registry event channel closed")
+            }
+        }
     }
 }
 
@@ -482,23 +739,24 @@ async fn assert_external_detection_unavailable(registry: &SessionRegistry, id: &
     );
 }
 
-async fn wait_for_external_gone(registry: &SessionRegistry, pid: u32, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let present = registry
-            .list()
-            .await
-            .into_iter()
-            .any(|session| session.pid == pid);
-        if !present {
-            return;
+/// Waits for the removal event of the external session `id`.
+///
+/// The proof comes from the event itself, never from a listing that a later
+/// sweep could overwrite; `events` must be subscribed before the exit is
+/// triggered.
+async fn wait_for_external_gone(
+    id: &SessionId,
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+) {
+    guard("the removal event of the external session", async {
+        loop {
+            let removed = next_session_event(events, event::SESSION_REMOVED).await;
+            if removed.id == *id {
+                return;
+            }
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for external pid {pid} to disappear"
-        );
-        tokio::time::sleep(EXTERNAL_WAIT_POLL).await;
-    }
+    })
+    .await;
 }
 
 fn kill9(pid: u32) {
