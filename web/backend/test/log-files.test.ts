@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,8 @@ import {
 import { createFixtureRoot, startFixtureDaemon } from "@pohunek/testkit";
 
 const SMALL_FILE_BYTES = 400;
+/** A blocking open of a FIFO would return only after its late peer opens it. */
+const FIFO_PEER_DELAY_MS = 2_000;
 
 describe("rotating backend log files", () => {
   test("writes one JSON object per line into an owner-private file", async () => {
@@ -126,6 +129,50 @@ describe("rotating backend log files", () => {
   });
 });
 
+describe("non-regular files in log slots", () => {
+  test("a FIFO in the active or a rotated slot is refused without blocking", async () => {
+    await withRoot(async (root) => {
+      const activeDir = join(root, "active");
+      await mkdir(activeDir, { mode: 0o700 });
+      const activePeer = makeFifoWithLatePeer(join(activeDir, LOG_FILE_NAME));
+      const rotatedDir = join(root, "rotated");
+      await mkdir(rotatedDir, { mode: 0o700 });
+      const rotatedPeer = makeFifoWithLatePeer(join(rotatedDir, `${LOG_FILE_NAME}.1`));
+      try {
+        const started = performance.now();
+        let activeFailed = false;
+        try {
+          rotatingFileLogger({ dir: activeDir, maxFileBytes: 4096, maxFiles: 2 });
+        } catch {
+          activeFailed = true;
+        }
+        expectLogFileError(() => rotatingFileLogger({ dir: rotatedDir, maxFileBytes: 4096, maxFiles: 3 }));
+        expect(activeFailed).toBe(true);
+        expect(performance.now() - started < FIFO_PEER_DELAY_MS).toBe(true);
+      } finally {
+        await Promise.all([stopPeer(activePeer), stopPeer(rotatedPeer)]);
+      }
+    });
+  });
+
+  test("a symlink in a rotated slot is removed without touching its target", async () => {
+    await withRoot(async (root) => {
+      const dir = join(root, "logs");
+      await mkdir(dir, { mode: 0o700 });
+      const target = join(root, "target");
+      await writeFile(target, "keep\n", { mode: 0o644 });
+      await chmod(target, 0o644);
+      await symlink(target, join(dir, `${LOG_FILE_NAME}.1`));
+      const logger = rotatingFileLogger({ dir, maxFileBytes: 4096, maxFiles: 3 });
+      logger.close();
+
+      expect(await readdir(dir)).toEqual([LOG_FILE_NAME]);
+      expect(await readFile(target, "utf8")).toBe("keep\n");
+      expect((await stat(target)).mode & 0o777).toBe(0o644);
+    });
+  });
+});
+
 describe("rotating log file failure handling", () => {
   test("a failing rotation reaches the fallback instead of the caller and recovers", async () => {
     await withRoot(async (root) => {
@@ -228,6 +275,29 @@ describe("backend log destination", () => {
     }
   });
 });
+
+/**
+ * Creates a FIFO and a helper process that opens it after `FIFO_PEER_DELAY_MS`.
+ * A blocking open of the FIFO in the logger then returns late and fails the
+ * elapsed-time check instead of freezing the suite.
+ */
+function makeFifoWithLatePeer(path: string): ChildProcess {
+  const created = spawnSync("mkfifo", ["-m", "600", path]);
+  if (created.status !== 0) {
+    throw new Error(`mkfifo failed for ${path}`);
+  }
+  const delaySeconds = String(FIFO_PEER_DELAY_MS / 1000);
+  return spawn("sh", ["-c", 'sleep "$1"; exec 3<>"$0"; sleep "$1"', path, delaySeconds], { stdio: "ignore" });
+}
+
+async function stopPeer(peer: ChildProcess): Promise<void> {
+  if (peer.exitCode !== null || peer.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise<void>((resolve) => peer.once("exit", () => resolve()));
+  peer.kill();
+  await exited;
+}
 
 function expectLogFileError(action: () => unknown): void {
   let failure: unknown;

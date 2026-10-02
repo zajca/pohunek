@@ -186,12 +186,13 @@ function requireCurrentOwner(uid: number, path: string): void {
 /**
  * Opens the active file without following a symlink, requires a regular file
  * owned by the current user, forces mode 0600 through the descriptor, and
- * empties a file left above the size bound.
+ * empties a file left above the size bound. `O_NONBLOCK` keeps a FIFO in the
+ * slot from blocking startup (it fails with `ENXIO`); regular files ignore it.
  */
 function openActive(path: string, maxFileBytes: number): number {
   const descriptor = openSync(
     path,
-    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
+    constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     FILE_MODE,
   );
   try {
@@ -231,12 +232,19 @@ function sanitizeRotated(dir: string, maxFiles: number, maxFileBytes: number): v
       continue;
     }
     // O_NOFOLLOW: a symlink in a rotated slot is removed, never followed.
+    // O_NONBLOCK: a FIFO opens without waiting for a writer and is then refused.
     let descriptor: number;
     try {
-      descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    } catch {
-      removeIfPresent(path);
-      continue;
+      descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch (error: unknown) {
+      if (hasCode(error, "ELOOP")) {
+        removeIfPresent(path);
+        continue;
+      }
+      if (isMissing(error)) {
+        continue;
+      }
+      throw error;
     }
     try {
       const info = fstatSync(descriptor);
@@ -276,5 +284,9 @@ function renameIfPresent(from: string, to: string): void {
 }
 
 function isMissing(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "ENOENT";
+  return hasCode(error, "ENOENT");
+}
+
+function hasCode(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
 }

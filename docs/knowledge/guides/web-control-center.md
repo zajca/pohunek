@@ -160,8 +160,10 @@ directory, `0600` file) rotating family `pohunek-backend.jsonl[.N]` instead.
 `POHUNEK_BACKEND_LOG_MAX_FILE_BYTES` (default 32 MiB) and
 `POHUNEK_BACKEND_LOG_MAX_FILES` (default 8, including the active file) bound it
 like the daemon's own log family; the two limits are rejected without a log
-directory. A symlinked directory or file, a directory open to group or others,
-or a foreign owner stops startup. Files left by an earlier run are brought inside
+directory. A symlinked directory or active file, a non-regular file such as a
+FIFO in any log slot, a directory open to group or others, or a foreign owner
+stops startup; a symlink in a rotated slot is removed without being followed.
+Files left by an earlier run are brought inside
 the bound when the backend starts: oversize ones are removed (the active one is
 emptied) and loose modes are forced to `0600`. An event larger than one file is
 replaced by a fixed notice, so total disk use stays within the product of the two
