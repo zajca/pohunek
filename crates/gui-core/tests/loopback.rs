@@ -2040,6 +2040,13 @@ impl LoopbackDaemon {
         let store_path =
             store_path.unwrap_or_else(|| temp_dir(&format!("{tag}-state")).join("metadata.jsonl"));
         let mut config = SessionRegistryConfig {
+            // A fixed shell keeps the sessions independent of the host user's
+            // `$SHELL` and its startup files, whose background helpers can
+            // hold the PTY open past the stop deadline.
+            shell_command: pohunek_daemon::session::ShellCommand::new(
+                "/bin/sh",
+                std::iter::empty::<String>(),
+            ),
             stop_grace: Duration::from_millis(50),
             store_path: Some(store_path),
             worktree_root: Some(temp_dir(&format!("{tag}-worktrees"))),

@@ -37,6 +37,7 @@ use crate::procwatch::{
 };
 use crate::project::detect::project_id;
 use crate::runtime::{Worker, WorkerError};
+use pohunek_test_support::wait::HANG_GUARD;
 
 use super::{
     native_report_is_current, preserve_durable_worker_metadata, terminalize_running_subagents,
@@ -5475,6 +5476,45 @@ async fn session_input_wait_shutdown_while_worker_reserved_never_sends_late_inpu
     let _ = registry.stop(&created.id).await;
 }
 
+/// Deadline of the waited write in
+/// [`session_input_wait_timeout_after_atomic_plan_does_not_stage_body`], on the
+/// paused clock.
+const PLAN_DEADLINE: Duration = Duration::from_millis(50);
+/// Worker-side delay before the plan ACK, on the paused clock. It lies past
+/// [`PLAN_DEADLINE`], so the ACK is withheld until the test advances the clock
+/// to it.
+const PLAN_ACK_DELAY: Duration = Duration::from_millis(250);
+
+/// Margin added to every `advance` of the paused clock: tokio rounds a timer
+/// up to the next millisecond, so advancing by exactly a timer's duration can
+/// leave it one tick short.
+const TIMER_TICK: Duration = Duration::from_millis(1);
+
+/// Keeps tokio's paused clock from auto-advancing while real I/O is awaited.
+///
+/// A blocking task in flight inhibits auto-advance, so the paused clock moves
+/// only through `tokio::time::advance`, even when the runtime is idle waiting
+/// for the PTY or a worker socket. Dropping it lets the blocking task end.
+struct AutoAdvanceInhibitor {
+    release: std::sync::mpsc::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl AutoAdvanceInhibitor {
+    fn new() -> Self {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = released.recv();
+        });
+        Self { release, task }
+    }
+
+    async fn release(self) {
+        drop(self.release);
+        self.task.await.expect("auto-advance inhibitor task joins");
+    }
+}
+
 #[tokio::test]
 async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
     let agents_dir = temp_agents_dir_with(
@@ -5494,23 +5534,58 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
         .create(create)
         .await
         .expect("create Claude session");
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
 
-    let error = tokio::time::timeout(
-        Duration::from_millis(150),
-        registry.write_waited_input_with_ack_delay(
-            &created.id,
-            "atomic-plan-timeout",
-            deadline,
-            Duration::from_millis(250),
-        ),
-    )
-    .await
-    .expect("atomic plan must respect the overall deadline")
-    .expect_err("delayed plan ACK must time out");
+    // From here the clock moves only through `advance`: the deadline and the
+    // worker's ACK delay are virtual timers, while the PTY and the worker
+    // socket stay real.
+    let inhibitor = AutoAdvanceInhibitor::new();
+    tokio::time::pause();
+    let send_boundary = Arc::new(tokio::sync::Barrier::new(2));
+    registry.hold_next_input_send(Arc::clone(&send_boundary));
+    let deadline = tokio::time::Instant::now() + PLAN_DEADLINE;
+    let write = tokio::spawn({
+        let registry = registry.clone();
+        let session_id = created.id.clone();
+        async move {
+            registry
+                .write_waited_input_with_ack_delay(
+                    &session_id,
+                    "atomic-plan-timeout",
+                    deadline,
+                    PLAN_ACK_DELAY,
+                )
+                .await
+        }
+    });
+    send_boundary.wait().await;
+    send_boundary.wait().await;
+    // The write holds the session lock until its send starts, so acquiring it
+    // means the atomic plan is committed to the worker.
+    drop(registry.inner.sessions.lock().await);
 
+    tokio::time::advance(PLAN_DEADLINE + TIMER_TICK).await;
+    let error = write
+        .await
+        .expect("waited write task joins")
+        .expect_err("delayed plan ACK must time out");
     assert_eq!(error.code, "session_input_timeout");
-    let mut next_input = tokio::spawn({
+    let gate_held = {
+        let sessions = registry.inner.sessions.lock().await;
+        let held = sessions[&created.id].input_gate.try_lock().is_err();
+        held
+    };
+    assert!(
+        gate_held,
+        "input gate must remain held until the late worker ACK is consumed"
+    );
+
+    // Releases the ACK when the worker already armed its delay. Otherwise the
+    // remaining delay elapses on the real clock after `resume`.
+    tokio::time::advance(PLAN_ACK_DELAY + TIMER_TICK).await;
+    tokio::time::resume();
+    inhibitor.release().await;
+
+    let next_input = tokio::spawn({
         let registry = registry.clone();
         let session_id = created.id.clone();
         async move {
@@ -5523,12 +5598,6 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
                 .await
         }
     });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), &mut next_input)
-            .await
-            .is_err(),
-        "input gate must remain held until the late worker ACK is consumed"
-    );
     next_input
         .await
         .expect("next input task joins")
@@ -6487,6 +6556,11 @@ async fn worker_metadata_retry_preserves_newer_memory_timestamp() {
     let newer_timestamp = "2099-01-01T00:00:00Z";
     let mut sessions = registry.inner.sessions.lock().await;
     let entry = sessions.get_mut(&created.id).expect("session entry");
+    // The session's live procwatch observes the shell's real cwd and would
+    // overwrite the injected one. Stopping it and marking the injected cwd as
+    // the newest evidence confines the test to the metadata rebase.
+    entry.procwatch_cancel.cancel();
+    entry.cwd_observed_at = crate::time::now();
     entry.info.subagents.clear();
     entry.info.cwd = PathBuf::from("/tmp/concurrent-cwd");
     entry.info.project_id = Some("p-concurrent".to_owned());
@@ -10986,6 +11060,35 @@ fn temp_agent_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> Pa
     )
 }
 
+/// Like [`temp_agent_that_exits_then_resumes`], but the first run stays alive
+/// until `exit_gate` (see [`hook_gate`]) is written, so the test decides when
+/// the runtime ends instead of racing a fixed lifetime against session creation.
+#[cfg(unix)]
+fn temp_agent_that_exits_when_released(
+    tag: &str,
+    marker: &std::path::Path,
+    exit_gate: &std::path::Path,
+) -> PathBuf {
+    let runtime = temp_dir(&format!("{tag}-runtime"));
+    let script = runtime.join("resume-agent");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            marker.display(),
+            exit_gate.display(),
+        ),
+    );
+    temp_agents_dir_with(
+        tag,
+        "resumable",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\nargs = [\"--model\", \"sonnet\"]\n",
+            script.display()
+        ),
+    )
+}
+
 #[cfg(unix)]
 fn temp_hermes_that_exits_then_resumes(tag: &str, marker: &std::path::Path) -> (PathBuf, PathBuf) {
     let runtime = temp_dir(&format!("{tag}-runtime"));
@@ -12025,8 +12128,11 @@ async fn hermes_resume_without_native_reference_fails_before_relaunch() {
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_native_recovery_accepts_terminal_runtime() {
-    let marker = temp_dir("terminal-recovery-marker").join("argv.txt");
-    let agents_dir = temp_agent_that_exits_then_resumes("terminal-recovery", &marker);
+    let marker_dir = temp_dir("terminal-recovery-marker");
+    let marker = marker_dir.join("argv.txt");
+    let gate_path = marker_dir.join("exit.gate");
+    let mut gate = hook_gate(&gate_path);
+    let agents_dir = temp_agent_that_exits_when_released("terminal-recovery", &marker, &gate_path);
     let registry = SessionRegistry::new(SessionRegistryConfig {
         stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
@@ -12048,8 +12154,11 @@ async fn explicit_native_recovery_accepts_terminal_runtime() {
             .await
             .recorded
     );
+    // The agent exits only now, after its native id was recorded.
+    gate.write_all(b"go\n")
+        .expect("release the agent exit gate");
     let terminal = registry
-        .wait_for_exit(&created.id, Duration::from_secs(2))
+        .wait_for_exit(&created.id, HANG_GUARD)
         .await
         .expect("session exits");
     assert_eq!(terminal.state, SessionState::Done);

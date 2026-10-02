@@ -3998,6 +3998,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use pohunek_test_support::wait::{wait_until, HANG_GUARD};
+
     #[cfg(target_os = "linux")]
     use base64::Engine as _;
     use pohunek_session_worker::{
@@ -4041,6 +4043,15 @@ mod tests {
         DesiredState, NativeIdentityOrdering, ResumeBinding, RuntimeRecord, SessionRecord,
         SessionWriteOutcome, Store, StoredInputRules,
     };
+
+    /// Interactive shell for registries whose sessions run the default shell.
+    ///
+    /// A fixed `/bin/sh` keeps the sessions independent of the host user's
+    /// `$SHELL` and its startup files, whose background helpers can hold the PTY
+    /// open past the stop deadline.
+    fn hermetic_shell() -> crate::session::ShellCommand {
+        crate::session::ShellCommand::new("/bin/sh", std::iter::empty::<String>())
+    }
 
     fn temp_root() -> PathBuf {
         // Short enough for worker sockets named by full session ids on macOS.
@@ -4284,35 +4295,25 @@ while os.getppid() == parent:
         std::fs::write(&staged, &encoded).expect("stage hook request");
         std::fs::rename(&staged, &request_path).expect("publish hook request");
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Ok(answer) = std::fs::read(&response_path) {
-                return serde_json::from_slice::<serde_json::Value>(&answer)
-                    .expect("decode hook response")
-                    .get("ok")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "in-PTY reporter did not answer {}",
-                request_path.display()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let answer = wait_until(
+            &format!("in-PTY reporter answer to {}", request_path.display()),
+            || async { std::fs::read(&response_path).ok() },
+        )
+        .await;
+        serde_json::from_slice::<serde_json::Value>(&answer)
+            .expect("decode hook response")
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     }
 
     /// Waits until the reporter has created its inbox directory.
     async fn wait_for_directory(path: &Path) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !path.is_dir() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "in-PTY reporter never created {}",
-                path.display()
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        wait_until(
+            &format!("in-PTY reporter inbox {}", path.display()),
+            || async { path.is_dir().then_some(()) },
+        )
+        .await;
     }
 
     async fn send_identity_hook(socket: &Path, request: serde_json::Value) -> bool {
@@ -4334,14 +4335,11 @@ while os.getppid() == parent:
     }
 
     async fn wait_for_pid_file(path: &Path) -> u32 {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                return contents.trim().parse().expect("nested pid");
-            }
-            assert!(tokio::time::Instant::now() < deadline, "nested pid timeout");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let contents = wait_until("the nested pid file", || async {
+            std::fs::read_to_string(path).ok()
+        })
+        .await;
+        contents.trim().parse().expect("nested pid")
     }
 
     fn process_start_identity(pid: u32) -> u64 {
@@ -4798,6 +4796,7 @@ while os.getppid() == parent:
             Arc::<RetryInspector>::clone(&inspector);
         let replacement = SessionRegistry::new_with_inspector(
             SessionRegistryConfig {
+                shell_command: hermetic_shell(),
                 store_path: Some(store_path),
                 worker_runtime_root: Some(runtime_root),
                 worker_state_root: Some(root.join("state/workers")),
@@ -4832,7 +4831,7 @@ while os.getppid() == parent:
             .cancel();
 
         inspector.fail_descendants(false);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + HANG_GUARD;
         loop {
             let retried = replacement
                 .inspect(&SessionId(session_id.to_owned()))
@@ -5052,17 +5051,14 @@ while os.getppid() == parent:
             .expect("persist draining logical record");
 
         std::fs::write(&root_release, b"release").expect("release root process");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        while !root_exited.exists() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for identity-safe root exit"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until("identity-safe root exit", || async {
+            root_exited.exists().then_some(())
+        })
+        .await;
         drop(controller);
 
         let replacement = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             worker_runtime_root: Some(runtime_root),
             worker_state_root: Some(root.join("state/workers")),
@@ -5110,9 +5106,8 @@ while os.getppid() == parent:
             "output wait must be registered before descendant release"
         );
         std::fs::write(&descendant_release, b"release").expect("release descendant");
-        let page = tokio::time::timeout(Duration::from_secs(3), &mut output)
+        let page = pohunek_test_support::wait::guard("the late output page", &mut output)
             .await
-            .expect("late output deadline")
             .expect("late output page");
         let decoded = base64::prelude::BASE64_STANDARD
             .decode(page.data_base64())
@@ -5121,22 +5116,15 @@ while os.getppid() == parent:
             .windows(19)
             .any(|window| window == b"late-restart-output"));
 
-        let terminal_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
+        wait_until("terminal worker state after PTY EOF", || async {
             let state = replacement
                 .inspect(&SessionId(session_id.to_owned()))
                 .await
                 .expect("inspect completed draining runtime")
                 .state;
-            if state != SessionState::Running {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < terminal_deadline,
-                "worker did not publish terminal state after PTY EOF"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            (state != SessionState::Running).then_some(())
+        })
+        .await;
 
         server_task.abort();
     }
@@ -5394,6 +5382,7 @@ while os.getppid() == parent:
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let replacement = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             worker_runtime_root: Some(runtime_root),
             worker_state_root: Some(root.join("state/workers")),
@@ -5662,6 +5651,7 @@ while os.getppid() == parent:
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let replacement = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             worker_runtime_root: Some(runtime_root),
             worker_state_root: Some(root.join("state/workers")),
@@ -5720,6 +5710,7 @@ while os.getppid() == parent:
             .expect("persist previous daemon session");
 
         let replacement = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             ..SessionRegistryConfig::default()
         });
@@ -5785,6 +5776,7 @@ while os.getppid() == parent:
             .record_session(&record)
             .expect("persist preparing record");
         let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path.clone()),
             worker_runtime_root: Some(root.join("runtime/workers")),
             worker_state_root: Some(root.join("state/workers")),
@@ -5835,6 +5827,7 @@ while os.getppid() == parent:
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o600))
             .expect("set private journal mode");
         let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             worker_runtime_root: Some(root.join("runtime/workers")),
             worker_state_root: Some(state_root),
@@ -5931,6 +5924,7 @@ while os.getppid() == parent:
             .write(&journal)
             .expect("persist terminal journal");
         let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             worker_runtime_root: Some(root.join("runtime/workers")),
             worker_state_root: Some(state_root),
@@ -6260,6 +6254,10 @@ while os.getppid() == parent:
         worker_connect_deadline: Duration,
     ) -> SessionRegistry {
         SessionRegistry::new(SessionRegistryConfig {
+            // A fixed shell keeps the sessions independent of the host user's
+            // `$SHELL` and its startup files, whose background helpers can
+            // hold the PTY open past the stop deadline.
+            shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
             store_path: Some(root.join("data/metadata.jsonl")),
             worker_runtime_root: Some(runtime_root.to_path_buf()),
             worker_state_root: Some(root.join("state/workers")),
@@ -6835,6 +6833,7 @@ while os.getppid() == parent:
             .expect("persist deleted-profile session");
 
         let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             worker_runtime_root: Some(root.join("runtime")),
             ..SessionRegistryConfig::default()
@@ -6898,6 +6897,7 @@ while os.getppid() == parent:
         std::fs::write(&store_path, legacy).expect("write legacy record");
 
         let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
             store_path: Some(store_path),
             worker_runtime_root: Some(root.join("runtime")),
             ..SessionRegistryConfig::default()
@@ -7616,8 +7616,8 @@ while os.getppid() == parent:
 
         /// Sweep grace of the fixtures; short so a `SIGKILL` fallback stays fast.
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
-        /// Bound on observing an asynchronous effect (process exit, retry).
-        const EFFECT_DEADLINE: Duration = Duration::from_secs(10);
+        use super::hermetic_shell;
+        use pohunek_test_support::wait::HANG_GUARD;
 
         struct Fixture {
             root: PathBuf,
@@ -7665,6 +7665,7 @@ while os.getppid() == parent:
             let supervisor = Arc::new(supervisor);
             let registry = SessionRegistry::new_with_launcher_and_inspector(
                 SessionRegistryConfig {
+                    shell_command: hermetic_shell(),
                     store_path: Some(root.join("data/metadata.jsonl")),
                     worker_runtime_root: Some(runtime_root),
                     worker_state_root: Some(state_root),
@@ -7869,7 +7870,7 @@ while os.getppid() == parent:
             }
 
             async fn wait_gone(&self) {
-                let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+                let deadline = tokio::time::Instant::now() + HANG_GUARD;
                 while self.alive() {
                     assert!(
                         tokio::time::Instant::now() < deadline,
@@ -8234,7 +8235,7 @@ while os.getppid() == parent:
             fixture
                 .supervisor
                 .script_job(id.clone(), present(ServiceState::Failed, None));
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             loop {
                 let runtime = runtime_of(&fixture.registry, "s-309").await;
                 if runtime.state == RuntimeState::Lost {
@@ -8339,7 +8340,7 @@ while os.getppid() == parent:
             assert_eq!(retire_count(&fixture.supervisor, &id), 1);
             assert!(discovered(&fixture.supervisor, &id).await);
 
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while discovered(&fixture.supervisor, &id).await {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -8476,7 +8477,7 @@ while os.getppid() == parent:
             fixture
                 .supervisor
                 .script_job(id.clone(), present(ServiceState::Failed, None));
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while fixture
                 .registry
                 .inspect(&SessionId("s-316".to_owned()))
@@ -8526,7 +8527,7 @@ while os.getppid() == parent:
         /// the last ownership record it removes, so an unlisted session is
         /// not yet a finished removal.
         async fn wait_removed(fixture: &Fixture, session_id: &str) {
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while fixture
                 .registry
                 .inspect(&SessionId(session_id.to_owned()))
@@ -8544,7 +8545,7 @@ while os.getppid() == parent:
 
         /// Waits until procwatch has recorded `session_id`'s observed cwd.
         async fn wait_procwatch_cwd(registry: &SessionRegistry, session_id: &str) {
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             loop {
                 let info = registry
                     .inspect(&SessionId(session_id.to_owned()))
@@ -8567,7 +8568,7 @@ while os.getppid() == parent:
             session_id: &str,
             state: RuntimeState,
         ) -> protocol::SessionRuntime {
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             loop {
                 let runtime = runtime_of(registry, session_id).await;
                 if runtime.state == state {
@@ -9051,7 +9052,7 @@ while os.getppid() == parent:
                 .iter()
                 .all(tokio_util::sync::CancellationToken::is_cancelled));
             let removed = loop {
-                let event = tokio::time::timeout(EFFECT_DEADLINE, events.recv())
+                let event = tokio::time::timeout(HANG_GUARD, events.recv())
                     .await
                     .expect("removal event")
                     .expect("event stream");
@@ -9519,7 +9520,10 @@ while os.getppid() == parent:
             assert!(!recorded(&fixture.root, "s-352"));
         }
 
-        #[tokio::test]
+        /// The background supervision retry sleeps before it re-attempts the
+        /// removal, so the clock is paused: the retried removal below is issued
+        /// before that delay can elapse, however slow the fsyncs are.
+        #[tokio::test(start_paused = true)]
         async fn removal_whose_record_cannot_be_deleted_stays_listed_for_a_retry() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             persist_record(&fixture.root, "s-376", Some("runtime-s-376"));
@@ -9941,7 +9945,7 @@ while os.getppid() == parent:
             id: &ServiceId,
             seen: usize,
         ) {
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while inspections(supervisor, id) <= seen {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10220,7 +10224,10 @@ while os.getppid() == parent:
             assert_eq!(fixture.supervisor.retired(), vec![crashed]);
         }
 
-        #[tokio::test]
+        /// The initialization deadline is the behavior under test, so the clock
+        /// is paused: only `advance` moves it, however slow the fsyncs of
+        /// reconciliation are.
+        #[tokio::test(start_paused = true)]
         async fn stale_job_without_a_process_is_retired_by_its_journal_or_its_deadline() {
             const CURRENT_GENERATION: &str = "zzzz3333";
             const INITIALIZE: Duration = Duration::from_millis(500);
@@ -10268,6 +10275,10 @@ while os.getppid() == parent:
             let retired = fixture.supervisor.retired();
             assert!(retired.contains(&proven), "{retired:?}");
             assert!(
+                started.elapsed() < INITIALIZE,
+                "the initialization deadline has not passed on the paused clock"
+            );
+            assert!(
                 !retired.contains(&unjournaled),
                 "an unjournaled stale job is kept until its initialization deadline"
             );
@@ -10275,7 +10286,8 @@ while os.getppid() == parent:
             assert!(orphaned(&inventory, &unjournaled), "{inventory:?}");
             assert!(orphaned(&inventory, &running), "{inventory:?}");
 
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            tokio::time::advance(INITIALIZE).await;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while !fixture.supervisor.retired().contains(&unjournaled) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10300,7 +10312,10 @@ while os.getppid() == parent:
             );
         }
 
-        #[tokio::test]
+        /// Each re-check fires one initialization deadline after the previous
+        /// one, so the clock is paused: the orphan observed between two
+        /// re-checks cannot be settled by a slow host.
+        #[tokio::test(start_paused = true)]
         async fn failed_stale_job_retirement_keeps_the_orphan_and_retries() {
             const CURRENT_GENERATION: &str = "zzzz4444";
             const INITIALIZE: Duration = Duration::from_millis(500);
@@ -10366,7 +10381,7 @@ while os.getppid() == parent:
             );
 
             // The ended job's re-check retires it and drops its orphan.
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while orphaned(&fixture.registry.runtime_inventory().await, &ended) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10378,7 +10393,7 @@ while os.getppid() == parent:
 
             // The unproven job's first re-check also fails to retire: its
             // orphan entry must stay, and a further re-check must follow.
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while retire_count(&fixture, &unproven) < 1 {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10391,7 +10406,7 @@ while os.getppid() == parent:
                 orphaned(&inventory, &unproven),
                 "a failed retirement keeps the orphan: {inventory:?}"
             );
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while orphaned(&fixture.registry.runtime_inventory().await, &unproven) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10531,7 +10546,7 @@ while os.getppid() == parent:
             );
             assert!(fixture.supervisor.retired().is_empty());
 
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while !fixture.supervisor.retired().contains(&stale) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10545,7 +10560,7 @@ while os.getppid() == parent:
                 "retired only once an inspection proved it ended"
             );
             assert_eq!(fixture.supervisor.retired(), vec![stale.clone()]);
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while orphaned(&fixture.registry.runtime_inventory().await) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10585,13 +10600,10 @@ while os.getppid() == parent:
                 .script_job(id.clone(), present(ServiceState::Running, None));
             let silent = spawn_silent_worker(&runtime_root, "s-361");
 
-            tokio::time::timeout(
-                EFFECT_DEADLINE,
-                Box::pin(fixture.registry.reconcile_workers()),
-            )
-            .await
-            .expect("startup reconciliation is bounded by the connect deadline")
-            .expect("reconcile");
+            tokio::time::timeout(HANG_GUARD, Box::pin(fixture.registry.reconcile_workers()))
+                .await
+                .expect("startup reconciliation is bounded by the connect deadline")
+                .expect("reconcile");
             let runtime = runtime_of(&fixture.registry, "s-361").await;
             assert_eq!(runtime.state, RuntimeState::Conflict);
             assert_eq!(runtime.loss_reason.as_deref(), Some(SUPERVISION_AMBIGUOUS));
@@ -10600,14 +10612,14 @@ while os.getppid() == parent:
             let session = SessionId("s-361".to_owned());
             let guard = fixture.registry.lock_lifecycle(&session).await;
             let pending = tokio::time::timeout(
-                EFFECT_DEADLINE,
+                HANG_GUARD,
                 fixture.registry.reconcile_single_session(record.clone()),
             )
             .await
             .expect("a retry pass is bounded by the connect deadline");
             assert!(pending, "unknown socket evidence keeps the session pending");
             let settled = tokio::time::timeout(
-                EFFECT_DEADLINE,
+                HANG_GUARD,
                 fixture.registry.retry_terminal_retirement(&record),
             )
             .await
@@ -10687,8 +10699,7 @@ while os.getppid() == parent:
         const SHORT_CONNECT: Duration = Duration::from_millis(300);
         /// Sweep grace; short so the `SIGKILL` fallback stays fast.
         const SWEEP_GRACE: Duration = Duration::from_millis(300);
-        /// Bound on observing an asynchronous classification or exit.
-        const EFFECT_DEADLINE: Duration = Duration::from_secs(20);
+        use pohunek_test_support::wait::HANG_GUARD;
         struct Fixture {
             root: PathBuf,
             registry: SessionRegistry,
@@ -10767,7 +10778,7 @@ while os.getppid() == parent:
                     .find(|record| record.session_id == created.id.0)
                     .and_then(|record| record.runtime.service_id)
                     .expect("the record names its job");
-                let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+                let deadline = tokio::time::Instant::now() + HANG_GUARD;
                 let descendant = loop {
                     if let Some(pid) = std::fs::read_to_string(&self.marker_pid_file)
                         .ok()
@@ -10805,7 +10816,7 @@ while os.getppid() == parent:
                 id: &SessionId,
                 state: RuntimeState,
             ) -> protocol::SessionRuntime {
-                let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+                let deadline = tokio::time::Instant::now() + HANG_GUARD;
                 loop {
                     let runtime = self
                         .registry
@@ -10833,7 +10844,7 @@ while os.getppid() == parent:
         }
 
         async fn wait_gone(pid: u32) {
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             while alive(pid) {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -10881,7 +10892,7 @@ while os.getppid() == parent:
             let runtime = fixture
                 .wait_for(&created.id, RuntimeState::Reconnecting)
                 .await;
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             let mut runtime = runtime;
             while runtime.loss_reason.as_deref() != Some(SUPERVISION_UNAVAILABLE) {
                 assert!(
@@ -10920,7 +10931,7 @@ while os.getppid() == parent:
             fixture.supervisor.script_retire_unavailable(job.clone());
 
             fixture.crash(&created.id).await;
-            let deadline = tokio::time::Instant::now() + EFFECT_DEADLINE;
+            let deadline = tokio::time::Instant::now() + HANG_GUARD;
             loop {
                 let runtime = fixture
                     .registry
