@@ -144,11 +144,20 @@ impl ProcessInspector for OwnProcesses {
     }
 }
 
+/// Program standing in for `systemd-analyze` in transactions that are not
+/// about unit verification: it accepts any units, so the verdict never
+/// depends on the host's user systemd.
+#[cfg(target_os = "linux")]
+const ACCEPTING_VERIFIER: &str = "/bin/true";
+
 /// An engine over `context` and `backend` that observes only this test's
-/// own processes.
+/// own processes and, on Linux, verifies units with [`ACCEPTING_VERIFIER`].
 fn engine_over<'a>(context: &'a Context, backend: &'a Backend) -> Engine<'a> {
     let mut engine = Engine::new(context, backend);
     engine.inspector = Box::new(OwnProcesses::default());
+    #[cfg(target_os = "linux")]
+    let engine =
+        engine.with_unit_verifier(UnitVerifier::default().with_program(ACCEPTING_VERIFIER));
     engine
 }
 
@@ -1611,6 +1620,34 @@ fn assert_incomplete(harness: &Harness, error: &Error, step: Step) {
             .active_version(),
         V1
     );
+}
+
+/// The install fails closed when the unit verifier is absent or rejects the
+/// units: nothing is registered and no installation is left behind.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_install_fails_closed_when_the_unit_verifier_is_missing_or_rejects() {
+    let harness = Harness::new();
+    let missing = harness.root.join("no-such-verifier");
+    let error = harness
+        .engine()
+        .with_unit_verifier(UnitVerifier::default().with_program(missing))
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("a missing verifier refuses the install");
+    assert!(matches!(error, Error::VerifierMissing), "{error:?}");
+    assert!(harness.fake.world().registered.is_none());
+    harness.assert_clean();
+
+    let error = harness
+        .engine()
+        .with_unit_verifier(UnitVerifier::default().with_program("/bin/false"))
+        .install(&harness.staged(V1), &harness.prefix(), V1)
+        .await
+        .expect_err("a rejecting verifier refuses the install");
+    assert!(matches!(error, Error::UnitVerification { .. }), "{error:?}");
+    assert!(harness.fake.world().registered.is_none());
+    harness.assert_clean();
 }
 
 #[tokio::test]
