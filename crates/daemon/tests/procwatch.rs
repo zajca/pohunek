@@ -19,6 +19,7 @@ use pohunek_daemon::runtime::{
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{
@@ -48,9 +49,6 @@ const CWD_PROCWATCH_POLL: Duration = Duration::from_millis(150);
 /// reason as [`TEST_PROCWATCH_POLL`].
 const EXTERNAL_PROCWATCH_POLL: Duration = Duration::from_millis(100);
 
-static EXTERNAL_ENV_LOCK: Mutex<()> = Mutex::new(());
-static POHUNEK_ENV_LOCK: Mutex<()> = Mutex::new(());
-
 /// Clears `POHUNEK_DAEMON_ID`/`POHUNEK_SESSION_ID` for the scope of spawning a
 /// worker-backed test session.
 ///
@@ -60,39 +58,17 @@ static POHUNEK_ENV_LOCK: Mutex<()> = Mutex::new(());
 /// (`crates/daemon/src/runtime/launcher.rs`) spawns the worker subprocess
 /// without scrubbing the ambient environment, so those stale markers would
 /// otherwise leak all the way down into the freshly spawned worker and the
-/// PTY child it forks — stamping the test's own fake agent with a foreign
+/// PTY child it forks, stamping the test's own fake agent with a foreign
 /// daemon id that `is_foreign_owned_agent`
 /// (`crates/daemon/src/session/procwatch.rs`) then correctly refuses to
 /// adopt, so it never surfaces as this test's observed agent. Clearing both
-/// vars before `registry.create` breaks the leak at its source; mirrors this
-/// file's existing `ExternalEnvGuard` pattern for `CLAUDE_CONFIG_DIR`/
-/// `CODEX_HOME`.
-struct PohunekEnvGuard {
-    _lock: MutexGuard<'static, ()>,
-    daemon_id: Option<std::ffi::OsString>,
-    session_id: Option<std::ffi::OsString>,
-}
-
-impl PohunekEnvGuard {
-    fn clear() -> Self {
-        let lock = POHUNEK_ENV_LOCK.lock().expect("pohunek env lock");
-        let daemon_id = std::env::var_os(ENV_DAEMON_ID);
-        let session_id = std::env::var_os(ENV_SESSION_ID);
-        std::env::remove_var(ENV_DAEMON_ID);
-        std::env::remove_var(ENV_SESSION_ID);
-        Self {
-            _lock: lock,
-            daemon_id,
-            session_id,
-        }
-    }
-}
-
-impl Drop for PohunekEnvGuard {
-    fn drop(&mut self) {
-        restore_env(ENV_DAEMON_ID, self.daemon_id.clone());
-        restore_env(ENV_SESSION_ID, self.session_id.clone());
-    }
+/// vars before `registry.create` breaks the leak at its source. The returned
+/// value holds the binary-wide environment lock and restores both variables
+/// when dropped.
+fn without_pohunek_markers() -> ProcessEnv {
+    let mut process_env = ProcessEnv::lock();
+    process_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
+    process_env
 }
 
 /// What the poll path keeps reading about a process after it died.
@@ -347,7 +323,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
         Arc::clone(&poll_blind) as Arc<dyn ProcessInspector>,
     );
     let created = {
-        let _env = PohunekEnvGuard::clear();
+        let _process_env = without_pohunek_markers();
         registry
             .create(SessionNewParams {
                 name: Some("procwatch-real-child".to_owned()),
@@ -460,7 +436,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
         return;
     }
 
-    let _env = ExternalEnvGuard::set();
+    let mut process_env = ProcessEnv::lock();
     let env = TestEnv::new().expect("create the test environment");
     let claude_config = env.config_home().join("claude");
     let codex_home = env.config_home().join("codex");
@@ -468,8 +444,9 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     let codex_sessions = codex_home.join("sessions");
     fs::create_dir_all(&claude_projects).expect("create claude projects");
     fs::create_dir_all(&codex_sessions).expect("create codex sessions");
-    std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config);
-    std::env::set_var("CODEX_HOME", &codex_home);
+    process_env
+        .set("CLAUDE_CONFIG_DIR", &claude_config)
+        .set("CODEX_HOME", &codex_home);
 
     let work_dir = env.cwd().to_path_buf();
     let bin_dir = env.data_home().join("bin");
@@ -766,38 +743,4 @@ fn kill9(pid: u32) {
         .status()
         .expect("run kill");
     assert!(status.success(), "kill -9 {pid} failed");
-}
-
-struct ExternalEnvGuard {
-    _lock: MutexGuard<'static, ()>,
-    claude_config_dir: Option<std::ffi::OsString>,
-    codex_home: Option<std::ffi::OsString>,
-}
-
-impl ExternalEnvGuard {
-    fn set() -> Self {
-        let lock = EXTERNAL_ENV_LOCK.lock().expect("external env lock");
-        let claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-        let codex_home = std::env::var_os("CODEX_HOME");
-        Self {
-            _lock: lock,
-            claude_config_dir,
-            codex_home,
-        }
-    }
-}
-
-impl Drop for ExternalEnvGuard {
-    fn drop(&mut self) {
-        restore_env("CLAUDE_CONFIG_DIR", self.claude_config_dir.clone());
-        restore_env("CODEX_HOME", self.codex_home.clone());
-    }
-}
-
-fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
-    if let Some(value) = value {
-        std::env::set_var(key, value);
-    } else {
-        std::env::remove_var(key);
-    }
 }
