@@ -995,7 +995,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::sync::CancellationToken;
 
-    use pohunek_daemon::api::{DaemonState, HealthInfo};
+    use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
     use pohunek_daemon::governance::HostGovernanceService;
     use pohunek_daemon::session::SessionRegistry;
     use pohunek_daemon::DaemonError;
@@ -1181,6 +1181,14 @@ mod tests {
         }
     }
 
+    /// A loopback address distinct from `127.0.0.1`. Linux routes all of
+    /// `127.0.0.0/8` to `lo`; Darwin configures only `127.0.0.1` on `lo0`,
+    /// so the IPv6 loopback is its second local address.
+    #[cfg(not(target_os = "macos"))]
+    const SECOND_LOOPBACK: &str = "127.0.0.2";
+    #[cfg(target_os = "macos")]
+    const SECOND_LOOPBACK: &str = "::1";
+
     /// Bind attempts made to find one port that is free on both loopback addresses.
     ///
     /// A port taken on the second address by an unrelated socket is the only
@@ -1212,16 +1220,60 @@ mod tests {
         panic!("no port free on both loopback addresses after {RESERVE_ATTEMPTS} attempts");
     }
 
+    /// Run `bind_with` for `first_ip:port` with an opener that returns `listener`.
+    async fn bind_with_returned_listener(
+        listener: TcpListener,
+        requested: std::net::SocketAddr,
+    ) -> Result<RemoteServer, DaemonError> {
+        let (_state_root, governance) = governance_service().await;
+        let transport = MutableListenerTransport {
+            id: OverlayId::new("mutable").expect("overlay id"),
+            address: Arc::new(RwLock::new(requested.ip())),
+        };
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            SessionRegistry::default(),
+            governance,
+            netbird::configured_registry().expect("configured registry"),
+        );
+        RemoteServer::bind_with(requested, state, &transport, |_| async { Ok(listener) }).await
+    }
+
+    #[tokio::test]
+    async fn bind_with_rejects_listener_on_a_different_ip() {
+        let first_ip = "127.0.0.1".parse().expect("first IP");
+        let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
+        let (port, mut reserved) = reserve_port_on_both(first_ip, second_ip).await;
+        let wrong = reserved.remove(&second_ip).expect("second listener");
+        let result = bind_with_returned_listener(wrong, (first_ip, port).into()).await;
+        match result {
+            Err(DaemonError::OverlayBind { addr, .. }) => assert_eq!(addr, second_ip),
+            Err(other) => panic!("expected OverlayBind, got: {other}"),
+            Ok(_) => panic!("a listener on another IP must be rejected"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_with_rejects_listener_on_a_different_port() {
+        let ip: std::net::IpAddr = "127.0.0.1".parse().expect("loopback IP");
+        let wrong = TcpListener::bind((ip, 0))
+            .await
+            .expect("ephemeral listener");
+        let wrong_port = wrong.local_addr().expect("listener address").port();
+        let requested_port = wrong_port.checked_add(1).unwrap_or(wrong_port - 1);
+        let result = bind_with_returned_listener(wrong, (ip, requested_port).into()).await;
+        match result {
+            Err(DaemonError::OverlayBind { addr, reason }) => {
+                assert_eq!(addr, ip);
+                assert!(reason.contains(&wrong_port.to_string()), "reason: {reason}");
+            }
+            Err(other) => panic!("expected OverlayBind, got: {other}"),
+            Ok(_) => panic!("a listener on another port must be rejected"),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn remote_supervisor_rebinds_when_listener_address_changes() {
-        /// A loopback address distinct from `127.0.0.1`. Linux routes all of
-        /// `127.0.0.0/8` to `lo`; Darwin configures only `127.0.0.1` on `lo0`,
-        /// so the IPv6 loopback is its second local address.
-        #[cfg(not(target_os = "macos"))]
-        const SECOND_LOOPBACK: &str = "127.0.0.2";
-        #[cfg(target_os = "macos")]
-        const SECOND_LOOPBACK: &str = "::1";
-
         let (_state_root, governance) = governance_service().await;
         let first_ip = "127.0.0.1".parse().expect("first IP");
         let second_ip = SECOND_LOOPBACK.parse().expect("second IP");

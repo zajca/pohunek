@@ -325,12 +325,15 @@ impl RemoteServer {
     /// before `open` is called, so the opener only ever sees validated
     /// addresses. `open` supplies the listening socket for that address, which
     /// lets a caller that already holds a bound socket hand it over instead of
-    /// releasing and re-binding the port.
+    /// releasing and re-binding the port. The returned listener must be bound
+    /// to exactly `addr` (IP and port); any other socket is dropped unserved so
+    /// the control port cannot leave the validated overlay address.
     ///
     /// # Errors
     ///
     /// Returns [`DaemonError::OverlayBind`] when the address is not a valid
-    /// member of the overlay's range, or [`DaemonError::Socket`] when `open`
+    /// member of the overlay's range or when `open` returns a listener bound
+    /// to a different address or port, or [`DaemonError::Socket`] when `open`
     /// fails or the listener's local address cannot be read.
     pub async fn bind_with<F, Fut>(
         addr: SocketAddr,
@@ -359,6 +362,15 @@ impl RemoteServer {
                 path: PathBuf::from(addr.to_string()),
                 source,
             })?;
+
+        if local_addr != addr {
+            return Err(DaemonError::OverlayBind {
+                addr: local_addr.ip(),
+                reason: format!(
+                    "opener returned a listener bound to {local_addr} instead of the validated {addr}"
+                ),
+            });
+        }
 
         info!(addr = %local_addr, "remote control listener bound");
         Ok(Self {
