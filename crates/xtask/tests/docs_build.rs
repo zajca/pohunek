@@ -14,8 +14,8 @@ fn validate_docs_reports_committed_bundle() {
 #[test]
 fn build_docs_copies_files_and_writes_deterministic_manifest() {
     let temp = temp_dir("build-docs");
-    let source = temp.join("source");
-    let target = temp.join("target");
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
     write_source_bundle(&source);
 
     let first = build_docs(BuildOptions {
@@ -67,8 +67,8 @@ fn build_docs_copies_files_and_writes_deterministic_manifest() {
 #[test]
 fn build_site_writes_matching_site_and_offline_outputs_with_relative_nav() {
     let temp = temp_dir("build-site");
-    let source = temp.join("source");
-    let target = temp.join("target");
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
     write_source_bundle(&source);
 
     let docs = build_docs(BuildOptions {
@@ -134,17 +134,9 @@ fn repo_root() -> PathBuf {
     pohunek_test_support::workspace_root()
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-xtask-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after unix epoch")
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+/// A private fixture directory that is removed when the guard drops.
+fn temp_dir(name: &str) -> tempfile::TempDir {
+    pohunek_test_support::tempdir_with_prefix(&format!("pxd-{name}-")).expect("private fixture dir")
 }
 
 fn write_source_bundle(root: &Path) {

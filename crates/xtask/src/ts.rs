@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -96,14 +97,12 @@ pub(crate) fn generate(root: &Path) -> Result<TsSummary, XtaskError> {
 }
 
 pub(crate) fn check(root: &Path) -> Result<(), XtaskError> {
-    let temp_root = temp_check_root();
-    let paths = TsPaths {
-        generated: temp_root.join("generated"),
-        relay: temp_root.join("relay-generated"),
-        fixtures: temp_root.join("fixtures"),
-    };
-
-    let result = (|| {
+    with_check_root(|temp_root| {
+        let paths = TsPaths {
+            generated: temp_root.join("generated"),
+            relay: temp_root.join("relay-generated"),
+            fixtures: temp_root.join("fixtures"),
+        };
         regenerate(root, &paths)?;
         compare_output_dirs(&root.join(GENERATED_DIR), &paths.generated, GENERATED_DIR)?;
         compare_output_dirs(
@@ -113,13 +112,7 @@ pub(crate) fn check(root: &Path) -> Result<(), XtaskError> {
         )?;
         compare_output_dirs(&root.join(FIXTURE_DIR), &paths.fixtures, FIXTURE_DIR)?;
         Ok(())
-    })();
-
-    if temp_root.exists() {
-        let _ = fs::remove_dir_all(&temp_root);
-    }
-
-    result
+    })
 }
 
 fn regenerate(root: &Path, paths: &TsPaths) -> Result<TsSummary, XtaskError> {
@@ -1039,13 +1032,87 @@ fn absolute_path(path: &Path) -> Result<PathBuf, XtaskError> {
     })
 }
 
-fn temp_check_root() -> PathBuf {
-    std::env::temp_dir().join(format!("pohunek-ts-check-{}", std::process::id()))
+/// Prefix of the scratch directory a check run generates into.
+const CHECK_ROOT_PREFIX: &str = "pohunek-ts-check-";
+
+/// Mode of the scratch directory: owner only, whatever the process umask.
+const CHECK_ROOT_MODE: u32 = 0o700;
+
+/// Runs `body` with a scratch directory that exists only for that call.
+///
+/// The directory is created fresh with a random name and owner-only
+/// permissions (`tempfile` itself creates directories with the default mode,
+/// so the mode is requested at creation and set again explicitly), so another user of the shared temporary directory can neither
+/// predict nor pre-create it, and it is removed when `body` returns, whether it
+/// succeeded or failed.
+fn with_check_root<T>(body: impl FnOnce(&Path) -> Result<T, XtaskError>) -> Result<T, XtaskError> {
+    let private = |scratch: &tempfile::TempDir| {
+        fs::set_permissions(scratch.path(), fs::Permissions::from_mode(CHECK_ROOT_MODE))
+    };
+    let scratch = tempfile::Builder::new()
+        .prefix(CHECK_ROOT_PREFIX)
+        .permissions(fs::Permissions::from_mode(CHECK_ROOT_MODE))
+        .tempdir()
+        .map_err(|source| XtaskError::Io {
+            path: std::env::temp_dir(),
+            source,
+        })?;
+    private(&scratch).map_err(|source| XtaskError::Io {
+        path: scratch.path().to_path_buf(),
+        source,
+    })?;
+    body(scratch.path())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_root_is_fresh_private_and_removed_after_success() {
+        let mut seen = None;
+        let value = with_check_root(|root| {
+            assert!(root.is_dir());
+            assert!(fs::read_dir(root).expect("read root").next().is_none());
+            let mode = fs::metadata(root).expect("stat root").permissions().mode();
+            assert_eq!(mode & 0o777, CHECK_ROOT_MODE);
+            let name = root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("name");
+            assert!(name.starts_with(CHECK_ROOT_PREFIX), "{name}");
+            assert_ne!(name, format!("{CHECK_ROOT_PREFIX}{}", std::process::id()));
+            seen = Some(root.to_path_buf());
+            Ok(7)
+        })
+        .expect("body succeeds");
+        assert_eq!(value, 7);
+        assert!(!seen.expect("root seen").exists());
+    }
+
+    #[test]
+    fn check_root_is_removed_after_a_failing_body() {
+        let mut seen = None;
+        let error = with_check_root::<()>(|root| {
+            fs::write(root.join("partial"), b"x").expect("write partial output");
+            seen = Some(root.to_path_buf());
+            Err(XtaskError::Usage("body failed".to_owned()))
+        })
+        .expect_err("the body's error is returned");
+        assert!(matches!(error, XtaskError::Usage(_)), "{error:?}");
+        assert!(!seen.expect("root seen").exists());
+    }
+
+    #[test]
+    fn nested_check_roots_are_distinct() {
+        with_check_root(|first| {
+            with_check_root(|second| {
+                assert_ne!(first, second);
+                Ok(())
+            })
+        })
+        .expect("nested roots");
+    }
 
     #[test]
     fn method_imports_ignore_null_and_flatten_arrays() {
