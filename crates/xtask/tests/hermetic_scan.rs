@@ -15,26 +15,35 @@
 //!   `/var/tmp` or `/private/tmp` as a path of its own (start of the literal,
 //!   or after whitespace, a quote or one of `= : ; , ( [ < > | &`; a
 //!   component such as `/x/tmp` or `{}/tmp` is not host `/tmp`), followed by
-//!   the end of the literal, `/`, or any character that cannot extend a file
-//!   name. The scan cannot tell a path that is used from a fake path that only
+//!   the end of the literal, `/`, or a syntactic delimiter (a quote, whitespace,
+//!   or one of ``: ; , ) & | ` \``); a character such as `+` or `@` extends the
+//!   file name, so `/tmp+x` is another path. The scan cannot tell a path that is used from a fake path that only
 //!   feeds a validator, and a shell script that mentions `/tmp` writes there
 //!   for real, so every such literal needs a rewrite (the migrations use
 //!   `/work`) or a marker;
 //! - `tempfile::tempdir()`, `tempdir_in(..)`, `tempfile()`, `TempDir::new()`,
 //!   `TempDir::with_prefix(..)`, `NamedTempFile::new()` (and `with_prefix`,
-//!   `with_suffix`), and a `tempfile::Builder` chain ending in `.tempdir(..)`,
-//!   `.tempdir_in(..)` or `.tempfile(..)`. `NamedTempFile::new_in(dir)` and
-//!   `.tempfile_in(dir)` name their directory and are allowed, and so is the
-//!   type name `tempfile::TempDir`;
+//!   `with_suffix`), and every `tempfile::Builder::new()` construction, whatever
+//!   the builder is used for afterwards (a builder kept in a variable and
+//!   finished later is still a host-temp-capable fixture). A chain that
+//!   only ends in `.tempfile_in(dir)` names its directory and is allowed, and so
+//!   are `NamedTempFile::new_in(dir)` and the type name `tempfile::TempDir`;
 //! - a `TcpListener::bind(..)` of port 0 whose listener is not kept. Port 0
 //!   in the bind argument is recognised as a string literal ending in `:0` or
-//!   a trailing `, 0` operand (`("127.0.0.1", 0)`, `SocketAddr::new(ip, 0)`).
+//!   a trailing decimal zero operand, with `_` separators and an optional
+//!   integer suffix (`("127.0.0.1", 0)`, `SocketAddr::new(ip, 0_u16)`). The
+//!   qualifier is `TcpListener` or any alias of it (`use .. TcpListener as L`,
+//!   `type L = ..TcpListener;`).
 //!   Whether the listener is dropped cannot be decided from tokens alone, so
 //!   the rule is conservative: the bind is accepted only when it initializes a
 //!   named struct field, or when it is the whole initializer of a
 //!   `let [mut] name = ..` (suffixes `?`, `.await`, `.unwrap()`, `.expect(..)`,
-//!   `.map_err(..)` only; a name that is `_` or never `drop(name)`d in the
-//!   enclosing block). Anything else, such as
+//!   `.map_err(..)` only). A field initializer keeps the listener only when
+//!   the rest of the field expression also only unwraps. A `let` name is kept
+//!   when it is never `drop(name)`d and the rest of its block uses it for
+//!   something other than `name.local_addr()` (passed on, returned, moved into
+//!   a value, `.accept()`, ..); a name that starts with `_` and is never used
+//!   again is a scope guard and is kept. Anything else, such as
 //!   `bind(..).unwrap().local_addr().unwrap().port()`, consumes or reduces the
 //!   listener and is reported; hand the bound listener to the code under test
 //!   (`from_std`, a socket path from `TestEnv::socket_path`) instead.
@@ -72,8 +81,16 @@ const HOST_TEMP_PATHS: [&str; 3] = ["/tmp", "/var/tmp", "/private/tmp"];
 /// Characters that may precede a host temp path inside a literal.
 const PATH_START_DELIMITERS: &str = "\"'= :;,([<>|&\t\n\r";
 
-/// Characters that extend a file name, so `/tmp` followed by one is another path.
-const NAME_CHARS: &str = "_.-";
+/// Characters that end a host temp path inside a literal: quotes, whitespace,
+/// shell separators and list or escape delimiters. Any other character (letters,
+/// digits, `_ . - + @ ..`) extends the file name, so `/tmp` followed by it
+/// is another path.
+const PATH_END_DELIMITERS: &str = "\"' \t\n\r:;,)&|`\\";
+
+/// Integer type suffixes a port literal may carry (`0_u16`).
+const INTEGER_SUFFIXES: [&str; 12] = [
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+];
 
 /// Methods that may follow a bind and still leave the listener as the value.
 const LISTENER_SUFFIXES: [&str; 4] = ["unwrap", "expect", "map_err", "await"];
@@ -292,7 +309,7 @@ fn is_host_temp_path(text: &str, at: usize, needle: &str) -> bool {
     let before = text[..at].chars().next_back();
     let after = text[at + needle.len()..].chars().next();
     before.is_none_or(|c| PATH_START_DELIMITERS.contains(c))
-        && after.is_none_or(|c| !(c.is_ascii_alphanumeric() || NAME_CHARS.contains(c)))
+        && after.is_none_or(|c| c == '/' || PATH_END_DELIMITERS.contains(c))
 }
 
 /// Offsets of host temp paths inside string literals.
@@ -343,6 +360,16 @@ fn end_of_statement(bytes: &[u8], from: usize) -> usize {
         }
     }
     bytes.len()
+}
+
+/// Whether `statement` calls the builder method spelled `method` (leading dot).
+fn builder_calls(statement: &str, method: &str) -> bool {
+    let bytes = statement.as_bytes();
+    statement.match_indices(method).any(|(at, _)| {
+        let end = at + method.len();
+        !bytes.get(end).copied().is_some_and(is_ident)
+            && bytes.get(skip_whitespace(bytes, end)) == Some(&b'(')
+    })
 }
 
 /// `tempfile` crate fixtures that create entries in the host temp directory
@@ -402,18 +429,21 @@ fn tempfile_candidates(skeleton: &str) -> Vec<usize> {
             Qualifier::Bare => imported.contains(&"Builder"),
             Qualifier::Path(_) | Qualifier::Method => false,
         };
-        if !is_tempfile {
+        let constructed = expect_token(bytes, offset + "Builder".len(), "::").is_some_and(|at| {
+            let at = skip_whitespace(bytes, at);
+            let end = end_of_ident(bytes, at);
+            end > at && bytes.get(skip_whitespace(bytes, end)) == Some(&b'(')
+        });
+        if !is_tempfile || !constructed {
             continue;
         }
-        let end = end_of_statement(bytes, offset);
-        let statement = &skeleton[offset..end];
-        for method in [".tempdir", ".tempdir_in", ".tempfile"] {
-            for (at, _) in statement.match_indices(method) {
-                let after = offset + at + method.len();
-                if bytes.get(skip_whitespace(bytes, after)) == Some(&b'(') {
-                    found.push(offset + at + 1);
-                }
-            }
+        let statement = &skeleton[offset..end_of_statement(bytes, offset)];
+        let names_directory = builder_calls(statement, ".tempfile_in")
+            && ![".tempdir", ".tempdir_in", ".tempfile"]
+                .iter()
+                .any(|method| builder_calls(statement, method));
+        if !names_directory {
+            found.push(offset);
         }
     }
     found.sort_unstable();
@@ -421,15 +451,30 @@ fn tempfile_candidates(skeleton: &str) -> Vec<usize> {
     found
 }
 
+/// Whether `token` is a decimal zero: digits and `_` separators with at least
+/// one digit, all zero, and an optional integer type suffix.
+fn is_zero_literal(token: &str) -> bool {
+    let digits = INTEGER_SUFFIXES
+        .iter()
+        .find_map(|suffix| token.strip_suffix(suffix))
+        .unwrap_or(token)
+        .trim_end_matches('_');
+    digits.starts_with('0') && digits.bytes().all(|b| b == b'0' || b == b'_')
+}
+
 /// Whether the bind argument (code view) names port 0.
 fn binds_port_zero(argument_code: &str, argument_skeleton: &str) -> bool {
+    if argument_code.contains(":0\"") {
+        return true;
+    }
     let trailing = argument_skeleton
-        .trim_end_matches(|c: char| c.is_whitespace() || c == ')' || c == ']')
-        .trim_end();
-    argument_code.contains(":0\"")
-        || trailing.ends_with(", 0")
-        || trailing.ends_with(",0")
-        || trailing.ends_with(", 0u16")
+        .trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | ','));
+    let token_start = trailing
+        .bytes()
+        .rposition(|b| !is_ident(b))
+        .map_or(0, |at| at + 1);
+    let operand = trailing[..token_start].trim_end();
+    operand.ends_with(',') && is_zero_literal(&trailing[token_start..])
 }
 
 /// Whether the rest of a statement (after the bind call) only unwraps the
@@ -503,24 +548,72 @@ fn is_field_initializer(bytes: &[u8], bind_path_start: usize) -> bool {
         .is_some_and(is_ident)
 }
 
-/// Whether `name` is dropped explicitly somewhere in the block that follows.
-fn dropped_later(skeleton: &str, from: usize, name: &str) -> bool {
-    let bytes = skeleton.as_bytes();
+/// End of the field initializer that contains `from`: the next `,`, `;` or
+/// unmatched closer outside nested groups.
+fn end_of_field(bytes: &[u8], from: usize) -> usize {
     let mut depth = 0_usize;
-    let mut block_end = bytes.len();
+    for (i, &byte) in bytes.iter().enumerate().skip(from) {
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    return i;
+                }
+                depth -= 1;
+            }
+            b',' | b';' if depth == 0 => return i,
+            _ => {}
+        }
+    }
+    bytes.len()
+}
+
+/// End of the block that contains `from`: its unmatched `}`, or the text end.
+fn end_of_block(bytes: &[u8], from: usize) -> usize {
+    let mut depth = 0_usize;
     for (i, &byte) in bytes.iter().enumerate().skip(from) {
         match byte {
             b'{' => depth += 1,
             b'}' => {
                 if depth == 0 {
-                    block_end = i;
-                    break;
+                    return i;
                 }
                 depth -= 1;
             }
             _ => {}
         }
     }
+    bytes.len()
+}
+
+/// One entry per use of `name` in the rest of the block after `from`: `true`
+/// when the use is more than `name.local_addr(..)` (passing, moving or returning
+/// the listener, any other method call). A `name` reached through a field access
+/// (`other.name`) is a different binding and is skipped.
+fn later_uses(skeleton: &str, from: usize, name: &str) -> Vec<bool> {
+    let bytes = skeleton.as_bytes();
+    let block_end = end_of_block(bytes, from);
+    named_uses(&skeleton[..block_end], name, false)
+        .into_iter()
+        .filter(|&(offset, _)| offset >= from)
+        .filter(|(_, qualifier)| *qualifier != Qualifier::Method)
+        .map(|(offset, _)| {
+            let after = skip_whitespace(bytes, offset + name.len());
+            let method = (bytes.get(after) == Some(&b'.')).then(|| {
+                let start = skip_whitespace(bytes, after + 1);
+                (&skeleton[start..end_of_ident(bytes, start)], start)
+            });
+            !method.is_some_and(|(method, start)| {
+                method == "local_addr"
+                    && bytes.get(skip_whitespace(bytes, start + method.len())) == Some(&b'(')
+            })
+        })
+        .collect()
+}
+
+/// Whether `name` is dropped explicitly somewhere in the block that follows.
+fn dropped_later(skeleton: &str, from: usize, name: &str) -> bool {
+    let block_end = end_of_block(skeleton.as_bytes(), from);
     let block = &skeleton[from..block_end];
     named_uses(block, "drop", true)
         .into_iter()
@@ -531,15 +624,76 @@ fn dropped_later(skeleton: &str, from: usize, name: &str) -> bool {
         })
 }
 
+/// Names that denote `TcpListener` in `skeleton`: the type itself and every
+/// alias introduced by `use .. TcpListener as L` (also inside braces) or
+/// `type L = ..TcpListener;`.
+fn listener_names(skeleton: &str) -> BTreeSet<String> {
+    let bytes = skeleton.as_bytes();
+    let mut names = BTreeSet::from(["TcpListener".to_owned()]);
+    loop {
+        let mut aliases = Vec::new();
+        for (at, _) in skeleton.match_indices("use ") {
+            if !starts_word(bytes, at) {
+                continue;
+            }
+            let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+            for name in &names {
+                for (offset, _) in skeleton[at..end].match_indices(name.as_str()) {
+                    let offset = at + offset;
+                    let name_end = offset + name.len();
+                    if !starts_word(bytes, offset) || end_of_ident(bytes, offset) != name_end {
+                        continue;
+                    }
+                    let Some(after_as) = expect_token(bytes, name_end, "as") else {
+                        continue;
+                    };
+                    let alias_start = skip_whitespace(bytes, after_as);
+                    if alias_start > after_as {
+                        aliases.push(
+                            skeleton[alias_start..end_of_ident(bytes, alias_start)].to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+        for (at, _) in skeleton.match_indices("type ") {
+            if !starts_word(bytes, at) {
+                continue;
+            }
+            let alias_start = skip_whitespace(bytes, at + "type ".len());
+            let alias_end = end_of_ident(bytes, alias_start);
+            let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+            let Some(equals) = expect_token(bytes, alias_end, "=") else {
+                continue;
+            };
+            if names
+                .iter()
+                .any(|name| contains_word(&skeleton[equals..end], name))
+            {
+                aliases.push(skeleton[alias_start..alias_end].to_owned());
+            }
+        }
+        let before = names.len();
+        names.extend(aliases.into_iter().filter(|alias| !alias.is_empty()));
+        if names.len() == before {
+            return names;
+        }
+    }
+}
+
 /// Port-0 `TcpListener::bind` calls whose listener is not demonstrably kept.
 fn bind_candidates(file: &SourceFile) -> Vec<usize> {
     let views = file.views();
     let (skeleton, bytes) = (&views.skeleton, views.skeleton.as_bytes());
     let mut found = Vec::new();
+    let listeners = listener_names(skeleton);
     for (offset, qualifier) in named_uses(skeleton, "bind", true) {
-        let Qualifier::Path("TcpListener") = qualifier else {
+        let Qualifier::Path(listener) = qualifier else {
             continue;
         };
+        if !listeners.contains(listener) {
+            continue;
+        }
         let open = skip_whitespace(bytes, offset + "bind".len());
         let close = matching_close(bytes, open);
         if !binds_port_zero(&views.code[open + 1..close], &skeleton[open + 1..close]) {
@@ -552,11 +706,15 @@ fn bind_candidates(file: &SourceFile) -> Vec<usize> {
         }
         let statement_end = end_of_statement(bytes, close + 1);
         let kept = if is_field_initializer(bytes, start) {
-            true
+            only_unwraps(bytes, close + 1, end_of_field(bytes, close + 1))
         } else {
             let_binding(skeleton, start).is_some_and(|name| {
                 only_unwraps(bytes, close + 1, statement_end)
                     && !dropped_later(skeleton, statement_end, name)
+                    && {
+                        let uses = later_uses(skeleton, statement_end, name);
+                        uses.contains(&true) || (name.starts_with('_') && uses.is_empty())
+                    }
             })
         };
         if !kept {
@@ -854,7 +1012,7 @@ fn tempfile_fixtures_are_flagged() {
         let found = flagged(call);
         assert_eq!(found.len(), 1, "{call}: {found:?}");
         assert_eq!(found[0].1, Rule::Tempfile, "{call}");
-        assert_eq!(found[0].0, if call.contains('\n') { 5 } else { 3 }, "{call}");
+        assert_eq!(found[0].0, 3, "{call}");
     }
     for (import, call) in [
         ("use tempfile::tempdir;", "let d = tempdir().unwrap();"),
@@ -932,10 +1090,10 @@ fn a_port_zero_bind_that_is_not_kept_is_flagged() {
 fn a_kept_port_zero_bind_and_other_binds_are_not_flagged() {
     for call in [
         "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = listener.local_addr().unwrap().port();\n    serve(listener, port);",
-        "let mut listener = std::net::TcpListener::bind(\"127.0.0.1:0\").expect(\"bind\");",
-        "let listener: TcpListener = TcpListener::bind(\"127.0.0.1:0\").await.unwrap();",
+        "let mut listener = std::net::TcpListener::bind(\"127.0.0.1:0\").expect(\"bind\");\n    serve(&mut listener);",
+        "let listener: TcpListener = TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n    tokio::spawn(run(listener));",
         "let _listener = TcpListener::bind(\"127.0.0.1:0\")?;",
-        "let listener = tokio::net::TcpListener::bind((\"127.0.0.1\", 0)).await.map_err(fail).unwrap();",
+        "let listener = tokio::net::TcpListener::bind((\"127.0.0.1\", 0)).await.map_err(fail).unwrap();\n    let (stream, _) = listener.accept().await.unwrap();",
         "let s = Server { listener: TcpListener::bind(\"127.0.0.1:0\").unwrap(), port: 1 };",
         "let s = Server {\n        listener:\n            TcpListener::bind(\"127.0.0.1:0\").unwrap(),\n    };",
         "let l = TcpListener::bind(\"127.0.0.1:8080\").unwrap().local_addr();",
@@ -1083,4 +1241,184 @@ fn failure_lines_name_the_location_and_rule_and_guidance_names_the_fix() {
         &in_test("let p = TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr();"),
     );
     assert!(guidance(&scan).contains("keep the bound listener"));
+}
+
+/// Flagged lines of `text` as the content of a test module.
+fn flagged_module(text: &str) -> Vec<(usize, Rule)> {
+    rules_of(&scan_one(
+        DEMO,
+        &format!("#[cfg(test)]\nmod tests {{\n{text}\n}}\n"),
+    ))
+}
+
+#[test]
+fn a_split_tempfile_builder_is_flagged_at_its_construction() {
+    for text in [
+        "let builder = tempfile::Builder::new();\n    let d = builder.tempdir().unwrap();",
+        "let mut b = tempfile::Builder::new();\n    b.prefix(\"x\");\n    let d = b.tempdir().unwrap();",
+        "let b = tempfile::Builder::default();",
+        "let b = ::tempfile::Builder :: new();",
+    ] {
+        let found = flagged(text);
+        assert_eq!(found, [(3, Rule::Tempfile)], "{text}");
+    }
+    let imported = "use tempfile::Builder;\n#[test]\nfn f() {\n    let b = Builder::new();\n    let d = b.tempdir().unwrap();\n}\n";
+    assert_eq!(rules_of(&scan_one(DEMO, imported)), [(4, Rule::Tempfile)]);
+    // The import and a type position are not constructions.
+    let type_only = "use tempfile::Builder;\n#[test]\nfn f(b: tempfile::Builder<'_, '_>) {}\n";
+    assert!(scan_one(DEMO, type_only).violations.is_empty());
+    assert!(flagged("let b = other::Builder::new();").is_empty());
+}
+
+#[test]
+fn a_port_zero_operand_is_recognised_with_separators_and_suffixes() {
+    for argument in [
+        "(ip, 0)",
+        "(ip, 0_u16)",
+        "(ip, 0u16)",
+        "(ip, 0_000)",
+        "(ip, 00)",
+        "(ip, 0usize)",
+        "(ip,0)",
+        "SocketAddr::new(ip, 0_u16)",
+        "SocketAddr::from(([127, 0, 0, 1], 0_u16))",
+        "(ip, 0,)",
+        "\"127.0.0.1:0\"",
+    ] {
+        let call = format!("let port = TcpListener::bind({argument}).unwrap().local_addr();");
+        assert_eq!(flagged(&call), [(3, Rule::PortZeroBind)], "{call}");
+    }
+    for argument in [
+        "(ip, 80)",
+        "(ip, 10)",
+        "(ip, 0x10)",
+        "(ip, PORT0)",
+        "(ip, port_0)",
+        "(ip, _0x)",
+        "(ip, 10_u16)",
+        "(0, ip)",
+    ] {
+        let call = format!("let port = TcpListener::bind({argument}).unwrap().local_addr();");
+        assert!(flagged(&call).is_empty(), "{call}: {:?}", flagged(&call));
+    }
+}
+
+#[test]
+fn an_aliased_tcp_listener_is_still_a_listener() {
+    let bind = "let port = Listener::bind(\"127.0.0.1:0\").unwrap().local_addr();";
+    for header in [
+        "use std::net::TcpListener as Listener;",
+        "use tokio::net::TcpListener as Listener;",
+        "use std::net::{TcpListener as Listener, UdpSocket};",
+        "use std::net::{UdpSocket, TcpListener  as  Listener};",
+        "type Listener = std::net::TcpListener;",
+        "type Listener = tokio::net::TcpListener;",
+        "use std::net::TcpListener as Base;\ntype Listener = Base;",
+        "use std::net::TcpListener as Base;\nuse self::Base as Listener;",
+    ] {
+        let text = format!("{header}\n#[test]\nfn f() {{\n    {bind}\n}}\n");
+        let lines = header.lines().count() + 3;
+        assert_eq!(
+            rules_of(&scan_one(DEMO, &text)),
+            [(lines, Rule::PortZeroBind)],
+            "{header}"
+        );
+    }
+    for header in [
+        "use other::Listener;",
+        "use std::net::UdpSocket as Listener;",
+        "type Listener = std::net::UdpSocket;",
+        "use std::net::{TcpListener, UdpSocket as Listener};",
+    ] {
+        let text = format!("{header}\n#[test]\nfn f() {{\n    {bind}\n}}\n");
+        assert!(scan_one(DEMO, &text).violations.is_empty(), "{header}");
+    }
+}
+
+#[test]
+fn a_field_initializer_only_keeps_a_listener_that_is_only_unwrapped() {
+    for call in [
+        "let s = Fixture { port: TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr().unwrap().port() };",
+        "let s = Fixture {\n        port: TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr().unwrap().port(),\n        name: 1,\n    };",
+        "let s = Fixture {\n        port: TcpListener::bind(\"127.0.0.1:0\").unwrap().into_std(),\n    };",
+    ] {
+        let found = flagged(call);
+        assert_eq!(found.len(), 1, "{call}: {found:?}");
+        assert_eq!(found[0].1, Rule::PortZeroBind, "{call}");
+    }
+    for call in [
+        "let s = Fixture { listener: TcpListener::bind(\"127.0.0.1:0\").unwrap() };",
+        "let s = Fixture {\n        listener: TcpListener::bind(\"127.0.0.1:0\").await.map_err(fail)?,\n        port: 1,\n    };",
+        "let s = Fixture { a: 1, listener: TcpListener::bind(\"127.0.0.1:0\").expect(\"bind\") };",
+    ] {
+        assert!(flagged(call).is_empty(), "{call}: {:?}", flagged(call));
+    }
+}
+
+#[test]
+fn a_binding_that_only_reports_its_address_is_flagged() {
+    let helper = "fn free_port() -> std::io::Result<u16> {\n    let listener = TcpListener::bind(\"127.0.0.1:0\")?;\n    Ok(listener.local_addr()?.port())\n}";
+    assert_eq!(flagged_module(helper), [(4, Rule::PortZeroBind)]);
+    let nested = "#[test]\nfn f() {\n    let port = {\n        let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n        l.local_addr().unwrap().port()\n    };\n    serve(port);\n}";
+    assert_eq!(flagged_module(nested), [(6, Rule::PortZeroBind)]);
+    let never_used =
+        "#[test]\nfn f() {\n    let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n}";
+    assert_eq!(flagged_module(never_used), [(5, Rule::PortZeroBind)]);
+    let twice = "#[test]\nfn f() {\n    let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let a = l.local_addr().unwrap();\n    let b = l . local_addr ().unwrap();\n}";
+    assert_eq!(flagged_module(twice), [(5, Rule::PortZeroBind)]);
+}
+
+#[test]
+fn a_binding_that_escapes_or_is_used_is_kept() {
+    for body in [
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = l.local_addr().unwrap().port();\n    tokio::spawn(serve(l));\n    check(port);",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = l.local_addr().unwrap().port();\n    (l, port)",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = l.local_addr().unwrap().port();\n    let shared = Arc::new(l);\n    check(port);",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let (s, _) = l.accept().unwrap();",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    for s in l.incoming() {}",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = l.local_addr().unwrap().port();\n    let s = Server { l, port };",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = l.local_addr().unwrap().port();\n    thread::spawn(move || run(&l));",
+        "let _guard = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    connect_elsewhere();",
+        "let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = l.local_addr().unwrap().port();\n    let other = x.l.local_addr();\n    keep(l);",
+    ] {
+        let text = format!("#[test]\nfn f() {{\n    {body}\n}}");
+        assert!(flagged_module(&text).is_empty(), "{body}: {:?}", flagged_module(&text));
+    }
+    // A field of another value with the binding's name is not a use of the binding.
+    let other_field = "#[test]\nfn f() {\n    let l = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    let port = l.local_addr().unwrap().port();\n    serve(self.l, port);\n}";
+    assert_eq!(flagged_module(other_field), [(5, Rule::PortZeroBind)]);
+}
+
+#[test]
+fn tmp_followed_by_a_name_character_is_another_path() {
+    for literal in [
+        r#"let p = "/tmp+fixture";"#,
+        r#"let p = "/tmp@fixture";"#,
+        r#"let p = "/tmp~";"#,
+        r#"let p = "/tmp%20x";"#,
+        r#"let p = "/tmp#x";"#,
+        r#"let p = "/var/tmp+x";"#,
+    ] {
+        assert!(
+            flagged(literal).is_empty(),
+            "{literal}: {:?}",
+            flagged(literal)
+        );
+    }
+    for literal in [
+        r#"let p = "/tmp/x";"#,
+        r#"let p = "/tmp";"#,
+        r#"let p = "/tmp:/usr";"#,
+        r#"let p = "/usr:/tmp:/bin";"#,
+        r#"let p = "ls /tmp";"#,
+        r#"let p = "ls /tmp && true";"#,
+        r#"let p = "cd /tmp; ls";"#,
+        r#"let p = "(cd /tmp)";"#,
+        r#"let p = "'/tmp'";"#,
+        r#"let p = "a /tmp\n";"#,
+    ] {
+        let found = flagged(literal);
+        assert_eq!(found.len(), 1, "{literal}: {found:?}");
+        assert_eq!(found[0].1, Rule::TmpLiteral, "{literal}");
+    }
 }
