@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn credential_operations_exclude_concurrent_writers_and_reject_symlinks() {
-        let directory = tempfile::tempdir().expect("lock directory");
+        let directory = pohunek_test_support::tempdir().expect("lock directory");
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
             .expect("private fixture directory");
         let origin = Origin::parse("https://relay.example").expect("origin");
@@ -412,7 +412,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn submitted_keyring_mutations_keep_exclusion_until_the_backend_finishes() {
         for cancel_caller in [false, true] {
-            let directory = tempfile::tempdir().expect("lock directory");
+            let directory = pohunek_test_support::tempdir().expect("lock directory");
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
                 .expect("private directory");
             let origin = Origin::parse("https://relay.example").expect("origin");

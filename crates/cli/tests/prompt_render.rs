@@ -1,37 +1,20 @@
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+use pohunek_test_support::env::TestEnv;
 
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-cli-prompt-{tag}-{}-{nanos}-{n}",
-        std::process::id(),
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-fn pohunek() -> Command {
-    Command::new(pohunek_test_support::bin_exe("pohunek"))
+fn pohunek(env: &TestEnv) -> Command {
+    env.command(pohunek_test_support::bin_exe("pohunek"))
 }
 
 #[test]
 fn prompt_render_writes_rendered_prompt_without_extra_newline() {
-    let dir = temp_dir("render");
-    let template = dir.join("issue.tmpl");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let template = env.cwd().join("issue.tmpl");
     fs::write(&template, "Issue ${id}: ${title}\n${body}").expect("write template");
 
-    let mut child = pohunek()
+    let mut child = pohunek(&env)
         .args([
             "prompt",
             "render",
@@ -76,7 +59,8 @@ fn prompt_render_writes_rendered_prompt_without_extra_newline() {
 
 #[test]
 fn prompt_render_help_documents_required_inputs() {
-    let out = pohunek()
+    let env = TestEnv::new().expect("hermetic test environment");
+    let out = pohunek(&env)
         .args(["prompt", "render", "--help"])
         .output()
         .expect("spawn pohunek");

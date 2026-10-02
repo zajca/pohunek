@@ -2151,7 +2151,7 @@ impl Fixture {
     }
 
     fn with_runtime_dir(runtime_dir: impl FnOnce(&Path) -> PathBuf) -> Self {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         // macOS places temporary directories below the `/var` symlink, which
         // the wrapper's trusted-directory check refuses like the installer.
         let base = fs::canonicalize(root.path()).expect("canonical temp dir");
@@ -2316,8 +2316,10 @@ impl Fixture {
             self.commands.display(),
             std::env::var("PATH").expect("PATH")
         );
-        let mut command = Command::new("sh");
+        let mut command = Command::new("/bin/sh");
         command
+            .env_clear()
+            .current_dir(self.base())
             .arg(self.archive.join("packaging/install-daemon.sh"))
             .args(args)
             .env("HOME", &self.home)
@@ -2332,7 +2334,7 @@ impl Fixture {
                     .parent()
                     .and_then(|dir| dir.parent())
                     .map_or(
-                        std::env::temp_dir().join("missing-pohunek-runtime"),
+                        self.base().join("missing-pohunek-runtime"),
                         ToOwned::to_owned,
                     ),
             )
@@ -2439,7 +2441,7 @@ impl Fixture {
     fn real_pohunek(&self, args: &[&str]) -> Command {
         let template = self.command(&[], &[]);
         let mut real = Command::new(pohunek_test_support::bin_exe("pohunek"));
-        real.args(args);
+        real.env_clear().current_dir(self.base()).args(args);
         for (key, value) in template.get_envs() {
             match value {
                 Some(value) => real.env(key, value),
@@ -2483,8 +2485,11 @@ fn seal_manifest_with_minimum(archive: &Path, target: &str, minimum: &str) {
 }
 
 fn seal(archive: &Path, target: &str, component: &str, minimum: &str) {
-    let mut command = Command::new("sh");
+    let mut command = Command::new("/bin/sh");
     command
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("PATH"))
+        .current_dir(archive)
         .arg(repo_root().join("packaging/write-manifest"))
         .arg(archive)
         .args([component, ARCHIVE_VERSION, target, "none"]);

@@ -234,7 +234,7 @@ fn has_git_workspace_ancestor(path: &Path) -> Result<bool, Error> {
 
 #[cfg(test)]
 pub(crate) fn isolated_test_temp_root() -> PathBuf {
-    let standard = std::env::temp_dir();
+    let standard = pohunek_test_support::temp_root();
     if !has_git_workspace_ancestor(&standard).unwrap_or(true) {
         return fs::canonicalize(&standard).expect("canonical temporary root");
     }

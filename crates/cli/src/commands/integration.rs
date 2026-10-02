@@ -1067,12 +1067,13 @@ mod tests {
             .expect("set private directory mode");
     }
 
-    fn temporary_directory(tag: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("pohunek-integration-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&path);
+    /// Returns a private fixture directory guard and a private child directory of
+    /// it; the guard removes everything when it drops, also when a test fails.
+    fn temporary_directory(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let path = guard.path().join(tag);
         private_directory(&path);
-        path
+        (guard, path)
     }
 
     fn doctor_report(statuses: &[(&'static str, doctor::Status)]) -> doctor::Report {
@@ -1227,7 +1228,7 @@ mod tests {
 
     #[test]
     fn bounded_path_resolution_uses_only_absolute_entries() {
-        let root = temporary_directory("path-resolution");
+        let (_guard, root) = temporary_directory("path-resolution");
         let relative = root.join("relative");
         let absolute = root.join("absolute");
         private_directory(&relative);
@@ -1240,7 +1241,6 @@ mod tests {
             super::resolve_hermes_from_path(&path).expect("absolute candidate"),
             absolute.join("hermes")
         );
-        fs::remove_dir_all(root).expect("cleanup fixture");
     }
 
     #[test]

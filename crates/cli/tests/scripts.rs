@@ -1,25 +1,8 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time after epoch")
-        .as_nanos();
-    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-script-{tag}-{}-{nanos}-{n}",
-        std::process::id(),
-    ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
+use pohunek_test_support::env::TestEnv;
 
 /// Path of the `pohunek` binary under test, resolved at run time.
 fn real_pohunek() -> PathBuf {
@@ -45,25 +28,24 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Poll `path` until it contains every needle, or fail after a short deadline.
+/// Poll `path` until it contains every needle; the hang guard fails the wait by
+/// name if it never does.
 ///
 /// The switcher spawns attach terminals in the background, so the mock terminal
 /// may finish writing its arg log slightly after the script returns
 /// (especially under parallel test load). Polling avoids a flaky read race
 /// without changing the script's fire-and-forget behavior.
 fn wait_for_file_contains(path: &Path, needles: &[&str], label: &str) {
-    let deadline = SystemTime::now() + std::time::Duration::from_secs(5);
-    loop {
-        let content = read(path);
-        if needles.iter().all(|needle| content.contains(needle)) {
-            return;
-        }
-        assert!(
-            SystemTime::now() < deadline,
-            "{label}: timed out waiting for {needles:?} in:\n{content}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(25));
-    }
+    pohunek_test_support::wait::poll_until(
+        &format!("{label}: {needles:?} in {}", path.display()),
+        || {
+            let content = read(path);
+            needles
+                .iter()
+                .all(|needle| content.contains(needle))
+                .then_some(())
+        },
+    );
 }
 
 fn assert_meta_args(args: &str, expected: &[(&str, &str)]) {
@@ -92,7 +74,8 @@ fn write_config(root: &Path, lines: &[(&str, &str)]) -> PathBuf {
 
 #[test]
 fn launch_pr_resolves_action_from_daemon_and_starts_one_session_without_token_leak() {
-    let root = temp_dir("launch-pr");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let gh = bin.join("gh");
@@ -141,7 +124,8 @@ esac
     );
     let recipe = r#"{"provider":"github_pr","agent":"claude","prompt_name":"pr","prompt_content":"PR ${number}: ${title}\n${body}\nbranch=${branch}\nurl=${url}\n"}"#;
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-launch-pr"))
         .arg("ui")
         .arg("7")
@@ -204,7 +188,8 @@ esac
 
 #[test]
 fn launch_issue_uses_linear_seam_and_daemon_resolved_recipe() {
-    let root = temp_dir("launch-issue");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let linear = bin.join("linear-wrapper");
@@ -241,7 +226,8 @@ esac
     // The recipe sets a base_branch; the launcher must thread it as --base-branch.
     let recipe = r#"{"provider":"linear_issue","agent":"codex","base_branch":"develop","prompt_name":"issue","prompt_content":"Issue ${id}: ${title}\n${body}\nbranch=${branch}\n"}"#;
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-launch-issue"))
         .arg("ui")
         .arg("LIN-123")
@@ -310,7 +296,8 @@ fn launch_issue_agent_diverges_per_project_recipe() {
     // Two projects (driven entirely by the daemon-resolved recipe) launch issues
     // with different agents — the launcher passes through whatever the daemon's
     // action resolves, with no agent in the client config.
-    let root = temp_dir("launch-divergence");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let linear = bin.join("linear-wrapper");
@@ -348,7 +335,8 @@ esac
     let codex_recipe = r#"{"provider":"linear_issue","agent":"codex-fast","prompt_name":"issue","prompt_content":"P ${title}\n"}"#;
 
     let run = |project: &str, recipe: &str, args_file: &Path| {
-        let out = Command::new("sh")
+        let out = env
+            .command("/bin/sh")
             .arg(script_path("pohunek-launch-issue"))
             .arg(project)
             .arg("LIN-1")
@@ -381,7 +369,8 @@ esac
 fn launch_issue_aborts_without_session_on_prompt_not_found() {
     // A daemon resolution failure (prompt_not_found) aborts the launch before any
     // session is started — no silent fallback.
-    let root = temp_dir("launch-abort");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let linear = bin.join("linear-wrapper");
@@ -416,7 +405,8 @@ esac
         ],
     );
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-launch-issue"))
         .arg("ui")
         .arg("LIN-1")
@@ -441,7 +431,8 @@ esac
 
 #[test]
 fn launch_issue_rejects_action_with_non_linear_provider_before_fetch() {
-    let root = temp_dir("launch-issue-provider-mismatch");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let linear = bin.join("linear-wrapper");
@@ -478,7 +469,8 @@ esac
     );
     let recipe = r#"{"provider":"github_pr","agent":"codex","prompt_name":"issue","prompt_content":"Issue ${id}\n"}"#;
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-launch-issue"))
         .arg("ui")
         .arg("LIN-1")
@@ -508,7 +500,8 @@ esac
 
 #[test]
 fn launch_pr_rejects_provider_none_static_branch_before_fetch() {
-    let root = temp_dir("launch-pr-provider-none");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let gh = bin.join("gh");
@@ -545,7 +538,8 @@ esac
     );
     let recipe = r#"{"provider":"none","agent":"claude","branch":"feature/static","prompt_name":"pr","prompt_content":"PR ${number}\n"}"#;
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-launch-pr"))
         .arg("ui")
         .arg("7")
@@ -575,7 +569,8 @@ esac
 
 #[test]
 fn launch_issue_rejects_unknown_template_variable_without_session() {
-    let root = temp_dir("launch-issue-unknown-var");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let linear = bin.join("linear-wrapper");
@@ -610,7 +605,8 @@ esac
     );
     let recipe = r#"{"provider":"linear_issue","agent":"codex","prompt_name":"issue","prompt_content":"Issue ${id}: ${missing}\n"}"#;
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-launch-issue"))
         .arg("ui")
         .arg("LIN-1")
@@ -643,7 +639,8 @@ esac
 
 #[test]
 fn rofi_issue_lists_my_issues_and_hands_selection_to_launch_issue() {
-    let root = temp_dir("rofi-issue");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let linear = bin.join("linear-wrapper");
@@ -692,7 +689,8 @@ for arg in \"$@\"; do printf '%s\\n' \"$arg\" >>\"$POHUNEK_TEST_TERMINAL_ARGS\";
         ],
     );
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-rofi-issue"))
         .arg("ui")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
@@ -741,7 +739,8 @@ for arg in \"$@\"; do printf '%s\\n' \"$arg\" >>\"$POHUNEK_TEST_TERMINAL_ARGS\";
 
 #[test]
 fn rofi_issue_derives_assignee_from_whoami_when_unset() {
-    let root = temp_dir("rofi-issue-derive");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let linear = bin.join("linear-wrapper");
@@ -790,7 +789,8 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
         ],
     );
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-rofi-issue"))
         .arg("ui")
         .env("POHUNEK_CONFIG_DIR", &config_dir)
@@ -824,7 +824,8 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
     reason = "single end-to-end scenario; splitting it would obscure the narrative under test"
 )]
 fn rofi_merges_local_and_remote_hosts_multi_selects_and_reconciles_marks() {
-    let root = temp_dir("rofi");
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = env.root().to_path_buf();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("create bin dir");
     let pohunek = bin.join("pohunek");
@@ -910,7 +911,8 @@ for arg in "$@"; do printf '%s\n' "$arg" >>"$POHUNEK_TEST_TERMINAL_ARGS"; done
         ],
     );
 
-    let out = Command::new("sh")
+    let out = env
+        .command("/bin/sh")
         .arg(script_path("pohunek-rofi"))
         .args(["--filter", "state=running"])
         .env("POHUNEK_CONFIG_DIR", &config_dir)

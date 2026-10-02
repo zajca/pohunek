@@ -85,7 +85,9 @@ class StartIdentityTests(unittest.TestCase):
 
     def test_real_hook_reports_the_host_start_identity_over_a_unix_socket(self) -> None:
         received: list[dict[str, object]] = []
-        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+        # The directory follows TMPDIR, which the Rust driver points at a short
+        # private path so the socket path stays inside the Unix `sun_path` limit.
+        with tempfile.TemporaryDirectory() as directory:
             endpoint = str(Path(directory) / "w.sock")
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             server.bind(endpoint)

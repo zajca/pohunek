@@ -2,8 +2,12 @@
 
 use std::process::Command;
 
+/// The built `pohunek` binary with an empty environment: these tests stop at
+/// argument parsing and read none of it.
 fn pohunek() -> Command {
-    Command::new(pohunek_test_support::bin_exe("pohunek"))
+    let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
+    command.env_clear();
+    command
 }
 
 #[test]

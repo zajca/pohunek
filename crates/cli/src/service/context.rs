@@ -505,7 +505,7 @@ pub(crate) mod tests {
     /// macOS temporary directories live below the `/var` symlink, which the
     /// trusted-directory checks and process executable paths never traverse.
     pub(crate) fn temp_root() -> (tempfile::TempDir, PathBuf) {
-        let root = tempfile::tempdir().expect("temp dir");
+        let root = pohunek_test_support::tempdir().expect("temp dir");
         let path = std::fs::canonicalize(root.path()).expect("canonical temp dir");
         (root, path)
     }

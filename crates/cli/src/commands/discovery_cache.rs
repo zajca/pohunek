@@ -280,11 +280,12 @@ mod tests {
         }]
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "pohunek-discovery-cache-{tag}-{}",
-            std::process::id()
-        ))
+    /// Returns a private fixture directory and a not-yet-created child path of
+    /// it; the guard removes the directory when it drops, also when a test fails.
+    fn temp_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let root = guard.path().join(tag);
+        (guard, root)
     }
 
     fn snapshot(port: u16, fetched_unix_nanos: u128, records: Vec<HostRecord>) -> Snapshot {
@@ -311,7 +312,7 @@ mod tests {
 
     #[test]
     fn fresh_cache_requires_matching_schema_protocol_and_port() {
-        let root = temp_dir("fresh");
+        let (_guard, root) = temp_dir("fresh");
         let dir = root.join(CACHE_SUBDIR);
         ensure_private_dir(&dir).expect("private directory");
         let snapshot = snapshot(18722, unix_nanos().expect("clock"), Vec::new());
@@ -320,12 +321,11 @@ mod tests {
             .expect("load")
             .is_some());
         assert!(load_fresh(&dir, &routes(18723)).expect("load").is_none());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn corrupt_and_open_cache_are_ignored() {
-        let root = temp_dir("unsafe");
+        let (_guard, root) = temp_dir("unsafe");
         let dir = root.join(CACHE_SUBDIR);
         ensure_private_dir(&dir).expect("private directory");
         let path = dir.join(CACHE_FILE);
@@ -334,12 +334,11 @@ mod tests {
         assert!(load_fresh(&dir, &routes(TEST_PORT))
             .expect("load")
             .is_none());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn stale_future_schema_and_protocol_snapshots_are_ignored() {
-        let root = temp_dir("invalid");
+        let (_guard, root) = temp_dir("invalid");
         let dir = root.join(CACHE_SUBDIR);
         ensure_private_dir(&dir).expect("private directory");
         let now = unix_nanos().expect("clock");
@@ -373,12 +372,11 @@ mod tests {
         assert!(load_fresh(&dir, &routes(TEST_PORT))
             .expect("load")
             .is_none());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn symlink_cache_is_ignored_without_following_it() {
-        let root = temp_dir("symlink");
+        let (_guard, root) = temp_dir("symlink");
         let dir = root.join(CACHE_SUBDIR);
         ensure_private_dir(&dir).expect("private directory");
         let target = root.join("target");
@@ -387,12 +385,11 @@ mod tests {
         assert!(load_fresh(&dir, &routes(TEST_PORT))
             .expect("load")
             .is_none());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn atomic_store_replaces_a_complete_previous_snapshot() {
-        let root = temp_dir("atomic");
+        let (_guard, root) = temp_dir("atomic");
         let dir = root.join(CACHE_SUBDIR);
         ensure_private_dir(&dir).expect("private directory");
         let now = unix_nanos().expect("clock");
@@ -402,7 +399,6 @@ mod tests {
             .expect("load")
             .expect("fresh");
         assert_eq!(loaded.records[0].name.as_deref(), Some("new"));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -415,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_hit_refresh_and_failed_refresh_preserve_snapshot() {
-        let root = temp_dir("refresh");
+        let (_guard, root) = temp_dir("refresh");
         let dir = root.join(CACHE_SUBDIR);
         ensure_private_dir(&dir).expect("private directory");
         let port = TEST_PORT;
@@ -459,12 +455,11 @@ mod tests {
             fs::read(dir.join(CACHE_FILE)).expect("after failure"),
             before
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
     async fn concurrent_cold_refreshes_coalesce() {
-        let root = temp_dir("coalesce");
+        let (_guard, root) = temp_dir("coalesce");
         let calls = Arc::new(AtomicUsize::new(0));
         let left_root = root.clone();
         let left_calls = Arc::clone(&calls);
@@ -495,6 +490,5 @@ mod tests {
         let _left = left.expect("left refresh");
         let _right = right.expect("right refresh");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let _ = fs::remove_dir_all(root);
     }
 }

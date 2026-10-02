@@ -14,7 +14,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use pohunek_test_support::env::TestEnv;
 
 /// The real CLI under test.
 /// Path of the `pohunek` binary under test, resolved at run time.
@@ -25,30 +27,19 @@ fn pohunek_bin() -> std::path::PathBuf {
 /// Variable the lock passes its holder token in.
 const LOCK_TOKEN_ENV: &str = "POHUNEK_SERVICE_LOCK_TOKEN";
 
-/// Bound on waiting for a helper process to report.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Poll interval of that wait.
-const POLL: Duration = Duration::from_millis(20);
-
 /// An isolated user environment.
 struct Host {
-    _temp: tempfile::TempDir,
+    env: TestEnv,
     root: PathBuf,
 }
 
 impl Host {
     fn new() -> Self {
-        let temp = tempfile::tempdir().expect("temp dir");
-        // macOS temporary directories live below the `/var` symlink, which the
-        // trusted-directory checks refuse.
-        let root = fs::canonicalize(temp.path()).expect("canonical temp dir");
-        for directory in ["home", "run"] {
-            fs::create_dir(root.join(directory)).expect("create directory");
-            fs::set_permissions(root.join(directory), fs::Permissions::from_mode(0o700))
-                .expect("make directory private");
-        }
-        Self { _temp: temp, root }
+        // `TestEnv` roots are canonical, so the trusted-directory checks never
+        // meet a symlinked ancestor (macOS `/var`).
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let root = env.root().to_path_buf();
+        Self { env, root }
     }
 
     /// `pohunek` with `args` in this host's environment.
@@ -63,13 +54,8 @@ impl Host {
     fn isolate(&self, command: &mut Command) {
         command
             .env_clear()
-            .env("PATH", std::env::var_os("PATH").expect("PATH"))
-            .env("HOME", self.root.join("home"))
-            .env("XDG_CONFIG_HOME", self.root.join("config"))
-            .env("XDG_STATE_HOME", self.root.join("state"))
-            .env("XDG_DATA_HOME", self.root.join("data"))
-            .env("XDG_CACHE_HOME", self.root.join("cache"))
-            .env("XDG_RUNTIME_DIR", self.root.join("run"));
+            .envs(self.env.environment())
+            .current_dir(self.env.cwd());
     }
 
     /// `pohunek service lock -- sh -c <script>`, with `$POHUNEK` naming the CLI.
@@ -101,20 +87,12 @@ fn assert_code(output: &Output, code: i32) {
 
 /// Waits until `path` holds a line and returns it.
 fn wait_for_line(path: &Path) -> String {
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    loop {
-        if let Ok(text) = fs::read_to_string(path) {
-            if text.ends_with('\n') {
-                return text.trim_end().to_owned();
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{} never appeared",
-            path.display()
-        );
-        std::thread::sleep(POLL);
-    }
+    pohunek_test_support::wait::poll_until(&format!("{} to hold a line", path.display()), || {
+        fs::read_to_string(path)
+            .ok()
+            .filter(|text| text.ends_with('\n'))
+            .map(|text| text.trim_end().to_owned())
+    })
 }
 
 #[test]
@@ -277,29 +255,18 @@ fn a_token_that_proves_no_live_holder_fails_instead_of_locking_anew() {
     assert_refused(&output, "stale token");
 }
 
-/// Polls `child` until it exits, failing after [`WAIT_TIMEOUT`].
+/// Polls `child` until it exits; the hang guard names the wait if it never does.
 fn wait_exit(child: &mut Child) -> std::process::ExitStatus {
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll the lock process") {
-            return status;
-        }
-        assert!(Instant::now() < deadline, "the lock process never exited");
-        std::thread::sleep(POLL);
-    }
+    pohunek_test_support::wait::poll_until("the lock process to exit", || {
+        child.try_wait().expect("poll the lock process")
+    })
 }
 
 /// Waits until `path` exists.
 fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "{} never appeared",
-            path.display()
-        );
-        std::thread::sleep(POLL);
-    }
+    pohunek_test_support::wait::poll_until(&format!("{} to appear", path.display()), || {
+        path.exists().then_some(())
+    });
 }
 
 impl Host {
@@ -392,11 +359,9 @@ fn an_adopter_keeps_other_transactions_out_after_its_holder_crashed() {
 
     fs::write(&stop, "").expect("stop the adopter");
     wait_for_file(&done);
-    let deadline = Instant::now() + WAIT_TIMEOUT;
-    while !host.lock_is_free() {
-        assert!(Instant::now() < deadline, "the lock never became free");
-        std::thread::sleep(POLL);
-    }
+    pohunek_test_support::wait::poll_until("the lock to become free", || {
+        host.lock_is_free().then_some(())
+    });
 }
 
 #[test]

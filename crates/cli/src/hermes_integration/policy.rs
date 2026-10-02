@@ -525,56 +525,29 @@ fn reject_symlink_components(path: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use serde_json::json;
 
     use super::*;
     use crate::hermes_integration::target::{ProfileName, TargetContext, TargetSelection};
 
-    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-
-    struct Fixture {
-        path: PathBuf,
-    }
+    /// A private fixture directory removed when the value drops, also when a
+    /// test fails.
+    struct Fixture(tempfile::TempDir);
 
     impl std::ops::Deref for Fixture {
         type Target = Path;
 
         fn deref(&self) -> &Self::Target {
-            &self.path
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            if let Err(error) = fs::remove_dir_all(&self.path) {
-                assert_eq!(
-                    error.kind(),
-                    std::io::ErrorKind::NotFound,
-                    "cleanup fixture"
-                );
-            }
+            self.0.path()
         }
     }
 
     fn temp_dir(tag: &str) -> Fixture {
-        loop {
-            let counter = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "pohunek-hermes-policy-{tag}-{}-{counter}",
-                std::process::id()
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => {
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-                        .expect("set private mode");
-                    return Fixture { path };
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("create isolated test directory: {error}"),
-            }
-        }
+        Fixture(
+            pohunek_test_support::tempdir_with_prefix(&format!("phpol-{tag}-"))
+                .expect("create isolated test directory"),
+        )
     }
 
     fn executable(root: &Path) -> PathBuf {
