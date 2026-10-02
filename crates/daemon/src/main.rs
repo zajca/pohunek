@@ -47,7 +47,9 @@ use pohunek_daemon::runtime::lifecycle::{
     LogNaming, DEV_OPEN_FILES, DEV_SWEEP_GRACE, DEV_WORKER_CONNECT, DEV_WORKER_EXIT_TIMEOUT,
     DEV_WORKER_INITIALIZE,
 };
-use pohunek_daemon::runtime::{SubprocessWorkerLauncher, SupervisionConfig, WorkerLauncher};
+use pohunek_daemon::runtime::{
+    EnvironmentSource, SubprocessWorkerLauncher, SupervisionConfig, WorkerLauncher,
+};
 use pohunek_daemon::session::{
     SessionRegistry, SessionRegistryConfig, SessionRetentionTask, RETENTION_POLICY_NAME,
 };
@@ -489,6 +491,7 @@ async fn build_session_registry(
                     worker_initialize: deadlines.worker_initialize,
                     worker_exit_timeout: deadlines.worker_exit_timeout,
                     environment_allowlist: service.environment_allowlist().to_vec(),
+                    environment_source: EnvironmentSource::Process,
                     sweep_grace: service.sweep_grace(),
                     open_files: service.open_files(),
                     bootstrap_environment,
@@ -521,6 +524,7 @@ async fn build_session_registry(
                         .iter()
                         .map(|pattern| (*pattern).to_owned())
                         .collect(),
+                    environment_source: EnvironmentSource::Process,
                     sweep_grace: DEV_SWEEP_GRACE,
                     open_files: DEV_OPEN_FILES,
                     bootstrap_environment,

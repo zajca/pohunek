@@ -493,7 +493,8 @@ impl Harness {
         }
         .supervision(PathBuf::from(
             "/opt/pohunek/libexec/pohunek/1.0.0/pohunek-sessiond",
-        ));
+        ))
+        .with_environment_source(crate::test_support::thread_environment_source());
         config.worker_initialize = worker_initialize;
         Self {
             supervisor,
@@ -1855,7 +1856,8 @@ async fn a_subprocess_worker_that_exits_at_once_ends_the_wait_with_its_status_an
         home: roots.base.clone(),
         daemon_socket: runtime_root.join("daemon.sock"),
     }
-    .supervision(executable.clone());
+    .supervision(executable.clone())
+    .with_environment_source(crate::test_support::thread_environment_source());
     let supervisor = ScriptedSupervisor::over(crate::runtime::SubprocessWorkerLauncher::new());
     let inspector = HostInspector::new();
     let lifecycle = Lifecycle {

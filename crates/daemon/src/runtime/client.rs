@@ -1351,6 +1351,7 @@ mod tests {
             base_environment: Some(
                 crate::runtime::environment::base_environment(
                     pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                    &crate::test_support::thread_environment_source(),
                 )
                 .expect("base environment"),
             ),

@@ -1048,9 +1048,11 @@ impl SessionRegistry {
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let environment = SecretEnv::new(command.env.iter().cloned().collect())
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
-        let base_environment =
-            crate::runtime::environment::base_environment(&lifecycle.config.environment_allowlist)
-                .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
+        let base_environment = crate::runtime::environment::base_environment(
+            &lifecycle.config.environment_allowlist,
+            &lifecycle.config.environment_source,
+        )
+        .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let transaction_id = TransactionId::new(transaction_id)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let worker_session_id = WorkerSessionId::new(&id.0)

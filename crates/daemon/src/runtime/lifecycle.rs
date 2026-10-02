@@ -197,6 +197,9 @@ pub struct SupervisionConfig {
     pub worker_exit_timeout: Duration,
     /// Daemon environment names or trailing-`*` prefixes forwarded to agents.
     pub environment_allowlist: Vec<String>,
+    /// Variables the allowlist is applied to: the daemon's own environment in
+    /// production, an explicit set in hermetic tests.
+    pub environment_source: super::environment::EnvironmentSource,
     /// Delay between `SIGTERM` and `SIGKILL` when sweeping orphaned processes.
     pub sweep_grace: Duration,
     /// Open-file limit applied to worker jobs.
@@ -209,6 +212,21 @@ pub struct SupervisionConfig {
     /// Backend naming of worker stdout and stderr files; `None` when the
     /// backend keeps job output elsewhere (systemd journal, dev/test children).
     pub worker_logs: Option<LogNaming>,
+}
+
+impl SupervisionConfig {
+    /// Replaces the variables the environment allowlist is applied to.
+    ///
+    /// Hermetic tests pass the environment of their fixture so agent children
+    /// never inherit the developer's `HOME` or credentials.
+    #[must_use]
+    pub fn with_environment_source(
+        mut self,
+        source: super::environment::EnvironmentSource,
+    ) -> Self {
+        self.environment_source = source;
+        self
+    }
 }
 
 /// Describes an isolated dev/test worker tree for [`super::SubprocessWorkerLauncher`].
@@ -236,9 +254,11 @@ pub struct SubprocessWorkerEnvironment {
 impl SubprocessWorkerEnvironment {
     /// Builds the dev/test supervision contract for this tree.
     ///
-    /// Uses the `DEV_*` constants and
-    /// [`pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST`]; no
-    /// `service.toml` is passed to workers.
+    /// Uses the `DEV_*` constants,
+    /// [`pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST`] and the daemon
+    /// process environment as the allowlist source (see
+    /// [`SupervisionConfig::with_environment_source`]); no `service.toml` is
+    /// passed to workers.
     #[must_use]
     pub fn supervision(&self, worker_executable: PathBuf) -> SupervisionConfig {
         let uid = nix::unistd::Uid::effective().as_raw();
@@ -268,6 +288,7 @@ impl SubprocessWorkerEnvironment {
                 .iter()
                 .map(|pattern| (*pattern).to_owned())
                 .collect(),
+            environment_source: super::environment::EnvironmentSource::Process,
             sweep_grace: DEV_SWEEP_GRACE,
             open_files: DEV_OPEN_FILES,
             bootstrap_environment,
