@@ -207,22 +207,11 @@ fn remove_path_if_exists(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pohunek-knowledge-unit-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock is after unix epoch")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
-    }
-
     #[test]
     fn publish_leaves_temp_dir_owned_by_another_materializer_untouched() {
-        let knowledge_dir = scratch_dir("foreign-temp");
+        let guard = pohunek_test_support::tempdir_with_prefix("knowledge-unit-foreign-temp-")
+            .expect("create scratch dir");
+        let knowledge_dir = guard.path();
         let target = knowledge_dir.join("sha256:test-foreign-temp");
         let temp = knowledge_dir.join(".tmp-sha256:test-foreign-temp-1-2-3");
         fs::create_dir(&temp).expect("create foreign temp dir");
@@ -238,7 +227,6 @@ mod tests {
         );
         assert!(!temp.join(COMPLETE_MARKER).exists());
         assert!(matches!(target_state(&target), Ok(TargetState::Missing)));
-        fs::remove_dir_all(&knowledge_dir).expect("remove scratch dir");
     }
 
     #[test]

@@ -134,7 +134,7 @@ fn auxiliary_socket_paths_must_be_absolute_and_normalized() {
     ));
     assert!(matches!(
         validate_socket_path(
-            "/tmp/parent/../socket.sock",
+            "/work/parent/../socket.sock",
             Platform::Linux,
             SocketKind::Auxiliary
         ),
@@ -303,7 +303,7 @@ fn daemon_socket_is_validated_during_resolution() {
 fn socket_and_environment_paths_reject_nul_bytes() {
     use std::os::unix::ffi::OsStringExt as _;
 
-    let socket = PathBuf::from(OsString::from_vec(b"/tmp/bad\0socket".to_vec()));
+    let socket = PathBuf::from(OsString::from_vec(b"/work/bad\0socket".to_vec()));
     assert!(matches!(
         validate_socket_path(&socket, Platform::Linux, SocketKind::Auxiliary),
         Err(PathError::SocketPathContainsNul {
@@ -313,7 +313,7 @@ fn socket_and_environment_paths_reject_nul_bytes() {
     ));
 
     let env = PathEnv {
-        xdg_runtime_dir: Some(OsString::from_vec(b"/tmp/bad\0runtime".to_vec())),
+        xdg_runtime_dir: Some(OsString::from_vec(b"/work/bad\0runtime".to_vec())),
         xdg_data_home: Some("/data".into()),
         xdg_state_home: Some("/state".into()),
         xdg_cache_home: Some("/cache".into()),

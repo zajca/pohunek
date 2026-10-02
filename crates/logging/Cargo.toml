@@ -6,5 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 description = "Bounded owner-private file logging for pohunek processes."
 
+[dev-dependencies]
+pohunek-test-support = { workspace = true }
+
 [lints]
 workspace = true

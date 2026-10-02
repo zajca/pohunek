@@ -4405,6 +4405,9 @@ dependencies = [
 [[package]]
 name = "pohunek-logging"
 version = "0.31.6"
+dependencies = [
+ "pohunek-test-support",
+]
 
 [[package]]
 name = "pohunek-netbird"
@@ -4467,6 +4470,7 @@ dependencies = [
 name = "pohunek-prompt"
 version = "0.31.6"
 dependencies = [
+ "pohunek-test-support",
  "serde_json",
  "thiserror 2.0.18",
 ]
@@ -4536,10 +4540,10 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "pohunek-relay-protocol",
+ "pohunek-test-support",
  "reqwest",
  "serde",
  "serde_json",
- "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -4568,6 +4572,7 @@ version = "0.31.6"
 dependencies = [
  "pohunek-paths",
  "pohunek-platform",
+ "pohunek-test-support",
  "proptest",
  "serde",
  "tempfile",

@@ -10,5 +10,8 @@ description = "Shared prompt rendering for pohunek provider launch flows."
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+pohunek-test-support = { workspace = true }
+
 [lints]
 workspace = true

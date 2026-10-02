@@ -1,19 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use knowledge::{gc, materialize};
-
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "pohunek-knowledge-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock is after unix epoch")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
 
 fn touch_dir(path: impl AsRef<Path>) {
     std::fs::create_dir_all(path).expect("create directory");
@@ -21,10 +8,12 @@ fn touch_dir(path: impl AsRef<Path>) {
 
 #[test]
 fn materialize_writes_embedded_bundle_to_versioned_cache_dir() {
-    let cache_dir = temp_dir("materialize-writes");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-writes-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let version_hash = "sha256:test-materialize-writes";
 
-    let materialized = materialize(&cache_dir, version_hash).expect("materialize bundle");
+    let materialized = materialize(cache_dir, version_hash).expect("materialize bundle");
 
     assert_eq!(materialized, cache_dir.join("knowledge").join(version_hash));
     assert!(materialized.join(".complete").is_file());
@@ -37,13 +26,15 @@ fn materialize_writes_embedded_bundle_to_versioned_cache_dir() {
 
 #[test]
 fn materialize_is_idempotent_when_complete_marker_exists() {
-    let cache_dir = temp_dir("materialize-idempotent");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-idempotent-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let version_hash = "sha256:test-materialize-idempotent";
-    let materialized = materialize(&cache_dir, version_hash).expect("materialize bundle");
+    let materialized = materialize(cache_dir, version_hash).expect("materialize bundle");
     let sentinel = materialized.join("sentinel.txt");
     std::fs::write(&sentinel, "preserved").expect("write sentinel");
 
-    let second = materialize(&cache_dir, version_hash).expect("materialize bundle again");
+    let second = materialize(cache_dir, version_hash).expect("materialize bundle again");
 
     assert_eq!(second, materialized);
     assert_eq!(
@@ -54,13 +45,15 @@ fn materialize_is_idempotent_when_complete_marker_exists() {
 
 #[test]
 fn materialize_concurrent_same_version_preserves_complete_bundle() {
-    let cache_dir = temp_dir("materialize-concurrent");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-concurrent-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let version_hash = "sha256:test-materialize-concurrent";
 
     let handles = (0..8)
         .map(|_| {
-            let cache_dir = cache_dir.clone();
-            std::thread::spawn(move || materialize(&cache_dir, version_hash))
+            let cache_dir = cache_dir.to_path_buf();
+            std::thread::spawn(move || materialize(cache_dir, version_hash))
         })
         .collect::<Vec<_>>();
 
@@ -78,13 +71,15 @@ fn materialize_concurrent_same_version_preserves_complete_bundle() {
 
 #[test]
 fn materialize_refuses_nonempty_incomplete_version_dir_without_deleting_it() {
-    let cache_dir = temp_dir("materialize-incomplete");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-incomplete-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let version_hash = "sha256:test-materialize-incomplete";
     let target = cache_dir.join("knowledge").join(version_hash);
     touch_dir(&target);
     std::fs::write(target.join("stale.txt"), "stale").expect("write stale file");
 
-    let error = materialize(&cache_dir, version_hash).expect_err("incomplete target should fail");
+    let error = materialize(cache_dir, version_hash).expect_err("incomplete target should fail");
 
     assert!(
         matches!(
@@ -105,7 +100,9 @@ fn materialize_refuses_nonempty_incomplete_version_dir_without_deleting_it() {
 #[cfg(unix)]
 #[test]
 fn materialize_refuses_symlinked_version_dir_even_when_complete() {
-    let cache_dir = temp_dir("materialize-symlink-target");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-symlink-target-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let version_hash = "sha256:test-materialize-symlink-target";
     let target = cache_dir.join("knowledge").join(version_hash);
     let outside = cache_dir.join("outside-complete");
@@ -114,7 +111,7 @@ fn materialize_refuses_symlinked_version_dir_even_when_complete() {
     touch_dir(cache_dir.join("knowledge"));
     std::os::unix::fs::symlink(&outside, &target).expect("create target symlink");
 
-    let error = materialize(&cache_dir, version_hash).expect_err("symlink target should fail");
+    let error = materialize(cache_dir, version_hash).expect_err("symlink target should fail");
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
@@ -122,7 +119,9 @@ fn materialize_refuses_symlinked_version_dir_even_when_complete() {
 #[cfg(unix)]
 #[test]
 fn materialize_refuses_symlinked_complete_marker() {
-    let cache_dir = temp_dir("materialize-symlink-marker");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-symlink-marker-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let version_hash = "sha256:test-materialize-symlink-marker";
     let target = cache_dir.join("knowledge").join(version_hash);
     touch_dir(&target);
@@ -130,14 +129,16 @@ fn materialize_refuses_symlinked_complete_marker() {
     std::os::unix::fs::symlink(cache_dir.join("outside-marker"), target.join(".complete"))
         .expect("create marker symlink");
 
-    let error = materialize(&cache_dir, version_hash).expect_err("symlink marker should fail");
+    let error = materialize(cache_dir, version_hash).expect_err("symlink marker should fail");
 
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
 
 #[test]
 fn gc_removes_stale_version_dirs_and_keeps_current_only_under_knowledge_cache() {
-    let cache_dir = temp_dir("materialize-gc");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-gc-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let keep = "sha256:keep";
     let stale = "sha256:stale";
     let another_stale = "sha256:another-stale";
@@ -147,7 +148,7 @@ fn gc_removes_stale_version_dirs_and_keeps_current_only_under_knowledge_cache() 
     touch_dir(knowledge_dir.join(another_stale));
     touch_dir(cache_dir.join("outside-knowledge"));
 
-    gc(&cache_dir, keep).expect("garbage collect stale versions");
+    gc(cache_dir, keep).expect("garbage collect stale versions");
 
     assert!(knowledge_dir.join(keep).is_dir());
     assert!(!knowledge_dir.join(stale).exists());
@@ -157,13 +158,15 @@ fn gc_removes_stale_version_dirs_and_keeps_current_only_under_knowledge_cache() 
 
 #[test]
 fn materialize_prunes_stale_version_dirs() {
-    let cache_dir = temp_dir("materialize-prunes-stale");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-prunes-stale-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let version_hash = "sha256:test-materialize-prunes-stale";
     let knowledge_dir = cache_dir.join("knowledge");
     let stale = knowledge_dir.join("sha256:old-version");
     touch_dir(&stale);
 
-    let materialized = materialize(&cache_dir, version_hash).expect("materialize bundle");
+    let materialized = materialize(cache_dir, version_hash).expect("materialize bundle");
 
     assert!(materialized.join(".complete").is_file());
     assert!(
@@ -174,7 +177,9 @@ fn materialize_prunes_stale_version_dirs() {
 
 #[test]
 fn gc_skips_in_progress_temp_dirs() {
-    let cache_dir = temp_dir("materialize-gc-temp");
+    let guard = pohunek_test_support::tempdir_with_prefix("knowledge-materialize-gc-temp-")
+        .expect("create temp dir");
+    let cache_dir = guard.path();
     let keep = "sha256:keep";
     let stale = "sha256:stale";
     let knowledge_dir = cache_dir.join("knowledge");
@@ -183,7 +188,7 @@ fn gc_skips_in_progress_temp_dirs() {
     touch_dir(knowledge_dir.join(stale));
     touch_dir(&temp);
 
-    gc(&cache_dir, keep).expect("garbage collect stale versions");
+    gc(cache_dir, keep).expect("garbage collect stale versions");
 
     assert!(knowledge_dir.join(keep).is_dir());
     assert!(!knowledge_dir.join(stale).exists());

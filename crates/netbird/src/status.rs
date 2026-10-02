@@ -604,15 +604,9 @@ mod tests {
         const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
         const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
         const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "pohunek-netbird-slow-status-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&root).expect("create test root");
+        let directory = pohunek_test_support::tempdir_with_prefix("pohunek-netbird-slow-status-")
+            .expect("private test root");
+        let root = directory.path();
         let program = root.join("netbird-test");
         let pid_path = root.join("pid");
         fs::write(
@@ -655,7 +649,6 @@ mod tests {
         })
         .await
         .expect("timed-out status subprocess must be killed");
-        fs::remove_dir_all(root).expect("remove test root");
     }
 
     /// A private directory (canonical, mode 0700) holding a fake `netbird`

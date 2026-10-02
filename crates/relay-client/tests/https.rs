@@ -13,6 +13,7 @@ use pohunek_relay_client::{
     config::{Limits, Origin},
     Client, Error,
 };
+use pohunek_test_support::env::TestEnv;
 use relay_protocol::{
     AccountRecord, CredentialId, DeviceCredential, DeviceLoginStart, DevicePollResult, LoginId,
     PrincipalId, PrincipalKind, PrincipalState, RevokeCredentialRequest, Secret,
@@ -20,7 +21,6 @@ use relay_protocol::{
 use std::{
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
-    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -35,15 +35,16 @@ struct Fixture {
     certificate: reqwest::Certificate,
     handle: axum_server::Handle<SocketAddr>,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
-    _directory: tempfile::TempDir,
+    _env: TestEnv,
 }
 
 impl Fixture {
     async fn new(app: Router) -> Self {
-        let directory = tempfile::tempdir().expect("isolated TLS fixture");
-        let key = directory.path().join("tls.key");
-        let certificate = directory.path().join("tls.crt");
-        let output = Command::new("openssl")
+        let env = TestEnv::new().expect("isolated TLS fixture");
+        let key = env.cwd().join("tls.key");
+        let certificate = env.cwd().join("tls.crt");
+        let output = env
+            .command("openssl")
             .args([
                 "req",
                 "-x509",
@@ -97,7 +98,7 @@ impl Fixture {
             certificate,
             handle,
             task,
-            _directory: directory,
+            _env: env,
         }
     }
 

@@ -1,37 +1,9 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{symlink, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use pohunek_logging::{remove_family, Error, Files, Legacy, Policy, Writer};
-
-static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
-
-#[derive(Debug)]
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> Self {
-        let sequence = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "pohunek-logging-{tag}-{}-{sequence}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).expect("create isolated test directory");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).expect("remove isolated test directory");
-    }
-}
 
 fn files(active: &str) -> Files {
     Files::new(active, Legacy::None).expect("valid test filename")
@@ -59,7 +31,8 @@ fn family_files(dir: &Path, active: &str) -> Vec<(String, u64)> {
 
 #[test]
 fn writes_to_owner_private_files() {
-    let temp = TempDir::new("happy");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-happy-")
+        .expect("create isolated test directory");
     let mut writer = Writer::open(
         temp.path(),
         files("service.jsonl"),
@@ -89,7 +62,8 @@ fn writes_to_owner_private_files() {
 
 #[test]
 fn rotates_before_the_limit_and_retains_only_the_configured_count() {
-    let temp = TempDir::new("rotate");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-rotate-")
+        .expect("create isolated test directory");
     let policy = Policy::new(10, 3).unwrap();
     let mut writer = Writer::open(temp.path(), files("service.jsonl"), policy).unwrap();
 
@@ -111,7 +85,8 @@ fn rotates_before_the_limit_and_retains_only_the_configured_count() {
 
 #[test]
 fn startup_prunes_owned_legacy_oversized_and_excess_files_only() {
-    let temp = TempDir::new("restart");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-restart-")
+        .expect("create isolated test directory");
     fs::write(temp.path().join("service.jsonl"), vec![b'a'; 12]).unwrap();
     fs::write(temp.path().join("service.jsonl.1"), vec![b'b'; 11]).unwrap();
     fs::write(temp.path().join("service.jsonl.2"), b"kept").unwrap();
@@ -150,7 +125,8 @@ fn startup_prunes_owned_legacy_oversized_and_excess_files_only() {
 
 #[test]
 fn active_symlink_is_rejected_without_touching_its_target() {
-    let temp = TempDir::new("active-symlink");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-active-symlink-")
+        .expect("create isolated test directory");
     let target = temp.path().join("target.txt");
     fs::write(&target, b"target").unwrap();
     symlink(&target, temp.path().join("service.jsonl")).unwrap();
@@ -180,7 +156,8 @@ fn zero_policy_limits_are_rejected() {
 
 #[test]
 fn one_oversized_event_is_replaced_atomically() {
-    let temp = TempDir::new("oversize");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-oversize-")
+        .expect("create isolated test directory");
     let mut writer = Writer::open(
         temp.path(),
         files("service.jsonl"),
@@ -202,7 +179,8 @@ fn one_oversized_event_is_replaced_atomically() {
 
 #[test]
 fn multiple_writers_share_one_family_bound_and_preserve_event_boundaries() {
-    let temp = TempDir::new("multi-writer");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-multi-writer-")
+        .expect("create isolated test directory");
     let policy = Policy::new(24, 3).unwrap();
     let owned = files("session.jsonl");
     let mut first = Writer::open(temp.path(), owned.clone(), policy).unwrap();
@@ -240,7 +218,8 @@ fn multiple_writers_share_one_family_bound_and_preserve_event_boundaries() {
 
 #[test]
 fn an_oversized_event_is_dropped_when_even_the_notice_cannot_fit() {
-    let temp = TempDir::new("tiny");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-tiny-")
+        .expect("create isolated test directory");
     let mut writer = Writer::open(
         temp.path(),
         files("service.jsonl"),
@@ -255,7 +234,8 @@ fn an_oversized_event_is_dropped_when_even_the_notice_cannot_fit() {
 
 #[test]
 fn remove_family_preserves_unrelated_files_and_symlinks() {
-    let temp = TempDir::new("remove");
+    let temp = pohunek_test_support::tempdir_with_prefix("log-remove-")
+        .expect("create isolated test directory");
     let owned = files("service.jsonl");
     fs::write(temp.path().join("service.jsonl"), b"active").unwrap();
     fs::write(temp.path().join("service.jsonl.1"), b"rotated").unwrap();
