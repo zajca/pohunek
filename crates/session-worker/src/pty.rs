@@ -1905,6 +1905,12 @@ mod tests {
         );
     }
 
+    /// The production stop grace: a stop under test never escalates early because
+    /// a loaded host was slow, and a child that dies on SIGTERM does not wait it out.
+    fn stop_grace() -> Duration {
+        WorkerConfig::new().stop_grace
+    }
+
     fn shell(script: &str, cwd: &std::path::Path) -> Command {
         Command {
             program: "/bin/sh".to_owned(),
@@ -2293,10 +2299,7 @@ mod tests {
         assert_eq!(pause.held_bytes().expect("TIOCOUTQ"), 0);
         pause.resume().expect("resume output");
 
-        let _ = pty
-            .stop("cleanup", Duration::from_millis(200))
-            .await
-            .expect("cleanup");
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
     }
 
     #[tokio::test]
@@ -2434,14 +2437,11 @@ mod tests {
             .execute_control("daemon-test", 1, operation)
             .await
             .expect("deduplicate");
-        let exit = pty
-            .stop("stop-1", Duration::from_millis(200))
-            .await
-            .expect("stop");
+        let exit = pty.stop("stop-1", stop_grace()).await.expect("stop");
 
         assert!(!exit.success);
         assert_eq!(
-            pty.stop("stop-1", Duration::from_millis(200))
+            pty.stop("stop-1", stop_grace())
                 .await
                 .expect("duplicate stop"),
             exit
@@ -2482,28 +2482,29 @@ mod tests {
             cwd.path(),
         ));
         let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
-        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+        let root_exit = pohunek_test_support::wait::guard("the root to exit", pty.wait_exit())
             .await
-            .expect("root exit deadline")
             .expect("root exit");
 
-        let observed = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut observed = Vec::new();
-            loop {
-                match output.recv().await.expect("output event before EOF") {
-                    OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
-                        observed.extend_from_slice(&chunk.bytes);
+        let observed = pohunek_test_support::wait::guard(
+            "the revoked terminal to reach EOF without waiting for the descendant",
+            async {
+                let mut observed = Vec::new();
+                loop {
+                    match output.recv().await.expect("output event before EOF") {
+                        OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
+                            observed.extend_from_slice(&chunk.bytes);
+                        }
+                        OutputEvent::TerminalSnapshot(chunk) => {
+                            observed.extend_from_slice(&chunk.bytes);
+                        }
+                        OutputEvent::Gap { .. } => observed.clear(),
+                        OutputEvent::Exit { .. } => break observed,
                     }
-                    OutputEvent::TerminalSnapshot(chunk) => {
-                        observed.extend_from_slice(&chunk.bytes);
-                    }
-                    OutputEvent::Gap { .. } => observed.clear(),
-                    OutputEvent::Exit { .. } => break observed,
                 }
-            }
-        })
-        .await
-        .expect("the revoked terminal must reach EOF without waiting for the descendant");
+            },
+        )
+        .await;
         let text = String::from_utf8_lossy(&observed);
         assert!(
             text.contains("root-final"),
@@ -2527,26 +2528,22 @@ mod tests {
             "the unreaped root must stay observable as the group authority"
         );
 
-        let stopped = tokio::time::timeout(
-            Duration::from_secs(2),
-            pty.stop("stop-after-revoke", Duration::from_millis(200)),
+        let stopped = pohunek_test_support::wait::guard(
+            "stop to end the remaining group",
+            pty.stop("stop-after-revoke", stop_grace()),
         )
         .await
-        .expect("bounded stop deadline")
         .expect("stop the remaining group");
         assert_eq!(stopped, root_exit);
         assert!(
             read_process_start(pty.identity().pid).is_err(),
             "root must be reaped after stop"
         );
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while kill(descendant.0, None).is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "stop must terminate the descendant left in the root's group"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        pohunek_test_support::wait::wait_until(
+            "stop to terminate the descendant left in the root's group",
+            || async { kill(descendant.0, None).is_err().then_some(()) },
+        )
+        .await;
     }
 
     // Needs a descendant that keeps the PTY open after the root exits. Darwin
@@ -2565,9 +2562,8 @@ mod tests {
             cwd.path(),
         ));
         let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
-        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+        let root_exit = pohunek_test_support::wait::guard("the root to exit", pty.wait_exit())
             .await
-            .expect("root exit deadline")
             .expect("root exit");
         assert!(root_exit.success);
         assert!(
@@ -2640,18 +2636,19 @@ mod tests {
             cols: 80,
             rows: 24,
         });
-        tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+        pohunek_test_support::wait::guard("the root to exit", pty.wait_exit())
             .await
-            .expect("root exit deadline")
             .expect("root exit");
         assert!(!pty.output().observe(None, 1).expect("output page").exited);
 
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
+        // The escaped holder never closes the PTY, so the outcome is a forced close
+        // whatever the grace is; the short grace only keeps the test fast, and the
+        // hang guard replaces a wall-clock bound on the stop.
+        let error = pohunek_test_support::wait::guard(
+            "stop to force-close the escaped output",
             pty.stop("stop-escaped-descendant", Duration::from_millis(50)),
         )
         .await
-        .expect("bounded forced-close deadline")
         .expect_err("escaped PTY holder requires forced close");
         assert!(matches!(error, PtyError::OutputForcedClosed));
         assert!(matches!(
@@ -2700,9 +2697,8 @@ mod tests {
             cols: 80,
             rows: 24,
         });
-        let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
+        let root_exit = pohunek_test_support::wait::guard("the root to exit", pty.wait_exit())
             .await
-            .expect("root exit deadline")
             .expect("root exit");
         pty.output().mark_exit();
 
@@ -2721,7 +2717,7 @@ mod tests {
         assert_eq!(finished, root_exit);
         assert!(!pty.output_forced_closed());
         assert_eq!(
-            pty.stop("repeat-after-natural-winner", Duration::from_millis(50))
+            pty.stop("repeat-after-natural-winner", stop_grace())
                 .await
                 .expect("repeat stop"),
             root_exit
@@ -2912,12 +2908,11 @@ mod tests {
             .expect("reader thread lock")
             .take()
             .expect("reader thread handle");
-        tokio::time::timeout(
-            Duration::from_secs(2),
+        pohunek_test_support::wait::guard(
+            "the output reader thread to exit",
             tokio::task::spawn_blocking(move || reader.join()),
         )
         .await
-        .expect("reader exit deadline")
         .expect("reader join task")
         .expect("reader thread must exit cleanly");
 
@@ -2940,7 +2935,7 @@ mod tests {
         );
 
         let exit = pty
-            .stop("cleanup", Duration::from_millis(200))
+            .stop("cleanup", stop_grace())
             .await
             .expect("stop still reaps the root after a forced output close");
         assert!(!exit.success, "the root was signalled, not left to finish");
@@ -2956,10 +2951,7 @@ mod tests {
         assert!(!pty.resize("attach-1", 1, 80, 24).await.expect("older"));
         assert_eq!(pty.dimensions().await, (100, 40));
 
-        let _ = pty
-            .stop("cleanup", Duration::from_millis(200))
-            .await
-            .expect("cleanup");
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
     }
 
     #[tokio::test]
@@ -3006,31 +2998,30 @@ mod tests {
     async fn resize_and_snapshot_complete_during_continuous_output() {
         let cwd = crate::test_support::child_cwd();
         let pty = spawn(shell("yes continuous-output", cwd.path()));
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while pty.output().next_offset() < READ_CHUNK_BYTES as u64 {
-                tokio::task::yield_now().await;
-            }
+        pohunek_test_support::wait::wait_until("continuous output to start", || async {
+            (pty.output().next_offset() >= READ_CHUNK_BYTES as u64).then_some(())
         })
-        .await
-        .expect("continuous output must start");
+        .await;
 
-        tokio::time::timeout(
-            Duration::from_secs(2),
+        // A starved resize or snapshot never completes while output keeps
+        // flowing, which the hang guard reports by name.
+        pohunek_test_support::wait::guard(
+            "resize to complete during continuous output",
             pty.resize("attach-noisy", 1, 100, 30),
         )
         .await
-        .expect("resize must not starve")
         .expect("resize");
-        let (subscriber, dimensions) =
-            tokio::time::timeout(Duration::from_secs(2), pty.attach_snapshot(Some((90, 28))))
-                .await
-                .expect("snapshot must not starve")
-                .expect("snapshot");
+        let (subscriber, dimensions) = pohunek_test_support::wait::guard(
+            "snapshot to complete during continuous output",
+            pty.attach_snapshot(Some((90, 28))),
+        )
+        .await
+        .expect("snapshot");
         assert_eq!(dimensions, (90, 28));
         drop(subscriber);
 
         let _ = pty
-            .stop("cleanup-noisy", Duration::from_millis(200))
+            .stop("cleanup-noisy", stop_grace())
             .await
             .expect("cleanup");
     }
@@ -3047,10 +3038,7 @@ mod tests {
             "a blocking master read can park while holding the ordering gate"
         );
 
-        let _ = pty
-            .stop("cleanup", Duration::from_millis(200))
-            .await
-            .expect("cleanup");
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
     }
 
     /// A read whose readiness lapsed ends the drain instead of parking.
@@ -3086,10 +3074,7 @@ mod tests {
             .expect("drain");
         assert_eq!(state, OutputReadState::Lapsed);
 
-        let _ = pty
-            .stop("cleanup", Duration::from_millis(200))
-            .await
-            .expect("cleanup");
+        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
     }
 
     /// Input larger than the kernel's PTY queues is written in full.
