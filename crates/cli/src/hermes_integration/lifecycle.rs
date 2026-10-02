@@ -1456,7 +1456,7 @@ mod tests {
                 .expect("private directory");
         }
         let cli = root.0.join("pohunek");
-        fs::write(&cli, b"#!/bin/sh\nexit 0\n").expect("cli");
+        pohunek_test_support::fs::write_file(&cli, b"#!/bin/sh\nexit 0\n").expect("cli");
         fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).expect("executable");
         let context = TargetContext::new(
             root.0.join("hermes"),
@@ -1486,7 +1486,8 @@ mod tests {
     }
 
     fn write_executable(path: &Path, body: &str) -> PathBuf {
-        fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write executable");
+        pohunek_test_support::fs::write_file(path, format!("#!/bin/sh\nset -eu\n{body}\n"))
+            .expect("write executable");
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("executable mode");
         path.to_owned()
     }
@@ -1890,7 +1891,7 @@ mod tests {
                 .expect("private fixture directory");
         }
         let cli = root.0.join("pohunek");
-        fs::write(&cli, b"#!/bin/sh\nexit 0\n").expect("cli");
+        pohunek_test_support::fs::write_file(&cli, b"#!/bin/sh\nexit 0\n").expect("cli");
         fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).expect("executable");
         let context = TargetContext::new(
             root.0.join("hermes"),

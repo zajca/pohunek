@@ -1,10 +1,8 @@
 //! Fixtures shared by the `shell_env` unit tests.
 
 use std::fs;
-use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// A canonical temporary root with mode 0700.
 ///
@@ -45,53 +43,20 @@ pub(super) fn make_dir(root: &Path, path: &Path) {
 
 /// Writes an executable script with mode 0755 and returns its path.
 ///
-/// A separate process writes the file. While this process held a writable
-/// descriptor, a sibling test thread that spawned a process would give its
-/// child a copy until the child's own `exec`, and executing the script
-/// meanwhile would fail with `ETXTBSY`. The writer exits before the script is
-/// returned, so no descriptor open for writing remains anywhere.
+/// The file is written through `pohunek_test_support::fs::write_executable`,
+/// which holds no write descriptor in this process, so a sibling test thread
+/// that spawns a process cannot make `exec` of the script fail with `ETXTBSY`.
 pub(super) fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    write_without_local_writer(&path, format!("#!/bin/sh\n{body}\n").as_bytes());
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod script");
+    pohunek_test_support::fs::write_executable(&path, format!("#!/bin/sh\n{body}\n"))
+        .expect("write script");
     path
-}
-
-/// Search path of the fixture's `sh` children: the system directories that
-/// hold `cat` on Linux and macOS, so no developer `PATH` entry is consulted.
-const CHILD_PATH: &str = "/usr/bin:/bin";
-
-/// A `sh` command with an empty environment apart from [`CHILD_PATH`], in the
-/// private directory `cwd`.
-fn scrubbed_command(cwd: &Path) -> Command {
-    let mut command = Command::new("/bin/sh");
-    command.env_clear().env("PATH", CHILD_PATH).current_dir(cwd);
-    command
-}
-
-/// Creates `path` with `content` through a `sh` child that owns the write
-/// descriptor.
-fn write_without_local_writer(path: &Path, content: &[u8]) {
-    let mut writer = scrubbed_command(path.parent().expect("script path has a directory"))
-        .args(["-c", "cat > \"$1\"", "sh"])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .spawn()
-        .expect("spawn script writer");
-    writer
-        .stdin
-        .take()
-        .expect("script writer stdin")
-        .write_all(content)
-        .expect("send script content");
-    assert!(
-        writer.wait().expect("wait for script writer").success(),
-        "the script writer failed"
-    );
 }
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
     use crate::test_spawn::while_a_sibling_spawns;
 

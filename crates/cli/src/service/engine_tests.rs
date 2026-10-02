@@ -761,10 +761,9 @@ fn discovering(
     name: &str,
     dir: &std::path::Path,
 ) -> Context {
-    use std::os::unix::fs::PermissionsExt as _;
     crate::service::context::tests::make_dirs(root, dir);
     let shell = root.join(name);
-    std::fs::write(
+    pohunek_test_support::fs::write_executable(
         &shell,
         format!(
             "#!/bin/sh\nPATH='{}'; export PATH\nexec /bin/sh -c \"$3\"\n",
@@ -772,7 +771,6 @@ fn discovering(
         ),
     )
     .expect("write shell");
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let discovery = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
         .expect("discovery");
     let crate::service::context::PathDiscovery::Managed {
@@ -906,18 +904,15 @@ async fn a_hostile_discovery_environment_fails_install_and_check_before_a_foreig
 
 #[tokio::test]
 async fn an_existing_installation_wins_over_discovery_and_never_starts_the_probe() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let mut harness = Harness::new();
     harness.install(V1).await.expect("install");
     let marker = harness.root.join("probe-ran");
     let shell = harness.root.join("marker-shell");
-    std::fs::write(
+    pohunek_test_support::fs::write_executable(
         &shell,
         format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
     )
     .expect("write shell");
-    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let discovery = crate::service::context::managed_path_discovery(Some(shell), Vec::new())
         .expect("discovery");
     let probing = harness.context.clone().with_path_discovery(discovery);
@@ -990,8 +985,6 @@ async fn check_and_install_agree_on_the_config_of_a_resumed_install() {
 
 #[tokio::test]
 async fn rolling_back_an_interrupted_upgrade_needs_no_discovery() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     for hostile in [true, false] {
         let mut harness = Harness::new();
         harness.install(V1).await.expect("install");
@@ -1005,12 +998,11 @@ async fn rolling_back_an_interrupted_upgrade_needs_no_discovery() {
 
         let marker = harness.root.join("probe-ran");
         let shell = harness.root.join("marker-shell");
-        std::fs::write(
+        pohunek_test_support::fs::write_executable(
             &shell,
             format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
         )
         .expect("write shell");
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         harness.context = if hostile {
             with_hostile_discovery_environment(&harness.context)
         } else {

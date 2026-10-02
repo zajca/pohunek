@@ -490,7 +490,8 @@ mod tests {
     }
 
     fn write_executable(path: &Path, body: &str) -> PathBuf {
-        fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write executable");
+        pohunek_test_support::fs::write_file(path, format!("#!/bin/sh\nset -eu\n{body}\n"))
+            .expect("write executable");
         set_mode(path, PRIVATE_DIRECTORY_MODE);
         path.to_owned()
     }
@@ -767,7 +768,7 @@ mod tests {
         assert_eq!(check(&report, "skill_registration"), Status::NotRun);
 
         let mut incompatible_cli = fixture("bad-cli", "enabled", "full");
-        fs::write(&incompatible_cli.cli, "#!/bin/sh\nprintf '%s\\n' '{\"protocol\":{\"minimum\":99,\"maximum\":99},\"ok\":{}}'\n")
+        pohunek_test_support::fs::write_file(&incompatible_cli.cli, "#!/bin/sh\nprintf '%s\\n' '{\"protocol\":{\"minimum\":99,\"maximum\":99},\"ok\":{}}'\n")
             .expect("rewrite controlled CLI");
         set_mode(&incompatible_cli.cli, PRIVATE_DIRECTORY_MODE);
         let report = inspect(

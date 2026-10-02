@@ -2522,12 +2522,8 @@ fn write(path: &Path, contents: &str) {
 }
 
 fn write_executable(path: &Path, contents: &str) {
-    write(path, contents);
-    let mut permissions = fs::metadata(path)
-        .expect("executable metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("set executable mode");
+    create_dirs(path.parent().expect("parent"));
+    pohunek_test_support::fs::write_executable(path, contents).expect("write executable");
 }
 
 fn read(path: &Path) -> String {

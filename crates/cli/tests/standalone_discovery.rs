@@ -1,14 +1,14 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 
 use pohunek_test_support::env::TestEnv;
 
 fn fake_netbird(bin: &std::path::Path) {
     let path = bin.join("netbird");
-    fs::write(&path, "#!/bin/sh\nprintf '%s\\n' '{\"peers\":[]}'\n").expect("write fake netbird");
-    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("chmod fake netbird");
+    pohunek_test_support::fs::write_executable(
+        &path,
+        "#!/bin/sh\nprintf '%s\\n' '{\"peers\":[]}'\n",
+    )
+    .expect("write fake netbird");
 }
 
 #[test]
