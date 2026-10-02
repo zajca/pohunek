@@ -50,6 +50,10 @@ fn discover_and_list_json_need_cache_and_netbird_but_not_runtime_socket() {
             .env("XDG_CACHE_HOME", root.join("cache"))
             .env_remove("XDG_RUNTIME_DIR")
             .env_remove("HOME")
+            // The child must not inherit the origin pair of a developer's own
+            // pohunek session: a partial pair is a hard error.
+            .env_remove(pohunek_client::protocol::ENV_SESSION_ID)
+            .env_remove(pohunek_client::protocol::ENV_DAEMON_ID)
             .output()
             .expect("run CLI");
         assert!(

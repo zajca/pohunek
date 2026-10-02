@@ -417,6 +417,7 @@ mod tests {
             cache_dir: base.join("cache"),
             config_home: base.join("config"),
             config_dir: base.join("config").join("pohunek"),
+            origin_source: pohunek_client::OriginSource::Omitted,
         }
     }
 

@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use pohunek_client::OriginSource;
+
 use crate::error::CliError;
 
 /// Resolved CLI paths.
@@ -28,6 +30,10 @@ pub(crate) struct Paths {
     /// pohunek's config dir (`<config_home>/pohunek`) — holds `launcher.conf`
     /// and `prompts/*.tmpl` consumed by the launcher scripts.
     pub(crate) config_dir: PathBuf,
+    /// Where daemon connections made with these paths take their request
+    /// origin from. [`Self::resolve`] selects the process environment, so the
+    /// binary attributes requests to the session it runs in.
+    pub(crate) origin_source: OriginSource,
 }
 
 impl Paths {
@@ -77,6 +83,7 @@ impl Paths {
             cache_dir: base.cache_dir,
             config_home: base.config_home,
             config_dir: base.config_dir,
+            origin_source: OriginSource::Environment,
         })
     }
 

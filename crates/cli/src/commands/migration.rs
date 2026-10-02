@@ -61,7 +61,7 @@ pub(crate) async fn run_preflight(
         )));
     }
     let mut client = match socket {
-        Some(socket) => Client::connect_socket(socket).await?,
+        Some(socket) => Client::connect_socket(socket, paths).await?,
         None => Client::connect(host, paths).await?,
     };
     let sessions = client
