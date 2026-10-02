@@ -614,6 +614,7 @@ async fn login_stops_at_its_monotonic_deadline_instead_of_sleeping_past_expiry()
         login(&api, &MemoryStore::default(), |_uri, _code| Ok(())).await,
         Err(Error::Expired)
     ));
+    // timing-allowed: #362 Instant comes from tokio::time via super::*, so this reads the paused clock
     assert!(started.elapsed() <= Duration::from_secs(3));
     assert_eq!(api.poll_times.lock().expect("times").len(), 1);
 }

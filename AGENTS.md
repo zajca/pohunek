@@ -223,7 +223,9 @@ it is incidental, wait on a readiness signal with `pohunek_test_support::wait`,
 bounded by `HANG_GUARD`. `crates/xtask/tests/timing_ratchet.rs` counts sleeps
 and `.elapsed()` literal assertions in test code per file against
 `timing_ratchet_baseline.txt`, which may only go down (lower it with the
-ignored `regenerate_timing_baseline` test). An unavoidable real-time wait
+ignored `regenerate_timing_baseline` test). Paused-time tests exempt only
+tokio timers (and `.elapsed()` when the file uses `tokio::time::Instant`
+alone); `thread::sleep` and `Timer::after` stay counted. An unavoidable real-time wait
 carries `// timing-allowed: #<issue> <reason>` on or directly above its line.
 
 Flaky tests: `.config/nextest.toml` sets `flaky-result = "fail"` in

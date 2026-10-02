@@ -24,12 +24,16 @@
 //! only goes down, so a removed wait must also be removed from the baseline.
 //!
 //! Not counted:
-//! - occurrences inside a test item declared
-//!   `#[tokio::test(.. start_paused = true ..)]`, which run on virtual time;
+//! - tokio `time::sleep`/`sleep_until` occurrences inside a test item declared
+//!   `#[tokio::test(.. start_paused = true ..)]`: only tokio timers run on the
+//!   paused clock. `thread::sleep` and `Timer::after` wait in real time there
+//!   too and stay counted. An `.elapsed()` assertion in such a test is exempt
+//!   only when the file imports `tokio::time::Instant` and names no other
+//!   `Instant`; a lexical scan cannot otherwise tell it from `std::time::Instant`;
 //! - occurrences on a line that carries, or follows a line that carries, a
-//!   comment starting `// timing-allowed: #<issue> <reason>`. The marker must
+//!   line comment starting `// timing-allowed: #<issue> <reason>`. The marker must
 //!   name an issue number and a non-empty reason; a malformed marker is itself
-//!   a failure.
+//!   a failure. Text inside a block comment or string is never a marker.
 //!
 //! After lowering counts, rewrite the baseline with
 //! `cargo nextest run -p xtask --run-ignored only -E 'test(regenerate_timing_baseline)'`.
@@ -347,29 +351,63 @@ fn elapsed_candidates(skeleton: &str) -> Vec<(usize, Kind)> {
     found
 }
 
-/// Lines (one-based) carrying a valid marker and the malformed marker lines.
-fn markers(file: &SourceFile, text: &str) -> (Vec<usize>, Vec<usize>) {
-    let code = file.views().code.as_bytes();
-    let mut valid = Vec::new();
-    let mut malformed = Vec::new();
-    let mut line_start = 0;
-    for (index, line) in text.split_inclusive('\n').enumerate() {
-        let comment = line
-            .match_indices("//")
-            .map(|(at, _)| at)
-            .find(|&at| code[line_start + at] == b' ');
-        if let Some(rest) = comment.map(|at| &line[at + 2..]) {
-            if !rest.starts_with(['/', '!']) {
-                if let Some(body) = rest.trim_start().strip_prefix(MARKER) {
-                    if is_valid_marker(body) {
-                        valid.push(index + 1);
-                    } else {
-                        malformed.push(index + 1);
+/// Byte offsets of the `//` that begin a line comment, outside block comments,
+/// strings and char literals.
+///
+/// `Views::code` blanks line and block comments alike, so a blanked,
+/// non-whitespace byte starts a comment and the text there tells the kind.
+fn line_comment_starts(text: &str, code: &str) -> Vec<usize> {
+    let (text, code) = (text.as_bytes(), code.as_bytes());
+    let mut starts = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if code[i] != b' ' || text[i].is_ascii_whitespace() {
+            i += 1;
+        } else if text[i..].starts_with(b"//") {
+            starts.push(i);
+            i += text[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(text.len() - i);
+        } else {
+            let mut depth = 0_usize;
+            while i < text.len() {
+                if text[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if text[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
                     }
+                } else {
+                    i += 1;
                 }
             }
         }
-        line_start += line.len();
+    }
+    starts
+}
+
+/// Lines (one-based) carrying a valid marker and the malformed marker lines.
+fn markers(file: &SourceFile, text: &str) -> (Vec<usize>, Vec<usize>) {
+    let mut valid = Vec::new();
+    let mut malformed = Vec::new();
+    for at in line_comment_starts(text, &file.views().code) {
+        let rest = &text[at + 2..];
+        let rest = &rest[..rest.find('\n').unwrap_or(rest.len())];
+        if rest.starts_with(['/', '!']) {
+            continue;
+        }
+        if let Some(body) = rest.trim_start().strip_prefix(MARKER) {
+            let line = file.line_of(at);
+            if is_valid_marker(body) {
+                valid.push(line);
+            } else {
+                malformed.push(line);
+            }
+        }
     }
     (valid, malformed)
 }
@@ -396,6 +434,48 @@ fn on_virtual_time(file: &SourceFile, offset: usize) -> bool {
     })
 }
 
+/// Whether every `Instant` the file names is `tokio::time::Instant`, so an
+/// `.elapsed()` reads the paused clock.
+///
+/// A lexical scan cannot type `started`; the file counts as tokio-only when it
+/// imports `tokio::time::Instant` and no other `Instant` by `use` or by a
+/// `time::Instant` path.
+fn uses_only_tokio_instant(skeleton: &str) -> bool {
+    let bytes = skeleton.as_bytes();
+    let (mut tokio, mut other) = (false, false);
+    for (at, _) in skeleton.match_indices("use ") {
+        if !starts_word(bytes, at) {
+            continue;
+        }
+        let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+        let statement = &skeleton[at..end];
+        if contains_word(statement, "Instant") || statement.contains("time::*") {
+            if contains_word(statement, "tokio") {
+                tokio = true;
+            } else {
+                other = true;
+            }
+        }
+    }
+    let squeezed: String = skeleton.chars().filter(|c| !c.is_whitespace()).collect();
+    for (at, _) in squeezed.match_indices("time::Instant") {
+        if !squeezed[..at].ends_with("tokio::") {
+            other = true;
+        }
+    }
+    tokio && !other
+}
+
+/// Whether an occurrence of `kind` waits on tokio's paused clock: only tokio
+/// timers are virtualized, and `.elapsed()` only when it reads a tokio `Instant`.
+fn is_virtual(kind: Kind, only_tokio_instant: bool) -> bool {
+    match kind {
+        Kind::TokioSleep => true,
+        Kind::ElapsedAssert => only_tokio_instant,
+        Kind::ThreadSleep | Kind::TimerAfter => false,
+    }
+}
+
 /// Scans `files` (workspace-relative path to text).
 fn scan_files(files: &BTreeMap<String, String>) -> Scan {
     let mut scan = Scan::default();
@@ -408,6 +488,7 @@ fn scan_files(files: &BTreeMap<String, String>) -> Scan {
                 line,
             }));
         let skeleton = &file.views().skeleton;
+        let only_tokio_instant = uses_only_tokio_instant(skeleton);
         let mut candidates = sleep_candidates(skeleton);
         candidates.extend(timer_candidates(skeleton));
         candidates.extend(elapsed_candidates(skeleton));
@@ -415,7 +496,9 @@ fn scan_files(files: &BTreeMap<String, String>) -> Scan {
         for (offset, kind) in candidates {
             let line = file.line_of(offset);
             let allowed = valid.contains(&line) || valid.contains(&(line.saturating_sub(1)));
-            if file.in_test_code(offset) && !on_virtual_time(&file, offset) && !allowed {
+            let virtual_time =
+                is_virtual(kind, only_tokio_instant) && on_virtual_time(&file, offset);
+            if file.in_test_code(offset) && !virtual_time && !allowed {
                 scan.counted.push(Occurrence {
                     path: path.clone(),
                     line,
@@ -622,6 +705,60 @@ fn sleeps_inside_a_start_paused_test_are_virtual_time() {
 }
 
 #[test]
+fn only_tokio_timers_are_exempt_in_a_paused_test() {
+    let paused = "#[tokio::test(start_paused = true)]\nasync fn f() {\n";
+    for statement in [
+        "std::thread::sleep(d);",
+        "thread::sleep(d);",
+        "Timer::after(d).await;",
+        "smol::Timer::after(d).await;",
+    ] {
+        let text = format!("{paused}    {statement}\n}}\n");
+        assert_eq!(scan_one(DEMO, &text).counted.len(), 1, "{statement}");
+    }
+    let text = format!("use std::thread::sleep;\n{paused}    sleep(d);\n}}\n");
+    assert_eq!(scan_one(DEMO, &text).counted.len(), 1);
+    let text = format!("{paused}    tokio::time::sleep_until(t).await;\n}}\n");
+    assert!(scan_one(DEMO, &text).counted.is_empty());
+}
+
+#[test]
+fn elapsed_in_a_paused_test_is_exempt_only_for_a_tokio_instant() {
+    let body = "#[tokio::test(start_paused = true)]\nasync fn f() {\n    assert!(t.elapsed() >= Duration::from_secs(1));\n}\n";
+    let counted = [
+        String::new(),
+        "use std::time::Instant;\n".to_owned(),
+        "use std::time::{Duration, Instant};\n".to_owned(),
+        "use std::time::*;\n".to_owned(),
+        "use tokio::time::Instant;\nuse std::time::Instant as Real;\n".to_owned(),
+        "use tokio::time::Instant;\nfn g() { std::time::Instant::now(); }\n".to_owned(),
+        "use tokio::time::Instant;\nuse std::time;\nfn g() { time::Instant::now(); }\n".to_owned(),
+        "use tokio::time::Duration;\n".to_owned(),
+    ];
+    for prefix in counted {
+        let scan = scan_one(DEMO, &format!("{prefix}{body}"));
+        assert_eq!(scan.counted.len(), 1, "{prefix}");
+        assert_eq!(scan.counted[0].kind, Kind::ElapsedAssert, "{prefix}");
+    }
+    for prefix in [
+        "use tokio::time::Instant;\n",
+        "use tokio::time::{Duration, Instant};\n",
+        "use tokio::time::{self, Instant};\n",
+        "use tokio::time::Instant;\nfn g() { tokio::time::Instant::now(); }\n",
+    ] {
+        assert!(
+            scan_one(DEMO, &format!("{prefix}{body}"))
+                .counted
+                .is_empty(),
+            "{prefix}"
+        );
+    }
+    let unpaused = body.replace("(start_paused = true)", "");
+    let text = format!("use tokio::time::Instant;\n{unpaused}");
+    assert_eq!(scan_one(DEMO, &text).counted.len(), 1);
+}
+
+#[test]
 fn a_valid_marker_on_or_above_the_line_exempts_the_occurrence() {
     let forms = [
         "#[test]\nfn f() {\n    thread::sleep(d); // timing-allowed: #362 asserts the OS timer\n}\n",
@@ -674,6 +811,32 @@ fn marker_text_in_docs_strings_and_mid_comment_is_not_a_marker() {
         "}\n",
     );
     assert!(scan_one(DEMO, text).malformed.is_empty());
+}
+
+#[test]
+fn a_marker_inside_a_block_comment_is_neither_valid_nor_malformed() {
+    let inside = [
+        "/* // timing-allowed: #362 reason */",
+        "/* // timing-allowed */",
+        "/* a\n// timing-allowed: broken\n*/",
+        "/* /* nested */ // timing-allowed */",
+    ];
+    for comment in inside {
+        let text = format!("#[test]\nfn f() {{\n    {comment}\n    thread::sleep(d);\n}}\n");
+        let scan = scan_one(DEMO, &text);
+        assert!(scan.malformed.is_empty(), "{comment}");
+        assert_eq!(scan.counted.len(), 1, "{comment}");
+    }
+}
+
+#[test]
+fn a_line_comment_marker_after_a_closed_block_comment_still_works() {
+    let valid = "#[test]\nfn f() {\n    /* note */ // timing-allowed: #362 reason\n    thread::sleep(d);\n}\n";
+    let scan = scan_one(DEMO, valid);
+    assert!(scan.counted.is_empty() && scan.malformed.is_empty());
+    let malformed =
+        "#[test]\nfn f() {\n    /* note */ // timing-allowed\n    thread::sleep(d);\n}\n";
+    assert_eq!(scan_one(DEMO, malformed).malformed.len(), 1);
 }
 
 #[test]
