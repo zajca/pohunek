@@ -5005,18 +5005,23 @@ try:
         data = os.read(IN, 4096)
         if not data:
             break
+        # Everything read in one go is echoed before any line reaches the shell
+        # loop, so the loop's output never lands inside a half-echoed paste.
+        submitted = []
         for byte in data:
             if byte == 3:
                 line.clear()
                 acknowledge_interrupt()
             elif byte in (10, 13):
                 echo(byte)
-                child.stdin.write(bytes(line) + b"\n")
-                child.stdin.flush()
+                submitted.append(bytes(line) + b"\n")
                 line.clear()
             else:
                 echo(byte)
                 line.append(byte)
+        for text in submitted:
+            child.stdin.write(text)
+            child.stdin.flush()
 except BrokenPipeError:
     pass
 finally:
