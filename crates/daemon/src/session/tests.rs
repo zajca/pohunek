@@ -9946,8 +9946,11 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
 async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
     let store_path = temp_store_path("stale-watcher-commit-window");
     let registry = SessionRegistry::new(SessionRegistryConfig {
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path.clone()),
+        // The foreground process dies on SIGTERM. The default command is the host's
+        // interactive `$SHELL`, which ignores it, so stop would wait out the grace and
+        // then depend on the SIGKILL window.
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        store_path: Some(store_path),
         ..SessionRegistryConfig::default()
     });
     let created = registry
@@ -9972,7 +9975,10 @@ async fn stale_runtime_watchers_emit_nothing_during_new_runtime_commit() {
         crate::store::DesiredState::Running,
         None,
     );
-    let store = crate::store::Store::new(store_path);
+    // The commit goes through the registry's own store: its write lock is what
+    // serializes it against a stale watcher's in-flight write. A second `Store`
+    // over the same path has its own lock and can lose that update.
+    let store = registry.inner.store.clone().expect("registry store");
     assert_eq!(
         store
             .record_session(&new_record)
