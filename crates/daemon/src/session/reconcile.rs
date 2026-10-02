@@ -2087,9 +2087,18 @@ impl SessionRegistry {
             }
         }
         terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
+        // An exited runtime has completed any stop it was asked for; a durable
+        // stop intent decides the outcome even when the worker saw the root exit
+        // before the stop request. A lost runtime proves nothing about its
+        // transaction, so that one stays for the next reconciliation.
+        let exited = snapshot.phase == RuntimePhase::Exited;
+        if exited {
+            record.transaction = None;
+        }
+        let stopped_by_intent = exited && record.desired_state != DesiredState::Running;
         if let Some(exit) = &snapshot.exit {
             record.info.exit_code = exit.code;
-            record.info.state = if exit.stopped_by_user {
+            record.info.state = if exit.stopped_by_user || stopped_by_intent {
                 SessionState::Stopped
             } else if exit.code == Some(0) && exit.signal.is_none() {
                 SessionState::Done
@@ -6978,6 +6987,63 @@ while os.getppid() == parent:
             assert_eq!(info.state, SessionState::Stopped);
             assert_eq!(info.output_force_closed, expected);
             assert!(info.warnings.is_empty());
+        }
+    }
+
+    /// An exited worker whose root exited before the stop request: the durable
+    /// stop intent makes the session Stopped and settles the stop transaction.
+    #[tokio::test]
+    async fn an_exited_worker_import_honours_a_durable_stop_intent() {
+        for (desired_state, code, expected_state) in [
+            (DesiredState::Stopped, Some(0), SessionState::Stopped),
+            (DesiredState::Stopped, Some(3), SessionState::Stopped),
+            (DesiredState::Running, Some(0), SessionState::Done),
+            (DesiredState::Running, Some(3), SessionState::Failed),
+        ] {
+            let dir = pohunek_test_support::tempdir().expect("store fixture root");
+            let store_path = dir.path().join("data/metadata.jsonl");
+            let registry = SessionRegistry::new(SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                store_path: Some(store_path.clone()),
+                ..SessionRegistryConfig::default()
+            });
+            let mut snapshot = identity_snapshot("native-launch");
+            snapshot.phase = WorkerRuntimePhase::Exited;
+            snapshot.active_identity = None;
+            snapshot.exit = Some(pohunek_worker_protocol::ExitStatus {
+                code,
+                signal: None,
+                stopped_by_user: false,
+                exited_at_ms: 1,
+                output_forced_closed: true,
+            });
+            let mut record = identity_record();
+            record.desired_state = desired_state;
+            record.transaction = Some(crate::store::SessionTransaction {
+                id: "stop-s-identity".to_owned(),
+                kind: crate::store::TransactionKind::Stop,
+                phase: "requested".to_owned(),
+                previous_worker_id: None,
+                previous_runtime_id: None,
+                daemon_instance_id: None,
+            });
+
+            registry.import_ended_worker(record, &snapshot).await;
+
+            let info = registry
+                .inspect(&SessionId("s-identity".to_owned()))
+                .await
+                .expect("the imported session is listed");
+            assert_eq!(info.state, expected_state, "{desired_state:?} {code:?}");
+            assert_eq!(info.exit_code, code);
+            assert!(info.output_force_closed);
+            let persisted = Store::new(store_path)
+                .load_sessions()
+                .expect("load store")
+                .pop()
+                .expect("persisted record");
+            assert_eq!(persisted.transaction, None);
+            assert_eq!(persisted.info.state, expected_state);
         }
     }
 
