@@ -427,13 +427,18 @@ fn exec_path_does_not_reach_daemon_git() {
 
 /// Persistent user choices the parent exports; each must reach the subprocesses
 /// of a daemon fetch and checkout. None points at a file Git needs.
-const KEPT_USER_VARS: [(&str, &str); 6] = [
+const KEPT_USER_VARS: [(&str, &str); 11] = [
     ("GIT_SSL_CERT", "/nonexistent/pohunek/client.pem"),
     ("GIT_SSL_KEY", "/nonexistent/pohunek/client.key"),
+    ("GIT_SSL_CERT_TYPE", "P12"),
+    ("GIT_SSL_KEY_TYPE", "ENG"),
     ("GIT_SSL_CAINFO", "/nonexistent/pohunek/ca.pem"),
     ("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1"),
     ("GIT_LFS_SKIP_SMUDGE", "1"),
     ("GIT_HTTP_LOW_SPEED_LIMIT", "1"),
+    ("GIT_HTTP_RETRY_AFTER", "1"),
+    ("GIT_HTTP_MAX_RETRIES", "1"),
+    ("GIT_HTTP_MAX_RETRY_TIME", "1"),
 ];
 
 /// Variable naming the file the parent set as `GIT_TRACE`, which a Git child
@@ -600,6 +605,88 @@ fn persistent_user_variables_reach_daemon_git_subprocesses() {
         .envs(KEPT_USER_VARS)
         .envs(DROPPED_USER_VARS)
         .env(TRACE_FILE_VAR, env.root().join("trace"))
+        .output()
+        .expect("run scenario child");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Variable naming the local repository the child fetches from.
+const SOURCE_VAR: &str = "POHUNEK_TEST_GIT_SOURCE";
+
+/// Child half of [`protocol_trust_marker_does_not_reach_daemon_git`]: the
+/// environment holds `GIT_PROTOCOL_FROM_USER=0`, and the repository allows the
+/// `file` protocol for user-initiated fetches only.
+#[test]
+#[ignore = "child process of protocol_trust_marker_does_not_reach_daemon_git"]
+fn daemon_fetch_under_protocol_trust_marker() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let source = PathBuf::from(std::env::var_os(SOURCE_VAR).expect("source path"));
+    let repo = env.root().join("repo");
+    for dir in [&source, &repo] {
+        std::fs::create_dir(dir).expect("create repository directory");
+        fixture_git(&env, dir, &["init", "-q", "-b", "main"]);
+        fixture_git(&env, dir, &["config", "user.email", "test@example.com"]);
+        fixture_git(&env, dir, &["config", "user.name", "Test"]);
+        fixture_git(&env, dir, &["config", "commit.gpgsign", "false"]);
+    }
+    fixture_git(
+        &env,
+        &source,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
+    fixture_git(
+        &env,
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            &format!("file://{}", source.display()),
+        ],
+    );
+    fixture_git(&env, &repo, &["config", "protocol.file.allow", "user"]);
+
+    // Control: a git child that inherits the marker refuses the fetch, so the
+    // variable is effective for this Git.
+    let control = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["fetch", "--no-tags", "origin", "main"])
+        .output()
+        .expect("run control git");
+    assert!(
+        !control.status.success(),
+        "the inherited trust marker must refuse the user-allowed protocol"
+    );
+
+    fetch_origin(&repo, "main").expect("the daemon's fetch is user-initiated");
+    assert_eq!(
+        fixture_git(&env, &repo, &["rev-parse", "--verify", "FETCH_HEAD"]),
+        fixture_git(&env, &source, &["rev-parse", "HEAD"])
+    );
+}
+
+/// Git sets `GIT_PROTOCOL_FROM_USER=0` for the subprocesses it runs on behalf of
+/// an untrusted URL; a daemon started from one must still fetch the project's
+/// own remote.
+#[test]
+fn protocol_trust_marker_does_not_reach_daemon_git() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let output = env
+        .command(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "worktree::git_env_tests::daemon_fetch_under_protocol_trust_marker",
+        ])
+        .envs(ISOLATED_GIT_CONFIG)
+        .env("GIT_PROTOCOL_FROM_USER", "0")
+        .env(SOURCE_VAR, env.root().join("source"))
         .output()
         .expect("run scenario child");
     assert!(

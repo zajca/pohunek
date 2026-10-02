@@ -46,13 +46,16 @@ const TRANSPORT_VARS: &[&str] = &[
 ];
 
 /// TLS trust and client authentication of HTTPS remotes; the user's certificate
-/// authority, client certificate and key, and protocol or cipher policy.
+/// authority, client certificate and key (with the `*_TYPE` of a P12/DER
+/// certificate or an ENG/PKCS#11 key), and protocol or cipher policy.
 /// `GIT_SSL_NO_VERIFY` is not among them because it disables verification.
 const TLS_VARS: &[&str] = &[
     "GIT_SSL_CAINFO",
     "GIT_SSL_CAPATH",
     "GIT_SSL_CERT",
     "GIT_SSL_KEY",
+    "GIT_SSL_CERT_TYPE",
+    "GIT_SSL_KEY_TYPE",
     "GIT_SSL_CERT_PASSWORD_PROTECTED",
     "GIT_SSL_VERSION",
     "GIT_SSL_CIPHER_LIST",
@@ -69,11 +72,17 @@ const HTTP_VARS: &[&str] = &[
     "GIT_HTTP_LOW_SPEED_TIME",
     "GIT_HTTP_USER_AGENT",
     "GIT_HTTP_MAX_REQUESTS",
+    "GIT_HTTP_RETRY_AFTER",
+    "GIT_HTTP_MAX_RETRIES",
+    "GIT_HTTP_MAX_RETRY_TIME",
     "GIT_CURL_FTP_NO_EPSV",
 ];
 
-/// Which transport protocols Git may use.
-const PROTOCOL_VARS: &[&str] = &["GIT_ALLOW_PROTOCOL", "GIT_PROTOCOL_FROM_USER"];
+/// Which transport protocols Git may use. `GIT_PROTOCOL_FROM_USER` is not among
+/// them: Git sets it for its own subprocesses to mark a URL as untrusted, and an
+/// inherited `0` would refuse the `user`-allowed protocols of the daemon's own
+/// fetches.
+const PROTOCOL_VARS: &[&str] = &["GIT_ALLOW_PROTOCOL"];
 
 /// Repository detection across a mount boundary, which the user opts into for a
 /// project that spans filesystems.
@@ -108,6 +117,11 @@ const DIAGNOSTIC_FILE_VARS: &[&str] = &["GIT_LFS_PROGRESS"];
 /// reflog action and editor hand-offs a parent Git exports) or a diagnostic that
 /// can write to arbitrary files (`GIT_TRACE*`, `GIT_CURL_VERBOSE`,
 /// [`DIAGNOSTIC_FILE_VARS`]).
+///
+/// `GIT_CEILING_DIRECTORIES` is dropped because the daemon serves many projects
+/// and a ceiling inherited from the environment that launched it is not a
+/// setting about them: a hook or a shell can carry one that would hide a
+/// project's repository from detection.
 pub(crate) fn is_inherited(name: &str) -> bool {
     if DIAGNOSTIC_FILE_VARS.contains(&name) {
         return false;
@@ -203,6 +217,8 @@ mod tests {
             "GIT_SSL_CAPATH",
             "GIT_SSL_CERT",
             "GIT_SSL_KEY",
+            "GIT_SSL_CERT_TYPE",
+            "GIT_SSL_KEY_TYPE",
             "GIT_SSL_CERT_PASSWORD_PROTECTED",
             "GIT_SSL_VERSION",
             "GIT_SSL_CIPHER_LIST",
@@ -215,8 +231,10 @@ mod tests {
             "GIT_HTTP_LOW_SPEED_TIME",
             "GIT_HTTP_USER_AGENT",
             "GIT_HTTP_MAX_REQUESTS",
+            "GIT_HTTP_RETRY_AFTER",
+            "GIT_HTTP_MAX_RETRIES",
+            "GIT_HTTP_MAX_RETRY_TIME",
             "GIT_ALLOW_PROTOCOL",
-            "GIT_PROTOCOL_FROM_USER",
             "GIT_DISCOVERY_ACROSS_FILESYSTEM",
             "GIT_LFS_SKIP_SMUDGE",
             "GIT_LFS_",
@@ -243,6 +261,7 @@ mod tests {
             "GIT_PREFIX",
             "GIT_REFLOG_ACTION",
             "GIT_PROTOCOL",
+            "GIT_PROTOCOL_FROM_USER",
             "GIT_PUSH_CERT",
             "GIT_PROJECT_ROOT",
             "GIT_EDITOR",
