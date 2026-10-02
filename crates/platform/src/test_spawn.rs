@@ -7,6 +7,13 @@
 //! body panics. Setting it only on the success path would leave the thread
 //! looping, and the scope that joins it would hide the body's failure by never
 //! returning.
+//!
+//! Tests built on this helper are stress tests: the counters show that the
+//! spawner ran while the body repeated its operation, but which operation a
+//! given fork lands in is up to the scheduler. The deterministic regression
+//! tests for inherited lock descriptors hand the copy over explicitly
+//! (`filesystem::tests::dropping_a_lock_releases_it_while_a_duplicate_descriptor_stays_open`
+//! and `..._while_a_child_process_holds_an_inherited_copy`).
 
 // Rust guideline compliant 2026-10-02
 
@@ -30,8 +37,9 @@ impl Drop for StopOnDrop<'_> {
 /// Spawns that must complete during a body that repeats its operation through
 /// [`Sibling::repeat_while_spawning`].
 ///
-/// One completed spawn already proves an overlap with the body; a few make the
-/// proof independent of which single spawn the scheduler happened to run.
+/// A few completed spawns show the spawner kept running while the body
+/// repeated its operation, rather than one spawn that may have completed
+/// between two cycles.
 const MIN_OVERLAPPING_SPAWNS: usize = 3;
 
 /// Handle given to the body of [`while_a_sibling_spawns`].
@@ -48,8 +56,9 @@ impl Sibling<'_> {
 
     /// Runs `cycle` with the cycle number until at least `min_cycles` cycles ran
     /// and the spawner completed [`MIN_OVERLAPPING_SPAWNS`] spawns since the
-    /// body started, so the repeated operation overlaps spawning whatever the
-    /// scheduler does.
+    /// body started, so the operation keeps repeating while the spawner runs.
+    /// Whether a fork lands while the operation holds its descriptor is up to
+    /// the scheduler; repetition makes it likely, not certain.
     ///
     /// # Panics
     ///
@@ -68,6 +77,7 @@ impl Sibling<'_> {
             number += 1;
         }
     }
+
     /// Blocks until the spawner completes one more spawn than it had when this
     /// was called, so a short body can stay active across a spawn.
     ///
