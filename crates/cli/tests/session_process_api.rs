@@ -122,9 +122,8 @@ impl TestHome {
         // Doctor's `worker_executable` check requires an executable
         // `pohunek-sessiond` on macOS; a scripted stand-in satisfies it.
         let worker = root.join("bin-worker");
-        fs::write(&worker, b"#!/bin/sh\nexit 0\n").expect("write worker stand-in");
-        fs::set_permissions(&worker, fs::Permissions::from_mode(0o755))
-            .expect("make the worker stand-in executable");
+        pohunek_test_support::fs::write_executable(&worker, b"#!/bin/sh\nexit 0\n")
+            .expect("write worker stand-in");
         Self { env, root, worker }
     }
 
@@ -1305,7 +1304,7 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
     let bin = home.root.join("bin");
     fs::create_dir_all(&bin).expect("create fixture bin");
     let netbird = bin.join("netbird");
-    fs::write(
+    pohunek_test_support::fs::write_file(
         &netbird,
         format!(
             "#!/bin/sh\nprintf '%s\\n' '{{\"peers\":{{\"details\":[{{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"{netbird_ip}\",\"status\":\"Connected\"}}]}}}}'\n"

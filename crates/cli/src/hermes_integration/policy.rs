@@ -552,7 +552,8 @@ mod tests {
 
     fn executable(root: &Path) -> PathBuf {
         let path = root.join("pohunek");
-        fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("write executable fixture");
+        pohunek_test_support::fs::write_file(&path, b"#!/bin/sh\nexit 0\n")
+            .expect("write executable fixture");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("set executable mode");
         path
     }

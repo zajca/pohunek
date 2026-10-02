@@ -848,12 +848,11 @@ pub(crate) mod tests {
     pub(crate) fn write_fake(dir: &Path, name: &str, version: &str) {
         std::fs::create_dir_all(dir).expect("create staged dir");
         let path = dir.join(name);
-        std::fs::write(
+        pohunek_test_support::fs::write_executable(
             &path,
             format!("#!/bin/sh\n[ \"$1\" = --version ] && echo '{name} {version}'\n"),
         )
         .expect("write fake binary");
-        std::fs::set_permissions(&path, Permissions::from_mode(0o755)).expect("chmod");
     }
 
     fn busy() -> io::Error {
@@ -984,7 +983,7 @@ pub(crate) mod tests {
         assert!(!publish(&layout, &again, "1.0.0").expect("identical publish"));
 
         write_fake(&from, DAEMON_EXECUTABLE_NAME, "1.0.0");
-        std::fs::write(
+        pohunek_test_support::fs::write_file(
             from.join(DAEMON_EXECUTABLE_NAME),
             "#!/bin/sh\necho 'pohunekd 1.0.0' # changed\n",
         )
@@ -1028,8 +1027,11 @@ pub(crate) mod tests {
         let (_root, root) = temp_root();
         let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
         let from = stage_dir(root.as_path(), "1.0.0");
-        std::fs::write(from.join(DAEMON_EXECUTABLE_NAME), "#!/bin/sh\nexit 3\n")
-            .expect("broken daemon");
+        pohunek_test_support::fs::write_file(
+            from.join(DAEMON_EXECUTABLE_NAME),
+            "#!/bin/sh\nexit 3\n",
+        )
+        .expect("broken daemon");
         assert!(matches!(
             stage(&layout, &from, "1.0.0").await,
             Err(Error::VersionProbe { .. })

@@ -613,7 +613,6 @@ pub(crate) mod tests {
     #[test]
     fn a_custom_profile_location_supplies_a_prefix_outside_the_fallback_list() {
         use std::ffi::OsString;
-        use std::os::unix::fs::PermissionsExt as _;
 
         let (_root, root) = temp_root();
         let root = root.as_path();
@@ -625,12 +624,11 @@ pub(crate) mod tests {
         // under `ZDOTDIR` would set it, and ignores everything else.
         std::fs::write(zdotdir.join("path"), prefix.display().to_string()).expect("profile");
         let shell = root.join("fake-zsh");
-        std::fs::write(
+        pohunek_test_support::fs::write_executable(
             &shell,
             "#!/bin/sh\n[ -n \"$ZDOTDIR\" ] && PATH=\"$(cat \"$ZDOTDIR/path\")\"; export PATH\nexec /bin/sh -c \"$3\"\n",
         )
         .expect("shell");
-        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let shell_value = OsString::from(shell.as_os_str());
         let zdotdir_value = OsString::from(zdotdir.as_os_str());
         let PathDiscovery::Managed {

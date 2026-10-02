@@ -57,7 +57,8 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 fn write_executable(path: &Path, body: &str) {
-    fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("write executable");
+    pohunek_test_support::fs::write_file(path, format!("#!/bin/sh\nset -eu\n{body}\n"))
+        .expect("write executable");
     set_mode(path, 0o700);
 }
 

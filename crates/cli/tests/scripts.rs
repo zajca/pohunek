@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use pohunek_test_support::env::TestEnv;
@@ -18,10 +17,7 @@ fn script_path(name: &str) -> PathBuf {
 }
 
 fn write_executable(path: &Path, content: &str) {
-    fs::write(path, content).expect("write executable");
-    let mut perms = fs::metadata(path).expect("metadata").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms).expect("chmod executable");
+    pohunek_test_support::fs::write_executable(path, content).expect("write executable");
 }
 
 fn read(path: &Path) -> String {

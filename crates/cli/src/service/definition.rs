@@ -262,11 +262,9 @@ mod tests {
 
     /// Writes an executable fake login shell and returns its path.
     fn fake_shell(dir: &Path, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("fake-shell");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write shell");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod shell");
+        pohunek_test_support::fs::write_executable(&path, format!("#!/bin/sh\n{body}\n"))
+            .expect("write shell");
         path
     }
 
