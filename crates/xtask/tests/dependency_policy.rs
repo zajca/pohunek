@@ -1,5 +1,6 @@
 //! Keeps the public-verification-only RSA exception within its reviewed graph.
 
+use pohunek_test_support::env::TestEnv;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +91,7 @@ fn rsa_exception_has_only_the_reviewed_oidc_dependency_parent() {
 
 #[test]
 fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_allow() {
-    use std::{fs, process::Command};
+    use std::fs;
 
     let root = pohunek_test_support::workspace_root();
     let workspace: toml::Value =
@@ -121,13 +122,12 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
     for lint in ["disallowed_types", "disallowed_methods"] {
         lints[lint] = toml::Value::String("forbid".to_owned());
     }
-    let fixture = tempfile::tempdir().expect("isolated policy fixture");
-    fs::create_dir(fixture.path().join("src")).expect("fixture source");
-    fs::copy(
-        root.join(".clippy.toml"),
-        fixture.path().join(".clippy.toml"),
-    )
-    .expect("production Clippy policy");
+    let env = TestEnv::new().expect("hermetic test environment");
+    // The environment's private working directory is the isolated fixture crate.
+    let fixture = env.cwd();
+    fs::create_dir(fixture.join("src")).expect("fixture source");
+    fs::copy(root.join(".clippy.toml"), fixture.join(".clippy.toml"))
+        .expect("production Clippy policy");
     let mut dependency = workspace["workspace"]["dependencies"]["openidconnect"].clone();
     assert_eq!(dependency["version"].as_str(), Some("4.0.1"));
     assert_eq!(dependency["default-features"].as_bool(), Some(false));
@@ -137,21 +137,21 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
             .expect("reviewed features"),
         &[toml::Value::String("reqwest".to_owned())]
     );
-    assert_member_features(&root);
+    assert_member_features(&env, &root);
     dependency["version"] = toml::Value::String("=4.0.1".to_owned());
     let manifest = fixture_manifest(dependency, lints);
     fs::write(
-        fixture.path().join("Cargo.toml"),
+        fixture.join("Cargo.toml"),
         toml::to_string(&manifest).expect("fixture manifest"),
     )
     .expect("write manifest");
     // Reuse the already downloaded reviewed dependency versions rather than
     // resolving newer cached versions while preparing the isolated root crate.
-    fs::copy(root.join("Cargo.lock"), fixture.path().join("Cargo.lock"))
+    fs::copy(root.join("Cargo.lock"), fixture.join("Cargo.lock"))
         .expect("reviewed dependency resolution");
-    fs::write(fixture.path().join("src/main.rs"), "fn main() {}").expect("initial fixture source");
-    let resolution = Command::new("cargo")
-        .current_dir(fixture.path())
+    fs::write(fixture.join("src/main.rs"), "fn main() {}").expect("initial fixture source");
+    let resolution = host_cargo(&env)
+        .current_dir(fixture)
         .args(["tree", "--offline", "--prefix", "none"])
         .output()
         .expect("resolve isolated fixture");
@@ -160,7 +160,7 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
         "fixture resolution failed: {}",
         String::from_utf8_lossy(&resolution.stderr)
     );
-    assert_reviewed_resolution(&fixture.path().join("Cargo.lock"));
+    assert_reviewed_resolution(&fixture.join("Cargo.lock"));
     for (source, expected) in [
         (
             include_str!("fixtures/rsa_direct.rs"),
@@ -172,9 +172,9 @@ fn production_clippy_policy_rejects_private_rsa_even_through_aliases_and_local_a
         ),
         (include_str!("fixtures/rsa_alias_allow.rs"), &["E0453"][..]),
     ] {
-        fs::write(fixture.path().join("src/main.rs"), source).expect("write negative fixture");
-        let output = Command::new("cargo")
-            .current_dir(fixture.path())
+        fs::write(fixture.join("src/main.rs"), source).expect("write negative fixture");
+        let output = host_cargo(&env)
+            .current_dir(fixture)
             .args([
                 "clippy",
                 "--offline",
@@ -214,10 +214,32 @@ fn assert_reviewed_resolution(path: &std::path::Path) {
     }
 }
 
-fn assert_member_features(root: &std::path::Path) {
+/// A `cargo` command in the scrubbed environment of `env`.
+///
+/// The fixture resolves offline against the dependency versions already in the
+/// developer's registry cache, so the cargo and rustup homes (and a pinned
+/// toolchain) are passed on explicitly; everything else the environment drops.
+/// The homes default to `~/.cargo` and `~/.rustup` of the test process.
+fn host_cargo(env: &TestEnv) -> std::process::Command {
+    let mut command = env.command("cargo");
+    let host_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    for (name, default_dir) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+        let value = std::env::var_os(name)
+            .or_else(|| host_home.as_ref().map(|home| home.join(default_dir).into()));
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+    if let Some(toolchain) = std::env::var_os("RUSTUP_TOOLCHAIN") {
+        command.env("RUSTUP_TOOLCHAIN", toolchain);
+    }
+    command
+}
+
+fn assert_member_features(env: &TestEnv, root: &std::path::Path) {
     // no-deps metadata enumerates every workspace member, including newly added
     // members/globs, without downloading irrelevant target dependencies.
-    let output = std::process::Command::new("cargo")
+    let output = host_cargo(env)
         .current_dir(root)
         .args([
             "metadata",

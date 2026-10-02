@@ -232,28 +232,12 @@ fn is_tool_name(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
-    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_root() -> TempDir {
-        let path = std::env::temp_dir().join(format!(
-            "pohunek-hermes-skill-{}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("create temporary root");
-        TempDir(path)
+    /// A private fixture root that is removed when the guard drops.
+    fn temp_root() -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix("pxs-").expect("private fixture root")
     }
 
     fn write_sources(root: &Path, source: &str, plugin: &str) {
@@ -285,10 +269,10 @@ mod tests {
     #[test]
     fn deterministic_renderer_strips_knowledge_frontmatter() {
         let root = temp_root();
-        write_sources(&root.0, source(), &plugin());
+        write_sources(root.path(), source(), &plugin());
 
-        let first = render(&root.0).expect("render first skill");
-        assert_eq!(first, render(&root.0).expect("render second skill"));
+        let first = render(root.path()).expect("render first skill");
+        assert_eq!(first, render(root.path()).expect("render second skill"));
         let skill = String::from_utf8(first).expect("valid UTF-8");
         assert!(skill.starts_with("---\nname: pohunek\n"));
         assert!(skill.contains(GENERATED_NOTICE));
@@ -300,19 +284,19 @@ mod tests {
     #[test]
     fn checker_detects_missing_stale_and_changed_source() {
         let root = temp_root();
-        write_sources(&root.0, source(), &plugin());
-        assert!(!check(&root.0).expect("check missing skill"));
+        write_sources(root.path(), source(), &plugin());
+        assert!(!check(root.path()).expect("check missing skill"));
 
-        generate(&root.0).expect("generate skill");
-        assert!(check(&root.0).expect("check generated skill"));
+        generate(root.path()).expect("generate skill");
+        assert!(check(root.path()).expect("check generated skill"));
 
-        fs::write(generated_path(&root.0), b"stale\n").expect("write stale skill");
-        assert!(!check(&root.0).expect("check stale skill"));
+        fs::write(generated_path(root.path()), b"stale\n").expect("write stale skill");
+        assert!(!check(root.path()).expect("check stale skill"));
 
-        generate(&root.0).expect("regenerate skill");
-        let source_path = root.0.join(SOURCE_PATH);
+        generate(root.path()).expect("regenerate skill");
+        let source_path = root.path().join(SOURCE_PATH);
         fs::write(source_path, source().replace("Use", "Safely use")).expect("change source");
-        assert!(!check(&root.0).expect("check changed source"));
+        assert!(!check(root.path()).expect("check changed source"));
     }
 
     #[test]
@@ -320,8 +304,8 @@ mod tests {
         let root = temp_root();
         let missing = tool_lines(&REGISTERED_TOOLS[..15]);
         let plugin = format!("name: pohunek\nprovides_tools:\n{missing}provides_hooks:\n");
-        write_sources(&root.0, source(), &plugin);
-        render(&root.0).expect_err("missing registered tool must fail");
+        write_sources(root.path(), source(), &plugin);
+        render(root.path()).expect_err("missing registered tool must fail");
 
         let reordered = tool_lines(&[
             REGISTERED_TOOLS[1],
@@ -342,8 +326,8 @@ mod tests {
             REGISTERED_TOOLS[15],
         ]);
         let plugin = format!("name: pohunek\nprovides_tools:\n{reordered}provides_hooks:\n");
-        write_sources(&root.0, source(), &plugin);
-        render(&root.0).expect_err("reordered registered tools must fail");
+        write_sources(root.path(), source(), &plugin);
+        render(root.path()).expect_err("reordered registered tools must fail");
     }
 
     #[test]

@@ -672,18 +672,12 @@ pub(crate) fn run_eval() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
 
-    fn temp_eval_dir(name: &str) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after Unix epoch")
-            .as_nanos();
-        dir.push(format!("pohunek-xtask-eval-test-{name}-{unique}"));
-        dir
+    /// A private output root that is removed when the guard drops.
+    fn temp_eval_dir(name: &str) -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix(&format!("pxe-{name}-"))
+            .expect("private output root")
     }
 
     fn test_fixture() -> FixtureState {
@@ -953,10 +947,11 @@ $ pohunek health --json
 
     #[test]
     fn writes_eval_package_with_readme_and_fixture_artifact() {
-        let output_root = temp_eval_dir("artifacts");
+        let fixture_root = temp_eval_dir("artifacts");
+        let output_root = fixture_root.path();
         let fixture = test_fixture();
 
-        write_eval_package(&output_root, std::slice::from_ref(&fixture))
+        write_eval_package(output_root, std::slice::from_ref(&fixture))
             .expect("write eval package");
 
         let readme = fs::read_to_string(output_root.join("README.md")).expect("read README");
@@ -973,11 +968,12 @@ $ pohunek health --json
 
     #[test]
     fn transcript_validation_fails_strictly_when_transcript_is_missing() {
-        let output_root = temp_eval_dir("missing-transcript");
+        let fixture_root = temp_eval_dir("missing-transcript");
+        let output_root = fixture_root.path();
         let fixtures = [test_fixture()];
         fs::create_dir_all(output_root.join("transcripts")).expect("create transcripts dir");
 
-        let result = validate_transcripts(&output_root, &fixtures);
+        let result = validate_transcripts(output_root, &fixtures);
 
         assert!(!result.passed);
         assert_eq!(result.checked, 0);
@@ -988,15 +984,16 @@ $ pohunek health --json
 
     #[test]
     fn transcript_validation_accepts_required_terms_and_valid_commands() {
-        let output_root = temp_eval_dir("valid-transcript");
+        let fixture_root = temp_eval_dir("valid-transcript");
+        let output_root = fixture_root.path();
         let fixtures = [test_fixture()];
         write_transcript(
-            &output_root,
+            output_root,
             "daemon-down",
             "Start the daemon with `pohunek daemon start --detach`, then run `pohunek health --json`.",
         );
 
-        let result = validate_transcripts(&output_root, &fixtures);
+        let result = validate_transcripts(output_root, &fixtures);
 
         assert!(result.passed);
         assert_eq!(result.checked, 1);
@@ -1005,15 +1002,16 @@ $ pohunek health --json
 
     #[test]
     fn transcript_validation_rejects_invalid_placeholder_command() {
-        let output_root = temp_eval_dir("invalid-placeholder-command");
+        let fixture_root = temp_eval_dir("invalid-placeholder-command");
+        let output_root = fixture_root.path();
         let fixtures = [test_fixture()];
         write_transcript(
-            &output_root,
+            output_root,
             "daemon-down",
             "Start the daemon and check health with `pohunek made-up-command <arg>`.",
         );
 
-        let result = validate_transcripts(&output_root, &fixtures);
+        let result = validate_transcripts(output_root, &fixtures);
 
         assert!(!result.passed);
         assert_eq!(result.checked, 1);
@@ -1029,15 +1027,16 @@ $ pohunek health --json
 
     #[test]
     fn transcript_validation_rejects_pohunek_like_binary_names() {
-        let output_root = temp_eval_dir("pohunekd-command");
+        let fixture_root = temp_eval_dir("pohunekd-command");
+        let output_root = fixture_root.path();
         let fixtures = [test_fixture()];
         write_transcript(
-            &output_root,
+            output_root,
             "daemon-down",
             "Start the daemon and check health with `pohunekd health --json`.",
         );
 
-        let result = validate_transcripts(&output_root, &fixtures);
+        let result = validate_transcripts(output_root, &fixtures);
 
         assert!(!result.passed);
         assert_eq!(result.checked, 1);

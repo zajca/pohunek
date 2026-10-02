@@ -156,7 +156,6 @@ fn strip_frontmatter(source: &str) -> Result<&str, XtaskError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
 
@@ -175,24 +174,9 @@ mod tests {
         "## Explicit safety boundaries",
     ];
 
-    static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
-
-    struct TempDir(PathBuf);
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_root() -> TempDir {
-        let path = std::env::temp_dir().join(format!(
-            "pohunek-agent-skill-{}-{}",
-            std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("create temporary root");
-        TempDir(path)
+    /// A private fixture root that is removed when the guard drops.
+    fn temp_root() -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix("pxs-").expect("private fixture root")
     }
 
     fn write_source(root: &Path, source: &str) {
@@ -208,10 +192,10 @@ mod tests {
     #[test]
     fn deterministic_renderer_strips_knowledge_frontmatter() {
         let root = temp_root();
-        write_source(&root.0, source());
+        write_source(root.path(), source());
 
-        let first = render(&root.0).expect("render first skill");
-        assert_eq!(first, render(&root.0).expect("render second skill"));
+        let first = render(root.path()).expect("render first skill");
+        assert_eq!(first, render(root.path()).expect("render second skill"));
         let skill = String::from_utf8(first).expect("valid UTF-8");
         assert!(skill.starts_with("---\nname: pohunek\n"));
         assert!(skill.contains(GENERATED_NOTICE));
@@ -223,9 +207,9 @@ mod tests {
     #[test]
     fn rendered_frontmatter_parses_with_expected_name_and_description() {
         let root = temp_root();
-        write_source(&root.0, source());
+        write_source(root.path(), source());
 
-        let rendered = String::from_utf8(render(&root.0).expect("render skill"))
+        let rendered = String::from_utf8(render(root.path()).expect("render skill"))
             .expect("rendered skill is UTF-8");
         let parsed = frontmatter_mapping(&rendered);
         assert_eq!(
@@ -272,32 +256,32 @@ mod tests {
     #[test]
     fn checker_detects_missing_stale_and_changed_source() {
         let root = temp_root();
-        write_source(&root.0, source());
-        assert!(!check(&root.0).expect("check missing skill"));
+        write_source(root.path(), source());
+        assert!(!check(root.path()).expect("check missing skill"));
 
-        generate(&root.0).expect("generate skill");
-        assert!(check(&root.0).expect("check generated skill"));
+        generate(root.path()).expect("generate skill");
+        assert!(check(root.path()).expect("check generated skill"));
 
-        fs::write(generated_path(&root.0), b"stale\n").expect("write stale skill");
-        assert!(!check(&root.0).expect("check stale skill"));
+        fs::write(generated_path(root.path()), b"stale\n").expect("write stale skill");
+        assert!(!check(root.path()).expect("check stale skill"));
 
-        generate(&root.0).expect("regenerate skill");
-        let source_path = root.0.join(SOURCE_PATH);
+        generate(root.path()).expect("regenerate skill");
+        let source_path = root.path().join(SOURCE_PATH);
         fs::write(source_path, source().replace("Use", "Safely use")).expect("change source");
-        assert!(!check(&root.0).expect("check changed source"));
+        assert!(!check(root.path()).expect("check changed source"));
     }
 
     #[test]
     fn renderer_requires_frontmatter_and_nonempty_body() {
         let root = temp_root();
-        write_source(&root.0, "# no frontmatter\n");
-        render(&root.0).expect_err("missing frontmatter must fail");
+        write_source(root.path(), "# no frontmatter\n");
+        render(root.path()).expect_err("missing frontmatter must fail");
 
-        write_source(&root.0, "---\ntype: Guide\n");
-        render(&root.0).expect_err("unterminated frontmatter must fail");
+        write_source(root.path(), "---\ntype: Guide\n");
+        render(root.path()).expect_err("unterminated frontmatter must fail");
 
-        write_source(&root.0, "---\ntype: Guide\n---\n\n   \n");
-        render(&root.0).expect_err("empty body must fail");
+        write_source(root.path(), "---\ntype: Guide\n---\n\n   \n");
+        render(root.path()).expect_err("empty body must fail");
     }
 
     #[test]

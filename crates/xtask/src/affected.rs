@@ -748,6 +748,8 @@ fn command_output(dir: &Path, program: &str, args: &[&str]) -> Result<Vec<u8>, X
 
 #[cfg(test)]
 mod tests {
+    use pohunek_test_support::env::TestEnv;
+
     use super::*;
 
     fn package(name: &str, dir: &str) -> Package {
@@ -1188,9 +1190,12 @@ mod tests {
         );
     }
 
-    fn git(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .current_dir(dir)
+    /// Runs git in the environment's private working directory with a scrubbed
+    /// environment; system and global configuration are disabled so the
+    /// developer's identity, hooks and signing settings never apply.
+    fn git(env: &TestEnv, args: &[&str]) {
+        let output = env
+            .command("git")
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1205,28 +1210,28 @@ mod tests {
 
     #[test]
     fn changed_files_unite_committed_staged_unstaged_and_untracked_paths() {
-        let repo = tempfile::tempdir().expect("temporary repository");
-        let dir = repo.path();
+        let env = TestEnv::new().expect("hermetic test environment");
+        let dir = env.cwd();
         let write = |path: &str, content: &str| {
             let path = dir.join(path);
             std::fs::create_dir_all(path.parent().expect("parent")).expect("create parent");
             std::fs::write(path, content).expect("write file");
         };
-        git(dir, &["init", "--quiet", "--initial-branch=main"]);
-        git(dir, &["config", "user.email", "test@example.invalid"]);
-        git(dir, &["config", "user.name", "test"]);
+        git(&env, &["init", "--quiet", "--initial-branch=main"]);
+        git(&env, &["config", "user.email", "test@example.invalid"]);
+        git(&env, &["config", "user.name", "test"]);
         write("a/moved.rs", "moved\n");
         write("staged.rs", "1\n");
         write("unstaged.rs", "1\n");
         write(".gitignore", "ignored.rs\n");
-        git(dir, &["add", "."]);
-        git(dir, &["commit", "--quiet", "-m", "base"]);
-        git(dir, &["checkout", "--quiet", "-b", "topic"]);
+        git(&env, &["add", "."]);
+        git(&env, &["commit", "--quiet", "-m", "base"]);
+        git(&env, &["checkout", "--quiet", "-b", "topic"]);
         std::fs::create_dir(dir.join("b")).expect("create move target");
-        git(dir, &["mv", "a/moved.rs", "b/moved.rs"]);
-        git(dir, &["commit", "--quiet", "-m", "move"]);
+        git(&env, &["mv", "a/moved.rs", "b/moved.rs"]);
+        git(&env, &["commit", "--quiet", "-m", "move"]);
         write("staged.rs", "2\n");
-        git(dir, &["add", "staged.rs"]);
+        git(&env, &["add", "staged.rs"]);
         write("unstaged.rs", "2\n");
         write("sub/untracked.rs", "new\n");
         write("ignored.rs", "ignored\n");

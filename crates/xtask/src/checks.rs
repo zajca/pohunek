@@ -600,23 +600,18 @@ fn secret_hits(content: &str, display_path: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use std::{env, fs};
+    use std::fs;
 
     use super::{
         check_agent_skill_commands, collect_pohunek_examples, missing_release_extras,
         parse_failure_message, parse_pohunek_command, secret_hits, MIN_AGENT_SKILL_EXAMPLES,
     };
 
-    fn temp_root(tag: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time after epoch")
-            .as_nanos();
-        env::temp_dir().join(format!(
-            "pohunek-xtask-checks-{tag}-{nanos}-{}",
-            std::process::id()
-        ))
+    /// A private fixture root that is removed when the guard drops, also when
+    /// the test fails.
+    fn temp_root(tag: &str) -> tempfile::TempDir {
+        pohunek_test_support::tempdir_with_prefix(&format!("pxc-{tag}-"))
+            .expect("private fixture root")
     }
 
     #[test]
@@ -744,24 +739,24 @@ mod tests {
     #[test]
     fn check_agent_skill_commands_reports_example_and_artifact_drift() {
         const SENTINEL: &str = "never-expose-this-secret-sentinel";
-        let root = temp_root("agent-skill");
-        fs::create_dir_all(&root).expect("create temp root");
+        let fixture = temp_root("agent-skill");
+        let root = fixture.path();
 
         assert!(
-            !check_agent_skill_commands(&root).expect("missing source is a failure, not an error")
+            !check_agent_skill_commands(root).expect("missing source is a failure, not an error")
         );
 
         let source_path = root.join(crate::agent_skill::SOURCE_PATH);
         fs::create_dir_all(source_path.parent().expect("source parent")).expect("source parent");
         write_skill_source(&source_path, MIN_AGENT_SKILL_EXAMPLES, &[]);
-        assert!(check_agent_skill_commands(&root).expect("valid examples pass without artifact"));
+        assert!(check_agent_skill_commands(root).expect("valid examples pass without artifact"));
 
         write_skill_source(
             &source_path,
             MIN_AGENT_SKILL_EXAMPLES - 1,
             &["Run `pohunek made-up-command` first."],
         );
-        assert!(!check_agent_skill_commands(&root)
+        assert!(!check_agent_skill_commands(root)
             .expect("unparsable example is a failure, not an error"));
 
         write_skill_source(
@@ -773,36 +768,32 @@ mod tests {
         fs::create_dir_all(artifact_path.parent().expect("artifact parent"))
             .expect("artifact parent");
         fs::write(&artifact_path, "see `crates/does-not-exist.md`\n").expect("write artifact");
-        assert!(!check_agent_skill_commands(&root).expect("missing backtick path is a failure"));
+        assert!(!check_agent_skill_commands(root).expect("missing backtick path is a failure"));
 
         fs::write(&artifact_path, format!("env\napi_key={SENTINEL}\n")).expect("write artifact");
-        assert!(!check_agent_skill_commands(&root).expect("secret hit is a failure"));
+        assert!(!check_agent_skill_commands(root).expect("secret hit is a failure"));
 
         fs::write(&artifact_path, "clean generated body\n").expect("write clean artifact");
-        assert!(check_agent_skill_commands(&root).expect("clean artifact passes"));
+        assert!(check_agent_skill_commands(root).expect("clean artifact passes"));
 
         write_skill_source(&source_path, MIN_AGENT_SKILL_EXAMPLES - 1, &[]);
-        assert!(!check_agent_skill_commands(&root)
+        assert!(!check_agent_skill_commands(root)
             .expect("an emptied or truncated source must not pass vacuously"));
-
-        fs::remove_dir_all(&root).expect("remove temp root");
     }
 
     #[test]
     fn missing_release_extras_reports_required_files() {
-        let root = temp_root("release-extras");
-        fs::create_dir_all(&root).expect("create temp root");
-        assert_eq!(missing_release_extras(&root), vec!["README.md", "LICENSE"]);
+        let fixture = temp_root("release-extras");
+        let root = fixture.path();
+        assert_eq!(missing_release_extras(root), vec!["README.md", "LICENSE"]);
 
         let readme = root.join("README.md");
         fs::write(&readme, "readme\n").expect("write README");
-        assert_eq!(missing_release_extras(&root), vec!["LICENSE"]);
+        assert_eq!(missing_release_extras(root), vec!["LICENSE"]);
 
         let license = root.join("LICENSE");
         fs::write(&license, "license\n").expect("write LICENSE");
-        assert!(missing_release_extras(&root).is_empty());
-
-        fs::remove_dir_all(&root).expect("remove temp root");
+        assert!(missing_release_extras(root).is_empty());
     }
 
     #[test]
