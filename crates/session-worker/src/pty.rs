@@ -1905,13 +1905,13 @@ mod tests {
         );
     }
 
-    fn shell(script: &str) -> Command {
+    fn shell(script: &str, cwd: &std::path::Path) -> Command {
         Command {
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), script.to_owned()],
-            base: EnvBase::Inherited,
-            env: Vec::new(),
-            cwd: std::env::temp_dir(),
+            base: EnvBase::Empty,
+            env: crate::test_support::child_env(),
+            cwd: cwd.to_path_buf(),
             cols: 80,
             rows: 24,
         }
@@ -2164,8 +2164,9 @@ mod tests {
             "mkfifo \"$HELD_RELEASE\" \"$HELD_WRITTEN\" && printf ready \
              && read go < \"$HELD_RELEASE\" && printf held-before-boundary \
              && printf w > \"$HELD_WRITTEN\" && sleep 30",
+            release.parent().expect("FIFO directory"),
         );
-        command.env = vec![
+        command.env.extend([
             (
                 "HELD_RELEASE".to_owned(),
                 release.to_str().expect("UTF-8 FIFO path").to_owned(),
@@ -2174,7 +2175,7 @@ mod tests {
                 "HELD_WRITTEN".to_owned(),
                 written.to_str().expect("UTF-8 FIFO path").to_owned(),
             ),
-        ];
+        ]);
         spawn(command)
     }
 
@@ -2234,7 +2235,7 @@ mod tests {
         use rustix::fs::{open, Mode, OFlags};
 
         const HELD: &[u8] = b"held-before-boundary";
-        let fifos = tempfile::tempdir().expect("fixture FIFO directory");
+        let fifos = pohunek_test_support::tempdir().expect("fixture FIFO directory");
         let release_path = fifos.path().join("release");
         let written_path = fifos.path().join("written");
         let pty = held_output_fixture(&release_path, &written_path);
@@ -2300,7 +2301,8 @@ mod tests {
 
     #[tokio::test]
     async fn real_pty_drains_output_and_reports_exit() {
-        let pty = spawn(shell("printf 'worker-ready'; exit 7"));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("printf 'worker-ready'; exit 7", cwd.path()));
         let mut output = pty.subscribe_output(None).expect("subscribe");
         let exit = pty.wait_exit().await.expect("exit");
 
@@ -2411,7 +2413,11 @@ mod tests {
 
     #[tokio::test]
     async fn real_pty_accepts_deduplicated_input_and_stops_group() {
-        let pty = spawn(shell("read line; printf 'got:%s' \"$line\"; sleep 30"));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell(
+            "read line; printf 'got:%s' \"$line\"; sleep 30",
+            cwd.path(),
+        ));
         let operation = InputPlan {
             write_id: "input-1".to_owned(),
             fragments: vec![InputFragment {
@@ -2465,12 +2471,16 @@ mod tests {
             }
         }
 
-        let pty = spawn(shell(concat!(
-            "trap '' HUP; ",
-            "sh -c 'trap \"\" HUP; while :; do sleep 1; done' & ",
-            "printf 'descendant:%s\\n' \"$!\"; ",
-            "printf 'root-final\\n'"
-        )));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell(
+            concat!(
+                "trap '' HUP; ",
+                "sh -c 'trap \"\" HUP; while :; do sleep 1; done' & ",
+                "printf 'descendant:%s\\n' \"$!\"; ",
+                "printf 'root-final\\n'"
+            ),
+            cwd.path(),
+        ));
         let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
         let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
             .await
@@ -2545,11 +2555,15 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stop_terminates_descendants_after_root_exit_without_waiting_for_eof() {
-        let pty = spawn(shell(concat!(
-            "trap '' HUP; ",
-            "sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & ",
-            "printf 'descendant:%s\\n' \"$!\""
-        )));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell(
+            concat!(
+                "trap '' HUP; ",
+                "sh -c 'trap \"\" HUP TERM; while :; do sleep 1; done' & ",
+                "printf 'descendant:%s\\n' \"$!\""
+            ),
+            cwd.path(),
+        ));
         let mut output = pty.subscribe_output(Some(0)).expect("subscribe output");
         let root_exit = tokio::time::timeout(Duration::from_secs(2), pty.wait_exit())
             .await
@@ -2602,7 +2616,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stop_force_closes_output_retained_outside_the_owned_process_group() {
-        let barrier = tempfile::tempdir().expect("create escaped descendant barrier");
+        let barrier = pohunek_test_support::tempdir().expect("create escaped descendant barrier");
         let ready = barrier.path().join("ready");
         let pty = spawn(Command {
             program: "/bin/sh".to_owned(),
@@ -2621,9 +2635,9 @@ mod tests {
                 barrier.path().to_string_lossy().into_owned(),
                 ready.to_string_lossy().into_owned(),
             ],
-            base: EnvBase::Inherited,
-            env: Vec::new(),
-            cwd: std::env::temp_dir(),
+            base: EnvBase::Empty,
+            env: crate::test_support::child_env(),
+            cwd: barrier.path().to_path_buf(),
             cols: 80,
             rows: 24,
         });
@@ -2663,7 +2677,7 @@ mod tests {
         use super::CleanupState;
         use crate::output::OutputCompletion;
 
-        let barrier = tempfile::tempdir().expect("create EOF race barrier");
+        let barrier = pohunek_test_support::tempdir().expect("create EOF race barrier");
         let ready = barrier.path().join("ready");
         let pty = spawn(Command {
             program: "/bin/sh".to_owned(),
@@ -2681,9 +2695,9 @@ mod tests {
                 barrier.path().to_string_lossy().into_owned(),
                 ready.to_string_lossy().into_owned(),
             ],
-            base: EnvBase::Inherited,
-            env: Vec::new(),
-            cwd: std::env::temp_dir(),
+            base: EnvBase::Empty,
+            env: crate::test_support::child_env(),
+            cwd: barrier.path().to_path_buf(),
             cols: 80,
             rows: 24,
         });
@@ -2889,7 +2903,8 @@ mod tests {
     /// readiness. Neither may report success on a force-closed PTY.
     #[tokio::test]
     async fn forced_close_fails_resize_and_snapshot_after_the_reader_has_woken() {
-        let pty = spawn(shell("sleep 30"));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("sleep 30", cwd.path()));
         pty.force_output_close().expect("force output close");
 
         let reader = pty
@@ -2934,7 +2949,8 @@ mod tests {
 
     #[tokio::test]
     async fn resize_ignores_duplicate_and_older_source_sequences() {
-        let pty = spawn(shell("sleep 30"));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("sleep 30", cwd.path()));
 
         assert!(pty.resize("attach-1", 2, 100, 40).await.expect("resize"));
         assert!(!pty.resize("attach-1", 2, 80, 24).await.expect("duplicate"));
@@ -2989,7 +3005,8 @@ mod tests {
 
     #[tokio::test]
     async fn resize_and_snapshot_complete_during_continuous_output() {
-        let pty = spawn(shell("yes continuous-output"));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("yes continuous-output", cwd.path()));
         tokio::time::timeout(Duration::from_secs(2), async {
             while pty.output().next_offset() < READ_CHUNK_BYTES as u64 {
                 tokio::task::yield_now().await;
@@ -3022,7 +3039,8 @@ mod tests {
     /// The master is non-blocking for every descriptor the owner reads through.
     #[tokio::test]
     async fn master_description_is_non_blocking() {
-        let pty = spawn(shell("sleep 30"));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("sleep 30", cwd.path()));
 
         let flags = rustix::fs::fcntl_getfl(&pty.output_readiness.master).expect("master flags");
         assert!(
@@ -3044,7 +3062,8 @@ mod tests {
     /// reporting readiness that the real master does not have.
     #[tokio::test]
     async fn drain_ends_when_readiness_lapses_before_the_read() {
-        let pty = spawn(shell("sleep 30"));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell("sleep 30", cwd.path()));
         let reader = std::sync::Arc::clone(&pty.output_reader);
         let order = std::sync::Arc::clone(&pty.output_order);
         let output = pty.output().clone();
@@ -3079,7 +3098,8 @@ mod tests {
     async fn input_beyond_the_pty_queue_waits_for_room() {
         let script =
             format!("stty raw -echo && printf ready && head -c {OVERSIZED_INPUT_BYTES} >/dev/null");
-        let pty = spawn(shell(&script));
+        let cwd = crate::test_support::child_cwd();
+        let pty = spawn(shell(&script, cwd.path()));
         let mut output = pty.subscribe_output(None).expect("subscribe");
         tokio::time::timeout(OVERSIZED_INPUT_DEADLINE, async {
             let mut observed = Vec::new();
@@ -3227,7 +3247,7 @@ mod tests {
     #[test]
     fn command_debug_redacts_environment_values() {
         let secret = "seeded-secret-environment";
-        let mut command = shell("true");
+        let mut command = shell("true", std::path::Path::new("/"));
         command.env.push(("SECRET".to_owned(), secret.to_owned()));
         command.args.push(secret.to_owned());
 
@@ -3246,8 +3266,12 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("allocate rollback PTY");
+        let cwd = crate::test_support::child_cwd();
         let mut command = CommandBuilder::new("/bin/sh");
         command.args(["-c", "trap '' HUP TERM; sleep 30 & wait"]);
+        command.env_clear();
+        command.env("PATH", crate::test_support::CHILD_PATH);
+        command.cwd(cwd.path());
         let child = pair
             .slave
             .spawn_command(command)

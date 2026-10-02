@@ -186,8 +186,8 @@ mod pending_socket_tests {
 
     #[test]
     fn pending_worker_socket_guard_follows_the_published_name() {
-        let temporary = tempfile::tempdir_in(crate::test_support::temp_root())
-            .expect("create worker socket guard fixture");
+        let temporary =
+            pohunek_test_support::tempdir().expect("create worker socket guard fixture");
         std::fs::set_permissions(
             temporary.path(),
             std::fs::Permissions::from_mode(SOCKET_DIRECTORY_MODE),
@@ -4433,29 +4433,17 @@ mod tests {
     /// Worker-to-client buffering of the partial-input regression stream.
     const CLIENT_BUFFER: usize = 4096;
 
-    struct BarrierDirectory(std::path::PathBuf);
+    /// A private fixture directory removed when the guard drops, also when the
+    /// test fails.
+    struct BarrierDirectory(tempfile::TempDir);
 
     impl BarrierDirectory {
         fn new() -> Self {
-            let path =
-                crate::test_support::temp_root().join(random_value("output-barrier").unwrap());
-            std::fs::create_dir(&path).expect("create output barrier directory");
-            std::fs::set_permissions(
-                &path,
-                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
-            )
-            .expect("make output barrier directory private");
-            Self(path)
+            Self(pohunek_test_support::tempdir().expect("create fixture directory"))
         }
 
         fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-
-    impl Drop for BarrierDirectory {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 
@@ -4509,17 +4497,17 @@ mod tests {
         assert!(!directory.path().join(super::SOCKET_LOCK_NAME).exists());
     }
 
-    async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, std::path::PathBuf) {
-        let directory =
-            crate::test_support::temp_root().join(random_value("worker-claim").unwrap());
+    async fn launch_claim_fixture() -> (super::Server, crate::PtyOwner, BarrierDirectory) {
+        let directory = BarrierDirectory::new();
+        let root = directory.path().to_path_buf();
         let config = crate::WorkerConfig::new();
         let server = super::Server::bind(super::ServerArgs {
             session_id: "s-112".into(),
             worker_id: "worker-claim".into(),
             generation: "abcd2345".to_owned(),
-            socket_path: directory.join("worker.sock"),
-            journal_path: directory.join("journal.json"),
-            daemon_socket_path: directory.join("daemon.sock"),
+            socket_path: root.join("worker.sock"),
+            journal_path: root.join("journal.json"),
+            daemon_socket_path: root.join("daemon.sock"),
             config: config.clone(),
         })
         .await
@@ -4528,9 +4516,9 @@ mod tests {
             crate::Command {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), "read -r line".into()],
-                base: crate::EnvBase::Inherited,
-                env: Vec::new(),
-                cwd: directory.clone(),
+                base: crate::EnvBase::Empty,
+                env: crate::test_support::child_env(),
+                cwd: root.clone(),
                 cols: 80,
                 rows: 24,
             },
@@ -4577,7 +4565,7 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_launch_ack_owns_durable_original_claim_and_retry_commits_before_event() {
-        let (server, pty, directory) = launch_claim_fixture().await;
+        let (server, pty, _directory) = launch_claim_fixture().await;
         let mut bytes = Vec::new();
         super::serve_identity_hook_with_probe(
             std::sync::Arc::clone(&server.shared),
@@ -4645,7 +4633,6 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// A peer that no longer exists leaves the journal untouched.
@@ -4655,7 +4642,7 @@ mod tests {
     /// would say nothing about whether durable state moved.
     #[tokio::test]
     async fn a_vanished_peer_is_rejected_without_touching_the_journal() {
-        let (server, pty, directory) = launch_claim_fixture().await;
+        let (server, pty, _directory) = launch_claim_fixture().await;
         let before = server.shared.state.lock().await.journal.clone();
         // A start identity the live process cannot have makes the recheck fail
         // exactly as an exited-and-reused process id would.
@@ -4684,12 +4671,11 @@ mod tests {
             before,
             "a rejected claim must not move durable state"
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
     async fn immediate_launch_rejection_commits_fence_before_acknowledgment() {
-        let (server, pty, directory) = launch_claim_fixture().await;
+        let (server, pty, _directory) = launch_claim_fixture().await;
         let mut bytes = Vec::new();
         super::serve_identity_hook_with_probe(
             std::sync::Arc::clone(&server.shared),
@@ -4737,7 +4723,6 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
@@ -4745,7 +4730,7 @@ mod tests {
         let (server, pty, directory) = launch_claim_fixture().await;
         std::fs::rename(
             server.shared.journal.path(),
-            directory.join("original.json"),
+            directory.path().join("original.json"),
         )
         .unwrap();
         std::fs::create_dir(server.shared.journal.path()).unwrap();
@@ -4773,7 +4758,6 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4987,9 +4971,9 @@ mod tests {
                     release.to_string_lossy().into_owned(),
                     barrier.path().to_string_lossy().into_owned(),
                 ],
-                base: crate::EnvBase::Inherited,
-                env: Vec::new(),
-                cwd: std::env::temp_dir(),
+                base: crate::EnvBase::Empty,
+                env: crate::test_support::child_env(),
+                cwd: barrier.path().to_path_buf(),
                 cols: 80,
                 rows: 24,
             },
@@ -5073,8 +5057,8 @@ mod tests {
                     )
                     .to_owned(),
                 ],
-                base: crate::EnvBase::Inherited,
-                env: Vec::new(),
+                base: crate::EnvBase::Empty,
+                env: crate::test_support::child_env(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
                 rows: 24,
@@ -5167,8 +5151,8 @@ mod tests {
                     directory.path().to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                 ],
-                base: crate::EnvBase::Inherited,
-                env: Vec::new(),
+                base: crate::EnvBase::Empty,
+                env: crate::test_support::child_env(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
                 rows: 24,
@@ -5239,8 +5223,8 @@ mod tests {
                     directory.path().to_string_lossy().into_owned(),
                     ready.to_string_lossy().into_owned(),
                 ],
-                base: crate::EnvBase::Inherited,
-                env: Vec::new(),
+                base: crate::EnvBase::Empty,
+                env: crate::test_support::child_env(),
                 cwd: directory.path().to_path_buf(),
                 cols: 80,
                 rows: 24,
@@ -5284,7 +5268,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_commit_retries_before_publishing_exited_state() {
-        let (server, pty, directory) = launch_claim_fixture().await;
+        let (server, pty, _directory) = launch_claim_fixture().await;
         let journal_path = server.shared.journal.path().to_path_buf();
         std::fs::remove_file(&journal_path).expect("remove writable journal fixture");
         std::fs::create_dir(&journal_path).expect("block journal replacement with a directory");
@@ -5362,7 +5346,6 @@ mod tests {
             .await
             .expect("stop fixture PTY");
         drop(server);
-        std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     #[test]
@@ -5567,7 +5550,7 @@ mod tests {
             peer_start_identity: "7200".to_owned(),
         };
         let shared = launch_claim_fixture().await;
-        let (server, _pty, directory) = shared;
+        let (server, _pty, _directory) = shared;
 
         let mut connection = Connection::new(std::sync::Arc::new(owner_peer(&owner)));
         connection.owner = Some(owner.clone());
@@ -5596,7 +5579,6 @@ mod tests {
             ),
             "expected a lease-owner mismatch, got {error:?}"
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Output that becomes ready while an attach input frame is only partly
@@ -5609,7 +5591,7 @@ mod tests {
             peer_pid: std::process::id(),
             peer_start_identity: "7400".to_owned(),
         };
-        let (server, pty, directory) = launch_claim_fixture().await;
+        let (server, pty, _directory) = launch_claim_fixture().await;
         let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
         let subscriber = output.subscribe(Some(0)).expect("live output subscriber");
         let stream_id = StreamId::new("a-partial").expect("stream id");
@@ -5694,7 +5676,6 @@ mod tests {
         pty.stop("test-cleanup", Duration::from_millis(100))
             .await
             .expect("stop fixture PTY");
-        std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     /// An observation stream proves its peer again after it stops waiting.
@@ -5709,7 +5690,7 @@ mod tests {
             peer_pid: std::process::id(),
             peer_start_identity: "7300".to_owned(),
         };
-        let (server, pty, directory) = launch_claim_fixture().await;
+        let (server, pty, _directory) = launch_claim_fixture().await;
         let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
         output
             .push(b"must-not-cross-a-handoff")
@@ -5757,7 +5738,6 @@ mod tests {
             written.is_empty(),
             "no PTY history may reach a peer that changed"
         );
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -6560,8 +6540,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_six_child_environment_is_exactly_base_term_profile_and_identity() {
-        let directory =
-            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
         let server = environment_fixture(directory.path(), "abcd2345")
             .await
             .expect("bind worker");
@@ -6621,8 +6600,7 @@ mod tests {
 
     #[tokio::test]
     async fn profile_environment_may_override_the_worker_term() {
-        let directory =
-            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
         let server = environment_fixture(directory.path(), "abcd2345")
             .await
             .expect("bind worker");
@@ -6638,8 +6616,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_five_child_inherits_without_service_manager_variables() {
-        let directory =
-            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
         let server = environment_fixture(directory.path(), "abcd2345")
             .await
             .expect("bind worker");
@@ -6669,8 +6646,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_journals_the_worker_executable_version_and_generation() {
-        let directory =
-            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
 
         let server = environment_fixture(directory.path(), "mzxw6ytb")
             .await
@@ -6693,8 +6669,7 @@ mod tests {
 
     #[tokio::test]
     async fn bind_rejects_an_invalid_generation_before_touching_disk() {
-        let directory =
-            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
 
         let error = environment_fixture(directory.path(), "NOT-VALID")
             .await
@@ -6722,8 +6697,7 @@ mod tests {
     /// on the refusal, so the spawn and the commit share one state-lock hold.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn initialize_spawns_the_child_only_under_the_running_commit() {
-        let directory =
-            tempfile::tempdir_in(crate::test_support::temp_root()).expect("fixture directory");
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
         let server = environment_fixture(directory.path(), "abcd2345")
             .await
             .expect("bind worker");
@@ -6800,5 +6774,12 @@ mod tests {
         pty.stop("test-cleanup", Duration::from_millis(500))
             .await
             .expect("stop child");
+        // The runtime monitors journal the terminal state in the background;
+        // the fixture directory must outlive that write.
+        pohunek_test_support::wait::wait_until("the worker to journal the child exit", || async {
+            (server.shared.state.lock().await.phase == super::WireRuntimePhase::Exited)
+                .then_some(())
+        })
+        .await;
     }
 }

@@ -348,7 +348,9 @@ mod tests {
     fn a_zombie_peer_is_not_live() {
         use pohunek_platform::process::{HostInspector, ProcessInspector};
 
-        let mut child = std::process::Command::new("/bin/sh")
+        let env = pohunek_test_support::env::TestEnv::new().expect("hermetic test environment");
+        let mut child = env
+            .command("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
             .expect("spawn a process that exits immediately");

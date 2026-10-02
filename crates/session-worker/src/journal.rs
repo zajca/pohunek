@@ -610,16 +610,14 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-    fn test_dir(tag: &str) -> PathBuf {
-        let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        crate::test_support::temp_root().join(format!(
-            "pohunek-session-worker-{tag}-{}-{sequence}",
-            std::process::id()
-        ))
+    /// Returns a private fixture directory and a not-yet-created child path of it.
+    ///
+    /// The guard removes the directory when it drops, also when a test fails.
+    fn test_dir(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let guard = pohunek_test_support::tempdir().expect("create fixture directory");
+        let root = guard.path().join(tag);
+        (guard, root)
     }
 
     fn record(secret: &str) -> JournalRecord {
@@ -683,7 +681,7 @@ mod tests {
 
     #[test]
     fn atomic_round_trip_is_owner_private() {
-        let root = test_dir("round-trip");
+        let (_guard, root) = test_dir("round-trip");
         let path = root.join("s-1").join("worker-1.json");
         let journal = Journal::new(&path);
         let record = record("native-reference");
@@ -702,7 +700,6 @@ mod tests {
                 & 0o777,
             0o700
         );
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
@@ -744,7 +741,7 @@ mod tests {
 
     #[test]
     fn corrupt_journal_returns_typed_error() {
-        let root = test_dir("corrupt");
+        let (_guard, root) = test_dir("corrupt");
         fs::create_dir_all(&root).expect("create");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod");
         let path = root.join("record.json");
@@ -755,7 +752,6 @@ mod tests {
             Journal::new(&path).load(),
             Err(JournalError::Corrupt { .. })
         ));
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     /// Writes `json` as an owner-private journal file and returns its path.
@@ -782,7 +778,7 @@ mod tests {
 
     #[test]
     fn schema_three_journal_is_outdated_not_corrupt() {
-        let root = test_dir("schema-three");
+        let (_guard, root) = test_dir("schema-three");
         let path = write_raw(&root, &schema_three_json());
         let journal = Journal::new(&path);
 
@@ -804,12 +800,11 @@ mod tests {
                 ..
             })
         ));
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn outdated_journal_without_liveness_fields_reports_them_unknown() {
-        let root = test_dir("schema-one");
+        let (_guard, root) = test_dir("schema-one");
         let path = write_raw(
             &root,
             &serde_json::json!({ "schema_version": 1, "phase": "someday", "worker_pid": -1 }),
@@ -827,12 +822,11 @@ mod tests {
                 phase: None,
             })
         );
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn newer_or_unversioned_journals_are_refused() {
-        let root = test_dir("schema-newer");
+        let (_guard, root) = test_dir("schema-newer");
         let mut json = serde_json::to_value(record("native-reference")).expect("serialize");
         json["schema_version"] = 5.into();
         let path = write_raw(&root, &json);
@@ -849,12 +843,11 @@ mod tests {
             Journal::new(&path).load_any(),
             Err(JournalError::Corrupt { .. })
         ));
-        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]
     fn symlink_target_is_rejected() {
-        let root = test_dir("symlink");
+        let (_guard, root) = test_dir("symlink");
         fs::create_dir_all(&root).expect("create");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod");
         let target = root.join("target");
@@ -868,6 +861,5 @@ mod tests {
                 AtomicReplaceError::BeforeCommit(_)
             ))
         ));
-        fs::remove_dir_all(root).expect("cleanup");
     }
 }

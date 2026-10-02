@@ -32,24 +32,30 @@ const IDLE_CPU_BUDGET: Duration = Duration::from_millis(100);
 const STOP_GRACE: Duration = Duration::from_millis(200);
 /// Bounds every wait on a session reaching a lifecycle state.
 const LIFECYCLE_DEADLINE: Duration = Duration::from_secs(5);
+/// `PATH` of every PTY child: pinned so the fixture scripts resolve `sleep` from
+/// the system directories on Linux and macOS, never from the developer's.
+const CHILD_PATH: &str = "/usr/bin:/bin";
 /// Pause between descriptor recounts while released handles close.
 const RECOUNT_INTERVAL: Duration = Duration::from_millis(10);
 
-fn shell(script: &str) -> Command {
+fn shell(script: &str, cwd: &Path) -> Command {
     Command {
         program: "/bin/sh".to_owned(),
         args: vec!["-c".to_owned(), script.to_owned()],
-        base: EnvBase::Inherited,
-        env: Vec::new(),
-        cwd: std::env::temp_dir(),
+        base: EnvBase::Empty,
+        env: vec![
+            ("PATH".to_owned(), CHILD_PATH.to_owned()),
+            ("SHELL".to_owned(), "/bin/sh".to_owned()),
+        ],
+        cwd: cwd.to_path_buf(),
         cols: 80,
         rows: 24,
     }
 }
 
-fn spawn(config: &WorkerConfig, script: &str) -> PtyOwner {
+fn spawn(config: &WorkerConfig, script: &str, cwd: &Path) -> PtyOwner {
     PtyOwner::spawn(
-        shell(script),
+        shell(script, cwd),
         config.history_bytes,
         config.subscriber_bytes,
         config.input_dedup_entries,
@@ -87,12 +93,14 @@ fn process_cpu_time() -> Duration {
 #[tokio::test]
 async fn idle_sessions_do_not_spin_or_leak_descriptors() {
     let config = WorkerConfig::new();
+    // Created before the baseline: it holds no descriptor once built.
+    let cwd = pohunek_test_support::tempdir().expect("child working directory");
     let baseline = open_descriptors();
 
     let idle: Vec<PtyOwner> = (0..IDLE_SESSIONS)
-        .map(|_| spawn(&config, "sleep 30"))
+        .map(|_| spawn(&config, "sleep 30", cwd.path()))
         .collect();
-    let hung_up = spawn(&config, "exit 0");
+    let hung_up = spawn(&config, "exit 0", cwd.path());
     tokio::time::timeout(LIFECYCLE_DEADLINE, hung_up.wait_exit())
         .await
         .expect("hung-up root exit deadline")
