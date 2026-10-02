@@ -4,10 +4,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
 use pohunek_daemon::runtime::{
@@ -15,10 +16,11 @@ use pohunek_daemon::runtime::{
 };
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
-use pohunek_test_support::wait::wait_until;
+use pohunek_test_support::time::AutoAdvanceInhibitor;
+use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{
-    AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
+    event, AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
     SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
@@ -27,22 +29,16 @@ use protocol::{
 // here is about the grace.
 const TEST_COLS: u16 = 80;
 const TEST_ROWS: u16 = 24;
-/// Poll interval used by the integration test.
+/// Poll interval of the managed-session watcher in the pidfd test.
 ///
-/// It is intentionally long enough that a clear observed well below this bound
-/// proves the pidfd exit path fired instead of waiting for the next poll tick.
+/// The test freezes the clock around the exit, so the value only has to be
+/// long enough that the first poll tick has not fired yet when the agent is
+/// observed.
 const TEST_PROCWATCH_POLL: Duration = Duration::from_secs(2);
-/// Upper bound for pidfd-driven release after `kill -9`.
-///
-/// This is below [`TEST_PROCWATCH_POLL`], so success demonstrates event-driven
-/// exit handling rather than poll cleanup.
-const EXIT_EVENT_TIMEOUT: Duration = Duration::from_millis(900);
 /// Poll interval for the cwd-tracking integration test.
 const CWD_PROCWATCH_POLL: Duration = Duration::from_millis(150);
-/// Poll interval for the external observer integration test.
+/// Sweep interval of the external observer in the pidfd test.
 const EXTERNAL_PROCWATCH_POLL: Duration = Duration::from_secs(2);
-/// Lightweight polling cadence while waiting for external entries.
-const EXTERNAL_WAIT_POLL: Duration = Duration::from_millis(20);
 
 static EXTERNAL_ENV_LOCK: Mutex<()> = Mutex::new(());
 static POHUNEK_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -191,15 +187,16 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     assert_eq!(observed.active_agent.as_deref(), Some("codex"));
     assert_eq!(observed.active_agent_base, Some(AgentKind::Codex));
 
-    kill9(child_pid);
-    let started = Instant::now();
-    let cleared = wait_for_cleared_agent(&registry, &created.id, EXIT_EVENT_TIMEOUT).await;
+    // The poll timer cannot fire while the clock is frozen, so the agent can
+    // only be cleared by the pidfd exit watch.
+    let cleared = without_poll_ticks(async {
+        let mut events = registry.subscribe();
+        kill9(child_pid);
+        wait_for_cleared_agent(&registry, &created.id, &mut events).await
+    })
+    .await;
 
     assert_eq!(cleared.active_agent, None);
-    assert!(
-        started.elapsed() < TEST_PROCWATCH_POLL,
-        "active agent cleared only after the poll interval"
-    );
     let _ = registry.stop(&created.id).await;
 }
 
@@ -357,13 +354,14 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
         .expect_err("external sessions cannot be resumed");
     assert_eq!(resumed.code, "session_external_read_only");
 
-    kill9(child_pid);
-    let started = Instant::now();
-    wait_for_external_gone(&registry, child_pid, EXIT_EVENT_TIMEOUT).await;
-    assert!(
-        started.elapsed() < EXTERNAL_PROCWATCH_POLL,
-        "external agent disappeared only after the poll interval"
-    );
+    // The sweep timer cannot fire while the clock is frozen, so the entry can
+    // only be removed by the pidfd exit watch.
+    without_poll_ticks(async {
+        let mut events = registry.subscribe();
+        kill9(child_pid);
+        wait_for_external_gone(&registry, &observed.id, &mut events).await;
+    })
+    .await;
     let _ = child.wait();
 }
 
@@ -437,27 +435,61 @@ async fn wait_for_observed_pid(
     .await
 }
 
-/// Waits until the registry reports no active agent, within `timeout`.
+/// Runs `future` with tokio's clock frozen and returns its output.
 ///
-/// The bound is the contract under test: the release must come from the exit
-/// watch, which is faster than the poll interval.
+/// The freeze keeps every poll and sweep timer of the registry from firing, so
+/// whatever `future` waits for was produced by an event rather than by a tick.
+/// `future` must wait on readiness signals only: a sleep or a timeout inside it
+/// is a timer that never fires until the hang guard of the inhibitor ends.
+/// The clock is asserted unmoved afterwards, which proves no tick could have
+/// run.
+async fn without_poll_ticks<F: Future>(future: F) -> F::Output {
+    tokio::time::pause();
+    let inhibitor = AutoAdvanceInhibitor::new();
+    let frozen_at = tokio::time::Instant::now();
+    let output = future.await;
+    let moved = frozen_at.elapsed();
+    inhibitor.release().await;
+    tokio::time::resume();
+    assert_eq!(moved, Duration::ZERO, "the clock moved while it was frozen");
+    output
+}
+
+/// Waits until the registry reports no active agent for the session.
+///
+/// Waits on lifecycle events, never on a timer; `events` must be subscribed
+/// before the exit is triggered.
 async fn wait_for_cleared_agent(
     registry: &SessionRegistry,
     id: &SessionId,
-    timeout: Duration,
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
 ) -> SessionInfo {
-    let deadline = Instant::now() + timeout;
     loop {
         let info = registry.inspect(id).await.expect("inspect session");
         if info.active_agent_pid.is_none() {
             return info;
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the active agent to clear"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_for_event(events, event::SESSION_UPDATED).await;
     }
+}
+
+/// Waits for the next event named `name`, tolerating a lagged receiver.
+async fn wait_for_event(
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+    name: &str,
+) {
+    guard("the next lifecycle event", async {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.event() == name => return,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("the registry event channel closed")
+                }
+            }
+        }
+    })
+    .await;
 }
 
 async fn wait_for_external_pid(registry: &SessionRegistry, pid: u32) -> SessionInfo {
@@ -482,22 +514,25 @@ async fn assert_external_detection_unavailable(registry: &SessionRegistry, id: &
     );
 }
 
-async fn wait_for_external_gone(registry: &SessionRegistry, pid: u32, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+/// Waits until the external session `id` is absent from the listing.
+///
+/// Waits on lifecycle events, never on a timer; `events` must be subscribed
+/// before the exit is triggered.
+async fn wait_for_external_gone(
+    registry: &SessionRegistry,
+    id: &SessionId,
+    events: &mut tokio::sync::broadcast::Receiver<protocol::Event>,
+) {
     loop {
         let present = registry
             .list()
             .await
             .into_iter()
-            .any(|session| session.pid == pid);
+            .any(|session| session.id == *id);
         if !present {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for external pid {pid} to disappear"
-        );
-        tokio::time::sleep(EXTERNAL_WAIT_POLL).await;
+        wait_for_event(events, event::SESSION_REMOVED).await;
     }
 }
 
