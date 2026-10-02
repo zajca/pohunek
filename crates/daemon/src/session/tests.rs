@@ -230,6 +230,7 @@ fn production_supervision() -> crate::runtime::SupervisionConfig {
     .supervision(PathBuf::from(
         "/home/user/.local/libexec/pohunek/1.0.0/pohunek-sessiond",
     ))
+    .with_environment_source(crate::test_support::thread_environment_source())
 }
 
 #[test]
@@ -3502,6 +3503,67 @@ async fn detects_successful_process_exit() {
 
     assert_eq!(exit.state, SessionState::Done);
     assert_eq!(exit.exit_code, Some(0));
+}
+
+#[tokio::test]
+async fn session_child_sees_the_fixture_home_and_not_the_developer_environment() {
+    let root = temp_dir("session-child-home");
+    let cwd = temp_dir("session-child-home-cwd");
+    let report = root.join("child-env.txt");
+    let crate::runtime::EnvironmentSource::Fixed(fixture) =
+        crate::test_support::thread_environment_source()
+    else {
+        panic!("a test fixture supplies an explicit environment");
+    };
+    let fixture_home = fixture
+        .get(std::ffi::OsStr::new("HOME"))
+        .expect("the fixture environment pins HOME")
+        .clone();
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new(
+            "/bin/sh",
+            [
+                "-c",
+                &format!(
+                    "printf 'HOME=%s\\nSSH_AUTH_SOCK=%s\\nDISPLAY=%s\\n' \
+                     \"$HOME\" \"${{SSH_AUTH_SOCK-unset}}\" \"${{DISPLAY-unset}}\" > '{}'; sleep 30",
+                    report.display()
+                ),
+            ],
+        ),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+
+    let created = registry
+        .create(SessionNewParams {
+            cwd: Some(cwd),
+            ..params()
+        })
+        .await
+        .expect("create session");
+
+    wait_for_file_contains(&report, "DISPLAY=").await;
+    let child = parse_env_dump(&fs::read_to_string(&report).expect("read the child report"));
+    assert_eq!(
+        child.get("HOME").map(String::as_str),
+        fixture_home.to_str(),
+        "the session child must see the fixture HOME"
+    );
+    if let Some(process_home) = std::env::var_os("HOME") {
+        assert_ne!(
+            child.get("HOME").map(std::ffi::OsStr::new),
+            Some(process_home.as_os_str()),
+            "the session child must not see the developer's HOME"
+        );
+    }
+    assert_eq!(
+        child.get("SSH_AUTH_SOCK").map(String::as_str),
+        Some("unset")
+    );
+    assert_eq!(child.get("DISPLAY").map(String::as_str), Some("unset"));
+
+    let _ = registry.stop(&created.id).await;
 }
 
 #[tokio::test]
@@ -14996,7 +15058,8 @@ fn exiting_worker_registry(
             home: state_root,
             daemon_socket: runtime_root.join("test-daemon.sock"),
         }
-        .supervision(executable),
+        .supervision(executable)
+        .with_environment_source(crate::test_support::thread_environment_source()),
     );
     let supervisor = Arc::new(crate::runtime::lifecycle::tests::ScriptedSupervisor::over(
         crate::runtime::SubprocessWorkerLauncher::new(),
@@ -15977,7 +16040,9 @@ async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
         home: root.clone(),
         daemon_socket: root.join("daemon.sock"),
     };
-    let mut supervision = environment.supervision(pohunek_test_support::worker_binary());
+    let mut supervision = environment
+        .supervision(pohunek_test_support::worker_binary())
+        .with_environment_source(crate::test_support::thread_environment_source());
     supervision.sweep_grace = Duration::from_secs(5);
     let launcher = crate::runtime::SubprocessWorkerLauncher::new();
     let supervisor = Arc::new(crate::runtime::lifecycle::tests::ScriptedSupervisor::over(

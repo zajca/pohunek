@@ -5195,6 +5195,7 @@ while os.getppid() == parent:
                 base_environment: Some(
                     crate::runtime::environment::base_environment(
                         pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                        &crate::test_support::thread_environment_source(),
                     )
                     .expect("base environment"),
                 ),
@@ -5589,6 +5590,7 @@ while os.getppid() == parent:
                 base_environment: Some(
                     crate::runtime::environment::base_environment(
                         pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                        &crate::test_support::thread_environment_source(),
                     )
                     .expect("base environment"),
                 ),
@@ -6419,6 +6421,7 @@ while os.getppid() == parent:
                 base_environment: Some(
                     crate::runtime::environment::base_environment(
                         pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+                        &crate::test_support::thread_environment_source(),
                     )
                     .expect("base environment"),
                 ),
@@ -10720,7 +10723,9 @@ while os.getppid() == parent:
                 home: root.clone(),
                 daemon_socket: root.join("daemon.sock"),
             };
-            let mut supervision = environment.supervision(worker_binary());
+            let mut supervision = environment
+                .supervision(worker_binary())
+                .with_environment_source(crate::test_support::thread_environment_source());
             supervision.sweep_grace = SWEEP_GRACE;
             let marker_pid_file = root.join("descendant.pid");
             let script = format!(

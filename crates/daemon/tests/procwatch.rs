@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use pohunek_daemon::procwatch::{HostInspector, ProcessInspector};
-use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
+use pohunek_daemon::runtime::{
+    EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
+};
 use pohunek_daemon::session::{SessionRegistry, SessionRegistryConfig, ShellCommand};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::wait_until;
@@ -117,7 +119,11 @@ fn worker_backed_registry(env: &TestEnv, mut config: SessionRegistryConfig) -> S
     };
     config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-    config.supervision = Some(worker_environment.supervision(worker_binary()));
+    config.supervision = Some(
+        worker_environment
+            .supervision(worker_binary())
+            .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
+    );
     let launcher = Arc::new(SubprocessWorkerLauncher::new());
     SessionRegistry::new_with_launcher_and_inspector(
         config,

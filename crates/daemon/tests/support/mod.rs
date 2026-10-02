@@ -7,7 +7,26 @@ use overlay::{
     BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
     OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
 };
+use pohunek_daemon::runtime::EnvironmentSource;
 use pohunek_daemon::session::{SessionRegistryConfig, ShellCommand};
+use pohunek_test_support::env::TestEnv;
+
+std::thread_local! {
+    /// The hermetic environment of the current test thread.
+    static THREAD_ENV: std::cell::OnceCell<TestEnv> = const { std::cell::OnceCell::new() };
+}
+
+/// Variables of the current test thread's [`TestEnv`] as the source of the
+/// agent children's base environment.
+///
+/// A session child then sees the fixture's private `HOME` and none of the
+/// developer's variables. The environment lives until the test thread ends.
+pub(crate) fn hermetic_environment_source() -> EnvironmentSource {
+    THREAD_ENV.with(|cell| {
+        let env = cell.get_or_init(|| TestEnv::new().expect("create the thread test environment"));
+        EnvironmentSource::fixed(env.environment().clone())
+    })
+}
 
 #[derive(Debug)]
 struct EmptyTransport {

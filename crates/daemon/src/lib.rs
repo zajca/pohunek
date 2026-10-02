@@ -114,6 +114,30 @@ pub(crate) mod test_support {
         path
     }
 
+    std::thread_local! {
+        /// The hermetic environment of the current test thread.
+        static THREAD_ENV: std::cell::OnceCell<pohunek_test_support::env::TestEnv> =
+            const { std::cell::OnceCell::new() };
+    }
+
+    /// Returns the variables of the current test thread's hermetic
+    /// [`TestEnv`](pohunek_test_support::env::TestEnv) as a base-environment
+    /// source.
+    ///
+    /// Registry fixtures hand this to their supervision config so an agent
+    /// child sees the fixture's private `HOME` and none of the developer's
+    /// variables. The environment lives until the calling thread ends, which
+    /// is the end of the test.
+    pub(crate) fn thread_environment_source() -> crate::runtime::EnvironmentSource {
+        THREAD_ENV.with(|cell| {
+            let env = cell.get_or_init(|| {
+                pohunek_test_support::env::TestEnv::new()
+                    .expect("create the thread-scoped test environment")
+            });
+            crate::runtime::EnvironmentSource::fixed(env.environment().clone())
+        })
+    }
+
     /// Creates a private, short-named [`ScopedDir`] whose name starts with
     /// `prefix`.
     pub(crate) fn scoped_dir(prefix: &str) -> ScopedDir {

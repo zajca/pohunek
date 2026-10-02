@@ -14,6 +14,7 @@ pub mod lifecycle;
 
 pub(crate) use client::WriteReservation;
 pub use client::{DataStream, DimensionUpdate, Worker, WorkerError};
+pub use environment::EnvironmentSource;
 #[cfg(test)]
 pub use launcher::InProcessWorkerLauncher;
 pub use launcher::{

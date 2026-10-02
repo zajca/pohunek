@@ -123,7 +123,11 @@ async fn spawn_dual_servers(
     config.socket_path = Some(socket.clone());
     config.worker_runtime_root = Some(worker_environment.runtime_home.join("pohunek/workers"));
     config.worker_state_root = Some(worker_environment.state_home.join("pohunek/workers"));
-    config.supervision = Some(worker_environment.supervision(worker_binary()));
+    config.supervision = Some(
+        worker_environment
+            .supervision(worker_binary())
+            .with_environment_source(support::hermetic_environment_source()),
+    );
     let registry = SessionRegistry::new_with_launcher_and_inspector(
         config,
         Arc::new(SubprocessWorkerLauncher::new()),

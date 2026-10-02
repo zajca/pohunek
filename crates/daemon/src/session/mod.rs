@@ -5289,6 +5289,7 @@ fn test_supervision(runtime_root: &Path, state_root: &Path) -> SupervisionConfig
         daemon_socket: runtime_root.join("test-daemon.sock"),
     }
     .supervision(PathBuf::from("/nonexistent/pohunek-sessiond"))
+    .with_environment_source(crate::test_support::thread_environment_source())
 }
 
 #[cfg(test)]
