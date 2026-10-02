@@ -20,7 +20,7 @@ const BODY_LIMIT: usize = 4096;
 const SECRET_DETAIL: &str = "invalid input syntax for type uuid: \"s3cr3t-token-value\"";
 
 #[derive(Clone)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Capture(pub(super) Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Capture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {

@@ -199,10 +199,16 @@ async fn browser_callback(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> Result<Response, ApiFailure> {
-    if gate(&state).is_err() || reject_mixed(&headers).is_err() {
+    if gate(&state).is_err() {
         return callback_failure_response(&AuthError::durable_state(
             "the callback gate refused the request",
         ));
+    }
+    // A caller-supplied `Authorization` header is a client mistake, not a
+    // durable failure, so it is answered with the same unavailable response
+    // without recording a durable incident.
+    if reject_mixed(&headers).is_err() {
+        return callback_failure(ApiFailure::unavailable());
     }
     let query = match parse_callback_query(raw_query.as_deref()) {
         Ok(query) => query,
@@ -308,7 +314,13 @@ fn parse_callback_query(raw_query: Option<&str>) -> Result<CallbackQuery, AuthEr
 }
 
 fn callback_failure_response(error: &AuthError) -> Result<Response, ApiFailure> {
-    let mut response = ApiFailure::auth(error).into_response();
+    callback_failure(ApiFailure::auth(error))
+}
+
+/// Builds the callback error response: the failure's status and body, the
+/// login binding cookie cleared and caching disabled.
+fn callback_failure(failure: ApiFailure) -> Result<Response, ApiFailure> {
+    let mut response = failure.into_response();
     response
         .headers_mut()
         .append(header::SET_COOKIE, cleared_cookie(LOGIN_COOKIE, true)?);
@@ -1061,6 +1073,112 @@ mod credential_router_tests {
             .expect("valid test evidence knobs"),
             login_policy: LoginPolicy::AnyAuthenticatedSubject,
         }
+    }
+
+    /// Sends one callback request to a router backed by a healthy database and
+    /// returns its response together with the structured log lines it emitted.
+    async fn callback_with_log(
+        close_ingress: bool,
+        authorization: Option<&str>,
+    ) -> (Response, Vec<serde_json::Value>) {
+        let (store, _schema, _bootstrap) = auth_tests::fixture().await;
+        let (authority, _directory) = auth_tests::authority(store.clone()).await;
+        let auth = AuthService::new(
+            store.clone(),
+            DigestKey::new("test".to_owned(), b"ephemeral-test-key".to_vec()),
+            2,
+            router_auth_limits(),
+            LoginPolicy::AnyAuthenticatedSubject,
+            Arc::clone(&authority),
+        );
+        let state = ServerState::new(config(), store, auth, OidcClient::test_client(), authority);
+        if close_ingress {
+            state.close_ingress();
+        }
+        let app = router(state);
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&bytes);
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(move || super::durable_failure_tests::Capture(Arc::clone(&captured)))
+            .finish();
+        // The guard is thread-local and the test runtime is single-threaded, so
+        // it covers the whole request.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut request = Request::builder().uri("/v1/auth/oidc/callback?state=s&code=c");
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        let response = app
+            .oneshot(
+                request
+                    .body(axum::body::Body::empty())
+                    .expect("callback request"),
+            )
+            .await
+            .expect("router response");
+        let output = bytes.lock().expect("capture lock").clone();
+        let rows = std::str::from_utf8(&output)
+            .expect("UTF-8 JSON")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("structured log"))
+            .collect();
+        (response, rows)
+    }
+
+    fn durable_failure_events(rows: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        rows.iter()
+            .filter(|row| row["fields"]["message"] == "durable authentication state is unavailable")
+            .collect()
+    }
+
+    async fn error_code(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("callback body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        body["error"]["code"]
+            .as_str()
+            .expect("error code")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_callback_carrying_an_authorization_header_is_not_a_durable_incident() {
+        let (response, rows) = callback_with_log(false, Some("Bearer anything")).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let cleared = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| {
+                value.to_str().is_ok_and(|text| {
+                    text.starts_with("__Host-pohunek-relay-login=") && text.contains("Max-Age=0")
+                })
+            });
+        assert!(cleared, "the login binding cookie is cleared");
+        assert_eq!(error_code(response).await, "unavailable");
+        assert!(
+            durable_failure_events(&rows).is_empty(),
+            "no durable incident is recorded: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_callback_gate_is_still_logged_as_a_durable_failure() {
+        let (response, rows) = callback_with_log(true, None).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(response).await, "unavailable");
+        let events = durable_failure_events(&rows);
+        assert_eq!(events.len(), 1, "{rows:?}");
+        assert_eq!(events[0]["level"], "ERROR");
+        assert_eq!(
+            events[0]["fields"]["cause"],
+            "the callback gate refused the request"
+        );
     }
 
     fn router_auth_limits() -> AuthLimits {
