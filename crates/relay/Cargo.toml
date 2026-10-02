@@ -52,6 +52,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tokio::time::pause` and `advance` virtualize the relay fence's process-local lease deadline in tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
