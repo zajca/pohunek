@@ -208,17 +208,20 @@ const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// The classic prompt normally appears within this bounded startup window.
 const STARTUP_WAIT: Duration = Duration::from_secs(8);
 /// Local mock turns include a real Hermes startup and must remain bounded.
+///
+/// Every evidence wait returns as soon as its marker appears, so this is a hang
+/// guard that also bounds the working and interruption evidence: a submitted
+/// turn first pays the agent start and its local mock round trips.
 const TURN_WAIT: Duration = Duration::from_secs(45);
-/// Working and interruption evidence is sampled shortly after submission.
-const WORKING_WAIT: Duration = Duration::from_secs(3);
 /// Give input handling and terminal cleanup a short bounded grace period.
 const INPUT_SETTLE_WAIT: Duration = Duration::from_secs(2);
 const EXIT_GRACE: Duration = Duration::from_secs(8);
-/// Upper bound for the interrupt acknowledgement after Ctrl-C.
+/// Upper bound for each wait after Ctrl-C: the interrupt acknowledgement and
+/// the return to the idle prompt.
 ///
-/// The wait returns as soon as the interrupt marker appears, so the bound only
-/// matters when the terminal stalls; a lower value turns a slow runner into a
-/// false failure.
+/// Each wait returns as soon as its marker appears, so the bound only matters
+/// when the terminal stalls; a lower value turns a slow runner into a false
+/// failure.
 const INTERRUPT_WAIT: Duration = Duration::from_secs(8);
 /// Reader completion is bounded even if an escaped descendant retained a pipe.
 const READER_GRACE: Duration = Duration::from_secs(2);
@@ -505,7 +508,7 @@ impl Limits {
             pty_output_bytes: MAX_PTY_OUTPUT_BYTES,
             startup_wait: STARTUP_WAIT,
             turn_wait: TURN_WAIT,
-            working_wait: WORKING_WAIT,
+            working_wait: TURN_WAIT,
             input_settle_wait: INPUT_SETTLE_WAIT,
             interrupt_wait: INTERRUPT_WAIT,
             exit_grace: EXIT_GRACE,
@@ -892,6 +895,8 @@ enum Evidence {
     Working(&'static str),
     Approval,
     Interrupted,
+    /// The idle prompt is back after an acknowledged Ctrl-C.
+    IdlePromptAfterInterrupt,
     Resumed(String),
     AlternateScreen,
 }
@@ -2540,6 +2545,7 @@ fn classic_scenarios(limits: Limits) -> Vec<Scenario> {
                 Action::WaitFor(Evidence::Working("sleep 30"), limits.working_wait),
                 Action::Write(INTERRUPT),
                 Action::WaitFor(Evidence::Interrupted, limits.interrupt_wait),
+                Action::WaitFor(Evidence::IdlePromptAfterInterrupt, limits.interrupt_wait),
                 Action::Write(EXIT_COMMAND),
             ],
         },
@@ -2569,6 +2575,10 @@ fn turn_scenario(
         actions.push(Action::Write(INTERRUPT));
         actions.push(Action::WaitFor(
             Evidence::Interrupted,
+            limits.interrupt_wait,
+        ));
+        actions.push(Action::WaitFor(
+            Evidence::IdlePromptAfterInterrupt,
             limits.interrupt_wait,
         ));
     }
@@ -2831,9 +2841,24 @@ fn evidence_matches(evidence: &Evidence, output: &[u8]) -> bool {
                 && text.contains("Deny")
         }
         Evidence::Interrupted => text.contains(INTERRUPT_MARKER),
+        Evidence::IdlePromptAfterInterrupt => has_idle_prompt_after_interrupt(&text),
         Evidence::Resumed(reference) => text.contains(&format!("Resumed session {reference}")),
         Evidence::AlternateScreen => unreachable!("alternate-screen handled above"),
     }
+}
+
+/// Reports whether a bare prompt line follows the last interrupt acknowledgement.
+///
+/// Hermes shows `⚕ ❯ msg=interrupt ...` while the agent is still unwinding and a
+/// bare `❯` line once it is idle again, so only a line that is exactly the
+/// prompt glyph counts. The prompt line is unterminated while it waits for input.
+fn has_idle_prompt_after_interrupt(text: &str) -> bool {
+    text.rfind(INTERRUPT_MARKER).is_some_and(|start| {
+        text[start..]
+            .lines()
+            .skip(1)
+            .any(|line| line.trim() == PROMPT_READY_MARKER)
+    })
 }
 
 /// Returns the prefix of raw PTY output that ends at its last `\n`.
@@ -4061,7 +4086,7 @@ mod tests {
         isolation_root_budget, COMMAND_TIMEOUT, DAEMON_SOCKET_RELATIVE_PATH,
         DARWIN_SOCKET_PATH_MAX_BYTES, EXIT_GRACE, INTEGRATION_ACTION_TIMEOUT, INTERRUPT_WAIT,
         ISOLATED_RUNTIME_DIRECTORY, LINUX_SOCKET_PATH_MAX_BYTES, PRODUCTION_ISOLATION_PREFIX,
-        STARTUP_WAIT, TURN_WAIT, WORKING_WAIT,
+        STARTUP_WAIT, TURN_WAIT,
     };
 
     /// Serializes PTY refresh scenarios within the test process.
@@ -4097,7 +4122,7 @@ mod tests {
             pty_output_bytes: 64 * 1024,
             startup_wait: STARTUP_WAIT,
             turn_wait: TURN_WAIT,
-            working_wait: WORKING_WAIT,
+            working_wait: TURN_WAIT,
             input_settle_wait: Duration::from_secs(1),
             interrupt_wait: INTERRUPT_WAIT,
             exit_grace: EXIT_GRACE,
@@ -4473,6 +4498,48 @@ mod tests {
         let mut closed_border = super::AssistantPanelObserver::new(SHORT_RESPONSE);
         closed_border.feed_snapshot(super::terminated_prefix(closed.as_bytes()));
         assert!(closed_border.one_panel().is_some());
+    }
+
+    #[test]
+    fn idle_prompt_evidence_requires_a_bare_prompt_after_the_interrupt() {
+        let idle = super::Evidence::IdlePromptAfterInterrupt;
+        let interrupt = INTERRUPT_MARKER;
+        let before = format!("{PROMPT_READY_MARKER} \r\nRunning sleep 30\r\n");
+
+        assert!(!super::evidence_matches(&idle, before.as_bytes()));
+        let acknowledged = format!("{before}^C\r\n{interrupt}...\r\n");
+        assert!(!super::evidence_matches(&idle, acknowledged.as_bytes()));
+        let busy = format!(
+            "{acknowledged}\u{2695} {PROMPT_READY_MARKER} msg=interrupt \u{b7} Ctrl+C cancel\r\n"
+        );
+        assert!(!super::evidence_matches(&idle, busy.as_bytes()));
+        let ready = format!("{acknowledged}{PROMPT_READY_MARKER} ");
+        assert!(super::evidence_matches(&idle, ready.as_bytes()));
+        let repainted = format!("{busy}\r\n{PROMPT_READY_MARKER}\r\n");
+        assert!(super::evidence_matches(&idle, repainted.as_bytes()));
+    }
+
+    #[test]
+    fn idle_prompt_evidence_matches_the_committed_goldens_only_after_the_interrupt() {
+        let idle = super::Evidence::IdlePromptAfterInterrupt;
+        let root = pohunek_test_support::workspace_root().join(GOLDEN_ROOT);
+        for id in ["working", "interruption", "approval-blocked"] {
+            let golden =
+                fs::read_to_string(root.join(format!("{id}.txt"))).expect("read committed golden");
+            let idle_prompt = format!("\n{PROMPT_READY_MARKER}\n");
+            let end = golden
+                .rfind(&idle_prompt)
+                .expect("golden ends at an idle prompt");
+
+            assert!(
+                super::evidence_matches(&idle, golden.as_bytes()),
+                "golden `{id}` shows the idle prompt after the interrupt"
+            );
+            assert!(
+                !super::evidence_matches(&idle, &golden.as_bytes()[..end]),
+                "golden `{id}` without its idle prompt must not match"
+            );
+        }
     }
 
     #[test]
@@ -6006,7 +6073,7 @@ PY
             tui_loop,
             "    echo 'node not found \u{2014} install Node.js to use the TUI.'\n    exit 1",
         );
-        let summary = refresh_with(repo.path(), &unavailable, expiring_limits())
+        let summary = refresh_with(repo.path(), &unavailable, fast_limits())
             .expect("recognized local TUI unavailability is recorded");
         assert_eq!(summary.unsupported, 1);
 
@@ -6017,11 +6084,14 @@ PY
             tui_loop,
             "    echo 'authentication failed'\n    exit 1",
         );
-        let error = refresh_with(crash_repo.path(), &crash, expiring_limits())
+        let error = refresh_with(crash_repo.path(), &crash, fast_limits())
             .expect_err("auth failure cannot be recorded as unsupported");
-        assert!(error
-            .to_string()
-            .contains("neither alternate-screen evidence"));
+        assert!(
+            error
+                .to_string()
+                .contains("neither alternate-screen evidence"),
+            "an auth failure must be rejected for the TUI diagnosis, not an earlier scenario: {error}"
+        );
 
         let alt_crash_repo = fixture_repo();
         let alt_crash = fake_hermes(alt_crash_repo.path(), "0.20.0");
@@ -6301,16 +6371,20 @@ PY
         }
     }
 
+    /// Short expiry for fixtures that never produce the awaited evidence, so
+    /// the scenario fails there instead of at the production turn bound.
+    #[cfg(unix)]
+    const EXPIRING_WAIT: Duration = Duration::from_secs(3);
+
     /// Budgets for fixtures that never produce the awaited evidence: every wait
-    /// expires after the short working-evidence window, so the scenario fails
-    /// there instead of at the production turn bound.
+    /// expires after `EXPIRING_WAIT`.
     #[cfg(unix)]
     fn expiring_limits() -> Limits {
         Limits {
-            startup_wait: WORKING_WAIT,
-            turn_wait: WORKING_WAIT,
-            working_wait: WORKING_WAIT,
-            interrupt_wait: WORKING_WAIT,
+            startup_wait: EXPIRING_WAIT,
+            turn_wait: EXPIRING_WAIT,
+            working_wait: EXPIRING_WAIT,
+            interrupt_wait: EXPIRING_WAIT,
             ..fast_limits()
         }
     }
@@ -6392,6 +6466,37 @@ PY
 
         refresh_with(repo.path(), &binary, fast_limits())
             .expect("the exit is sent after the assistant panel border is complete");
+    }
+
+    /// Rewrites the fake Hermes so that it acknowledges Ctrl-C and then stays
+    /// busy for `FIXTURE_STALL`, discarding any input typed meanwhile, before
+    /// it prints its idle prompt.
+    ///
+    /// Like the real Hermes, input typed before the idle prompt never reaches
+    /// the exit command. No handshake can release the prompt, because the
+    /// harness types nothing until it sees it; the hold only widens the window
+    /// in which an early `/exit` is lost.
+    #[cfg(unix)]
+    fn busy_after_interrupt_fake_hermes(root: &Path) -> PathBuf {
+        let binary = fake_hermes(root, "0.20.0");
+        rewrite_script(
+            &binary,
+            "trap 'printf \"\\nInterrupting agent...\\n\u{276f} \"' INT",
+            &format!(
+                "trap 'printf \"\\nInterrupting agent...\\n\"; sleep {FIXTURE_STALL}; python3 -c \"import termios; termios.tcflush(0, termios.TCIFLUSH)\"; printf \"\u{276f} \"' INT"
+            ),
+        );
+        binary
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn refresh_exits_only_after_the_post_interrupt_prompt() {
+        let repo = fixture_repo();
+        let binary = busy_after_interrupt_fake_hermes(repo.path());
+
+        refresh_with(repo.path(), &binary, fast_limits())
+            .expect("the exit command is typed once the idle prompt is back");
     }
 
     #[test]
