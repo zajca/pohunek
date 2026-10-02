@@ -16,3 +16,5 @@ export { DEFAULT_PTY_READY_BYTES } from "./pty";
 export type { FixturePtyOptions } from "./pty";
 export { FixtureScenario } from "./scenario";
 export type { ScenarioNotificationInput, ScenarioResize } from "./scenario";
+export { MACOS_FIXTURE_ROOT_PARENT, createFixtureRoot, createFixtureRootSync } from "./runtime-root";
+export type { FixtureRootOptions } from "./runtime-root";

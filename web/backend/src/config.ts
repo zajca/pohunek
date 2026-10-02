@@ -1,5 +1,16 @@
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  currentRuntimePathContext,
+  ENV_XDG_RUNTIME_DIR,
+  resolveDaemonSocket,
+  resolveRuntimeDir,
+  RuntimePathError,
+  validateSocketPath,
+  type RuntimePathContext,
+} from "./runtime-paths";
+
+export { ENV_XDG_RUNTIME_DIR };
 
 export const DEFAULT_DISCOVER_INTERVAL_SECONDS = 30;
 export const DEFAULT_STATIC_ASSETS_DIR = fileURLToPath(
@@ -12,20 +23,24 @@ export const ENV_ALLOW_LOOPBACK = "POHUNEK_BACKEND_ALLOW_LOOPBACK";
 export const ENV_DAEMON_SOCKET = "POHUNEK_BACKEND_DAEMON_SOCKET";
 export const ENV_DISCOVER_INTERVAL = "POHUNEK_BACKEND_DISCOVER_INTERVAL";
 export const ENV_STATIC_ASSETS_DIR = "POHUNEK_BACKEND_STATIC_DIR";
-export const ENV_XDG_RUNTIME_DIR = "XDG_RUNTIME_DIR";
 
-const DEFAULT_DAEMON_SOCKET_SUBDIRECTORY = "pohunek";
-const DEFAULT_DAEMON_SOCKET_FILENAME = "daemon.sock";
 const MIN_PORT = 0;
 const MAX_PORT = 65_535;
 const TRUE_ENV_VALUES = new Set(["1", "true", "yes", "on"]);
 const FALSE_ENV_VALUES = new Set(["0", "false", "no", "off"]);
+
+export interface DerivedRuntime {
+  readonly dir: string;
+  readonly effectiveUid: number;
+}
 
 export interface BackendConfig {
   readonly bindHost: string;
   readonly port: number;
   readonly allowLoopbackBind: boolean;
   readonly daemonSocketPath: string;
+  /** Set when the socket is derived from the runtime directory; checked before connecting. */
+  readonly derivedRuntime: DerivedRuntime | undefined;
   readonly discoverIntervalSeconds: number;
   readonly staticAssetsDir: string;
 }
@@ -40,12 +55,18 @@ export class BackendConfigError extends Error {
   }
 }
 
-export function loadBackendConfig(env: NodeJS.ProcessEnv = process.env): BackendConfig {
+export function loadBackendConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  runtime: RuntimePathContext = currentRuntimePathContext(),
+): BackendConfig {
   return {
     bindHost: requiredEnv(env, ENV_BIND_HOST),
     port: parsePort(requiredEnv(env, ENV_PORT), ENV_PORT, MIN_PORT),
     allowLoopbackBind: parseBoolean(env[ENV_ALLOW_LOOPBACK], ENV_ALLOW_LOOPBACK),
-    daemonSocketPath: resolveDaemonSocketPath(env),
+    daemonSocketPath: resolveConfiguredSocket(env, runtime),
+    derivedRuntime: env[ENV_DAEMON_SOCKET] === undefined
+      ? { dir: resolveRuntimeDirChecked(env, runtime), effectiveUid: runtime.effectiveUid }
+      : undefined,
     discoverIntervalSeconds: parseDiscoverInterval(env[ENV_DISCOVER_INTERVAL]),
     staticAssetsDir: resolveStaticAssetsDir(env[ENV_STATIC_ASSETS_DIR]),
   };
@@ -59,23 +80,37 @@ function requiredEnv(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
-function resolveDaemonSocketPath(env: NodeJS.ProcessEnv): string {
-  const override = env[ENV_DAEMON_SOCKET];
-  if (override !== undefined) {
-    if (override.length === 0) {
-      throw new BackendConfigError(ENV_DAEMON_SOCKET, "must not be empty when present");
+function resolveRuntimeDirChecked(env: NodeJS.ProcessEnv, runtime: RuntimePathContext): string {
+  try {
+    return resolveRuntimeDir(runtime, env);
+  } catch (error: unknown) {
+    if (error instanceof RuntimePathError) {
+      throw new BackendConfigError(error.variable, error.message);
     }
-    return override;
+    throw error;
   }
+}
 
-  const runtimeDir = env[ENV_XDG_RUNTIME_DIR];
-  if (runtimeDir === undefined || runtimeDir.length === 0) {
-    throw new BackendConfigError(
-      ENV_XDG_RUNTIME_DIR,
-      `is required when ${ENV_DAEMON_SOCKET} is not set`,
-    );
+function resolveConfiguredSocket(env: NodeJS.ProcessEnv, runtime: RuntimePathContext): string {
+  const override = env[ENV_DAEMON_SOCKET];
+  try {
+    if (override !== undefined) {
+      if (override.length === 0) {
+        throw new BackendConfigError(ENV_DAEMON_SOCKET, "must not be empty when present");
+      }
+      validateSocketPath(runtime.platform, override, ENV_DAEMON_SOCKET);
+      return override;
+    }
+    return resolveDaemonSocket(runtime, env);
+  } catch (error: unknown) {
+    if (error instanceof RuntimePathError) {
+      const hint = error.failure.variant === "missing_env"
+        ? ` when ${ENV_DAEMON_SOCKET} is not set`
+        : "";
+      throw new BackendConfigError(error.variable, `${error.message}${hint}`);
+    }
+    throw error;
   }
-  return join(runtimeDir, DEFAULT_DAEMON_SOCKET_SUBDIRECTORY, DEFAULT_DAEMON_SOCKET_FILENAME);
 }
 
 function parsePort(raw: string, variable: string, minimum: number): number {

@@ -1,9 +1,9 @@
 import { rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type SessionInfo } from "@pohunek/protocol";
 import { ClientError, type ControlChannel, type RawDuplex, type Transport } from "@pohunek/sdk";
+import { createFixtureRootSync } from "@pohunek/testkit";
 
 export type MockEndpoint =
   | { kind: "unix"; socketPath: string }
@@ -34,11 +34,32 @@ const CARRIAGE_RETURN = 0x0d;
 
 let nextSocketId = 0;
 
+// One private root keeps every socket path short and out of shared directories.
+// It is created on first use so importing this module needs no writable disk.
+let socketRoot: string | undefined;
+
+function socketRootDir(): string {
+  if (socketRoot === undefined) {
+    const root = createFixtureRootSync("pk-sdk-");
+    process.on("exit", (): void => {
+      rmSync(root, { recursive: true, force: true });
+    });
+    socketRoot = root;
+  }
+  return socketRoot;
+}
+
 export async function startUnixDaemon(steps: ScriptStep[]): Promise<MockDaemon> {
-  const socketPath = join(
-    tmpdir(),
-    `pohunek-sdk-${process.pid}-${nextSocketId++}.sock`,
-  );
+  let socketPath: string;
+  try {
+    socketPath = join(socketRootDir(), `${nextSocketId++}.sock`);
+  } catch (error: unknown) {
+    // A sandbox without a writable temp directory cannot bind a Unix socket.
+    if (isFilesystemDenied(error)) {
+      return startMemoryDaemon(steps);
+    }
+    throw error;
+  }
   rmSync(socketPath, { force: true });
   const runtime = createRuntime(steps);
   const server = createServer({ allowHalfOpen: true }, (socket) => {
@@ -680,6 +701,11 @@ function isAddressInfo(address: string | AddressInfo | null): address is Address
 function isPermissionDenied(error: Error): boolean {
   const code = (error as { code?: unknown }).code;
   return code === "EPERM" || error.message.includes("Failed to listen");
+}
+
+function isFilesystemDenied(error: unknown): boolean {
+  const code = (error as { code?: unknown }).code;
+  return code === "EROFS" || code === "EACCES" || code === "EPERM";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

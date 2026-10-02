@@ -56,6 +56,10 @@ test("manages a session lifecycle and keeps observed sessions read-only", async 
 
 test("manages host-scoped projects and eligible owned worktrees", async ({ page, stack }) => {
   await page.goto(stack.backend.url);
+  // Projects does nothing until a host is connected; a listed session means one is.
+  await expect(
+    page.locator(`[data-testid="session-row"][data-host="${FIXTURE_LOCAL_HOST}"]`).first(),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Projects" }).click();
   await expect(page).toHaveURL((url): boolean => url.pathname === projectPath(FIXTURE_LOCAL_HOST));
   await page.getByRole("combobox", { name: "Project host" }).selectOption(FIXTURE_PEER_HOST);

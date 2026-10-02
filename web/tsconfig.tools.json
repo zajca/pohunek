@@ -12,6 +12,9 @@
     "release/smoke.ts",
     "scripts/**/*.ts"
   ],
+  "exclude": [
+    "scripts/test"
+  ],
   "references": [
     {
       "path": "./shared"

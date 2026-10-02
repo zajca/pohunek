@@ -679,9 +679,9 @@ landscape orientations.
 
 For local UI development with two fixture daemons, run `bun run dev` from
 `web/`; no Rust daemon or NetBird setup is required. Bun remains the workspace
-runtime, while the development orchestrator requires `node` on `PATH` to run
-Vite's WebSocket proxy in a compatible Node child process. Set
-`POHUNEK_NODE_BIN` only when the Node executable has a nonstandard path. A
+runtime, while the development orchestrator locates Node (`POHUNEK_NODE_BIN`, then
+`PATH`, then the Homebrew and installer prefixes on macOS) to run Vite's
+WebSocket proxy in a compatible Node child process. A
 deployed backend binds only to a NetBird address (loopback requires the explicit
 development flag; wildcard binds are rejected). The supplied systemd user unit
 and its environment file instructions are in
@@ -725,9 +725,8 @@ the examples use `POHUNEK_SOCKET` rather than reconstructing a Linux-only path.
 With an explicit `XDG_RUNTIME_DIR`, Pohunek uses its `pohunek` child on Linux and
 macOS. Linux requires that variable, while macOS without it uses
 `/private/tmp/pohunek-<effective-uid>` and ignores `TMPDIR` for this decision.
-The current Bun owner backend does not derive that macOS default yet; until the
-#103 integration, configure its exact socket explicitly or provide
-`XDG_RUNTIME_DIR`.
+The Bun owner backend derives the same default and checks the runtime directory
+before connecting; `POHUNEK_BACKEND_DAEMON_SOCKET` overrides it.
 
 ```rust
 // Rust — `pohunek-client`

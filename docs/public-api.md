@@ -229,11 +229,11 @@ Unsafe symlinks, foreign entries, wrong types or modes, and encoded socket paths
 that exceed the native Unix-socket limit are errors and are never repaired,
 deleted, or truncated implicitly.
 
-The Rust daemon, CLI, GUI, workers, and hooks use this shared resolver. The
-current Bun owner backend still requires either an explicit
-`POHUNEK_BACKEND_DAEMON_SOCKET` or `XDG_RUNTIME_DIR`; adopting the shared macOS
-default in that consumer is tracked by #103 and is not part of the protocol-v3
-contract change.
+The Rust daemon, CLI, GUI, workers, and hooks use this shared resolver, and the
+Bun owner backend implements the same contract: both are driven by the cases in
+`crates/paths/fixtures/runtime-paths.json`. The backend additionally accepts
+`POHUNEK_BACKEND_DAEMON_SOCKET`, validated by the same absolute, parent-component
+and native-length rules.
 
 The JSON control stream is newline-delimited UTF-8 JSON. One JSON value is sent
 per line. The current daemon and Rust SDK cap control lines at 1 MiB.

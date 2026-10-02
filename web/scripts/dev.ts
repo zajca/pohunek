@@ -10,6 +10,7 @@ import {
   startFixtureStack,
   type FixtureStackHandle,
 } from "./fixture-stack";
+import { resolveNodeExecutable } from "./node-executable";
 
 const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const LOGS_DIR = join(WEB_ROOT, "logs");
@@ -17,8 +18,6 @@ const DEV_LOG_PATH = join(LOGS_DIR, "dev.log");
 const CLEAN_EXIT_CODE = 0;
 const FAILURE_EXIT_CODE = 1;
 const VITE_BACKEND_URL_ENV = "POHUNEK_VITE_BACKEND_URL";
-const NODE_EXECUTABLE_ENV = "POHUNEK_NODE_BIN";
-const DEFAULT_NODE_EXECUTABLE = "node";
 const VITE_READY_PREFIX = "POHUNEK_VITE_READY ";
 const VITE_CHILD_PATH = join(WEB_ROOT, "scripts", "vite-dev.mjs");
 const DEV_SIGNALS = ["SIGINT", "SIGTERM"] as const;
@@ -134,7 +133,10 @@ async function main(): Promise<void> {
 
 async function startViteProcess(backendUrl: string, logs: DevLogTee): Promise<ViteProcessHandle> {
   // Vite's WebSocket proxy requires Node net.Socket APIs that Bun 1.3 does not implement.
-  const nodeExecutable = process.env[NODE_EXECUTABLE_ENV] ?? DEFAULT_NODE_EXECUTABLE;
+  const nodeExecutable = await resolveNodeExecutable({
+    env: process.env,
+    platform: process.platform,
+  });
   const child = spawn(nodeExecutable, [VITE_CHILD_PATH], {
     cwd: WEB_ROOT,
     env: {
