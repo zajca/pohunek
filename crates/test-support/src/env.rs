@@ -10,7 +10,8 @@
 //!   symlink-free and short enough for nested sockets; otherwise creation
 //!   fails with a message naming `TMPDIR`;
 //! - a private working directory, `HOME`, the five XDG base directories and a
-//!   `TMPDIR`, all inside that root and owner-only (`0700`);
+//!   `TMPDIR`, all inside that root and owner-only (`0700`, whatever the process
+//!   umask);
 //! - an environment for child processes built from an allowlist: only the
 //!   parent variables named by [`INHERITED_VARS`] are passed on, `HOME`,
 //!   `XDG_*` and `TMPDIR` point at the private directories, and every other
@@ -59,18 +60,14 @@ use std::path::{Component, Path, PathBuf};
 
 use tempfile::TempDir;
 
+use crate::{make_private, PRIVATE_DIR_MODE};
+
 /// Capacity of a Unix socket path on the strictest supported platform, in bytes.
 ///
 /// Darwin's `sun_path` holds 104 bytes including the terminating NUL (Linux
 /// holds 108). A path that fits this limit binds on every supported platform;
 /// raising the value lets tests pass on Linux and fail on macOS.
 pub const STRICTEST_SOCKET_PATH_CAPACITY: usize = 104;
-
-/// Mode of every directory a [`TestEnv`] creates.
-///
-/// The trusted filesystem layer rejects group- or world-accessible private
-/// roots, and `XDG_RUNTIME_DIR` must be owner-only by specification.
-const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// Name prefix of the [`TestEnv`] root.
 ///
@@ -325,6 +322,9 @@ impl TestEnv {
             .rand_bytes(ROOT_RANDOM_BYTES)
             .permissions(std::fs::Permissions::from_mode(PRIVATE_DIR_MODE))
             .tempdir_in(base)?;
+        // Before any child is created: a umask that clears owner bits would
+        // otherwise leave a root the owner cannot enter.
+        make_private(root.path())?;
         let child = |name: &str| root.path().join(name);
         let (cwd, home) = (child(CWD_DIR), child(HOME_DIR));
         let (config_home, data_home) = (child(CONFIG_DIR), child(DATA_DIR));
@@ -343,6 +343,7 @@ impl TestEnv {
             std::fs::DirBuilder::new()
                 .mode(PRIVATE_DIR_MODE)
                 .create(dir)?;
+            make_private(dir)?;
         }
         let pinned = [
             (HOME_VAR, &home),
@@ -1010,5 +1011,66 @@ mod tests {
             "{stdout}"
         );
         assert!(!stdout.contains(HOST_SESSION_ID), "{stdout}");
+    }
+
+    /// Prefix of the lines the umask probe child prints.
+    const UMASK_PROBE_LINE: &str = "umask-probe:";
+
+    /// Umask that removes every permission bit, the worst case for `mkdir`.
+    const OWNER_MASKING_UMASK: &str = "777";
+
+    /// Child half of [`directories_are_private_under_an_owner_masking_umask`].
+    #[test]
+    #[ignore = "child process of directories_are_private_under_an_owner_masking_umask"]
+    fn umask_probe_test_env() {
+        let env = TestEnv::new().expect("create env under the masking umask");
+        std::fs::write(env.cwd().join("file"), b"x").expect("write into the cwd");
+        for dir in [
+            env.root(),
+            env.cwd(),
+            env.home(),
+            env.config_home(),
+            env.data_home(),
+            env.state_home(),
+            env.cache_home(),
+            env.runtime_dir(),
+            env.tmp_dir(),
+        ] {
+            let mode = std::fs::metadata(dir)
+                .expect("stat dir")
+                .permissions()
+                .mode();
+            println!("{UMASK_PROBE_LINE}{:o}", mode & 0o777);
+        }
+    }
+
+    #[test]
+    fn directories_are_private_under_an_owner_masking_umask() {
+        let exe = std::env::current_exe().expect("test executable");
+        // The umask is process-global, so it is set in a child; POSIX `sh` has the
+        // `umask` builtin and exists at `/bin/sh` on Linux and macOS.
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("umask {OWNER_MASKING_UMASK}; exec \"$0\" \"$@\""),
+            ])
+            .arg(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "env::tests::umask_probe_test_env",
+                "--nocapture",
+            ])
+            .output()
+            .expect("run probe child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "probe failed: {stderr}");
+        let stdout = String::from_utf8(output.stdout).expect("utf-8 stdout");
+        let modes: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(UMASK_PROBE_LINE))
+            .collect();
+        let expected = format!("{PRIVATE_DIR_MODE:o}");
+        assert_eq!(modes, [expected.as_str(); 9], "{stdout}");
     }
 }
