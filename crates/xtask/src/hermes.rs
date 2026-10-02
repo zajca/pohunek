@@ -901,13 +901,12 @@ enum Evidence {
     AlternateScreen,
 }
 
-#[cfg(test)]
+/// Incrementally rendered terminal screen with its scrollback history.
 struct TerminalCapture {
     parser: vt100::Parser,
     observed_bytes: usize,
 }
 
-#[cfg(test)]
 impl TerminalCapture {
     fn new() -> Self {
         Self {
@@ -933,6 +932,7 @@ impl TerminalCapture {
         terminal_history(&mut self.parser)
     }
 
+    #[cfg(test)]
     fn assistant_panel_count(&mut self, expected: &str) -> usize {
         assistant_panel_count(&self.transcript(), expected)
     }
@@ -2777,6 +2777,8 @@ fn wait_for_evidence(
         Evidence::AssistantPanel(expected) => Some(AssistantPanelObserver::new(expected)),
         _ => None,
     };
+    let mut screen =
+        matches!(evidence, Evidence::IdlePromptAfterInterrupt).then(TerminalCapture::new);
     loop {
         let (bytes, overflow) = output_snapshot(output)?;
         if overflow {
@@ -2788,6 +2790,12 @@ fn wait_for_evidence(
             (evidence, panel_observer.as_mut())
         {
             observer.feed_snapshot(terminated_prefix(&bytes)) && observer.one_panel().is_some()
+        } else if let Some(screen) = screen.as_mut() {
+            screen.feed_snapshot(&bytes)
+                && has_idle_prompt_after_interrupt(
+                    &raw_terminal_transcript(&bytes),
+                    &screen.transcript(),
+                )
         } else {
             evidence_matches(evidence, &bytes)
         };
@@ -2841,24 +2849,34 @@ fn evidence_matches(evidence: &Evidence, output: &[u8]) -> bool {
                 && text.contains("Deny")
         }
         Evidence::Interrupted => text.contains(INTERRUPT_MARKER),
-        Evidence::IdlePromptAfterInterrupt => has_idle_prompt_after_interrupt(&text),
+        Evidence::IdlePromptAfterInterrupt => {
+            unreachable!("the idle prompt uses the terminal-state matcher")
+        }
         Evidence::Resumed(reference) => text.contains(&format!("Resumed session {reference}")),
         Evidence::AlternateScreen => unreachable!("alternate-screen handled above"),
     }
 }
 
-/// Reports whether a bare prompt line follows the last interrupt acknowledgement.
+/// Reports whether the screen shows the idle prompt after an acknowledged interrupt.
 ///
 /// Hermes shows `⚕ ❯ msg=interrupt ...` while the agent is still unwinding and a
-/// bare `❯` line once it is idle again, so only a line that is exactly the
-/// prompt glyph counts. The prompt line is unterminated while it waits for input.
-fn has_idle_prompt_after_interrupt(text: &str) -> bool {
-    text.rfind(INTERRUPT_MARKER).is_some_and(|start| {
-        text[start..]
-            .lines()
-            .skip(1)
-            .any(|line| line.trim() == PROMPT_READY_MARKER)
-    })
+/// bare `❯` line once it is idle again. The prompt is judged on the rendered
+/// screen: its most recent prompt-bearing line, below the interrupt
+/// acknowledgement when that is still on screen, must be exactly the prompt
+/// glyph. A bare prompt that a later repaint replaced with the busy status
+/// therefore does not count. The acknowledgement itself is read from the raw
+/// transcript, because a repaint may already have erased it from the screen.
+fn has_idle_prompt_after_interrupt(raw: &str, rendered: &str) -> bool {
+    if !raw.contains(INTERRUPT_MARKER) {
+        return false;
+    }
+    let after_interrupt = rendered
+        .rfind(INTERRUPT_MARKER)
+        .map_or(rendered, |start| &rendered[start..]);
+    after_interrupt
+        .lines()
+        .rfind(|line| line.contains(PROMPT_READY_MARKER))
+        .is_some_and(|line| line.trim() == PROMPT_READY_MARKER)
 }
 
 /// Returns the prefix of raw PTY output that ends at its last `\n`.
@@ -4500,43 +4518,66 @@ mod tests {
         assert!(closed_border.one_panel().is_some());
     }
 
+    /// Renders the output on a terminal screen and applies the idle-prompt judgement.
+    fn idle_prompt_matches(output: &[u8]) -> bool {
+        let mut screen = TerminalCapture::new();
+        screen.feed_snapshot(output);
+        super::has_idle_prompt_after_interrupt(
+            &raw_terminal_transcript(output),
+            &screen.transcript(),
+        )
+    }
+
     #[test]
     fn idle_prompt_evidence_requires_a_bare_prompt_after_the_interrupt() {
-        let idle = super::Evidence::IdlePromptAfterInterrupt;
         let interrupt = INTERRUPT_MARKER;
         let before = format!("{PROMPT_READY_MARKER} \r\nRunning sleep 30\r\n");
 
-        assert!(!super::evidence_matches(&idle, before.as_bytes()));
+        assert!(!idle_prompt_matches(before.as_bytes()));
         let acknowledged = format!("{before}^C\r\n{interrupt}...\r\n");
-        assert!(!super::evidence_matches(&idle, acknowledged.as_bytes()));
+        assert!(!idle_prompt_matches(acknowledged.as_bytes()));
         let busy = format!(
             "{acknowledged}\u{2695} {PROMPT_READY_MARKER} msg=interrupt \u{b7} Ctrl+C cancel\r\n"
         );
-        assert!(!super::evidence_matches(&idle, busy.as_bytes()));
+        assert!(!idle_prompt_matches(busy.as_bytes()));
         let ready = format!("{acknowledged}{PROMPT_READY_MARKER} ");
-        assert!(super::evidence_matches(&idle, ready.as_bytes()));
+        assert!(idle_prompt_matches(ready.as_bytes()));
         let repainted = format!("{busy}\r\n{PROMPT_READY_MARKER}\r\n");
-        assert!(super::evidence_matches(&idle, repainted.as_bytes()));
+        assert!(idle_prompt_matches(repainted.as_bytes()));
+    }
+
+    #[test]
+    fn idle_prompt_evidence_ignores_a_bare_prompt_that_was_overwritten() {
+        let acknowledged = format!(
+            "{PROMPT_READY_MARKER} \r\nRunning sleep 30\r\n^C\r\n{INTERRUPT_MARKER}...\r\n"
+        );
+        // prompt-toolkit repaints the prompt row in place: the bare prompt is
+        // replaced by the busy status before the agent is idle again.
+        let repainted = format!(
+            "{acknowledged}{PROMPT_READY_MARKER}\r\u{2695} {PROMPT_READY_MARKER} msg=interrupt \u{b7} /queue \u{b7} Ctrl+C cancel"
+        );
+        let settled = format!("{repainted}\r\n\r\n{PROMPT_READY_MARKER} ");
+
+        assert!(!idle_prompt_matches(repainted.as_bytes()));
+        assert!(idle_prompt_matches(settled.as_bytes()));
     }
 
     #[test]
     fn idle_prompt_evidence_matches_the_committed_goldens_only_after_the_interrupt() {
-        let idle = super::Evidence::IdlePromptAfterInterrupt;
         let root = pohunek_test_support::workspace_root().join(GOLDEN_ROOT);
         for id in ["working", "interruption", "approval-blocked"] {
             let golden =
                 fs::read_to_string(root.join(format!("{id}.txt"))).expect("read committed golden");
-            let idle_prompt = format!("\n{PROMPT_READY_MARKER}\n");
+            let golden = golden.replace('\n', "\r\n");
             let end = golden
-                .rfind(&idle_prompt)
+                .rfind(&format!("\r\n{PROMPT_READY_MARKER}\r\n"))
                 .expect("golden ends at an idle prompt");
-
             assert!(
-                super::evidence_matches(&idle, golden.as_bytes()),
+                idle_prompt_matches(golden.as_bytes()),
                 "golden `{id}` shows the idle prompt after the interrupt"
             );
             assert!(
-                !super::evidence_matches(&idle, &golden.as_bytes()[..end]),
+                !idle_prompt_matches(&golden.as_bytes()[..end]),
                 "golden `{id}` without its idle prompt must not match"
             );
         }
