@@ -85,9 +85,16 @@ impl Request {
 struct PathGuard {
     _guard: MutexGuard<'static, ()>,
     old_path: Option<OsString>,
-    /// The isolated `PATH` directory, kept until `PATH` is restored.
-    _isolated: Option<TestDir>,
 }
+
+/// Name of the agent-free `PATH` directory under Cargo's per-target test
+/// scratch directory.
+const AGENTLESS_PATH_DIR: &str = "agentless-path";
+
+/// Tools sibling tests resolve through `PATH` while it is isolated: `git`,
+/// `python3` and `sh` for stub agents, `sleep` and `stty` inside worker-backed
+/// shell commands.
+const AGENTLESS_PATH_TOOLS: [&str; 5] = ["git", "python3", "sh", "sleep", "stty"];
 
 impl PathGuard {
     async fn prepend(path: &Path) -> Self {
@@ -102,7 +109,6 @@ impl PathGuard {
         Self {
             _guard: guard,
             old_path,
-            _isolated: None,
         }
     }
 
@@ -116,32 +122,43 @@ impl PathGuard {
     /// test's `fork`/`exec` of a worker-backed session's shell inherits this same
     /// isolated `PATH` — `PATH_LOCK` only serializes this swap against other
     /// PATH-*mutating* tests, not against ordinary session creation happening
-    /// elsewhere in the suite. The rest of the suite resolves a handful of tools
-    /// through PATH (`git`, `python3`, `sh` for stub agents; `sleep`/`stty` inside
-    /// worker-backed shell test commands such as `"sleep 30"` or `"stty -echo"`);
-    /// the isolated dir is seeded with symlinks to all of those, resolved from the
-    /// current PATH, so replacing PATH cannot starve a sibling test of them (a
-    /// missing `sleep` here previously surfaced as a sibling's shell exiting with
-    /// code 127 and its session flipping to `Failed` mid-test). PATH is restored
-    /// on drop.
-    async fn isolated_without_agents(tag: &str) -> Self {
+    /// elsewhere in the suite. The isolated directory therefore holds links to
+    /// [`AGENTLESS_PATH_TOOLS`], and it is never removed: a sibling process
+    /// started under it keeps a valid `PATH` after this guard restores the
+    /// variable. It lives under Cargo's per-target test scratch directory, not
+    /// the system temporary directory, and is reused by every run. PATH is
+    /// restored on drop.
+    async fn isolated_without_agents() -> Self {
         let guard = PATH_LOCK.lock().await;
         let old_path = std::env::var_os("PATH");
-        let dir = temp_dir(tag);
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(AGENTLESS_PATH_DIR);
+        std::fs::create_dir_all(&dir).expect("create the agent-free PATH directory");
         if let Some(old_path) = &old_path {
-            for tool in ["git", "python3", "sh", "sleep", "stty"] {
+            for tool in AGENTLESS_PATH_TOOLS {
                 if let Some(real) = which_in(old_path, tool) {
-                    let _ = std::os::unix::fs::symlink(&real, dir.join(tool));
+                    link_tool(&dir, tool, &real);
                 }
             }
         }
-        std::env::set_var("PATH", &*dir);
+        std::env::set_var("PATH", &dir);
         Self {
             _guard: guard,
             old_path,
-            _isolated: Some(dir),
         }
     }
+}
+
+/// Points `dir/tool` at `real`, replacing a link to anything else in one
+/// rename so a concurrent reader never sees the name missing.
+fn link_tool(dir: &Path, tool: &str, real: &Path) {
+    let link = dir.join(tool);
+    if std::fs::read_link(&link).is_ok_and(|target| target == real) {
+        return;
+    }
+    let staged = dir.join(format!(".{tool}.{}", std::process::id()));
+    let _ = std::fs::remove_file(&staged);
+    std::os::unix::fs::symlink(real, &staged).expect("stage the tool link");
+    std::fs::rename(&staged, &link).expect("install the tool link");
 }
 
 /// Resolve `name` to its first existing entry across the directories in a PATH
@@ -1753,7 +1770,7 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
     // recoverable `agent_binary_missing` error (stable code a script can branch
     // on) rather than a generic spawn failure.
     let resp = {
-        let _path = PathGuard::isolated_without_agents("missing-agent-path").await;
+        let _path = PathGuard::isolated_without_agents().await;
         create_session_with_agent(&mut control, AgentKind::Claude, cwd.to_path_buf()).await
     };
 
