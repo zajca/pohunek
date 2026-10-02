@@ -4,7 +4,8 @@
 //! `git -C <repo>`, but `-C` does not override the repository-location
 //! variables of the environment: a daemon started from a git hook, or from a
 //! shell that exported `GIT_DIR`, would otherwise address that repository for
-//! every project it manages.
+//! every project it manages, or refuse every ref update because a
+//! `git receive-pack` hook left its quarantine marker behind.
 
 // Rust guideline compliant 2026-10-02
 
@@ -39,7 +40,7 @@ use std::process::Command;
 /// (`REPOSITORY_REDIRECTING_VARS` in `crates/xtask/src/affected.rs`); a test
 /// here keeps it equal, because no crate both depend on is a sensible home for
 /// a list of Git variable names. The daemon additionally drops
-/// [`DISCOVERY_RESTRICTING_VARS`].
+/// [`DISCOVERY_RESTRICTING_VARS`] and [`WRITE_RESTRICTING_VARS`].
 pub(crate) const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
     "GIT_DIR",
     "GIT_COMMON_DIR",
@@ -64,9 +65,34 @@ pub(crate) const REPOSITORY_REDIRECTING_VARS: &[&str] = &[
 /// does not drop it because it always runs git from the repository root.
 pub(crate) const DISCOVERY_RESTRICTING_VARS: &[&str] = &["GIT_CEILING_DIRECTORIES"];
 
+/// Variables Git exports to a hook that forbid the hook's children from
+/// updating refs.
+///
+/// `git receive-pack` sets `GIT_QUARANTINE_PATH` while it runs `pre-receive` and
+/// `update` hooks; with it present, every ref update of a child fails with "ref
+/// updates forbidden inside quarantine environment", which breaks
+/// `git worktree add -b` for the daemon's whole life. `xtask` only reads, so it
+/// does not drop it.
+///
+/// The other variables Git sets for a hook (githooks(5), git-receive-pack(1))
+/// stay, because none changes what a daemon child reads or writes:
+/// `GIT_PUSH_OPTION_COUNT`, `GIT_PUSH_OPTION_<n>` and the `GIT_PUSH_CERT*`
+/// family are data that only a hook consumes; `GIT_REFLOG_ACTION` only labels
+/// reflog entries; `GIT_EDITOR` and `GIT_SEQUENCE_EDITOR` are never run because
+/// the daemon passes no command that opens an editor; `GIT_EXEC_PATH` names the
+/// helper directory of the Git that set it and is as trusted as `PATH`;
+/// `GIT_TRACE*` only writes diagnostics; `GIT_PAGER_IN_USE` only affects
+/// output decoration; `GIT_TEMPLATE_DIR` is read by `init` and `clone`, which
+/// the daemon does not run; `GIT_SENDEMAIL_FILE_*` and `GIT_DIFF_PATH_*` are
+/// handed to `send-email` hooks and external diff programs only. The
+/// repository-location variables Git also sets (`GIT_DIR`, `GIT_INDEX_FILE`,
+/// `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+/// `GIT_WORK_TREE`) are in [`REPOSITORY_REDIRECTING_VARS`].
+pub(crate) const WRITE_RESTRICTING_VARS: &[&str] = &["GIT_QUARANTINE_PATH"];
+
 /// Builds a command for the trusted `git` executable that drops the
-/// [`REPOSITORY_REDIRECTING_VARS`] and [`DISCOVERY_RESTRICTING_VARS`] it would
-/// inherit.
+/// [`REPOSITORY_REDIRECTING_VARS`], [`DISCOVERY_RESTRICTING_VARS`] and
+/// [`WRITE_RESTRICTING_VARS`] it would inherit.
 ///
 /// The executable is resolved once through
 /// [`trusted_program`](crate::agent::trusted_program), so no second `PATH`
@@ -83,6 +109,7 @@ pub(crate) fn command() -> Result<Command, String> {
     for var in REPOSITORY_REDIRECTING_VARS
         .iter()
         .chain(DISCOVERY_RESTRICTING_VARS)
+        .chain(WRITE_RESTRICTING_VARS)
     {
         command.env_remove(var);
     }
@@ -106,6 +133,7 @@ mod tests {
         removed.sort_unstable();
         let mut expected = REPOSITORY_REDIRECTING_VARS.to_vec();
         expected.extend(DISCOVERY_RESTRICTING_VARS);
+        expected.extend(WRITE_RESTRICTING_VARS);
         expected.sort_unstable();
         assert_eq!(removed, expected);
         assert_eq!(command.get_envs().count(), expected.len());
@@ -126,12 +154,19 @@ mod tests {
             "GIT_DEFAULT_HASH",
             "GIT_DEFAULT_REF_FORMAT",
             "GIT_INDEX_VERSION",
+            "GIT_PUSH_OPTION_COUNT",
+            "GIT_PUSH_CERT",
+            "GIT_REFLOG_ACTION",
+            "GIT_EXEC_PATH",
+            "GIT_EDITOR",
         ] {
             assert!(!REPOSITORY_REDIRECTING_VARS.contains(&kept), "{kept}");
             assert!(!DISCOVERY_RESTRICTING_VARS.contains(&kept), "{kept}");
+            assert!(!WRITE_RESTRICTING_VARS.contains(&kept), "{kept}");
         }
         assert_eq!(REPOSITORY_REDIRECTING_VARS.len(), 12);
         assert_eq!(DISCOVERY_RESTRICTING_VARS, ["GIT_CEILING_DIRECTORIES"]);
+        assert_eq!(WRITE_RESTRICTING_VARS, ["GIT_QUARANTINE_PATH"]);
     }
 
     /// Names in the string-literal list that follows `marker` in `source`.
@@ -149,7 +184,8 @@ mod tests {
     }
 
     #[test]
-    fn the_list_contains_every_xtask_variable_and_only_the_ceiling_is_daemon_only() {
+    fn the_list_contains_every_xtask_variable_and_only_hook_and_ceiling_variables_are_daemon_only()
+    {
         let xtask = pohunek_test_support::workspace_root().join("crates/xtask/src/affected.rs");
         let source = std::fs::read_to_string(xtask).expect("read the xtask affected module");
         let theirs = literal_list(&source, "const REPOSITORY_REDIRECTING_VARS")
@@ -157,20 +193,25 @@ mod tests {
         let ours: Vec<&str> = REPOSITORY_REDIRECTING_VARS
             .iter()
             .chain(DISCOVERY_RESTRICTING_VARS)
+            .chain(WRITE_RESTRICTING_VARS)
             .copied()
             .collect();
         for name in &theirs {
             assert!(ours.contains(&name.as_str()), "daemon list lacks {name}");
         }
         // The daemon runs git from nested session directories, where an
-        // inherited ceiling hides the project; xtask runs from the repository
-        // root, where it cannot.
+        // inherited ceiling hides the project, and writes refs, which a
+        // quarantine marker forbids; xtask runs from the repository root and
+        // only reads.
         let daemon_only: Vec<&str> = ours
             .iter()
             .copied()
             .filter(|name| !theirs.iter().any(|theirs| theirs == name))
             .collect();
-        assert_eq!(daemon_only, ["GIT_CEILING_DIRECTORIES"]);
+        assert_eq!(
+            daemon_only,
+            ["GIT_CEILING_DIRECTORIES", "GIT_QUARANTINE_PATH"]
+        );
     }
 
     /// Product code outside this module that resolves or spawns `git`.

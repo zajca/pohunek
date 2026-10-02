@@ -39,6 +39,11 @@ const SHALLOW_FILE_VAR: &str = "GIT_SHALLOW_FILE";
 /// `GIT_GRAFT_FILE`; it declares `HEAD` parentless.
 const GRAFT_FILE_VAR: &str = "GIT_GRAFT_FILE";
 
+/// Variable naming the existing directory the parent set as
+/// `GIT_QUARANTINE_PATH`, as `git receive-pack` does for its hooks; Git refuses
+/// every ref update while it is set.
+const QUARANTINE_VAR: &str = "GIT_QUARANTINE_PATH";
+
 /// Variable naming the repository the child creates and the parent set as the
 /// ceiling, so the ceiling sits at the project root.
 const REPO_VAR: &str = "POHUNEK_TEST_GIT_REPO";
@@ -138,6 +143,18 @@ fn daemon_git_under_ambient_git_variables() {
     worktree_remove(&repo, &checkout).expect("remove worktree");
     assert!(!checkout.exists());
 
+    // The quarantine marker forbids ref updates of any git child that sees it,
+    // and creating a branch is a ref update.
+    assert!(
+        std::env::var_os(QUARANTINE_VAR).is_some_and(|dir| Path::new(&dir).is_dir()),
+        "the child starts with the quarantine marker set to an existing directory"
+    );
+    let quarantined = env.root().join("quarantined");
+    worktree_add_new(&repo, &quarantined, "quarantined-feature", "main")
+        .expect("add worktree despite the quarantine marker");
+    assert_eq!(branch_exists(&repo, "quarantined-feature"), Ok(true));
+    worktree_remove(&repo, &quarantined).expect("remove quarantined worktree");
+
     // A replace ref substitutes `HEAD` with the first commit; the daemon applies
     // it like the fixture does.
     let first = fixture_git(&env, &repo, &["rev-list", "--max-parents=0", "HEAD"]);
@@ -155,6 +172,8 @@ fn daemon_git_under_ambient_git_variables() {
 fn ambient_git_variables_do_not_redirect_daemon_git() {
     let env = TestEnv::new().expect("hermetic test environment");
     let repo = env.root().join("repo");
+    let quarantine = env.root().join("quarantine");
+    std::fs::create_dir(&quarantine).expect("create quarantine directory");
     let output = env
         .command(std::env::current_exe().expect("test executable"))
         .args([
@@ -167,6 +186,7 @@ fn ambient_git_variables_do_not_redirect_daemon_git() {
         .env(SHALLOW_FILE_VAR, env.root().join("shallow"))
         .env(GRAFT_FILE_VAR, env.root().join("grafts"))
         .env("GIT_CEILING_DIRECTORIES", &repo)
+        .env(QUARANTINE_VAR, &quarantine)
         .env(REPO_VAR, &repo)
         .output()
         .expect("run scenario child");
