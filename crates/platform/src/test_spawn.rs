@@ -26,24 +26,44 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// Handle given to the body of [`while_a_sibling_spawns`].
+pub(crate) struct Sibling<'a> {
+    spawns: &'a AtomicUsize,
+}
+
+impl Sibling<'_> {
+    /// Blocks until the spawner completes one more spawn than it had when this
+    /// was called, so a short body can stay active across a spawn.
+    ///
+    /// The wait is bounded by the hang guard and fails with a message naming the
+    /// spawn.
+    pub(crate) fn wait_for_next_spawn(&self) {
+        let target = self.spawns.load(Ordering::Relaxed) + 1;
+        pohunek_test_support::wait::poll_until("the next sibling spawn", || {
+            (self.spawns.load(Ordering::Relaxed) >= target).then_some(())
+        });
+    }
+}
+
 /// Runs `body` while a sibling thread spawns `sh` children in a loop, then
 /// stops the spawner and returns the body's result.
 ///
-/// `body` starts only after the spawner has completed its first spawn, so even
-/// a short body overlaps a spawning thread, and the helper asserts that the
-/// spawner completed at least one spawn. The spawner's children start from an
-/// empty environment in the private directory `cwd`. A panic in `body` stops
-/// the spawner before it propagates. If the spawner fails before its first
-/// spawn the wait ends at once, and a spawner that never reports fails the
-/// wait at the hang guard.
+/// The spawner's children start from an empty environment in the private
+/// directory `cwd`. `body` starts after the spawner completed its first spawn.
+/// When `body` returns normally, the helper asserts that the spawner completed
+/// at least one more spawn while `body` ran; a body too short for that calls
+/// [`Sibling::wait_for_next_spawn`]. A panic in `body` stops the spawner and
+/// propagates without that assertion.
 ///
 /// # Panics
 ///
-/// Panics when the spawner fails or never completes a spawn.
-pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce() -> R) -> R {
+/// Panics when the spawner fails before its first spawn (the wait ends at once),
+/// when it never completes a spawn (the wait ends at the hang guard), or when no
+/// spawn completed while `body` ran.
+pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce(&Sibling<'_>) -> R) -> R {
     let stop = AtomicBool::new(false);
     let spawns = AtomicUsize::new(0);
-    let result = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let (first_spawn, first_spawn_done) = mpsc::sync_channel::<()>(1);
         let (stop, spawns) = (&stop, &spawns);
         scope.spawn(move || {
@@ -70,13 +90,14 @@ pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce() -> R) ->
                 panic!("hang guard elapsed waiting for the sibling spawner's first spawn")
             }
         }
-        body()
-    });
-    assert!(
-        spawns.load(Ordering::Relaxed) > 0,
-        "no sibling spawn overlapped the body"
-    );
-    result
+        let at_start = spawns.load(Ordering::Relaxed);
+        let result = body(&Sibling { spawns });
+        assert!(
+            spawns.load(Ordering::Relaxed) > at_start,
+            "no sibling spawn completed while the body ran"
+        );
+        result
+    })
 }
 
 #[cfg(test)]
@@ -91,7 +112,13 @@ mod tests {
     #[test]
     fn the_result_of_the_body_is_returned() {
         let dir = pohunek_test_support::tempdir().expect("fixture directory");
-        assert_eq!(while_a_sibling_spawns(dir.path(), || 7), 7);
+        assert_eq!(
+            while_a_sibling_spawns(dir.path(), |sibling| {
+                sibling.wait_for_next_spawn();
+                7
+            }),
+            7
+        );
     }
 
     #[test]
@@ -102,7 +129,7 @@ mod tests {
         // deadline instead of blocking this test forever.
         let scope = std::thread::spawn(move || {
             catch_unwind(AssertUnwindSafe(|| {
-                while_a_sibling_spawns(&cwd, || panic!("{BODY_FAILURE}"));
+                while_a_sibling_spawns(&cwd, |_sibling| panic!("{BODY_FAILURE}"));
             }))
         });
         pohunek_test_support::wait::poll_until("the scope to return after a body panic", || {
