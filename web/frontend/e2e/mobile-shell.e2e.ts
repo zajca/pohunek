@@ -28,6 +28,9 @@ test.describe("portrait mobile shell", () => {
 
     const firstTabStop = navigation.getByRole("button", { name: "New session" });
     const lastTabStop = navigation.locator('[data-testid="session-row"][tabindex="0"]');
+    // The trap wraps to the last focusable element present at keypress time; the session rows
+    // arrive over the control channel after the drawer opens.
+    await expect(lastTabStop).toBeVisible();
     await firstTabStop.focus();
     await page.keyboard.press("Shift+Tab");
     await expect(lastTabStop).toBeFocused();
