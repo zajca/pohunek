@@ -19,7 +19,15 @@ pub const REMOTE_PORT_ENV: &str = "POHUNEK_REMOTE_PORT";
 /// value is a configuration error rather than a silent fallback to the default,
 /// so a typo in configuration fails loudly.
 pub fn remote_port() -> Result<u16, NetbirdError> {
-    match std::env::var(REMOTE_PORT_ENV) {
+    port_from_lookup(std::env::var(REMOTE_PORT_ENV))
+}
+
+/// Resolves the port from the result of looking up [`REMOTE_PORT_ENV`].
+///
+/// Takes the lookup result as an argument so tests cover every case without
+/// changing the process environment.
+fn port_from_lookup(lookup: Result<String, std::env::VarError>) -> Result<u16, NetbirdError> {
+    match lookup {
         Err(std::env::VarError::NotPresent) => Ok(DEFAULT_REMOTE_PORT),
         Err(std::env::VarError::NotUnicode(_)) => Err(NetbirdError::InvalidConfig(format!(
             "invalid {REMOTE_PORT_ENV}: value is not valid Unicode"
@@ -30,8 +38,7 @@ pub fn remote_port() -> Result<u16, NetbirdError> {
 
 /// Parse a configured port string into a non-zero `u16`.
 ///
-/// Factored out so it is unit-testable without mutating process environment
-/// (which would race parallel tests).
+/// Factored out so it is unit-testable without touching the process environment.
 fn parse_port(raw: &str) -> Result<u16, NetbirdError> {
     let trimmed = raw.trim();
     let invalid = || {
@@ -49,6 +56,7 @@ fn parse_port(raw: &str) -> Result<u16, NetbirdError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pohunek_test_support::process_env::ProcessEnv;
 
     // Documented invariants, checked at compile time: the default port is
     // non-zero and below the Linux default ephemeral floor (32768).
@@ -85,19 +93,38 @@ mod tests {
     }
 
     #[test]
-    fn remote_port_with_unset_env_returns_default() {
-        // `remote_port()` reads process env, so guard the variable across the
-        // call. SAFETY note: env mutation is process-global; this test does not
-        // run in parallel with another that touches REMOTE_PORT_ENV (no other
-        // test mutates it — they exercise the pure `parse_port` helper).
-        let previous = std::env::var_os(REMOTE_PORT_ENV);
-        std::env::remove_var(REMOTE_PORT_ENV);
-        let resolved = remote_port();
-        // Restore before asserting so a failure cannot leak env into siblings.
-        match previous {
-            Some(value) => std::env::set_var(REMOTE_PORT_ENV, value),
-            None => std::env::remove_var(REMOTE_PORT_ENV),
-        }
-        assert_eq!(resolved.unwrap(), DEFAULT_REMOTE_PORT);
+    fn unset_lookup_returns_default() {
+        assert_eq!(
+            port_from_lookup(Err(std::env::VarError::NotPresent)).unwrap(),
+            DEFAULT_REMOTE_PORT
+        );
+    }
+
+    #[test]
+    fn set_lookup_is_parsed() {
+        assert_eq!(port_from_lookup(Ok("9000".to_owned())).unwrap(), 9000);
+        assert!(matches!(
+            port_from_lookup(Ok("0".to_owned())),
+            Err(NetbirdError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn non_unicode_lookup_is_a_configuration_error() {
+        let err = port_from_lookup(Err(std::env::VarError::NotUnicode(
+            std::ffi::OsString::new(),
+        )))
+        .unwrap_err();
+        assert!(matches!(err, NetbirdError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn remote_port_reads_the_process_environment() {
+        let mut env = ProcessEnv::lock();
+        env.remove(REMOTE_PORT_ENV);
+        assert_eq!(remote_port().unwrap(), DEFAULT_REMOTE_PORT);
+
+        env.set(REMOTE_PORT_ENV, "19000");
+        assert_eq!(remote_port().unwrap(), 19000);
     }
 }

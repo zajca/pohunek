@@ -40,6 +40,7 @@ use pohunek_gui_core::{
     WindowSize, Workspace,
 };
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::{wait, worker_binary};
 use protocol::{
     method, AgentActivity, AgentKind, ErrorClass, NotificationPolicyParams, ProcessStartIdentity,
@@ -68,10 +69,9 @@ const GUI_TEST_WAIT_MS: u32 = 100;
 
 mod no_origin;
 
-static PATH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 #[tokio::test]
 async fn governance_inspect_returns_safe_never_enrolled_status_over_tcp() {
+    let _env = ProcessEnv::lock();
     let daemon = LoopbackDaemon::spawn("gui-governance-inspect", "0.5.0").await;
     let host = HostConfig::tcp("host-governance", daemon.addr);
 
@@ -94,13 +94,13 @@ async fn governance_inspect_returns_safe_never_enrolled_status_over_tcp() {
 
 #[tokio::test]
 async fn loopback_hosts_seed_and_stream_agent_state() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-codex-bin");
     write_executable(
         &bin_dir.join("codex"),
         "#!/bin/sh\n/bin/sleep 0.2\nprintf '\\033]2;Action Required\\007'\n/bin/sleep 30\n",
     );
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon_a = LoopbackDaemon::spawn("gui-a", "0.0.0-a").await;
     let daemon_b = LoopbackDaemon::spawn("gui-b", "0.0.0-b").await;
@@ -143,10 +143,10 @@ async fn loopback_hosts_seed_and_stream_agent_state() {
 
 #[tokio::test]
 async fn workspace_connects_to_multiple_loopback_daemons_and_lists_sessions() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m1-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon_a = LoopbackDaemon::spawn("m1-a", "0.1.0-a").await;
     let daemon_b = LoopbackDaemon::spawn("m1-b", "0.1.0-b").await;
@@ -192,13 +192,13 @@ async fn workspace_connects_to_multiple_loopback_daemons_and_lists_sessions() {
 
 #[tokio::test]
 async fn live_agent_state_updates_are_reflected() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m1-blocked-bin");
     write_executable(
         &bin_dir.join("codex"),
         "#!/bin/sh\n/bin/sleep 0.2\nprintf '\\033]2;Action Required\\007'\n/bin/sleep 30\n",
     );
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m1-blocked", "0.1.0-blocked").await;
     let host = HostConfig::tcp("host-blocked", daemon.addr);
@@ -238,10 +238,10 @@ async fn live_agent_state_updates_are_reflected() {
 
 #[tokio::test]
 async fn notification_seed_degrades_gracefully_without_daemon_support() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-notif-seed-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     // This daemon build does not serve `notification.list`, so seeding must be
     // non-fatal: the host still connects and streams sessions with an empty
@@ -270,6 +270,7 @@ async fn notification_seed_degrades_gracefully_without_daemon_support() {
 
 #[tokio::test]
 async fn notification_seed_runtime_error_surfaces_on_snapshot() {
+    let _env = ProcessEnv::lock();
     let daemon = NotificationListErrorDaemon::spawn().await;
     let host = HostConfig::tcp("host-notif-error", daemon.addr);
 
@@ -296,10 +297,10 @@ async fn notification_seed_runtime_error_surfaces_on_snapshot() {
 
 #[tokio::test]
 async fn unreachable_host_marks_error_without_breaking_other_hosts() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m1-unreachable-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m1-live", "0.1.0-live").await;
     let live_host = HostConfig::tcp("host-live", daemon.addr);
@@ -334,10 +335,10 @@ async fn unreachable_host_marks_error_without_breaking_other_hosts() {
 
 #[tokio::test]
 async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m2-session-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn_with_notifications("m2-session", "0.2.0-session").await;
     let host = HostConfig::tcp("host-session", daemon.addr);
@@ -421,7 +422,7 @@ async fn session_lifecycle_create_inspect_and_stop_reconciles_workspace_state() 
 
 #[tokio::test]
 async fn session_children_receive_the_fixture_environment_not_the_host_one() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-env-bin");
     let record_dir = temp_dir("gui-core-env-record");
     let env_out = record_dir.join("env.txt");
@@ -429,7 +430,7 @@ async fn session_children_receive_the_fixture_environment_not_the_host_one() {
         &bin_dir.join("codex"),
         &environment_recorder_script(&env_out),
     );
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("env-scrub", "0.2.0-env-scrub").await;
     let host = HostConfig::tcp("host-env-scrub", daemon.addr);
@@ -546,10 +547,10 @@ async fn exercise_observation_and_policy(host: &HostConfig, session: &SessionInf
 
 #[tokio::test]
 async fn session_metadata_merge_and_clear_round_trips() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m2-metadata-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m2-metadata", "0.2.0-metadata").await;
     let host = HostConfig::tcp("host-metadata", daemon.addr);
@@ -617,7 +618,7 @@ async fn session_metadata_merge_and_clear_round_trips() {
 
 #[tokio::test]
 async fn project_add_list_show_rename_and_remove_round_trips() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let _env = ProcessEnv::lock();
     let daemon = LoopbackDaemon::spawn("m2-project", "0.2.0-project").await;
     let host = HostConfig::tcp("host-project", daemon.addr);
     let repo = init_git_repo("gui-core-m2-project-repo");
@@ -683,10 +684,10 @@ async fn project_add_list_show_rename_and_remove_round_trips() {
 
 #[tokio::test]
 async fn worktree_creation_is_session_new_with_branch_and_visible_in_project_show() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m2-worktree-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m2-worktree", "0.2.0-worktree").await;
     let host = HostConfig::tcp("host-worktree", daemon.addr);
@@ -749,7 +750,7 @@ async fn worktree_creation_is_session_new_with_branch_and_visible_in_project_sho
 
 #[tokio::test]
 async fn prompt_actions_and_prompt_resolve_from_target_host() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let _env = ProcessEnv::lock();
     let daemon = LoopbackDaemon::spawn("m3-resolve", "0.3.0-resolve").await;
     let host = HostConfig::tcp("host-prompts", daemon.addr);
     let repo = init_git_repo("gui-core-m3-resolve-repo");
@@ -829,13 +830,13 @@ provider = "linear_issue"
 
 #[tokio::test]
 async fn remote_prompt_resolution_uses_target_daemon_config_not_operator_filesystem() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let operator_config_home = temp_dir("gui-core-m3-operator-config-home");
     write_file(
         &operator_config_home.join("pohunek/prompts/issue.tmpl"),
         "OPERATOR LOCAL ${title}",
     );
-    let _xdg = EnvGuard::set("XDG_CONFIG_HOME", operator_config_home);
+    env.set("XDG_CONFIG_HOME", operator_config_home);
 
     let remote_config_dir = temp_dir("gui-core-m3-remote-config");
     write_file(
@@ -958,12 +959,12 @@ fn preview_state_updates_without_launching_session() {
 
 #[tokio::test]
 async fn launch_from_rendered_preset_creates_one_session_with_rendered_input() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m3-launch-bin");
     let record_dir = temp_dir("gui-core-m3-launch-record");
     let prompt_out = record_dir.join("prompt.txt");
     write_executable(&bin_dir.join("codex"), &recording_script(&prompt_out));
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m3-launch", "0.3.0-launch").await;
     let host = HostConfig::tcp("host-launch", daemon.addr);
@@ -1051,12 +1052,12 @@ async fn launch_from_rendered_preset_creates_one_session_with_rendered_input() {
 
 #[tokio::test]
 async fn assistant_launch_creates_project_session_with_opening_prompt() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-assistant-bin");
     let record_dir = temp_dir("gui-core-assistant-record");
     let prompt_out = record_dir.join("prompt.txt");
     write_executable(&bin_dir.join("codex"), &recording_script(&prompt_out));
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("assistant-launch", "0.4.0-assistant").await;
     let host = HostConfig::tcp("host-assistant", daemon.addr);
@@ -1126,12 +1127,12 @@ async fn assistant_launch_creates_project_session_with_opening_prompt() {
     reason = "keeps the linked launch and metadata-persistence flow in one end-to-end assertion"
 )]
 async fn provider_launch_linear_issue_creates_one_linked_session_and_persists_metadata() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m4-linear-bin");
     let record_dir = temp_dir("gui-core-m4-linear-record");
     let prompt_out = record_dir.join("prompt.txt");
     write_executable(&bin_dir.join("codex"), &recording_script(&prompt_out));
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let store_path = temp_dir("gui-core-m4-linear-store").join("metadata.jsonl");
     let daemon =
@@ -1236,12 +1237,12 @@ async fn provider_launch_linear_issue_creates_one_linked_session_and_persists_me
 
 #[tokio::test]
 async fn provider_launch_github_pr_creates_one_linked_session_with_rendered_input() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m4-github-bin");
     let record_dir = temp_dir("gui-core-m4-github-record");
     let prompt_out = record_dir.join("prompt.txt");
     write_executable(&bin_dir.join("claude"), &recording_script(&prompt_out));
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m4-github", "0.4.0-github").await;
     let host = HostConfig::tcp("host-github", daemon.addr);
@@ -1328,10 +1329,10 @@ async fn provider_launch_github_pr_creates_one_linked_session_with_rendered_inpu
 
 #[tokio::test]
 async fn prompt_errors_surface_without_corrupting_workspace_state() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-m3-error-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("m3-error", "0.3.0-error").await;
     let host = HostConfig::tcp("host-error", daemon.addr);
@@ -1521,13 +1522,13 @@ fn review_prompt_template() -> &'static str {
 /// Points `XDG_CONFIG_HOME` at a fresh temp dir with a `review.tmpl` in place,
 /// so [`render_review_prompt`] finds a template without touching the real
 /// operator config.
-fn install_review_template(tag: &str) -> EnvGuard {
+fn install_review_template(env: &mut ProcessEnv, tag: &str) {
     let config_home = temp_dir(tag);
     write_file(
         &config_home.join("pohunek/prompts/review.tmpl"),
         review_prompt_template(),
     );
-    EnvGuard::set("XDG_CONFIG_HOME", config_home)
+    env.set("XDG_CONFIG_HOME", config_home);
 }
 
 async fn create_worktree_session(host: &HostConfig, project_id: &str, branch: &str) -> SessionInfo {
@@ -1554,10 +1555,10 @@ async fn create_worktree_session(host: &HostConfig, project_id: &str, branch: &s
 
 #[tokio::test]
 async fn review_session_diff_is_parsed_into_added_and_modified_files() {
-    let _path_lock = PATH_LOCK.lock().await;
+    let mut env = ProcessEnv::lock();
     let bin_dir = temp_dir("gui-core-review-diff-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("review-diff", "0.1.0-review-diff").await;
     let host = HostConfig::tcp("host-review-diff", daemon.addr);
@@ -1618,8 +1619,8 @@ async fn review_session_diff_is_parsed_into_added_and_modified_files() {
     reason = "keeps the dispatch, metadata-copy, and reload-after-dispatch assertions in one end-to-end flow"
 )]
 async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_link_metadata() {
-    let _path_lock = PATH_LOCK.lock().await;
-    let _xdg = install_review_template("gui-core-review-dispatch-config-home");
+    let mut env = ProcessEnv::lock();
+    install_review_template(&mut env, "gui-core-review-dispatch-config-home");
 
     // Plain no-op `codex` for the *source* session: it takes no `input`, so
     // it must not touch the recorded prompt file at all. If it shared the
@@ -1627,12 +1628,12 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
     // a race against the dispatched session's write to the same file.
     let sleep_bin_dir = temp_dir("gui-core-review-dispatch-sleep-bin");
     write_executable(&sleep_bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _sleep_path = PathGuard::prepend(&sleep_bin_dir);
+    prepend_path(&mut env, &sleep_bin_dir);
     // The recording directory is on `PATH` ahead of the plain one from the
     // start, because the sessions' environment is fixed when the daemon is
     // built. It holds no `codex` until the recording script is written below.
     let record_bin_dir = temp_dir("gui-core-review-dispatch-record-bin");
-    let _record_path = PathGuard::prepend(&record_bin_dir);
+    prepend_path(&mut env, &record_bin_dir);
 
     let daemon = LoopbackDaemon::spawn("review-dispatch", "0.1.0-review-dispatch").await;
     let host = HostConfig::tcp("host-review-dispatch", daemon.addr);
@@ -1785,12 +1786,12 @@ async fn review_dispatch_creates_one_session_in_the_same_worktree_with_copied_li
 
 #[tokio::test]
 async fn review_dispatch_leaves_the_draft_byte_identical_when_session_new_fails() {
-    let _path_lock = PATH_LOCK.lock().await;
-    let _xdg = install_review_template("gui-core-review-dispatch-fail-config-home");
+    let mut env = ProcessEnv::lock();
+    install_review_template(&mut env, "gui-core-review-dispatch-fail-config-home");
 
     let bin_dir = temp_dir("gui-core-review-dispatch-fail-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("review-dispatch-fail", "0.1.0-review-dispatch-fail").await;
     let host = HostConfig::tcp("host-review-dispatch-fail", daemon.addr);
@@ -1866,12 +1867,15 @@ async fn review_dispatch_leaves_the_draft_byte_identical_when_session_new_fails(
 
 #[tokio::test]
 async fn review_dispatch_uses_the_overridden_agent_instead_of_the_source_sessions() {
-    let _path_lock = PATH_LOCK.lock().await;
-    let _xdg = install_review_template("gui-core-review-dispatch-agent-override-config-home");
+    let mut env = ProcessEnv::lock();
+    install_review_template(
+        &mut env,
+        "gui-core-review-dispatch-agent-override-config-home",
+    );
 
     let bin_dir = temp_dir("gui-core-review-dispatch-agent-override-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn(
         "review-dispatch-agent-override",
@@ -1943,12 +1947,12 @@ async fn review_dispatch_uses_the_overridden_agent_instead_of_the_source_session
 async fn review_state_never_contains_diff_content_or_embedded_secrets() {
     const SECRET_FIXTURE: &str = "gh_api_secret_fixture_should_never_persist";
 
-    let _path_lock = PATH_LOCK.lock().await;
-    let _xdg = install_review_template("gui-core-review-secret-scan-config-home");
+    let mut env = ProcessEnv::lock();
+    install_review_template(&mut env, "gui-core-review-secret-scan-config-home");
 
     let bin_dir = temp_dir("gui-core-review-secret-scan-bin");
     write_executable(&bin_dir.join("codex"), "#!/bin/sh\n/bin/sleep 30\n");
-    let _path = PathGuard::prepend(&bin_dir);
+    prepend_path(&mut env, &bin_dir);
 
     let daemon = LoopbackDaemon::spawn("review-secret-scan", "0.1.0-review-secret-scan").await;
     let host = HostConfig::tcp("host-review-secret-scan", daemon.addr);
@@ -2978,50 +2982,11 @@ fn write_executable(path: &Path, body: &str) {
     }
 }
 
-struct PathGuard {
-    old_path: Option<OsString>,
-}
-
-struct EnvGuard {
-    key: &'static str,
-    old_value: Option<OsString>,
-}
-
-impl EnvGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        let old_value = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, old_value }
+/// Puts `dir` ahead of the current `PATH` until `env` drops.
+fn prepend_path(env: &mut ProcessEnv, dir: &Path) {
+    let mut paths = vec![dir.to_path_buf()];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
     }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        match &self.old_value {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
-impl PathGuard {
-    fn prepend(path: &Path) -> Self {
-        let old_path = std::env::var_os("PATH");
-        let mut paths = vec![path.to_path_buf()];
-        if let Some(old_path) = &old_path {
-            paths.extend(std::env::split_paths(old_path));
-        }
-        let joined = std::env::join_paths(paths).expect("join PATH");
-        std::env::set_var("PATH", joined);
-        Self { old_path }
-    }
-}
-
-impl Drop for PathGuard {
-    fn drop(&mut self) {
-        match &self.old_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-    }
+    env.set("PATH", std::env::join_paths(paths).expect("join PATH"));
 }
