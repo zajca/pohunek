@@ -3,10 +3,11 @@
 //! A process spawned while another thread holds a descriptor open gives its
 //! child a copy until the child's own `exec`, which is the window the lock and
 //! fixture-writing tests need to hit. The spawner thread loops until it is told
-//! to stop; the stop signal is set by a drop guard, so it is also set while the
-//! body panics. Setting it only on the success path would leave the thread
-//! looping, and the scope that joins it would hide the body's failure by never
-//! returning.
+//! to stop. When the body returns, the stop signal is set and the thread is
+//! joined before its recorded failure is checked; a drop guard sets the signal
+//! while the body panics. Leaving the signal unset on a panic would leave the
+//! thread looping, and the scope that joins it would hide the body's failure by
+//! never returning.
 //!
 //! Tests built on this helper are stress tests: the counters show that the
 //! spawner ran while the body repeated its operation, but which operation a
@@ -17,6 +18,7 @@
 
 // Rust guideline compliant 2026-10-02
 
+use std::io;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -127,34 +129,49 @@ impl Sibling<'_> {
 ///
 /// The spawner's children start from an empty environment in the private
 /// directory `cwd`. `body` starts after the spawner completed its first spawn.
-/// When `body` returns normally, the helper asserts that the spawner completed
-/// at least one more spawn while `body` ran; a body that repeats an operation
-/// uses [`Sibling::repeat_while_spawning`] and a body too short for either calls
-/// [`Sibling::wait_for_next_spawn`]. A panic in `body` stops the spawner and
-/// propagates without that assertion.
+/// When `body` returns normally, the helper stops and joins the spawner, then
+/// asserts that no spawn failed, including one that failed after `body` returned,
+/// and that the spawner completed at least one more spawn while `body` ran. A
+/// body that repeats an operation uses [`Sibling::repeat_while_spawning`] and a
+/// body too short for either calls [`Sibling::wait_for_next_spawn`]. A panic in
+/// `body` stops the spawner and propagates without those assertions.
 ///
 /// # Panics
 ///
 /// Panics with the spawner's error when a spawn fails: before the first spawn
 /// the wait ends at once, and afterwards the waiting methods of [`Sibling`] end
-/// at once as does the check after `body` returns. Also panics when the spawner
-/// never completes a spawn (the wait ends at the hang guard) or when no spawn
-/// completed while `body` ran.
+/// at once as does the check once the spawner is joined. Also panics when the
+/// spawner never completes a spawn (the wait ends at the hang guard) or when no
+/// spawn completed while `body` ran.
 pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce(&Sibling<'_>) -> R) -> R {
+    run_with_spawner(
+        |_stop| {
+            Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .env_clear()
+                .current_dir(cwd)
+                .status()
+                .map(drop)
+        },
+        body,
+    )
+}
+
+/// Implements [`while_a_sibling_spawns`] over `spawn`, which performs one spawn
+/// and receives the stop flag the helper sets once the body is done.
+fn run_with_spawner<R>(
+    mut spawn: impl FnMut(&AtomicBool) -> io::Result<()> + Send,
+    body: impl FnOnce(&Sibling<'_>) -> R,
+) -> R {
     let stop = AtomicBool::new(false);
     let spawns = AtomicUsize::new(0);
     let failure = SpawnerFailure::default();
     std::thread::scope(|scope| {
         let (first_spawn, first_spawn_done) = mpsc::sync_channel::<()>(1);
         let (stop, spawns, failure) = (&stop, &spawns, &failure);
-        scope.spawn(move || {
+        let spawner = scope.spawn(move || {
             while !stop.load(Ordering::Relaxed) {
-                let spawned = Command::new("/bin/sh")
-                    .args(["-c", "exit 0"])
-                    .env_clear()
-                    .current_dir(cwd)
-                    .status();
-                if let Err(error) = spawned {
+                if let Err(error) = spawn(stop) {
                     failure.record(format!("sibling spawn failed: {error}"));
                     return;
                 }
@@ -164,6 +181,7 @@ pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce(&Sibling<'
                 }
             }
         });
+        // Sets the stop flag when the body or a check below panics.
         let _stop = StopOnDrop(stop);
         match first_spawn_done.recv_timeout(HANG_GUARD) {
             Ok(()) => {}
@@ -182,6 +200,13 @@ pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce(&Sibling<'
             at_start,
         };
         let result = body(&sibling);
+        // A spawn that fails before the spawner observes the stop flag is recorded
+        // by the spawner thread, which then returns normally, so the failure is
+        // read only after the thread is joined.
+        stop.store(true, Ordering::Relaxed);
+        if let Err(payload) = spawner.join() {
+            std::panic::resume_unwind(payload);
+        }
         sibling.assert_spawner_running();
         assert!(
             spawns.load(Ordering::Relaxed) > at_start,
@@ -195,16 +220,7 @@ pub(crate) fn while_a_sibling_spawns<R>(cwd: &Path, body: impl FnOnce(&Sibling<'
 mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    use std::time::Duration;
-
     use super::*;
-
-    /// Longest a body may take to see a spawner failure.
-    ///
-    /// Far below [`HANG_GUARD`], so a failure that is only noticed at the hang
-    /// guard is told apart from one reported at once, and generous enough for a
-    /// loaded runner to schedule one failing spawn.
-    const FAILURE_SURFACING_CEILING: Duration = Duration::from_secs(30);
 
     /// Panic message of the body the regression test unwinds with.
     const BODY_FAILURE: &str = "body failed after the spawner started";
@@ -246,13 +262,12 @@ mod tests {
     }
 
     /// Removes the spawner's directory after the handshake, runs `wait` as the
-    /// body, and returns the panic message and how long the body took to fail.
+    /// body, and returns the panic message the failure surfaces with.
     fn failure_message_of_a_spawner_that_fails_after_its_first_spawn(
         wait: impl FnOnce(&Sibling<'_>),
-    ) -> (String, Duration) {
+    ) -> String {
         let dir = pohunek_test_support::tempdir().expect("fixture directory");
         let cwd = dir.path().to_path_buf();
-        let started = Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             while_a_sibling_spawns(&cwd, |sibling| {
                 // The handshake is complete, so every spawn from here on that
@@ -261,13 +276,11 @@ mod tests {
                 wait(sibling);
             });
         }));
-        let elapsed = started.elapsed();
         let payload = outcome.expect_err("the spawner's failure reaches the caller");
-        let message = payload
+        payload
             .downcast_ref::<String>()
             .expect("the failure message is formatted")
-            .clone();
-        (message, elapsed)
+            .clone()
     }
 
     /// Error text of a spawn in a directory that does not exist.
@@ -284,31 +297,59 @@ mod tests {
     }
 
     #[test]
-    fn a_spawner_failing_after_its_first_spawn_fails_a_repeating_body_at_once() {
-        // The cycle count is unreachable, so only the failure ends the loop.
-        let (message, elapsed) =
-            failure_message_of_a_spawner_that_fails_after_its_first_spawn(|sibling| {
-                sibling.repeat_while_spawning(usize::MAX, |_| {});
-            });
+    fn a_spawner_failing_after_its_first_spawn_fails_a_repeating_body() {
+        // The cycle count is unreachable, so only the recorded failure ends the
+        // loop; without it the hang guard fails the test.
+        let message = failure_message_of_a_spawner_that_fails_after_its_first_spawn(|sibling| {
+            sibling.repeat_while_spawning(usize::MAX, |_| {});
+        });
         assert_eq!(message, missing_directory_spawn_error());
-        assert!(
-            elapsed < FAILURE_SURFACING_CEILING,
-            "the failure took {elapsed:?}"
-        );
     }
 
     #[test]
-    fn a_spawner_failing_after_its_first_spawn_fails_a_waiting_body_at_once() {
+    fn a_spawner_failing_after_its_first_spawn_fails_a_waiting_body() {
         // A spawn in flight during the removal may still complete and end one
-        // wait, so the body waits until the failure ends it.
-        let (message, elapsed) =
+        // wait, so the body waits until the recorded failure ends it; without it
+        // the hang guard fails the test.
+        let message =
             failure_message_of_a_spawner_that_fails_after_its_first_spawn(|sibling| loop {
                 sibling.wait_for_next_spawn();
             });
         assert_eq!(message, missing_directory_spawn_error());
-        assert!(
-            elapsed < FAILURE_SURFACING_CEILING,
-            "the failure took {elapsed:?}"
+    }
+
+    #[test]
+    fn a_spawn_failing_after_the_body_returned_fails_the_helper() {
+        const INJECTED: &str = "injected spawn failure";
+        let completed = AtomicUsize::new(0);
+        let blocked = AtomicBool::new(false);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            run_with_spawner(
+                |stop| {
+                    // The second spawn blocks until the helper sets the stop flag,
+                    // so it fails strictly after the body returned.
+                    if completed.fetch_add(1, Ordering::Relaxed) == 0 {
+                        return Ok(());
+                    }
+                    blocked.store(true, Ordering::Relaxed);
+                    pohunek_test_support::wait::poll_until("the stop flag", || {
+                        stop.load(Ordering::Relaxed).then_some(())
+                    });
+                    Err(io::Error::other(INJECTED))
+                },
+                |_sibling| {
+                    // Returning earlier could stop the spawner before it attempts
+                    // the failing spawn.
+                    pohunek_test_support::wait::poll_until("the blocked spawn", || {
+                        blocked.load(Ordering::Relaxed).then_some(())
+                    });
+                },
+            );
+        }));
+        let payload = outcome.expect_err("the late spawn failure reaches the caller");
+        assert_eq!(
+            payload.downcast_ref::<String>().map(String::as_str),
+            Some(format!("the sibling spawner failed: sibling spawn failed: {INJECTED}").as_str())
         );
     }
 }
