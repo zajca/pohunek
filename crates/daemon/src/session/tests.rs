@@ -3584,13 +3584,39 @@ async fn session_start_hook_runs_detached_from_create() {
     // The hook opens the gate before it writes `started`, so `started` implies
     // it holds a reader on a FIFO whose only writer is the test's handle and
     // that carries no data. It cannot pass `read` until the test writes a line,
-    // so a `create` that waited for it would never return.
-    let created = registry
-        .create(SessionNewParams {
-            cwd: Some(cwd),
-            ..params()
-        })
+    // so a `create` that waited for it would not return. `create` runs in its
+    // own task so that the hang guard can release the gate, join the task and
+    // fail with a diagnostic instead of waiting for the hook timeout.
+    let mut creator = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .create(SessionNewParams {
+                    cwd: Some(cwd),
+                    ..params()
+                })
+                .await
+        }
+    });
+    let outcome = tokio::time::timeout(pohunek_test_support::wait::HANG_GUARD, &mut creator).await;
+    let Ok(joined) = outcome else {
+        release_hook_gate(&gate);
+        let late = pohunek_test_support::wait::guard(
+            "create to return after the gate was released",
+            creator,
+        )
         .await
+        .expect("create task joins after the release");
+        if let Ok(late) = late {
+            let _ = registry.stop(&late.id).await;
+        }
+        panic!(
+            "create waited for the session-start hook past the hang guard of {:?}",
+            pohunek_test_support::wait::HANG_GUARD
+        );
+    };
+    let created = joined
+        .expect("create task joins")
         .expect("create session returns while the session-start hook is still running");
 
     pohunek_test_support::wait::wait_until("the hook to report started", || async {
