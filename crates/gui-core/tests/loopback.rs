@@ -35,7 +35,7 @@ use pohunek_gui_core::{
     ReviewSide, ReviewSource, ReviewStatus, ReviewStore, Selection, SessionLinkKind,
     SessionLinkProvider, UiState, WindowSize, Workspace,
 };
-use pohunek_test_support::worker_binary;
+use pohunek_test_support::{wait, worker_binary};
 use protocol::{
     method, AgentActivity, AgentKind, ErrorClass, NotificationPolicyParams, ProcessStartIdentity,
     ProjectActionParams, ProjectActionResult, ProjectActionsParams, ProjectAddParams,
@@ -2460,22 +2460,150 @@ fn expected_linear_link_metadata() -> pohunek_gui_core::SessionLinkMetadata {
     }
 }
 
-async fn wait_for_file(path: &Path) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match std::fs::read_to_string(path) {
-            Ok(value) => return value,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => panic!("failed to read {}: {err}", path.display()),
-        }
-        let now = tokio::time::Instant::now();
-        assert!(
-            now < deadline,
-            "file {} was not written before deadline",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+/// Reads a file that its writer publishes by atomic rename.
+///
+/// `None` means the file has not been published yet. A published file is
+/// complete, so a partially written file is never observable here.
+fn read_published(path: &Path) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(value) => Some(value),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => panic!("failed to read {}: {err}", path.display()),
     }
+}
+
+/// Waits until a fake agent has published `path` and returns its content.
+async fn wait_for_file(path: &Path) -> String {
+    wait::wait_until(&format!("{} to be published", path.display()), || async {
+        read_published(path)
+    })
+    .await
+}
+
+/// A recorder process that is killed and reaped when dropped, including when
+/// the owning test unwinds.
+struct RecorderGuard(std::process::Child);
+
+impl Drop for RecorderGuard {
+    fn drop(&mut self) {
+        // The child may already have exited, which makes `kill` fail; reaping
+        // it is what matters.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_recorder(script: &Path, prompt: &str) -> RecorderGuard {
+    let child = std::process::Command::new("/bin/sh")
+        .arg(script)
+        .arg(prompt)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn recorder");
+    RecorderGuard(child)
+}
+
+fn make_fifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo failed: {status}");
+}
+
+/// Opens the gate FIFO and queues the release token without blocking.
+///
+/// A read-write open never waits for a reader, so a recorder that died before
+/// opening the FIFO cannot hang the test. The returned handle keeps the token
+/// buffered and must stay alive until the recorder has consumed it.
+fn release_gate(gate: &Path) -> std::fs::File {
+    use std::io::Write as _;
+
+    let mut fifo = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(gate)
+        .expect("open gate FIFO");
+    fifo.write_all(b"go\n").expect("queue gate release token");
+    fifo
+}
+
+/// Waits for `path` like [`wait_for_file`], failing at once if `recorder` exits
+/// first.
+async fn wait_for_file_while_recording(path: &Path, recorder: &mut RecorderGuard) -> String {
+    let what = format!("{} to be published", path.display());
+    let outcome = wait::wait_until(&what, || {
+        let probed = match read_published(path) {
+            Some(content) => Some(Ok(content)),
+            None => recorder
+                .0
+                .try_wait()
+                .expect("poll recorder status")
+                .map(Err),
+        };
+        std::future::ready(probed)
+    })
+    .await;
+    outcome.unwrap_or_else(|status| {
+        panic!(
+            "recorder exited with {status} before publishing {}",
+            path.display()
+        )
+    })
+}
+
+#[tokio::test]
+async fn recorded_prompt_is_unobservable_until_the_writer_has_published_it() {
+    let dir = temp_dir("gui-core-recorder-gate");
+    let prompt_out = dir.join("prompt.txt");
+    let gate = dir.join("gate.fifo");
+    make_fifo(&gate);
+    let script = dir.join("recorder.sh");
+    std::fs::write(&script, recorder_script(&prompt_out, Some(&gate))).expect("write recorder");
+    let expected = "PR 7: Fix filters\nBody text\nbranch=feature/filters\n";
+    let mut recorder = spawn_recorder(&script, expected);
+
+    // The writer has started and is held at the gate: its partial file exists
+    // while the published path must not.
+    let partial = prompt_out.with_extension("partial");
+    assert_eq!(
+        wait_for_file_while_recording(&partial, &mut recorder).await,
+        ""
+    );
+    assert_eq!(
+        read_published(&prompt_out),
+        None,
+        "an unfinished prompt is visible at the published path"
+    );
+
+    let _token = release_gate(&gate);
+    assert_eq!(
+        wait_for_file_while_recording(&prompt_out, &mut recorder).await,
+        expected
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "recorder exited with")]
+async fn recorder_that_dies_before_opening_the_gate_fails_the_wait_without_hanging() {
+    let dir = temp_dir("gui-core-recorder-dies");
+    let prompt_out = dir.join("prompt.txt");
+    let gate = dir.join("gate.fifo");
+    make_fifo(&gate);
+    let script = dir.join("recorder.sh");
+    let partial = prompt_out.with_extension("partial");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\n: > '{}'\nexit 3\n", partial.display()),
+    )
+    .expect("write recorder");
+    let mut recorder = spawn_recorder(&script, "unused");
+
+    // No reader ever opens the FIFO, so a blocking open would never return.
+    let _token = release_gate(&gate);
+    wait_for_file_while_recording(&prompt_out, &mut recorder).await;
 }
 
 async fn report_native_id(host: &HostConfig, id: &SessionId, agent: &str, native_id: &str) {
@@ -2675,11 +2803,29 @@ fn make_owner_private(_dir: &Path) {}
 /// The path is embedded in the script because a session's agent receives only
 /// the allowlisted base environment, never arbitrary daemon variables.
 fn recording_script(prompt_out: &Path) -> String {
-    let quoted = prompt_out
-        .to_str()
-        .expect("UTF-8 prompt path")
-        .replace('\'', "'\\''");
-    format!("#!/bin/sh\nprintf '%s' \"${{1:-}}\" > '{quoted}'\n/bin/sleep 30\n")
+    recorder_script(prompt_out, None)
+}
+
+/// Builds the recording script, optionally blocked on `gate` mid-publication.
+///
+/// The prompt is written to a sibling `.partial` file and renamed into place,
+/// so `prompt_out` appears only once it is complete. With a `gate` FIFO the
+/// script creates the partial file, then blocks until the test writes to the
+/// FIFO, which lets a test hold the writer between "started" and "published".
+fn recorder_script(prompt_out: &Path, gate: Option<&Path>) -> String {
+    let quote = |path: &Path| {
+        path.to_str()
+            .expect("UTF-8 script path")
+            .replace('\'', "'\\''")
+    };
+    let target = quote(prompt_out);
+    let partial = quote(&prompt_out.with_extension("partial"));
+    let gate_step = gate
+        .map(|gate| format!("read -r _ < '{}'\n", quote(gate)))
+        .unwrap_or_default();
+    format!(
+        "#!/bin/sh\n: > '{partial}'\n{gate_step}printf '%s' \"${{1:-}}\" > '{partial}' && /bin/mv '{partial}' '{target}'\nexec /bin/sleep 30\n"
+    )
 }
 
 fn write_executable(path: &Path, body: &str) {
