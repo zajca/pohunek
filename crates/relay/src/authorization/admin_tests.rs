@@ -76,6 +76,7 @@ async fn fixture() -> (Store, String, Uuid, Uuid, Uuid) {
 }
 
 async fn cleanup(pool: &PgPool, schema: &str) {
+    test_lease::stop_renewals(schema).await;
     sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(pool)
         .await
@@ -131,10 +132,10 @@ async fn unrenewed_authority(store: Store) -> (Authority, TempDir) {
 }
 
 /// Opens an authority whose fence a background renewer keeps alive.
-async fn authority(store: Store) -> (Arc<Authority>, test_lease::WitnessDirectory) {
+async fn authority(store: Store) -> (Arc<Authority>, TempDir) {
     let (authority, directory) = unrenewed_authority(store).await;
     let authority = Arc::new(authority);
-    let directory = test_lease::WitnessDirectory::renewed(directory, &authority);
+    test_lease::keep_renewed(&authority).await;
     (authority, directory)
 }
 

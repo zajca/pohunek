@@ -2069,6 +2069,33 @@ async fn mutation_succeeds_past_the_original_lease_lifetime_with_renewal() {
     cleanup(&pool, &schema).await;
 }
 
+/// A recovery transition on the relay identity leaves the held fence renewable.
+///
+/// The lease row carries its own recovery generation and renewal compares only
+/// that row, so advancing or quarantining `relay_identity` does not fail a
+/// renewal. The renewing fixture therefore cannot close the authority under
+/// the tests that move the relay's recovery generation on purpose.
+#[tokio::test]
+async fn renewal_survives_a_recovery_generation_advance() {
+    let (store, schema, pool) = fixture().await;
+    let (authority, _directory) = unrenewed_authority(store.clone()).await;
+    let service = service(&store, authority);
+    sqlx::query(
+        "UPDATE relay_identity SET recovery_generation = recovery_generation + 1, \
+         state = 'recovery_quarantine' WHERE relay_id = 'test-relay'",
+    )
+    .execute(store.pool())
+    .await
+    .expect("advance and quarantine the relay identity");
+    service
+        .authority
+        .renew_once()
+        .await
+        .expect("the fence stays renewable across a recovery transition");
+    assert!(!service.authority.is_closed());
+    cleanup(&pool, &schema).await;
+}
+
 /// The same two steps without a renewal lose the fence, so the mutation above
 /// succeeds because of the renewal and not because time did not pass.
 #[tokio::test]

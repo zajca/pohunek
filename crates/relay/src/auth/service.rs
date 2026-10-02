@@ -3067,6 +3067,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) async fn cleanup(pool: &PgPool, schema: &str) {
+        crate::admission::test_lease::stop_renewals(schema).await;
         sqlx::query(AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(pool)
             .await
@@ -3101,15 +3102,9 @@ pub(crate) mod tests {
     }
 
     /// Opens an authority whose fence a background renewer keeps alive.
-    pub(crate) async fn authority(
-        store: Store,
-    ) -> (
-        Arc<Authority>,
-        crate::admission::test_lease::WitnessDirectory,
-    ) {
+    pub(crate) async fn authority(store: Store) -> (Arc<Authority>, tempfile::TempDir) {
         let (authority, directory) = unrenewed_authority(store).await;
-        let directory =
-            crate::admission::test_lease::WitnessDirectory::renewed(directory, &authority);
+        crate::admission::test_lease::keep_renewed(&authority).await;
         (authority, directory)
     }
 
