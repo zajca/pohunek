@@ -1,6 +1,6 @@
-//! Daemon `git` children ignore repository-location variables and
-//! command-scoped configuration of the environment they inherit, as in a daemon
-//! started from a git hook.
+//! Daemon `git` children ignore repository-location variables, command-scoped
+//! configuration and the helper directory of the environment they inherit, as in
+//! a daemon started from a git hook.
 //!
 //! The variables are set on a child process, because mutating this process's
 //! environment would race every other test.
@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use pohunek_test_support::env::TestEnv;
 
-use super::{branch_exists, worktree_add_new, worktree_remove};
+use super::{branch_exists, fetch_origin, worktree_add_new, worktree_remove};
 
 /// Variables the child starts with: each points Git at a repository, index or
 /// worktree that does not exist.
@@ -329,5 +329,98 @@ fn command_scoped_config_entries_do_not_reach_daemon_git() {
                 .env("GIT_CONFIG_KEY_0", "core.hooksPath")
                 .env("GIT_CONFIG_VALUE_0", hooks);
         },
+    );
+}
+
+/// Variable naming the directory the parent set as `GIT_EXEC_PATH`, as Git does
+/// for its hooks; it holds a `git-remote-https` helper that records its run.
+const EXEC_DIR_VAR: &str = "POHUNEK_TEST_GIT_EXEC_DIR";
+
+/// File the `git-remote-https` helper creates when Git runs it.
+const HELPER_MARKER: &str = "helper-ran";
+
+/// Writes an executable `git-remote-https` that creates [`HELPER_MARKER`] next to
+/// itself and fails, and returns its directory.
+fn write_marker_remote_helper(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exec = root.join("exec");
+    std::fs::create_dir(&exec).expect("create exec directory");
+    let helper = exec.join("git-remote-https");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\n: > '{}'\nexit 1\n",
+            exec.join(HELPER_MARKER).display()
+        ),
+    )
+    .expect("write helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("make helper executable");
+    exec
+}
+
+/// Child half of [`exec_path_does_not_reach_daemon_git`]: the daemon's fetch from
+/// an HTTPS remote must resolve `git-remote-https` without the inherited
+/// `GIT_EXEC_PATH`.
+#[test]
+#[ignore = "child process of exec_path_does_not_reach_daemon_git"]
+fn daemon_fetch_under_exec_path() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let repo = env.root().join("repo");
+    let exec = PathBuf::from(std::env::var_os(EXEC_DIR_VAR).expect("exec directory"));
+    let marker = exec.join(HELPER_MARKER);
+    std::fs::create_dir(&repo).expect("create repository directory");
+    fixture_git(&env, &repo, &["init", "-q", "-b", "main"]);
+    // Nothing listens on the discard port, so a fetch that reaches the real
+    // helper fails fast with a refused connection.
+    fixture_git(
+        &env,
+        &repo,
+        &["remote", "add", "origin", "https://127.0.0.1:9/pohunek.git"],
+    );
+
+    // Control: a git child that inherits the environment runs the planted
+    // helper, so the variable is effective for this Git.
+    let control = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["fetch", "--no-tags", "origin", "main"])
+        .output()
+        .expect("run control git");
+    assert!(!control.status.success());
+    assert!(marker.is_file(), "the inherited exec path runs the helper");
+    std::fs::remove_file(&marker).expect("remove marker");
+
+    assert!(fetch_origin(&repo, "main").is_err());
+    assert!(
+        !marker.exists(),
+        "the daemon's fetch ran a helper from the inherited GIT_EXEC_PATH"
+    );
+}
+
+/// Git exports `GIT_EXEC_PATH` to hooks; a daemon started from one must not look
+/// for helpers in that directory.
+#[test]
+fn exec_path_does_not_reach_daemon_git() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let exec = write_marker_remote_helper(env.root());
+    let output = env
+        .command(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "worktree::git_env_tests::daemon_fetch_under_exec_path",
+        ])
+        .envs(ISOLATED_GIT_CONFIG)
+        .env("GIT_EXEC_PATH", &exec)
+        .env(EXEC_DIR_VAR, &exec)
+        .output()
+        .expect("run scenario child");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
