@@ -24,7 +24,7 @@ impl Fixture {
 
 /// Creates a canonical temporary root.
 pub(super) fn fixture() -> Fixture {
-    let temp = tempfile::tempdir().expect("tempdir");
+    let temp = pohunek_test_support::tempdir().expect("tempdir");
     let root = fs::canonicalize(temp.path()).expect("canonical temp root");
     Fixture { _temp: temp, root }
 }

@@ -1062,8 +1062,10 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::time::{Duration, Instant};
+
+    use pohunek_test_support::env::TestEnv;
 
     /// Bounds every poll for an observable operating-system state change.
     const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1091,7 +1093,13 @@ mod tests {
     const SECRET_SENTINEL: &str = "pohunek-darwin-secret-sentinel";
 
     /// Kills and reaps a spawned fixture even when an assertion fails.
-    struct Fixture(Child);
+    ///
+    /// The second field is the fixture's scrubbed environment and private
+    /// working directory; it is removed after the child is reaped.
+    struct Fixture(
+        Child,
+        #[expect(dead_code, reason = "held only so the directory outlives the child")] TestEnv,
+    );
 
     impl Fixture {
         fn pid(&self) -> Pid {
@@ -1165,7 +1173,8 @@ mod tests {
         environment: &[(&str, &str)],
         directory: Option<&Path>,
     ) -> Fixture {
-        let mut command = Command::new("/bin/sh");
+        let env = TestEnv::new().expect("test environment");
+        let mut command = env.command("/bin/sh");
         command
             .args(["-c", script])
             .stdin(Stdio::null())
@@ -1177,7 +1186,24 @@ mod tests {
         if let Some(directory) = directory {
             command.current_dir(directory);
         }
-        Fixture(command.spawn().expect("spawn shell fixture"))
+        Fixture(command.spawn().expect("spawn shell fixture"), env)
+    }
+
+    /// Terminal type of the pseudoterminal shells: `dumb` keeps the shell from
+    /// emitting host-dependent escape sequences around its prompt.
+    const PTY_TERM: &str = "dumb";
+
+    /// A pseudoterminal command for `program` with the scrubbed environment and
+    /// private working directory of `env`.
+    fn pty_command(env: &TestEnv, program: &str) -> portable_pty::CommandBuilder {
+        let mut command = portable_pty::CommandBuilder::new(program);
+        command.env_clear();
+        for (name, value) in env.environment() {
+            command.env(name, value);
+        }
+        command.env("TERM", PTY_TERM);
+        command.cwd(env.cwd());
+        command
     }
 
     /// Runs one observation on a helper thread and bounds how long it may take.
@@ -1299,8 +1325,9 @@ mod tests {
     ///
     /// Returns the number of reads and every failed observation.
     fn read_through_exec_chains(inspector: DarwinInspector) -> (usize, Vec<String>) {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use portable_pty::{native_pty_system, PtySize};
 
+        let env = TestEnv::new().expect("test environment");
         let mut failures = Vec::new();
         let mut reads = 0_usize;
         for _ in 0..EXEC_LAUNCHES {
@@ -1312,7 +1339,7 @@ mod tests {
                     pixel_height: 0,
                 })
                 .expect("open a pseudoterminal");
-            let mut command = CommandBuilder::new("/bin/sh");
+            let mut command = pty_command(&env, "/bin/sh");
             command.args(["-c", "/bin/sleep 30"]);
             let child = pair.slave.spawn_command(command).expect("spawn the root");
             let pid = child.process_id().expect("root process id");
@@ -1464,7 +1491,9 @@ mod tests {
         use rustix::process::{waitid, Pid as RustixPid, WaitId, WaitIdOptions};
 
         let inspector = DarwinInspector::new();
-        let mut child = Command::new("/bin/sh")
+        let env = TestEnv::new().expect("test environment");
+        let mut child = env
+            .command("/bin/sh")
             .args(["-c", "exit 0"])
             .spawn()
             .expect("spawn a process that exits immediately");
@@ -1498,7 +1527,7 @@ mod tests {
     #[test]
     fn cwd_reports_the_child_working_directory() {
         let inspector = DarwinInspector::new();
-        let directory = tempfile::tempdir().expect("create a working directory");
+        let directory = pohunek_test_support::tempdir().expect("create a working directory");
         let expected = directory
             .path()
             .canonicalize()
@@ -1524,7 +1553,7 @@ mod tests {
     #[test]
     fn cwd_preserves_exact_directory_bytes() {
         let inspector = DarwinInspector::new();
-        let parent = tempfile::tempdir().expect("create a parent directory");
+        let parent = pohunek_test_support::tempdir().expect("create a parent directory");
         let parent = parent
             .path()
             .canonicalize()
@@ -1854,7 +1883,7 @@ mod tests {
         reason = "the PTY ownership scenario is linear so each foreground transition stays ordered"
     )]
     fn foreground_group_tracks_the_terminal_owner() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use portable_pty::{native_pty_system, PtySize};
         use std::io::Read;
 
         let inspector = DarwinInspector::new();
@@ -1866,7 +1895,8 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("open a pseudoterminal");
-        let mut command = CommandBuilder::new("/bin/bash");
+        let env = TestEnv::new().expect("test environment");
+        let mut command = pty_command(&env, "/bin/bash");
         command.args(["--norc", "--noprofile", "-i"]);
         command.env("PS1", "READY>");
         let child = pair.slave.spawn_command(command).expect("spawn the shell");

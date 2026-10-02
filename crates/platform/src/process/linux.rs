@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn narrow_identity_and_parent_reads_ignore_unreadable_cmdline() {
-        let root = tempfile::tempdir().expect("temporary proc root");
+        let root = pohunek_test_support::tempdir().expect("temporary proc root");
         let process_id = 123;
         let process_dir = root.path().join(process_id.to_string());
         fs::create_dir(&process_dir).expect("process directory");
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn exact_liveness_rejects_zombies_and_reused_identities() {
-        let root = tempfile::tempdir().expect("temporary proc root");
+        let root = pohunek_test_support::tempdir().expect("temporary proc root");
         let process_id = 123;
         let process_dir = root.path().join(process_id.to_string());
         fs::create_dir(&process_dir).expect("process directory");
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn stat_file_reader_resolves_a_transient_sample_from_procfs_layout() {
-        let root = tempfile::tempdir().expect("temporary proc root");
+        let root = pohunek_test_support::tempdir().expect("temporary proc root");
         let process_dir = root.path().join("123");
         fs::create_dir(&process_dir).expect("process directory");
         fs::write(process_dir.join("stat"), stat_text(7, 456)).expect("stat");
@@ -1040,7 +1040,7 @@ mod tests {
 
     #[test]
     fn narrow_identity_reports_malformed_process_stat() {
-        let root = tempfile::tempdir().expect("temporary proc root");
+        let root = pohunek_test_support::tempdir().expect("temporary proc root");
         let process_id = 123;
         let process_dir = root.path().join(process_id.to_string());
         fs::create_dir(&process_dir).expect("process directory");
@@ -1054,7 +1054,7 @@ mod tests {
 
     #[test]
     fn control_group_membership_requires_a_component_boundary() {
-        let root = tempfile::tempdir().expect("temporary proc root");
+        let root = pohunek_test_support::tempdir().expect("temporary proc root");
         let process_id = 123;
         let process_dir = root.path().join(process_id.to_string());
         fs::create_dir(&process_dir).expect("process directory");
@@ -1157,7 +1157,9 @@ mod tests {
     #[test]
     fn exit_watch_created_without_tokio_observes_exit_in_runtime_without_io() {
         let inspector = LinuxInspector::new();
-        let mut child = std::process::Command::new("/bin/sleep")
+        let env = pohunek_test_support::env::TestEnv::new().expect("test environment");
+        let mut child = env
+            .command("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn watched child");
@@ -1217,7 +1219,9 @@ POHUNEK_SESSION_ID=s-1\0POHUNEK_RUNTIME_ID=r-1\0POHUNEK_RUNTIME_IDX=r-2\0HOME=/h
     #[test]
     fn runtime_marker_is_read_from_a_live_process_environment() {
         let inspector = LinuxInspector::new();
-        let mut child = std::process::Command::new("/bin/sleep")
+        let env = pohunek_test_support::env::TestEnv::new().expect("test environment");
+        let mut child = env
+            .command("/bin/sleep")
             .arg("30")
             .env("POHUNEK_RUNTIME_ID", "runtime-live")
             .env("POHUNEK_TEST_SECRET", "not-a-marker")

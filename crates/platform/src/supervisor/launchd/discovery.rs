@@ -194,7 +194,7 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let root = tempfile::tempdir().expect("temporary directory");
+            let root = pohunek_test_support::tempdir().expect("temporary directory");
             let base = std::fs::canonicalize(root.path()).expect("canonical temporary directory");
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
                 .expect("private mode");

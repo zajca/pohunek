@@ -3629,7 +3629,7 @@ mod tests {
         "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
 
     fn trusted_root() -> (tempfile::TempDir, TrustedDir) {
-        let temporary = tempfile::tempdir().expect("create temporary directory");
+        let temporary = pohunek_test_support::tempdir().expect("create temporary directory");
         let canonical_path = fs::canonicalize(temporary.path()).expect("canonicalize test root");
         fs::set_permissions(&canonical_path, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set temporary directory permissions");
@@ -3638,9 +3638,34 @@ mod tests {
         (temporary, trusted)
     }
 
+    /// A command for `program` that starts with an empty environment in the
+    /// private directory `cwd`, so no host variable or working directory
+    /// reaches the child.
+    fn scrubbed_command(program: &str, cwd: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new(program);
+        command.env_clear().current_dir(cwd);
+        command
+    }
+
+    /// Runs `chmod +a` on `path` with the native macOS tool.
+    #[cfg(target_os = "macos")]
+    fn add_acl(path: &std::path::Path, acl: &str) {
+        let cwd = if path.is_dir() {
+            path
+        } else {
+            path.parent().expect("an ACL fixture file has a parent")
+        };
+        let status = scrubbed_command("/bin/chmod", cwd)
+            .args(["+a", acl])
+            .arg(path)
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+    }
+
     #[test]
     fn ancestor_validation_accepts_a_private_directory_and_creates_nothing() {
-        let temporary = tempfile::tempdir().expect("create fixture root");
+        let temporary = pohunek_test_support::tempdir().expect("create fixture root");
         // Canonical: the macOS temporary directory sits below the `/var` symlink,
         // which the ancestor policy refuses.
         let root = fs::canonicalize(temporary.path()).expect("canonicalize fixture root");
@@ -3660,7 +3685,7 @@ mod tests {
 
     #[test]
     fn ancestor_validation_rejects_writable_and_symlinked_directories() {
-        let temporary = tempfile::tempdir().expect("create fixture root");
+        let temporary = pohunek_test_support::tempdir().expect("create fixture root");
         // Canonical: the macOS temporary directory sits below the `/var` symlink,
         // which the ancestor policy refuses.
         let root = fs::canonicalize(temporary.path()).expect("canonicalize fixture root");
@@ -3854,11 +3879,11 @@ mod tests {
     /// A real child that inherited the lock descriptor and is still running.
     #[test]
     fn dropping_a_lock_releases_it_while_a_child_process_holds_an_inherited_copy() {
-        let (_temporary, first) = trusted_root();
+        let (temporary, first) = trusted_root();
         let lock = first
             .lock_file("child.lock", FILE_MODE, LockKind::Exclusive)
             .expect("acquire file lock");
-        let mut child = std::process::Command::new("sleep")
+        let mut child = scrubbed_command("/bin/sleep", temporary.path())
             .arg(CHILD_HOLD_SECONDS)
             .stdin(std::process::Stdio::from(lock.inherited_copy()))
             .spawn()
@@ -4638,7 +4663,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn open_file_rejects_a_macos_acl_granting_access_and_accepts_deny_only() {
-        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        let temporary = pohunek_test_support::tempdir().expect("create macOS fixture root");
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
         let trusted =
@@ -4646,12 +4671,7 @@ mod tests {
         for (name, acl) in [("writable", WRITABLE_ACL), ("deny-only", DENY_ONLY_ACL)] {
             let file = temporary.path().join(name);
             write_private(&file, b"contents");
-            let status = std::process::Command::new("/bin/chmod")
-                .args(["+a", acl])
-                .arg(&file)
-                .status()
-                .expect("run native ACL fixture command");
-            assert!(status.success(), "native ACL fixture command must succeed");
+            add_acl(&file, acl);
         }
 
         assert!(matches!(
@@ -4667,15 +4687,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn inherited_macos_acl_is_rejected_from_an_owner_private_directory() {
-        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        let temporary = pohunek_test_support::tempdir().expect("create macOS fixture root");
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
-        let status = std::process::Command::new("/bin/chmod")
-            .args(["+a", WRITABLE_INHERITABLE_ACL])
-            .arg(temporary.path())
-            .status()
-            .expect("run native ACL fixture command");
-        assert!(status.success(), "native ACL fixture command must succeed");
+        add_acl(temporary.path(), WRITABLE_INHERITABLE_ACL);
         let child = temporary.path().join("inherited");
         fs::create_dir(&child).expect("create ACL-inheriting child");
         fs::set_permissions(&child, fs::Permissions::from_mode(DIRECTORY_MODE))
@@ -4694,7 +4709,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn deny_only_macos_acl_on_an_ancestor_is_accepted() {
-        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        let temporary = pohunek_test_support::tempdir().expect("create macOS fixture root");
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
         let ancestor = temporary.path().join("ancestor");
@@ -4705,12 +4720,7 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))
                 .expect("set private mode bits");
         }
-        let status = std::process::Command::new("/bin/chmod")
-            .args(["+a", DENY_ONLY_ACL])
-            .arg(&ancestor)
-            .status()
-            .expect("run native ACL fixture command");
-        assert!(status.success(), "native ACL fixture command must succeed");
+        add_acl(&ancestor, DENY_ONLY_ACL);
 
         TrustedDir::open_absolute(&leaf, DIRECTORY_MODE)
             .expect("deny-only ancestor ACL must be accepted");
@@ -4721,15 +4731,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn deny_only_macos_acl_on_a_final_directory_is_accepted() {
-        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        let temporary = pohunek_test_support::tempdir().expect("create macOS fixture root");
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
-        let status = std::process::Command::new("/bin/chmod")
-            .args(["+a", DENY_ONLY_ACL])
-            .arg(temporary.path())
-            .status()
-            .expect("run native ACL fixture command");
-        assert!(status.success(), "native ACL fixture command must succeed");
+        add_acl(temporary.path(), DENY_ONLY_ACL);
 
         TrustedDir::open_absolute(temporary.path(), DIRECTORY_MODE)
             .expect("deny-only final ACL must be accepted");
@@ -4775,7 +4780,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn non_inherited_macos_acl_on_an_ancestor_is_rejected() {
-        let temporary = tempfile::tempdir_in("/private/tmp").expect("create macOS fixture root");
+        let temporary = pohunek_test_support::tempdir().expect("create macOS fixture root");
         fs::set_permissions(temporary.path(), fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture root mode");
         let ancestor = temporary.path().join("ancestor");
@@ -4786,12 +4791,7 @@ mod tests {
             fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE))
                 .expect("set private mode bits");
         }
-        let status = std::process::Command::new("/bin/chmod")
-            .args(["+a", WRITABLE_ACL])
-            .arg(&ancestor)
-            .status()
-            .expect("run native ACL fixture command");
-        assert!(status.success(), "native ACL fixture command must succeed");
+        add_acl(&ancestor, WRITABLE_ACL);
 
         assert!(matches!(
             TrustedDir::open_absolute(&leaf, DIRECTORY_MODE),
@@ -5275,7 +5275,7 @@ mod tests {
     #[ignore = "native APFS CI runs this test as root to create a foreign-owned fixture"]
     fn apfs_foreign_owned_private_directory_is_rejected() {
         assert_eq!(rustix::process::geteuid().as_raw(), 0, "test requires root");
-        let temporary = tempfile::tempdir().expect("create APFS fixture");
+        let temporary = pohunek_test_support::tempdir().expect("create APFS fixture");
         let canonical_path = fs::canonicalize(temporary.path()).expect("canonicalize APFS fixture");
         fs::set_permissions(&canonical_path, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set fixture mode");
@@ -5283,7 +5283,7 @@ mod tests {
         fs::create_dir(&foreign).expect("create foreign directory");
         fs::set_permissions(&foreign, fs::Permissions::from_mode(DIRECTORY_MODE))
             .expect("set foreign mode");
-        let status = std::process::Command::new("/usr/sbin/chown")
+        let status = scrubbed_command("/usr/sbin/chown", &foreign)
             .args(["1", foreign.to_str().expect("UTF-8 fixture path")])
             .status()
             .expect("run chown");
@@ -5307,15 +5307,9 @@ mod tests {
 
     #[test]
     fn file_sync_flushes_real_descriptor() {
-        let temporary = tempfile::NamedTempFile::new().expect("create temporary file");
-        sync_file(temporary.as_file()).expect("sync temporary file");
-        assert_eq!(
-            temporary
-                .as_file()
-                .metadata()
-                .expect("inspect file")
-                .nlink(),
-            1
-        );
+        let temporary = pohunek_test_support::tempdir().expect("create fixture root");
+        let file = fs::File::create(temporary.path().join("synced")).expect("create file");
+        sync_file(&file).expect("sync temporary file");
+        assert_eq!(file.metadata().expect("inspect file").nlink(), 1);
     }
 }
