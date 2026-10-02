@@ -28,9 +28,7 @@ const IDLE_WINDOW: Duration = Duration::from_secs(1);
 /// housekeeping on a loaded CI runner while staying a small fraction of what a
 /// single spinning reader would burn.
 const IDLE_CPU_BUDGET: Duration = Duration::from_millis(100);
-/// Grace each stop gives its root before escalating.
-const STOP_GRACE: Duration = Duration::from_millis(200);
-/// Bounds every wait on a session reaching a lifecycle state.
+/// Bounds the wait for released descriptors to close after the sessions stop.
 const LIFECYCLE_DEADLINE: Duration = Duration::from_secs(5);
 /// `PATH` of every PTY child: pinned so the fixture scripts resolve `sleep` from
 /// the system directories on Linux and macOS, never from the developer's.
@@ -101,9 +99,8 @@ async fn idle_sessions_do_not_spin_or_leak_descriptors() {
         .map(|_| spawn(&config, "sleep 30", cwd.path()))
         .collect();
     let hung_up = spawn(&config, "exit 0", cwd.path());
-    tokio::time::timeout(LIFECYCLE_DEADLINE, hung_up.wait_exit())
+    pohunek_test_support::wait::guard("the hung-up root to exit", hung_up.wait_exit())
         .await
-        .expect("hung-up root exit deadline")
         .expect("hung-up root exit");
 
     let sessions = IDLE_SESSIONS + 1;
@@ -125,10 +122,12 @@ async fn idle_sessions_do_not_spin_or_leak_descriptors() {
     );
 
     for pty in idle.iter().chain(std::iter::once(&hung_up)) {
-        tokio::time::timeout(LIFECYCLE_DEADLINE, pty.stop("resources", STOP_GRACE))
-            .await
-            .expect("stop deadline")
-            .expect("stop session");
+        pohunek_test_support::wait::guard(
+            "a session to stop",
+            pty.stop("resources", config.stop_grace),
+        )
+        .await
+        .expect("stop session");
     }
     drop(idle);
     drop(hung_up);
