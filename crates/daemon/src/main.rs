@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use overlay::{ConfiguredTransport, OverlayId, OverlayRegistry};
-use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, RemoteServer};
+use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, OpenedListener, RemoteServer};
 use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::governance::HostGovernanceService;
@@ -820,9 +820,16 @@ where
         let task = tokio::spawn(async move {
             serve_remote_with_retry(
                 |current_addr| {
-                    bind_remote_server(state.clone(), configured.clone(), current_addr, |addr| {
-                        tokio::net::TcpListener::bind(addr)
-                    })
+                    bind_remote_server(
+                        state.clone(),
+                        configured.clone(),
+                        current_addr,
+                        |addr| async move {
+                            tokio::net::TcpListener::bind(addr)
+                                .await
+                                .map(OpenedListener::os_bound)
+                        },
+                    )
                 },
                 shutdown,
                 REMOTE_BIND_INITIAL_RETRY_INTERVAL,
@@ -891,7 +898,7 @@ where
 /// [`RemoteServer`] on that overlay's configured port. Missing CLI disables
 /// that listener; unavailable state, a missing self address, and bind failures
 /// are retried by the caller. `open` supplies the listening socket for the
-/// validated address; production passes `TcpListener::bind`.
+/// validated address; production binds the address with the OS.
 async fn bind_remote_server<O, Fut>(
     state: DaemonState,
     configured: ConfiguredTransport,
@@ -900,7 +907,7 @@ async fn bind_remote_server<O, Fut>(
 ) -> RemoteBind
 where
     O: FnOnce(std::net::SocketAddr) -> Fut,
-    Fut: Future<Output = std::io::Result<tokio::net::TcpListener>>,
+    Fut: Future<Output = std::io::Result<OpenedListener>>,
 {
     let overlay_id = configured.id().clone();
     let port = configured.port();
@@ -991,11 +998,11 @@ mod tests {
         BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, OverlayError,
         OverlayFuture, OverlayId, OverlayTransport, ResolvedPeer,
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_util::sync::CancellationToken;
 
-    use pohunek_daemon::api::{DaemonState, HealthInfo, RemoteServer};
+    use pohunek_daemon::api::{DaemonState, HealthInfo, OpenedListener, RemoteServer};
     use pohunek_daemon::governance::HostGovernanceService;
     use pohunek_daemon::session::SessionRegistry;
     use pohunek_daemon::DaemonError;
@@ -1223,6 +1230,7 @@ mod tests {
     /// Run `bind_with` for `first_ip:port` with an opener that returns `listener`.
     async fn bind_with_returned_listener(
         listener: TcpListener,
+        wrap: fn(TcpListener) -> OpenedListener,
         requested: std::net::SocketAddr,
     ) -> Result<RemoteServer, DaemonError> {
         let (_state_root, governance) = governance_service().await;
@@ -1236,7 +1244,10 @@ mod tests {
             governance,
             netbird::configured_registry().expect("configured registry"),
         );
-        RemoteServer::bind_with(requested, state, &transport, |_| async { Ok(listener) }).await
+        RemoteServer::bind_with(requested, state, &transport, |_| async {
+            Ok(wrap(listener))
+        })
+        .await
     }
 
     #[tokio::test]
@@ -1245,12 +1256,26 @@ mod tests {
         let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
         let (port, mut reserved) = reserve_port_on_both(first_ip, second_ip).await;
         let wrong = reserved.remove(&second_ip).expect("second listener");
-        let result = bind_with_returned_listener(wrong, (first_ip, port).into()).await;
+        let result =
+            bind_with_returned_listener(wrong, OpenedListener::held, (first_ip, port).into()).await;
         match result {
             Err(DaemonError::OverlayBind { addr, .. }) => assert_eq!(addr, second_ip),
             Err(other) => panic!("expected OverlayBind, got: {other}"),
             Ok(_) => panic!("a listener on another IP must be rejected"),
         }
+    }
+
+    #[tokio::test]
+    async fn bind_with_trusts_an_os_bound_listener() {
+        let first_ip = "127.0.0.1".parse().expect("first IP");
+        let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
+        let (port, mut reserved) = reserve_port_on_both(first_ip, second_ip).await;
+        let other = reserved.remove(&second_ip).expect("second listener");
+        let server =
+            bind_with_returned_listener(other, OpenedListener::os_bound, (first_ip, port).into())
+                .await
+                .expect("an OS-bound listener is not compared with the requested address");
+        assert_eq!(server.local_addr(), (second_ip, port).into());
     }
 
     #[tokio::test]
@@ -1261,7 +1286,9 @@ mod tests {
             .expect("ephemeral listener");
         let wrong_port = wrong.local_addr().expect("listener address").port();
         let requested_port = wrong_port.checked_add(1).unwrap_or(wrong_port - 1);
-        let result = bind_with_returned_listener(wrong, (ip, requested_port).into()).await;
+        let result =
+            bind_with_returned_listener(wrong, OpenedListener::held, (ip, requested_port).into())
+                .await;
         match result {
             Err(DaemonError::OverlayBind { addr, reason }) => {
                 assert_eq!(addr, ip);
@@ -1272,6 +1299,42 @@ mod tests {
         }
     }
 
+    /// Send `daemon.health` to `addr` and require an OK protocol response.
+    ///
+    /// A bare TCP handshake is not proof of a serving daemon: a reserved but
+    /// unserved listener completes it too. The reply proves the supervisor's
+    /// accept loop owns the socket.
+    async fn assert_serves_health(addr: std::net::SocketAddr) {
+        pohunek_test_support::wait::guard("daemon.health over TCP", async {
+            let stream = TcpStream::connect(addr)
+                .await
+                .expect("listener accepts connections");
+            let mut reader = BufReader::new(stream);
+            let request = protocol::Request::new(
+                "health",
+                protocol::method::DAEMON_HEALTH,
+                serde_json::Value::Null,
+            )
+            .expect("valid health request");
+            let mut line = serde_json::to_string(&request).expect("serialize health request");
+            line.push('\n');
+            reader
+                .get_mut()
+                .write_all(line.as_bytes())
+                .await
+                .expect("send health request");
+            let mut reply = String::new();
+            reader
+                .read_line(&mut reply)
+                .await
+                .expect("read health response");
+            let response: protocol::Response =
+                serde_json::from_str(&reply).expect("parse health response");
+            response.into_result().expect("daemon.health succeeds");
+        })
+        .await;
+    }
+
     #[tokio::test(start_paused = true)]
     async fn remote_supervisor_rebinds_when_listener_address_changes() {
         let (_state_root, governance) = governance_service().await;
@@ -1279,6 +1342,9 @@ mod tests {
         let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
         let (port, reserved) = reserve_port_on_both(first_ip, second_ip).await;
         let reserved = Arc::new(Mutex::new(reserved));
+        // Real socket I/O runs while the clock is paused; only the explicit
+        // `advance` below may move virtual time.
+        let inhibitor = pohunek_test_support::time::AutoAdvanceInhibitor::new();
         let address = Arc::new(RwLock::new(first_ip));
         let transport = Arc::new(MutableListenerTransport {
             id: OverlayId::new("mutable").expect("overlay id"),
@@ -1306,6 +1372,7 @@ mod tests {
                             .lock()
                             .expect("reserved listener lock")
                             .remove(&addr.ip())
+                            .map(OpenedListener::held)
                             .ok_or_else(|| {
                                 std::io::Error::other("no reserved listener for address")
                             })
@@ -1318,22 +1385,19 @@ mod tests {
         ));
 
         tokio::task::yield_now().await;
-        TcpStream::connect((first_ip, port))
-            .await
-            .expect("initial listener accepts connections");
+        assert_serves_health((first_ip, port).into()).await;
 
         *address.write().expect("listener address write lock") = second_ip;
         tokio::time::advance(reconcile_interval).await;
         tokio::task::yield_now().await;
-        TcpStream::connect((second_ip, port))
-            .await
-            .expect("rebound listener accepts connections");
+        assert_serves_health((second_ip, port).into()).await;
         TcpStream::connect((first_ip, port))
             .await
             .expect_err("stale listener no longer accepts connections");
 
         shutdown.cancel();
         supervisor.await.expect("supervisor exits after shutdown");
+        inhibitor.release().await;
     }
 
     #[tokio::test]
