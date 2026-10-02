@@ -1,14 +1,13 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
-use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pohunek_client::protocol::{
     self, ErrorClass, ProtocolError, Request, Response, MAX_CONTROL_LINE_BYTES,
 };
 use pohunek_client::{next_request_id, Client, ClientError, ClientOptions, OriginSource};
+use pohunek_test_support::env::TestEnv;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -24,7 +23,6 @@ fn no_origin_options() -> ClientOptions {
 }
 const LEGACY_PROTOCOL_VERSION: u32 = 1;
 const DISCOVERED_HOST_PORT: u16 = 18_722;
-static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 enum Reply {
@@ -74,12 +72,29 @@ struct EchoDaemon {
     _socket_file: SocketFile,
 }
 
+/// A Unix socket path inside a private test root, which is removed with its
+/// socket when the value drops.
+///
+/// [`TestEnv::socket_path`] checks the path against the 104-byte Darwin
+/// `sun_path` limit, which a path below macOS's per-user temporary directory
+/// would exceed.
 #[derive(Debug)]
-struct SocketFile(PathBuf);
+struct SocketFile {
+    path: PathBuf,
+    _env: TestEnv,
+}
 
-impl Drop for SocketFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+impl SocketFile {
+    fn new() -> Self {
+        let env = TestEnv::new().expect("create the hermetic test environment");
+        let path = env
+            .socket_path("daemon.sock")
+            .expect("socket path fits the sun_path limit");
+        Self { path, _env: env }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -192,10 +207,9 @@ async fn canonical_negotiation_mismatch_is_not_masked_by_response_version_valida
     reason = "the test keeps both accepted connections and their wire assertions adjacent"
 )]
 async fn waiting_output_uses_a_dedicated_connection() {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix daemon");
-    let socket_file = SocketFile(socket_path.clone());
 
     let task = tokio::spawn(async move {
         let (first, _) = listener.accept().await.expect("accept primary connection");
@@ -375,10 +389,9 @@ async fn waiting_output_uses_a_dedicated_remote_tcp_connection() {
 
 #[tokio::test]
 async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix daemon");
-    let socket_file = SocketFile(socket_path.clone());
 
     let task = tokio::spawn(async move {
         let (primary, _) = listener.accept().await.expect("accept primary connection");
@@ -475,10 +488,9 @@ async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
 
 #[tokio::test]
 async fn cancelling_session_wait_keeps_the_shared_connection_usable() {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix daemon");
-    let socket_file = SocketFile(socket_path.clone());
 
     let task = tokio::spawn(async move {
         let (first, _) = listener.accept().await.expect("accept primary connection");
@@ -1336,8 +1348,8 @@ async fn run_remote(reply: Reply) -> (Result<Value, ClientError>, String) {
 }
 
 fn spawn_unix_daemon(reply: Reply) -> UnixDaemon {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix test daemon");
     let (request_tx, request_line) = oneshot::channel();
 
@@ -1350,13 +1362,13 @@ fn spawn_unix_daemon(reply: Reply) -> UnixDaemon {
         socket_path: socket_path.clone(),
         request_line,
         task,
-        _socket_file: SocketFile(socket_path),
+        _socket_file: socket_file,
     }
 }
 
 fn spawn_unix_echo_daemon(ok: Value) -> UnixDaemon {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix echo test daemon");
     let (request_tx, request_line) = oneshot::channel();
 
@@ -1369,7 +1381,7 @@ fn spawn_unix_echo_daemon(ok: Value) -> UnixDaemon {
         socket_path: socket_path.clone(),
         request_line,
         task,
-        _socket_file: SocketFile(socket_path),
+        _socket_file: socket_file,
     }
 }
 
@@ -1393,8 +1405,8 @@ async fn spawn_tcp_daemon(reply: Reply) -> TcpDaemon {
 }
 
 fn spawn_late_response_daemon(reply_line: String, delay: Duration) -> LateResponseDaemon {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix test daemon");
     let (first_request_tx, first_request_line) = oneshot::channel();
     let (second_request_tx, second_request_line) = oneshot::channel();
@@ -1416,13 +1428,13 @@ fn spawn_late_response_daemon(reply_line: String, delay: Duration) -> LateRespon
         first_request_line,
         second_request_line,
         task,
-        _socket_file: SocketFile(socket_path),
+        _socket_file: socket_file,
     }
 }
 
 fn spawn_reusable_daemon(first_reply_line: String) -> ReusableDaemon {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix reusable test daemon");
     let (first_request_tx, first_request_line) = oneshot::channel();
     let (second_request_tx, second_request_line) = oneshot::channel();
@@ -1443,13 +1455,13 @@ fn spawn_reusable_daemon(first_reply_line: String) -> ReusableDaemon {
         first_request_line,
         second_request_line,
         task,
-        _socket_file: SocketFile(socket_path),
+        _socket_file: socket_file,
     }
 }
 
 fn spawn_echo_ok_daemon(ok_payload: Value) -> EchoDaemon {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix echo test daemon");
     let (request_tx, request_line) = oneshot::channel();
 
@@ -1462,13 +1474,13 @@ fn spawn_echo_ok_daemon(ok_payload: Value) -> EchoDaemon {
         socket_path: socket_path.clone(),
         request_line,
         task,
-        _socket_file: SocketFile(socket_path),
+        _socket_file: socket_file,
     }
 }
 
 fn spawn_echo_error_daemon(error: ProtocolError) -> EchoDaemon {
-    let socket_path = unique_socket_path();
-    let _ = std::fs::remove_file(&socket_path);
+    let socket_file = SocketFile::new();
+    let socket_path = socket_file.path().to_path_buf();
     let listener = UnixListener::bind(&socket_path).expect("bind unix error test daemon");
     let (request_tx, request_line) = oneshot::channel();
     let task = tokio::spawn(async move {
@@ -1497,7 +1509,7 @@ fn spawn_echo_error_daemon(error: ProtocolError) -> EchoDaemon {
         socket_path: socket_path.clone(),
         request_line,
         task,
-        _socket_file: SocketFile(socket_path),
+        _socket_file: socket_file,
     }
 }
 
@@ -1784,12 +1796,4 @@ fn sample_policy() -> protocol::NotificationPolicy {
 
 fn trim_line_end(line: &str) -> &str {
     line.trim_end_matches('\n').trim_end_matches('\r')
-}
-
-fn unique_socket_path() -> PathBuf {
-    let id = NEXT_SOCKET_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "pohunek-client-request-response-{}-{id}.sock",
-        process::id()
-    ))
 }
