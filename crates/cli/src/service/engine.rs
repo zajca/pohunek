@@ -147,6 +147,8 @@ use super::report::{
 };
 use super::settings;
 use super::usage::{Journals, Usage};
+#[cfg(target_os = "linux")]
+use super::verify::UnitVerifier;
 
 /// Durable metadata `--purge` removes from the data directory.
 ///
@@ -188,6 +190,9 @@ pub struct Engine<'a> {
     inherited: Option<TransactionLock>,
     ready_timeout: Duration,
     stop_timeout: Duration,
+    /// Verifies the rendered units before they are registered.
+    #[cfg(target_os = "linux")]
+    unit_verifier: UnitVerifier,
     #[cfg(test)]
     interrupt_after: Option<Step>,
     #[cfg(feature = "test-util")]
@@ -206,6 +211,8 @@ impl<'a> Engine<'a> {
             inherited: None,
             ready_timeout: settings::DAEMON_READY_TIMEOUT,
             stop_timeout: settings::SESSION_STOP_TIMEOUT,
+            #[cfg(target_os = "linux")]
+            unit_verifier: UnitVerifier::default(),
             #[cfg(test)]
             interrupt_after: None,
             #[cfg(feature = "test-util")]
@@ -220,6 +227,18 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn with_inherited_lock(mut self, lock: TransactionLock) -> Self {
         self.inherited = Some(lock);
+        self
+    }
+
+    /// Verifies the rendered units with `verifier` instead of `systemd-analyze`
+    /// found on `PATH`.
+    ///
+    /// The units are still rendered and verified before registration; only the
+    /// program that checks them is configured.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_unit_verifier(mut self, verifier: UnitVerifier) -> Self {
+        self.unit_verifier = verifier;
         self
     }
 
@@ -909,8 +928,9 @@ impl<'a> Engine<'a> {
         config: &ServiceConfig,
         definition: &JobDefinition,
     ) -> Result<(), Error> {
-        let _ = self;
-        super::verify::verify_units(&config.namespace(), definition).await
+        self.unit_verifier
+            .verify(&config.namespace(), definition)
+            .await
     }
 
     /// Creates the launchd log directory the daemon agent writes into.
