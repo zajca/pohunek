@@ -183,29 +183,63 @@ fn resolve_target_from_sessions(
     }
 }
 
+/// Process-wide cancellation signals (SIGINT and SIGTERM on Unix, Ctrl-C elsewhere).
+///
+/// [`Self::install`] registers the handlers immediately, so a signal that arrives
+/// before [`Self::cancelled`] is first polled is queued instead of taking the
+/// default action. Install it before sending a request whose outcome the signal
+/// must be reported against.
 #[cfg(unix)]
-async fn process_cancellation() -> Result<(), CliError> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result.map_err(CliError::from),
-        _ = terminate.recv() => Ok(()),
+struct ProcessCancellation {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ProcessCancellation {
+    fn install() -> Result<Self, CliError> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    /// Completes once a cancellation signal has been delivered since installation.
+    async fn cancelled(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
     }
 }
 
+/// Process-wide cancellation signals (Ctrl-C only on this platform).
 #[cfg(not(unix))]
-async fn process_cancellation() -> Result<(), CliError> {
-    tokio::signal::ctrl_c().await.map_err(CliError::from)
+struct ProcessCancellation;
+
+#[cfg(not(unix))]
+impl ProcessCancellation {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the Unix constructor, which can fail to register a handler"
+    )]
+    fn install() -> Result<Self, CliError> {
+        Ok(Self)
+    }
+
+    /// Completes once Ctrl-C has been delivered.
+    async fn cancelled(&mut self) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn cancellable<T>(
     future: impl std::future::Future<Output = Result<T, pohunek_client::ClientError>>,
 ) -> Result<T, CliError> {
+    let mut cancellation = ProcessCancellation::install()?;
     tokio::select! {
         result = future => result.map_err(CliError::from),
-        signal = process_cancellation() => {
-            signal?;
-            Err(CliError::Cancelled)
-        }
+        () = cancellation.cancelled() => Err(CliError::Cancelled),
     }
 }
 
@@ -682,12 +716,10 @@ pub(crate) async fn run_input(
     let mut client = Client::connect(host, paths).await?;
     let params = input_params(target, text, wait_until, timeout_ms);
     let input = if params.wait.is_some() {
+        let mut cancellation = ProcessCancellation::install()?;
         tokio::select! {
             result = client.session_input(params) => result?,
-            signal = process_cancellation() => {
-                signal?;
-                return Err(CliError::InputWaitInterrupted);
-            }
+            () = cancellation.cancelled() => return Err(CliError::InputWaitInterrupted),
         }
     } else {
         client.session_input(params).await?
@@ -3664,5 +3696,20 @@ mod tests {
         let resolved = resolve_target_from_sessions(&target, &[session]).expect("unique name");
         assert_eq!(resolved.host.as_deref(), Some("host-b"));
         assert_eq!(resolved.session_id, "s-42");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installed_cancellation_queues_a_signal_raised_before_it_is_polled() {
+        let mut cancellation = ProcessCancellation::install().expect("install signal handlers");
+        #[expect(
+            unsafe_code,
+            reason = "libc::raise delivers the signal whose handler the test just installed"
+        )]
+        // SAFETY: `raise` only delivers SIGTERM to this process, and the handler
+        // for it was registered by `install` above.
+        let result = unsafe { libc::raise(libc::SIGTERM) };
+        assert_eq!(result, 0, "raise SIGTERM");
+        pohunek_test_support::wait::guard("the queued SIGTERM", cancellation.cancelled()).await;
     }
 }

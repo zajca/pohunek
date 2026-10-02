@@ -9,16 +9,17 @@
 
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::net::Shutdown;
 #[cfg(target_os = "linux")]
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use protocol::{Request, Response, PROTOCOL_VERSION};
@@ -26,7 +27,6 @@ use serde_json::{json, Value};
 
 const SESSION_ID: &str = "s-fixture-1";
 const SESSION_NAME: &str = "fixture-session";
-const REQUEST_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const SLOW_RESPONSE_DELAY: Duration = Duration::from_millis(300);
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -262,6 +262,7 @@ struct FixtureDaemon {
     socket: PathBuf,
     stop: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<Request>>>,
+    accepted: Arc<AtomicUsize>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -287,9 +288,11 @@ impl TcpFixtureDaemon {
         let thread_requests = Arc::clone(&requests);
         let thread = thread::spawn(move || {
             let mut handlers = Vec::new();
+            let mut connections = Vec::new();
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _address)) => {
+                        connections.push(stream.try_clone().expect("clone TCP fixture connection"));
                         let requests = Arc::clone(&thread_requests);
                         handlers.push(thread::spawn(move || {
                             handle_connection(stream, scenario, &requests, None);
@@ -300,6 +303,11 @@ impl TcpFixtureDaemon {
                     }
                     Err(error) => panic!("TCP fixture accept failed: {error}"),
                 }
+            }
+            // Closing the fixture's end unblocks a handler still waiting for a
+            // request line from a client that never sent one.
+            for connection in &connections {
+                let _closed = connection.shutdown(Shutdown::Both);
             }
             for handler in handlers {
                 handler.join().expect("TCP fixture connection handler");
@@ -315,17 +323,21 @@ impl TcpFixtureDaemon {
 
     fn finish(mut self) -> Vec<Request> {
         self.stop.store(true, Ordering::Release);
-        let _wake = TcpStream::connect(self.address);
-        self.thread
-            .take()
-            .expect("TCP fixture thread")
-            .join()
-            .expect("TCP fixture daemon");
+        join_fixture_thread(
+            "TCP fixture daemon to stop",
+            self.thread.take().expect("TCP fixture thread"),
+        );
         self.requests
             .lock()
             .expect("TCP request capture lock")
             .clone()
     }
+}
+
+/// Joins a fixture thread, failing with a named step instead of hanging.
+fn join_fixture_thread(what: &str, thread: thread::JoinHandle<()>) {
+    pohunek_test_support::wait::poll_until(what, || thread.is_finished().then_some(()));
+    thread.join().expect(what);
 }
 
 impl FixtureDaemon {
@@ -341,8 +353,11 @@ impl FixtureDaemon {
         let thread_stop = Arc::clone(&stop);
         let thread_requests = Arc::clone(&requests);
         let thread_request_log = Arc::clone(&request_log);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let thread_accepted = Arc::clone(&accepted);
         let thread = thread::spawn(move || {
             let mut handlers = Vec::new();
+            let mut connections = Vec::new();
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _address)) => {
@@ -351,6 +366,8 @@ impl FixtureDaemon {
                         stream
                             .set_nonblocking(false)
                             .expect("set fixture connection blocking");
+                        connections.push(stream.try_clone().expect("clone fixture connection"));
+                        thread_accepted.fetch_add(1, Ordering::Release);
                         let requests = Arc::clone(&thread_requests);
                         let request_log = Arc::clone(&thread_request_log);
                         handlers.push(thread::spawn(move || {
@@ -363,6 +380,11 @@ impl FixtureDaemon {
                     Err(error) => panic!("fixture accept failed: {error}"),
                 }
             }
+            // Closing the fixture's end unblocks a handler still waiting for a
+            // request line from a client that never sent one.
+            for connection in &connections {
+                let _closed = connection.shutdown(Shutdown::Both);
+            }
             for handler in handlers {
                 handler.join().expect("fixture connection handler");
             }
@@ -371,6 +393,7 @@ impl FixtureDaemon {
             socket,
             stop,
             requests,
+            accepted,
             thread: Some(thread),
         }
     }
@@ -380,13 +403,15 @@ impl FixtureDaemon {
     }
 
     fn finish(mut self) -> Vec<Request> {
+        // The accept loop polls a non-blocking listener, so it observes `stop`
+        // within one poll interval. Connecting to it as a wake-up would let it
+        // accept that connection and then wait on it while this thread waits
+        // for the loop to end.
         self.stop.store(true, Ordering::Release);
-        let _wake = UnixStream::connect(&self.socket);
-        self.thread
-            .take()
-            .expect("fixture thread")
-            .join()
-            .expect("fixture daemon");
+        join_fixture_thread(
+            "fixture daemon to stop",
+            self.thread.take().expect("fixture thread"),
+        );
         let requests = self.requests();
         let _result = fs::remove_file(&self.socket);
         requests
@@ -1128,25 +1153,19 @@ fn process_signals_cancel_local_wait_while_wire_timeout_remains_bounded() {
     for (signal, signal_name) in [(libc::SIGINT, "SIGINT"), (libc::SIGTERM, "SIGTERM")] {
         let home = TestHome::new();
         let fixture = FixtureDaemon::start(&home.socket(), Scenario::SlowWait);
-        let mut child = home
-            .command()
-            .args([
-                "session",
-                "wait",
-                SESSION_ID,
-                "--state",
-                "done",
-                "--timeout-ms",
-                "8000",
-                "--json",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn pohunek");
+        let mut child = SpawnedCli::spawn(home.command().args([
+            "session",
+            "wait",
+            SESSION_ID,
+            "--state",
+            "done",
+            "--timeout-ms",
+            "8000",
+            "--json",
+        ]));
         wait_for_method(&fixture, protocol::method::SESSION_WAIT);
-        send_signal(&mut child, signal, signal_name);
-        let output = child.wait_with_output().expect("wait for cancelled CLI");
+        child.signal(signal, signal_name);
+        let output = child.finish(&format!("session wait cancelled by {signal_name}"));
         let requests = fixture.finish();
         assert_json_error(&output, "cancelled");
         let wait_request = requests
@@ -1165,26 +1184,20 @@ fn process_signals_report_unknown_delivery_for_waited_input_without_retry_hint()
     for (signal, signal_name) in [(libc::SIGINT, "SIGINT"), (libc::SIGTERM, "SIGTERM")] {
         let home = TestHome::new();
         let fixture = FixtureDaemon::start(&home.socket(), Scenario::SlowInput);
-        let mut child = home
-            .command()
-            .args([
-                "session",
-                "input",
-                SESSION_ID,
-                "approval response",
-                "--until",
-                "idle",
-                "--timeout",
-                "8000",
-                "--json",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn pohunek");
+        let mut child = SpawnedCli::spawn(home.command().args([
+            "session",
+            "input",
+            SESSION_ID,
+            "approval response",
+            "--until",
+            "idle",
+            "--timeout",
+            "8000",
+            "--json",
+        ]));
         wait_for_method(&fixture, protocol::method::SESSION_INPUT);
-        send_signal(&mut child, signal, signal_name);
-        let output = child.wait_with_output().expect("wait for interrupted CLI");
+        child.signal(signal, signal_name);
+        let output = child.finish(&format!("session input interrupted by {signal_name}"));
         let requests = fixture.finish();
         let document = assert_json_error(&output, "session_input_interrupted");
         assert!(document["err"].get("recover").is_none());
@@ -1198,19 +1211,96 @@ fn process_signals_report_unknown_delivery_for_waited_input_without_retry_hint()
     }
 }
 
+#[test]
+fn fixture_finish_returns_while_an_accepted_connection_is_idle() {
+    let home = TestHome::new();
+    let fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    // The connection never sends a request line, so its handler stays blocked
+    // reading it until the fixture closes its end.
+    let idle = UnixStream::connect(home.socket()).expect("connect idle client");
+    pohunek_test_support::wait::poll_until("the fixture to accept the idle client", || {
+        (fixture.accepted.load(Ordering::Acquire) > 0).then_some(())
+    });
+    let requests = fixture.finish();
+    assert!(requests.is_empty());
+    drop(idle);
+}
+
 fn wait_for_method(fixture: &FixtureDaemon, method: &str) {
-    let deadline = Instant::now() + REQUEST_CAPTURE_TIMEOUT;
-    while Instant::now() < deadline {
-        if fixture
+    pohunek_test_support::wait::poll_until(&format!("the fixture to receive {method}"), || {
+        fixture
             .requests()
             .iter()
             .any(|request| request.method() == method)
-        {
-            return;
+            .then_some(())
+    });
+}
+
+/// A spawned CLI child that is killed and reaped when the test unwinds.
+struct SpawnedCli {
+    child: Child,
+    stdout: Option<thread::JoinHandle<Vec<u8>>>,
+    stderr: Option<thread::JoinHandle<Vec<u8>>>,
+}
+
+impl SpawnedCli {
+    /// Spawns `command` with piped stdout and stderr drained on helper threads.
+    fn spawn(command: &mut Command) -> Self {
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pohunek");
+        let stdout = drain(child.stdout.take().expect("piped stdout"));
+        let stderr = drain(child.stderr.take().expect("piped stderr"));
+        Self {
+            child,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
         }
-        thread::sleep(Duration::from_millis(5));
     }
-    panic!("fixture did not receive {method}");
+
+    fn signal(&mut self, signal: libc::c_int, signal_name: &str) {
+        send_signal(&mut self.child, signal, signal_name);
+    }
+
+    /// Waits for the child to exit and returns its output, failing with a named
+    /// step if the child or its pipes stay open past the hang guard.
+    fn finish(mut self, what: &str) -> Output {
+        let status =
+            pohunek_test_support::wait::poll_until(&format!("the CLI to exit: {what}"), || {
+                self.child.try_wait().expect("poll CLI exit")
+            });
+        Output {
+            status,
+            stdout: join_drain(self.stdout.take().expect("stdout reader"), what),
+            stderr: join_drain(self.stderr.take().expect("stderr reader"), what),
+        }
+    }
+}
+
+impl Drop for SpawnedCli {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _killed = self.child.kill();
+            let _reaped = self.child.wait();
+        }
+    }
+}
+
+fn drain(mut pipe: impl std::io::Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _read = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+fn join_drain(reader: thread::JoinHandle<Vec<u8>>, what: &str) -> Vec<u8> {
+    pohunek_test_support::wait::poll_until(&format!("the CLI pipes to close: {what}"), || {
+        reader.is_finished().then_some(())
+    });
+    reader.join().expect("CLI pipe reader")
 }
 
 fn send_signal(child: &mut Child, signal: libc::c_int, signal_name: &str) {
