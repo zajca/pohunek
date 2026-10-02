@@ -109,6 +109,14 @@ The assistant must:
   session; hooks require that path, and the public native-id report is the
   necessary local fallback when the owner-private worker claim cannot be
   delivered.
+- The Rust SDK inherits that origin from the calling process by default
+  (`OriginSource::Environment`, which reads `POHUNEK_SESSION_ID` and
+  `POHUNEK_DAEMON_ID`). `OriginSource::Omitted` makes a connection attach no
+  origin of its own; it exists for callers that are not a managed session's
+  delegate, such as test fixtures and tools started outside any session. Code
+  running inside a managed session, including plugins and hooks, must keep the
+  default: selecting `Omitted` there to reach the hosting session is the same
+  bypass of `plugin_self_target_denied` as stripping the markers.
 - Treat `notification.create` like every other control method: it is guarded by
   the owner-only daemon socket, not by per-session authentication. Any same-user
   process that can reach the socket can create notifications and influence
