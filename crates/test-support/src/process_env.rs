@@ -168,6 +168,7 @@ impl Drop for ProcessEnv {
 ///
 /// Do not call it while holding a [`ProcessEnv`] on the same thread; the lock
 /// is not reentrant.
+#[must_use]
 pub fn command(program: &str) -> Command {
     let path = {
         let _env = ProcessEnv::lock();
