@@ -235,17 +235,13 @@ fn has_git_workspace_ancestor(path: &Path) -> Result<bool, Error> {
 #[cfg(test)]
 pub(crate) fn isolated_test_temp_root() -> PathBuf {
     let standard = pohunek_test_support::temp_root();
-    if !has_git_workspace_ancestor(&standard).unwrap_or(true) {
-        return fs::canonicalize(&standard).expect("canonical temporary root");
-    }
-    // `/var/tmp` is the standard persistent Unix temporary root and keeps
-    // custom-target fixtures outside an ambient repository rooted at `/tmp`.
-    let fallback = PathBuf::from("/var/tmp");
     assert!(
-        !has_git_workspace_ancestor(&fallback).unwrap_or(true),
-        "no temporary root outside a Git workspace"
+        !has_git_workspace_ancestor(&standard).unwrap_or(true),
+        "the temporary root {} is inside a Git workspace or unreadable; point TMPDIR at a \
+         directory outside any repository",
+        standard.display()
     );
-    fs::canonicalize(fallback).expect("canonical fallback temporary root")
+    fs::canonicalize(&standard).expect("canonical temporary root")
 }
 
 fn canonical_existing_dir(path: &Path, uid: u32) -> Result<PathBuf, Error> {
@@ -630,7 +626,7 @@ mod tests {
     fn error_display_and_recovery_do_not_leak_unsafe_paths() {
         let error = Error::UnsafeTarget;
         let rendered = error.to_string();
-        assert!(!rendered.contains("/tmp"));
-        assert!(!error.recovery_hint().contains("/tmp"));
+        assert!(!rendered.contains("/work"));
+        assert!(!error.recovery_hint().contains("/work"));
     }
 }

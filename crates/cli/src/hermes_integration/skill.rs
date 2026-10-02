@@ -36,7 +36,7 @@ mod tests {
 
     #[test]
     fn embedded_skill_frontmatter_and_tool_assets_have_exact_parity() {
-        let assets = crate::hermes_integration::assets::render(Path::new("/tmp/policy.json"))
+        let assets = crate::hermes_integration::assets::render(Path::new("/work/policy.json"))
             .expect("render embedded plugin assets");
         let skill = asset_text(&assets, "skills/pohunek/SKILL.md");
         let manifest = asset_text(&assets, "plugin.yaml");

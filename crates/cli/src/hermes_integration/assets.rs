@@ -260,7 +260,7 @@ mod tests {
 
     #[test]
     fn renderer_replaces_exactly_one_policy_token_and_owns_every_asset() {
-        let policy_path = Path::new("/tmp/policy\\\"quoted-á.json");
+        let policy_path = Path::new("/work/policy\\\"quoted-á.json");
         let assets = render(policy_path).expect("rendered assets");
         let init = assets
             .iter()
@@ -272,8 +272,8 @@ mod tests {
             .expect("policy literal");
         assert!(init.contains(&format!("POLICY_PATH = {literal}")));
         let ownership = ownership(
-            Path::new("/tmp/hermes"),
-            Path::new("/tmp/policy.json"),
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
             &assets,
         )
         .expect("ownership");
@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn rendered_init_is_valid_python_for_escaped_absolute_paths() {
         let env = TestEnv::new().expect("hermetic test environment");
-        let assets = render(Path::new("/tmp/policy\\\"quoted-á.json")).expect("rendered assets");
+        let assets = render(Path::new("/work/policy\\\"quoted-á.json")).expect("rendered assets");
         let init = assets
             .iter()
             .find(|asset| asset.path() == "__init__.py")
@@ -373,10 +373,10 @@ mod tests {
 
     #[test]
     fn marker_rejects_unknown_missing_duplicate_and_malformed_checksums() {
-        let assets = render(Path::new("/tmp/policy.json")).expect("rendered assets");
+        let assets = render(Path::new("/work/policy.json")).expect("rendered assets");
         let ownership = ownership(
-            Path::new("/tmp/hermes"),
-            Path::new("/tmp/policy.json"),
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
             &assets,
         )
         .expect("ownership");
@@ -386,8 +386,8 @@ mod tests {
             document.replacen("plugin.yaml", "./plugin.yaml", 1),
             document.replacen("plugin.yaml", "../plugin.yaml", 1),
             document.replacen("plugin.yaml", "/plugin.yaml", 1),
-            document.replacen("\"hermes_home\": \"/tmp/hermes\"", "\"hermes_home\": \"relative\"", 1),
-            document.replacen("\"policy_path\": \"/tmp/policy.json\"", "\"policy_path\": \"relative\"", 1),
+            document.replacen("\"hermes_home\": \"/work/hermes\"", "\"hermes_home\": \"relative\"", 1),
+            document.replacen("\"policy_path\": \"/work/policy.json\"", "\"policy_path\": \"relative\"", 1),
             document.replacen(&ownership.assets["plugin.yaml"], "not-a-checksum", 1),
             document.replacen("\"assets\": {", "\"assets\": {\n    \"plugin.yaml\": \"0000000000000000000000000000000000000000000000000000000000000000\",", 1),
         ];
@@ -399,10 +399,10 @@ mod tests {
     #[test]
     fn marker_accepts_absolute_trailing_slash_target_metadata() {
         for (hermes_home, policy_path) in [
-            ("/tmp/hermes/", "/tmp/config/policy.json"),
+            ("/work/hermes/", "/work/config/policy.json"),
             (
-                "/tmp/pohunek-hermes-lifecycle-x/pohunek/hermes/",
-                "/tmp/pohunek-hermes-lifecycle-x/config/policy.json",
+                "/work/pohunek-hermes-lifecycle-x/pohunek/hermes/",
+                "/work/pohunek-hermes-lifecycle-x/config/policy.json",
             ),
         ] {
             let assets = render(Path::new(policy_path)).expect("rendered assets");
@@ -415,8 +415,8 @@ mod tests {
 
     #[test]
     fn embedded_skill_checksum_is_deterministic_and_owned_as_exact_bytes() {
-        let first = render(Path::new("/tmp/policy.json")).expect("render first assets");
-        let second = render(Path::new("/tmp/policy.json")).expect("render second assets");
+        let first = render(Path::new("/work/policy.json")).expect("render first assets");
+        let second = render(Path::new("/work/policy.json")).expect("render second assets");
         let first_skill = first
             .iter()
             .find(|asset| asset.path() == SKILL_PATH)
@@ -430,8 +430,8 @@ mod tests {
         assert_eq!(first_skill.checksum(), second_skill.checksum());
 
         let ownership = ownership(
-            Path::new("/tmp/hermes"),
-            Path::new("/tmp/policy.json"),
+            Path::new("/work/hermes"),
+            Path::new("/work/policy.json"),
             &first,
         )
         .expect("ownership");

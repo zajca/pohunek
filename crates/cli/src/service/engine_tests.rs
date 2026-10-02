@@ -449,7 +449,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
         capabilities: SessionCapabilities::default(),
         agent: "shell".to_owned(),
         agent_base: AgentKind::Shell,
-        cwd: PathBuf::from("/tmp"),
+        cwd: PathBuf::from("/work"),
         cwd_source: None,
         pid: 1,
         cols: 80,
