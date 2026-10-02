@@ -819,7 +819,11 @@ where
         let shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             serve_remote_with_retry(
-                |current_addr| bind_remote_server(state.clone(), configured.clone(), current_addr),
+                |current_addr| {
+                    bind_remote_server(state.clone(), configured.clone(), current_addr, |addr| {
+                        tokio::net::TcpListener::bind(addr)
+                    })
+                },
                 shutdown,
                 REMOTE_BIND_INITIAL_RETRY_INTERVAL,
                 REMOTE_LISTENER_RECONCILE_INTERVAL,
@@ -886,12 +890,18 @@ where
 /// Queries the overlay for its explicit listener address and binds a
 /// [`RemoteServer`] on that overlay's configured port. Missing CLI disables
 /// that listener; unavailable state, a missing self address, and bind failures
-/// are retried by the caller.
-async fn bind_remote_server(
+/// are retried by the caller. `open` supplies the listening socket for the
+/// validated address; production passes `TcpListener::bind`.
+async fn bind_remote_server<O, Fut>(
     state: DaemonState,
     configured: ConfiguredTransport,
     current_addr: Option<std::net::SocketAddr>,
-) -> RemoteBind {
+    open: O,
+) -> RemoteBind
+where
+    O: FnOnce(std::net::SocketAddr) -> Fut,
+    Fut: Future<Output = std::io::Result<tokio::net::TcpListener>>,
+{
     let overlay_id = configured.id().clone();
     let port = configured.port();
     let transport = Arc::clone(configured.transport());
@@ -911,7 +921,7 @@ async fn bind_remote_server(
         return RemoteBind::Unchanged;
     }
 
-    match RemoteServer::bind(addr, state, transport.as_ref()).await {
+    match RemoteServer::bind_with(addr, state, transport.as_ref(), open).await {
         Ok(remote) => {
             info!(overlay = %overlay_id, addr = %remote.local_addr(), "serving control protocol over overlay");
             RemoteBind::Bound(remote)
@@ -971,9 +981,10 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, RwLock};
+    use std::sync::{Arc, Mutex, RwLock};
     use std::time::Duration;
 
     use overlay::{
@@ -1170,6 +1181,37 @@ mod tests {
         }
     }
 
+    /// Bind attempts made to find one port that is free on both loopback addresses.
+    ///
+    /// A port taken on the second address by an unrelated socket is the only
+    /// failure; a fresh ephemeral port on the first address is independent, so a
+    /// handful of attempts makes exhaustion practically impossible.
+    const RESERVE_ATTEMPTS: usize = 64;
+
+    /// Bind one port on both addresses and keep the listeners open.
+    ///
+    /// The returned listeners stay bound until the supervisor takes them, so no
+    /// other process can claim the port in between.
+    async fn reserve_port_on_both(
+        first_ip: std::net::IpAddr,
+        second_ip: std::net::IpAddr,
+    ) -> (u16, HashMap<std::net::IpAddr, TcpListener>) {
+        for _ in 0..RESERVE_ATTEMPTS {
+            let first = TcpListener::bind((first_ip, 0))
+                .await
+                .expect("first reservation");
+            let port = first
+                .local_addr()
+                .expect("first reservation address")
+                .port();
+            if let Ok(second) = TcpListener::bind((second_ip, port)).await {
+                let reserved = HashMap::from([(first_ip, first), (second_ip, second)]);
+                return (port, reserved);
+            }
+        }
+        panic!("no port free on both loopback addresses after {RESERVE_ATTEMPTS} attempts");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn remote_supervisor_rebinds_when_listener_address_changes() {
         /// A loopback address distinct from `127.0.0.1`. Linux routes all of
@@ -1183,10 +1225,8 @@ mod tests {
         let (_state_root, governance) = governance_service().await;
         let first_ip = "127.0.0.1".parse().expect("first IP");
         let second_ip = SECOND_LOOPBACK.parse().expect("second IP");
-        // hermetic-allowed: #408 bind_remote_server binds the configured port itself, so the probe port must be released first; needs a product seam
-        let probe = TcpListener::bind((first_ip, 0)).await.expect("port probe");
-        let port = probe.local_addr().expect("probe address").port();
-        drop(probe);
+        let (port, reserved) = reserve_port_on_both(first_ip, second_ip).await;
+        let reserved = Arc::new(Mutex::new(reserved));
         let address = Arc::new(RwLock::new(first_ip));
         let transport = Arc::new(MutableListenerTransport {
             id: OverlayId::new("mutable").expect("overlay id"),
@@ -1203,7 +1243,23 @@ mod tests {
         let supervisor_shutdown = shutdown.clone();
         let reconcile_interval = Duration::from_secs(1);
         let supervisor = tokio::spawn(serve_remote_with_retry(
-            move |current_addr| bind_remote_server(state.clone(), configured.clone(), current_addr),
+            move |current_addr| {
+                let reserved = Arc::clone(&reserved);
+                bind_remote_server(
+                    state.clone(),
+                    configured.clone(),
+                    current_addr,
+                    move |addr| async move {
+                        reserved
+                            .lock()
+                            .expect("reserved listener lock")
+                            .remove(&addr.ip())
+                            .ok_or_else(|| {
+                                std::io::Error::other("no reserved listener for address")
+                            })
+                    },
+                )
+            },
             supervisor_shutdown,
             Duration::from_secs(1),
             reconcile_interval,

@@ -316,6 +316,32 @@ impl RemoteServer {
         state: DaemonState,
         transport: &dyn OverlayTransport,
     ) -> Result<Self, DaemonError> {
+        Self::bind_with(addr, state, transport, TcpListener::bind).await
+    }
+
+    /// Bind a TCP control listener at `addr` using a caller-supplied socket opener.
+    ///
+    /// Runs the same fail-closed overlay validation as [`bind`](Self::bind)
+    /// before `open` is called, so the opener only ever sees validated
+    /// addresses. `open` supplies the listening socket for that address, which
+    /// lets a caller that already holds a bound socket hand it over instead of
+    /// releasing and re-binding the port.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::OverlayBind`] when the address is not a valid
+    /// member of the overlay's range, or [`DaemonError::Socket`] when `open`
+    /// fails or the listener's local address cannot be read.
+    pub async fn bind_with<F, Fut>(
+        addr: SocketAddr,
+        state: DaemonState,
+        transport: &dyn OverlayTransport,
+        open: F,
+    ) -> Result<Self, DaemonError>
+    where
+        F: FnOnce(SocketAddr) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<TcpListener>>,
+    {
         if let Err(err) = transport.validate_bind_addr(addr.ip()) {
             return Err(DaemonError::OverlayBind {
                 addr: addr.ip(),
@@ -323,12 +349,10 @@ impl RemoteServer {
             });
         }
 
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|source| DaemonError::Socket {
-                path: PathBuf::from(addr.to_string()),
-                source,
-            })?;
+        let listener = open(addr).await.map_err(|source| DaemonError::Socket {
+            path: PathBuf::from(addr.to_string()),
+            source,
+        })?;
         let local_addr = listener
             .local_addr()
             .map_err(|source| DaemonError::Socket {
