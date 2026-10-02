@@ -18,6 +18,7 @@
 #![deny(unsafe_code)]
 
 pub mod error;
+mod git;
 pub mod governance;
 pub mod host_state;
 pub mod lock;
