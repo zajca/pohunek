@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 use super::commit::{DESTINATION_COLLISION_CODE, RECOVERY_REQUIRED_CODE};
 use super::removal_tests::RaceHook;
 use super::tests::{
-    capture_worker_hook, explicit_status, read_json, run_state_asset_at, scoped_dir, tree_snapshot,
-    with_config_dirs,
+    capture_worker_hook, explicit_status, inherited_path, read_json, run_state_asset_at,
+    scoped_dir, tree_snapshot, with_config_dirs, with_config_dirs_and,
 };
 use super::{
     hook_command, install_claude, install_claude_gated, install_codex, install_codex_gated,
@@ -325,7 +325,7 @@ fn a_directory_at_a_managed_hook_path_is_preserved_and_reported_untrusted() {
 fn a_fifo_at_a_managed_hook_path_is_rejected_without_blocking_or_mutation() {
     let dir = scoped_dir("fifo-at-hook");
     let hook = dir.join(STATE_HOOK_INSTALL_NAME);
-    let output = std::process::Command::new("mkfifo")
+    let output = pohunek_test_support::process_env::command("mkfifo")
         .arg(&hook)
         .output()
         .expect("run mkfifo");
@@ -739,6 +739,7 @@ fn hooks_reach_a_worker_socket_resolved_at_the_darwin_staged_limit() {
         .expect("worker socket fits the staged limit")
         .expect("valid worker session id");
     fs::create_dir_all(socket.parent().expect("worker dir")).expect("create worker dir");
+    let path = inherited_path();
     let capture = capture_worker_hook(
         &socket,
         b"{\"ok\":true,\"launch_identity_accepted\":true}\n",
@@ -748,7 +749,7 @@ fn hooks_reach_a_worker_socket_resolved_at_the_darwin_staged_limit() {
         .arg(super::tests::state_asset("claude"))
         .arg("session")
         .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("PATH", path)
         .env(super::ENV_FLAG, "1")
         .env("POHUNEK_WORKER_SOCKET_PATH", &socket)
         .env("POHUNEK_NATIVE_REFERENCE_KIND", "id")
@@ -843,13 +844,13 @@ fn provider_secrets_never_reach_install_status_or_error_output() {
     .expect("write Codex config");
 
     let mut outputs = Vec::new();
-    let (installed, statuses) = with_config_dirs(&claude, &codex, || {
-        std::env::set_var("ANTHROPIC_API_KEY", SENTINELS[2]);
-        std::env::set_var("OPENAI_API_KEY", SENTINELS[2]);
+    let provider_keys = [
+        ("ANTHROPIC_API_KEY", SENTINELS[2]),
+        ("OPENAI_API_KEY", SENTINELS[2]),
+    ];
+    let (installed, statuses) = with_config_dirs_and(&claude, &codex, &provider_keys, || {
         let installed = super::install(None);
         let statuses = super::status(IntegrationStatusParams { agent: None });
-        std::env::remove_var("ANTHROPIC_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
         (installed, statuses)
     });
     outputs.push(format!("{:?}", installed.expect("install")));

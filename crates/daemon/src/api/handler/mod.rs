@@ -390,6 +390,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use pohunek_test_support::process_env::ProcessEnv;
     use protocol::{
         method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult,
         DaemonDoctorResult, DetectionRegionKind, ForkCwdMode, ProtocolError, Request,
@@ -590,7 +591,7 @@ mod tests {
     #[tokio::test]
     async fn session_set_metadata_dispatch_updates_session() {
         let sessions = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
             ..SessionRegistryConfig::default()
         });
         let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
@@ -648,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn session_fork_dispatch_returns_canonical_error_without_child_session() {
         let sessions = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
             ..SessionRegistryConfig::default()
         });
         let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
@@ -697,7 +698,7 @@ mod tests {
     #[tokio::test]
     async fn session_detection_dispatch_returns_active_manifest_previews() {
         let sessions = SessionRegistry::new(SessionRegistryConfig {
-            shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
             ..SessionRegistryConfig::default()
         });
         let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
@@ -1174,55 +1175,35 @@ mod tests {
         serde_json::from_value(ok).expect("result deserializes")
     }
 
+    /// A shell session body that stays alive without a `PATH` lookup, so a test
+    /// that overrides `PATH` cannot make the session exit early.
+    const SLEEP_SESSION_SCRIPT: &str = "exec /bin/sleep 30";
+
+    /// Points every base directory the handlers resolve at a fresh temp root and
+    /// holds the process-environment lock until dropped.
     struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved: Vec<(&'static str, Option<String>)>,
-        /// Removed after the saved variables are restored.
+        /// Dropped first: restores the variables and releases the lock before
+        /// the root below is removed.
+        _env: ProcessEnv,
         _root: tempfile::TempDir,
     }
 
     impl EnvGuard {
         fn set_all(tag: &str) -> Self {
-            let lock = crate::test_support::XDG_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let vars = [
-                "XDG_RUNTIME_DIR",
-                "XDG_STATE_HOME",
-                "XDG_DATA_HOME",
-                "XDG_CONFIG_HOME",
-                "XDG_CACHE_HOME",
-                "HOME",
-            ];
-            let saved = vars
-                .iter()
-                .map(|&key| (key, std::env::var(key).ok()))
-                .collect::<Vec<_>>();
+            let mut env = ProcessEnv::lock();
             // Short enough for the daemon socket below it on macOS.
             let root_dir = pohunek_test_support::tempdir_with_prefix(&format!("ph-{tag}-"))
                 .expect("create isolated XDG root");
             let root = root_dir.path();
-            std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
-            std::env::set_var("XDG_STATE_HOME", root.join("state"));
-            std::env::set_var("XDG_DATA_HOME", root.join("data"));
-            std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
-            std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
-            std::env::set_var("HOME", root.join("home"));
+            env.set("XDG_RUNTIME_DIR", root.join("runtime"))
+                .set("XDG_STATE_HOME", root.join("state"))
+                .set("XDG_DATA_HOME", root.join("data"))
+                .set("XDG_CONFIG_HOME", root.join("config"))
+                .set("XDG_CACHE_HOME", root.join("cache"))
+                .set("HOME", root.join("home"));
             Self {
-                _lock: lock,
-                saved,
+                _env: env,
                 _root: root_dir,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.saved {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
             }
         }
     }

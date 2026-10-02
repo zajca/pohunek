@@ -5247,7 +5247,7 @@ while os.getppid() == parent:
             )
             .await
         );
-        assert!(std::process::Command::new("kill")
+        assert!(pohunek_test_support::process_env::command("kill")
             .args(["-KILL", &released_pid.to_string()])
             .status()
             .expect("kill released child")
@@ -7820,7 +7820,7 @@ while os.getppid() == parent:
 
         /// Identity of a worker process that has exited and been reaped.
         fn dead_worker() -> (u32, u64) {
-            let mut child = std::process::Command::new("true")
+            let mut child = pohunek_test_support::process_env::command("true")
                 .spawn()
                 .expect("spawn short-lived worker stand-in");
             let pid = child.id();
@@ -7888,7 +7888,7 @@ while os.getppid() == parent:
 
         impl Drop for Marked {
             fn drop(&mut self) {
-                let _ = std::process::Command::new("kill")
+                let _ = pohunek_test_support::process_env::command("kill")
                     .args(["-KILL", &self.0.to_string()])
                     .status();
             }

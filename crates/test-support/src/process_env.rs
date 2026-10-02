@@ -35,6 +35,10 @@
 //!   taking it again on the same thread deadlocks. Make every change through
 //!   one [`ProcessEnv`] and use [`ProcessEnv::set`] and [`ProcessEnv::remove`]
 //!   repeatedly on it.
+//! - **Spawn by absolute path.** `Command::new("git")` searches the *parent's*
+//!   `PATH` when it spawns, which is a read of the process environment. Build
+//!   such a command with [`command`], which resolves the program under the lock
+//!   and hands back a command holding the absolute path.
 //! - **Children are immune.** A process started through
 //!   [`crate::env::TestEnv::command`] or [`crate::env::TestEnv::tokio_command`]
 //!   gets an explicit, scrubbed environment and ignores the changes made here,
@@ -70,6 +74,9 @@
 // Rust guideline compliant 2026-10-02
 
 use std::ffi::{OsStr, OsString};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// The one lock of this test binary's process environment.
@@ -148,6 +155,42 @@ impl Drop for ProcessEnv {
             }
         }
     }
+}
+
+/// Builds a [`Command`] for `program`, resolved against the current `PATH`
+/// while holding the environment lock.
+///
+/// The returned command carries an absolute path, so spawning it reads no
+/// environment variable and cannot observe a `PATH` another test has
+/// overridden. A `program` that is not a bare name, or that is not found, is
+/// passed through unchanged and fails or resolves at spawn like
+/// [`Command::new`].
+///
+/// Do not call it while holding a [`ProcessEnv`] on the same thread; the lock
+/// is not reentrant.
+pub fn command(program: &str) -> Command {
+    let path = {
+        let _env = ProcessEnv::lock();
+        std::env::var_os("PATH")
+    };
+    let resolved = path.and_then(|path| resolve_in(program, &path));
+    Command::new(resolved.unwrap_or_else(|| PathBuf::from(program)))
+}
+
+/// The first executable regular file named `program` in an absolute entry of
+/// `path`, or `None` for an empty name, a name containing `/`, or no match.
+fn resolve_in(program: &str, path: &OsStr) -> Option<PathBuf> {
+    if program.is_empty() || program.contains('/') {
+        return None;
+    }
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(program))
+        .find(|candidate| {
+            candidate
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
 }
 
 #[cfg(test)]
@@ -263,5 +306,48 @@ mod tests {
             "the lock was granted before the holder dropped"
         );
         assert_eq!(seen, None, "the holder's value leaked past its drop");
+    }
+
+    #[test]
+    fn resolve_in_takes_the_first_executable_in_an_absolute_entry() {
+        let first = crate::tempdir().expect("first dir");
+        let second = crate::tempdir().expect("second dir");
+        crate::fs::write_file(first.path().join("tool"), "not executable").expect("plain file");
+        crate::fs::write_executable(second.path().join("tool"), "#!/bin/sh\n").expect("tool");
+        let path = std::env::join_paths([first.path(), second.path()]).expect("join");
+        assert_eq!(
+            super::resolve_in("tool", &path),
+            Some(second.path().join("tool"))
+        );
+    }
+
+    #[test]
+    fn resolve_in_skips_relative_entries_and_refuses_paths_and_empty_names() {
+        let dir = crate::tempdir().expect("fixture dir");
+        crate::fs::write_executable(dir.path().join("tool"), "#!/bin/sh\n").expect("tool");
+        let path = std::env::join_paths([
+            std::path::PathBuf::from("relative"),
+            dir.path().to_path_buf(),
+        ])
+        .expect("join");
+        assert_eq!(
+            super::resolve_in("tool", &path),
+            Some(dir.path().join("tool"))
+        );
+        assert_eq!(super::resolve_in("sub/tool", &path), None);
+        assert_eq!(super::resolve_in("", &path), None);
+        assert_eq!(super::resolve_in("missing", &path), None);
+    }
+
+    #[test]
+    fn command_passes_an_unresolvable_name_through() {
+        let command = super::command("test-support-no-such-program");
+        assert_eq!(command.get_program(), "test-support-no-such-program");
+    }
+
+    #[test]
+    fn command_hands_back_an_absolute_program_for_a_name_on_path() {
+        let command = super::command("sh");
+        assert!(std::path::Path::new(command.get_program()).is_absolute());
     }
 }

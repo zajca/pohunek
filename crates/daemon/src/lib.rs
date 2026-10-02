@@ -63,8 +63,6 @@ pub(crate) mod test_support {
         OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
     };
 
-    pub(crate) static XDG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A per-test directory, removed with its contents when dropped.
     ///
     /// Dereferences to its path, so callers that take a `&PathBuf` or a path

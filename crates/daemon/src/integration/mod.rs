@@ -2975,6 +2975,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use pohunek_test_support::process_env::ProcessEnv;
     use protocol::method;
     use protocol::AgentKind;
     use serde_json::{json, Value};
@@ -3145,6 +3146,9 @@ mod tests {
             asset_path.display()
         );
 
+        // Read before the capture thread starts so waiting for the lock cannot
+        // eat into its deadline.
+        let path = inherited_path();
         let temp = scoped_dir(&format!("{agent}-state-run"));
         let socket_path = env_socket_path;
         let handle = listener_path.map(|listener_path| {
@@ -3191,7 +3195,7 @@ mod tests {
             .arg(&asset_path)
             .args(args)
             .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env("TMPDIR", &*temp)
             .env(ENV_FLAG, "1")
             .env(ENV_SOCKET_PATH, socket_path)
@@ -3242,7 +3246,7 @@ mod tests {
             .arg(state_asset(agent))
             .arg(action)
             .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", inherited_path())
             .env("TMPDIR", &*temp)
             .env(ENV_FLAG, "1")
             .env(
@@ -3353,6 +3357,7 @@ mod tests {
         expected_public_requests: usize,
     ) -> (Value, Vec<Value>) {
         let asset_path = state_asset(agent);
+        let path = inherited_path();
         let temp = scoped_dir(&format!("{agent}-worker-state-run"));
         let worker_socket = temp.join("worker.sock");
         let daemon_socket = temp.join("daemon.sock");
@@ -3398,7 +3403,7 @@ mod tests {
             .arg(asset_path)
             .arg(action)
             .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env("TMPDIR", &*temp)
             .env(ENV_FLAG, "1")
             .env("POHUNEK_WORKER_SOCKET_PATH", &worker_socket)
@@ -3494,6 +3499,7 @@ mod tests {
             asset_path.display()
         );
 
+        let path = inherited_path();
         let temp = scoped_dir(&format!("{agent}-notify-run"));
         let socket_path = temp.join("daemon.sock");
         let tmpdir = tmpdir_override.unwrap_or(&temp);
@@ -3542,7 +3548,7 @@ mod tests {
             .arg(&asset_path)
             .args(args)
             .env_clear()
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env("TMPDIR", tmpdir)
             .env(ENV_FLAG, "1")
             .env(ENV_SOCKET_PATH, &socket_path)
@@ -5668,69 +5674,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn status_env_restores_home_and_provider_specific_overrides_under_shared_lock() {
-        let _lock = crate::test_support::XDG_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_claude = std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV);
-        let original_codex = std::env::var_os(super::CODEX_HOME_ENV);
-        let original_home = std::env::var_os("HOME");
-        let root = scoped_dir("status-env-isolation");
-        let claude = root.join("claude");
-        let codex = root.join("codex");
-        let home = root.join("home");
-
-        let () = {
-            let _guard = ConfigDirGuard {
-                claude_dir: original_claude.clone(),
-                codex_dir: original_codex.clone(),
-                home: original_home.clone(),
-            };
-            set_optional_env(super::CLAUDE_CONFIG_DIR_ENV, Some(&claude));
-            set_optional_env(super::CODEX_HOME_ENV, Some(&codex));
-            set_optional_env("HOME", Some(&home));
-            assert_eq!(
-                std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
-                Some(claude.into())
-            );
-            assert_eq!(std::env::var_os(super::CODEX_HOME_ENV), Some(codex.into()));
-            assert_eq!(std::env::var_os("HOME"), Some(home.into()));
-        };
-
-        assert_eq!(
-            std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
-            original_claude
-        );
-        assert_eq!(std::env::var_os(super::CODEX_HOME_ENV), original_codex);
-        assert_eq!(std::env::var_os("HOME"), original_home);
-    }
-
-    /// Restores the pre-test environment when the scoped assertion finishes.
-    struct ConfigDirGuard {
-        claude_dir: Option<std::ffi::OsString>,
-        codex_dir: Option<std::ffi::OsString>,
-        home: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for ConfigDirGuard {
-        fn drop(&mut self) {
-            if let Some(value) = self.claude_dir.take() {
-                std::env::set_var(super::CLAUDE_CONFIG_DIR_ENV, value);
-            } else {
-                std::env::remove_var(super::CLAUDE_CONFIG_DIR_ENV);
-            }
-            if let Some(value) = self.codex_dir.take() {
-                std::env::set_var(super::CODEX_HOME_ENV, value);
-            } else {
-                std::env::remove_var(super::CODEX_HOME_ENV);
-            }
-            if let Some(value) = self.home.take() {
-                std::env::set_var("HOME", value);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
+    /// The `PATH` a hook child inherits, read under the process-environment lock
+    /// so a test that overrides `PATH` cannot leak its value into the child.
+    pub(super) fn inherited_path() -> String {
+        let _env = ProcessEnv::lock();
+        std::env::var("PATH").unwrap_or_default()
     }
 
     pub(super) fn with_config_dirs<T>(
@@ -5738,13 +5686,24 @@ mod tests {
         codex_dir: &Path,
         operation: impl FnOnce() -> T,
     ) -> T {
-        let home = std::env::var_os("HOME");
-        with_status_env(
-            Some(claude_dir),
-            Some(codex_dir),
-            home.as_deref().map(Path::new),
-            operation,
-        )
+        with_config_dirs_and(claude_dir, codex_dir, &[], operation)
+    }
+
+    /// Like [`with_config_dirs`], additionally setting `extra` variables for the
+    /// duration of `operation`.
+    pub(super) fn with_config_dirs_and<T>(
+        claude_dir: &Path,
+        codex_dir: &Path,
+        extra: &[(&str, &str)],
+        operation: impl FnOnce() -> T,
+    ) -> T {
+        let mut env = ProcessEnv::lock();
+        env.set(super::CLAUDE_CONFIG_DIR_ENV, claude_dir)
+            .set(super::CODEX_HOME_ENV, codex_dir);
+        for (key, value) in extra {
+            env.set(key, value);
+        }
+        operation()
     }
 
     pub(super) fn with_status_env<T>(
@@ -5753,25 +5712,18 @@ mod tests {
         home: Option<&Path>,
         operation: impl FnOnce() -> T,
     ) -> T {
-        let _lock = crate::test_support::XDG_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = ConfigDirGuard {
-            claude_dir: std::env::var_os(super::CLAUDE_CONFIG_DIR_ENV),
-            codex_dir: std::env::var_os(super::CODEX_HOME_ENV),
-            home: std::env::var_os("HOME"),
-        };
-        set_optional_env(super::CLAUDE_CONFIG_DIR_ENV, claude_dir);
-        set_optional_env(super::CODEX_HOME_ENV, codex_dir);
-        set_optional_env("HOME", home);
+        let mut env = ProcessEnv::lock();
+        set_optional_env(&mut env, super::CLAUDE_CONFIG_DIR_ENV, claude_dir);
+        set_optional_env(&mut env, super::CODEX_HOME_ENV, codex_dir);
+        set_optional_env(&mut env, "HOME", home);
         operation()
     }
 
-    fn set_optional_env(key: &str, value: Option<&Path>) {
+    fn set_optional_env(env: &mut ProcessEnv, key: &str, value: Option<&Path>) {
         match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
+            Some(value) => env.set(key, value),
+            None => env.remove(key),
+        };
     }
 
     pub(super) fn explicit_status(
