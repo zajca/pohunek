@@ -16,7 +16,7 @@ protocol. One `@pohunek/backend` origin serves the Svelte SPA, reports hosts at
 `GET /api/hosts`, and exposes a transparent control or attach WebSocket per
 daemon. The backend is not authoritative: each daemon still owns its logical
 sessions, events, and notifications, while per-session workers own live PTYs.
-The CLI and native GUI keep working when the backend is down. This is a
+The CLI keeps working when the backend is down. This is a
 mesh-local owner tool, not the accepted public team relay.
 
 The backend remains a transparent owner transport for the additive

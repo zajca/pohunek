@@ -66,11 +66,11 @@ semantics, safe persistence — config in `.github/agent-workflow.json`).
 `docs/knowledge/` is the hand-authored source for the Universal Pohunek
 Assistant. Per AGENTS.md, treat it as part of the change, never a follow-up:
 whenever you touch something it describes — a CLI command/flag, a protocol
-method/event, GUI behavior, an operating-model concept, a safety rule, the
+method/event, an operating-model concept, a safety rule, the
 `docs/public-api.md` surface, or a path in
 `docs/knowledge/assistant/source-map.md` — update the matching knowledge file in
 the *same* change and re-run `cargo xtask docs check`. For wire-protocol work
-this is one more ripple target alongside `client`/`daemon`/`cli`/`gui-core`: a
+this is one more ripple target alongside `client`/`daemon`/`cli`: a
 new method/event is not done until the bundle and `docs/public-api.md` reflect
 it. If unsure whether a change is assistant-visible, check whether any file under
 `docs/knowledge/` mentions the surface you changed.
@@ -85,12 +85,12 @@ parallel exploration. Good fits here:
   errors in the daemon/state machines) + `performance-reviewer`, synthesized by
   `product-engineer`.
 - **Protocol changes:** spawn parallel implementers per affected crate
-  (`protocol` → `client`/`daemon`/`cli`/`gui-core`), coordinated by `tech-lead`,
+  (`protocol` → `client`/`daemon`/`cli`), coordinated by `tech-lead`,
   because one wire change ripples across crates — and out into
   `docs/public-api.md` and the `docs/knowledge/` bundle (see "Keep the assistant
   knowledge bundle current").
 - **State-machine bugs:** competing-hypothesis investigation across
-  `gui-core`/`daemon` session detection.
+  `client`/`daemon` session detection.
 
 By default, delegate milestone implementation and post-review fixes to parallel
 subagents or Codex — this is the standing mode of work here, not something to
@@ -104,7 +104,7 @@ this project's work (scope, decisions, evidence, handoffs — the
 `github-workflow` skill holds the rules). Local memory under
 `~/.claude/projects/-home-zajca-Code-me-zremoteng/memory/` (index:
 `MEMORY.md`) and SiYuan notes are **optional pointers only** — consult them
-for standing facts (pohunek is experimental with no back-compat; the GUI is
-the pinned native control-plane direction; the `ms-rust` skill must precede
+for standing facts (pohunek is experimental with no back-compat; the native
+GUI lives in `zajca/pohunek-work`; the `ms-rust` skill must precede
 Rust edits), but they are not a mandatory second writing location and never a
 competing project authority.

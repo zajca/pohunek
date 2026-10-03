@@ -27,12 +27,11 @@ Because the assistant reads knowledge from files, the launch path must verify
 that the selected profile can read the materialized bundle and snapshot before
 starting the session.
 
-Profiles are not CLI-only. `host.inspect.runtimes` is the authoritative native
-GUI launch inventory, and the Start-session and Dispatch pickers list its
-launchable base runtimes and profiles. `supported_agents` remains a name-only
-compatibility summary and is not sufficient for launch decisions. If runtime
-inventory is unavailable, the GUI fails closed instead of inventing a fallback
-set (see [GUI: Session Launch](../guides/gui.md#session-launch)).
+Profiles are not CLI-only. `host.inspect.runtimes` is the authoritative launch
+inventory for any client, and launch pickers list its launchable base runtimes
+and profiles. `supported_agents` remains a name-only compatibility summary and
+is not sufficient for launch decisions. If runtime inventory is unavailable, a
+client fails closed instead of inventing a fallback set.
 
 `host.inspect.runtimes` is the availability and support decision point. Each
 entry has a user-facing `agent`; optional `agent_base` identifies its compiled

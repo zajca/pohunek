@@ -30,7 +30,7 @@ aggregator, or public `pohunek-relayd` implementation.
 Version 3 also ships host-local stable identity and safe governance inspection.
 It does not ship a relay connection, relay-local transport, enrollment or owner
 mutation RPC, team WebUI, share API, or public transfer API. Existing local,
-direct-overlay, native-GUI, and transparent owner-WebUI paths remain owner-only
+direct-overlay and transparent owner-WebUI paths remain owner-only
 and unchanged.
 
 ### Implemented relay foundation outside protocol v3
@@ -232,7 +232,7 @@ Unsafe symlinks, foreign entries, wrong types or modes, and encoded socket paths
 that exceed the native Unix-socket limit are errors and are never repaired,
 deleted, or truncated implicitly.
 
-The Rust daemon, CLI, GUI, workers, and hooks use this shared resolver, and the
+The Rust daemon, CLI, workers, and hooks use this shared resolver, and the
 TypeScript SDK (`@pohunek/sdk`, used by the Bun owner backend) implements the same contract: both are driven by the cases in
 `crates/paths/fixtures/runtime-paths.json`. The backend additionally accepts
 `POHUNEK_BACKEND_DAEMON_SOCKET`, validated by the same absolute, parent-component
@@ -492,8 +492,8 @@ canonical IDs; only `enrollment`, `owner`, `owner_revision`, and `quarantine`
 are conditionally nullable according to the lifecycle invariants below. Unknown
 or missing fields are not a valid result:
 
-- `host_id`: the daemon's stable opaque `HostId`. It is distinct from a CLI,
-  GUI, or overlay route selector and from every other typed identity.
+- `host_id`: the daemon's stable opaque `HostId`. It is distinct from a CLI
+  or overlay route selector and from every other typed identity.
 - `enrollment`: `null` for a never-enrolled host, otherwise the one local
   enrollment's relay ID, status, and canonical non-zero enrollment revision.
 - `owner`: `null` for a never-enrolled host, otherwise exactly one tagged
@@ -596,8 +596,8 @@ Important fields:
 - `metadata`: owner-controlled strings; must not contain secrets. The daemon
   treats every key opaquely; clients own the convention. One such
   client-defined convention is the `link.*` key family (`link.provider`,
-  `link.kind`, `link.id`, `link.url`, `link.branch`) written by the GUI and
-  the launch scripts to tie a session to a work item — no protocol surface
+  `link.kind`, `link.id`, `link.url`, `link.branch`) written by external clients
+  (such as the native GUI) and the launch scripts to tie a session to a work item — no protocol surface
   is dedicated to it.
 - `created_at`, `updated_at`: RFC3339 timestamps.
 - `exit_code`: optional process exit code.
@@ -1542,13 +1542,6 @@ emits only the public `HostGovernanceStatus` result through the normal CLI
 envelope. The command has no mutation sibling; it does not enroll, transfer an
 owner, unenroll, or expose approval or transfer secrets.
 
-The native GUI requests this same safe snapshot after a daemon-host snapshot is
-loaded. Its headless state keeps loading, error, never-enrolled, enrolled, and
-quarantined presentation distinct and ignores stale route responses. The Iced
-shell only renders that state; it does not own governance I/O or offer a
-governance mutation control. Its daemon route selector remains distinct from
-the stable protocol `HostId` displayed in the result.
-
 `session new` accepts either `--input <text>` or bounded UTF-8 stdin through
 `--input-stdin` / `--stdin`, never both. `session input` accepts either
 positional text or `--stdin`, never both. Stdin payloads do not appear in argv,
@@ -1748,6 +1741,28 @@ Rust SDK helpers:
 These helpers open the raw connection and write the prelude before returning a
 `RawStream`.
 
+## External clients
+
+The native desktop GUI lives in
+[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work) and is an external
+client of this protocol and the SDKs; nothing in it is private. Three methods
+are public obligations that the clients in this repository do not call, so only
+core tests keep them honest:
+
+- `host.discover`: socket-level coverage in
+  `crates/daemon/tests/health_socket.rs`
+  (`public_bind_serves_host_discover_with_supplied_registry`) and the
+  version-mismatch contract test in `crates/daemon/tests/remote_tcp.rs`.
+- `subscribe`: socket-level coverage in `crates/daemon/tests/health_socket.rs`
+  (`subscribe_streams_session_created_event` and the notification and
+  agent-state subscribe tests) and the client subscription tests in
+  `crates/client/tests/subscription.rs`.
+- `worktree.remove`: socket-level coverage in
+  `crates/daemon/tests/health_socket.rs`
+  (`worktree_remove_over_the_socket_succeeds_and_fails_closed`): success after
+  stop, `worktree_in_use` for a live session, `worktree_not_owned` for the main
+  checkout, and `bad_request` for malformed params.
+
 ## Rust SDK Surface
 
 The `pohunek-client` crate is the supported Rust client surface. New Rust
@@ -1853,9 +1868,7 @@ Request APIs:
 - `Client::session_resume`, `session_resize`, and `session_set_metadata`: typed
   lifecycle helpers used by automation clients.
 - `Client::integration_status(IntegrationStatusParams)`: reads the complete
-  daemon-managed Codex/Claude install contract without mutation. `gui-core`
-  exposes matching `integration_status` and `integration_status_with_options`
-  host helpers.
+  daemon-managed Codex/Claude install contract without mutation.
 - `Client::request(&Request) -> serde_json::Value`: sends one request and returns
   the raw `ok` payload for low-level callers and framing tests.
 - `Client::subscribe(&Request) -> Subscription`: consumes the client connection

@@ -47,7 +47,7 @@ The following invariants span both domains:
 
 | Area | Status | Owner |
 |---|---|---|
-| Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, SDK, and GUI |
+| Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, and SDK |
 | Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
 | Shared Linux/macOS platform, secure path, and portable filesystem contracts with native Darwin CI | Shipped foundation; Linux backends are active, while complete macOS host/client support remains deferred | [#95](https://github.com/zajca/pohunek/issues/95)-[#96](https://github.com/zajca/pohunek/issues/96); remaining delivery [#97](https://github.com/zajca/pohunek/issues/97)-[#105](https://github.com/zajca/pohunek/issues/105) |
 | Local/direct-overlay transparent Bun browser backend | Shipped and retained owner-path client transport | Existing `web/backend`; team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
@@ -183,7 +183,7 @@ from hostile same-UID control or replacement of the complete XDG state root:
 that remains within the owner trust domain.
 
 This host-local foundation does not change session ownership. Local Unix,
-direct NetBird/WireGuard owner access, the native GUI, and the transparent owner
+direct NetBird/WireGuard owner access and the transparent owner
 WebUI remain available. Local unenrollment does not stop PTYs, revoke those
 owner paths, or create a relay-local mode.
 
@@ -593,7 +593,7 @@ Hooks have two separate roles:
   provider payloads on disk. Prompt text, results, transcript paths, and raw
   hook payloads never cross this boundary. Running children become `lost` when
   their PTY runtime terminates. This state is independent of the parent
-  session's coarse `activity` and survives daemon and GUI reconnects.
+  session's coarse `activity` and survives daemon and client reconnects.
 
 Live state remains detector-first: OSC, screen, PTY activity, and process state
 continue to drive normal activity transitions. Notification hooks still target
@@ -727,7 +727,7 @@ not a process-exit signal. A higher-sequence continuation identity reported by
 
 ## Overlay Registry and Discovery
 
-The daemon, SDK, CLI, GUI core, and web backend consume one configured overlay
+The daemon, SDK, CLI, and web backend consume one configured overlay
 registry. Each entry has a stable overlay ID, a transport implementation, and
 its own non-zero daemon port. Daemon listeners run concurrently for every
 entry; discovery aggregates providers concurrently while isolating a failed
@@ -756,10 +756,10 @@ addresses. Stable client identity is overlay-qualified, so equal names,
 addresses, or provider IDs cannot collide across overlays. Address-less peers
 remain candidates. The public `HostRecord` carries `overlay`, optional
 `peer_id`, optional IP-only `address`, and the effective per-overlay `port`.
-Provider discovery returns remote peers only; GUI, web, and CLI fan-out
+Provider discovery returns remote peers only; web, CLI, and other fan-out
 consumers add the explicit local Unix-socket target themselves.
 
-The GUI retains the overlay-qualified peer identity and discovered port, never
+A client retains the overlay-qualified peer identity and discovered port, never
 the discovered IP as reconnect state. Every control reconnect resolves that
 stable identity through current provider state. External attach receives the
 same selector with its explicit discovered port; the resulting SDK client keeps
@@ -1059,7 +1059,7 @@ terminal content. Useful signals:
 - PTY allocation, resize, stream errors, worker protocol versions, and
   controller reconnect latency.
 - NetBird discovery runs and candidate/capability results. The CLI can discover
-  locally without `pohunekd`; daemon discovery remains available for GUI/web RPC consumers.
+  locally without `pohunekd`; daemon discovery remains available for web and other RPC consumers.
 - Agent state transitions with their `source`.
 - Latency for CLI commands, attach, discovery, and remote connections.
 
@@ -1126,8 +1126,8 @@ Integration tests:
   interface; rely on NetBird policies; no `0.0.0.0`.
 - **Worktree cleanup conflicts.** Mitigation: explicit session ownership and
   recorded bindings; ownership checks before reuse/cleanup.
-- **Embedded terminal maturity.** Mitigation: GUI deferred; choose and verify the
-  desktop terminal component when Track D starts. The CLI attach path needs no GUI.
+- **Embedded terminal maturity.** Mitigation: the CLI attach path needs no embedded terminal; the native GUI
+  lives in `zajca/pohunek-work`.
 - **Agent CLIs change under us.** Mitigation: keep the agent boundary thin; rely
   on documented modes (hooks, native resume) and pin behavior with fixtures.
 
@@ -1142,6 +1142,6 @@ Integration tests:
 | Audit | Tamper-evident considered | Plain local event log today; durable relay audit and admission foundation implemented in [#85](https://github.com/zajca/pohunek/issues/85), with operational retention and load evidence in [#87](https://github.com/zajca/pohunek/issues/87) |
 | Agent state | Terminal heuristics | OSC title + screen-manifest + PTY activity for parent state; hooks capture recovery identity and durable Claude/Codex subagent lifecycle |
 | Providers | In-tree Linear/GitHub adapters | Deferred, shell-out (`gh`, Linear GraphQL/MCP) in the client surfaces, not the chassis |
-| GUI | libghostty client (MVP5) + spike (MVP0) | Native Rust desktop and mesh-local browser clients shipped; the HTTPS native relay credential CLI is implemented, while the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |
+| GUI | libghostty client (MVP5) + spike (MVP0) | Mesh-local browser client shipped (the native desktop client lives in `zajca/pohunek-work`); the HTTPS native relay credential CLI is implemented, while the full team client and UI remain [#86](https://github.com/zajca/pohunek/issues/86) |
 | Attach framing | "separate stream mode" (unspecified) | Separate connection per PTY (specified) |
 | Agents | Codex + Claude Code | Codex + Claude Code + local-terminal Hermes Agent 0.20.0 |

@@ -30,7 +30,7 @@ the separate legacy daemon-owned-PTY boundary only.
 
 For each host after that one-time transition:
 
-1. Inventory local and NetBird-reachable daemons, CLI/GUI/web clients, and
+1. Inventory local and NetBird-reachable daemons, CLI and web clients, and
    Hermes profiles that will operate sessions.
 2. Install the matching daemon archive so `pohunekd` and
    `pohunek-sessiond` are updated together. Restart/reconcile the daemon and

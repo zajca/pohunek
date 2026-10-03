@@ -26,12 +26,9 @@ Use the split setup commands when diagnosing or applying changes:
 1. `pohunek setup scripts` materializes launcher scripts into the data directory
    bin path.
 2. `pohunek setup config` writes default launcher configuration and prompt
-   templates (`issue.tmpl`, `pr.tmpl`, `review.tmpl`) without overwriting
-   existing files unless `--force` is used. `review.tmpl` is GUI-only
-   (Track D.6, see [GUI setup](gui.md#review)): the shell launcher scripts
-   render `issue.tmpl`/`pr.tmpl` themselves, but `pohunek-gui` reads and
-   renders `review.tmpl` directly to build a review-dispatch session's
-   prompt.
+   templates (`issue.tmpl`, `pr.tmpl`) without overwriting existing files
+   unless `--force` is used. The shell launcher scripts render
+   `issue.tmpl`/`pr.tmpl` themselves.
 3. `pohunek setup sway` writes the sway drop-in, or `pohunek setup sway --print`
    prints the snippet for manual review.
 
@@ -71,8 +68,8 @@ and use explicit native recovery only when supported. Set
 ## Work-item Links
 
 `pohunek-launch-issue` and `pohunek-launch-pr` render the action's prompt with
-`pohunek prompt render` (the same shared `crates/prompt` renderer the GUI
-uses), then build the session-link metadata with a sibling client-side
+`pohunek prompt render` (the shared `crates/prompt` renderer other
+clients use too), then build the session-link metadata with a sibling client-side
 subcommand, `pohunek prompt link --provider <linear_issue|github_pr>
 --item-id <id> --url <url>`, reading the same provider JSON from stdin. It
 derives `link.branch` from the provider JSON and prints the five canonical
@@ -84,5 +81,5 @@ subcommand talks to the daemon.
 key=value` flag, so the link is written atomically in the same `session.new`
 call that starts the agent — never as a separate post-launch step. Because
 both surfaces build the metadata from the one shared implementation, a link
-written by a launch script is byte-identical to one written by the GUI for the
-same work item; see [GUI setup](gui.md) for the GUI side of this convention.
+written by a launch script is byte-identical to one written by any other client
+using the same implementation for the same work item.

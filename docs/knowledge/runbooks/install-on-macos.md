@@ -2,7 +2,7 @@
 type: Runbook
 id: runbook/install-on-macos
 title: Install, upgrade, and remove Pohunek on macOS
-description: Install the daemon, GUI, and owner web backend on Apple Silicon from release archives, upgrade without losing sessions, roll back, uninstall, and handle Gatekeeper.
+description: Install the daemon and owner web backend on Apple Silicon from release archives, upgrade without losing sessions, roll back, uninstall, and handle Gatekeeper.
 source_kind: manual
 intents: [setup, update, debug, help]
 since: 0.31.6
@@ -24,7 +24,6 @@ Everything runs as the logged-in owner: no `sudo`, no root service.
 |---------|----------|--------------|
 | `pohunek-cli-<v>-aarch64-apple-darwin` | `pohunek`, completions, offline docs | copy the binary onto `PATH` |
 | `pohunek-daemon-<v>-aarch64-apple-darwin` | `pohunek`, `pohunekd`, `pohunek-sessiond`, `packaging/install-daemon.sh` | `packaging/install-daemon.sh` |
-| `pohunek-gui-<v>-aarch64-apple-darwin` | `Pohunek.app` | copy to `~/Applications` |
 | `pohunek-web-<v>-aarch64-apple-darwin` | owner web backend, SPA, `install.sh` | `./install.sh` |
 
 Every archive carries a `MANIFEST` (component, version, target, signing state,
@@ -41,10 +40,7 @@ shasum -a 256 -c pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz.sha256
 
 After extracting, `codesign --verify --strict <binary>` and
 `codesign -dvv <binary>` show the Developer ID Application authority, the hardened
-runtime flag, and the team identifier. For the app bundle,
-`spctl --assess --type execute --verbose=4 Pohunek.app` and
-`xcrun stapler validate Pohunek.app` confirm Gatekeeper acceptance and the
-stapled notarization ticket.
+runtime flag, and the team identifier.
 
 ## Install the daemon
 
@@ -93,13 +89,6 @@ Stop only the daemon agent with `launchctl bootout gui/$(id -u)/io.github.zajca.
 workers keep running, and `pohunek service status` shows them. Never boot out the
 whole `gui/$(id -u)` domain: that ends every worker.
 
-## GUI
-
-Copy `Pohunek.app` to `~/Applications` and open it from Finder. It finds the
-installed `pohunek` through `pohunek_bin` in `~/.config/pohunek/gui.toml`, the
-login-shell `PATH`, or `~/.local/bin`; install the daemon first. See the
-[GUI guide](../guides/gui.md).
-
 ## Owner web backend (optional)
 
 From the web archive, with the daemon installed:
@@ -122,8 +111,7 @@ Extract the new daemon archive and run its installer again. It runs
 `pohunek service upgrade`, which stages the new versioned directory, probes every
 binary, and then restarts only the daemon agent. Live workers keep their process,
 PTY, and child, and keep running from the version directory they started in; that
-directory stays installed until no worker references it. Update the web backend and
-GUI from their own archives. Components that talk to each other must cross a
+directory stays installed until no worker references it. Update the web backend from its own archive. Components that talk to each other must cross a
 protocol boundary together; see
 [update after release](update-after-release.md).
 
@@ -157,8 +145,7 @@ refuses while sessions are live and names them; end them yourself, or accept the
 destructive path explicitly with `pohunek service uninstall --stop-sessions`. The
 default keeps the durable host identity, governance keys, session history, and
 worktrees. `pohunek service uninstall --purge` additionally removes the session
-store, event logs, worker journals, and host identity: it is never implicit. Delete
-`Pohunek.app` yourself, and remove the web backend with `./install.sh --uninstall`.
+store, event logs, worker journals, and host identity: it is never implicit. Remove the web backend with `./install.sh --uninstall`.
 
 ## Logs
 
@@ -170,7 +157,7 @@ store, event logs, worker journals, and host identity: it is never implicit. Del
 
 ## Logout, reboot, sleep
 
-Locking the screen, closing a terminal, and quitting the GUI do not stop workers.
+Locking the screen and closing a terminal do not stop workers.
 Logging out ends the launchd login domain and every worker with it; after the next
 login the daemon agent starts again and marks each of those sessions `lost` with
 reason `runtime_lost`. A reboot does the same. Sessions with a native resume
