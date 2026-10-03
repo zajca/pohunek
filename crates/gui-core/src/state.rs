@@ -2999,8 +2999,7 @@ mod tests {
     use crate::link::action_prompt_provider;
     use crate::sdk::notification_seed_queries;
     use crate::{
-        render_attach_command, AttachTemplateValues, ConnectionOptions, HostSnapshot,
-        HostTransport, DEFAULT_BACKOFF_MAX,
+        render_attach_command, AttachTemplateValues, ConnectionOptions, HostSnapshot, HostTransport,
     };
 
     use super::*;
@@ -5254,7 +5253,7 @@ mod tests {
     fn reconnect_backoff_is_capped_at_thirty_seconds() {
         let backoff = Backoff::new(ConnectionOptions {
             backoff_initial: Duration::from_secs(45),
-            backoff_max: DEFAULT_BACKOFF_MAX.saturating_mul(4),
+            backoff_max: crate::connection::default_backoff_max().saturating_mul(4),
             ..ConnectionOptions::default()
         });
 

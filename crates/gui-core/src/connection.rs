@@ -16,7 +16,6 @@ use serde_json::Value;
 use crate::sdk::{call_client, load_host_snapshot_with_options};
 use crate::{
     AgentStateEvent, ConnectionOptions, CoreError, DomainEvent, HostConfig, HostEvent, HostId,
-    HostTransport, DEFAULT_BACKOFF_MAX,
 };
 
 /// Build a reconnecting stream of messages for one host's event subscription.
@@ -212,6 +211,11 @@ enum StreamState {
     },
 }
 
+/// Ceiling every host worker clamps its reconnect delay to.
+pub(crate) fn default_backoff_max() -> Duration {
+    ConnectionOptions::default().backoff_max
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Backoff {
     pub(crate) current: Duration,
@@ -220,7 +224,7 @@ pub(crate) struct Backoff {
 
 impl Backoff {
     pub(crate) fn new(options: ConnectionOptions) -> Self {
-        let max = options.backoff_max.min(DEFAULT_BACKOFF_MAX);
+        let max = options.backoff_max.min(default_backoff_max());
         Self {
             current: options.backoff_initial.min(max),
             max,
@@ -258,21 +262,7 @@ pub(crate) async fn connect_client(
     config: &HostConfig,
     options: ConnectionOptions,
 ) -> Result<Client, CoreError> {
-    let options = options.client();
-    match &config.transport {
-        HostTransport::Local { socket_path } => {
-            Ok(Client::connect_local_with_options(socket_path, options).await?)
-        }
-        HostTransport::Remote { host, socket_path } => {
-            Ok(Client::connect_with_options(host, socket_path, options).await?)
-        }
-        HostTransport::Tcp { addr, .. } => {
-            Ok(
-                Client::connect_trusted_tcp_addr_with_options(config.id.as_str(), *addr, options)
-                    .await?,
-            )
-        }
-    }
+    Ok(pohunek_assistant::connect_client(config, options).await?)
 }
 
 pub(crate) fn parse_event_message(host_id: &HostId, line: &str) -> Result<DomainEvent, CoreError> {

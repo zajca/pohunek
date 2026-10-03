@@ -1,9 +1,10 @@
-//! Shared assistant launch primitives.
+//! Client-side assistant launch orchestration.
 //!
-//! The module contains client-side assistant orchestration used by both the CLI
-//! and native GUI. The daemon still sees ordinary protocol requests.
+//! Agent selection, knowledge materialization, prompt composition and the
+//! `session.new` call shared by every pohunek client. The daemon only sees
+//! ordinary protocol requests.
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-10-03
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,9 @@ use protocol::{
 };
 use serde::Serialize;
 
-use crate::connection::connect_client;
 use crate::{
-    runtime_is_assistant_capable, runtime_is_launchable, ConnectionOptions, CoreError, HostConfig,
-    HostTransport,
+    connect_client, runtime_is_assistant_capable, runtime_is_launchable, AssistantError,
+    ConnectionOptions, HostConfig, HostTransport,
 };
 
 const SNAPSHOT_FILE: &str = "snapshot.json";
@@ -81,9 +81,9 @@ impl AssistantPaths {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::MissingEnv`] when the required XDG or `HOME`
+    /// Returns [`AssistantError::MissingEnv`] when the required XDG or `HOME`
     /// environment variables are absent.
-    pub fn resolve() -> Result<Self, CoreError> {
+    pub fn resolve() -> Result<Self, AssistantError> {
         let paths = pohunek_paths::BasePaths::resolve().map_err(path_error)?;
 
         Ok(Self {
@@ -232,14 +232,14 @@ pub fn select_agent(
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] when target validation, host inspection, snapshot
+/// Returns [`AssistantError`] when target validation, host inspection, snapshot
 /// materialization, read preflight, or prompt construction fails.
 pub async fn prepare_with_options(
     config: &HostConfig,
     paths: &AssistantPaths,
     params: LaunchParams,
     options: ConnectionOptions,
-) -> Result<PreparedLaunch, CoreError> {
+) -> Result<PreparedLaunch, AssistantError> {
     validate_target(config, &params)?;
     let mut client = connect_client(config, options).await?;
     let capabilities = fetch_capabilities(&mut client).await?;
@@ -315,12 +315,12 @@ pub async fn prepare_with_options(
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] when `session.new` fails.
+/// Returns [`AssistantError`] when `session.new` fails.
 pub async fn start_prepared_with_options(
     config: &HostConfig,
     prepared: PreparedLaunch,
     options: ConnectionOptions,
-) -> Result<LaunchResult, CoreError> {
+) -> Result<LaunchResult, AssistantError> {
     let mut client = connect_client(config, options).await?;
     let result = client
         .call::<method::SessionNew>(prepared.session_params)
@@ -344,13 +344,13 @@ pub async fn start_prepared_with_options(
 ///
 /// # Errors
 ///
-/// Returns [`CoreError`] when preparation or `session.new` fails.
+/// Returns [`AssistantError`] when preparation or `session.new` fails.
 pub async fn launch_with_options(
     config: &HostConfig,
     paths: &AssistantPaths,
     params: LaunchParams,
     options: ConnectionOptions,
-) -> Result<LaunchResult, CoreError> {
+) -> Result<LaunchResult, AssistantError> {
     let prepared = prepare_with_options(config, paths, params, options).await?;
     start_prepared_with_options(config, prepared, options).await
 }
@@ -382,16 +382,16 @@ fn explicit_agent_is_allowed(capabilities: &HostCapabilities, agent: &str) -> bo
     true
 }
 
-fn validate_target(config: &HostConfig, params: &LaunchParams) -> Result<(), CoreError> {
+fn validate_target(config: &HostConfig, params: &LaunchParams) -> Result<(), AssistantError> {
     if !is_remote(config) {
         return Ok(());
     }
     let host = host_label(config);
     if params.degraded {
-        return Err(CoreError::RemoteAssistantDegradedUnsupported { host });
+        return Err(AssistantError::RemoteAssistantDegradedUnsupported { host });
     }
     if params.project.is_none() && params.repo.is_none() {
-        return Err(CoreError::RemoteAssistantTargetRequired { host });
+        return Err(AssistantError::RemoteAssistantTargetRequired { host });
     }
     Ok(())
 }
@@ -408,7 +408,7 @@ fn host_label(config: &HostConfig) -> String {
     }
 }
 
-async fn fetch_capabilities(client: &mut Client) -> Result<HostCapabilities, CoreError> {
+async fn fetch_capabilities(client: &mut Client) -> Result<HostCapabilities, AssistantError> {
     Ok(client.call::<method::HostInspect>(()).await?)
 }
 
@@ -446,7 +446,7 @@ impl PreparedKnowledge {
 fn materialize_degraded(
     paths: &AssistantPaths,
     snapshot: &str,
-) -> Result<DegradedMaterializeResult, CoreError> {
+) -> Result<DegradedMaterializeResult, AssistantError> {
     let runtime_dir = assistant_runtime_dir(paths)?;
     std::fs::create_dir_all(&runtime_dir).map_err(|err| {
         ProtocolError::materialization_failed(&runtime_dir.display().to_string(), &err.to_string())
@@ -468,7 +468,7 @@ fn materialize_degraded(
 fn materialize_local(
     paths: &AssistantPaths,
     snapshot: &str,
-) -> Result<AssistantMaterializeResult, CoreError> {
+) -> Result<AssistantMaterializeResult, AssistantError> {
     let version_hash = materialized_version_hash();
     let concepts: Vec<protocol::ConceptMeta> = bundle_index()
         .map_err(|err| {
@@ -508,7 +508,7 @@ fn materialize_local(
 async fn materialize_remote(
     client: &mut Client,
     snapshot: &str,
-) -> Result<AssistantMaterializeResult, CoreError> {
+) -> Result<AssistantMaterializeResult, AssistantError> {
     let params = AssistantMaterializeParams {
         snapshot: snapshot.to_owned(),
     };
@@ -520,7 +520,7 @@ async fn materialize_remote(
     Ok(result)
 }
 
-fn assistant_runtime_dir(paths: &AssistantPaths) -> Result<PathBuf, CoreError> {
+fn assistant_runtime_dir(paths: &AssistantPaths) -> Result<PathBuf, AssistantError> {
     let version_hash = materialized_version_hash();
     let launch_id = assistant_launch_id(&version_hash);
     paths.assistant_runtime_dir(&launch_id).ok_or_else(|| {
@@ -528,7 +528,7 @@ fn assistant_runtime_dir(paths: &AssistantPaths) -> Result<PathBuf, CoreError> {
     })
 }
 
-fn assert_bundle_matches(result: &AssistantMaterializeResult) -> Result<(), CoreError> {
+fn assert_bundle_matches(result: &AssistantMaterializeResult) -> Result<(), AssistantError> {
     let expected_hash = bundle_content_hash();
     if result.version == BUNDLE_VERSION && result.content_hash == expected_hash {
         Ok(())
@@ -566,7 +566,7 @@ fn preflight_read_access(
     bundle_path: &str,
     snapshot_path: &str,
     remote: bool,
-) -> Result<(), CoreError> {
+) -> Result<(), AssistantError> {
     if remote {
         return Ok(());
     }
@@ -583,14 +583,14 @@ fn preflight_read_access(
     Ok(())
 }
 
-fn preflight_snapshot_readable(snapshot_path: &str) -> Result<(), CoreError> {
+fn preflight_snapshot_readable(snapshot_path: &str) -> Result<(), AssistantError> {
     check_readable(
         Path::new(snapshot_path),
         "degraded snapshot is not readable",
     )
 }
 
-fn check_readable(path: &Path, constraint: &str) -> Result<(), CoreError> {
+fn check_readable(path: &Path, constraint: &str) -> Result<(), AssistantError> {
     match std::fs::File::open(path) {
         Ok(_) => Ok(()),
         Err(err) => Err(ProtocolError::agent_cannot_read_bundle(
@@ -827,9 +827,9 @@ fn write_toc(prompt: &mut String, intent: Intent, concepts: &[ConceptMeta]) {
     }
 }
 
-fn path_error(err: pohunek_paths::PathError) -> CoreError {
+fn path_error(err: pohunek_paths::PathError) -> AssistantError {
     match err {
-        pohunek_paths::PathError::MissingEnv { var } => CoreError::MissingEnv { var },
-        source => CoreError::Paths { source },
+        pohunek_paths::PathError::MissingEnv { var } => AssistantError::MissingEnv { var },
+        source => AssistantError::Paths { source },
     }
 }

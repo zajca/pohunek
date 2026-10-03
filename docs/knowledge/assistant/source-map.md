@@ -72,7 +72,11 @@ Native GUI client:
 - `crates/gui/src/view/session.rs`
 - `crates/gui/src/view/hosts.rs`
 - `crates/gui/src/view/selectable_text.rs`
-- `crates/gui-core/src/assistant.rs`
+- `crates/assistant/src/lib.rs`
+- `crates/assistant/src/host.rs`
+- `crates/assistant/src/error.rs`
+- `crates/assistant/src/launch.rs`
+- `crates/assistant/tests/select_agent.rs`
 - `crates/gui-core/src/lib.rs`
 - `crates/gui-core/src/sdk.rs`
 - `crates/gui-core/src/state.rs`

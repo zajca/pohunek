@@ -36,7 +36,7 @@ pohunek-worker-protocol = { workspace = true }
 pohunek-client = { workspace = true }
 pohunek-prompt = { workspace = true }
 pohunek-terminal = { workspace = true }
-pohunek-gui-core = { workspace = true }
+pohunek-assistant = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 base64 = { workspace = true }
@@ -64,6 +64,7 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 portable-pty = { workspace = true }
 overlay = { workspace = true }
+pohunek-gui-core = { workspace = true }
 pohunek-logging = { workspace = true }
 pohunek-test-support = { workspace = true }
 

@@ -1,7 +1,8 @@
-//! Tests for the shared GUI/CLI assistant launch core.
+//! Tests for assistant agent selection.
 
+use pohunek_assistant::launch as assistant;
+use pohunek_assistant::runtime_is_launchable;
 use pohunek_client::protocol::{AgentKind, AgentRuntime, HostCapabilities, PROTOCOL_VERSION};
-use pohunek_gui_core::{assistant, runtime_is_launchable};
 
 fn runtime(
     name: &str,

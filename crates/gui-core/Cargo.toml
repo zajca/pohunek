@@ -9,8 +9,8 @@ description = "Pure state and SDK bridge logic for the pohunek native GUI."
 [dependencies]
 base64 = { workspace = true }
 futures = { workspace = true }
+pohunek-assistant = { workspace = true }
 pohunek-client = { workspace = true }
-pohunek-knowledge = { workspace = true, features = ["protocol"] }
 pohunek-paths = { workspace = true }
 pohunek-prompt = { workspace = true }
 pohunek-protocol = { workspace = true }

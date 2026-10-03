@@ -1,0 +1,20 @@
+[package]
+name = "pohunek-assistant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Assistant launch orchestration and host connection types shared by pohunek clients."
+publish = false
+
+[dependencies]
+pohunek-client = { workspace = true }
+pohunek-knowledge = { workspace = true, features = ["protocol"] }
+pohunek-paths = { workspace = true }
+pohunek-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -3,7 +3,7 @@
 //! The assistant is an ordinary PTY-backed agent session opened with a small
 //! navigational opening prompt that points at a materialized knowledge bundle
 //! and a redacted live snapshot. This module owns the CLI surface and delegates
-//! the shared launch orchestration to `pohunek-gui-core`, so the CLI and native
+//! the shared launch orchestration to `pohunek-assistant`, so the CLI and native
 //! GUI use the same `session.new` path.
 //!
 //! The remaining local submodule is [`bootstrap`], which brings up the local
@@ -18,8 +18,8 @@ pub(crate) mod bootstrap;
 
 use std::path::PathBuf;
 
-use pohunek_gui_core::assistant as core_assistant;
-use pohunek_gui_core::{ConnectionOptions, HostConfig};
+use pohunek_assistant::launch as core_assistant;
+use pohunek_assistant::{AssistantError, ConnectionOptions, HostConfig};
 use serde::Serialize;
 
 use crate::commands::session::{confirmation_decision, ConfirmDecision};
@@ -366,20 +366,16 @@ fn core_intent(intent: Intent) -> core_assistant::Intent {
     }
 }
 
-fn core_error(err: pohunek_gui_core::CoreError) -> CliError {
+fn core_error(err: AssistantError) -> CliError {
     match err {
-        pohunek_gui_core::CoreError::Client(source) => CliError::Client(source),
-        pohunek_gui_core::CoreError::Json(source) => CliError::Json(source),
-        pohunek_gui_core::CoreError::Protocol(source) => CliError::Protocol(source),
-        pohunek_gui_core::CoreError::Prompt(source) => CliError::Prompt(source),
-        pohunek_gui_core::CoreError::MissingEnv { var } => CliError::MissingEnv { var },
-        pohunek_gui_core::CoreError::RemoteAssistantTargetRequired { .. } => {
-            CliError::RemoteTargetRequired
-        }
-        pohunek_gui_core::CoreError::RemoteAssistantDegradedUnsupported { host } => {
+        AssistantError::Client(source) => CliError::Client(source),
+        AssistantError::Protocol(source) => CliError::Protocol(source),
+        AssistantError::MissingEnv { var } => CliError::MissingEnv { var },
+        AssistantError::RemoteAssistantTargetRequired { .. } => CliError::RemoteTargetRequired,
+        AssistantError::RemoteAssistantDegradedUnsupported { host } => {
             CliError::DegradedRemoteUnsupported { host }
         }
-        other => CliError::Protocol(protocol::ProtocolError::new(
+        other @ AssistantError::Paths { .. } => CliError::Protocol(protocol::ProtocolError::new(
             protocol::ErrorClass::Runtime,
             "assistant_launch_failed",
             other.to_string(),

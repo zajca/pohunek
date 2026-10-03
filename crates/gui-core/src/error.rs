@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use pohunek_assistant::AssistantError;
 use thiserror::Error;
 
 use crate::{PromptError, ReviewStoreError};
@@ -72,6 +73,23 @@ pub enum CoreError {
     },
     #[error("session `{}` has no bound worktree to dispatch a review into", session_id.0)]
     ReviewSessionMissingWorktree { session_id: protocol::SessionId },
+}
+
+impl From<AssistantError> for CoreError {
+    fn from(error: AssistantError) -> Self {
+        match error {
+            AssistantError::Client(source) => Self::Client(source),
+            AssistantError::Protocol(source) => Self::Protocol(source),
+            AssistantError::MissingEnv { var } => Self::MissingEnv { var },
+            AssistantError::Paths { source } => Self::Paths { source },
+            AssistantError::RemoteAssistantTargetRequired { host } => {
+                Self::RemoteAssistantTargetRequired { host }
+            }
+            AssistantError::RemoteAssistantDegradedUnsupported { host } => {
+                Self::RemoteAssistantDegradedUnsupported { host }
+            }
+        }
+    }
 }
 
 impl CoreError {

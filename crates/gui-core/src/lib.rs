@@ -6,8 +6,16 @@
 // Rust guideline compliant 2026-10-01
 #![forbid(unsafe_code)]
 
-pub mod assistant;
 pub mod providers;
+
+/// Assistant launch orchestration, re-exported from `pohunek-assistant`.
+pub mod assistant {
+    pub use pohunek_assistant::launch::{
+        launch_with_options, prepare_with_options, select_agent, start_prepared_with_options,
+        AgentSelection, AssistantPaths, Intent, KnowledgeInfo, LaunchMeta, LaunchParams,
+        LaunchResult, PreparedLaunch,
+    };
+}
 
 mod connection;
 mod error;
@@ -18,17 +26,15 @@ mod sdk;
 mod state;
 mod ui_state;
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::time::Duration;
-
-use pohunek_client::{ClientOptions, OriginSource};
 use protocol::{
-    AgentKind, AgentRuntime, DaemonHealthResult, NotificationRecord, ProjectInfo, ProtocolVersion,
-    SessionInfo,
+    AgentRuntime, DaemonHealthResult, NotificationRecord, ProjectInfo, ProtocolVersion, SessionInfo,
 };
 use serde::{Deserialize, Serialize};
 
+pub use pohunek_assistant::{
+    runtime_is_assistant_capable, runtime_is_launchable, ConnectionOptions, HostConfig, HostId,
+    HostTransport,
+};
 pub use pohunek_prompt::{
     render as render_prompt, Error as PromptError, Provider as PromptProvider,
 };
@@ -91,11 +97,6 @@ pub use state::{
 #[doc(inline)]
 pub use ui_state::{default_state_dir, Selection, UiState, UiStateError, WindowSize};
 
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
-const DEFAULT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
-const DEFAULT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const UI_STATE_FILE: &str = "ui-state.toml";
 /// Stable protocol code older daemons return for unknown optional methods.
 const METHOD_NOT_FOUND_CODE: &str = "method_not_found";
@@ -110,157 +111,6 @@ const DEFAULT_WINDOW_HEIGHT: u32 = 640;
 /// history. It bounds reconcile cost while keeping realistic per-host inboxes
 /// accurate.
 const GUI_NOTIFICATION_SEED_LIMIT: u32 = 200;
-
-/// Connection and reconciliation timing for host workers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ConnectionOptions {
-    pub connect_timeout: Duration,
-    pub request_timeout: Duration,
-    pub reconcile_interval: Duration,
-    pub backoff_initial: Duration,
-    pub backoff_max: Duration,
-    /// Where SDK requests take their origin from. Process-local policy, not
-    /// part of the serialized form.
-    #[serde(skip)]
-    pub origin_source: OriginSource,
-}
-
-impl Default for ConnectionOptions {
-    fn default() -> Self {
-        Self {
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
-            reconcile_interval: DEFAULT_RECONCILE_INTERVAL,
-            backoff_initial: DEFAULT_BACKOFF_INITIAL,
-            backoff_max: DEFAULT_BACKOFF_MAX,
-            origin_source: OriginSource::default(),
-        }
-    }
-}
-
-impl ConnectionOptions {
-    fn client(self) -> ClientOptions {
-        ClientOptions::default()
-            .with_connect_timeout(self.connect_timeout)
-            .with_request_timeout(self.request_timeout)
-            .with_origin_source(self.origin_source)
-    }
-}
-
-/// Stable host key used by the GUI state and Iced subscription identity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HostId(String);
-
-impl HostId {
-    /// Construct a host id.
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
-    }
-
-    /// Borrow the stable host id string.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for HostId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// SDK transport target for one host.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum HostTransport {
-    /// Local daemon over Unix socket.
-    Local { socket_path: PathBuf },
-    /// Remote daemon resolved by the SDK through `NetBird`.
-    Remote { host: String, socket_path: PathBuf },
-    /// Remote daemon over a trusted TCP route with a policy-resolved attach selector.
-    Tcp {
-        addr: SocketAddr,
-        attach_host: String,
-    },
-}
-
-/// Static connection config for one host.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct HostConfig {
-    pub id: HostId,
-    pub transport: HostTransport,
-}
-
-impl HostConfig {
-    /// Build a local Unix-socket host config.
-    #[must_use]
-    pub fn local(id: impl Into<String>, socket_path: impl Into<PathBuf>) -> Self {
-        Self {
-            id: HostId::new(id),
-            transport: HostTransport::Local {
-                socket_path: socket_path.into(),
-            },
-        }
-    }
-
-    /// Build a TCP host config.
-    #[must_use]
-    pub fn tcp(id: impl Into<String>, addr: SocketAddr) -> Self {
-        let id = id.into();
-        Self {
-            id: HostId::new(id.clone()),
-            transport: HostTransport::Tcp {
-                addr,
-                attach_host: id,
-            },
-        }
-    }
-
-    /// Build a trusted TCP config whose external attach command re-resolves a
-    /// provider-qualified selector through CLI overlay policy.
-    #[must_use]
-    pub fn tcp_with_attach_host(
-        id: impl Into<String>,
-        addr: SocketAddr,
-        attach_host: impl Into<String>,
-    ) -> Self {
-        Self {
-            id: HostId::new(id),
-            transport: HostTransport::Tcp {
-                addr,
-                attach_host: attach_host.into(),
-            },
-        }
-    }
-
-    /// Build a remote host config resolved by the SDK.
-    #[must_use]
-    pub fn remote(
-        id: impl Into<String>,
-        host: impl Into<String>,
-        socket_path: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            id: HostId::new(id),
-            transport: HostTransport::Remote {
-                host: host.into(),
-                socket_path: socket_path.into(),
-            },
-        }
-    }
-
-    /// Value substituted into `{host}` for attach commands.
-    #[must_use]
-    pub fn attach_host(&self) -> String {
-        match &self.transport {
-            HostTransport::Local { .. } => String::new(),
-            HostTransport::Remote { host, .. } => host.clone(),
-            HostTransport::Tcp { attach_host, .. } => attach_host.clone(),
-        }
-    }
-}
 
 /// Minimal daemon health facts used by the spike UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,37 +155,6 @@ pub struct HostSnapshot {
     pub notification_providers: Vec<String>,
     /// Provider-neutral observation features advertised by `host.inspect`.
     pub observation_capabilities: ObservationCapabilities,
-}
-
-/// Returns whether a runtime can be selected for a new session.
-///
-/// Hermes requires positive version-policy confirmation. Legacy profiles that
-/// predate `agent_base` remain selectable when available, while a future
-/// unknown compiled base fails closed.
-#[must_use]
-pub fn runtime_is_launchable(runtime: &AgentRuntime) -> bool {
-    if !runtime.available {
-        return false;
-    }
-
-    match runtime.agent_base.as_ref() {
-        Some(AgentKind::Hermes) => runtime.supported == Some(true),
-        Some(AgentKind::Unknown(_)) => false,
-        None if runtime.agent == "hermes" => runtime.supported == Some(true),
-        Some(_) | None => true,
-    }
-}
-
-/// Returns whether a launchable runtime can host the assistant.
-///
-/// Shell-backed profiles are excluded even when their profile name is not the
-/// built-in `shell` name. Legacy custom profiles without `agent_base` retain
-/// the name-based behavior used before the field existed.
-#[must_use]
-pub fn runtime_is_assistant_capable(runtime: &AgentRuntime) -> bool {
-    runtime.agent != "shell"
-        && runtime.agent_base.as_ref() != Some(&AgentKind::Shell)
-        && runtime_is_launchable(runtime)
 }
 
 /// Host-level provider-neutral terminal observation capabilities.
