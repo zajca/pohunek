@@ -678,7 +678,7 @@ and the arrow keys. Mobile overlays use the full viewport, controls provide
 landscape orientations.
 
 For local UI development with two fixture daemons, run `bun run dev` from
-`web/`; no Rust daemon or NetBird setup is required. Bun remains the workspace
+the repository root; no Rust daemon or NetBird setup is required. Bun remains the workspace
 runtime, while the development orchestrator locates Node (`POHUNEK_NODE_BIN`, then
 `PATH`, then the Homebrew and installer prefixes on macOS) to run Vite's
 WebSocket proxy in a compatible Node child process. A
@@ -836,7 +836,7 @@ pohunek is built for **one operator on machines they own**:
 ## Development
 
 The workspace is a Cargo monorepo (edition 2021, MSRV 1.96) plus a Bun
-workspace in `web/` for the TypeScript packages.
+workspace (rooted at the repository root, spanning `sdk/ts/*` and `web/*`) for the TypeScript packages.
 
 | Crate | Role |
 |-------|------|
@@ -855,7 +855,8 @@ workspace in `web/` for the TypeScript packages.
 | `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
-| `web/` | `@pohunek/protocol`, `@pohunek/sdk`, `@pohunek/backend`, `@pohunek/client-core`, `@pohunek/frontend`, `@pohunek/testkit`. |
+| `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
+| `web/` | `@pohunek/backend`, `@pohunek/client-core`, `@pohunek/frontend`. |
 
 Read **[AGENTS.md](AGENTS.md)** first — it is the canonical contributor guide.
 Authoritative design lives in [docs/architecture.md](docs/architecture.md);
@@ -883,7 +884,7 @@ cargo t                        # all fast unit + integration tests, no PTY/DB fi
 cargo t -p pohunek-gui-core     # fast tests in one crate
 cargo ti                       # fast daemon/client/session-worker surface
 cargo tw                       # unfiltered full suite, four test processes
-bun test sdk/test/config.test.ts -t "one case"  # one web test file, name pattern (from web/)
+bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
 bacon                          # watcher: profile-fast nextest loop (bacon.toml)
 python3 scripts/test-partitions run cli    # exact CI shard (unit/daemon/relay/cli/relay-db/heavy)
 python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
@@ -920,19 +921,18 @@ cost filter, run the partition coverage check, and measure the fast loop again.
 Web workspace:
 
 ```bash
-cd web
 bun install --frozen-lockfile
 bun run typecheck && bun run lint && bun test
 ```
 
 `bun run typecheck` is one command: `tsc -b` over the composite (source-only)
-`shared → sdk → backend/testkit → client-core/tools` graph (incremental via
+`protocol → sdk → backend/testkit → client-core/tools` graph (incremental via
 `.tsbuildinfo` in each `dist-types/`), then the standalone checks — `frontend`
 (`svelte-check`), `release-test`, and the per-package `test/tsconfig.json`
 projects — run concurrently. Tests stay out of the composite graph because
 their imports of sibling packages resolve to `.ts` sources and would otherwise
 be pulled into non-referenced projects (and form reference cycles). Each
-package also supports `tsc -b` on its own (`cd web/sdk && bun run typecheck`,
+package also supports `tsc -b` on its own (`cd sdk/ts/sdk && bun run typecheck`,
 which also typechecks that package's tests). Per-package `dist-types/` output
 is git-ignored.
 
@@ -952,7 +952,7 @@ a `--target-dir` that is not a Cargo target dir refuses to run.
 A protocol change is not done until the generated TypeScript types match:
 
 ```bash
-cargo xtask ts generate   # regenerate web/shared/src/generated/**
+cargo xtask ts generate   # regenerate sdk/ts/protocol/src/generated/**
 cargo xtask ts check      # CI gate
 ```
 

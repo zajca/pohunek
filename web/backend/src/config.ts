@@ -2,15 +2,12 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   currentRuntimePathContext,
-  ENV_XDG_RUNTIME_DIR,
   resolveDaemonSocket,
   resolveRuntimeDir,
   RuntimePathError,
   validateSocketPath,
   type RuntimePathContext,
-} from "./runtime-paths";
-
-export { ENV_XDG_RUNTIME_DIR };
+} from "@pohunek/sdk";
 
 export const DEFAULT_DISCOVER_INTERVAL_SECONDS = 30;
 /** Size of one backend log file; matches the daemon's log family (`crates/logging`). */

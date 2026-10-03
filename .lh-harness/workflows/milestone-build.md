@@ -138,7 +138,7 @@ RUSTFLAGS="-D warnings" cargo xtask docs check
 cargo xtask hermes compatibility --pohunek-bin "$PWD/target/release/pohunek"
 ```
 
-Web workspace gates (from the worktree's `web/`):
+Web workspace gates (from the worktree root, which is the Bun workspace root):
 
 ```bash
 bun install --frozen-lockfile
@@ -150,16 +150,15 @@ bun run test:e2e
 ```
 
 Real-daemon web suite (mandatory for done; build the three binaries from the
-worktree root first, then run the suite from the worktree's `web/` directory
-where the workspace manifest and the `sdk/`/`backend/` paths live):
+worktree root first, then run the suite from the worktree root, where the
+workspace manifest lives):
 
 ```bash
 cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
-cd web
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=<abs>/target/debug/pohunekd \
   POHUNEK_CLI_BIN=<abs>/target/debug/pohunek \
   POHUNEK_PYTHON_BIN=/usr/bin/python3 \
-  bun test sdk/test/e2e.test.ts backend/test/real-daemon.e2e.test.ts
+  bun test sdk/ts/sdk/test/e2e.test.ts web/backend/test/real-daemon.e2e.test.ts
 ```
 
 - A gate is green only when its command exits 0. A milestone is never green

@@ -1,8 +1,9 @@
 // Run the composite TypeScript build graph plus the standalone checks in one
 // command.
 //
-// `tsc -b web/tsconfig.json` typechecks the shared/sdk/backend/testkit/
-// client-core/tools source graph incrementally: unchanged referenced projects
+// `tsc -b tsconfig.json` (repository root) typechecks the protocol/sdk/testkit
+// packages under `sdk/ts/` and the backend/client-core/tools projects under
+// `web/` as one source graph incrementally: unchanged referenced projects
 // are reported "up to date" from their `.tsbuildinfo` instead of being
 // rechecked.
 //
@@ -21,13 +22,13 @@ import { spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // Spawn Bun by its own executable path so the orchestrator does not depend on
 // what `bun` resolves to on `PATH`.
 const BUN_EXECUTABLE = process.execPath;
 // Hoisted workspace TypeScript binary. The composite build must not go
 // through `bun run typecheck`, which would recurse into this orchestrator.
-const TSC_EXECUTABLE = join(WEB_ROOT, "node_modules", "typescript", "bin", "tsc");
+const TSC_EXECUTABLE = join(REPO_ROOT, "node_modules", "typescript", "bin", "tsc");
 const MS_PER_SECOND = 1000;
 
 interface TypecheckTask {
@@ -43,33 +44,40 @@ interface TypecheckResult {
   readonly output: string;
 }
 
-const TEST_PROJECTS = ["sdk", "backend", "testkit", "client-core"] as const;
+// Workspace directories (relative to the repository root) that carry a
+// standalone `test/tsconfig.json`.
+const TEST_PROJECTS = [
+  "sdk/ts/sdk",
+  "sdk/ts/testkit",
+  "web/backend",
+  "web/client-core",
+] as const;
 
 const TASKS: readonly TypecheckTask[] = [
   {
     name: "build",
-    cwd: WEB_ROOT,
+    cwd: REPO_ROOT,
     args: [TSC_EXECUTABLE, "-b", "tsconfig.json"],
   },
   {
     name: "release-test",
-    cwd: WEB_ROOT,
-    args: [TSC_EXECUTABLE, "--noEmit", "-p", "release/test/tsconfig.json"],
+    cwd: REPO_ROOT,
+    args: [TSC_EXECUTABLE, "--noEmit", "-p", "web/release/test/tsconfig.json"],
   },
   {
     name: "scripts-test",
-    cwd: WEB_ROOT,
-    args: [TSC_EXECUTABLE, "--noEmit", "-p", "scripts/test/tsconfig.json"],
+    cwd: REPO_ROOT,
+    args: [TSC_EXECUTABLE, "--noEmit", "-p", "web/scripts/test/tsconfig.json"],
   },
   {
     name: "frontend",
-    cwd: join(WEB_ROOT, "frontend"),
+    cwd: join(REPO_ROOT, "web", "frontend"),
     args: ["run", "typecheck"],
   },
   ...TEST_PROJECTS.map(
     (name): TypecheckTask => ({
-      name: `${name}-test`,
-      cwd: join(WEB_ROOT, name),
+      name: `${name.replace(/^(?:sdk\/ts|web)\//u, "")}-test`,
+      cwd: join(REPO_ROOT, name),
       args: [TSC_EXECUTABLE, "--noEmit", "-p", "test/tsconfig.json"],
     }),
   ),

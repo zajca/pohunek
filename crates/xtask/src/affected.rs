@@ -125,8 +125,9 @@ impl Reminder {
             Self::ScriptTests => {
                 format!("scripts changed: also run `{SCRIPT_TESTS_COMMAND}`")
             }
-            Self::WebGates => "web changed: also run the Bun gates in web/ (AGENTS.md \
-                               \"Web workspace gates\") and `cargo xtask ts check`"
+            Self::WebGates => "TypeScript workspace changed: also run the Bun gates from the \
+                               repository root (AGENTS.md \"Web workspace gates\") and \
+                               `cargo xtask ts check`"
                 .to_owned(),
         }
     }
@@ -235,6 +236,42 @@ const RULES: &[Rule] = &[
         Effect::NoRustTests,
         &[Reminder::WebGates],
         "Bun workspace; xtask only writes its generated bindings, checked by `cargo xtask ts check`",
+    ),
+    reminding(
+        Pattern::Dir("sdk/ts"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace; xtask only writes its generated bindings, checked by `cargo xtask ts check`",
+    ),
+    reminding(
+        Pattern::File("package.json"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace root manifest; read only by the Bun gates",
+    ),
+    reminding(
+        Pattern::File("bun.lock"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace lockfile; read only by the Bun gates",
+    ),
+    reminding(
+        Pattern::File(".bun-version"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun version pin; read only by the Bun gates",
+    ),
+    reminding(
+        Pattern::File("eslint.config.js"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "ESLint configuration of the Bun workspace",
+    ),
+    reminding(
+        Pattern::RootPrefix("tsconfig"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "TypeScript configuration of the Bun workspace",
     ),
     reminding(
         Pattern::Dir("docs"),
@@ -908,6 +945,12 @@ mod tests {
     fn allowlisted_paths_select_no_rust_tests() {
         for path in [
             "web/frontend/src/app.ts",
+            "sdk/ts/sdk/src/client.ts",
+            "package.json",
+            "bun.lock",
+            ".bun-version",
+            "eslint.config.js",
+            "tsconfig.base.json",
             "docs/ROADMAP.md",
             ".github/workflows/ci.yml",
             ".claude/skills/gates/SKILL.md",
@@ -968,7 +1011,7 @@ mod tests {
             &changed(&[
                 "docs/knowledge/concepts/session.md",
                 "scripts/tests/test_ci_timings.py",
-                "web/shared/src/index.ts",
+                "sdk/ts/protocol/src/index.ts",
                 "Cargo.lock",
             ]),
             &fixture(),
@@ -1066,8 +1109,8 @@ mod tests {
              web/x.ts -> no Rust tests (Bun workspace; xtask only writes its generated \
              bindings, checked by `cargo xtask ts check`)\n\
              selection: pohunek-cli plus their dependents\n\
-             reminder: web changed: also run the Bun gates in web/ (AGENTS.md \"Web workspace \
-             gates\") and `cargo xtask ts check`\n\
+             reminder: TypeScript workspace changed: also run the Bun gates from the repository \
+             root (AGENTS.md \"Web workspace gates\") and `cargo xtask ts check`\n\
              cargo t -E 'rdeps(=pohunek-cli)'\n"
         );
     }

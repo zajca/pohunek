@@ -7,7 +7,7 @@ import * as browserSdk from "@pohunek/sdk/browser";
 
 const SDK_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const BROWSER_ENTRY = resolve(SDK_ROOT, "src/index.browser.ts");
-const PROTOCOL_ENTRY = resolve(SDK_ROOT, "../shared/src/index.ts");
+const PROTOCOL_ENTRY = resolve(SDK_ROOT, "../protocol/src/index.ts");
 const MODULE_SPECIFIER_PATTERN = /(?:from\s*|import\s*\(\s*|import\s*)["']([^"']+)["']/gu;
 
 describe("browser entry", () => {

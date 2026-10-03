@@ -48,7 +48,7 @@ a CLI command/flag, a protocol method/event, GUI behavior, or `docs/public-api.m
 
 ## When the change touches the web workspace
 
-Run in `web/` (see AGENTS.md for the full commands): `bun install
+Run from the repository root (see AGENTS.md for the full commands): `bun install
 --frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, and, for
 changes covered by the e2e suite, `bun run test:e2e` (after
 `bunx playwright install --with-deps chromium`). The real-daemon suite runs

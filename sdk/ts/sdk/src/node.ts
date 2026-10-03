@@ -71,3 +71,23 @@ export async function attachRawTcp(
 }
 
 export { SocketTransport };
+
+export {
+  APP_DIR,
+  ENV_XDG_RUNTIME_DIR,
+  MACOS_DEFAULT_RUNTIME_PREFIX,
+  RuntimePathError,
+  SOCKET_NAME,
+  SOCKET_PATH_MAX_BYTES,
+  currentRuntimePathContext,
+  resolveDaemonSocket,
+  resolveRuntimeDir,
+  validateSocketPath,
+  verifyDaemonRuntime,
+} from "./runtime-paths";
+export type {
+  RuntimePathContext,
+  RuntimePathFailure,
+  RuntimePathReason,
+  RuntimePlatform,
+} from "./runtime-paths";

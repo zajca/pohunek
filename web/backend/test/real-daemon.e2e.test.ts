@@ -6,13 +6,13 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import {
-  MACOS_DEFAULT_RUNTIME_PREFIX,
   loadBackendConfig,
   startBackendFromEnv,
   type BackendHandle,
   type BackendHostEntry,
   type BackendLogger,
 } from "@pohunek/backend";
+import { MACOS_DEFAULT_RUNTIME_PREFIX } from "@pohunek/sdk";
 import {
   Client,
   PROTOCOL_VERSION,

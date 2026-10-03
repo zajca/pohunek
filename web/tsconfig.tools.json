@@ -1,5 +1,5 @@
 {
-  "extends": "./tsconfig.base.json",
+  "extends": "../tsconfig.base.json",
   "compilerOptions": {
     "composite": true,
     "noEmit": false,
@@ -17,16 +17,16 @@
   ],
   "references": [
     {
-      "path": "./shared"
+      "path": "../sdk/ts/protocol"
     },
     {
-      "path": "./sdk"
+      "path": "../sdk/ts/sdk"
     },
     {
       "path": "./backend"
     },
     {
-      "path": "./testkit"
+      "path": "../sdk/ts/testkit"
     }
   ]
 }

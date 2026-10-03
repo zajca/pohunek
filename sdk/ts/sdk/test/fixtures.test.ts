@@ -25,7 +25,7 @@ import type {
   SessionWaitResult,
 } from "@pohunek/protocol";
 
-const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), "../../shared/fixtures");
+const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), "../../protocol/fixtures");
 
 describe("golden fixtures", () => {
   test("every fixture is representable by the TS envelope and generated type layer", () => {

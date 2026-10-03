@@ -3,20 +3,16 @@
   "type": "module",
   "packageManager": "bun@1.3.11",
   "workspaces": [
-    "shared",
-    "sdk",
-    "backend",
-    "client-core",
-    "frontend",
-    "testkit"
+    "sdk/ts/*",
+    "web/*"
   ],
   "scripts": {
-    "dev": "bun run scripts/dev.ts",
-    "build:frontend": "cd frontend && bun run build",
-    "typecheck": "bun run scripts/typecheck.ts",
-    "lint": "eslint \"**/*.{ts,svelte}\" --max-warnings=0",
+    "dev": "bun run web/scripts/dev.ts",
+    "build:frontend": "cd web/frontend && bun run build",
+    "typecheck": "bun run web/scripts/typecheck.ts",
+    "lint": "eslint \"sdk/ts/**/*.ts\" \"web/**/*.{ts,svelte}\" --max-warnings=0",
     "test": "bun test",
-    "test:e2e": "bun run build:frontend && bun ./node_modules/@playwright/test/cli.js test --config frontend/playwright.config.ts"
+    "test:e2e": "bun run build:frontend && bun ./node_modules/@playwright/test/cli.js test --config web/frontend/playwright.config.ts"
   },
   "devDependencies": {
     "@playwright/test": "1.61.1",
