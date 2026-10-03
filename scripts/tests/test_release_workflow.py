@@ -51,6 +51,43 @@ JOB_HEADER = re.compile(r"^  ([a-z][a-z0-9-]*):\n", re.M)
 USES = re.compile(r"^\s+(?:- )?uses:\s*(\S+)", re.M)
 RUN = re.compile(r"^(\s+)(?:- )?run:\s*(.*)$", re.M)
 
+# The parser is lexical, so it fails closed: a token block is recognized only
+# in its canonical spelling, and every line of a write-token job must match
+# one of these shapes. Anything else (whitespace before a colon, quoted keys,
+# flow mappings, anchors, aliases, merge keys) is reported, not skipped.
+PERMISSIONS_LINE = re.compile(r"^\s*['\"]?permissions['\"]?\s*:", re.M)
+CANONICAL_JOB_PERMISSIONS = re.compile(r"^    permissions:\n      contents: (read|write)\n", re.M)
+# A plain scalar value: its first character may not open a flow collection,
+# an anchor, an alias, a tag, a block scalar, or a quoted string.
+_SCALAR = r"[^\s{}\[\]&*!|>'\"%@`][^\n]*"
+CANONICAL_WRITE_JOB_LINES = [
+    re.compile(pattern)
+    for pattern in (
+        rf"    (name|needs|runs-on|timeout-minutes): {_SCALAR}",
+        r"    needs: \[[a-z0-9, -]+\]",
+        r"    (permissions|strategy|steps):",
+        r"      contents: write",
+        r"      (fail-fast): (true|false)",
+        r"      matrix:",
+        r"        include:",
+        r"        component: \[[a-z, ]+\]",
+        r"          - target: [a-z0-9_-]+",
+        r"            component: [a-z]+",
+        rf"      - name: {_SCALAR}",
+        r"        uses: [a-z0-9_.-]+/[a-z0-9_.-]+@[0-9a-f]{40}( # v[0-9.]+)?",
+        r"        with:",
+        rf"          (name|path): {_SCALAR}",
+        r"          fail_on_unmatched_files: true",
+        r"          files: \|",
+        r"            \$\{\{ runner\.temp \}\}/[a-z-]+/[A-Za-z0-9_.*-]+",
+        r"        shell: bash",
+        r"        run: \|",
+        r"          \S[^\n]*",
+        r"            \S[^\n]*",
+        r"\s*#[^\n]*",
+    )
+]
+
 
 def jobs(text: str) -> dict[str, str]:
     """Top-level job name -> its block of the `jobs:` section."""
@@ -91,12 +128,34 @@ def run_scripts(block: str) -> list[tuple[str, ...]]:
     return scripts
 
 
+def permission_violations(name: str, block: str) -> list[str]:
+    """A job's token grant must be absent or spelled canonically."""
+    granted = len(PERMISSIONS_LINE.findall(block))
+    canonical = len(CANONICAL_JOB_PERMISSIONS.findall(block + "\n"))
+    if granted != canonical:
+        return [f"{name} declares permissions in a form the guard does not recognize"]
+    return []
+
+
 def write_job_violations(text: str) -> list[str]:
-    """Everything a write-token job does beyond the allowlisted steps."""
+    """Everything a write-token job does beyond the allowlisted steps.
+
+    Fails closed: a job whose permissions are not spelled canonically, and any
+    line of a write-token job outside the canonical shapes, is a violation.
+    """
     violations = []
+    header, _, _ = text.partition("\njobs:\n")
+    if len(PERMISSIONS_LINE.findall(header)) != 1 or not re.search(
+        r"(?m)^permissions:\n  contents: read$", header
+    ):
+        violations.append("the workflow default token is not exactly `contents: read`")
     for name, block in jobs(text).items():
+        violations.extend(permission_violations(name, block))
         if not holds_write_token(block):
             continue
+        for line in block.splitlines():
+            if line.strip() and not any(shape.fullmatch(line) for shape in CANONICAL_WRITE_JOB_LINES):
+                violations.append(f"{name} has a line outside the canonical shapes: {line!r}")
         for action in USES.findall(block):
             if action not in ALLOWED_WRITE_ACTIONS:
                 violations.append(f"{name} uses {action} with a write token")
@@ -148,13 +207,17 @@ class WriteJobGuardRejectionTests(unittest.TestCase):
     """The guard itself rejects the shapes it exists to stop."""
 
     PUBLISH = """name: Release
+permissions:
+  contents: read
 jobs:
   publish:
     permissions:
       contents: write
     steps:
-      - uses: {action}
-      - shell: bash
+      - name: Download
+        uses: {action}
+      - name: Check
+        shell: bash
         run: |
 {script}
 """
@@ -186,6 +249,42 @@ jobs:
 
     def test_an_unlisted_pinned_action_is_rejected(self):
         self.assertTrue(self.violations("evil/payload@" + "0" * 40, self.ALLOWED))
+
+    def test_whitespace_before_a_colon_is_rejected(self):
+        base = self.PUBLISH.format(action=self.DOWNLOAD, script=self.ALLOWED)
+        hidden_run = base.replace(
+            "        run: |", "        run : |\n          ./untrusted-payload\n        x: |"
+        )
+        hidden_uses = base.replace(
+            "        uses: " + self.DOWNLOAD, "        uses : ./untrusted-action"
+        )
+        for text in (hidden_run, hidden_uses):
+            with self.subTest(text=text):
+                self.assertNotEqual(text, base)
+                self.assertTrue(write_job_violations(text))
+
+    def test_quoted_keys_flow_mappings_and_aliases_are_rejected(self):
+        base = self.PUBLISH.format(action=self.DOWNLOAD, script=self.ALLOWED)
+        for extra in (
+            '      - "run": ./untrusted-payload',
+            "      - {run: ./untrusted-payload}",
+            "      - <<: *untrusted",
+            "      - name: &anchor x",
+        ):
+            with self.subTest(extra=extra):
+                self.assertTrue(write_job_violations(base + extra + "\n"))
+
+    def test_a_non_canonical_write_grant_is_rejected(self):
+        for grant in (
+            "    permissions: write-all\n",
+            "    permissions:\n      contents : write\n",
+            "    permissions: {contents: write}\n",
+        ):
+            text = self.PUBLISH.format(action=self.DOWNLOAD, script=self.ALLOWED).replace(
+                "    permissions:\n      contents: write\n", grant
+            )
+            with self.subTest(grant=grant):
+                self.assertTrue(write_job_violations(text))
 
     def test_a_checkout_is_rejected(self):
         self.assertTrue(
