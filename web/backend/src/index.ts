@@ -18,24 +18,6 @@ export {
 export type { BackendConfig, BackendLogFileConfig, DerivedRuntime } from "./config";
 export { LOG_FILE_NAME, LogFileError, rotatingFileLogger } from "./log-files";
 export type { ClosableBackendLogger, RotatingLogOptions } from "./log-files";
-export {
-  APP_DIR,
-  MACOS_DEFAULT_RUNTIME_PREFIX,
-  RuntimePathError,
-  SOCKET_NAME,
-  SOCKET_PATH_MAX_BYTES,
-  currentRuntimePathContext,
-  resolveDaemonSocket,
-  resolveRuntimeDir,
-  validateSocketPath,
-  verifyDaemonRuntime,
-} from "./runtime-paths";
-export type {
-  RuntimePathContext,
-  RuntimePathFailure,
-  RuntimePathReason,
-  RuntimePlatform,
-} from "./runtime-paths";
 export { externalFqdnSelector, externalPeerSelector } from "./identity";
 export { BackendStartupError, startHostsPipeline } from "./hosts";
 export type {

@@ -11,6 +11,7 @@
   },
   "devDependencies": {
     "@playwright/test": "1.61.1",
+    "@pohunek/sdk": "workspace:*",
     "@sveltejs/vite-plugin-svelte": "7.2.0",
     "@types/bun": "1.3.11",
     "svelte-check": "4.7.3",

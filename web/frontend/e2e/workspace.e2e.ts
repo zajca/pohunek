@@ -1,5 +1,5 @@
 import type { Locator, Page } from "@playwright/test";
-import { connectTcp } from "../../sdk/src/node";
+import { connectTcp } from "@pohunek/sdk";
 import {
   FIXTURE_LOCAL_HOST,
   FIXTURE_LOCAL_SESSION_ID,

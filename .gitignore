@@ -15,13 +15,12 @@ __pycache__/
 
 # TypeScript/Bun workspace artifacts. `bun.lock` is intentionally committed.
 node_modules/
-web/node_modules/
 web/**/dist/
-web/**/dist-types/
+**/dist-types/
 web/frontend/test-results/
-web/**/*.tsbuildinfo
+**/*.tsbuildinfo
 
-# ts-rs default export directory; committed bindings live under web/shared.
+# ts-rs default export directory; committed bindings live under sdk/ts/protocol.
 crates/protocol/bindings/
 crates/relay-protocol/bindings/
 
