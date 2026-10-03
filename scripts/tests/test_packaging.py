@@ -56,7 +56,7 @@ class Workspace:
             directory.mkdir(parents=True)
         (self.docs / "offline" / "index.html").write_text("<html></html>\n")
         (self.docs / "manifest.json").write_text("{}\n")
-        for name in ("pohunekd", "pohunek-sessiond", "pohunek-gui", "pohunek-relayd"):
+        for name in ("pohunekd", "pohunek-sessiond", "pohunek-relayd"):
             self.executable(name, "#!/bin/sh\nexit 0\n")
         self.executable("pohunek", FAKE_POHUNEK)
         (self.root / "README.md").write_text("readme\n")
@@ -110,7 +110,6 @@ class StageArchiveTest(unittest.TestCase):
         ):
             self.assertTrue((staging / member).is_file(), member)
         self.assertEqual((staging / "completions/_pohunek").read_text(), "completion for zsh\n")
-        self.assertFalse((staging / "pohunek-gui").exists())
 
     def test_cli_archive_carries_the_packaged_smoke_and_no_daemon(self):
         ws = Workspace(self)
@@ -119,19 +118,9 @@ class StageArchiveTest(unittest.TestCase):
         self.assertFalse((staging / "pohunekd").exists())
         self.assertFalse((staging / "packaging/install-daemon.sh").exists())
 
-    def test_gui_and_relay_archives_hold_one_binary(self):
+    def test_relay_archive_holds_one_binary(self):
         ws = Workspace(self)
-        self.assertTrue((ws.out / ws.stage("gui") / "pohunek-gui").is_file())
         self.assertTrue((ws.out / ws.stage("relay") / "pohunek-relayd").is_file())
-
-    def test_macos_gui_archive_holds_the_app_bundle(self):
-        ws = Workspace(self)
-        app = ws.bindir / "Pohunek.app" / "Contents" / "MacOS"
-        app.mkdir(parents=True)
-        (app / "pohunek-gui").write_text("binary\n")
-        staging = ws.out / ws.stage("gui", "aarch64-apple-darwin")
-        self.assertTrue((staging / "Pohunek.app/Contents/MacOS/pohunek-gui").is_file())
-        self.assertFalse((staging / "pohunek-gui").exists())
 
     def test_web_archive_wraps_the_input_tree_with_the_verifier_and_the_license(self):
         ws = Workspace(self)

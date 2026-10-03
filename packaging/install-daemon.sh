@@ -244,7 +244,7 @@ fi
 # are no-ops for what is already gone.
 #
 # Residual windows the wrapper cannot close without a legacy-side change:
-# a client that already holds a control connection (a long-lived GUI) may
+# a client that already holds a control connection (a long-lived client) may
 # still issue session requests between the barrier and the daemon stop, and
 # no offline scan of the legacy persisted store covers such a stop-only
 # session; its template worker is caught by the post-stop inventory instead.

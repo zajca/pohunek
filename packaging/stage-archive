@@ -3,9 +3,8 @@
 #
 # usage: stage-archive <component> <version> <target> <bindir> <docs-dir> <output-dir>
 #
-# <component> is cli, daemon, gui, relay, or web. <bindir> holds the built
-# binaries (a `Pohunek.app` bundle instead of `pohunek-gui` for the macOS gui
-# component); <docs-dir> is the `cargo xtask docs site` output with `offline/`
+# <component> is cli, daemon, relay, or web. <bindir> holds the built
+# binaries; <docs-dir> is the `cargo xtask docs site` output with `offline/`
 # and `manifest.json` (the web component takes its own assets and ignores it).
 # The staging directory <output-dir>/<name> is created
 # fresh and the archive name `<prefix>-<version>-<target>` is printed on
@@ -33,7 +32,6 @@ output=$6
 case $component in
     cli) prefix=pohunek-cli ;;
     daemon) prefix=pohunek-daemon ;;
-    gui) prefix=pohunek-gui ;;
     relay) prefix=pohunek-relay ;;
     web) prefix=pohunek-web ;;
     *) fail "unsupported component: $component" ;;
@@ -82,15 +80,6 @@ case $component in
         copy_binary pohunek-sessiond
         mkdir -p "$staging/packaging"
         cp packaging/install-daemon.sh packaging/verify-archive "$staging/packaging/"
-        ;;
-    gui)
-        case $target in
-            *-apple-darwin)
-                [ -d "$bindir/Pohunek.app" ] || fail "built app bundle is missing: $bindir/Pohunek.app"
-                cp -Rp "$bindir/Pohunek.app" "$staging/Pohunek.app"
-                ;;
-            *) copy_binary pohunek-gui ;;
-        esac
         ;;
     relay)
         copy_binary pohunek-relayd

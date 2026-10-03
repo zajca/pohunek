@@ -51,9 +51,9 @@ RUN = {
 
 JUNIT = """<?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="nextest-run" tests="3" failures="0" errors="0" time="12.5">
-  <testsuite name="gui-core::state" tests="2" failures="0" errors="0" time="1.5">
-    <testcase name="test_alpha" classname="gui-core::state" time="1.0"/>
-    <testcase name="test_beta" classname="gui-core::state" time="0.5"/>
+  <testsuite name="daemon::state" tests="2" failures="0" errors="0" time="1.5">
+    <testcase name="test_alpha" classname="daemon::state" time="1.0"/>
+    <testcase name="test_beta" classname="daemon::state" time="0.5"/>
   </testsuite>
   <testsuite name="cli::parse" tests="1" failures="1" errors="0" time="11.0">
     <testcase name="test_gamma" classname="cli::parse" time="11.0"/>
