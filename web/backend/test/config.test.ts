@@ -12,8 +12,8 @@ import {
   BackendConfigError,
   loadBackendConfig,
   startBackend,
-  type RuntimePathContext,
 } from "@pohunek/backend";
+import type { RuntimePathContext } from "@pohunek/sdk";
 
 const TEST_RUNTIME_DIR = "/tmp/pohunek-backend-config-runtime";
 const TEST_STATIC_DIR = "/tmp/pohunek-backend-config-static";

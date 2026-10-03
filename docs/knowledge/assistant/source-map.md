@@ -99,16 +99,16 @@ Launcher scripts:
 
 Web control center client:
 
-- `web/sdk/src/index.browser.ts`
-- `web/sdk/README.md`
-- `web/sdk/src/client.ts`
-- `web/sdk/src/envelope.ts`
-- `web/sdk/src/origin.ts`
-- `web/sdk/src/transport.ts`
+- `sdk/ts/sdk/src/index.browser.ts`
+- `sdk/ts/sdk/README.md`
+- `sdk/ts/sdk/src/client.ts`
+- `sdk/ts/sdk/src/envelope.ts`
+- `sdk/ts/sdk/src/origin.ts`
+- `sdk/ts/sdk/src/transport.ts`
 - `web/backend/src/config.ts`
-- `web/backend/src/runtime-paths.ts`
+- `sdk/ts/sdk/src/runtime-paths.ts`
 - `web/backend/src/log-files.ts`
-- `web/testkit/src/runtime-root.ts`
+- `sdk/ts/testkit/src/runtime-root.ts`
 - `web/scripts/node-executable.ts`
 - `web/backend/src/hosts.ts`
 - `web/backend/src/server.ts`
@@ -198,7 +198,7 @@ Shipped host-local identity and governance:
 - `crates/gui/src/command.rs`
 - `crates/gui/src/view/hosts.rs`
 - `crates/xtask/src/generators/protocol.rs`
-- `web/sdk/src/governance.ts` — strict TypeScript validation of the public
+- `sdk/ts/sdk/src/governance.ts` — strict TypeScript validation of the public
   `host.governance.inspect` response and its fixed redacted contract-mismatch
   error.
 - `docs/knowledge/concepts/host-governance.md`

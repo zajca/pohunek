@@ -125,8 +125,9 @@ impl Reminder {
             Self::ScriptTests => {
                 format!("scripts changed: also run `{SCRIPT_TESTS_COMMAND}`")
             }
-            Self::WebGates => "web changed: also run the Bun gates in web/ (AGENTS.md \
-                               \"Web workspace gates\") and `cargo xtask ts check`"
+            Self::WebGates => "TypeScript workspace changed: also run the Bun gates from the \
+                               repository root (AGENTS.md \"Web workspace gates\") and \
+                               `cargo xtask ts check`"
                 .to_owned(),
         }
     }
@@ -235,6 +236,49 @@ const RULES: &[Rule] = &[
         Effect::NoRustTests,
         &[Reminder::WebGates],
         "Bun workspace; xtask only writes its generated bindings, checked by `cargo xtask ts check`",
+    ),
+    reminding(
+        Pattern::Dir("sdk/ts"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "TypeScript SDK Bun workspace; xtask only writes its generated bindings, checked by \
+         `cargo xtask ts check`",
+    ),
+    reminding(
+        Pattern::File("package.json"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace root manifest",
+    ),
+    reminding(
+        Pattern::File("bun.lock"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace lockfile",
+    ),
+    reminding(
+        Pattern::File(".bun-version"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun toolchain pin",
+    ),
+    reminding(
+        Pattern::File("eslint.config.js"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace lint configuration",
+    ),
+    reminding(
+        Pattern::File("tsconfig.json"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace TypeScript project graph",
+    ),
+    reminding(
+        Pattern::File("tsconfig.base.json"),
+        Effect::NoRustTests,
+        &[Reminder::WebGates],
+        "Bun workspace shared compiler options",
     ),
     reminding(
         Pattern::Dir("docs"),
@@ -897,6 +941,10 @@ mod tests {
             ".lh-harness/state",
             "crates/README.md",
             "compat/other/x.json",
+            "sdk/other/x.ts",
+            "sdk/ts-extra/x.ts",
+            "tsconfig.tools.json",
+            "pnpm-lock.yaml",
         ] {
             let plan = plan(&changed(&[path]), &fixture()).expect("plan");
             assert_eq!(plan.selection, Selection::Everything, "{path}");
@@ -908,6 +956,14 @@ mod tests {
     fn allowlisted_paths_select_no_rust_tests() {
         for path in [
             "web/frontend/src/app.ts",
+            "sdk/ts/sdk/src/client.ts",
+            "sdk/ts/shared/src/generated/index.ts",
+            "package.json",
+            "bun.lock",
+            ".bun-version",
+            "eslint.config.js",
+            "tsconfig.json",
+            "tsconfig.base.json",
             "docs/ROADMAP.md",
             ".github/workflows/ci.yml",
             ".claude/skills/gates/SKILL.md",
@@ -968,7 +1024,7 @@ mod tests {
             &changed(&[
                 "docs/knowledge/concepts/session.md",
                 "scripts/tests/test_ci_timings.py",
-                "web/shared/src/index.ts",
+                "sdk/ts/shared/src/index.ts",
                 "Cargo.lock",
             ]),
             &fixture(),
@@ -1066,8 +1122,8 @@ mod tests {
              web/x.ts -> no Rust tests (Bun workspace; xtask only writes its generated \
              bindings, checked by `cargo xtask ts check`)\n\
              selection: pohunek-cli plus their dependents\n\
-             reminder: web changed: also run the Bun gates in web/ (AGENTS.md \"Web workspace \
-             gates\") and `cargo xtask ts check`\n\
+             reminder: TypeScript workspace changed: also run the Bun gates from the repository \
+             root (AGENTS.md \"Web workspace gates\") and `cargo xtask ts check`\n\
              cargo t -E 'rdeps(=pohunek-cli)'\n"
         );
     }

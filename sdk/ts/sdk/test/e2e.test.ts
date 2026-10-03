@@ -21,7 +21,7 @@ import {
 const E2E_ENABLED = process.env["POHUNEK_E2E"] === "1";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(TEST_DIR, "../../..");
+const REPO_ROOT = resolve(TEST_DIR, "../../../..");
 const DEFAULT_DAEMON_BIN = join(REPO_ROOT, "target", "debug", "pohunekd");
 const APP_DIR = "pohunek";
 const SOCKET_NAME = "daemon.sock";

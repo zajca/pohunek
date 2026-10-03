@@ -7,11 +7,11 @@ import {
   resolveRuntimeDir,
   RuntimePathError,
   type RuntimePathContext,
-} from "@pohunek/backend";
+} from "@pohunek/sdk";
 
 const FIXTURE_PATH = resolve(
   dirname(fileURLToPath(import.meta.url)),
-  "../../../crates/paths/fixtures/runtime-paths.json",
+  "../../../../crates/paths/fixtures/runtime-paths.json",
 );
 
 const ENVIRONMENT_KEYS = [
@@ -108,7 +108,7 @@ describe("shared runtime path contract", () => {
   });
 });
 
-describe("backend runtime path resolver", () => {
+describe("SDK runtime path resolver", () => {
   test("agrees with every case of the shared fixture", () => {
     const fixture = readFixture();
     for (const fixtureCase of fixture.cases) {

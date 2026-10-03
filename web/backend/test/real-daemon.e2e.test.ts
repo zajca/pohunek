@@ -6,7 +6,6 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import {
-  MACOS_DEFAULT_RUNTIME_PREFIX,
   loadBackendConfig,
   startBackendFromEnv,
   type BackendHandle,
@@ -24,6 +23,7 @@ import {
   type Request,
   type Subscription,
 } from "@pohunek/sdk/browser";
+import { MACOS_DEFAULT_RUNTIME_PREFIX } from "@pohunek/sdk";
 import { createFixtureRoot, startDurableWorkerFixture } from "@pohunek/testkit";
 
 const E2E_ENABLED = process.env["POHUNEK_E2E"] === "1";

@@ -1,5 +1,5 @@
 {
-  "extends": "../tsconfig.base.json",
+  "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "composite": true,
     "noEmit": false,
@@ -14,10 +14,10 @@
   ],
   "references": [
     {
-      "path": "../shared"
+      "path": "../../sdk/ts/shared"
     },
     {
-      "path": "../sdk"
+      "path": "../../sdk/ts/sdk"
     }
   ]
 }

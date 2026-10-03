@@ -201,8 +201,8 @@ attach traffic to `/daemon/<host>/attach` binary frames. The relay core lives in
 
 ## Regenerating Protocol Types
 
-Generated TypeScript protocol files live under `web/shared/src/generated/**` and
-fixtures live under `web/shared/fixtures/**`. Do not edit them by hand.
+Generated TypeScript protocol files live under `sdk/ts/shared/src/generated/**` and
+fixtures live under `sdk/ts/shared/fixtures/**`. Do not edit them by hand.
 
 From the repository root:
 

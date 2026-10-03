@@ -17,7 +17,29 @@
         "vite": "8.1.5",
       },
     },
-    "backend": {
+    "sdk/ts/sdk": {
+      "name": "@pohunek/sdk",
+      "dependencies": {
+        "@pohunek/protocol": "workspace:*",
+      },
+      "devDependencies": {
+        "@pohunek/backend": "workspace:*",
+        "@pohunek/testkit": "workspace:*",
+      },
+    },
+    "sdk/ts/shared": {
+      "name": "@pohunek/protocol",
+    },
+    "sdk/ts/testkit": {
+      "name": "@pohunek/testkit",
+      "dependencies": {
+        "@pohunek/protocol": "workspace:*",
+      },
+      "devDependencies": {
+        "@pohunek/sdk": "workspace:*",
+      },
+    },
+    "web/backend": {
       "name": "@pohunek/backend",
       "dependencies": {
         "@pohunek/protocol": "workspace:*",
@@ -27,7 +49,7 @@
         "@pohunek/testkit": "workspace:*",
       },
     },
-    "client-core": {
+    "web/client-core": {
       "name": "@pohunek/client-core",
       "dependencies": {
         "@pohunek/protocol": "workspace:*",
@@ -38,7 +60,7 @@
         "@pohunek/testkit": "workspace:*",
       },
     },
-    "frontend": {
+    "web/frontend": {
       "name": "@pohunek/frontend",
       "dependencies": {
         "@pohunek/client-core": "workspace:*",
@@ -53,28 +75,6 @@
         "@types/bun": "1.3.11",
         "svelte-check": "4.7.3",
         "vite": "8.1.5",
-      },
-    },
-    "sdk": {
-      "name": "@pohunek/sdk",
-      "dependencies": {
-        "@pohunek/protocol": "workspace:*",
-      },
-      "devDependencies": {
-        "@pohunek/backend": "workspace:*",
-        "@pohunek/testkit": "workspace:*",
-      },
-    },
-    "shared": {
-      "name": "@pohunek/protocol",
-    },
-    "testkit": {
-      "name": "@pohunek/testkit",
-      "dependencies": {
-        "@pohunek/protocol": "workspace:*",
-      },
-      "devDependencies": {
-        "@pohunek/sdk": "workspace:*",
       },
     },
   },
@@ -129,17 +129,17 @@
 
     "@playwright/test": ["@playwright/test@1.61.1", "", { "dependencies": { "playwright": "1.61.1" }, "bin": { "playwright": "cli.js" } }, "sha512-8nKv6+0RJSL9FE4jYOEGXnPeM/Hg12qZpmqzZjRh3qM0Y7c3z1mrOTfFLids72RDQYVh9WpLEfR5WdpNX4fkig=="],
 
-    "@pohunek/backend": ["@pohunek/backend@workspace:backend"],
+    "@pohunek/backend": ["@pohunek/backend@workspace:web/backend"],
 
-    "@pohunek/client-core": ["@pohunek/client-core@workspace:client-core"],
+    "@pohunek/client-core": ["@pohunek/client-core@workspace:web/client-core"],
 
-    "@pohunek/frontend": ["@pohunek/frontend@workspace:frontend"],
+    "@pohunek/frontend": ["@pohunek/frontend@workspace:web/frontend"],
 
-    "@pohunek/protocol": ["@pohunek/protocol@workspace:shared"],
+    "@pohunek/protocol": ["@pohunek/protocol@workspace:sdk/ts/shared"],
 
-    "@pohunek/sdk": ["@pohunek/sdk@workspace:sdk"],
+    "@pohunek/sdk": ["@pohunek/sdk@workspace:sdk/ts/sdk"],
 
-    "@pohunek/testkit": ["@pohunek/testkit@workspace:testkit"],
+    "@pohunek/testkit": ["@pohunek/testkit@workspace:sdk/ts/testkit"],
 
     "@rolldown/binding-android-arm64": ["@rolldown/binding-android-arm64@1.1.5", "", { "os": "android", "cpu": "arm64" }, "sha512-lZg8fqIv2v7FF237bwMgzGZEJvGL79/s5knJ/i6FmsGF4XXlzccZ4jb+TrFIxtSSxFtIpdsgrPZeMk1I9AFcyQ=="],
 

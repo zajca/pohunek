@@ -4,6 +4,26 @@ import { ClientError } from "./error";
 import type { ConnectOptions } from "./transport";
 import { SocketTransport } from "./transport-socket";
 
+export {
+  APP_DIR,
+  ENV_XDG_RUNTIME_DIR,
+  MACOS_DEFAULT_RUNTIME_PREFIX,
+  RuntimePathError,
+  SOCKET_NAME,
+  SOCKET_PATH_MAX_BYTES,
+  currentRuntimePathContext,
+  resolveDaemonSocket,
+  resolveRuntimeDir,
+  validateSocketPath,
+  verifyDaemonRuntime,
+} from "./runtime-paths";
+export type {
+  RuntimePathContext,
+  RuntimePathFailure,
+  RuntimePathReason,
+  RuntimePlatform,
+} from "./runtime-paths";
+
 const LOCAL_HOST = "local";
 
 /** Connects a client to a daemon over its local Unix socket. */

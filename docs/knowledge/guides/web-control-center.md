@@ -94,7 +94,7 @@ The TypeScript surfaces are:
 - `@pohunek/frontend`: the Svelte control-center SPA.
 - `@pohunek/testkit`: the stateful fixture daemon used by tests and dev mode.
 
-For development, run `bun run dev` from `web/`. It starts two loopback fixture
+For development, run `bun run dev` from the repository root. It starts two loopback fixture
 daemons, the backend with its explicit loopback-development allowance, and the
 Vite frontend. It needs neither a Rust daemon nor NetBird. Bun remains the
 workspace runtime and orchestrates the fixture daemons and backend. The command
@@ -131,8 +131,8 @@ JSON control frames and raw attach bytes; it does not define a second protocol.
 
 ## Runtime paths, logs and macOS
 
-The backend resolves the daemon socket with the same contract as the Rust
-host components (`crates/paths/fixtures/runtime-paths.json` drives both
+The backend resolves the daemon socket (through `@pohunek/sdk`) with the same
+contract as the Rust host components (`crates/paths/fixtures/runtime-paths.json` drives both
 implementations):
 
 - An explicit, valid absolute `XDG_RUNTIME_DIR` selects

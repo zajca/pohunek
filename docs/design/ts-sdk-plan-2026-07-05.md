@@ -9,6 +9,11 @@
 > [#71](https://github.com/zajca/pohunek/issues/71), and
 > [#86](https://github.com/zajca/pohunek/issues/86). The Bun backend remains the
 > supported owner-path WebUI; #86 adds a separate typed team-relay client.
+>
+> **Current location (2026-10-03):** the `web/shared`, `web/sdk`, and
+> `web/testkit` paths named below now live at `sdk/ts/shared`, `sdk/ts/sdk`,
+> and `sdk/ts/testkit` in the repository-root Bun workspace
+> ([#415](https://github.com/zajca/pohunek/issues/415)).
 
 Implements **Track S.3** from [`ROADMAP.md`](../ROADMAP.md) and Slice A items
 3–4 of [`phases/04-browser-control-center.md`](../phases/04-browser-control-center.md):

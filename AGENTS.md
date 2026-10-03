@@ -80,7 +80,8 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
 | `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
-| `web/`            | Bun workspace: generated protocol types, SDK runtime, retained owner-mode WebUI backend/client core/SPA, reusable presentation code, and testkit. |
+| `sdk/ts/`         | TypeScript SDK Bun packages: `shared` (`@pohunek/protocol`, generated types), `sdk` (`@pohunek/sdk` runtime client and runtime-path resolver), and `testkit` (`@pohunek/testkit`). |
+| `web/`            | Retained owner-mode WebUI Bun packages: backend, client core, SPA, reusable presentation code, and release tooling. Shares the repository-root Bun workspace with `sdk/ts/`. |
 
 Other top-level: `compat/` (pinned upstream compatibility locks and sanitized
 goldens), `docs/` (architecture, roadmap, phases, knowledge source), `scripts/`
@@ -133,8 +134,10 @@ constraints and rationale, not live delivery state.
 
 Web workspace gates:
 
+The Bun workspace root is the repository root (`package.json`, `bun.lock`,
+`tsconfig*.json`, `eslint.config.js`), spanning `sdk/ts/*` and the `web/` packages:
+
 ```bash
-cd web
 bun install --frozen-lockfile
 bun run typecheck   # one command: tsc -b source graph + test/frontend/release checks
 bun run lint
@@ -160,11 +163,11 @@ cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
   POHUNEK_CLI_BIN=/absolute/path/to/target/debug/pohunek \
   POHUNEK_PYTHON_BIN=/usr/bin/python3 \
-  bun test sdk/test/e2e.test.ts backend/test/real-daemon.e2e.test.ts
+  bun test sdk/ts/sdk/test/e2e.test.ts web/backend/test/real-daemon.e2e.test.ts
 ```
 
 For control-center development, `bun run dev` starts two fixture daemons, the
-backend, and the Vite frontend from `web/`; it does not require a Rust daemon or
+backend, and the Vite frontend (`web/`); it does not require a Rust daemon or
 NetBird. Bun remains the workspace runtime, but `node` must be available on
 `PATH` because the orchestrator runs Vite in a Node child process for WebSocket
 proxy compatibility; `POHUNEK_NODE_BIN` overrides a nonstandard Node path.
@@ -288,7 +291,7 @@ run too and the fast profile's default filter still applies. It fails safe:
 the root `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.config/nextest.toml`,
 `rust-toolchain*`, lint/format configs, and any path no rule covers run
 everything. Only a reviewed allowlist in `crates/xtask/src/affected.rs` (other
-`web/`, `docs/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
+`web/`, `sdk/ts/`, the root Bun workspace files, `docs/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
 `LICENSE`, `bacon.toml`) selects no Rust tests; when nothing else changed it
 exits 0 without running nextest and names the follow-up checks (`cargo xtask
 docs check`, the `scripts/` unittests, the Bun gates). It narrows only which
@@ -322,13 +325,13 @@ exclusive with `--no-seed`), and a staleness signal that cannot be read keeps
 the seed. Refreshing the main checkout's `target/` is a plain `cargo build
 --workspace --all-targets --all-features` there.
 
-Web (run inside `web/`):
+Web and SDK (run from the repository root):
 
 ```bash
-bun test backend/test/real-daemon.e2e.test.ts    # one test file
-bun test -t "notifications"                      # only tests matching the name pattern
-bun test sdk/test/config.test.ts -t "one case"   # file plus name pattern
-cd sdk && bun run typecheck                      # one package's tsc -b graph
+bun test web/backend/test/real-daemon.e2e.test.ts  # one test file
+bun test -t "notifications"                        # only tests matching the name pattern
+bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # file plus name pattern
+cd sdk/ts/sdk && bun run typecheck                 # one package's tsc -b graph
 ```
 
 Local toolchain: `scripts/dev-bootstrap` checks the tools these loops need

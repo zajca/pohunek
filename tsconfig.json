@@ -10,22 +10,22 @@
   "include": [],
   "references": [
     {
-      "path": "./shared"
+      "path": "./sdk/ts/shared"
     },
     {
-      "path": "./sdk"
+      "path": "./sdk/ts/sdk"
     },
     {
-      "path": "./backend"
+      "path": "./web/backend"
     },
     {
-      "path": "./testkit"
+      "path": "./sdk/ts/testkit"
     },
     {
-      "path": "./client-core"
+      "path": "./web/client-core"
     },
     {
-      "path": "./tsconfig.tools.json"
+      "path": "./web/tsconfig.tools.json"
     }
   ]
 }

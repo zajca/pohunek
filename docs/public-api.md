@@ -233,7 +233,8 @@ that exceed the native Unix-socket limit are errors and are never repaired,
 deleted, or truncated implicitly.
 
 The Rust daemon, CLI, GUI, workers, and hooks use this shared resolver, and the
-Bun owner backend implements the same contract: both are driven by the cases in
+TypeScript SDK (`@pohunek/sdk`, Node entry) implements the same contract for
+the Bun owner backend: both are driven by the cases in
 `crates/paths/fixtures/runtime-paths.json`. The backend additionally accepts
 `POHUNEK_BACKEND_DAEMON_SOCKET`, validated by the same absolute, parent-component
 and native-length rules.
@@ -1935,7 +1936,7 @@ Public exports:
 - Re-export of every symbol from `@pohunek/protocol`, including generated domain
   types, `Methods`, `ProtocolEvent`, `EventName`, `AttachPrelude`,
   `PROTOCOL_VERSION`, `MAX_CONTROL_LINE_BYTES`, `EVENT_NAMES`, and individual
-  event-name constants. Generated files under `web/shared/src/generated/**` are
+  event-name constants. Generated files under `sdk/ts/shared/src/generated/**` are
   refreshed only by `cargo xtask ts generate`, never hand-edited.
 
 Supported runtimes:
