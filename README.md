@@ -19,7 +19,7 @@ over a Unix socket and remotely over a NetBird/WireGuard mesh.
 control center, your own launcher — sits on top of the same versioned protocol.
 pohunek is fully usable from the CLI alone, and the Rust/TypeScript SDKs exist
 precisely so you can **build your own GUI or client** tailored to how you work.
-The native desktop GUI is a separate client that lives in
+The web control center and the native desktop GUI are separate clients that live in
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). See [SDKs and building your own client](#sdks-and-building-your-own-client).
 
 Start Codex, Claude Code, or Hermes Agent on any of your machines, detach, walk away, and
@@ -161,11 +161,10 @@ where they are doing it, and when they need you.
   setup, project configuration, updates, and debugging.
 - **SDKs — build your own GUI or client**: a Rust client crate
   (`pohunek-client`) and TypeScript packages (`@pohunek/protocol`,
-  `@pohunek/sdk`, `@pohunek/backend`, `@pohunek/client-core`,
-  `@pohunek/frontend`, and `@pohunek/testkit`) speak the same versioned
-  newline-delimited JSON protocol every bundled client uses — nothing is private
+  `@pohunek/sdk`, and `@pohunek/testkit`) speak the same versioned
+  newline-delimited JSON protocol every client uses — nothing is private
   to any one client. Browsers use the node-free `@pohunek/sdk/browser` entry through
-  the backend's WebSocket tunnels. TS protocol types are generated from the Rust
+  a WebSocket relay. TS protocol types are generated from the Rust
   source of truth. If the bundled clients do not fit your workflow, wire up your
   own control plane on these SDKs instead of forking one.
 
@@ -214,23 +213,16 @@ x86_64 Linux with both glibc and MUSL. Every
 archive contains its license and offline documentation under `docs/offline/`.
 Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
 `packaging/install-daemon.sh` wrapper around `pohunek service install`.
-Every CLI, daemon, relay, and web archive is packed deterministically
+Every CLI, daemon, and relay archive is packed deterministically
 (members sorted, root-owned, stamped with the tagged commit time) and carries a
-`MANIFEST` with the SHA-256 of every member; the daemon and web installers verify
+`MANIFEST` with the SHA-256 of every member; the daemon installer verifies
 it, the host OS and architecture, and member permissions before they run or
 change anything.
-
-Releases also publish `pohunek-web-*-linux-x86_64.tar.gz`: a standalone web
-control-center backend with Bun embedded, its compiled SPA, and a user-service
-installer. It runs beside a compatible local `pohunekd`; unpack it, run
-`./install.sh`, configure the required NetBird bind address and port in
-`~/.config/pohunek/backend.env`, then enable `pohunek-backend.service`. See the
-archive's `README.md` for the complete commands.
 
 macOS on Apple Silicon (macOS 14 or newer) is not yet a published platform:
 public macOS support is declared only when the final native acceptance gate
 (#105) passes. The release workflow already builds the `aarch64-apple-darwin`
-CLI, daemon, and web archives, signs them with a Developer ID
+CLI and daemon archives, signs them with a Developer ID
 Application certificate, has Apple notarize them, and verifies the result, but
 only when the protected `macos-signing` credentials exist (see "Release" below);
 without them the macOS jobs fail and nothing macOS is published. A build made
@@ -243,7 +235,7 @@ Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
 
 Protocol v2 was a one-time coordinated pre-1.0 boundary. Before that M1
-transition, every CLI, web backend/SDK, custom client, and local or remote
+transition, every CLI, SDK, custom client, and local or remote
 daemon had to cross together. The legacy integer-v1 envelope and fixed
 `codex`/`claude` notification-policy fields have no compatibility shim. Once a
 fleet is on v2, peers negotiate their highest overlap: M2 and this M3 plugin do
@@ -587,57 +579,6 @@ automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 `hermes`; explicit Hermes selection still requires the supported runtime on the
 selected host.
 
-## Web control center
-
-The optional web control center serves one Svelte SPA for host and session
-status, session lifecycle, live notifications, and in-browser terminal attach.
-`@pohunek/backend` discovers daemons through its local `pohunekd` and exposes
-the existing protocol as transparent WebSocket tunnels; it holds no
-authoritative session state, and the CLI remains independent.
-The owner WebUI keeps this transparent behavior for the additive safe
-`host.governance.inspect` method; it does not add a governance UI, team mode,
-or relay-local fallback.
-
-The workspace is a persistent session-first shell. Its rail groups sessions by
-project, promotes blocked work into an Attention section, searches and filters
-across every host, and keeps compact host connectivity visible without making
-hosts the primary navigation. Selecting a running session attaches its terminal
-in the main pane while the rail remains available. Session metadata and stop
-actions live in an inspector drawer; the terminal toolbar can rename, stop,
-resume, fork, or permanently remove eligible sessions. Observed external
-sessions remain read-only. New-session and Inbox flows are overlays, and opening
-a session notification marks it read and selects its terminal.
-
-A host-scoped Projects screen registers repositories by absolute daemon-host
-path, renames or removes project records, shows live worktrees, and removes an
-eligible Pohunek-owned worktree after explicit confirmation. The daemon remains
-authoritative for worktree ownership, live-session, and pruning safeguards.
-
-Keyboard controls are available outside form fields and terminals: `Ctrl+K`
-opens the command palette, `Ctrl+B` toggles the session rail, `n` starts a
-session, `i` opens the Inbox, `b` cycles blocked sessions, `/` focuses session
-search, and `j`/`k` or the arrow keys move focus through the rail before
-`Enter` opens the focused session. `Esc` closes the active overlay. Unmodified
-shortcuts never intercept input inside the embedded terminal.
-
-On mobile and short touch viewports, the session rail becomes an off-canvas
-drawer so the terminal owns the screen. The terminal follows the visual
-viewport when the software keyboard opens and provides a touch toolbar for
-keyboard focus, Escape, Tab, one-shot Control and Alt modifiers, Control-C,
-and the arrow keys. Mobile overlays use the full viewport, controls provide
-44-pixel touch targets, and safe-area insets are respected in portrait and
-landscape orientations.
-
-For local UI development with two fixture daemons, run `bun run dev` from
-the repository root; no Rust daemon or NetBird setup is required. Bun remains the workspace
-runtime, while the development orchestrator locates Node (`POHUNEK_NODE_BIN`, then
-`PATH`, then the Homebrew and installer prefixes on macOS) to run Vite's
-WebSocket proxy in a compatible Node child process. A
-deployed backend binds only to a NetBird address (loopback requires the explicit
-development flag; wildcard binds are rejected). The supplied systemd user unit
-and its environment file instructions are in
-`web/backend/systemd/pohunek-backend.service`.
-
 ## SDKs and building your own client
 
 pohunek's real interface is its **protocol**, not any one client. The CLI, the
@@ -657,10 +598,8 @@ entirely through this surface.
   the source of truth for every request, response, and event type.
 - **TypeScript** — `@pohunek/protocol` (types generated from the Rust protocol),
   `@pohunek/sdk` (Bun/Node plus shared runtime), its browser-safe
-  `@pohunek/sdk/browser` entry, `@pohunek/backend` (host discovery, static SPA,
-  and transparent WebSocket tunnels), `@pohunek/client-core` (headless
-  multi-host state), `@pohunek/frontend` (the Svelte SPA), and
-  `@pohunek/testkit` (the stateful fixture daemon used by tests and dev mode).
+  `@pohunek/sdk/browser` entry, and `@pohunek/testkit` (the stateful fixture
+  daemon and loopback test relay used by tests).
 - **Contract** — the wire surface is documented in
   [`docs/public-api.md`](docs/public-api.md); TS types are regenerated from
   Rust so the two SDKs never drift. The protocol is versioned, but pre-1.0 it
@@ -677,8 +616,8 @@ the examples use `POHUNEK_SOCKET` rather than reconstructing a Linux-only path.
 With an explicit `XDG_RUNTIME_DIR`, Pohunek uses its `pohunek` child on Linux and
 macOS. Linux requires that variable, while macOS without it uses
 `/private/tmp/pohunek-<effective-uid>` and ignores `TMPDIR` for this decision.
-The Bun owner backend derives the same default and checks the runtime directory
-before connecting; `POHUNEK_BACKEND_DAEMON_SOCKET` overrides it.
+`@pohunek/sdk` derives the same default and checks the runtime directory
+before connecting.
 
 ```rust
 // Rust — `pohunek-client`
@@ -716,7 +655,7 @@ for (const s of sessions) {
 await client.close();
 ```
 
-Browsers use the node-free entry and reach a daemon through the backend origin:
+Browsers use the node-free entry and reach a daemon through a WebSocket relay origin:
 
 ```ts
 import { Client } from "@pohunek/sdk/browser";
@@ -724,7 +663,7 @@ import { Client } from "@pohunek/sdk/browser";
 const client = await Client.connectWs(window.location.origin, "workstation");
 ```
 
-Or subscribe to the same live event stream the CLI and web clients consume — session
+Or subscribe to the same live event stream the CLI and other clients consume — session
 lifecycle, agent state, and notifications, decoded into typed events:
 
 ```rust
@@ -788,7 +727,7 @@ pohunek is built for **one operator on machines they own**:
 ## Development
 
 The workspace is a Cargo monorepo (edition 2021, MSRV 1.96) plus a Bun
-workspace (rooted at the repository root, spanning `sdk/ts/*` and `web/*`) for the TypeScript packages.
+workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScript packages.
 
 | Crate | Role |
 |-------|------|
@@ -806,7 +745,6 @@ workspace (rooted at the repository root, spanning `sdk/ts/*` and `web/*`) for t
 | `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
 | `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
 | `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
-| `web/` | `@pohunek/backend`, `@pohunek/client-core`, `@pohunek/frontend`. |
 
 Read **[AGENTS.md](AGENTS.md)** first — it is the canonical contributor guide.
 Authoritative design lives in [docs/architecture.md](docs/architecture.md);
@@ -827,7 +765,7 @@ cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbook
 ```
 
 Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see
-`AGENTS.md` "Fast loops" for web, watcher, and CI-timing variants):
+`AGENTS.md` "Fast loops" for watcher, and CI-timing variants):
 
 ```bash
 cargo t                        # all fast unit + integration tests, no PTY/DB fixtures
@@ -868,7 +806,7 @@ times separately from compile/setup time; validating the 90%-of-changes target
 requires representative CI history. When adding a costly fixture, update the
 cost filter, run the partition coverage check, and measure the fast loop again.
 
-Web workspace:
+SDK workspace:
 
 ```bash
 bun install --frozen-lockfile
@@ -876,9 +814,9 @@ bun run typecheck && bun run lint && bun test
 ```
 
 `bun run typecheck` is one command: `tsc -b` over the composite (source-only)
-`protocol → sdk → backend/testkit → client-core/tools` graph (incremental via
-`.tsbuildinfo` in each `dist-types/`), then the standalone checks — `frontend`
-(`svelte-check`), `release-test`, and the per-package `test/tsconfig.json`
+`protocol → sdk → testkit` graph (incremental via
+`.tsbuildinfo` in each `dist-types/`), then the standalone checks — the SDK
+release scripts and the per-package `test/tsconfig.json`
 projects — run concurrently. Tests stay out of the composite graph because
 their imports of sibling packages resolve to `.ts` sources and would otherwise
 be pulled into non-referenced projects (and form reference cycles). Each
@@ -927,9 +865,8 @@ cargo xtask ts check      # CI gate
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
 Release workflow re-runs the gates on the tag, then builds and publishes glibc
-and MUSL x86_64 CLI and daemon archives, a
-self-contained Linux x86_64 web-control-center archive, and signed, notarized
-`aarch64-apple-darwin` CLI, daemon, and web archives. The macOS
+and MUSL x86_64 CLI and daemon archives, and signed, notarized
+`aarch64-apple-darwin` CLI and daemon archives. The macOS
 build runs without secrets; a separate signing job on a fresh runner runs in the protected `macos-signing` environment (secrets
 `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
 `APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,

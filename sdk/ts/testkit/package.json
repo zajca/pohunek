@@ -13,6 +13,11 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./bun-relay": {
+      "types": "./src/bun-relay.ts",
+      "import": "./src/bun-relay.ts",
+      "default": "./src/bun-relay.ts"
     }
   },
   "types": "./src/index.ts",

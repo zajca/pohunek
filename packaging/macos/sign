@@ -11,9 +11,7 @@
 # notarization requires. Bare binaries get the stable identifier
 # `io.github.zajca.pohunek.<file name>`; an app bundle is signed after its
 # executable and takes its identifier from its Info.plist. No entitlement is
-# requested unless `packaging/macos/entitlements/<file name>.plist` exists: the
-# Bun runtime inside `pohunek-web` needs the JIT entitlements Bun documents for
-# signed standalone executables.
+# requested unless `packaging/macos/entitlements/<file name>.plist` exists.
 
 set -eu
 

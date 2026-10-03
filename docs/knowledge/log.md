@@ -8,6 +8,12 @@
   runbook parts. The native GUI is developed in `zajca/pohunek-work`; the public
   API reference lists it as an external client and names the core tests that
   cover `host.discover`, `subscribe`, and `worktree.remove`.
+- Removed the web control center from the bundle: the web control center guide
+  is replaced by the TypeScript SDK guide (package surfaces, WebSocket relay
+  transport contract, loopback test relay, runtime paths), and the macOS
+  install and update runbooks, the concept pages, the remote-hosts guide, and
+  the source map no longer describe the web backend or its archive. The web
+  control center is developed in `zajca/pohunek-work`.
 - Documented the owner backend's optional rotating owner-private log files
   (`POHUNEK_BACKEND_LOG_DIR` and its limits, failure fallback, torn-line
   recovery, repair at open, startup failures recorded in the files).

@@ -21,7 +21,7 @@ be updated.
 Pohunek will support a Mac as a first-class owner host and client without
 weakening its owner-first, direct-overlay, or PTY/TUI-first architecture. The
 complete release includes the CLI, daemon, independent session workers, native
-Iced GUI, retained owner WebUI, Codex, Claude Code, the pinned Hermes runtime,
+Iced GUI, owner WebUI (an external client in `zajca/pohunek-work`), Codex, Claude Code, the pinned Hermes runtime,
 and direct communication with Linux hosts over a configured overlay.
 
 The release targets native `aarch64-apple-darwin` artifacts without a Rosetta
@@ -335,8 +335,13 @@ notifications, browser, and clipboard integration. The GUI keeps the existing
 headless `gui-core` split.
 
 The owner WebUI remains the Bun gateway with private binding, origin,
-WebSocket, and reconnect protections. Release artifacts are native, signed, and
-notarized. Gatekeeper verification, upgrades with live sessions, and uninstall
+WebSocket, and reconnect protections, but its code, packaging, and acceptance
+are owned by `zajca/pohunek-work` ([#415](https://github.com/zajca/pohunek/issues/415)).
+This repository ships the daemon protocol, the `WsTransport` SDK client, and a
+loopback test relay in `@pohunek/testkit/bun-relay`; it does not ship the web
+gateway or SPA. Core release artifacts are native, signed, and notarized, and
+`zajca/pohunek-work` signs and notarizes the web and native GUI artifacts it
+publishes. Gatekeeper verification, upgrades with live sessions, and uninstall
 behavior are part of release acceptance, not follow-up polish.
 
 ## Dependency and target audit
@@ -375,7 +380,8 @@ The final gate exercises local create/attach/input/resize/stop, terminal and UI
 closure, graceful and forced daemon restart, upgrade, worker failure isolation,
 PID reuse, forged identity reports, unsafe paths, concurrent installers, disk
 failures, logout/reboot, sleep/wake, NetBird outage and reconnection, native GUI,
-owner WebUI, all supported agents, and install/upgrade/uninstall with live
+owner WebUI (accepted in `zajca/pohunek-work` against this repository's release),
+all supported agents, and install/upgrade/uninstall with live
 sessions. It records OS, architecture, hardware, deadlines, and resource use,
 including at least 20 concurrent sessions and five simultaneous attaches.
 

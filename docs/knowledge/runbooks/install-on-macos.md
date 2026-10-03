@@ -2,7 +2,7 @@
 type: Runbook
 id: runbook/install-on-macos
 title: Install, upgrade, and remove Pohunek on macOS
-description: Install the daemon and owner web backend on Apple Silicon from release archives, upgrade without losing sessions, roll back, uninstall, and handle Gatekeeper.
+description: Install the daemon on Apple Silicon from release archives, upgrade without losing sessions, roll back, uninstall, and handle Gatekeeper.
 source_kind: manual
 intents: [setup, update, debug, help]
 since: 0.31.6
@@ -24,7 +24,6 @@ Everything runs as the logged-in owner: no `sudo`, no root service.
 |---------|----------|--------------|
 | `pohunek-cli-<v>-aarch64-apple-darwin` | `pohunek`, completions, offline docs | copy the binary onto `PATH` |
 | `pohunek-daemon-<v>-aarch64-apple-darwin` | `pohunek`, `pohunekd`, `pohunek-sessiond`, `packaging/install-daemon.sh` | `packaging/install-daemon.sh` |
-| `pohunek-web-<v>-aarch64-apple-darwin` | owner web backend, SPA, `install.sh` | `./install.sh` |
 
 Every archive carries a `MANIFEST` (component, version, target, signing state,
 SHA-256 of each member) next to a `.sha256` of the archive itself. The installers
@@ -89,29 +88,13 @@ Stop only the daemon agent with `launchctl bootout gui/$(id -u)/io.github.zajca.
 workers keep running, and `pohunek service status` shows them. Never boot out the
 whole `gui/$(id -u)` domain: that ends every worker.
 
-## Owner web backend (optional)
-
-From the web archive, with the daemon installed:
-
-```bash
-./install.sh
-```
-
-The first run creates `~/.config/pohunek/backend.env`. Set the NetBird bind
-address and a port, run `./install.sh` again, and the installer registers the
-agent `io.github.zajca.pohunek.<ns>.backend`. It is a separate client service:
-installing, updating, or removing it never touches the daemon or any session.
-Re-run it after each edit of `backend.env`. Remove it with `./install.sh --uninstall`,
-which keeps `backend.env` and the logs. See the
-[web control center guide](../guides/web-control-center.md).
-
 ## Upgrade
 
 Extract the new daemon archive and run its installer again. It runs
 `pohunek service upgrade`, which stages the new versioned directory, probes every
 binary, and then restarts only the daemon agent. Live workers keep their process,
 PTY, and child, and keep running from the version directory they started in; that
-directory stays installed until no worker references it. Update the web backend from its own archive. Components that talk to each other must cross a
+directory stays installed until no worker references it. Components that talk to each other must cross a
 protocol boundary together; see
 [update after release](update-after-release.md).
 
@@ -145,14 +128,12 @@ refuses while sessions are live and names them; end them yourself, or accept the
 destructive path explicitly with `pohunek service uninstall --stop-sessions`. The
 default keeps the durable host identity, governance keys, session history, and
 worktrees. `pohunek service uninstall --purge` additionally removes the session
-store, event logs, worker journals, and host identity: it is never implicit. Remove the web backend with `./install.sh --uninstall`.
+store, event logs, worker journals, and host identity: it is never implicit.
 
 ## Logs
 
 - Daemon and worker launchd output: `~/.local/state/pohunek/logs/launchd/`.
 - Daemon structured logs: `~/.local/state/pohunek/logs/`.
-- Web backend: `~/.local/state/pohunek/web-logs/pohunek-backend.jsonl` (rotating,
-  owner-private), `launchd.stderr` in the same directory for a startup failure.
 - Worker definitions: `~/.local/state/pohunek/launchd/` (owner-private).
 
 ## Logout, reboot, sleep

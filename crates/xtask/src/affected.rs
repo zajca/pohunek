@@ -23,7 +23,7 @@
 //!
 //! This is an inner-loop accelerator. It never replaces the full gate set.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-03
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -113,7 +113,7 @@ enum Effect {
 enum Reminder {
     DocsCheck,
     ScriptTests,
-    WebGates,
+    SdkGates,
 }
 
 impl Reminder {
@@ -125,8 +125,8 @@ impl Reminder {
             Self::ScriptTests => {
                 format!("scripts changed: also run `{SCRIPT_TESTS_COMMAND}`")
             }
-            Self::WebGates => "TypeScript workspace changed: also run the Bun gates from the \
-                               repository root (AGENTS.md \"Web workspace gates\") and \
+            Self::SdkGates => "SDK workspace changed: also run the Bun gates from the \
+                               repository root (AGENTS.md \"SDK workspace gates\") and \
                                `cargo xtask ts check`"
                 .to_owned(),
         }
@@ -232,45 +232,39 @@ const RULES: &[Rule] = &[
     ),
     // Reviewed non-Rust paths. More specific rules above take precedence.
     reminding(
-        Pattern::Dir("web"),
-        Effect::NoRustTests,
-        &[Reminder::WebGates],
-        "Bun workspace; xtask only writes its generated bindings, checked by `cargo xtask ts check`",
-    ),
-    reminding(
         Pattern::Dir("sdk/ts"),
         Effect::NoRustTests,
-        &[Reminder::WebGates],
+        &[Reminder::SdkGates],
         "Bun workspace; xtask only writes its generated bindings, checked by `cargo xtask ts check`",
     ),
     reminding(
         Pattern::File("package.json"),
         Effect::NoRustTests,
-        &[Reminder::WebGates],
+        &[Reminder::SdkGates],
         "Bun workspace root manifest; read only by the Bun gates",
     ),
     reminding(
         Pattern::File("bun.lock"),
         Effect::NoRustTests,
-        &[Reminder::WebGates],
+        &[Reminder::SdkGates],
         "Bun workspace lockfile; read only by the Bun gates",
     ),
     reminding(
         Pattern::File(".bun-version"),
         Effect::NoRustTests,
-        &[Reminder::WebGates],
+        &[Reminder::SdkGates],
         "Bun version pin; read only by the Bun gates",
     ),
     reminding(
         Pattern::File("eslint.config.js"),
         Effect::NoRustTests,
-        &[Reminder::WebGates],
+        &[Reminder::SdkGates],
         "ESLint configuration of the Bun workspace",
     ),
     reminding(
         Pattern::RootPrefix("tsconfig"),
         Effect::NoRustTests,
-        &[Reminder::WebGates],
+        &[Reminder::SdkGates],
         "TypeScript configuration of the Bun workspace",
     ),
     reminding(
@@ -944,7 +938,6 @@ mod tests {
     #[test]
     fn allowlisted_paths_select_no_rust_tests() {
         for path in [
-            "web/frontend/src/app.ts",
             "sdk/ts/sdk/src/client.ts",
             "package.json",
             "bun.lock",
@@ -1022,7 +1015,7 @@ mod tests {
             BTreeSet::from([
                 Reminder::DocsCheck,
                 Reminder::ScriptTests,
-                Reminder::WebGates
+                Reminder::SdkGates
             ])
         );
         let report = render_report("main", &plan, None);
@@ -1098,19 +1091,22 @@ mod tests {
 
     #[test]
     fn report_lists_a_reason_per_file() {
-        let plan =
-            plan(&changed(&["crates/cli/src/lib.rs", "web/x.ts"]), &fixture()).expect("plan");
+        let plan = plan(
+            &changed(&["crates/cli/src/lib.rs", "sdk/ts/x.ts"]),
+            &fixture(),
+        )
+        .expect("plan");
         let args = nextest_args(&plan.selection, &[]);
         let report = render_report("origin/main", &plan, args.as_deref());
         assert_eq!(
             report,
             "base: origin/main\n\
              crates/cli/src/lib.rs -> pohunek-cli (package directory)\n\
-             web/x.ts -> no Rust tests (Bun workspace; xtask only writes its generated \
+             sdk/ts/x.ts -> no Rust tests (Bun workspace; xtask only writes its generated \
              bindings, checked by `cargo xtask ts check`)\n\
              selection: pohunek-cli plus their dependents\n\
-             reminder: TypeScript workspace changed: also run the Bun gates from the repository \
-             root (AGENTS.md \"Web workspace gates\") and `cargo xtask ts check`\n\
+             reminder: SDK workspace changed: also run the Bun gates from the repository \
+             root (AGENTS.md \"SDK workspace gates\") and `cargo xtask ts check`\n\
              cargo t -E 'rdeps(=pohunek-cli)'\n"
         );
     }

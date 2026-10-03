@@ -1,6 +1,12 @@
+// Bun-only entry point, published as `@pohunek/testkit/bun-relay`: the root
+// `@pohunek/testkit` entry runs on Node and Bun, this one needs `Bun.serve`.
+// Loopback-only WebSocket relay for SDK transport tests. It speaks the relay
+// framing the SDK `WsTransport` implements: `/daemon/<host>/control` carries
+// newline-free text frames, `/daemon/<host>/attach` carries binary frames, and
+// each socket is tunnelled to one daemon target over a real connection.
+
 import { createConnection, type Socket } from "node:net";
 import { MAX_CONTROL_LINE_BYTES } from "@pohunek/protocol";
-import { validateRelayBindAddr } from "./bind";
 
 export type DaemonTarget =
   | { readonly kind: "unix"; readonly socketPath: string }
@@ -10,15 +16,14 @@ export type DaemonTargetSource =
   | ReadonlyMap<string, DaemonTarget>
   | ((host: string) => DaemonTarget | undefined | Promise<DaemonTarget | undefined>);
 
-export interface StartRelayOptions {
+export interface StartTestRelayOptions {
+  // Must be a loopback address; the test relay refuses every other bind.
   readonly bindHost: string;
   readonly port: number;
   readonly targets: DaemonTargetSource;
-  readonly allowLoopbackBind?: boolean;
-  readonly httpHandler?: (request: Request) => Response | Promise<Response>;
 }
 
-export interface RelayHandle {
+export interface TestRelayHandle {
   readonly url: string;
   readonly port: number;
   close(): Promise<void>;
@@ -88,6 +93,8 @@ const UNSUPPORTED_DATA_CLOSE_CODE = 1003;
 const INVALID_TEXT_CLOSE_CODE = 1007;
 const POLICY_CLOSE_CODE = 1008;
 const INTERNAL_CLOSE_CODE = 1011;
+const IPV4_OCTET_COUNT = 4;
+const MAX_IPV4_OCTET = 255;
 const LINE_FEED = 0x0a;
 const CONTROL_FRAME_DELIMITER = Uint8Array.of(LINE_FEED);
 
@@ -109,12 +116,9 @@ const RESPONSE_TARGET_UNAVAILABLE = new Response("relay target unavailable", { s
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
 
-export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
+export function startTestRelay(options: StartTestRelayOptions): Promise<TestRelayHandle> {
   try {
-    validateRelayBindAddr(
-      options.bindHost,
-      options.allowLoopbackBind === undefined ? {} : { allowLoopback: options.allowLoopbackBind },
-    );
+    assertLoopbackBind(options.bindHost);
     const bun = bunRuntime();
     const targetForHost = targetResolver(options.targets);
 
@@ -124,7 +128,7 @@ export function startRelay(options: StartRelayOptions): Promise<RelayHandle> {
       async fetch(request, upgradeServer): Promise<Response | undefined> {
         const route = parseRelayRoute(request.url);
         if (route === undefined) {
-          return await options.httpHandler?.(request) ?? RESPONSE_NOT_FOUND;
+          return RESPONSE_NOT_FOUND;
         }
         if (!isWebSocketUpgrade(request)) {
           return RESPONSE_UPGRADE_REQUIRED;
@@ -313,7 +317,7 @@ function logRelayError(data: RelayWebSocketData, context: string, error: unknown
   console.error(
     JSON.stringify({
       level: "error",
-      component: "pohunek-relay",
+      component: "pohunek-test-relay",
       host: data.host,
       mode: data.mode,
       context,
@@ -462,10 +466,32 @@ function targetResolver(
     : (host: string): Promise<DaemonTarget | undefined> => Promise.resolve(source.get(host));
 }
 
+const IPV4_LOOPBACK_PREFIX = "127.";
+const IPV6_LOOPBACK_HOST = "::1";
+
+// The test relay carries unauthenticated daemon traffic, so it only ever binds
+// to loopback. Production bind policy belongs to the relay's real host.
+function assertLoopbackBind(bindHost: string): void {
+  const host = bindHost.replace(/^\[|\]$/gu, "");
+  const isIpv4Loopback =
+    host.startsWith(IPV4_LOOPBACK_PREFIX) && isIpv4Literal(host);
+  if (!isIpv4Loopback && host !== IPV6_LOOPBACK_HOST) {
+    throw new Error(`the test relay only binds to loopback addresses, got "${bindHost}"`);
+  }
+}
+
+function isIpv4Literal(host: string): boolean {
+  const octets = host.split(".");
+  return (
+    octets.length === IPV4_OCTET_COUNT &&
+    octets.every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) <= MAX_IPV4_OCTET)
+  );
+}
+
 function bunRuntime(): BunRuntime {
   const runtime = (globalThis as typeof globalThis & { Bun?: BunRuntime }).Bun;
   if (runtime === undefined) {
-    throw new Error("@pohunek/backend requires the Bun runtime");
+    throw new Error("@pohunek/testkit/bun-relay is Bun-only: run it under Bun (Bun.serve is unavailable)");
   }
   return runtime;
 }

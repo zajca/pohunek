@@ -37,7 +37,7 @@ no local `NEXT.md` is written.
    the real code, not assumptions.
 3. **Frame the phase.** State what this phase is for and where it sits in the
    roadmap. List the key assumptions explicitly. Respect the repo's hard
-   constraints (owner-first direct operation, owner WebUI, additive optional
+   constraints (owner-first direct operation, owner browser path, additive optional
    relay, PTY/TUI-first, remote over NetBird not SSH, providers shell-out and
    client-only, no back-compat shims).
 4. **Resolve open questions — one at a time.** This is the core of the skill and

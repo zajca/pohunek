@@ -34,7 +34,7 @@ signing=$5
 minimum_macos=${6:-}
 
 case $component in
-    cli | daemon | relay | web) ;;
+    cli | daemon | relay) ;;
     *) fail "unsupported component: $component" ;;
 esac
 case $version in

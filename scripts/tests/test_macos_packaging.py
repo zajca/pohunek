@@ -30,7 +30,6 @@ SCRIPTS = [
     ROOT / "packaging" / "archive",
     ROOT / "packaging" / "stage-archive",
     ROOT / "packaging" / "write-manifest",
-    ROOT / "web" / "release" / "install.sh",
     ROOT / "scripts" / "acceptance" / "macos-package-install",
 ]
 
@@ -181,15 +180,6 @@ class AuditTest(unittest.TestCase):
         result = self.audit(self.binary("path", strings="/opt/homebrew/bin\n/usr/local/bin\n/Volumes\n"))
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_the_string_scan_can_be_skipped_for_a_third_party_runtime(self):
-        path = self.binary("bun", strings="/Users/runner/work/bun/bun/src/x.zig\n")
-        self.assertEqual(self.audit(path).returncode, 1)
-        result = self.audit("--no-string-scan", path)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        # Every other check still applies.
-        bad = self.binary("bun-x86", archs="x86_64")
-        self.assertEqual(self.audit("--no-string-scan", bad).returncode, 1)
-
     def test_extra_forbidden_strings_apply(self):
         path = self.binary("extra", strings="/build/checkout/crates/x.rs\n")
         self.assertEqual(self.audit(path).returncode, 0)
@@ -308,16 +298,10 @@ class ToolingTest(unittest.TestCase):
             self.assertTrue(script.read_text().startswith(("#!/bin/sh\n", "#!/usr/bin/env sh\n")), script)
 
     def test_the_bash_scripts_parse_as_bash(self):
-        for script in (MACOS / "signing-keychain", ROOT / "web" / "release" / "package.sh"):
+        for script in (MACOS / "signing-keychain",):
             self.assertTrue(os.stat(script).st_mode & stat.S_IXUSR, script)
             result = subprocess.run(["bash", "-n", str(script)], stderr=subprocess.PIPE, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_the_audit_can_skip_the_string_scan_for_third_party_runtimes(self):
-        text = (MACOS / "audit-macho").read_text()
-        self.assertIn("--no-string-scan", text)
-        package = (MACOS / "package").read_text()
-        self.assertIn('web) require="--require pohunek-web --no-string-scan"', package)
 
     def test_the_deployment_target_is_one_value(self):
         target = (MACOS / "DEPLOYMENT_TARGET").read_text().strip()

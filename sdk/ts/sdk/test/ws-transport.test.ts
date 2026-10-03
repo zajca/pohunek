@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { describe, expect, test } from "bun:test";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
-import { startRelay, type DaemonTarget, type RelayHandle } from "@pohunek/backend";
+import { startTestRelay, type DaemonTarget, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 import {
   Client,
   ClientError,
@@ -30,7 +30,7 @@ const SLOW_CLIENT_READ_DELAY_MS = 1;
 
 interface RelayFixture {
   daemon: MockDaemon;
-  relay: RelayHandle;
+  relay: TestRelayHandle;
   client(requestTimeoutMs?: number): Promise<Client>;
   raw(): Promise<RawStream>;
   attach(streamId: string): Promise<RawStream>;
@@ -349,10 +349,9 @@ describe("WebSocket transport through relay", () => {
   });
 
   test("unreachable relay rejects connectWs with the host_unreachable taxonomy", async () => {
-    const relay = await startRelay({
+    const relay = await startTestRelay({
       bindHost: "127.0.0.1",
       port: 0,
-      allowLoopbackBind: true,
       targets: new Map([[RELAY_HOST, { kind: "unix", socketPath: "/tmp/pohunek-sdk-missing.sock" }]]),
     });
     const url = relay.url;
@@ -370,10 +369,9 @@ async function startRelayFixture(steps: Parameters<typeof startUnixDaemon>[0]): 
   const daemon = await startUnixDaemon(steps);
   try {
     const target = daemonTarget(daemon);
-    const relay = await startRelay({
+    const relay = await startTestRelay({
       bindHost: "127.0.0.1",
       port: 0,
-      allowLoopbackBind: true,
       targets: new Map([[RELAY_HOST, target]]),
     });
     return {
