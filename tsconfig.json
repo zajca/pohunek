@@ -16,16 +16,7 @@
       "path": "./sdk/ts/sdk"
     },
     {
-      "path": "./web/backend"
-    },
-    {
       "path": "./sdk/ts/testkit"
-    },
-    {
-      "path": "./web/client-core"
-    },
-    {
-      "path": "./web/tsconfig.tools.json"
     }
   ]
 }
