@@ -325,8 +325,12 @@ jobs:
         with:
           bun-version: 1.3.11
 
-      # The pack script uses only Bun/Node built-ins, so no `bun install` runs
-      # here. The asset base URL is where this very release serves its files.
+      # The pack script compiles each package with the workspace's locked
+      # TypeScript and `@types/*`, so the lockfile is installed first.
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      # The asset base URL is where this very release serves its files.
       - name: Pack SDK tarballs
         shell: bash
         env:
