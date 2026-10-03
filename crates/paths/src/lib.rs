@@ -21,10 +21,8 @@ pub const SOCKET_NAME: &str = "daemon.sock";
 pub const LOCK_NAME: &str = "daemon.lock";
 /// Structured log subdirectory under the app state directory.
 pub const LOGS_SUBDIR: &str = "logs";
-/// Launcher script subdirectory under the app data directory.
+/// Executable subdirectory under an installation prefix.
 pub const BIN_SUBDIR: &str = "bin";
-/// Sway config directory name under `XDG_CONFIG_HOME`.
-pub const SWAY_CONFIG_DIR: &str = "sway";
 /// Assistant knowledge cache subdirectory under the app cache directory.
 pub const KNOWLEDGE_CACHE_SUBDIR: &str = "knowledge";
 /// Assistant runtime subdirectory under the app runtime directory.
@@ -378,18 +376,6 @@ impl BasePaths {
             config_dir,
             platform,
         })
-    }
-
-    /// Directory containing materialized launcher scripts.
-    #[must_use]
-    pub fn launcher_bin_dir(&self) -> PathBuf {
-        self.data_dir.join(BIN_SUBDIR)
-    }
-
-    /// User sway config directory.
-    #[must_use]
-    pub fn sway_config_dir(&self) -> PathBuf {
-        self.config_home.join(SWAY_CONFIG_DIR)
     }
 
     /// Directory where assistant knowledge bundles are cached.

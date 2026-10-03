@@ -84,18 +84,6 @@ impl Paths {
         })
     }
 
-    /// Directory the launcher scripts are materialized into by `pohunek setup scripts`.
-    #[must_use]
-    pub fn launcher_bin_dir(&self) -> PathBuf {
-        self.data_dir.join(pohunek_paths::BIN_SUBDIR)
-    }
-
-    /// The user's sway config dir (`<config_home>/sway`).
-    #[must_use]
-    pub fn sway_config_dir(&self) -> PathBuf {
-        self.config_home.join(pohunek_paths::SWAY_CONFIG_DIR)
-    }
-
     /// Directory where assistant knowledge bundles are cached.
     #[must_use]
     pub fn assistant_bundle_cache_dir(&self) -> PathBuf {

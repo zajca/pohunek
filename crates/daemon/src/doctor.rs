@@ -63,15 +63,11 @@ fn standard_checks(
     worker: Option<&WorkerCandidate>,
     supervision: Supervision,
 ) -> Vec<DoctorCheck> {
-    let launcher_bin_dir = paths.launcher_bin_dir();
-    let sway_config_dir = paths.sway_config_dir();
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
     hostcheck::standard_checks(StandardCheckInputs {
         socket_dir: &paths.runtime_dir,
         state_dir: &paths.data_dir,
         log_dir: &paths.log_dir,
-        launcher_bin_dir: &launcher_bin_dir,
-        sway_config_dir: &sway_config_dir,
         config_dir: &paths.config_dir,
         home_dir: home_dir.as_deref(),
         effective_uid: nix::unistd::Uid::effective().as_raw(),

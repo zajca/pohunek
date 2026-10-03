@@ -114,14 +114,11 @@ carries the remediation. When `pohunek doctor` reaches the daemon, a check both 
 fails; optional capabilities are at most `warn`.
 
 Linux: `bin:git` (required), `bin:codex`, `bin:claude`, the socket, state and
-log directory writability checks, `netbird_cli`, `schema_version`, and the
-optional launcher probes `bin:rofi`, `bin:swaymsg`, `bin:python3`,
-`bin:timeout`, `terminal` (`$TERMINAL`), `launcher_scripts` and `sway_include`.
+log directory writability checks, `netbird_cli`, and `schema_version`.
 Executables count only when they are regular files the effective user can execute according to the kernel (`faccessat` with `X_OK`); a file it cannot execute is skipped and the `PATH` search continues. The writability probes create a randomly named file exclusively (never following a planted symlink) and remove it.
 
-macOS omits the Linux-only launcher probes (rofi, swaymsg, `timeout`,
-`$TERMINAL`, launcher scripts, sway include) and `bin:python3` (hook
-interpreter readiness is reported by `pohunek integration doctor`), and adds:
+macOS adds the following checks. Hook interpreter readiness (`python3`) is
+reported by `pohunek integration doctor`, not by `pohunek doctor`:
 
 | Check | Failure status | Meaning and remediation |
 | --- | --- | --- |
@@ -138,7 +135,6 @@ interpreter readiness is reported by `pohunek integration doctor`), and adds:
 | `launchd_job` | `fail` for a failed job, or a loaded job without a process while no daemon answers; else `warn` | CLI doctor only: the installed daemon job's state from `pohunek service status`. launchd reports a loaded job as `running` or `unknown` (no process) and records no exit, so an `unknown` job is fatal only when the doctor also cannot reach the daemon. Not installed is a `warn`; a manually started daemon is valid. A pending install or upgrade is reported alongside the job state, never instead of it. |
 | `bin:codex`, `bin:claude` | `warn` | Optional agents. A daemon started by launchd does not read shell startup files, so use an absolute agent profile `program` or fix the service PATH. |
 | `login_shell` | `warn` | `$SHELL` must be an absolute executable listed in `/etc/shells`. |
-| `terminal` | `warn` | The stock `/System/Applications/Utilities/Terminal.app`, plus the optional `terminal=` key in `launcher.conf`, read like the launcher does (last assignment wins, an empty value means unset). The launcher runs the whole value as one executable name, so a value with arguments such as `kitty -e` is reported as unresolvable; use a wrapper script. |
 | `desktop_notifications` | `warn` only when `osascript` is missing | Reports `/usr/bin/osascript`; delivery and user denial cannot be confirmed for an unbundled binary. If banners do not appear, allow notifications for the sending app in System Settings > Notifications. |
 | `keychain` | `warn` | Presence of `/usr/bin/security` and the login keychain file only. No secret is read and lock state is not probed; a locked keychain is reported when a provider credential is first requested. |
 

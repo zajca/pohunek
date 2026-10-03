@@ -26,10 +26,10 @@ pub(crate) struct Paths {
     /// The user cache directory.
     pub(crate) cache_dir: PathBuf,
     /// The XDG config base (`$XDG_CONFIG_HOME` or `$HOME/.config`). Used to
-    /// derive both pohunek's own config dir and the sway config dir.
+    /// derive pohunek's own config dir.
     pub(crate) config_home: PathBuf,
-    /// pohunek's config dir (`<config_home>/pohunek`) — holds `launcher.conf`
-    /// and `prompts/*.tmpl` consumed by the launcher scripts.
+    /// pohunek's config dir (`<config_home>/pohunek`) — holds `attach.conf`
+    /// and the `prompts/*.tmpl` project-action templates.
     pub(crate) config_dir: PathBuf,
     /// Where daemon connections made with these paths take their request
     /// origin from. [`Self::resolve`] selects the process environment, so the
@@ -99,23 +99,6 @@ impl Paths {
             config_dir: base.config_dir,
             origin_source: OriginSource::Environment,
         })
-    }
-
-    /// Directory the launcher scripts (`pohunek-rofi`, `pohunek-launch-*`,
-    /// `lib.sh`) are materialized into by `pohunek setup scripts`. They must be
-    /// siblings because the shell launchers source `lib.sh` from their own
-    /// directory.
-    #[must_use]
-    pub(crate) fn launcher_bin_dir(&self) -> PathBuf {
-        self.data_dir.join(pohunek_paths::BIN_SUBDIR)
-    }
-
-    /// The user's sway config dir (`<config_home>/sway`). `pohunek setup sway`
-    /// writes a drop-in under `<sway_config_dir>/config.d/`; it never edits the
-    /// main sway config.
-    #[must_use]
-    pub(crate) fn sway_config_dir(&self) -> PathBuf {
-        self.config_home.join(pohunek_paths::SWAY_CONFIG_DIR)
     }
 
     /// One-time legacy-to-worker migration manifest.

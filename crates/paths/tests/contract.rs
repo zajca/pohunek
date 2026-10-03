@@ -44,8 +44,6 @@ struct Expected {
     cache_dir: String,
     config_home: String,
     config_dir: String,
-    launcher_bin_dir: String,
-    sway_config_dir: String,
     assistant_bundle_cache_dir: String,
     assistant_runtime_dir: String,
     worker_runtime_root: String,
@@ -359,8 +357,6 @@ fn assert_complete_paths(paths: &BasePaths, expected: &Expected, fixture: &Fixtu
     assert_path(&paths.cache_dir, &expected.cache_dir);
     assert_path(&paths.config_home, &expected.config_home);
     assert_path(&paths.config_dir, &expected.config_dir);
-    assert_path(&paths.launcher_bin_dir(), &expected.launcher_bin_dir);
-    assert_path(&paths.sway_config_dir(), &expected.sway_config_dir);
     assert_path(
         &paths.assistant_bundle_cache_dir(),
         &expected.assistant_bundle_cache_dir,
