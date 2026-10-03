@@ -293,7 +293,7 @@ jobs:
 
   sdk-release:
     name: Pack TypeScript SDK release assets
-    needs: [gate, docs-gate, sdk-gate]
+    needs: [gate, docs-gate, sdk-gate, web-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -338,7 +338,7 @@ jobs:
 
   web-release:
     name: Build web control center for Linux x86_64
-    needs: [gate, docs-gate, web-gate]
+    needs: [gate, docs-gate, sdk-gate, web-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -380,7 +380,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.component }} for ${{ matrix.target }}
-    needs: [gate, docs-gate, sdk-gate]
+    needs: [gate, docs-gate, sdk-gate, web-gate]
     runs-on: ${{ matrix.runner }}
     env:
       SCCACHE_GHA_ENABLED: "true"
