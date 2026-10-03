@@ -247,6 +247,19 @@ class WriteTokenJobTests(unittest.TestCase):
         self.assertRegex(self.jobs["publish"], r"(?m)^    needs: \[build\]$")
 
 
+class LinkerSetupTests(unittest.TestCase):
+    """A job whose RUSTFLAGS select mold installs mold on every matrix leg."""
+
+    def test_mold_jobs_install_mold_unconditionally(self):
+        for name, block in jobs(WORKFLOW.read_text()).items():
+            if not re.search(r"(?m)^      RUSTFLAGS: [^\n]*-fuse-ld=mold", block):
+                continue
+            step = re.search(r"(?m)^      - name: Install mold linker\n((?:        [^\n]*\n)*)", block)
+            with self.subTest(job=name):
+                self.assertIsNotNone(step, f"{name} uses mold without installing it")
+                self.assertNotRegex(step.group(1), r"(?m)^        if:", f"{name} installs mold conditionally")
+
+
 class WriteJobGuardRejectionTests(unittest.TestCase):
     """The guard itself rejects the shapes it exists to stop."""
 
