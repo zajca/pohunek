@@ -158,10 +158,13 @@ relay transport.
 The native desktop client (an Iced control plane over the Rust SDK, with no
 embedded terminal and no aggregator backend) is developed in
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). This repository
-keeps only what every client shares: the versioned protocol, the Rust and
+ships no UI and keeps only what every client shares: the versioned protocol, the Rust and
 TypeScript SDKs, the shared prompt renderer (`crates/prompt` and `pohunek
 prompt render`), the opaque `link.*` session metadata (`pohunek prompt link`),
-and atomic launch via `session new --input`. Provider credentials never enter
+and atomic launch via `session new --input`. Clients consume core through public
+contracts only (CLI `--json`, and the public protocol through SDKs pinned by git
+tag or release tarball) and move in lockstep with `PROTOCOL_VERSION`. Issue/PR
+providers live only in `zajca/pohunek-work`. Provider credentials never enter
 daemon state, session metadata, or the event log.
 
 ### Track B — Mesh-local Browser Control Center *(M1 complete; later plan superseded)*

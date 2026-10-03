@@ -35,6 +35,12 @@
   install and update runbooks, the concept pages, the remote-hosts guide, and
   the source map no longer describe the web backend or its archive. The web
   control center is developed in `zajca/pohunek-work`.
+- Stated the UI-less core policy in the architecture concept page: core ships no
+  user interface, external clients in `zajca/pohunek-work` use public contracts
+  only (CLI `--json`, and the public protocol through the Rust crates pinned by
+  git tag and the TypeScript SDK release tarballs pinned by URL and integrity),
+  move in lockstep with the protocol version, and link core crates that are a
+  pinned, not a stable, API. Issue/PR providers live only in `zajca/pohunek-work`.
 - Documented the owner backend's optional rotating owner-private log files
   (`POHUNEK_BACKEND_LOG_DIR` and its limits, failure fallback, torn-line
   recovery, repair at open, startup failures recorded in the files).

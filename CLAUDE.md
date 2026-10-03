@@ -25,6 +25,15 @@ If you have the `ms-rust` Agent Skill registered locally (e.g. symlinked into
 But the vendored copy is the source of truth here so the rule holds for every
 agent and machine, not just a personally-configured one.
 
+## Scope: core ships no UI
+
+This repository holds the daemon, session worker, CLI, relay, Rust crates, and
+the TypeScript SDK workspace (`sdk/ts/`). Do not add a GUI, web frontend or
+backend, desktop launcher, or an issue/PR provider here: those live in
+`zajca/pohunek-work`, which consumes core only through public contracts (CLI
+`--json` and the public protocol via the pinned Rust crates and SDK tarballs).
+The constraints are spelled out in AGENTS.md ("Hard constraints").
+
 ## Verifying work
 
 CI is the source of truth. Before reporting a Rust change as done, run the gate
@@ -70,9 +79,11 @@ method/event, an operating-model concept, a safety rule, the
 `docs/public-api.md` surface, or a path in
 `docs/knowledge/assistant/source-map.md` — update the matching knowledge file in
 the *same* change and re-run `cargo xtask docs check`. For wire-protocol work
-this is one more ripple target alongside `client`/`daemon`/`cli`: a
-new method/event is not done until the bundle and `docs/public-api.md` reflect
-it. If unsure whether a change is assistant-visible, check whether any file under
+this is one more ripple target alongside `client`/`daemon`/`cli` and the
+generated `sdk/ts/` types (`cargo xtask ts check`): a new method/event is not
+done until the bundle and `docs/public-api.md` reflect it. The `zajca/pohunek-work`
+clients follow a protocol change by bumping their pinned core tag; core keeps
+no compatibility shim for them. If unsure whether a change is assistant-visible, check whether any file under
 `docs/knowledge/` mentions the surface you changed.
 
 ## Agent teams and sub-agents
@@ -85,7 +96,7 @@ parallel exploration. Good fits here:
   errors in the daemon/state machines) + `performance-reviewer`, synthesized by
   `product-engineer`.
 - **Protocol changes:** spawn parallel implementers per affected crate
-  (`protocol` → `client`/`daemon`/`cli`), coordinated by `tech-lead`,
+  (`protocol` → `client`/`daemon`/`cli`/`sdk/ts`), coordinated by `tech-lead`,
   because one wire change ripples across crates — and out into
   `docs/public-api.md` and the `docs/knowledge/` bundle (see "Keep the assistant
   knowledge bundle current").

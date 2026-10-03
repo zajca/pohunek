@@ -73,6 +73,9 @@ The following invariants span both domains:
 - Keep owner-path clients (including the external browser control center)
   available for local-daemon and direct-overlay access independently of the
   team relay.
+- Ship no user interface in core: the deliverables are the daemon, session
+  worker, CLI, relay, Rust crates, and TypeScript SDK; every UI and launcher is
+  an external client (see "Client boundary").
 - Make each host authoritative for its own PTYs, agent processes, state, logs,
   and worktrees.
 - Support durable detach and reattach by giving every live session a dedicated
@@ -142,6 +145,22 @@ is authoritative for one live PTY generation. Owner paths have no shared mesh
 state or coordinator. A remote owner reaches a host daemon directly over
 NetBird using the same public protocol as the local Unix socket. Workers are
 never remotely addressable.
+
+### Client boundary
+
+This repository ships no user interface. GUIs, the web control center, and
+desktop launchers live in `zajca/pohunek-work` and reach core through public
+contracts only: the CLI with `--json`, and the public protocol through the
+versioned SDKs. The Rust crates are pinned by git tag; the TypeScript SDK is
+pinned by release-tarball URL and integrity. The core crates a Rust client links
+(`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`, `assistant`)
+are a pinned, not a stable, API: they stay pre-1.0 with no back-compat shims.
+External UIs move in lockstep with `PROTOCOL_VERSION`, because the TypeScript SDK
+handshake requires the daemon's exact protocol version. Methods only UI clients
+call (`host.discover`, `worktree.remove`) are still public obligations with
+server-side contract tests in core (`docs/public-api.md`, "External clients").
+Issue and PR providers (Linear, GitHub) are client concerns and never enter
+core.
 
 ### Shipped host identity and local governance
 
@@ -728,7 +747,7 @@ not a process-exit signal. A higher-sequence continuation identity reported by
 
 ## Overlay Registry and Discovery
 
-The daemon, SDK, CLI, and browser gateways consume one configured overlay
+The daemon, SDK, CLI, and external browser gateways consume one configured overlay
 registry. Each entry has a stable overlay ID, a transport implementation, and
 its own non-zero daemon port. Daemon listeners run concurrently for every
 entry; discovery aggregates providers concurrently while isolating a failed

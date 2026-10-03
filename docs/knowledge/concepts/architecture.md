@@ -110,6 +110,14 @@ daemon connection through their own relay. Each host daemon remains
 authoritative for its sessions and each worker remains authoritative for one
 live PTY. The owner path remains supported after the team relay ships.
 
+Pohunek core ships no user interface. GUIs, the web control center, and desktop
+launchers are external clients developed in `zajca/pohunek-work`. They use public
+contracts only: the CLI with `--json`, or the public protocol through the Rust
+crates (pinned by git tag) and the TypeScript SDK (release tarballs pinned by URL
+and integrity). They move in lockstep with the protocol version, and the core
+crates they link are a pinned, not a stable, API. Issue and PR providers live
+only in `zajca/pohunek-work`.
+
 Pohunek has an [optional team-relay design](team-relay.md) with an implemented
 reduced foundation. The PostgreSQL-backed relay provides fencing, recovery,
 protected initial provisioning, generic OIDC browser/device authentication, and

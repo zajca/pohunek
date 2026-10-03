@@ -11,9 +11,11 @@ across the operator's own machines. A Rust daemon (`pohunekd`) owns the logical
 session registry and public API on each host; one isolated
 `pohunek-sessiond` worker owns each live PTY and agent process. The Rust CLI
 (`pohunek`) drives the daemon locally over a Unix socket and remotely over a
-NetBird/WireGuard address. The native desktop GUI is a separate client that
-lives in `zajca/pohunek-work`. The accepted future direction adds an optional trusted team relay
-without replacing these direct owner paths; it is not implemented yet.
+NetBird/WireGuard address. This repository ships no user interface: every GUI,
+web control center, and launcher is a separate client in
+[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). The accepted
+future direction adds an optional trusted team relay without replacing these
+direct owner paths; it is not implemented yet.
 
 It is pre-1.0 and experimental: wire shapes, config files, and on-disk metadata
 may change freely. **Do not add backward-compatibility shims** unless asked.
@@ -45,8 +47,28 @@ Hard constraints, decided on purpose — respect them in every change:
   plane.
 - **Remote owner transport is direct over NetBird**, never SSH bridging. Relay
   transport is the separate host-initiated path defined by the accepted RFC.
+- **Core ships no UI.** The deliverables are the daemon (`pohunekd`), the
+  session worker (`pohunek-sessiond`), the CLI (`pohunek`), the relay
+  (`pohunek-relayd`), the Rust crates, and the TypeScript SDK workspace
+  (`sdk/ts/`). No GUI, web frontend or backend, desktop launcher, or UI
+  packaging belongs here; they live in `zajca/pohunek-work`.
+- **The contract boundary is public contracts only.** A client reaches core
+  through the CLI with `--json` or through the public protocol via the
+  versioned SDKs: the Rust crates pinned by git tag and the TypeScript SDK
+  release tarballs pinned by URL and integrity. The core crates a Rust client
+  links (`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`,
+  `assistant`) are a pinned API, not a stable one: they stay pre-1.0 with no
+  back-compat shims, and a client absorbs breaking changes when it bumps its
+  pinned tag.
+- **UIs move in lockstep with `PROTOCOL_VERSION`.** The TypeScript SDK
+  handshake requires the daemon's protocol version, so a client pins the core
+  release it was built against. A protocol surface that only UI clients call
+  (`host.discover`, `worktree.remove`, and the UI use of `subscribe`) is still a
+  public obligation: core keeps server-side contract tests for it, listed in
+  `docs/public-api.md` ("External clients"). Core adds no CLI command only to
+  serve a UI.
 - **Issue/PR providers (Linear, GitHub) live only in `zajca/pohunek-work`,
-  never in core** (neither the daemon nor this repository's scripts).
+  never in core** (neither the daemon, the CLI, nor this repository's scripts).
 - **Protocol today:** public protocol v3 is owner-only newline-delimited JSON
   over a Unix socket (local) and TCP on configured overlays (remote); attach
   uses a separate raw-byte connection per PTY. [#70](https://github.com/zajca/pohunek/issues/70)
