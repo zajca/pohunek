@@ -122,24 +122,6 @@ class StageArchiveTest(unittest.TestCase):
         ws = Workspace(self)
         self.assertTrue((ws.out / ws.stage("relay") / "pohunek-relayd").is_file())
 
-    def test_web_archive_wraps_the_input_tree_with_the_verifier_and_the_license(self):
-        ws = Workspace(self)
-        web = ws.root / "web-input"
-        (web / "frontend").mkdir(parents=True)
-        (web / "pohunek-web").write_text("binary\n")
-        (web / "frontend" / "index.html").write_text("<html></html>\n")
-        (web / "install.sh").write_text("#!/bin/sh\n")
-        name = run(
-            [PACKAGING / "stage-archive", "web", VERSION, "aarch64-apple-darwin", web, ws.root, ws.out],
-            cwd=ws.root,
-        ).stdout.strip()
-        self.assertEqual(name, "pohunek-web-%s-aarch64-apple-darwin" % VERSION)
-        staging = ws.out / name
-        for member in ("pohunek-web", "frontend/index.html", "install.sh", "packaging/verify-archive", "LICENSE"):
-            self.assertTrue((staging / member).is_file(), member)
-        self.assertFalse((staging / "docs").exists())
-        self.assertFalse((staging / "README.md").exists())
-
     def test_the_output_directory_is_created_when_missing(self):
         ws = Workspace(self)
         out = ws.root / "fresh" / "dist"

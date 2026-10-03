@@ -30,7 +30,6 @@ SCRIPTS = [
     ROOT / "packaging" / "archive",
     ROOT / "packaging" / "stage-archive",
     ROOT / "packaging" / "write-manifest",
-    ROOT / "web" / "release" / "install.sh",
     ROOT / "scripts" / "acceptance" / "macos-package-install",
 ]
 
@@ -308,7 +307,7 @@ class ToolingTest(unittest.TestCase):
             self.assertTrue(script.read_text().startswith(("#!/bin/sh\n", "#!/usr/bin/env sh\n")), script)
 
     def test_the_bash_scripts_parse_as_bash(self):
-        for script in (MACOS / "signing-keychain", ROOT / "web" / "release" / "package.sh"):
+        for script in (MACOS / "signing-keychain",):
             self.assertTrue(os.stat(script).st_mode & stat.S_IXUSR, script)
             result = subprocess.run(["bash", "-n", str(script)], stderr=subprocess.PIPE, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -316,8 +315,6 @@ class ToolingTest(unittest.TestCase):
     def test_the_audit_can_skip_the_string_scan_for_third_party_runtimes(self):
         text = (MACOS / "audit-macho").read_text()
         self.assertIn("--no-string-scan", text)
-        package = (MACOS / "package").read_text()
-        self.assertIn('web) require="--require pohunek-web --no-string-scan"', package)
 
     def test_the_deployment_target_is_one_value(self):
         target = (MACOS / "DEPLOYMENT_TARGET").read_text().strip()

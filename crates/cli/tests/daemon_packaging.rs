@@ -204,7 +204,7 @@ fn a_manifest_that_omits_a_required_binary_is_refused() {
 
 #[test]
 fn another_components_archive_is_refused() {
-    for component in ["cli", "web"] {
+    for component in ["cli", "relay"] {
         let fixture = Fixture::new();
         seal_manifest(&fixture.archive, &host_target(), component);
         let output = fixture.run(&[], &[]);

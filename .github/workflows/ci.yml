@@ -51,7 +51,7 @@ env:
   # its worker.
   # Job `build-bins` stays a separate default-feature build: the archive
   # compiles with --all-features, which enables cli's `test-util` seams, and
-  # the web e2e and Hermes compatibility jobs must exercise shipped binaries.
+  # the SDK e2e and Hermes compatibility jobs must exercise shipped binaries.
   # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
   # layer. Each Rust job restores the entry of its job type (`shared-key`:
   # clippy, test-debug, bins, release, xtask, docs, hack, nightly-udeps,
@@ -418,33 +418,11 @@ jobs:
           git checkout -- Cargo.toml Cargo.lock
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
-      - name: Install Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.3.11
-
-      - name: Install web dependencies
-        run: bun install --frozen-lockfile
-
-      # The compiled backend for Apple Silicon (Bun runtime plus SPA), smoke
-      # tested by package.sh, packaged without signing.
-      - name: Build and package the owner web archive
-        id: package-web
-        shell: bash
-        run: |
-          set -euo pipefail
-          input="$(bash web/release/package.sh "${{ steps.package-a.outputs.version }}" aarch64-apple-darwin --input-only | tail -n 1)"
-          mkdir -p "$RUNNER_TEMP/dist-web"
-          archive="$(packaging/macos/package --development web "${{ steps.package-a.outputs.version }}" \
-            "$input" web "$RUNNER_TEMP/dist-web")"
-          echo "archive=$archive" >> "$GITHUB_OUTPUT"
-
       - name: Install, upgrade, and uninstall from the archives
         timeout-minutes: 20
         env:
           PKG_ACCEPT_ARCHIVE: ${{ steps.package-a.outputs.archive }}
           PKG_ACCEPT_UPGRADE_ARCHIVE: ${{ steps.package-b.outputs.archive }}
-          # Step 5b (the web backend agent) is disabled until https://github.com/zajca/pohunek/issues/368 is fixed.
         run: scripts/acceptance/macos-package-install
 
   test:
@@ -599,7 +577,7 @@ jobs:
       feature_matrix: ${{ steps.filter.outputs.feature_matrix }}
       macos: ${{ steps.filter.outputs.macos }}
       macos_package: ${{ steps.filter.outputs.macos_package }}
-      web_macos: ${{ steps.filter.outputs.web_macos }}
+      sdk_macos: ${{ steps.filter.outputs.sdk_macos }}
       hermes: ${{ steps.filter.outputs.hermes }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
@@ -679,7 +657,6 @@ jobs:
               - 'LICENSE'
               - 'scripts/acceptance/macos-package-install'
               - 'scripts/acceptance/launchd_lifetime_evidence.py'
-              - 'web/release/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -703,12 +680,11 @@ jobs:
               - 'crates/relay-protocol/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/release.yml'
-            # The owner web workspace runs natively on Apple Silicon against the
-            # real macOS daemon (issue #103): gate on the web workspace, the
+            # The SDK workspace runs natively on Apple Silicon against the
+            # real macOS daemon (issue #103): gate on the SDK workspace, the
             # shared path contract it consumes, and the crates behind the
             # binaries the real-daemon suites spawn.
-            web_macos:
-              - 'web/**'
+            sdk_macos:
               - 'sdk/ts/**'
               - 'package.json'
               - 'bun.lock'
@@ -1386,7 +1362,7 @@ jobs:
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
 
-  # Build the three runnable binaries exactly once. The web e2e and pinned
+  # Build the three runnable binaries exactly once. The SDK e2e and pinned
   # Hermes jobs reuse this artifact instead of each rebuilding Rust, which used
   # to cost a full duplicate build per job (issue #122).
   build-bins:
@@ -1430,8 +1406,8 @@ jobs:
             target/debug/pohunek
           if-no-files-found: error
 
-  web:
-    name: web SDK + control center
+  sdk:
+    name: SDK workspace
     runs-on: ubuntu-latest
     needs: build-bins
     steps:
@@ -1454,38 +1430,17 @@ jobs:
           restore-keys: |
             bun-${{ runner.os }}-1.3.11-
 
-      - name: Install web dependencies
+      - name: Install workspace dependencies
         run: bun install --frozen-lockfile
 
-      - name: Typecheck web
+      - name: Typecheck workspace
         run: bun run typecheck
 
-      - name: Lint web
+      - name: Lint workspace
         run: bun run lint
 
-      - name: Test web
+      - name: Test workspace
         run: bun test
-
-      # Build once, reuse for the Playwright e2e below. `bun run test:e2e`
-      # rebuilds the frontend itself, so invoke the Playwright CLI directly.
-      - name: Build web control center
-        run: bun run build:frontend
-
-      # The lockfile pins the Playwright version, so its browser build is
-      # derived from bun.lock instead of a hand-maintained literal.
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            playwright-chromium-${{ runner.os }}-
-
-      - name: Install Playwright Chromium
-        run: bunx playwright install --only-shell chromium
-
-      - name: Test web control center
-        run: bun ./node_modules/@playwright/test/cli.js test --config web/frontend/playwright.config.ts
 
       # Real SDK release tarballs installed by URL into a throwaway consumer
       # whose registry is unreachable, so a packaging break fails the PR instead
@@ -1538,21 +1493,12 @@ jobs:
           POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
           POHUNEK_PYTHON_BIN: /usr/bin/python3
 
-      - name: Backend e2e against real daemon
-        run: bun test web/backend/test/real-daemon.e2e.test.ts
-        env:
-          POHUNEK_E2E: "1"
-          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
-
-  # The owner web workspace on Apple Silicon (issue #103): typecheck, lint,
-  # unit tests, the Playwright browser suite, the compiled backend executable,
-  # and the SDK and backend suites against the real macOS pohunekd,
-  # pohunek-sessiond and pohunek. The runner is ephemeral, so the backend suite
-  # may also exercise the owner default runtime directory
-  # (`/private/tmp/pohunek-<uid>`), which a developer's own daemon would share.
-  web-macos:
-    name: web SDK + control center (macOS arm64)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.web_macos == 'true' }}
+  # The SDK workspace on Apple Silicon (issue #103): typecheck, lint, unit
+  # tests, and the SDK e2e suite against the real macOS pohunekd,
+  # pohunek-sessiond and pohunek.
+  sdk-macos:
+    name: SDK workspace (macOS arm64)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.sdk_macos == 'true' }}
     needs: changes
     runs-on: macos-15
     timeout-minutes: 60
@@ -1590,7 +1536,7 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          shared-key: web-macos
+          shared-key: sdk-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The real daemon spawns `pohunek-sessiond` by path from the same
@@ -1598,63 +1544,22 @@ jobs:
       - name: Build daemon, session worker, and CLI
         run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 
-      - name: Install web dependencies
+      - name: Install workspace dependencies
         run: bun install --frozen-lockfile
 
-      - name: Typecheck web
+      - name: Typecheck workspace
         run: bun run typecheck
 
-      - name: Lint web
+      - name: Lint workspace
         run: bun run lint
 
-      - name: Test web
+      - name: Test workspace
         run: bun test
-
-      # The Playwright run drives the built Svelte SPA through the fixture stack.
-      - name: Build web control center
-        run: bun run build:frontend
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/Library/Caches/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            playwright-chromium-${{ runner.os }}-${{ runner.arch }}-
-
-      - name: Install Playwright Chromium
-        run: bunx playwright install --only-shell chromium
-
-      - name: Test web control center
-        run: bun ./node_modules/@playwright/test/cli.js test --config web/frontend/playwright.config.ts
-
-      # The release package ships this executable: compile it for the native
-      # target and smoke it against a fixture daemon, outside the workspace
-      # runtime.
-      - name: Compile and smoke the packaged backend
-        shell: bash
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/pohunek-web-smoke"
-          rm -rf "$out"
-          mkdir -p "$out"
-          bun build --compile --target=bun-darwin-arm64 \
-            --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
-            --outfile="$out/pohunek-web" ./web/backend/src/entrypoint.ts
-          file "$out/pohunek-web" | tee /dev/stderr | grep -q "arm64"
-          bun run web/release/smoke.ts "$out/pohunek-web" web/frontend/dist
 
       - name: SDK e2e against real daemon
         run: bun test sdk/ts/sdk/test/e2e.test.ts
         env:
           POHUNEK_E2E: "1"
-          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
-
-      - name: Backend e2e against real daemon
-        run: bun test web/backend/test/real-daemon.e2e.test.ts
-        env:
-          POHUNEK_E2E: "1"
-          POHUNEK_E2E_DEFAULT_RUNTIME: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
   # Dependency hygiene (M-STATIC-VERIFICATION): security advisories, the Cargo

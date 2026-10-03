@@ -19,8 +19,8 @@
 # file: a required program that is a script, a Linux binary, or missing fails
 # even though the rest of the tree is fine. `--no-string-scan` skips the
 # build-machine path check for a third-party executable that embeds its own
-# build paths (the Bun runtime inside the web backend); every other check stays. It needs `otool`, `lipo`,
-# and `strings` from the Xcode command line tools.
+# build paths; every other check stays. It needs `otool`, `lipo`, and `strings`
+# from the Xcode command line tools.
 
 set -eu
 

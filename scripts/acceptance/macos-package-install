@@ -21,12 +21,6 @@
 #      both workers and both session children keep their PID, start time, and
 #      PTY, the workers keep running from the previous version directory, which
 #      stays installed, and a new session runs from the new version.
-#   5b. With a web archive: the owner web backend agent registers under its own
-#      label with the daemon's namespace, serves the compiled SPA on a loopback
-#      port, logs to its private rotating file, and installing, updating (a new
-#      backend process), and removing it leaves the daemon, both workers, and
-#      every session child with the same process identity; removal keeps
-#      `backend.env` and the log.
 #   6. `pohunek service uninstall` with live sessions is refused and changes
 #      nothing; once the sessions are stopped it removes the daemon job, the
 #      installed versions, and `service.toml`, and keeps the durable state
@@ -41,8 +35,6 @@
 #   PKG_ACCEPT_ARCHIVE          Version A daemon archive, `.tar.gz` (required).
 #   PKG_ACCEPT_UPGRADE_ARCHIVE  Version B daemon archive of a newer version
 #                               (required).
-#   PKG_ACCEPT_WEB_ARCHIVE      Owner web archive; when set, step 5b installs,
-#                               updates, and removes its launchd agent.
 #   PKG_ACCEPT_KEEP             Set to `yes` to keep the work directory.
 #   PKG_ACCEPT_PYTHON           Python 3 for JSON parsing (default /usr/bin/python3).
 #
@@ -478,7 +470,7 @@ session_three=$(new_session three)
 [ -n "$session_three" ] || die "no session could be created after the upgrade"
 wait_live "$session_three"
 # From here on every snapshot covers all three sessions; this one is the
-# baseline of the web and uninstall checks.
+# baseline of the uninstall checks.
 snapshot_sessions="$session_one $session_two $session_three"
 snapshot >"$work/ev/baseline.txt" || die "cannot snapshot after the upgrade"
 status_json "$work/ev/status-b2.json"
@@ -491,78 +483,6 @@ PY
 )
 [ "$new_worker_version" = "$version_b" ] || die "the new session's worker runs '$new_worker_version', expected $version_b"
 printf 'the upgrade replaced the daemon (%s -> %s) and kept both workers, children, and PTYs\n' "$daemon_pid_a" "$daemon_pid_b"
-
-# ---------------------------------------------------------------------------
-if [ -n "${PKG_ACCEPT_WEB_ARCHIVE:-}" ]; then
-  say "5b. Owner web backend agent beside the live daemon"
-  [ -f "$PKG_ACCEPT_WEB_ARCHIVE" ] || die "PKG_ACCEPT_WEB_ARCHIVE is not a file"
-  dir_w=$(extract_archive "$PKG_ACCEPT_WEB_ARCHIVE" w)
-  [ "$(manifest_field "$dir_w" component)" = web ] || die "$PKG_ACCEPT_WEB_ARCHIVE is not a web archive"
-  web_label="$label_prefix.$namespace.backend"
-  web_plist="$home/Library/LaunchAgents/$web_label.plist"
-  web_port=$("$python_bin" -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-  # Loopback is allowed only for this check; a real deployment binds the
-  # NetBird address.
-  cat >"$home/.config/pohunek/backend.env" <<ENV
-POHUNEK_BACKEND_BIND_HOST=127.0.0.1
-POHUNEK_BACKEND_PORT=$web_port
-POHUNEK_BACKEND_ALLOW_LOOPBACK=true
-ENV
-  chmod 600 "$home/.config/pohunek/backend.env"
-
-  web_install() {
-    iso_env POHUNEK_BIN="$installed_cli" sh "$dir_w/install.sh" >"$work/ev/web-install.out" 2>"$work/ev/web-install.err" ||
-      die "the web installer failed: $(cat "$work/ev/web-install.err")"
-  }
-  web_pid() {
-    /bin/launchctl print "gui/$uid/$web_label" 2>/dev/null | awk '$1 == "pid" && $2 == "=" { print $3; exit }'
-  }
-  wait_web() {
-    waited=0
-    until curl -fsS -o "$work/ev/web-index.html" "http://127.0.0.1:$web_port/" 2>>"$work/ev/web-curl.err"; do
-      [ "$waited" -lt "$daemon_timeout_s" ] || die "the web backend did not answer on port $web_port within ${daemon_timeout_s}s"
-      sleep 1
-      waited=$((waited + 1))
-    done
-    grep -qi '<!doctype html>' "$work/ev/web-index.html" || die "the backend did not serve the compiled SPA"
-  }
-
-  web_install
-  [ -f "$web_plist" ] || die "the web agent definition is missing: $web_plist"
-  /usr/bin/plutil -lint "$web_plist" >/dev/null || die "the web agent definition is not a valid property list"
-  [ "$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$web_plist")" = "$work/data/pohunek/web/pohunek-web" ] ||
-    die "the web agent does not start the installed backend by its exact path"
-  wait_web
-  first_web_pid=$(web_pid)
-  [ -n "$first_web_pid" ] || die "launchd reports no process for $web_label"
-  log_file="$work/state/pohunek/web-logs/pohunek-backend.jsonl"
-  [ -s "$log_file" ] || die "the backend wrote no log to $log_file"
-  [ "$(stat -f '%Lp' "$log_file")" = 600 ] || die "the backend log is not mode 600"
-  snapshot >"$work/ev/web-1.txt" || die "cannot snapshot after the web install"
-  cmp -s "$work/ev/after.txt" "$work/ev/web-1.txt" ||
-    die "installing the web backend changed the daemon, a worker, or a session child; diff $work/ev/after.txt $work/ev/web-1.txt"
-
-  say "5b. Updating the web backend restarts only the backend"
-  web_install
-  wait_web
-  second_web_pid=$(web_pid)
-  [ -n "$second_web_pid" ] && [ "$second_web_pid" != "$first_web_pid" ] ||
-    die "the web update did not restart the backend ($first_web_pid -> ${second_web_pid:-none})"
-  snapshot >"$work/ev/web-2.txt" || die "cannot snapshot after the web update"
-  cmp -s "$work/ev/after.txt" "$work/ev/web-2.txt" || die "updating the web backend changed the daemon or a session"
-
-  say "5b. Removing the web backend keeps configuration, logs, and every session"
-  iso_env POHUNEK_BIN="$installed_cli" sh "$dir_w/install.sh" --uninstall >"$work/ev/web-uninstall.out" 2>"$work/ev/web-uninstall.err" ||
-    die "the web uninstall failed: $(cat "$work/ev/web-uninstall.err")"
-  /bin/launchctl print "gui/$uid/$web_label" >/dev/null 2>&1 && die "the web agent is still loaded after uninstall"
-  [ ! -e "$web_plist" ] || die "the web agent definition remains after uninstall"
-  [ ! -e "$work/data/pohunek/web" ] || die "the web install directory remains after uninstall"
-  [ -f "$home/.config/pohunek/backend.env" ] || die "uninstall removed backend.env"
-  [ -s "$log_file" ] || die "uninstall removed the backend log"
-  snapshot >"$work/ev/web-3.txt" || die "cannot snapshot after the web uninstall"
-  cmp -s "$work/ev/after.txt" "$work/ev/web-3.txt" || die "removing the web backend changed the daemon or a session"
-  printf 'the web backend agent was installed, updated, and removed beside the live daemon and sessions\n'
-fi
 
 # ---------------------------------------------------------------------------
 say "6. Uninstall with live sessions is refused"

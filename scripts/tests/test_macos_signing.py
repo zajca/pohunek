@@ -218,25 +218,29 @@ class SignTest(Base):
         # identifier of its own.
         self.assertFalse(any("--identifier" in c and "example" in c for c in self.calls("codesign")))
 
-    def test_the_web_backend_gets_its_jit_entitlements_and_nothing_else_does(self):
-        self.macho("pohunek-web")
+    def test_a_binary_with_an_entitlements_file_is_signed_with_it_and_others_are_not(self):
+        # `sign` resolves entitlements next to itself, so run a copy of it from
+        # a directory that carries a neutral entitlements file.
+        mirror = self.root / "mirror"
+        (mirror / "entitlements").mkdir(parents=True)
+        shutil.copy2(MACOS / "sign", mirror / "sign")
+        plist = mirror / "entitlements" / "entitled-tool.plist"
+        plist.write_text("<plist/>")
+        self.macho("entitled-tool")
         self.macho("pohunek")
-        result = self.run_tool("sign", self.staging, env=SIGNING_ENV)
+        result = subprocess.run(
+            [str(mirror / "sign"), str(self.staging)],
+            env=self.env(**SIGNING_ENV),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         signs = [c for c in self.calls("codesign") if "--sign" in c]
-        web = next(c for c in signs if c.endswith("/pohunek-web") or "pohunek-web" in c.split(" --entitlements ")[-1])
-        self.assertIn("--entitlements " + str(MACOS / "entitlements" / "pohunek-web.plist"), web)
+        entitled = next(c for c in signs if c.endswith("/entitled-tool"))
+        self.assertIn("--entitlements " + str(plist), entitled)
         other = next(c for c in signs if c.endswith("/pohunek"))
         self.assertNotIn("--entitlements", other)
-        plist = (MACOS / "entitlements" / "pohunek-web.plist").read_text()
-        for key in (
-            "com.apple.security.cs.allow-jit",
-            "com.apple.security.cs.allow-unsigned-executable-memory",
-            "com.apple.security.cs.disable-executable-page-protection",
-            "com.apple.security.cs.allow-dyld-environment-variables",
-            "com.apple.security.cs.disable-library-validation",
-        ):
-            self.assertIn("<key>%s</key>" % key, plist)
 
     def test_missing_credentials_or_nothing_to_sign_fail(self):
         self.macho("pohunek")

@@ -2,9 +2,8 @@ name: Release
 
 # Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). First runs
 # the full quality gate (fmt/clippy/test) on the tagged commit, and only if that
-# passes builds the native component binaries and the self-contained web control
-# center for Linux x86_64, packages them with sha256 checksums, and attaches
-# everything to a GitHub Release for that tag.
+# passes builds the native component binaries, packages them with sha256
+# checksums, and attaches everything to a GitHub Release for that tag.
 #
 # The TypeScript SDK ships as three npm-pack tarballs (`pohunek-ts-protocol`,
 # `pohunek-ts-sdk`, `pohunek-ts-testkit`, each with a `.sha256`), built by
@@ -135,87 +134,6 @@ jobs:
       - name: TypeScript protocol drift check
         run: cargo xtask ts check
 
-  web-gate:
-    name: web typecheck + lint + test + e2e
-    runs-on: ubuntu-latest
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
-      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.11
-
-      # `bun install` re-downloads every registry tarball without a cache.
-      # Reuse Bun's global package cache, keyed by bun.lock and the
-      # setup-bun bun-version pin above, so repeat runs install from disk
-      # instead of the network.
-      - name: Cache Bun packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            bun-${{ runner.os }}-1.3.11-
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install mold linker
-        run: sudo apt-get update && sudo apt-get install -y mold
-
-      - name: Enable sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-
-
-      - name: Install web dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Typecheck web
-        run: bun run typecheck
-
-      - name: Lint web
-        run: bun run lint
-
-      - name: Test web
-        run: bun test
-
-      - name: Build web control center
-        run: bun run build:frontend
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            playwright-chromium-${{ runner.os }}-
-
-      - name: Install Playwright Chromium
-        run: bunx playwright install --with-deps chromium
-
-      - name: Test web control center
-        run: bun run test:e2e
-
-      # The real daemon spawns `pohunek-sessiond` by path, so both binaries must
-      # be present for the backend e2e.
-      - name: Build daemon and session worker for web e2e
-        run: cargo build -p pohunek-daemon -p pohunek-session-worker
-
-      - name: Backend e2e against real daemon
-        run: bun test web/backend/test/real-daemon.e2e.test.ts
-        env:
-          POHUNEK_E2E: "1"
-          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
-
   # The SDK gate owns everything that decides whether the SDK tarballs may be
   # published: workspace typecheck/lint/unit tests, the pack contract, and the
   # SDK and Hermes plugin suites against freshly built real binaries.
@@ -315,7 +233,7 @@ jobs:
   # `sdk-publish`, which runs no repository or dependency code, can write.
   sdk-pack:
     name: Pack TypeScript SDK release assets
-    needs: [gate, docs-gate, sdk-gate, web-gate]
+    needs: [gate, docs-gate, sdk-gate]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -395,51 +313,9 @@ jobs:
             ${{ runner.temp }}/sdk-download/pohunek-ts-testkit-*.tgz
             ${{ runner.temp }}/sdk-download/pohunek-ts-testkit-*.tgz.sha256
 
-  web-release:
-    name: Build web control center for Linux x86_64
-    needs: [gate, docs-gate, sdk-gate, web-gate]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.11
-
-      # `bun install` re-downloads every registry tarball without a cache.
-      # Reuse Bun's global package cache, keyed by bun.lock and the
-      # setup-bun bun-version pin above, so repeat runs install from disk
-      # instead of the network.
-      - name: Cache Bun packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('bun.lock') }}
-          restore-keys: |
-            bun-${{ runner.os }}-1.3.11-
-
-      - name: Install web dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Build and package web control center
-        id: package
-        shell: bash
-        run: bash web/release/package.sh "${GITHUB_REF_NAME#v}"
-
-      - name: Attach to release
-        uses: softprops/action-gh-release@v2
-        with:
-          fail_on_unmatched_files: true
-          files: |
-            web/${{ steps.package.outputs.archive }}
-            web/${{ steps.package.outputs.checksum }}
-
   build:
     name: Build ${{ matrix.component }} for ${{ matrix.target }}
-    needs: [gate, docs-gate, sdk-gate, web-gate]
+    needs: [gate, docs-gate, sdk-gate]
     runs-on: ${{ matrix.runner }}
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -634,7 +510,7 @@ jobs:
   # Running the archives on macOS 14 itself is a separate acceptance gate.
   stage-macos:
     name: Stage ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [gate, docs-gate, sdk-gate, web-gate]
+    needs: [gate, docs-gate, sdk-gate]
     runs-on: macos-15
     timeout-minutes: 120
     env:
@@ -642,7 +518,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, web]
+        component: [cli, daemon]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -653,47 +529,25 @@ jobs:
         run: test "$(uname -m)" = "arm64"
 
       - name: Install Rust toolchain
-        if: matrix.component != 'web'
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: stable
 
       - name: Cache cargo build
-        if: matrix.component != 'web'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-macos-${{ matrix.component }}
 
       - name: Build offline documentation
-        if: matrix.component != 'web'
         run: cargo xtask docs site
 
       - name: Build release binaries
-        if: matrix.component != 'web'
         id: build
         shell: bash
         run: |
           set -euo pipefail
           bindir="$(packaging/macos/build-release "${{ matrix.component }}")"
           echo "bindir=$bindir" >> "$GITHUB_OUTPUT"
-
-      - name: Install Bun
-        if: matrix.component == 'web'
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.3.11
-
-      - name: Install web dependencies
-        if: matrix.component == 'web'
-        run: bun install --frozen-lockfile
-
-      # The compiled backend (Bun runtime plus the compiled SPA), smoke-tested
-      # unsigned by package.sh; signing happens in the signing job.
-      - name: Build the web control center input tree
-        if: matrix.component == 'web'
-        id: webinput
-        shell: bash
-        run: bash web/release/package.sh "${GITHUB_REF_NAME#v}" aarch64-apple-darwin --input-only
 
       # Staging runs the built `pohunek` to write the shell completions, which
       # is why it happens here and not next to the credentials.
@@ -708,8 +562,7 @@ jobs:
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
           staging="$(packaging/macos/package --stage-release "${{ matrix.component }}" "${version}" \
-            "${{ matrix.component == 'web' && steps.webinput.outputs.input || steps.build.outputs.bindir }}" \
-            "${{ matrix.component == 'web' && 'web' || 'target/pohunek-docs' }}" dist)"
+            "${{ steps.build.outputs.bindir }}" target/pohunek-docs dist)"
           # A tar keeps the modes that an artifact upload would drop.
           mkdir -p "$RUNNER_TEMP/stage-upload"
           tar -cf "$RUNNER_TEMP/stage-upload/stage.tar" -C "$(dirname "$staging")" "$(basename "$staging")"
@@ -732,7 +585,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, web]
+        component: [cli, daemon]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -847,7 +700,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, web]
+        component: [cli, daemon]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -894,28 +747,6 @@ jobs:
           for binary in pohunek pohunekd pohunek-sessiond; do
             "$root/$binary" --version
           done
-
-      # The signed backend runs under the hardened runtime with its JIT
-      # entitlements, serving the compiled SPA from the extracted archive.
-      - name: Install Bun
-        if: matrix.component == 'web'
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        with:
-          bun-version: 1.3.11
-
-      - name: Install web dependencies
-        if: matrix.component == 'web'
-        run: bun install --frozen-lockfile
-
-      - name: Smoke-test the packaged web backend
-        if: matrix.component == 'web'
-        shell: bash
-        run: |
-          set -euo pipefail
-          root="${{ steps.extract.outputs.root }}"
-          test -x "$root/install.sh"
-          test -f "$root/packaging/verify-archive"
-          bun run web/release/smoke.ts "$root/pohunek-web" "$root/frontend"
 
       - name: Install Python for Hermes release verification
         if: matrix.component == 'cli'
@@ -977,7 +808,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        component: [cli, daemon, web]
+        component: [cli, daemon]
     steps:
       - name: Download the signed archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
