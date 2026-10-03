@@ -1902,12 +1902,22 @@ and the lockfile records the tarball integrity. Inside each tarball every
 `@pohunek/*` dependency is rewritten to the exact release-asset URL of the
 sibling package for the same tag, so the closure resolves from one release and
 the `@pohunek` scope is never looked up on a registry. `devDependencies`,
-`scripts` and `private` are dropped from the packed manifests. The packages ship
-TypeScript sources (the export map points at `src/*.ts`, plus
-`@pohunek/protocol/fixtures/*`), so consumers run under Bun or a TypeScript-aware
-toolchain. The packages have no third-party runtime dependencies. The
-`sdk/ts/scripts/test/pack-contract.test.ts` contract test installs the packed
-tarballs by URL against an unreachable registry and imports every entry point.
+`scripts` and `private` are dropped from the packed manifests. Each tarball
+ships compiled ES modules under `dist/`, matching declarations under `types/`,
+and (for `@pohunek/protocol`) the `fixtures/*` data files; no TypeScript source
+is shipped. The packed `exports` map points every entry at `./dist/*.js` with
+a `types` condition at `./types/*.d.ts`, so the packages load under Node without
+a loader or bundler and type-check under both `moduleResolution: "bundler"` and
+`"nodenext"`. The packages have no third-party runtime dependencies. Within the
+repository workspace the manifests keep pointing at `src/*.ts` for the Bun dev
+loop; only the packed artifact is compiled, by
+`sdk/ts/scripts/build-package.ts`. `@pohunek/testkit` is shipped compiled the
+same way; it uses no Bun globals, and the contract test imports it under Node. The `sdk/ts/scripts/test/pack-contract.test.ts` contract test
+installs the packed tarballs by URL against an unreachable registry, imports
+every entry point under Bun and under the Node binary named by
+`POHUNEK_TEST_NODE_BIN`, type-checks a consumer with both resolvers, and checks
+that the browser entry reaches no `node:` module. CI and the release SDK gate run
+it under Node 20 and Node 22.
 
 Public exports:
 
@@ -1960,7 +1970,9 @@ Supported runtimes:
 
 - Bun: supports the direct socket transport and the current WebSocket backend
   transport.
-- Node >= 18: supports the direct Unix/TCP socket transport through `node:net`.
+- Node >= 20: supports the direct Unix/TCP socket transport through `node:net`.
+  Node 18 is not supported: the SDK reads the `globalThis.crypto` global, which
+  Node exposes without a flag only from Node 19.
 - Node >= 22: supports the current WebSocket backend transport through the
   built-in WHATWG `WebSocket` global.
 - Browser: import `@pohunek/sdk/browser`; it supports only the current WebSocket

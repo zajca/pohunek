@@ -20,6 +20,7 @@ import { access, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { basename, dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
+import { builtTargets, buildPackage } from "./build-package";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = join(SCRIPT_DIR, "..", "..", "..");
@@ -30,8 +31,9 @@ const ASSET_SUFFIX = ".tgz";
 const LICENSE_IDENTIFIER = "MIT";
 const LICENSE_FILE = "LICENSE";
 const README_FILE = "README.md";
-// Directories whose full contents are published when present in a package.
-const PUBLISHED_DIRECTORIES = ["src", "fixtures"] as const;
+// Directories published verbatim when present in a package; compiled output
+// comes from `buildPackage`.
+const PUBLISHED_DIRECTORIES = ["fixtures"] as const;
 // npm unpacks a tarball into the single top-level directory `package/`.
 const TARBALL_ROOT = "package";
 const DEPENDENCY_FIELDS = ["dependencies", "peerDependencies", "optionalDependencies"] as const;
@@ -163,6 +165,41 @@ function assertExportsPacked(manifest: JsonObject, files: readonly string[], lab
   }
 }
 
+// Replaces every workspace `./src/X.ts` target with the built declaration (under
+// `types`) or module (any other condition). Data targets such as
+// `./fixtures/*` are left as they are.
+function rewriteExportTargets(value: unknown, condition: string | undefined, label: string): unknown {
+  if (typeof value === "string") {
+    if (!value.startsWith("./src/")) {
+      return value;
+    }
+    const built = builtTargets(value);
+    return condition === "types" ? built.types : built.js;
+  }
+  if (isRecord(value)) {
+    const result: JsonObject = {};
+    for (const [key, child] of Object.entries(value)) {
+      result[key] = rewriteExportTargets(child, key, label);
+    }
+    return result;
+  }
+  throw new Error(`${label}: exports contains a value that is neither a string nor an object`);
+}
+
+function rewriteManifestForBuild(manifest: JsonObject, label: string): JsonObject {
+  const result: JsonObject = {};
+  for (const [key, value] of Object.entries(manifest)) {
+    if (key === "exports") {
+      result[key] = rewriteExportTargets(value, undefined, label);
+    } else if (key === "types") {
+      result[key] = typeof value === "string" ? builtTargets(value).types : value;
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
 function rewriteDependencies(
   manifest: JsonObject,
   specs: readonly PackageSpec[],
@@ -265,7 +302,7 @@ async function packOne(
   if (!isRecord(source) || source["name"] !== spec.name) {
     throw new Error(`${spec.directory}/package.json must be named ${spec.name}`);
   }
-  const rewritten = rewriteDependencies(source, specs, baseUrl, spec.name);
+  const rewritten = rewriteManifestForBuild(rewriteDependencies(source, specs, baseUrl, spec.name), spec.name);
   const manifest: JsonObject = {};
   for (const [key, value] of Object.entries(rewritten)) {
     manifest[key] = value;
@@ -275,7 +312,7 @@ async function packOne(
   }
   manifest["license"] = LICENSE_IDENTIFIER;
 
-  const entries = new Map<string, Buffer>();
+  const entries = new Map<string, Buffer>(await buildPackage(packageDir));
   for (const directory of PUBLISHED_DIRECTORIES) {
     if (await exists(join(packageDir, directory))) {
       const files: string[] = [];
