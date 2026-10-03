@@ -327,3 +327,60 @@ fn assert_diagnostics(output: &std::process::Output, expected: &[&str]) {
         );
     }
 }
+
+/// zbus must stay on its runtime-agnostic backend. Cargo unifies features across
+/// the graph, so a `tokio` feature on any member makes zbus require a Tokio
+/// reactor for every consumer; the GUI's theme detection drives zbus from a
+/// non-Tokio thread and panics at startup with "there is no reactor running".
+#[test]
+fn zbus_is_never_built_with_its_tokio_backend() {
+    let env = TestEnv::new().expect("hermetic test environment");
+    let root = pohunek_test_support::workspace_root();
+    let output = host_cargo(&env)
+        .current_dir(&root)
+        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .output()
+        .expect("workspace metadata");
+    assert!(
+        output.status.success(),
+        "workspace metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("metadata JSON");
+    // Third-party crates may bring their own zbus major (the CLI's keyring
+    // pulls zbus 4); only the zbus that workspace members link against matters.
+    let nodes = metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("resolve nodes");
+    let members: Vec<&str> = metadata["workspace_members"]
+        .as_array()
+        .expect("workspace members")
+        .iter()
+        .map(|member| member.as_str().expect("member id"))
+        .collect();
+    let zbus_ids: Vec<&str> = nodes
+        .iter()
+        .filter(|node| node["id"].as_str().is_some_and(|id| members.contains(&id)))
+        .flat_map(|node| node["deps"].as_array().expect("node deps"))
+        .filter(|dependency| dependency["name"] == "zbus")
+        .map(|dependency| dependency["pkg"].as_str().expect("dependency id"))
+        .collect();
+    assert!(!zbus_ids.is_empty(), "the systemd backend depends on zbus");
+    for node in nodes
+        .iter()
+        .filter(|node| node["id"].as_str().is_some_and(|id| zbus_ids.contains(&id)))
+    {
+        let features = node["features"].as_array().expect("resolved features");
+        assert!(
+            !features.iter().any(|feature| feature == "tokio"),
+            "zbus resolved with its `tokio` feature; that makes the GUI panic at startup \
+             (\"there is no reactor running\") because its theme detection uses zbus off \
+             a Tokio runtime. Keep the workspace dependency on `async-io`."
+        );
+        assert!(
+            features.iter().any(|feature| feature == "async-io"),
+            "zbus needs the runtime-agnostic `async-io` backend"
+        );
+    }
+}

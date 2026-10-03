@@ -104,7 +104,10 @@ proptest = "1"
 # launchd job definitions are XML property lists built from `plist::Value`;
 # serde support is not needed.
 plist = { version = "1.10", default-features = false }
-zbus = { version = "5.16", default-features = false, features = ["tokio"] }
+# The runtime-agnostic async-io backend runs on any thread. The `tokio` backend
+# panics when a consumer in the same dependency graph (the GUI theme detector)
+# drives zbus outside a Tokio runtime, because cargo unifies the feature.
+zbus = { version = "5.16", default-features = false, features = ["async-io"] }
 pulldown-cmark = "0.12"
 # Session identifiers need durable, globally collision-resistant generation.
 ulid = "1"

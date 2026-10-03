@@ -1819,4 +1819,24 @@ mod tests {
             Error::Unavailable { .. }
         ));
     }
+
+    /// The connection path must not need a Tokio runtime: the backend is also
+    /// driven by callers that run it on a plain thread.
+    #[test]
+    fn connect_without_a_tokio_runtime_reports_an_unreachable_bus() {
+        let missing_bus = tempfile::tempdir()
+            .expect("scratch directory")
+            .path()
+            .join("no-such-bus");
+        let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
+        env.set(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", missing_bus.display()),
+        );
+        let outcome =
+            std::thread::spawn(|| async_io::block_on(Bus::connect(Duration::from_secs(5))))
+                .join()
+                .expect("connecting outside a Tokio runtime must not panic");
+        assert!(matches!(outcome, Err(Error::Unavailable { .. })));
+    }
 }
