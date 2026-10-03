@@ -45,8 +45,8 @@ Hard constraints, decided on purpose — respect them in every change:
   plane.
 - **Remote owner transport is direct over NetBird**, never SSH bridging. Relay
   transport is the separate host-initiated path defined by the accepted RFC.
-- **Providers (Linear/GitHub) are shell-out based** (`gh`, Linear GraphQL) and
-  live only in client surfaces (CLI scripts and external clients), never in the daemon.
+- **Issue/PR providers (Linear, GitHub) live only in `zajca/pohunek-work`,
+  never in core** (neither the daemon nor this repository's scripts).
 - **Protocol today:** public protocol v3 is owner-only newline-delimited JSON
   over a Unix socket (local) and TCP on configured overlays (remote); attach
   uses a separate raw-byte connection per PTY. [#70](https://github.com/zajca/pohunek/issues/70)
@@ -83,7 +83,8 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 
 Other top-level: `compat/` (pinned upstream compatibility locks and sanitized
 goldens), `docs/` (architecture, roadmap, phases, knowledge source), `scripts/`
-(rofi/sway launchers, release helper).
+(release helper, CI and dev tooling; the rofi/sway launchers live in
+`zajca/pohunek-work`).
 
 ## Build, test, lint — the gates that must pass
 

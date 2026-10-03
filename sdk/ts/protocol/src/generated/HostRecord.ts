@@ -3,7 +3,7 @@
 /**
  * One enumerated host with its overlay identity and classification.
  *
- * Field order and names are part of the wire contract the rofi switcher parses.
+ * Field order and names are part of the wire contract `--json` consumers parse.
  */
 export type HostRecord =
   & {

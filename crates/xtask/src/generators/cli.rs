@@ -380,9 +380,8 @@ static COMMANDS: &[CommandDescriptor] = &[
         arguments: "- `--json`: Emit machine-readable JSON instead of human text.",
         intents: &["setup", "help"],
         extra_body: "## Subcommands\n\n\
-                     - `pohunek setup scripts` — Materialize the launcher scripts into the data dir's bin/.\n\
-                     - `pohunek setup config` — Write a default launcher.conf and prompt templates.\n\
-                     - `pohunek setup sway` — Write the sway drop-in.",
+                     - `pohunek setup config` — Write a default attach.conf and prompt templates.\n\
+                     - `pohunek setup completions` — Install shell completion.",
     },
     CommandDescriptor {
         id: "setup-config",
