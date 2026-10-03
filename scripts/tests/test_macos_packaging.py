@@ -24,7 +24,6 @@ SCRIPTS = [
     MACOS / "build-release",
     MACOS / "package",
     MACOS / "sign",
-    MACOS / "notarize",
     MACOS / "verify-signed",
     ROOT / "packaging" / "verify-archive",
     ROOT / "packaging" / "archive",
@@ -297,11 +296,9 @@ class ToolingTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, "{}: {}".format(script, result.stderr))
             self.assertTrue(script.read_text().startswith(("#!/bin/sh\n", "#!/usr/bin/env sh\n")), script)
 
-    def test_the_bash_scripts_parse_as_bash(self):
-        for script in (MACOS / "signing-keychain",):
-            self.assertTrue(os.stat(script).st_mode & stat.S_IXUSR, script)
-            result = subprocess.run(["bash", "-n", str(script)], stderr=subprocess.PIPE, text=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
+    def test_the_removed_developer_id_scripts_are_gone(self):
+        for name in ("notarize", "signing-keychain"):
+            self.assertFalse((MACOS / name).exists(), name)
 
     def test_the_deployment_target_is_one_value(self):
         target = (MACOS / "DEPLOYMENT_TARGET").read_text().strip()
@@ -317,7 +314,18 @@ class ToolingTest(unittest.TestCase):
         development = text.split('if [ "$mode" = --development ]; then', 1)[1].split("\nfi", 1)[0]
         self.assertIn("suffix=-unsigned-development", development)
         self.assertIn("unsigned-development", text.split("write-manifest", 2)[2])
-        self.assertIn("developer-id", text.split("--sign-release ]; then", 1)[1])
+        release = text.split("--adhoc-release ]; then", 1)[1]
+        self.assertIn("adhoc", release)
+        self.assertNotIn("developer-id", text)
+        self.assertNotIn("--sign-release", text)
+
+    def test_the_release_package_mode_signs_ad_hoc_without_a_secret(self):
+        text = (MACOS / "package").read_text()
+        release = text.split("--adhoc-release ]; then", 1)[1].split("\nfi\n", 1)[0]
+        for step in ('"$script_dir/sign"', '"$script_dir/verify-signed" --adhoc', "write-manifest", "packaging/archive"):
+            self.assertIn(step, release, step)
+        for variable in ("MACOS_", "APPLE_"):
+            self.assertNotIn(variable, text)
 
 
 if __name__ == "__main__":

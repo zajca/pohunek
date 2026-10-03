@@ -4,25 +4,21 @@
 # usage:
 #   package --development   <component> <version> <bindir> <docs-dir> <output-dir>
 #   package --stage-release <component> <version> <bindir> <docs-dir> <output-dir>
-#   package --sign-release  <component> <version> <staging-dir>
+#   package --adhoc-release <component> <version> <staging-dir>
 #
 # <component> is cli or daemon. The staged tree is audited (`audit-macho`),
 # then sealed with a MANIFEST and archived reproducibly; the archive path is
 # printed on stdout.
 #
-# A release is made in two steps so that no built program runs while a signing
-# credential exists. `--stage-release` assembles and audits the tree, which runs
-# the built `pohunek` to write the shell completions, and needs no secret; it
-# prints the staging directory. `--sign-release` then signs the tree with the
-# Developer ID identity, has Apple notarize it, verifies
-# the result, and writes the manifest and the archive, so the manifest hashes the
-# final signed bytes and records `signing developer-id`. It audits the tree again
-# before signing (the tree came from another runner) and runs nothing from it. It needs the environment of `signing-keychain`
-# (MACOS_SIGNING_IDENTITY, MACOS_SIGNING_KEYCHAIN), of `notarize`
-# (APPLE_NOTARY_*), and MACOS_TEAM_ID, and fails when any is missing: a release
-# is never produced unsigned. Signing embeds Apple's secure timestamp, so a
-# signed archive differs between runs; the unsigned content it wraps is
-# reproducible.
+# A release is made in two steps so that no built program runs after the final
+# bytes exist. `--stage-release` assembles and audits the tree, which runs the
+# built `pohunek` to write the shell completions, and prints the staging
+# directory. `--adhoc-release` then ad-hoc signs every Mach-O file of the tree
+# (`sign`), verifies the result (`verify-signed --adhoc`), and writes the
+# manifest and the archive, so the manifest hashes the final signed bytes and
+# records `signing adhoc`. It audits the tree again before signing (the tree
+# came from another runner) and runs nothing from it. It needs no secret: an
+# ad-hoc signature uses no certificate and no keychain.
 #
 # `--development` builds an unsigned archive for local use and CI acceptance.
 # Its name ends in `-unsigned-development` and its MANIFEST says
@@ -40,12 +36,12 @@ fail() {
 }
 
 usage="usage: package --development|--stage-release <component> <version> <bindir> <docs-dir> <output-dir>
-       package --sign-release <component> <version> <staging-dir>"
+       package --adhoc-release <component> <version> <staging-dir>"
 [ "$#" -ge 1 ] || fail "$usage"
 mode=$1
 case $mode in
     --development | --stage-release) [ "$#" -eq 6 ] || fail "$usage" ;;
-    --sign-release) [ "$#" -eq 4 ] || fail "$usage" ;;
+    --adhoc-release) [ "$#" -eq 4 ] || fail "$usage" ;;
     *) fail "unsupported mode: $mode
 $usage" ;;
 esac
@@ -62,19 +58,12 @@ root=$(CDPATH= cd -- "$script_dir/../.." && pwd -P)
 target=aarch64-apple-darwin
 minimum_macos=$(tr -d ' \n' < "$script_dir/DEPLOYMENT_TARGET")
 
-if [ "$mode" = --sign-release ]; then
-    # Checked first so a release with a missing credential fails before any
-    # work is done.
-    for variable in MACOS_SIGNING_IDENTITY MACOS_SIGNING_KEYCHAIN MACOS_TEAM_ID \
-        APPLE_NOTARY_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID; do
-        eval "value=\${$variable:-}"
-        [ -n "$value" ] || fail "$variable is not set: a release is never produced unsigned"
-    done
+if [ "$mode" = --adhoc-release ]; then
     staging=$(CDPATH= cd -- "$4" && pwd -P)
     output=$(dirname -- "$staging")
     name=$(basename -- "$staging")
     case $name in
-        *-unsigned-development) fail "a development staging directory cannot be signed as a release: $name" ;;
+        *-unsigned-development) fail "a development staging directory cannot be packaged as a release: $name" ;;
         "pohunek-$component-$version-$target") ;;
         *) fail "unexpected staging directory name: $name" ;;
     esac
@@ -91,10 +80,9 @@ if [ "$mode" = --sign-release ]; then
     # shellcheck disable=SC2086
     "$script_dir/audit-macho" $require --forbid-string "$root" "$staging" >&2
     "$script_dir/sign" "$staging" >&2
-    "$script_dir/notarize" "$staging" >&2
-    "$script_dir/verify-signed" --notarized --team-id "$MACOS_TEAM_ID" "$staging" >&2
+    "$script_dir/verify-signed" --adhoc "$staging" >&2
     sh "$root/packaging/write-manifest" "$staging" "$component" "$version" "$target" \
-        developer-id "$minimum_macos"
+        adhoc "$minimum_macos"
     sh "$root/packaging/archive" "$output" "$name" "$output"
     printf '%s\n' "$output/$name.tar.gz"
     exit 0

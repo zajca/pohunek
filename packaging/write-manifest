@@ -11,7 +11,7 @@
 # because the hashes cover the final bytes.
 #
 # <signing> is `none` for archives without a signing step (Linux),
-# `developer-id` for a signed and notarized macOS archive, and
+# `adhoc` for a macOS archive whose Mach-O files carry an ad-hoc signature, and
 # `unsigned-development` for a local macOS build that must not be distributed.
 # <minimum-macos> is required for an `apple-darwin` target and refused for any
 # other.
@@ -48,7 +48,7 @@ case $target in
     '' | *[!a-z0-9_-]*) fail "target must be a lowercase target triple: $target" ;;
 esac
 case $signing in
-    none | developer-id | unsigned-development) ;;
+    none | adhoc | unsigned-development) ;;
     *) fail "unsupported signing state: $signing" ;;
 esac
 case $target in

@@ -306,9 +306,10 @@ jobs:
   # twice from the same commit and must come out byte-identical, its Mach-O
   # files are audited, and the extracted archives are installed, upgraded, and
   # uninstalled against real launchd with live sessions
-  # (scripts/acceptance/macos-package-install). Archives built here
-  # are unsigned development builds; signing and notarization run only in the
-  # release workflow.
+  # (scripts/acceptance/macos-package-install). Archives built here take the
+  # release path (`package --stage-release`, then `package --adhoc-release`), so
+  # they carry ad-hoc signatures and `signing adhoc` in the MANIFEST, and
+  # `verify-signed --adhoc` checks them.
   macos-package:
     # macos-15 is the required leg. macos-14 is the minimum supported macOS and
     # exercises the packaged archives on it, but GitHub retires that hosted
@@ -365,8 +366,10 @@ jobs:
           set -euo pipefail
           version="$(awk -F'"' '/^\[workspace\.package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version[[:space:]]*=/ { print $2; exit }' Cargo.toml)"
           mkdir -p "$RUNNER_TEMP/dist-a"
-          archive="$(packaging/macos/package --development daemon "$version" \
+          staging="$(packaging/macos/package --stage-release daemon "$version" \
             "${{ steps.build.outputs.bindir }}" target/pohunek-docs "$RUNNER_TEMP/dist-a")"
+          archive="$(packaging/macos/package --adhoc-release daemon "$version" "$staging")"
+          packaging/macos/verify-signed --adhoc "$staging"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
@@ -389,8 +392,10 @@ jobs:
             cmp "$first/$binary" "$bindir/$binary" \
               || { echo "::error::$binary is not reproducible from a cold build"; exit 1; }
           done
-          rebuilt="$(packaging/macos/package --development daemon \
+          rebuilt_staging="$(packaging/macos/package --stage-release daemon \
             "${{ steps.package-a.outputs.version }}" "$bindir" target/pohunek-docs "$RUNNER_TEMP/dist-repro")"
+          rebuilt="$(packaging/macos/package --adhoc-release daemon \
+            "${{ steps.package-a.outputs.version }}" "$rebuilt_staging")"
           cmp "${{ steps.package-a.outputs.archive }}" "$rebuilt" \
             || { echo "::error::the daemon archive is not reproducible from a cold build"; exit 1; }
 
@@ -414,7 +419,9 @@ jobs:
           )"
           bindir="$(CARGO_LOCKED_FLAG= packaging/macos/build-release daemon)"
           mkdir -p "$RUNNER_TEMP/dist-b"
-          archive="$(packaging/macos/package --development daemon "$version_b" "$bindir" target/pohunek-docs "$RUNNER_TEMP/dist-b")"
+          staging="$(packaging/macos/package --stage-release daemon "$version_b" "$bindir" target/pohunek-docs "$RUNNER_TEMP/dist-b")"
+          archive="$(packaging/macos/package --adhoc-release daemon "$version_b" "$staging")"
+          packaging/macos/verify-signed --adhoc "$staging"
           git checkout -- Cargo.toml Cargo.lock
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 

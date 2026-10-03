@@ -193,6 +193,21 @@ class WriteManifestTest(unittest.TestCase):
         self.assertIn("signing unsigned-development\n", text)
         self.assertIn("minimum-macos 14.0\n", text)
 
+    def test_darwin_manifest_records_an_ad_hoc_signing_state(self):
+        ws = Workspace(self)
+        name = ws.stage("daemon")
+        self.manifest(ws, name, "daemon", VERSION, "aarch64-apple-darwin", "adhoc", "14.0")
+        text = (ws.out / name / "MANIFEST").read_text()
+        self.assertIn("signing adhoc\n", text)
+        self.assertIn("minimum-macos 14.0\n", text)
+
+    def test_the_developer_id_signing_state_is_refused(self):
+        ws = Workspace(self)
+        name = ws.stage("daemon")
+        result = self.manifest(ws, name, "daemon", VERSION, "aarch64-apple-darwin", "developer-id", "14.0", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported signing state", result.stderr)
+
     def test_invalid_input_is_refused_and_leaves_no_manifest(self):
         ws = Workspace(self)
         name = ws.stage("daemon")
