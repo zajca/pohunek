@@ -150,17 +150,20 @@ line). `target/debug`, `target/release`, nextest/doc scratch dirs, manual
 cross-compile triples) are kept; only entries shaped like Cargo target dirs
 are deleted, and a non-target `--target-dir` refuses to run.
 
-The real-daemon web suite is opt-in locally and mandatory in CI after building
-`pohunekd`, `pohunek-sessiond`, and `pohunek` (the suite runs the daemon in
-subprocess worker mode, which spawns `pohunek-sessiond` from beside `pohunekd`,
-and the Hermes plugin e2e drives the real CLI):
+The real-daemon suites are opt-in locally and mandatory in CI after building
+`pohunekd`, `pohunek-sessiond`, and `pohunek` (the suites run the daemon in
+subprocess worker mode, which spawns `pohunek-sessiond` from beside `pohunekd`).
+The Hermes plugin e2e lives in the SDK workspace
+(`sdk/ts/sdk/test/hermes-plugin.e2e.test.ts`), depends on no web package, and
+drives the real CLI:
 
 ```bash
 cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
   POHUNEK_CLI_BIN=/absolute/path/to/target/debug/pohunek \
   POHUNEK_PYTHON_BIN=/usr/bin/python3 \
-  bun test sdk/ts/sdk/test/e2e.test.ts web/backend/test/real-daemon.e2e.test.ts
+  bun test sdk/ts/sdk/test/e2e.test.ts sdk/ts/sdk/test/hermes-plugin.e2e.test.ts \
+  web/backend/test/real-daemon.e2e.test.ts
 ```
 
 For control-center development, `bun run dev` starts two fixture daemons, the

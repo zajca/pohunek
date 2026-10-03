@@ -1641,13 +1641,19 @@ jobs:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
-      - name: Backend e2e against real daemon
-        run: bun test web/backend/test/real-daemon.e2e.test.ts
+      - name: Hermes plugin e2e against real daemon
+        run: bun test sdk/ts/sdk/test/hermes-plugin.e2e.test.ts
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
           POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
           POHUNEK_PYTHON_BIN: /usr/bin/python3
+
+      - name: Backend e2e against real daemon
+        run: bun test web/backend/test/real-daemon.e2e.test.ts
+        env:
+          POHUNEK_E2E: "1"
+          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
   # The owner web workspace on Apple Silicon (issue #103): typecheck, lint,
   # unit tests, the Playwright browser suite, the compiled backend executable,
@@ -1761,7 +1767,6 @@ jobs:
           POHUNEK_E2E: "1"
           POHUNEK_E2E_DEFAULT_RUNTIME: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
-          POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
 
   # Dependency hygiene (M-STATIC-VERIFICATION): security advisories, the Cargo
   # feature matrix, and unused dependencies. Kept off the critical `test` job so

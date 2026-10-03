@@ -209,13 +209,19 @@ jobs:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
-      - name: Backend e2e against real daemon
-        run: bun test web/backend/test/real-daemon.e2e.test.ts
+      - name: Hermes plugin e2e against real daemon
+        run: bun test sdk/ts/sdk/test/hermes-plugin.e2e.test.ts
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
           POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
           POHUNEK_PYTHON_BIN: /usr/bin/python3
+
+      - name: Backend e2e against real daemon
+        run: bun test web/backend/test/real-daemon.e2e.test.ts
+        env:
+          POHUNEK_E2E: "1"
+          POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
   web-release:
     name: Build web control center for Linux x86_64
