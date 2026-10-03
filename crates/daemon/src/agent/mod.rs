@@ -17,12 +17,16 @@ use crate::detect::Manifest;
 mod claude;
 mod codex;
 mod hermes;
+mod native_launch;
 mod profile;
 mod shell;
 
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use hermes::HermesAdapter;
+pub use native_launch::{
+    NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
+};
 pub(crate) use profile::{default_args, default_program, ProfileRegistry, ResolvedAgent};
 pub use shell::ShellAdapter;
 
@@ -55,8 +59,6 @@ impl AgentAdapter for UnsupportedAdapter {
 
 /// Default submit delay for Claude Code's Ink TUI.
 pub const DEFAULT_CLAUDE_SUBMIT_DELAY: Duration = Duration::from_millis(150);
-/// Claude Code flag that forks a resumed native conversation into a new branch.
-const CLAUDE_FORK_SESSION_ARG: &str = "--fork-session";
 
 /// A launch executable resolved and canonicalized before provider validation.
 ///
@@ -315,141 +317,25 @@ impl SessionRef {
     }
 }
 
-/// How an agent's resume invocation is shaped on the command line.
-///
-/// The two built-in kinds differ only in this: Claude resumes via a `--resume`
-/// flag, Codex via a `resume` subcommand. A host profile (Part C) may override the
-/// mode so a profile whose base is `claude` can still drive a `resume`-subcommand
-/// CLI. Both produce a two-element argv ending in the native session reference.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResumeMode {
-    /// `<program> --resume <ref>` (Claude).
-    Flag,
-    /// `<program> resume <ref>` (Codex).
-    Subcommand,
-}
-
-impl ResumeMode {
-    /// Build the resume argv (excluding `argv[0]`) for `value`.
-    fn argv(self, value: &str) -> Vec<String> {
-        match self {
-            ResumeMode::Flag => vec!["--resume".to_owned(), value.to_owned()],
-            ResumeMode::Subcommand => vec!["resume".to_owned(), value.to_owned()],
-        }
-    }
-}
-
-/// The resolved "how to resume" for a session: the argv mode plus which native
-/// reference kind ([`SessionRefKind`]) its captured value is.
-///
-/// `ref_kind` decides which validating [`SessionRef`] constructor builds the
-/// reference at resume — and therefore which trust-boundary guard applies: `Id`
-/// carries the leading-dash argv-injection guard, `Path` carries the
-/// must-be-absolute guard (the asymmetry is intentional, see [`SessionRef`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResumeTemplate {
-    /// Whether the resume argv uses a `--resume` flag or a `resume` subcommand.
-    pub mode: ResumeMode,
-    /// Whether the captured native reference is an id or a path.
-    pub ref_kind: SessionRefKind,
-}
-
-/// A compiled provider-native fork command shape.
-///
-/// Fork mechanics are intentionally independent from [`ResumeMode`]. A provider
-/// may support resume without supporting a native conversation fork.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ForkMode {
-    /// Append `--fork-session` to a Claude Code resume operation.
-    ClaudeSession,
-}
-
-impl ForkMode {
-    /// Append provider-specific fork arguments to `args`.
-    fn append_args(self, args: &mut Vec<String>) {
-        match self {
-            Self::ClaudeSession => args.push(CLAUDE_FORK_SESSION_ARG.to_owned()),
-        }
-    }
-}
-
-/// A compiled provider-native fork capability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ForkTemplate {
-    /// The frozen provider resume operation used to select the conversation.
-    pub resume: ResumeTemplate,
-    /// The provider-owned argv shape for a fork operation.
-    pub mode: ForkMode,
-}
-
-impl ForkTemplate {
-    /// Build fork argv from the frozen resume operation and provider extension.
-    fn argv(self, value: &str) -> Vec<String> {
-        let mut args = self.resume.mode.argv(value);
-        self.mode.append_args(&mut args);
-        args
-    }
-}
-
-/// The independently declared native recovery capabilities of an agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AgentCapabilities {
-    /// Native resume support, when the provider supports it.
-    pub resume: Option<ResumeTemplate>,
-    /// Native fork support, when the provider supports it.
-    pub fork: Option<ForkTemplate>,
-}
-
-/// Return the compiled capabilities for a built-in base agent kind.
+/// Return the compiled native-session launch spec for a built-in base agent
+/// kind, or `None` when the kind has no native recovery (a shell).
 #[must_use]
-pub(crate) fn base_capabilities(base: &protocol::AgentKind) -> AgentCapabilities {
+pub(crate) fn base_native_launch(base: &protocol::AgentKind) -> Option<NativeSessionLaunch> {
     match base {
-        protocol::AgentKind::Shell | protocol::AgentKind::Unknown(_) => AgentCapabilities {
-            resume: None,
-            fork: None,
-        },
-        protocol::AgentKind::Codex => AgentCapabilities {
-            resume: Some(ResumeTemplate {
-                mode: ResumeMode::Subcommand,
-                ref_kind: SessionRefKind::Id,
-            }),
-            fork: None,
-        },
-        protocol::AgentKind::Claude => AgentCapabilities {
-            resume: Some(ResumeTemplate {
-                mode: ResumeMode::Flag,
-                ref_kind: SessionRefKind::Id,
-            }),
-            fork: Some(ForkTemplate {
-                resume: ResumeTemplate {
-                    mode: ResumeMode::Flag,
-                    ref_kind: SessionRefKind::Id,
-                },
-                mode: ForkMode::ClaudeSession,
-            }),
-        },
-        protocol::AgentKind::Hermes => AgentCapabilities {
-            resume: Some(ResumeTemplate {
-                mode: ResumeMode::Flag,
-                ref_kind: SessionRefKind::Id,
-            }),
-            fork: None,
-        },
+        protocol::AgentKind::Shell | protocol::AgentKind::Unknown(_) => None,
+        protocol::AgentKind::Codex => Some(built_in_launch(&["resume", "{reference}"], None)),
+        protocol::AgentKind::Claude => Some(built_in_launch(
+            &["--resume", "{reference}"],
+            Some(&["--resume", "{reference}", "--fork-session"]),
+        )),
+        protocol::AgentKind::Hermes => Some(built_in_launch(&["--resume", "{reference}"], None)),
     }
 }
 
-/// The resume template for a bare base kind, or `None` when it has no native
-/// resume (a shell).
-pub(crate) fn base_resume_template(base: &protocol::AgentKind) -> Option<ResumeTemplate> {
-    base_capabilities(base).resume
-}
-
-/// Return the compiled native fork template for a base agent kind.
-#[must_use]
-pub(crate) fn base_fork_template(base: &protocol::AgentKind) -> Option<ForkTemplate> {
-    base_capabilities(base).fork
+/// Build a compiled id-kind spec from templates that are valid by construction.
+fn built_in_launch(resume: &[&str], fork: Option<&[&str]>) -> NativeSessionLaunch {
+    NativeSessionLaunch::from_templates(SessionRefKind::Id, resume, fork)
+        .expect("compiled native-session templates are valid (covered by unit tests)")
 }
 
 /// Thin per-agent adapter for launch, input, and activity behavior.
@@ -525,33 +411,32 @@ pub fn build_pty_command(
 /// Build the PTY command that resumes a session from its frozen structural
 /// snapshot (Part C: C.4).
 ///
-/// The `program` and the resume `template` come from the session's launch-time
-/// snapshot, so a host profile that overrode the launch program or the resume
-/// mode resumes with exactly those values. The `session_ref` must already be
-/// the kind named by `template.ref_kind` (its constructor enforced the matching
-/// guard).
-pub(crate) fn resume_pty_command_from_template(
+/// The `program` and the native-session `launch` spec come from the session's
+/// launch-time snapshot, so a host profile that overrode the launch program or
+/// the resume args resumes with exactly those values. `session_ref` must be of
+/// the kind the spec names.
+pub(crate) fn resume_pty_command_from_launch(
     program: &str,
     frozen_args: Vec<String>,
-    template: ResumeTemplate,
+    launch: &NativeSessionLaunch,
     session_ref: &SessionRef,
     opts: &LaunchOpts,
 ) -> Result<LaunchCommand, ProtocolError> {
     let mut args = frozen_args;
-    args.extend(template.mode.argv(session_ref.value()));
+    args.extend(launch.resume_argv(session_ref)?);
     build_pty_command(program, args, opts)
 }
 
 /// Build the PTY command that forks a native session from a frozen snapshot.
-pub(crate) fn fork_pty_command_from_template(
+pub(crate) fn fork_pty_command_from_launch(
     program: &str,
     frozen_args: Vec<String>,
-    template: ForkTemplate,
+    launch: &NativeSessionLaunch,
     session_ref: &SessionRef,
     opts: &LaunchOpts,
 ) -> Result<LaunchCommand, ProtocolError> {
     let mut args = frozen_args;
-    args.extend(template.argv(session_ref.value()));
+    args.extend(launch.fork_argv(session_ref)?);
     build_pty_command(program, args, opts)
 }
 
@@ -629,11 +514,10 @@ mod tests {
     use protocol::{AgentActivity, ErrorClass};
 
     use super::{
-        base_capabilities, base_resume_template, build_pty_command, fork_pty_command_from_template,
-        resolve_binary, resume_pty_command_from_template, trusted_program, which_executable,
-        AgentAdapter, ClaudeAdapter, CodexAdapter, ForkMode, ForkTemplate, HermesAdapter,
-        LaunchOpts, ResumeMode, ResumeTemplate, SessionRef, SessionRefKind, ShellAdapter,
-        ValidatedLaunchProgram,
+        base_native_launch, build_pty_command, fork_pty_command_from_launch, resolve_binary,
+        resume_pty_command_from_launch, trusted_program, which_executable, AgentAdapter,
+        ClaudeAdapter, CodexAdapter, HermesAdapter, LaunchOpts, NativeArgs, NativeSessionLaunch,
+        SessionRef, SessionRefKind, ShellAdapter, ValidatedLaunchProgram,
     };
     use crate::detect::{ManifestRegion, MatchContext};
 
@@ -1093,78 +977,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn base_resume_template_defines_native_resume_modes() {
-        // Claude → `--resume` flag, Codex → `resume` subcommand, both id-kind.
-        // This is the single source of resume argv shape for built-in base kinds.
-        let claude = base_resume_template(&protocol::AgentKind::Claude).expect("claude resumable");
-        assert_eq!(claude.mode, ResumeMode::Flag);
-        assert_eq!(claude.ref_kind, SessionRefKind::Id);
-        let codex = base_resume_template(&protocol::AgentKind::Codex).expect("codex resumable");
-        assert_eq!(codex.mode, ResumeMode::Subcommand);
-        assert_eq!(codex.ref_kind, SessionRefKind::Id);
-        let hermes = base_resume_template(&protocol::AgentKind::Hermes).expect("Hermes resumable");
-        assert_eq!(hermes.mode, ResumeMode::Flag);
-        assert_eq!(hermes.ref_kind, SessionRefKind::Id);
-        // A shell has no native resume.
-        assert!(base_resume_template(&protocol::AgentKind::Shell).is_none());
+    /// Render a spec's resume/fork argv for an id reference, panicking on error.
+    fn id_argv(launch: &NativeSessionLaunch, id: &str) -> (Vec<String>, Option<Vec<String>>) {
+        let reference = SessionRef::id(id).expect("id reference");
+        (
+            launch.resume_argv(&reference).expect("resume argv"),
+            launch.fork_argv(&reference).ok(),
+        )
     }
 
     #[test]
-    fn built_in_capabilities_keep_resume_and_fork_independent() {
-        let shell = base_capabilities(&protocol::AgentKind::Shell);
-        assert_eq!(shell.resume, None);
-        assert_eq!(shell.fork, None);
-
-        let codex = base_capabilities(&protocol::AgentKind::Codex);
+    fn built_in_native_launch_specs_pin_exact_argv() {
+        let claude = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        assert_eq!(claude.reference_kind(), SessionRefKind::Id);
         assert_eq!(
-            codex.resume,
-            base_resume_template(&protocol::AgentKind::Codex)
+            id_argv(&claude, "native-1"),
+            (
+                vec!["--resume".to_owned(), "native-1".to_owned()],
+                Some(vec![
+                    "--resume".to_owned(),
+                    "native-1".to_owned(),
+                    "--fork-session".to_owned(),
+                ]),
+            )
         );
-        assert_eq!(codex.fork, None);
 
-        let hermes = base_capabilities(&protocol::AgentKind::Hermes);
+        let codex = base_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
+        assert_eq!(codex.reference_kind(), SessionRefKind::Id);
         assert_eq!(
-            hermes.resume,
-            base_resume_template(&protocol::AgentKind::Hermes)
+            id_argv(&codex, "native-1"),
+            (vec!["resume".to_owned(), "native-1".to_owned()], None)
         );
-        assert_eq!(hermes.fork, None);
 
-        let claude = base_capabilities(&protocol::AgentKind::Claude);
+        let hermes = base_native_launch(&protocol::AgentKind::Hermes).expect("hermes recovers");
+        assert_eq!(hermes.reference_kind(), SessionRefKind::Id);
         assert_eq!(
-            claude.resume,
-            base_resume_template(&protocol::AgentKind::Claude)
+            id_argv(&hermes, "native-1"),
+            (vec!["--resume".to_owned(), "native-1".to_owned()], None)
         );
+
+        assert_eq!(base_native_launch(&protocol::AgentKind::Shell), None);
         assert_eq!(
-            claude.fork,
-            Some(ForkTemplate {
-                resume: ResumeTemplate {
-                    mode: ResumeMode::Flag,
-                    ref_kind: SessionRefKind::Id,
-                },
-                mode: ForkMode::ClaudeSession,
-            })
+            base_native_launch(&protocol::AgentKind::Unknown("x".to_owned())),
+            None
         );
     }
 
     #[test]
-    fn fork_pty_command_preserves_claude_argv_without_resume_mode_coupling() {
+    fn codex_and_hermes_report_fork_unsupported() {
+        let reference = SessionRef::id("native-1").expect("id reference");
+        for kind in [protocol::AgentKind::Codex, protocol::AgentKind::Hermes] {
+            let launch = base_native_launch(&kind).expect("recovers");
+            assert!(!launch.supports_fork());
+            assert_eq!(
+                launch.fork_argv(&reference).expect_err("no fork").code,
+                "agent_fork_unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn fork_pty_command_preserves_claude_argv_with_frozen_args() {
         let bin_dir = temp_dir("template-fork-bin");
         write_executable(&bin_dir, "claude-sonnet");
         let cwd = temp_dir("template-fork-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
+        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
 
         let command = with_path(&bin_dir, || {
-            fork_pty_command_from_template(
+            fork_pty_command_from_launch(
                 "claude-sonnet",
                 vec!["--model".to_owned(), "sonnet".to_owned()],
-                ForkTemplate {
-                    resume: ResumeTemplate {
-                        mode: ResumeMode::Flag,
-                        ref_kind: SessionRefKind::Id,
-                    },
-                    mode: ForkMode::ClaudeSession,
-                },
+                &launch,
                 &session,
                 &launch_opts(&cwd),
             )
@@ -1184,43 +1068,54 @@ mod tests {
     }
 
     #[test]
-    fn resume_pty_command_from_template_builds_argv_by_mode() {
+    fn fork_pty_command_refuses_a_spec_without_fork() {
+        let cwd = temp_dir("template-fork-none-cwd");
+        let session = SessionRef::id("native-123").expect("id ref");
+        let launch = base_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
+
+        let error = fork_pty_command_from_launch(
+            "codex",
+            Vec::new(),
+            &launch,
+            &session,
+            &launch_opts(&cwd),
+        )
+        .expect_err("codex cannot fork");
+        assert_eq!(error.code, "agent_fork_unsupported");
+    }
+
+    #[test]
+    fn resume_pty_command_from_launch_builds_exact_builtin_argv() {
         let bin_dir = temp_dir("template-resume-bin");
         write_executable(&bin_dir, "claude-sonnet");
         let cwd = temp_dir("template-resume-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
 
-        // Flag mode resumes with `--resume <id>`; the program is the snapshot's,
-        // NOT the base adapter's "claude".
+        // The program is the snapshot's, NOT the base adapter's "claude".
+        let claude = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
         let flag = with_path(&bin_dir, || {
-            resume_pty_command_from_template(
+            resume_pty_command_from_launch(
                 "claude-sonnet",
                 Vec::new(),
-                ResumeTemplate {
-                    mode: ResumeMode::Flag,
-                    ref_kind: SessionRefKind::Id,
-                },
+                &claude,
                 &session,
                 &launch_opts(cwd.clone()),
             )
-            .expect("flag resume command")
+            .expect("claude resume command")
         });
         assert!(flag.program.ends_with("claude-sonnet"));
         assert_eq!(flag.args, vec!["--resume", "native-123"]);
 
-        // Subcommand mode resumes with `resume <id>`.
+        let codex = base_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
         let sub = with_path(&bin_dir, || {
-            resume_pty_command_from_template(
+            resume_pty_command_from_launch(
                 "claude-sonnet",
                 Vec::new(),
-                ResumeTemplate {
-                    mode: ResumeMode::Subcommand,
-                    ref_kind: SessionRefKind::Id,
-                },
+                &codex,
                 &session,
                 &launch_opts(cwd.clone()),
             )
-            .expect("subcommand resume command")
+            .expect("codex resume command")
         });
         assert_eq!(sub.args, vec!["resume", "native-123"]);
     }
@@ -1233,10 +1128,10 @@ mod tests {
             .expect("spaces and non-control symbols are valid in opaque ids");
 
         let command = with_path(&bin_dir, || {
-            resume_pty_command_from_template(
+            resume_pty_command_from_launch(
                 "hermes",
                 vec!["chat".to_owned()],
-                base_resume_template(&protocol::AgentKind::Hermes).expect("Hermes resumes"),
+                &base_native_launch(&protocol::AgentKind::Hermes).expect("Hermes resumes"),
                 &session,
                 &launch_opts(temp_dir("hermes-resume-cwd")),
             )
@@ -1254,20 +1149,99 @@ mod tests {
     }
 
     #[test]
-    fn resume_pty_command_from_template_carries_path_ref_value() {
+    fn resume_keeps_shell_metacharacter_references_as_one_argv_element() {
+        let bin_dir = temp_dir("template-meta-bin");
+        write_executable(&bin_dir, "myagent");
+        let cwd = temp_dir("template-meta-cwd");
+        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let hostile_id = "a b;$(touch pwned)|`x` 'q' \"z\" *";
+        let hostile_path = "/work/a b/$(touch pwned);|.jsonl";
+
+        let by_id = with_path(&bin_dir, || {
+            resume_pty_command_from_launch(
+                "myagent",
+                Vec::new(),
+                &launch,
+                &SessionRef::id(hostile_id).expect("id"),
+                &launch_opts(&cwd),
+            )
+            .expect("id resume")
+        });
+        assert_eq!(
+            by_id.args,
+            vec!["--resume".to_owned(), hostile_id.to_owned()]
+        );
+
+        let path_launch = NativeSessionLaunch::new(
+            SessionRefKind::Path,
+            NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
+            Some(NativeArgs::from_template(&["--fork", "{reference}"]).expect("fork")),
+        );
+        let path = SessionRef::path(hostile_path).expect("path");
+        let (resume, fork) = with_path(&bin_dir, || {
+            (
+                resume_pty_command_from_launch(
+                    "myagent",
+                    Vec::new(),
+                    &path_launch,
+                    &path,
+                    &launch_opts(&cwd),
+                )
+                .expect("path resume"),
+                fork_pty_command_from_launch(
+                    "myagent",
+                    Vec::new(),
+                    &path_launch,
+                    &path,
+                    &launch_opts(&cwd),
+                )
+                .expect("path fork"),
+            )
+        });
+        assert_eq!(
+            resume.args,
+            vec!["--session".to_owned(), hostile_path.to_owned()]
+        );
+        assert_eq!(
+            fork.args,
+            vec!["--fork".to_owned(), hostile_path.to_owned()]
+        );
+    }
+
+    #[test]
+    fn resume_pty_command_from_launch_refuses_a_reference_of_the_wrong_kind() {
+        let cwd = temp_dir("template-kind-cwd");
+        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let path = SessionRef::path("/abs/session.jsonl").expect("path ref");
+
+        let error = resume_pty_command_from_launch(
+            "claude",
+            Vec::new(),
+            &launch,
+            &path,
+            &launch_opts(&cwd),
+        )
+        .expect_err("id spec rejects a path reference");
+        assert_eq!(error.code, "native_reference_kind_mismatch");
+    }
+
+    #[test]
+    fn resume_pty_command_from_launch_carries_path_ref_value() {
         let bin_dir = temp_dir("template-path-bin");
         write_executable(&bin_dir, "myagent");
         let cwd = temp_dir("template-path-cwd");
         let session = SessionRef::path("/abs/session.jsonl").expect("path ref");
+        let launch = NativeSessionLaunch::new(
+            SessionRefKind::Path,
+            NativeArgs::from_template(&["--resume", "{reference}"]).expect("resume"),
+            None,
+        );
 
         let command = with_path(&bin_dir, || {
-            resume_pty_command_from_template(
+            resume_pty_command_from_launch(
                 "myagent",
                 Vec::new(),
-                ResumeTemplate {
-                    mode: ResumeMode::Flag,
-                    ref_kind: SessionRefKind::Path,
-                },
+                &launch,
                 &session,
                 &launch_opts(&cwd),
             )
@@ -1277,20 +1251,18 @@ mod tests {
     }
 
     #[test]
-    fn resume_pty_command_from_template_preserves_frozen_profile_args() {
+    fn resume_pty_command_from_launch_preserves_frozen_profile_args() {
         let bin_dir = temp_dir("template-args-bin");
         write_executable(&bin_dir, "myagent");
         let cwd = temp_dir("template-args-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
+        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
 
         let command = with_path(&bin_dir, || {
-            resume_pty_command_from_template(
+            resume_pty_command_from_launch(
                 "myagent",
                 vec!["--model".to_owned(), "sonnet".to_owned()],
-                ResumeTemplate {
-                    mode: ResumeMode::Flag,
-                    ref_kind: SessionRefKind::Id,
-                },
+                &launch,
                 &session,
                 &launch_opts(&cwd),
             )

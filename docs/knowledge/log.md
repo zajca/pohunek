@@ -1,5 +1,15 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-03, native launch spec)
+
+- Replaced the profile `[resume] mode`/`ref_kind` keys and the `[fork]` table
+  with a typed native-session launch spec: `[resume] reference_kind`, `args`,
+  and optional `fork_args`, each argv with one whole-token `{reference}`.
+  `resumable = false` now also removes fork, since fork requires resume. The
+  agent-profiles page documents the built-in specs, the profile form, and the
+  `invalid_profile` rejections; the public API `capabilities` note and the
+  sessions fork paragraph follow the frozen spec.
+
 ## Unreleased (2026-10-03)
 
 - Documented the macOS release shape: `aarch64-apple-darwin` CLI and daemon

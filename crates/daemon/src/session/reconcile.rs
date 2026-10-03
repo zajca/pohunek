@@ -2419,38 +2419,9 @@ impl SessionRegistry {
             || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
             |binding| binding.input_rules.to_input_rules(&binding.agent_base),
         );
-        let snapshot = recovery.as_ref().map_or_else(
-            || ResumeSnapshot {
-                program: String::new(),
-                args: Vec::new(),
-                resume: None,
-                fork: None,
-            },
-            |binding| ResumeSnapshot {
-                program: binding.program.clone(),
-                args: binding.args.clone(),
-                resume: binding
-                    .resume_mode
-                    .zip(binding.ref_kind)
-                    .map(|(mode, ref_kind)| super::ResumeTemplate { mode, ref_kind }),
-                fork: binding
-                    .forkable
-                    .then(|| {
-                        binding
-                            .fork_mode
-                            .zip(binding.fork_resume_mode)
-                            .zip(binding.fork_ref_kind)
-                    })
-                    .flatten()
-                    .map(|((mode, resume_mode), ref_kind)| super::ForkTemplate {
-                        resume: super::ResumeTemplate {
-                            mode: resume_mode,
-                            ref_kind,
-                        },
-                        mode,
-                    }),
-            },
-        );
+        let snapshot = recovery
+            .as_ref()
+            .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
         let manifest_override = self
             .inner
             .profiles
@@ -2594,38 +2565,9 @@ impl SessionRegistry {
             || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
             |binding| binding.input_rules.to_input_rules(&binding.agent_base),
         );
-        let relaunch = recovery.as_ref().map_or_else(
-            || ResumeSnapshot {
-                program: String::new(),
-                args: Vec::new(),
-                resume: None,
-                fork: None,
-            },
-            |binding| ResumeSnapshot {
-                program: binding.program.clone(),
-                args: binding.args.clone(),
-                resume: binding
-                    .resume_mode
-                    .zip(binding.ref_kind)
-                    .map(|(mode, ref_kind)| super::ResumeTemplate { mode, ref_kind }),
-                fork: binding
-                    .forkable
-                    .then(|| {
-                        binding
-                            .fork_mode
-                            .zip(binding.fork_resume_mode)
-                            .zip(binding.fork_ref_kind)
-                    })
-                    .flatten()
-                    .map(|((mode, resume_mode), ref_kind)| super::ForkTemplate {
-                        resume: super::ResumeTemplate {
-                            mode: resume_mode,
-                            ref_kind,
-                        },
-                        mode,
-                    }),
-            },
-        );
+        let relaunch = recovery
+            .as_ref()
+            .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
         let default_detector_config = DetectorConfig::for_agent(&record.info.agent_base);
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
         let (detector_config, _) = watch::channel(DetectorConfigUpdate {
@@ -2905,11 +2847,7 @@ fn merge_persisted_recovery(
     if let Some(recovery) = record.recovery.as_ref() {
         if recovery.agent != binding.agent
             || recovery.agent_base != binding.agent_base
-            || recovery.ref_kind != binding.ref_kind
-            || recovery.fork_mode != binding.fork_mode
-            || recovery.fork_resume_mode != binding.fork_resume_mode
-            || recovery.fork_ref_kind != binding.fork_ref_kind
-            || recovery.forkable != binding.forkable
+            || recovery.native_launch != binding.native_launch
         {
             return Err("resume_binding_shape_mismatch");
         }
@@ -2932,13 +2870,11 @@ fn merge_persisted_recovery(
         }
     }
 
-    let persisted_kind = recovery_ref_kind(&binding)?;
+    let persisted_kind = binding.reference_kind();
     let record_kind = record
         .recovery
         .as_ref()
-        .map(recovery_ref_kind)
-        .transpose()?
-        .flatten();
+        .and_then(ResumeBinding::reference_kind);
     let kind = persisted_kind.or(record_kind);
     let (native_id, native_path) = match (
         kind,
@@ -3301,7 +3237,7 @@ fn apply_worker_launch_identity(
         .recovery
         .as_mut()
         .ok_or("launch_identity_recovery_missing")?;
-    if recovery_ref_kind(binding)? != Some(kind) {
+    if binding.reference_kind() != Some(kind) {
         return Err("launch_identity_reference_kind_mismatch");
     }
     let native = validate_native_reference(kind, &identity.native_reference)
@@ -3328,18 +3264,6 @@ fn apply_worker_launch_identity(
         }
     }
     Ok(())
-}
-
-fn recovery_ref_kind(binding: &ResumeBinding) -> Result<Option<SessionRefKind>, &'static str> {
-    let resume_kind = binding.resumable.then_some(binding.ref_kind).flatten();
-    let fork_kind = binding.forkable.then_some(binding.fork_ref_kind).flatten();
-    match (resume_kind, fork_kind) {
-        (Some(resume), Some(fork)) if resume != fork => {
-            Err("resume_binding_reference_kind_mismatch")
-        }
-        (Some(kind), _) | (_, Some(kind)) => Ok(Some(kind)),
-        (None, None) => Ok(None),
-    }
 }
 
 fn parse_provider(provider: &str) -> Option<protocol::AgentKind> {
@@ -4031,7 +3955,7 @@ mod tests {
         import_legacy_manifest, import_worker_identities, import_worker_subagents,
         merge_persisted_recovery, validate_worker_identity_process_facts, SessionRegistry,
     };
-    use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
+    use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
     use crate::procwatch::readable_host::ReadableHost;
     use crate::procwatch::{
         ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact,
@@ -4665,7 +4589,7 @@ while os.getppid() == parent:
             let binding = record.recovery.as_mut().expect("recovery");
             binding.agent = provider.to_owned();
             binding.agent_base = agent_base;
-            binding.ref_kind = Some(kind);
+            binding.native_launch = Some(test_native_launch(kind, false));
             let mut snapshot = identity_snapshot(launch_reference);
             snapshot.launch_identity.as_mut().expect("launch").provider = provider.to_owned();
             snapshot
@@ -5319,13 +5243,7 @@ while os.getppid() == parent:
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
             input_rules: StoredInputRules::from(InputRules::unrestricted(false, Duration::ZERO)),
-            resume_mode: Some(ResumeMode::Flag),
-            ref_kind: Some(SessionRefKind::Id),
-            resumable: true,
-            fork_mode: Some(ForkMode::ClaudeSession),
-            fork_resume_mode: Some(ResumeMode::Flag),
-            fork_ref_kind: Some(SessionRefKind::Id),
-            forkable: true,
+            native_launch: Some(test_native_launch(SessionRefKind::Id, true)),
         };
         store
             .record_session(&SessionRecord {
@@ -5632,13 +5550,7 @@ while os.getppid() == parent:
         recovery.args = vec!["chat".to_owned()];
         recovery.input_rules =
             StoredInputRules::from(InputRules::hermes(true, Duration::from_millis(150)));
-        recovery.resume_mode = Some(ResumeMode::Flag);
-        recovery.ref_kind = Some(SessionRefKind::Id);
-        recovery.resumable = true;
-        recovery.fork_mode = None;
-        recovery.fork_resume_mode = None;
-        recovery.fork_ref_kind = None;
-        recovery.forkable = false;
+        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
         record.runtime.worker_id = Some(worker_id.to_owned());
         record.runtime.runtime_id = Some(runtime_id.to_string());
 
@@ -6559,6 +6471,15 @@ while os.getppid() == parent:
         record.runtime.executable = Some(PathBuf::from(TEST_WORKER_EXECUTABLE));
     }
 
+    fn test_native_launch(kind: SessionRefKind, fork: bool) -> NativeSessionLaunch {
+        NativeSessionLaunch::from_templates(
+            kind,
+            &["--resume", "{reference}"],
+            fork.then_some(&["--resume", "{reference}", "--fork-session"][..]),
+        )
+        .expect("valid test templates")
+    }
+
     fn identity_record() -> SessionRecord {
         let created_at = "2026-07-23T00:00:00Z".to_owned();
         SessionRecord {
@@ -6630,13 +6551,7 @@ while os.getppid() == parent:
                 program: "codex".to_owned(),
                 args: Vec::new(),
                 input_rules: StoredInputRules::default(),
-                resume_mode: None,
-                ref_kind: Some(SessionRefKind::Id),
-                resumable: true,
-                fork_mode: None,
-                fork_resume_mode: None,
-                fork_ref_kind: None,
-                forkable: false,
+                native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -6825,13 +6740,7 @@ while os.getppid() == parent:
         recovery.agent_base = AgentKind::Claude;
         recovery.native_session_id = Some("native-before-restart".to_owned());
         recovery.program = "/bin/sh".to_owned();
-        recovery.resume_mode = Some(ResumeMode::Flag);
-        recovery.ref_kind = Some(SessionRefKind::Id);
-        recovery.resumable = true;
-        recovery.fork_mode = None;
-        recovery.fork_resume_mode = None;
-        recovery.fork_ref_kind = None;
-        recovery.forkable = false;
+        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
         Store::new(store_path.clone())
             .record_session(&record)
             .expect("persist deleted-profile session");
@@ -6873,9 +6782,7 @@ while os.getppid() == parent:
         recovery.agent_base = AgentKind::Claude;
         recovery.native_session_id = Some("legacy-native".to_owned());
         recovery.program = "claude".to_owned();
-        recovery.resume_mode = Some(ResumeMode::Flag);
-        recovery.ref_kind = Some(SessionRefKind::Id);
-        recovery.resumable = true;
+        recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
         Store::new(store_path.clone())
             .record_session(&record)
             .expect("persist pre-migration record shape");
@@ -6886,9 +6793,7 @@ while os.getppid() == parent:
             .get_mut("recovery")
             .and_then(serde_json::Value::as_object_mut)
             .expect("serialized recovery object");
-        for field in ["fork_mode", "fork_resume_mode", "fork_ref_kind", "forkable"] {
-            recovery.remove(field);
-        }
+        recovery.remove("native_launch");
         value
             .get_mut("info")
             .and_then(serde_json::Value::as_object_mut)
@@ -7123,13 +7028,7 @@ while os.getppid() == parent:
             program: "codex".to_owned(),
             args: Vec::new(),
             input_rules: StoredInputRules::default(),
-            resume_mode: None,
-            ref_kind: Some(SessionRefKind::Id),
-            resumable: true,
-            fork_mode: None,
-            fork_resume_mode: None,
-            fork_ref_kind: None,
-            forkable: false,
+            native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
         };
         store
             .record_resume(&recoverable_binding)
@@ -7403,13 +7302,7 @@ while os.getppid() == parent:
             program: "codex".to_owned(),
             args: Vec::new(),
             input_rules: StoredInputRules::default(),
-            resume_mode: None,
-            ref_kind: Some(SessionRefKind::Id),
-            resumable: true,
-            fork_mode: None,
-            fork_resume_mode: None,
-            fork_ref_kind: None,
-            forkable: false,
+            native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
         }
     }
 
