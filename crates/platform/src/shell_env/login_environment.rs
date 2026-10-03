@@ -3,7 +3,7 @@
 //! The probe runs from an empty environment, so everything a startup profile
 //! may branch on has to be passed explicitly: the user identity variables, the
 //! variables that relocate a shell's startup files, and `$SHELL` itself. The
-//! CLI's service installer and the GUI's executable resolver build that
+//! CLI's service installer and other executable resolvers build that
 //! environment here, so they validate it by the same rules.
 
 use std::ffi::OsString;

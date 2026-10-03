@@ -3,8 +3,8 @@
 //! The assistant is an ordinary PTY-backed agent session opened with a small
 //! navigational opening prompt that points at a materialized knowledge bundle
 //! and a redacted live snapshot. This module owns the CLI surface and delegates
-//! the shared launch orchestration to `pohunek-assistant`, so the CLI and native
-//! GUI use the same `session.new` path.
+//! the shared launch orchestration to `pohunek-assistant`, so the CLI and other
+//! assistant clients use the same `session.new` path.
 //!
 //! The remaining local submodule is [`bootstrap`], which brings up the local
 //! daemon when needed.

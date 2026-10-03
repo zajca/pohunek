@@ -6,8 +6,7 @@
 #   package --stage-release <component> <version> <bindir> <docs-dir> <output-dir>
 #   package --sign-release  <component> <version> <staging-dir>
 #
-# <component> is cli, daemon, gui, or web (the gui archive holds Pohunek.app,
-# built here from <bindir>/pohunek-gui; for web, <bindir> is the input tree of
+# <component> is cli, daemon, or web (for web, <bindir> is the input tree of
 # `web/release/package.sh <version> aarch64-apple-darwin --input-only` and
 # <docs-dir> is ignored but must exist). The staged tree is audited (`audit-macho`),
 # then sealed with a MANIFEST and archived reproducibly; the archive path is
@@ -17,7 +16,7 @@
 # credential exists. `--stage-release` assembles and audits the tree, which runs
 # the built `pohunek` to write the shell completions, and needs no secret; it
 # prints the staging directory. `--sign-release` then signs the tree with the
-# Developer ID identity, has Apple notarize it (stapling app bundles), verifies
+# Developer ID identity, has Apple notarize it, verifies
 # the result, and writes the manifest and the archive, so the manifest hashes the
 # final signed bytes and records `signing developer-id`. It audits the tree again
 # before signing (the tree came from another runner) and runs nothing from it. It needs the environment of `signing-keychain`
@@ -27,10 +26,9 @@
 # signed archive differs between runs; the unsigned content it wraps is
 # reproducible.
 #
-# `--development` builds an unsigned archive for local use and CI acceptance
-# (an app bundle gets only an ad-hoc seal so it can launch). Its name ends in
-# `-unsigned-development` and its MANIFEST says `signing unsigned-development`,
-# so it can never be mistaken for a release artifact and is never attached to a
+# `--development` builds an unsigned archive for local use and CI acceptance.
+# Its name ends in `-unsigned-development` and its MANIFEST says
+# `signing unsigned-development`, so it can never be mistaken for a release artifact and is never attached to a
 # release.
 #
 # `SOURCE_DATE_EPOCH` stamps the archive; it defaults to the commit time of
@@ -58,7 +56,6 @@ version=$3
 case $component in
     cli) require="--require pohunek" ;;
     daemon) require="--require pohunek --require pohunekd --require pohunek-sessiond" ;;
-    gui) require="--require Pohunek.app/Contents/MacOS/pohunek-gui" ;;
     web) require="--require pohunek-web --no-string-scan" ;;
     *) fail "unsupported component: $component" ;;
 esac
@@ -120,13 +117,6 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
 fi
 export SOURCE_DATE_EPOCH
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/pohunek-package.XXXXXX")
-trap 'rm -rf -- "$work"' EXIT
-if [ "$component" = gui ]; then
-    "$script_dir/build-app-bundle" "$bindir/pohunek-gui" "$version" "$work" > /dev/null
-    bindir=$work
-fi
-
 name=$("$root/packaging/stage-archive" "$component" "$version" "$target" "$bindir" "$docs" "$output")
 if [ "$mode" = --development ]; then
     suffix=-unsigned-development
@@ -135,14 +125,6 @@ if [ "$mode" = --development ]; then
     name=$name$suffix
 fi
 staging=$output/$name
-
-if [ "$mode" = --development ] && [ "$component" = gui ]; then
-    # Apple Silicon kills an app whose bundle seal is invalid. An ad-hoc seal
-    # (no identity, no trust) lets a development bundle launch; the manifest
-    # still says `unsigned-development`.
-    codesign --force --sign - "$staging/Pohunek.app" >&2
-    codesign --verify --strict --deep "$staging/Pohunek.app" >&2
-fi
 
 # The Bun runtime embedded in the web backend carries its own build paths, so
 # its string scan is skipped through $require.

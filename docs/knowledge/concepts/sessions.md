@@ -122,7 +122,7 @@ to 20 digits; any other ID is rejected there.
 A session can carry an optional owner-set display name. Set it at creation with
 `pohunek session new --name <NAME>`, and change or clear it later with
 `pohunek session rename <target> <NAME>` (or `--clear`). The name is cosmetic:
-it shows in `pohunek session list`, `session inspect`, and the GUI, but never
+it shows in `pohunek session list`, `session inspect`, and other clients, but never
 affects targeting or recovery — a session is still addressed by its id. The
 daemon trims the name and rejects a control character or an over-long one. The
 name is stored in the logical session record, so it survives daemon and worker
@@ -138,15 +138,14 @@ repeatable `pohunek session new --meta key=value` flags (split on the first
 repeated across separate `--meta` flags fails before any connection is
 dialed). The daemon enforces size limits on the values. The `link.*` key
 family (`link.provider`, `link.kind`, `link.id`, `link.url`, `link.branch`) is
-the cross-surface convention for tying a session to a work item: both the GUI
+the cross-surface convention for tying a session to a work item: every client
 and the launch scripts write exactly these five keys through the shared
 `pohunek_prompt::link` implementation, so a link is byte-identical regardless
 of which surface created the session. The daemon treats all metadata as
 opaque owner-controlled strings.
 
-Sessions created by older native GUI review flows may retain `review.source`
-and `review.dispatched_at` metadata. Those keys remain opaque session metadata,
-but the current native GUI no longer creates or manages reviews.
+Sessions created by older review flows may retain `review.source` and
+`review.dispatched_at` metadata. Those keys remain opaque session metadata.
 
 Notifications can be linked to a session through `session_id`. Provider hook
 adapters attach the id when `POHUNEK_SESSION_ID` is present and shape-valid;
@@ -198,15 +197,6 @@ Notification policy is provider-keyed. `enabled` is the complete base per-kind
 policy, while the deterministically ordered `providers` object holds complete
 overrides by open provider wire name. A missing provider key falls back to
 `enabled`. The old fixed `codex` and `claude` policy fields are not accepted.
-
-The GUI's Activity modal opens a notification's message detail when it is
-selected from the chronological history, auto-marking it read. If the record links to a session
-still known on the same host, the detail offers a primary Open session action
-that closes the modal and selects that session; if the linked session is gone,
-explanatory text replaces the button so the record is not a dead end. The main
-session list derives Needs you only from live blocked state and active approval
-records, never from unread informational history. Session detail presents
-Current attention separately from Recent activity.
 
 The notification policy also owns automatic retention. Informational/success,
 warning, acknowledged attention, acknowledged error, and archived records have
@@ -344,7 +334,7 @@ nothing else: a signalled process that is still running, a sweep error, or a
 missing supervision configuration still refuses. The trade-off is that an
 accepted process that does carry the runtime marker keeps running unsupervised
 after the worktree, logs, and record are deleted, so inspect the listed
-processes first. The GUI and web removal only call `session.remove` and so never consent. Against
+processes first. Web removal only calls `session.remove` and so never consent. Against
 a daemon without the method the CLI reports `method_not_found` with an upgrade
 hint.
 
@@ -443,7 +433,7 @@ it watches provider transcript trees under the operator's Claude/Codex homes.
 When enabled, the daemon combines same-user process facts with transcript JSONL
 candidates to show agents that were started outside pohunek. These entries use
 synthetic ids such as `ext-12345`, carry `external: true`, and appear in
-`session.list`, `session.inspect`, and the GUI as read-only sessions. They have
+`session.list`, `session.inspect`, and other clients as read-only sessions. They have
 no pohunek-owned PTY: attach, input, resize, stop, remove, rename, metadata, and
 resume operations are rejected with `session_external_read_only`. The observer
 removes the entry when the external process exits, including `kill -9` via the
@@ -523,7 +513,7 @@ agent and active native metadata while that process runs, but never populate or
 replace `native_session_id` / `native_session_path` for the parent session.
 Subagent lifecycle hooks use the same owner-private endpoint without a public
 daemon fallback, so their durable worker state continues to advance while the
-daemon or GUI is disconnected.
+daemon or a client is disconnected.
 Startup reconciliation merges the worker's immutable launch identity into the
 persisted session and recovery binding; it does not replace an already captured
 native reference with an empty worker field.

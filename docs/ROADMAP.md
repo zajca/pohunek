@@ -56,7 +56,8 @@ work.
 ## 3. Forward tracks
 
 The shipped forward work built client surfaces on top of the owner-first
-chassis: **SDKs → native desktop app → mesh-local browser control center**. The
+chassis: **SDKs → mesh-local browser control center** (the native desktop app is a
+separate client). The
 daemon remains provider-agnostic and presentation-agnostic.
 
 The accepted next product track is an **optional team relay**. It adds a
@@ -72,14 +73,14 @@ and issue hierarchy rooted at [#94](https://github.com/zajca/pohunek/issues/94)
 own delivery scope, sequencing, and status. The
 [accepted macOS RFC](design/macos-support-rfc.md) records the design constraints:
 native Apple Silicon hosts and clients, macOS 14.0 minimum target,
-launchd-owned durable workers, real PTYs and agent integrations, native GUI,
+launchd-owned durable workers, real PTYs and agent integrations,
 retained owner WebUI, direct overlay operation, installation, signing, and
 cross-stack acceptance. Intel Macs are outside this release scope.
 
 The shared platform foundation in #95 is complete: `crates/platform` owns
 portable process, peer, and supervisor contracts; shipped Linux consumers use
 the extracted implementations; target dependency graphs separate systemd,
-Secret Service, Keychain, and Linux-only Iced features; and native Darwin
+Secret Service, and Keychain; and native Darwin
 contract CI runs on Apple Silicon. This does **not** advertise working macOS
 applications.
 
@@ -127,7 +128,7 @@ upgrading forward. See the [operator guide](knowledge/guides/hermes-operator.md)
 Promote the control protocol from an internal CLI wire format to a **documented,
 versioned public API**, consumed only through SDKs (never hand-rolled wire code).
 This is the shared base for every client below; it is broken out of the old
-Phase 4 so the desktop app and the browser app build on the same contract.
+Phase 4 so every client builds on the same contract.
 
 - **S.1 — Rust SDK (`crates/client`) — complete.** Extract the
   transport-agnostic client that lived `pub(crate)` in `crates/cli/src/client.rs`:
@@ -153,108 +154,16 @@ version; breaking changes allowed with a version bump until the promise is made.
 a daemon; the TypeScript SDK also verifies the same flow through the WebSocket
 relay transport.
 
-### Track D — Native Desktop Companion App *(primary GUI)*
+### Track D — Native Desktop Companion App *(moved out of this repository)*
 
-> **Detailed design:** [`design/track-d-native-app.md`](design/track-d-native-app.md)
-> is the source of truth for Track D and supersedes this summary where they differ.
-> Key pivots since the original framing: **no embedded terminal** (attach is
-> delegated to an external terminal), **GUI = Iced** (decided), **Linux only** v1,
-> **v1 = D.1+D.3+D.4+D.5** (D.6 was v1.1; D.6 has since shipped, minus the
-> optional `gh pr review` posting, which is deferred).
-
-A **pure-native Rust desktop app** (no webview, no JS) and the **primary GUI**
-going forward. It is a **control plane** — it does *not* render a terminal. It is
-a client of the chassis over the **Rust SDK (Track S)**, talking **directly to
-each host's daemon over NetBird** — **no aggregator backend**, no central server.
-It is the operator's cockpit for everyday agent work: sessions, hosts, agents,
-projects, worktrees, prompts, Linear, and PRs in one window.
-
-This supersedes the dropped libghostty native-GUI direction (Phase 3) and the
-Phase-4 "Tauri later, optional" note: the desktop client is promoted to primary
-and built pure-native.
-
-**Tech (decided):** pure-native Rust GUI on **Iced** (Elm-style). **No terminal
-renderer** — "attach" spawns the operator's terminal via a configurable
-`attach_command` template running `pohunek attach` (the CLI already streams the
-remote PTY over NetBird). **PTY ownership stays in the daemon**; the GUI uses only
-the SDK `Client` + event `Subscription` (not the attach duplex stream). No TS/JS
-layer.
-
-**Provider integration lives in the app** (it is a real native process, so it can
-shell out and call APIs directly — no backend needed): **Linear via in-app GraphQL
-(keyring token), GitHub via `gh`**. It reuses the **same conventions** the sway
-launcher scripts already use, so the two surfaces share one source of truth:
-- prompt templates in `~/.config/pohunek/prompts/*.tmpl` (`${var}` substitution),
-  rendered by a **shared implementation** (`crates/prompt` + `pohunek prompt
-  render`) the GUI and the rewritten scripts both call;
-- atomic launch via `session new --input`;
-- work-item / PR links stored as **opaque `link.*` metadata** on the session in
-  the daemon store (the chassis never interprets them) — the same keys the sway
-  scripts write via the shared `pohunek_prompt::link` implementation and the
-  client-side `pohunek prompt link` subcommand, so a link made in one surface
-  shows in the other, byte-identical.
-
-Provider credentials live **only** in the app (gh's own auth; a Linear token read
-by name from the OS keyring) — never in daemon state, session metadata, or the
-event log.
-
-Suggested slices (each independently valuable):
-
-- **D.1 — Workspace shell + multi-host connect.** Auto-discover (`host discover`)
-  + localhost and auto-connect all reachable hosts concurrently (short timeout,
-  partial results with per-host error markers), unified workspace with **live
-  agent-state badges** off the event subscription (`agent_state`, `session_*`),
-  plus an **agents monitor** (blocked-first).
-- **D.2 — Attach delegation.** *(Redefined — no longer an in-app terminal.)* The
-  "open in terminal" action spawns the configured `attach_command` for the
-  selected session. The GUI is not on the terminal I/O path; closing the terminal
-  leaves the session running on its host.
-- **D.3 — Session + project + worktree management.** Full lifecycle (new / stop /
-  inspect), project list/add/show/rename/forget, and worktree inspect (creation is
-  a side effect of `session new --branch` — no standalone worktree method exists) —
-  driven through the existing protocol.
-- **D.4 — Prompt management.** Browse/edit the shared `~/.config/pohunek/prompts/`
-  templates; launch a session with a rendered preset prompt (`session new --input`).
-- **D.5 — Provider integration (Linear + GitHub).** Browse the operator's Linear
-  issues and GitHub PRs/issues; **launch an agent on an item** with a preset prompt
-  (parity with `pohunek-launch-issue` / `-pr`); link sessions; surface PR
-  checks/review status next to the live state badge; open/view a PR.
-- **D.6 — Diff review + comment-to-session loop (Kandev-style). Shipped, minus
-  gh-posting (see [`design/track-d-native-app.md`](design/track-d-native-app.md)
-  §6).** A unified diff surface for a **session's worktree or a PR**: render the
-  diff (worktree diff vs the base branch for a session, via the new daemon
-  method `session.diff`; `gh pr diff` for a PR), browse it by file/hunk, and add
-  **inline comments anchored to `file:line`**. Collect the comments into a
-  **review** and **dispatch it as a new session** — the review is rendered into
-  a preset prompt (`~/.config/pohunek/prompts/review.tmpl`) and launched
-  atomically via `session new --input` with `cwd` set to the **same worktree**
-  the review was of (git forbids a second worktree on an already-checked-out
-  branch), an agent picker seeded with the source session's own agent profile
-  and freely overridable, so the (possibly different) agent picks up the
-  review and acts on it in place. **Posting the review to the PR via `gh pr
-  review` / `gh pr comment` is deferred**, out of scope for this milestone.
-  Comments live **app-local until dispatch** (to keep the chassis free of a new
-  surface) as one JSON file per review, persisted immediately on every
-  add/edit/delete; reopening a review for the same source resumes the
-  most-recently-updated persisted draft for that exact source (a dispatched
-  review is never resumed), starting fresh only when none exists. On dispatch
-  the **review→session link**
-  (`review.source`, `review.dispatched_at`) is written into the new session's
-  metadata alongside the source session's `link.*` keys, so a dispatched review
-  is visible across surfaces.
-
-*Done when:* against ≥2 loopback-TCP stand-in daemons (CI for the SDK/data layer)
-the app lists both hosts' sessions, shows a state change, and **spawns the
-configured `attach_command`** for a selected session (the GUI is not on the
-terminal I/O path); launching on a fixture
-issue starts exactly one session on the expected branch with the rendered prompt;
-the link persists across daemon restart and is byte-identical to a sway-script
-link; given a session/PR with changes the app renders the diff, accepts
-inline comments, and dispatching the review starts exactly one new session in the
-**same** worktree with the comments delivered as the prompt and the review→session
-link persisted; no provider token appears in any daemon log, metadata, or event.
-**All met** as of the D.6 milestone, except the optional `gh pr review` posting,
-which is deferred.
+The native desktop client (an Iced control plane over the Rust SDK, with no
+embedded terminal and no aggregator backend) is developed in
+[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). This repository
+keeps only what every client shares: the versioned protocol, the Rust and
+TypeScript SDKs, the shared prompt renderer (`crates/prompt` and `pohunek
+prompt render`), the opaque `link.*` session metadata (`pohunek prompt link`),
+and atomic launch via `session new --input`. Provider credentials never enter
+daemon state, session metadata, or the event log.
 
 ### Track B — Mesh-local Browser Control Center *(M1 complete; later plan superseded)*
 
@@ -267,7 +176,7 @@ the local daemon, SPA serving) + browser-side aggregation in
 single-cert **mobile PWA**, with the same provider seam. The browser speaks
 the public protocol verbatim over those tunnels; the backend holds no
 protocol state. It remains an optional surface for **mobile /
-from-any-device** access (the one thing a native desktop app cannot give
+from-any-device** access (the one thing a desktop app cannot give
 you), reusing **Track S** (TS SDK).
 
 **M1 is implemented:** Slices B + C, the notifications inbox, and the
@@ -343,8 +252,8 @@ live blocker graph:
   [#83](https://github.com/zajca/pohunek/issues/83).
 - **In-tree provider adapters in the chassis** — never; providers stay shell-out
   (`gh`) / GraphQL (Linear) in the clients.
-- **libghostty / GTK / Electron native GUI** — dropped (replaced by the pure-native
-  Rust desktop app for desktop, and the browser app for mobile).
+- **libghostty / GTK / Electron native GUI** — dropped (the native desktop client
+  lives in `zajca/pohunek-work`; the browser app covers mobile).
 - **Filesystem scanning / auto-discovery of repos; cross-host project unification;
   GC of stale auto-projects; per-project policy beyond `default_base_branch`** —
   out of scope (from the Projects design).

@@ -57,38 +57,16 @@ Current CLI and command surface:
 - `crates/cli/tests/standalone_discovery.rs`
 - `crates/cli/tests/session_process_api.rs`
 
-Native GUI client:
+Assistant launch and prompt rendering:
 
-- `crates/gui/src/main.rs`
-- `crates/gui/src/config.rs`
-- `crates/gui/src/command.rs`
-- `crates/gui/src/keyboard.rs`
-- `crates/gui/src/message.rs`
-- `crates/gui/src/selection.rs`
-- `crates/gui/src/runtime.rs`
-- `crates/gui/src/view/detail.rs`
-- `crates/gui/src/view/modals.rs`
-- `crates/gui/src/view/inbox.rs`
-- `crates/gui/src/view/session.rs`
-- `crates/gui/src/view/hosts.rs`
-- `crates/gui/src/view/selectable_text.rs`
 - `crates/assistant/src/lib.rs`
 - `crates/assistant/src/host.rs`
 - `crates/assistant/src/error.rs`
 - `crates/assistant/src/launch.rs`
 - `crates/assistant/tests/select_agent.rs`
-- `crates/gui-core/src/lib.rs`
-- `crates/gui-core/src/sdk.rs`
-- `crates/gui-core/src/state.rs`
-- `crates/gui-core/src/ui_state.rs`
-- `crates/gui-core/tests/loopback.rs`
 - `crates/prompt/src/lib.rs`
 - `crates/prompt/src/link.rs`
-- `crates/cli/tests/gui_prompt_parity.rs`
-- `docs/knowledge/guides/gui.md`
 - `docs/knowledge/concepts/host-governance.md`
-- `docs/phases/06-native-app.md`
-- `docs/design/track-d-native-app.md`
 
 Launcher scripts:
 
@@ -193,10 +171,6 @@ Shipped host-local identity and governance:
   the shared owner-transport governance service.
 - `crates/client/src/transport.rs`
 - `crates/cli/src/commands/host.rs`
-- `crates/gui-core/src/sdk.rs`
-- `crates/gui-core/src/state.rs`
-- `crates/gui/src/command.rs`
-- `crates/gui/src/view/hosts.rs`
 - `crates/xtask/src/generators/protocol.rs`
 - `sdk/ts/sdk/src/governance.ts` — strict TypeScript validation of the public
   `host.governance.inspect` response and its fixed redacted contract-mismatch
@@ -354,7 +328,7 @@ Release packaging and contributor verification:
   last assembly step; refuses symbolic links and member names outside a plain
   alphabet.
 - `packaging/stage-archive` — assembles one component's archive staging
-  directory (binaries or app bundle, completions, offline docs, installer or
+  directory (binaries, completions, offline docs, installer or
   smoke script, README, license) from the built binaries.
 - `packaging/archive` — packs a staging directory into a byte-reproducible
   `.tar.gz` (sorted members, root ownership, `SOURCE_DATE_EPOCH` timestamps,
@@ -385,9 +359,6 @@ Release packaging and contributor verification:
   shims of `uname`, `launchctl`, `plutil`, and the daemon CLI.
 - `scripts/tests/test_macos_packaging.py` — regression checks for the audit
   (with `otool`/`lipo`/`strings` shims) and the packaging scripts.
-- `packaging/macos/build-app-bundle` — assembles `Pohunek.app` (bundle
-  identifier `io.github.zajca.pohunek.gui`, minimum macOS from the deployment
-  target) around `pohunek-gui`, writing the Info.plist with `plutil`.
 - `packaging/macos/signing-keychain` — creates the ephemeral keychain holding
   the Developer ID certificate from protected CI secrets (and removes it);
   fails when a secret is missing.
@@ -397,8 +368,6 @@ Release packaging and contributor verification:
   service with an API key, requires `Accepted`, and staples app bundles.
 - `packaging/macos/verify-signed` — verifies the signatures, team identifier,
   hardened runtime, timestamps, stapled tickets, and Gatekeeper verdict.
-- `scripts/smoke-gui-release-macos` — launches the packaged app bundle's
-  executable with a Finder-like environment and requires it to stay up.
 - `scripts/tests/test_macos_signing.py` — regression checks for the signing
   tooling and the release workflow's credential handling, against shims.
 - `crates/cli/tests/daemon_packaging.rs`

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the release binaries of one component natively for Apple Silicon.
 #
-# usage: build-release <cli|daemon|gui>
+# usage: build-release <cli|daemon>
 #
 # Prints the directory holding the built binaries on stdout. Runs only on an
 # arm64 Mac, from anywhere inside the repository. The build is locked to
@@ -19,7 +19,7 @@ fail() {
     exit 1
 }
 
-[ "$#" -eq 1 ] || fail "usage: build-release <cli|daemon|gui>"
+[ "$#" -eq 1 ] || fail "usage: build-release <cli|daemon>"
 component=$1
 [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ] \
     || fail "native Apple Silicon builds run on an arm64 Mac only"
@@ -67,10 +67,6 @@ case $component in
         cargo build --release $locked --target "$target" \
             -p pohunek-cli -p pohunek-daemon -p pohunek-session-worker \
             --bin pohunek --bin pohunekd --bin pohunek-sessiond >&2
-        ;;
-    gui)
-        # shellcheck disable=SC2086
-        cargo build --release $locked --target "$target" -p pohunek-gui --bin pohunek-gui >&2
         ;;
     *) fail "unsupported component: $component" ;;
 esac

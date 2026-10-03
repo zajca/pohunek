@@ -1,3 +1,0 @@
-#!/bin/sh
-printf 'authentication required\n' >&2
-exit 1

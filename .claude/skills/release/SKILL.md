@@ -58,7 +58,7 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
 
 5. **Verify the Release workflow — do not trust, confirm.** Pushing the `vX.Y.Z`
    tag triggers `.github/workflows/release.yml`, which runs the fmt/clippy/test
-   gate + docs-gate, then builds `pohunek`, `pohunekd`, and `pohunek-gui` for
+   gate + docs-gate, then builds `pohunek` and `pohunekd` for
    both `x86_64-unknown-linux-gnu` (dynamic glibc, primary) and
    `x86_64-unknown-linux-musl` (fully static, runs on any x86_64 Linux),
    packages per-component tarballs with sha256 checksums, and attaches them to

@@ -51,8 +51,8 @@ The issue is the spec — there is no `NEXT.md`.
    compliance.
 4. **Plan the PR stack.** Split the milestone into ordered slices per
    `pullRequests` in `.github/agent-workflow.json`: one coherent concern per
-   slice, in dependency order (e.g. protocol types → daemon → client/cli/
-   gui-core consumers), each mapped to the DoD items it satisfies. Record the
+   slice, in dependency order (e.g. protocol types → daemon → client/cli
+   consumers), each mapped to the DoD items it satisfies. Record the
    slice plan in the issue body (via the `github-workflow` skill) before
    implementing. Build each slice on its own branch based on the previous
    slice's branch, in the same worktree:
@@ -71,8 +71,7 @@ The issue is the spec — there is no `NEXT.md`.
    is the default, not something to wait for permission on. Brief each worker
    with concrete `path:line` context (per the global briefing protocol); they
    start with a clean context window. If the wire protocol
-   (`crates/protocol`) changes, expect ripples in `client`, `daemon`, `cli`, and
-   `gui-core` — update and test all of them, plus `docs/public-api.md`.
+   (`crates/protocol`) changes, expect ripples in `client`, `daemon`, and `cli` — update and test all of them, plus `docs/public-api.md`.
 6. **Write tests for all new logic.** Unit tests inline (`#[cfg(test)]`) for
    private behavior; `tests/` for integration. Extend the existing
    protocol/state-machine suites rather than adding untested branches.
@@ -81,7 +80,7 @@ The issue is the spec — there is no `NEXT.md`.
    crates and their dependents and saves CPU. Neither replaces the gates in
    step 8.
 7. **Keep the assistant knowledge bundle current.** If the milestone changes a
-   CLI command/flag, a protocol method/event, GUI behavior, an operating-model
+   CLI command/flag, a protocol method/event, an operating-model
    concept, a safety rule, `docs/public-api.md`, or a path in
    `docs/knowledge/assistant/source-map.md`, update the matching
    `docs/knowledge/` file in the *same* change. A stale bundle is treated like

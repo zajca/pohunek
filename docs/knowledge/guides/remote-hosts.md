@@ -34,7 +34,7 @@ Use these commands for orientation:
   daemons. Each record carries its overlay, optional provider peer identity,
   address, and that overlay's effective daemon port. Address-less peers remain
   visible as candidates instead of being discarded. Discovery emits remote
-  peers only; GUI, web, and `--all-hosts` consumers add the explicit local target
+  peers only; web and `--all-hosts` consumers add the explicit local target
   through its Unix socket.
 - `pohunek host list --json` to list known live peers. These commands need the
   local overlay CLI/state, but do not connect to local `pohunekd`; a short
@@ -106,8 +106,7 @@ error only when every provider fails.
 A Mac is a first-class host on the same direct overlay path; there is no
 macOS-specific routing, bridging, or relay mode.
 
-- **Finding the `netbird` CLI.** The daemon (a launchd job), the GUI (started
-  from Finder) and the CLI (a shell) each locate `netbird` in their own
+- **Finding the `netbird` CLI.** The daemon (a launchd job) and the CLI (a shell) each locate `netbird` in their own
   process: first the process `PATH`, then the trusted install directories
   (`/opt/homebrew/bin`, `/usr/local/bin` among them). An executable another
   account could replace is never used. `pohunek doctor` reports `netbird_cli`

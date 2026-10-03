@@ -185,7 +185,7 @@ Any refusal above leaves the legacy files untouched, so the operator can
 restart the legacy daemon and decide. Stop those sessions first; their PTYs
 cannot move into the new per-generation jobs. Even with this sequence, a
 client that already held a control connection before the barrier (a
-long-lived GUI) can still start a session into the window until the daemon
+long-lived client) can still start a session into the window until the daemon
 stops; the post-stop inventory catches it.
 
 ## Explicit Runtime-Loss Acceptance

@@ -57,7 +57,7 @@ impl ConnectionOptions {
     }
 }
 
-/// Stable host key used by the GUI state and Iced subscription identity.
+/// Stable host key used to identify a host across client state and subscriptions.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HostId(String);

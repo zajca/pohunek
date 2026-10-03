@@ -7,12 +7,12 @@ use knowledge::{
     CONCEPT_SCHEMA_VERSION,
 };
 
-// The committed bundle contains 24 frontmatter-backed concepts (including the
+// The committed bundle contains 25 frontmatter-backed concepts (including the
 // #81 host-governance concept, source map, and system prompt) plus the reserved
 // `index.md` and `log.md` files.
 // Keep this exact assertion so changing a checked Markdown file needs an intentional update.
-const COMMITTED_KNOWLEDGE_FILES: usize = 28;
-const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 26;
+const COMMITTED_KNOWLEDGE_FILES: usize = 27;
+const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 25;
 
 fn fixture(name: &str) -> PathBuf {
     manifest_dir().join("tests").join("fixtures").join(name)

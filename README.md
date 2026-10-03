@@ -15,15 +15,15 @@ and the public API on each host; one isolated `pohunek-sessiond` worker owns
 each live PTY and agent process. The CLI (`pohunek`) drives the daemon locally
 over a Unix socket and remotely over a NetBird/WireGuard mesh.
 
-**The GUI is optional.** The daemon and its protocol are the product; every
-client — the CLI, the bundled desktop GUI (`pohunek-gui`), your own launcher —
-sits on top of the same versioned protocol. `pohunek-gui` ships as a reference
-client, not a requirement: pohunek is fully usable from the CLI alone, and the
-Rust/TypeScript SDKs exist precisely so you can **build your own GUI or client**
-tailored to how you work. See [SDKs and building your own client](#sdks-and-building-your-own-client).
+**The daemon and its protocol are the product.** Every client — the CLI, the web
+control center, your own launcher — sits on top of the same versioned protocol.
+pohunek is fully usable from the CLI alone, and the Rust/TypeScript SDKs exist
+precisely so you can **build your own GUI or client** tailored to how you work.
+The native desktop GUI is a separate client that lives in
+[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). See [SDKs and building your own client](#sdks-and-building-your-own-client).
 
 Start Codex, Claude Code, or Hermes Agent on any of your machines, detach, walk away, and
-come back later — from any terminal, from a GUI, or from a keyboard
+come back later — from any terminal, from the web, or from a keyboard
 launcher. The agents keep working; pohunek keeps track of what they are doing,
 where they are doing it, and when they need you.
 
@@ -108,7 +108,7 @@ where they are doing it, and when they need you.
 - Per-project **actions and prompt templates**: an in-repo `.pohunek/`
   directory shadows host-level config, so `pohunek project action <ref> <name>`
   resolves a full launch recipe (agent, base branch, branch rule, rendered
-  prompt) for launchers, the GUI, and scripts.
+  prompt) for launchers and scripts.
 - `pohunek session diff` renders a unified diff of a session's worktree
   against its base — including untracked files — over the wire.
 
@@ -125,26 +125,6 @@ where they are doing it, and when they need you.
   reachable host client-side. Per-kind/provider policy, automatic age retention,
   and physical JSONL compaction are daemon-enforced; unresolved actions and
   errors never expire automatically.
-
-**Native desktop GUI (optional reference client)**
-
-- `pohunek-gui` (Iced, Wayland) is a session-first control plane. Its main pane
-  groups cross-host sessions as Needs you, Running, Ready, and Unavailable;
-  unread history never promotes a ready session. The header keeps only
-  Assistant, Activity, Hosts, and New session; a project chip on every row and a
-  project filter chip row show which project each session belongs to.
-- Clicking a session opens its detail in a modal over the list. Eligible rows
-  expose direct Open/Resume, Terminate, and confirmed Delete actions.
-- Session detail shows concurrent Claude/Codex subagents and their durable
-  running or terminal lifecycle; the browser workspace shows the same state
-  above an attached terminal.
-- The **Activity** modal is a quiet, chronological cross-host history with
-  Recent, Unread, and Archived views. Current approvals and blocked state are
-  shown directly on session rows and in session detail; failed sessions carry a
-  review signal without conflating unread history with live attention.
-- It deliberately embeds **no terminal** — opening a session spawns your own
-  terminal via a configurable `attach_command`. The native GUI has no
-  Linear/GitHub browser, review, worktree-management, or Agents-monitor panel.
 
 **Launcher and terminal UX**
 
@@ -183,8 +163,8 @@ where they are doing it, and when they need you.
   (`pohunek-client`) and TypeScript packages (`@pohunek/protocol`,
   `@pohunek/sdk`, `@pohunek/backend`, `@pohunek/client-core`,
   `@pohunek/frontend`, and `@pohunek/testkit`) speak the same versioned
-  newline-delimited JSON protocol the bundled GUI uses — nothing is private to
-  `pohunek-gui`. Browsers use the node-free `@pohunek/sdk/browser` entry through
+  newline-delimited JSON protocol every bundled client uses — nothing is private
+  to any one client. Browsers use the node-free `@pohunek/sdk/browser` entry through
   the backend's WebSocket tunnels. TS protocol types are generated from the Rust
   source of truth. If the bundled clients do not fit your workflow, wire up your
   own control plane on these SDKs instead of forking one.
@@ -192,7 +172,7 @@ where they are doing it, and when they need you.
 ## How it works
 
 ```text
-  CLI / GUI (local)                   CLI / GUI (remote)
+  CLI / client (local)                CLI / client (remote)
        |                                   |
        | Unix socket                       | TCP over NetBird/WireGuard
        | (resolved private runtime root)   | (daemon binds ONLY to the 100.x iface)
@@ -230,13 +210,11 @@ recovery metadata.
 ## Install
 
 Each release publishes `pohunek-cli-*` and `pohunek-daemon-*` archives for
-x86_64 Linux with both glibc and MUSL. The native `pohunek-gui-*` archive is
-published for glibc because its Wayland client and graphics stack are dynamic
-runtime dependencies; there is no self-contained MUSL GUI archive. Every
+x86_64 Linux with both glibc and MUSL. Every
 archive contains its license and offline documentation under `docs/offline/`.
 Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
 `packaging/install-daemon.sh` wrapper around `pohunek service install`.
-Every CLI, daemon, GUI, relay, and web archive is packed deterministically
+Every CLI, daemon, relay, and web archive is packed deterministically
 (members sorted, root-owned, stamped with the tagged commit time) and carries a
 `MANIFEST` with the SHA-256 of every member; the daemon and web installers verify
 it, the host OS and architecture, and member permissions before they run or
@@ -252,7 +230,7 @@ archive's `README.md` for the complete commands.
 macOS on Apple Silicon (macOS 14 or newer) is not yet a published platform:
 public macOS support is declared only when the final native acceptance gate
 (#105) passes. The release workflow already builds the `aarch64-apple-darwin`
-CLI, daemon, and GUI (`Pohunek.app`) archives, signs them with a Developer ID
+CLI, daemon, and web archives, signs them with a Developer ID
 Application certificate, has Apple notarize them, and verifies the result, but
 only when the protected `macos-signing` credentials exist (see "Release" below);
 without them the macOS jobs fail and nothing macOS is published. A build made
@@ -265,7 +243,7 @@ Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
 and put the binaries on your `PATH`.
 
 Protocol v2 was a one-time coordinated pre-1.0 boundary. Before that M1
-transition, every CLI, GUI, web backend/SDK, custom client, and local or remote
+transition, every CLI, web backend/SDK, custom client, and local or remote
 daemon had to cross together. The legacy integer-v1 envelope and fixed
 `codex`/`claude` notification-policy fields have no compatibility shim. Once a
 fleet is on v2, peers negotiate their highest overlap: M2 and this M3 plugin do
@@ -322,7 +300,7 @@ Or build from source (Rust 1.96+):
 git clone https://github.com/zajca/pohunek.git
 cd pohunek
 cargo build --release --locked \
-  --bin pohunek --bin pohunekd --bin pohunek-sessiond --bin pohunek-gui
+  --bin pohunek --bin pohunekd --bin pohunek-sessiond
 ```
 
 ## Quick start
@@ -609,40 +587,13 @@ automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
 `hermes`; explicit Hermes selection still requires the supported runtime on the
 selected host.
 
-## GUI
-
-`pohunek-gui` reads `~/.config/pohunek/gui.toml`:
-
-```toml
-pohunek_bin = "/usr/local/bin/pohunek"
-attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"
-notification_command = "notify-send"
-# attach_command_mode = "argv"        # run attach_command without a shell
-# attach_terminal = "terminal-app"    # macOS only, instead of attach_command
-```
-
-Set exactly one of `attach_command` or `attach_terminal`; see
-[GUI setup](docs/knowledge/guides/gui.md) for details.
-
-Highlights: prioritized session groups, modal session detail, quick lifecycle
-actions, `n` for Start session, `a` for Assistant, `i` for Activity, `o` to open
-the selected session, and `shift+?` for the full keymap. Supported bindings are
-remappable through `[keybindings]`. Wayland-only on Linux v1.
-
-The bundled GUI is a **reference client**, not the only supported way in. It
-uses the same public protocol and SDKs documented below — so if it does not fit
-your workflow, the next section is your starting point for building your own.
-After each daemon-host snapshot it also presents the same safe, read-only host
-governance status, including explicit never-enrolled and quarantined states. It
-does not provide enrollment, transfer, relay, or team controls.
-
 ## Web control center
 
 The optional web control center serves one Svelte SPA for host and session
 status, session lifecycle, live notifications, and in-browser terminal attach.
 `@pohunek/backend` discovers daemons through its local `pohunekd` and exposes
 the existing protocol as transparent WebSocket tunnels; it holds no
-authoritative session state, and the CLI and native GUI remain independent.
+authoritative session state, and the CLI remains independent.
 The owner WebUI keeps this transparent behavior for the additive safe
 `host.governance.inspect` method; it does not add a governance UI, team mode,
 or relay-local fallback.
@@ -689,14 +640,15 @@ and its environment file instructions are in
 
 ## SDKs and building your own client
 
-pohunek's real interface is its **protocol**, not any one client. `pohunek-gui`
-is just one consumer of a versioned, newline-delimited JSON protocol that every
-client speaks — and the same protocol and SDKs are available to you. You are
-encouraged to **build your own GUI, TUI, launcher, or automation** on top of
-them rather than being tied to the bundled app.
+pohunek's real interface is its **protocol**, not any one client. The CLI, the
+web control center, and the native GUI in `zajca/pohunek-work` are consumers of
+a versioned, newline-delimited JSON protocol that every client speaks — and the
+same protocol and SDKs are available to you. You are encouraged to **build your
+own GUI, TUI, launcher, or automation** on top of them rather than being tied
+to a bundled app.
 
-Nothing the GUI does is private to the GUI: it drives hosts, sessions,
-projects, worktrees, notifications, diffs, and `subscribe` event streams
+Nothing a bundled client does is private to it: hosts, sessions, projects,
+worktrees, notifications, diffs, and `subscribe` event streams are all driven
 entirely through this surface.
 
 - **Rust** — the `pohunek-client` crate: a typed `Client`, transports for local
@@ -772,7 +724,7 @@ import { Client } from "@pohunek/sdk/browser";
 const client = await Client.connectWs(window.location.origin, "workstation");
 ```
 
-Or subscribe to the same live event stream the CLI and GUI consume — session
+Or subscribe to the same live event stream the CLI and web clients consume — session
 lifecycle, agent state, and notifications, decoded into typed events:
 
 ```rust
@@ -846,9 +798,7 @@ workspace (rooted at the repository root, spanning `sdk/ts/*` and `web/*`) for t
 | `crates/worker-protocol` | Versioned owner-private daemon-to-worker protocol and framing. |
 | `crates/session-worker` | `pohunek-sessiond`: one durable PTY runtime owner per live session. |
 | `crates/cli` | `pohunek`: every command over the control protocol. |
-| `crates/gui-core` | Headless GUI state + SDK bridge (no Iced; fully unit-testable). |
-| `crates/gui` | Native Iced shell wrapping `gui-core`. |
-| `crates/prompt` | Shared prompt rendering + `link.*` metadata schema (CLI, GUI, scripts). |
+| `crates/prompt` | Shared prompt rendering + `link.*` metadata schema (CLI and scripts). |
 | `crates/knowledge` | Knowledge-bundle primitives for the assistant and offline docs. |
 | `crates/terminal` | VT screen tracking and attach compositing. |
 | `crates/netbird` | NetBird status parsing, host resolution, bind validation, and overlay adapter. |
@@ -881,7 +831,7 @@ Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see
 
 ```bash
 cargo t                        # all fast unit + integration tests, no PTY/DB fixtures
-cargo t -p pohunek-gui-core     # fast tests in one crate
+cargo t -p pohunek-daemon       # fast tests in one crate
 cargo ti                       # fast daemon/client/session-worker surface
 cargo tw                       # unfiltered full suite, four test processes
 bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
@@ -896,7 +846,7 @@ Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11
 for the shard helper. `profile.fast.default-filter` is the cost boundary;
 `scripts/test-partitions` subdivides it by package ownership, with an exact
 complement for heavy tests. Whole fixture-owning modules stay heavy: real
-PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites, GUI daemon loopback,
+PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites,
 and nested Cargo integration checks. Fast includes short filesystem, mock-socket,
 and CLI integration tests; `--lib` alone is **not** a cost boundary.
 
@@ -968,7 +918,7 @@ cargo xtask ts check      # CI gate
 - **Secrets never enter code, logs, errors, or agent context.** Keyring
   references only; `gh` output is redacted before it can reach an error.
 - **Protocol ripples**: touching `crates/protocol` means updating `client`,
-  `daemon`, `cli`, `gui-core`, the generated TS types, `docs/public-api.md`,
+  `daemon`, `cli`, the generated TS types, `docs/public-api.md`,
   and the `docs/knowledge/` bundle in the same change.
 - **Tests for all new logic**; the protocol and state machines have rich
   suites — extend them.
@@ -977,9 +927,9 @@ cargo xtask ts check      # CI gate
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
 Release workflow re-runs the gates on the tag, then builds and publishes glibc
-and MUSL x86_64 CLI and daemon archives, a glibc x86_64 GUI archive, a
+and MUSL x86_64 CLI and daemon archives, a
 self-contained Linux x86_64 web-control-center archive, and signed, notarized
-`aarch64-apple-darwin` CLI, daemon, and GUI (`Pohunek.app`) archives. The macOS
+`aarch64-apple-darwin` CLI, daemon, and web archives. The macOS
 build runs without secrets; a separate signing job on a fresh runner runs in the protected `macos-signing` environment (secrets
 `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
 `APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,

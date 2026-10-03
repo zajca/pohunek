@@ -17,12 +17,12 @@ committed, merged, or pushed by this run.
 - R2. The full gate set (below) passes on the final state of the worktree.
   A gate is green only when its command exits 0.
 - R3. When a change touches anything the assistant knowledge bundle describes
-  (CLI command/flag, protocol method/event, GUI behavior, operating-model
+  (CLI command/flag, protocol method/event, operating-model
   concept, safety rule, `docs/public-api.md`, a path in
   `docs/knowledge/assistant/source-map.md`), update the matching
   `docs/knowledge/` file in the same change. A stale bundle is stale code.
 - R4. When the wire protocol (`crates/protocol`) changes, update and test the
-  ripples in `client`, `daemon`, `cli`, and `gui-core`, and run
+  ripples in `client`, `daemon`, and `cli`, and run
   `cargo xtask ts check` (regenerate with `cargo xtask ts generate` if drift).
 - R5. The worktree ends with all milestone work present as file changes.
   Do not run `git commit`, `git merge`, `git push`, or `scripts/release`.

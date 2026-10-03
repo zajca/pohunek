@@ -151,7 +151,6 @@ mod tests {
         BindAddrError, ConfiguredTransport, DiscoveredPeer, ExternalIdentity, ExternalIdentityKind,
         OverlayError, OverlayFuture, OverlayId, OverlayRegistry, OverlayTransport, ResolvedPeer,
     };
-    use pohunek_gui_core::{render_attach_command, AttachTemplateValues};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -239,7 +238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gui_attach_route_preserves_discovered_port_over_cli_registry() {
+    async fn discovered_port_route_overrides_registry_port() {
         let address = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let registry_listener = TcpListener::bind(SocketAddr::new(address, 0))
             .await
@@ -262,21 +261,7 @@ mod tests {
             discovered_addr.port(),
         )
         .expect("discovered route");
-        let command = render_attach_command(
-            "{bin} attach --host {host} {id}",
-            &AttachTemplateValues {
-                bin: "pohunek".to_owned(),
-                host: route,
-                id: "s-42".to_owned(),
-            },
-        )
-        .expect("render attach command");
-        let selector = command
-            .split_whitespace()
-            .skip_while(|part| *part != "--host")
-            .nth(1)
-            .expect("rendered host argument")
-            .trim_matches('\'');
+        let selector = route.as_str();
 
         let client = Client::connect_with_registry(selector, registry)
             .await

@@ -10,7 +10,7 @@
 #   bacon check                                   # compile errors only, the fastest signal
 #   bacon clippy-fast                             # the CI lint gate
 #   bacon affected                                # fast loop for changed crates only
-#   bacon nextest-fast -- -p pohunek-gui-core      # narrow to one crate
+#   bacon nextest-fast -- -p pohunek-daemon       # narrow to one crate
 #   bacon nextest-fast -- some_test_name           # narrow to one test
 #
 # Inside bacon, `e` switches to `check`, `c` to `clippy-fast`, `n` or `t` to

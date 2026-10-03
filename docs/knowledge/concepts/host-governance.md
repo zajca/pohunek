@@ -26,7 +26,7 @@ pohunek host governance inspect <host> --json
 
 The command uses the same owner-only Unix or direct configured-overlay route as
 other v3 calls. It is safe to use through the Rust client, the generated
-TypeScript method map, the native GUI, or the transparent owner WebUI transport.
+TypeScript method map, or the transparent owner WebUI transport.
 It does not grant a relay or browser any new authority.
 
 The response always has a stable opaque `host_id` and an
@@ -78,7 +78,7 @@ same fail-closed repository behavior applies on APFS. Runtime cleanup never
 removes the host directory or its records.
 
 Local unenrollment does not stop a PTY, remove the owner Unix socket, disable a
-direct NetBird/WireGuard owner route, or prevent the native GUI and transparent
+direct NetBird/WireGuard owner route, or prevent the transparent
 owner WebUI from continuing to inspect and operate their existing owner
 surfaces.
 

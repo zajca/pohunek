@@ -168,9 +168,9 @@ class Base(unittest.TestCase):
         return path
 
     def app(self):
-        self.macho("Pohunek.app/Contents/MacOS/pohunek-gui")
-        (self.staging / "Pohunek.app/Contents/Info.plist").write_text("<plist/>")
-        return self.staging / "Pohunek.app"
+        self.macho("Example.app/Contents/MacOS/example")
+        (self.staging / "Example.app/Contents/Info.plist").write_text("<plist/>")
+        return self.staging / "Example.app"
 
 
 SIGNING_ENV = {"MACOS_SIGNING_IDENTITY": IDENTITY, "MACOS_SIGNING_KEYCHAIN": KEYCHAIN}
@@ -209,14 +209,14 @@ class SignTest(Base):
             signs,
             [
                 str(self.staging / "pohunek"),
-                str(app / "Contents/MacOS/pohunek-gui"),
+                str(app / "Contents/MacOS/example"),
                 str(app),
             ],
         )
         self.assertTrue(any("--verify --deep --strict" in c for c in self.calls("codesign")))
         # The executable inside the bundle is never signed on its own with an
         # identifier of its own.
-        self.assertFalse(any("--identifier" in c and "pohunek-gui" in c for c in self.calls("codesign")))
+        self.assertFalse(any("--identifier" in c and "example" in c for c in self.calls("codesign")))
 
     def test_the_web_backend_gets_its_jit_entitlements_and_nothing_else_does(self):
         self.macho("pohunek-web")
@@ -276,7 +276,7 @@ class NotarizeTest(Base):
         for text in ("--wait", "--key ", "--key-id KEYID12345", "--issuer 69a6de7a", "--output-format plist"):
             self.assertIn(text, submit)
         self.assertEqual(len(self.calls("ditto -c -k --keepParent " + str(self.staging))), 1)
-        self.assertTrue(any(c.startswith("xcrun stapler staple") and c.endswith("Pohunek.app") for c in self.calls()))
+        self.assertTrue(any(c.startswith("xcrun stapler staple") and c.endswith("Example.app") for c in self.calls()))
         self.assertTrue(any(c.startswith("xcrun stapler validate") for c in self.calls()))
         self.assertIn("Accepted", summary.read_text())
 

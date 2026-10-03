@@ -23,7 +23,6 @@ SCRIPTS = [
     MACOS / "audit-macho",
     MACOS / "build-release",
     MACOS / "package",
-    MACOS / "build-app-bundle",
     MACOS / "sign",
     MACOS / "notarize",
     MACOS / "verify-signed",
@@ -33,7 +32,6 @@ SCRIPTS = [
     ROOT / "packaging" / "write-manifest",
     ROOT / "web" / "release" / "install.sh",
     ROOT / "scripts" / "acceptance" / "macos-package-install",
-    ROOT / "scripts" / "smoke-gui-release-macos",
 ]
 
 MACHO_MAGIC = bytes.fromhex("cffaedfe")

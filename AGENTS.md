@@ -11,8 +11,8 @@ across the operator's own machines. A Rust daemon (`pohunekd`) owns the logical
 session registry and public API on each host; one isolated
 `pohunek-sessiond` worker owns each live PTY and agent process. The Rust CLI
 (`pohunek`) drives the daemon locally over a Unix socket and remotely over a
-NetBird/WireGuard address. A native Iced GUI (`pohunek-gui`) is an optional
-client. The accepted future direction adds an optional trusted team relay
+NetBird/WireGuard address. The native desktop GUI is a separate client that
+lives in `zajca/pohunek-work`. The accepted future direction adds an optional trusted team relay
 without replacing these direct owner paths; it is not implemented yet.
 
 It is pre-1.0 and experimental: wire shapes, config files, and on-disk metadata
@@ -45,7 +45,7 @@ Hard constraints, decided on purpose — respect them in every change:
 - **Remote owner transport is direct over NetBird**, never SSH bridging. Relay
   transport is the separate host-initiated path defined by the accepted RFC.
 - **Providers (Linear/GitHub) are shell-out based** (`gh`, Linear GraphQL) and
-  live only in client surfaces (CLI scripts, gui-core), never in the daemon.
+  live only in client surfaces (CLI scripts and external clients), never in the daemon.
 - **Protocol today:** public protocol v3 is owner-only newline-delimited JSON
   over a Unix socket (local) and TCP on configured overlays (remote); attach
   uses a separate raw-byte connection per PTY. [#70](https://github.com/zajca/pohunek/issues/70)
@@ -55,13 +55,13 @@ Hard constraints, decided on purpose — respect them in every change:
 ## Repository map
 
 Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
-`pohunekd` (daemon), `pohunek-gui` (GUI).
+`pohunekd` (daemon).
 
 | Crate | Role |
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
 | `crates/client`   | SDK client: typed errors, daemon transport, standalone configured-overlay discovery with bounded probing. |
-| `crates/assistant` | Assistant launch orchestration (agent selection, knowledge bundle, launch) and the host connection types (`HostConfig`, `ConnectionOptions`, `connect_client`) shared by the CLI and the GUI. |
+| `crates/assistant` | Assistant launch orchestration (agent selection, knowledge bundle, launch) and the host connection types (`HostConfig`, `ConnectionOptions`, `connect_client`) shared by the CLI and other clients. |
 | `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |
 | `crates/worker-protocol` | Private versioned daemon-to-worker protocol and framing. |
 | `crates/session-worker` | Durable per-session PTY owner (`pohunek-sessiond`). |
@@ -71,14 +71,12 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/terminal` | Shared VT screen tracking and attach compositing primitives. |
 | `crates/netbird`  | NetBird status parsing, host resolution, bind-address validation. |
 | `crates/overlay`  | Provider-neutral overlay contract, configured registry, routing identity, and per-overlay ports. |
-| `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and GUI clients. |
+| `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and other clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
 | `crates/test-support` | Test-only fixture roots that are symlink-free and short enough for Unix sockets on Linux and macOS, the hermetic per-test `TestEnv`, readiness waits bounded by one hang-guard ceiling (`wait`), the binary-wide unwind-safe process-environment override (`process_env`), the paused-clock auto-advance inhibitor (`time`), and fixture writers (`fs`) that cannot cause `ETXTBSY`. |
 | `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
 | `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`. |
-| `crates/gui-core` | Pure, headless state + SDK bridge for the GUI (no Iced dependency; fully unit-testable). |
-| `crates/gui`      | Native Iced shell that wraps `gui-core` in `Task`/`Subscription`. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
 | `sdk/ts/`         | TypeScript SDK packages in the Bun workspace: `protocol` (generated protocol types), `sdk` (runtime client and runtime-path resolver), and `testkit`. |
 | `web/`            | Retained owner-mode WebUI in the same Bun workspace: backend, client core, SPA, and release packaging. |
@@ -282,7 +280,7 @@ Rust:
 cargo t                                       # default inner loop: cost-filtered fast unit + integration tests
 cargo ta                                      # CPU-saving loop: fast tests of changed crates + dependents
 cargo ta --print                              # per-file reasons and the command; runs nothing
-cargo t -p pohunek-gui-core                   # fast tests in one crate (alias takes -p)
+cargo t -p pohunek-daemon                     # fast tests in one crate (alias takes -p)
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
 python3 scripts/test-partitions run cli       # exact CI shard: unit/daemon/relay/cli/relay-db/heavy
@@ -370,7 +368,7 @@ bacon                      # default job `nextest-fast`: profile-fast nextest lo
 bacon check                # `cargo check` over all targets and features only
 bacon clippy-fast          # CI lint command
 bacon affected             # `cargo xtask affected` on every save
-bacon nextest-fast -- -p pohunek-gui-core  # narrow the loop to one crate
+bacon nextest-fast -- -p pohunek-daemon    # narrow the loop to one crate
 ```
 
 Full debuginfo: the `dev`/`test` profiles emit line tables only for workspace
@@ -516,16 +514,14 @@ feature — `--all-features` only covers the everything-on case.
   read per-call from the keyring; `gh` output is redacted before it enters an
   error; types holding secrets get hand-written redacting `Debug`. Never read
   `.env*`, key/cert files, or print token values. Keep this posture.
-- **Headless/view split:** put state and I/O logic in `gui-core` (testable, no
-  Iced); keep `gui` a thin view + task-wrapping layer. Same spirit elsewhere —
-  shared logic goes in a library crate, not a binary.
+- **Shared logic goes in a library crate, not a binary.**
 - **Tests for all new logic.** Unit tests inline (`#[cfg(test)]`) for private
   behavior; `tests/` for integration. The protocol/state machines have rich
   test suites — extend them rather than adding untested branches.
 - **Keep the assistant knowledge bundle current.** `docs/knowledge/` is the
   hand-authored source for the Universal Pohunek Assistant (materialized via
   `assistant.materialize`). Whenever a change alters something the bundle
-  describes — a CLI command or flag, a protocol method/event, GUI behavior, an
+  describes — a CLI command or flag, a protocol method/event, an
   operating-model concept (sessions/projects/worktrees/agent profiles), a safety
   rule, the public-API surface in `docs/public-api.md`, or a path listed in
   `docs/knowledge/assistant/source-map.md` — update the matching knowledge
@@ -605,7 +601,8 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
 - **Commits are never signed.** Use clean, concise, English messages. Do not add
   a `Co-Authored-By` trailer or any "generated with" footer.
 - Keep changes scoped. If you touch the wire protocol (`crates/protocol`), expect
-  ripples in `client`, `daemon`, `cli`, and `gui-core` — update and test all.
+  ripples in `client`, `daemon`, and `cli`, and into `docs/public-api.md` and the
+  `docs/knowledge/` bundle — update and test all.
 - Run the full gate set above before declaring done. Report failures honestly
   with output; never claim green without running it.
 - When a task spans 3+ steps, plan first and verify after each major step.
@@ -635,7 +632,6 @@ do not re-report them as review findings:
 - `docs/ROADMAP.md`, `docs/phases/` — direction and historical context.
 - `docs/public-api.md` — the SDK/CLI contract surface.
 - `docs/knowledge/` — offline knowledge source built by `cargo xtask docs`.
-- `docs/gui-review.md` — current GUI review findings and refactor backlog.
 - `.agents/rust-guidelines/` — vendored Microsoft Pragmatic Rust Guidelines
   (read before editing `.rs`; `SKILL.md` routes you to the right file,
   `VENDORED.md` documents the source and how to re-sync).

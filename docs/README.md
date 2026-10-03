@@ -44,7 +44,7 @@ multi-team control plane without replacing either owner path.
 - [Phase 3 (superseded): Later Providers and libghostty GUI](phases/03-later-providers-and-gui.md)
   — historical; replaced by the SDK-first and native-desktop direction in the roadmap.
 - [Phase 4: Browser Control Center](phases/04-browser-control-center.md)
-  — historical plan behind the shipped optional owner-path browser GUI.
+  — historical plan behind the shipped optional owner-path browser control center.
 - [Phase 5: rofi / sway Launcher](phases/05-rofi-sway-launcher.md)
   — keyboard-driven launcher; the thinnest proof the chassis is an API.
 

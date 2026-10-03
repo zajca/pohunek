@@ -2,6 +2,12 @@
 
 ## Unreleased (2026-09-29)
 
+- Removed the native GUI from the bundle: the GUI setup guide, the GUI review
+  guide, the GUI attach-template section of the environment guide, the GUI
+  provider-token section of the secrets policy, and the macOS GUI app bundle
+  runbook parts. The native GUI is developed in `zajca/pohunek-work`; the public
+  API reference lists it as an external client and names the core tests that
+  cover `host.discover`, `subscribe`, and `worktree.remove`.
 - Documented the owner backend's optional rotating owner-private log files
   (`POHUNEK_BACKEND_LOG_DIR` and its limits, failure fallback, torn-line
   recovery, repair at open, startup failures recorded in the files).

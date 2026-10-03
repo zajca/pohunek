@@ -64,7 +64,6 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 portable-pty = { workspace = true }
 overlay = { workspace = true }
-pohunek-gui-core = { workspace = true }
 pohunek-logging = { workspace = true }
 pohunek-test-support = { workspace = true }
 

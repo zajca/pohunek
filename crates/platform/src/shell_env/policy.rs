@@ -12,7 +12,7 @@ use super::search_path::{
 /// Inputs of [`resolve_search_path`].
 #[derive(Debug, Clone, Copy)]
 pub struct PathPolicy<'a> {
-    /// An explicitly supplied environment `PATH` (a GUI launched from a shell
+    /// An explicitly supplied environment `PATH` (a client launched from a shell
     /// passes its inherited one); authoritative when present and non-empty. The
     /// installer supplies none.
     pub configured: Option<&'a SearchPath>,

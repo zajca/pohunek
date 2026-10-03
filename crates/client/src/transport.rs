@@ -1672,7 +1672,7 @@ mod tests {
             no_origin_options(),
         )
         .await
-        .expect("first GUI-style connection");
+        .expect("first long-lived client connection");
         let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), first_listener.accept())
             .await
             .expect("first accept deadline")
@@ -1687,7 +1687,7 @@ mod tests {
             no_origin_options(),
         )
         .await
-        .expect("reconnected GUI-style client");
+        .expect("reconnected long-lived client");
         let (_stream, _) = tokio::time::timeout(Duration::from_secs(1), second_listener.accept())
             .await
             .expect("second accept deadline")

@@ -2,7 +2,7 @@
 type: Guide
 id: guide/environment-resolution
 title: Environment and executable resolution
-description: How pohunek chooses the PATH of the daemon and agents on macOS and how attach commands are rendered safely.
+description: How pohunek chooses the PATH of the daemon and agents on macOS.
 source_kind: manual
 intents: [setup, debug, help]
 ---
@@ -30,7 +30,7 @@ Highest priority first:
    relative `PATH` entries (a trailing colon is harmless) rather than failing, and launches the exact
    canonical path it probed.
 2. **An explicitly supplied environment `PATH`.** A caller that already has a
-   validated `PATH` (the GUI, launched from a shell, passes its inherited one)
+   validated `PATH` (a client launched from a shell passes its inherited one)
    uses it without discovery. `pohunek service install` supplies none.
 3. **Bounded login-shell discovery (macOS only).** One `$SHELL -l -c` probe
    prints `PATH` between two random sentinel lines through the absolute
@@ -38,9 +38,9 @@ Highest priority first:
    null stdin, starts from an empty environment plus `HOME`, `USER`, `LOGNAME`, `SHELL` (the shell
    being probed, so a profile that branches on it behaves as in a real login), the
    profile selectors `ZDOTDIR` and `XDG_CONFIG_HOME` when set (each must be an
-   absolute UTF-8 path, or the install fails; the GUI skips the probe and names
-   the cause), built by the one shared `shell_env::login_environment` for both
-   the service installer and the GUI, `TERM=dumb`, and a baseline
+   absolute UTF-8 path, or the install fails; a client that skips the probe names
+   the cause), built by the one shared `shell_env::login_environment`,
+   `TERM=dumb`, and a baseline
    `PATH`, and runs in its own process group. One
    deadline (10 s) covers the fallback-directory validation, the executable
    checks, the probe, and the validation of the printed directories; output above 64 KiB kills the probe too. The
@@ -169,42 +169,3 @@ and `netbird_cli` in the doctor agrees with the daemon's own probe.
 - An abandoned discovery (deadline passed) starts no shell and validates no
   further output; a filesystem call already stuck in the kernel cannot be
   cancelled, only abandoned.
-
-## Attach command templates
-
-The GUI attach template uses `{bin}`, `{host}`, and `{id}`. It can be rendered in
-one of two ways, both in `pohunek-gui-core`:
-
-- **Shell string**: `render_attach_command` renders one string for `sh -c`.
-  Substitution is a single pass, and a placeholder is accepted only as an
-  unquoted word; its value is escaped as exactly one such word, so a value
-  containing quotes, `$()`, backticks, newlines, `;`, spaces, Unicode, or
-  another placeholder never changes the command's structure. The template is
-  not parsed as shell: a template without a placeholder only gets the minimal checks
-  (NUL, no command, an unterminated quote; comments, `$'...'` and heredocs are
-  skipped like the shell does). When it holds a placeholder it must fit an allowlist
-  grammar: outside single quotes, no backtick, parenthesis, bracket, `<`, `>`,
-  literal brace, `#` comment, line continuation, or `$` other than a plain
-  `$NAME`; double-quoted text may hold no `$` construct or backtick;
-  single-quoted text is opaque; a word that holds a placeholder may not also
-  hold an unquoted `*`, `?`, or `~` (quote the literal part, or put it in
-  another word). Anything else, a placeholder inside quotes, or a
-  placeholder right after `$`, is refused with
-  `AttachTemplateError::UnsafePlaceholderContext` (an unclosed quote is
-  `UnterminatedQuote`, a template with no command `EmptyCommand`). Values are
-  data for the launched program: a shell builtin that evaluates its arguments
-  (`let`, `eval`, arithmetic) can still interpret one, so never pass a value to
-  such a builtin. To run a nested script, pass the values as positional
-  parameters instead of quoting them into the script:
-  `attach_command = "$TERMINAL -e sh -c 'exec \"$@\"' sh {bin} attach --host {host} {id}"`.
-  Bare words exclude `,` and `=` and a leading `-`, so values never take
-  brace-expansion, assignment-word, or option shapes.
-- **Argument vector**: `render_attach_argv` renders an argument vector without a shell.
-  Only the template is split (POSIX quoting, no expansion, only space, tab, and
-  newline separate words); values are inserted after splitting as data in
-  exactly one argument each, so a quoted placeholder such as
-  `terminal -- "{bin}"` is fine and a path with spaces stays one argument.
-  This is the recommended mode for any launcher that needs no shell features.
-
-The GUI validates the template at config load, so a refused template fails at
-startup instead of at the first attach.

@@ -16,7 +16,7 @@ release archive or rebuilding it from source.
 ## Current public protocol v3 boundary
 
 The current release supports only protocol `3..=3` and cannot communicate with
-protocol-v2 peers. Before replacing any component, inventory every CLI, GUI,
+protocol-v2 peers. Before replacing any component, inventory every CLI,
 web backend/SDK, custom client, and local or NetBird-reachable daemon that must
 talk to another peer. Drain cross-host automation, upgrade that complete set in
 one maintenance window, and then verify every host with `pohunek health --json`
@@ -31,7 +31,7 @@ history does not widen the current supported range.
 
 1. Download the component archive for the binary being updated: CLI (`pohunek`),
    daemon (`pohunekd`, `pohunek-sessiond`, and the `pohunek` CLI that installs
-   them as a native service), or GUI (`pohunek-gui`).
+   them as a native service), or web backend.
 2. Run `pohunek doctor --json` to confirm the current binary can find required
    paths and state directories.
 3. Run `pohunek health --json` to confirm the daemon responds with the expected

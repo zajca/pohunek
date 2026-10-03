@@ -50,7 +50,7 @@ no local `NEXT.md` is written.
 5. **Write the complete plan into the issue.** The issue body (via the
    `github-workflow` skill) covers the phase end to end: scope, the design and
    decisions recorded above, the crates/surfaces affected (protocol ripples
-   into `client`/`daemon`/`cli`/`gui-core` if the wire changes),
+   into `client`/`daemon`/`cli` if the wire changes),
    knowledge-bundle and `docs/public-api.md` impact, and an explicit, testable
    definition-of-done list with stable IDs (`D1`, `D2`, ...) the `milestone`
    and `milestone-review` skills will check against, and a proposed PR stack:
