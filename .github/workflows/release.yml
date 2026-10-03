@@ -2,8 +2,11 @@ name: Release
 
 # Triggered by pushing a `vX.Y.Z` tag (created by `scripts/release`). First runs
 # the full quality gate (fmt/clippy/test) on the tagged commit, and only if that
-# passes builds the native component binaries, packages them with sha256
-# checksums, and attaches everything to a GitHub Release for that tag.
+# passes builds the native component binaries and packages them with sha256
+# checksums. Every build job holds a read-only token; the `publish*` jobs are
+# the only ones with a write token, and they only download an artifact, check
+# its checksum, and attach it to the GitHub Release for that tag, without
+# checking out the repository or running any code from it.
 #
 # The TypeScript SDK ships as three npm-pack tarballs (`pohunek-ts-protocol`,
 # `pohunek-ts-sdk`, `pohunek-ts-testkit`, each with a `.sha256`), built by
@@ -322,7 +325,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -479,13 +482,60 @@ jobs:
             --pohunek-bin "$release_pohunek"
           "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
+      # Only the archive and its checksum leave this job. Publishing happens in
+      # `publish`, which holds the write token and runs none of this code.
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.component }}-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ matrix.component }} for ${{ matrix.target }}
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            component: cli
+          - target: x86_64-unknown-linux-gnu
+            component: daemon
+          - target: x86_64-unknown-linux-gnu
+            component: relay
+          - target: x86_64-unknown-linux-musl
+            component: cli
+          - target: x86_64-unknown-linux-musl
+            component: daemon
+    steps:
+      - name: Download the release archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-${{ matrix.component }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-download
+
+      # The checksum file names the archive relative to its own directory.
+      - name: Check the archive checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/release-download"
+          sha256sum -c ./*.tar.gz.sha256
+          test "$(ls ./*.tar.gz | wc -l)" = 1
+
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           fail_on_unmatched_files: true
           files: |
-            ${{ steps.package.outputs.archive }}
-            ${{ steps.package.outputs.checksum }}
+            ${{ runner.temp }}/release-download/*.tar.gz
+            ${{ runner.temp }}/release-download/*.tar.gz.sha256
 
   # Signed and notarized native Apple Silicon archives (issue #104), in three
   # jobs so that signing credentials never share a runner with build code:

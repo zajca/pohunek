@@ -61,8 +61,10 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    gate + docs-gate, then builds `pohunek` and `pohunekd` for
    both `x86_64-unknown-linux-gnu` (dynamic glibc, primary) and
    `x86_64-unknown-linux-musl` (fully static, runs on any x86_64 Linux),
-   packages per-component tarballs with sha256 checksums, and attaches them to
-   the GitHub Release. After `sdk-gate` passes, `sdk-pack` builds (read-only token) and
+   packages per-component tarballs with sha256 checksums in read-only `build`
+   jobs, and the `publish` jobs (the only Linux jobs with a write token, no
+   checkout) download each archive, check its checksum, and attach it to the
+   GitHub Release. After `sdk-gate` passes, `sdk-pack` builds (read-only token) and
    `sdk-publish` attaches the TypeScript SDK tarballs `pohunek-ts-{protocol,sdk,testkit}-X.Y.Z.tgz`, each
    with a `.sha256`. Watch it to completion:
 
