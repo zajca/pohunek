@@ -385,8 +385,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Every leg links host binaries (build scripts, `cargo xtask docs site`)
+      # with the job-level mold RUSTFLAGS; only the musl target link itself
+      # drops mold, in the "Build release binaries" step.
       - name: Install mold linker
-        if: "!endsWith(matrix.target, '-musl')"
         run: sudo apt-get update && sudo apt-get install -y mold
 
       - name: Enable sccache
