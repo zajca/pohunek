@@ -83,6 +83,11 @@ jobs:
         with:
           shared-key: ci-
 
+      # xtask::dependency_policy resolves the locked graph with `--offline`, so
+      # every locked package source must already be in the cargo registry.
+      - name: Fetch locked dependency sources
+        run: cargo fetch --locked
+
       - name: Check formatting
         run: cargo fmt --all --check
 

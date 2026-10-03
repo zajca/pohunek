@@ -260,6 +260,25 @@ class LinkerSetupTests(unittest.TestCase):
                 self.assertNotRegex(step.group(1), r"(?m)^        if:", f"{name} installs mold conditionally")
 
 
+class OfflineDependencySourcesTests(unittest.TestCase):
+    """A job running `cargo test` fetches the locked sources before the tests.
+
+    The xtask dependency-policy tests resolve the locked graph with
+    `--offline`, which fails when a locked package source is missing from the
+    cargo registry.
+    """
+
+    def test_cargo_test_jobs_fetch_locked_sources_first(self):
+        for name, block in jobs(WORKFLOW.read_text()).items():
+            test_run = re.search(r"(?m)^\s+(?:- )?run: cargo test\b", block)
+            if test_run is None:
+                continue
+            fetch = re.search(r"(?m)^\s+(?:- )?run: cargo fetch --locked$", block)
+            with self.subTest(job=name):
+                self.assertIsNotNone(fetch, f"{name} runs cargo test without `cargo fetch --locked`")
+                self.assertLess(fetch.start(), test_run.start(), f"{name} fetches after running cargo test")
+
+
 class WriteJobGuardRejectionTests(unittest.TestCase):
     """The guard itself rejects the shapes it exists to stop."""
 
