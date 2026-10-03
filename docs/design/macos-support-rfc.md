@@ -339,10 +339,43 @@ WebSocket, and reconnect protections, but its code, packaging, and acceptance
 are owned by `zajca/pohunek-work` ([#415](https://github.com/zajca/pohunek/issues/415)).
 This repository ships the daemon protocol, the `WsTransport` SDK client, and a
 loopback test relay in `@pohunek/testkit/bun-relay`; it does not ship the web
-gateway or SPA. Core release artifacts are native, signed, and notarized, and
-`zajca/pohunek-work` signs and notarizes the web and native GUI artifacts it
-publishes. Gatekeeper verification, upgrades with live sessions, and uninstall
+gateway or SPA. Core release artifacts are native, ad-hoc signed, and carry a
+GitHub build-provenance attestation; they are distributed through a Homebrew
+formula and direct download (see the decision record below).
+`zajca/pohunek-work` signs the `.app` bundle it publishes, because casks are
+quarantined. Gatekeeper behavior, upgrades with live sessions, and uninstall
 behavior are part of release acceptance, not follow-up polish.
+
+### Decision record: ad-hoc signed core artifacts (2026-10-03)
+
+Core macOS artifacts (`pohunek-cli-<v>-aarch64-apple-darwin.tar.gz` and
+`pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz`, each with a `.sha256`) are
+ad-hoc signed (`codesign --sign -`, identifier
+`io.github.zajca.pohunek.<name>`), record `signing adhoc` in the `MANIFEST`, and
+carry a GitHub build-provenance attestation like every other release asset
+(`gh attestation verify <file> --repo zajca/pohunek`). They are distributed
+through the `zajca/homebrew-pohunek` formula and direct download. Developer ID
+signing and notarization are out of scope for core.
+
+Reasons:
+
+- No Apple Developer account exists to issue a Developer ID certificate or a
+  notary API key.
+- A release job that requires those credentials and fails closed when they are
+  missing kept every release run red and never published a macOS archive. A
+  fallback that signs only when the secrets exist would be fail-open.
+
+Costs, accepted and documented in the
+[macOS install runbook](../knowledge/runbooks/install-on-macos.md):
+
+- An ad-hoc signature has no stable designated requirement, so macOS may ask
+  again whether `pohunek` may access its `pohunek-relay` Keychain items after an
+  upgrade; "Always Allow" applies to that build only.
+- A file downloaded through a browser carries `com.apple.quarantine` and
+  Gatekeeper blocks it because it is not notarized. Homebrew formula installs and
+  `curl` downloads set no quarantine attribute.
+
+Public macOS support still requires the acceptance gate below.
 
 ## Dependency and target audit
 
@@ -385,6 +418,6 @@ all supported agents, and install/upgrade/uninstall with live
 sessions. It records OS, architecture, hardware, deadlines, and resource use,
 including at least 20 concurrent sessions and five simultaneous attaches.
 
-Missing native hardware, signing credentials, launchd login context, or pinned
+Missing native hardware, launchd login context, or pinned
 agent runtime is a visible open gate, never a green skip. Public macOS support is
 declared only after #105 is complete.

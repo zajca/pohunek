@@ -222,18 +222,44 @@ change anything.
 
 macOS on Apple Silicon (macOS 14 or newer) is not yet a published platform:
 public macOS support is declared only when the final native acceptance gate
-(#105) passes. The release workflow already builds the `aarch64-apple-darwin`
-CLI and daemon archives, signs them with a Developer ID
-Application certificate, has Apple notarize them, and verifies the result, but
-only when the protected `macos-signing` credentials exist (see "Release" below);
-without them the macOS jobs fail and nothing macOS is published. A build made
-with `packaging/macos/package --development` is unsigned, named
-`...-unsigned-development`, and never released. The install, upgrade, rollback,
-uninstall, log, logout/reboot, and Gatekeeper procedures are in the
-[macOS install runbook](docs/knowledge/runbooks/install-on-macos.md).
+(#105) passes. Each release already publishes
+`pohunek-cli-<v>-aarch64-apple-darwin.tar.gz` and
+`pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz`, each with a `.sha256`. They are
+ad-hoc signed (the `MANIFEST` says `signing adhoc`), not notarized, and carry no
+Developer ID. A build made with `packaging/macos/package --development` is
+unsigned, named `...-unsigned-development`, and never released. The install,
+upgrade, rollback, uninstall, log, logout/reboot, and Gatekeeper procedures are
+in the [macOS install runbook](docs/knowledge/runbooks/install-on-macos.md).
 
-Download from [Releases](https://github.com/zajca/pohunek/releases), unpack,
-and put the binaries on your `PATH`.
+Every release asset (Linux, macOS, and SDK) has a GitHub build-provenance
+attestation. Verify a download with:
+
+```bash
+gh attestation verify <file> --repo zajca/pohunek
+```
+
+Install on macOS with Homebrew:
+
+```bash
+brew install zajca/pohunek/pohunek    # tap zajca/homebrew-pohunek, formula pohunek
+pohunek service install
+```
+
+Run `pohunek service upgrade` after every `brew upgrade pohunek`, and
+`pohunek service uninstall` before `brew uninstall pohunek`. The formula does not
+touch launchd itself.
+
+Or install from the archive: download the daemon archive with `curl -fLO` (curl
+sets no quarantine attribute), check it with `shasum -a 256 -c` and
+`gh attestation verify`, extract it, and run `./packaging/install-daemon.sh`.
+A file downloaded through a browser gets `com.apple.quarantine`, and Gatekeeper
+blocks it because it is not notarized; see the runbook before removing the
+attribute. After an upgrade macOS may ask again whether `pohunek` may access its
+`pohunek-relay` Keychain items, because an ad-hoc signature has no stable
+designated requirement.
+
+On Linux, download from [Releases](https://github.com/zajca/pohunek/releases),
+unpack, and put the binaries on your `PATH`.
 
 Protocol v2 was a one-time coordinated pre-1.0 boundary. Before that M1
 transition, every CLI, SDK, custom client, and local or remote
@@ -872,18 +898,13 @@ cargo xtask ts check      # CI gate
 
 `scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
 Release workflow re-runs the gates on the tag, then builds and publishes glibc
-and MUSL x86_64 CLI and daemon archives, and signed, notarized
-`aarch64-apple-darwin` CLI and daemon archives. The macOS
-build runs without secrets; a separate signing job on a fresh runner runs in the protected `macos-signing` environment (secrets
-`MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_PASSWORD`,
-`APPLE_NOTARY_KEY_P8_BASE64`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,
-and the repository variable `MACOS_TEAM_ID`, which must not be environment-scoped because the verification job reads it too); a missing credential fails them before the
-build, so a macOS archive is never published unsigned and the release run stays
-red until the credentials exist. The `macos-signing` environment is created and
-protected by the repository owner, not by the workflow: restrict it to the
-`v*` release tags (and add a required reviewer if wanted), then add the five
-secrets and `MACOS_TEAM_ID`. A workflow that merely names an environment gets
-none of that protection. The offline docs are
+and MUSL x86_64 CLI and daemon archives, and ad-hoc signed `aarch64-apple-darwin`
+CLI and daemon archives. No macOS job uses secrets or a protected environment.
+A download-only `attest` job, the only job holding `id-token: write` and
+`attestations: write`, creates a build-provenance attestation for every
+published asset (Linux, macOS, SDK); the publish jobs depend on it, so an
+unattested asset is never published. Developer ID signing and notarization are
+not part of the pipeline. The offline docs are
 bundled into every native component archive. CLI archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
 source-locked Hermes runtime without provider credentials, runs the model-free

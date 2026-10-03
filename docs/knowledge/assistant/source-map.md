@@ -300,8 +300,9 @@ Release packaging and contributor verification:
   and native macOS arm64 hosts and verifies the archive `MANIFEST`: daemon
   component, target matching the host, macOS minimum version, every member
   present, a regular file, unmodified, and not writable by another account.
-- `docs/knowledge/runbooks/install-on-macos.md` — macOS install, upgrade,
-  rollback, uninstall, logs, logout/reboot, and Gatekeeper runbook.
+- `docs/knowledge/runbooks/install-on-macos.md` — macOS install (Homebrew and archive),
+  provenance verification, upgrade, rollback, uninstall, logs, logout/reboot,
+  and Gatekeeper and Keychain troubleshooting runbook.
 - `packaging/write-manifest` — writes an archive's `MANIFEST` (component,
   version, target, signing state, minimum macOS, SHA-256 of every member) as the
   last assembly step; refuses symbolic links and member names outside a plain
@@ -321,8 +322,9 @@ Release packaging and contributor verification:
   is thin arm64, within the deployment target, linked only against system
   libraries, with no runtime search path and no build-machine path.
 - `packaging/macos/package` — stages, audits, seals, and archives built macOS
-  binaries; `--development` produces the unsigned `-unsigned-development`
-  archive that is never released.
+  binaries; `--adhoc-release` produces the ad-hoc signed release archive
+  (`signing adhoc`), and `--development` produces the unsigned
+  `-unsigned-development` archive that is never released.
 - `scripts/acceptance/macos-package-install` — CI acceptance of installing,
   upgrading with live sessions, refusing bad archives, and uninstalling from
   the extracted macOS archives against real launchd.
@@ -332,17 +334,15 @@ Release packaging and contributor verification:
   before it runs or changes anything.
 - `scripts/tests/test_macos_packaging.py` — regression checks for the audit
   (with `otool`/`lipo`/`strings` shims) and the packaging scripts.
-- `packaging/macos/signing-keychain` — creates the ephemeral keychain holding
-  the Developer ID certificate from protected CI secrets (and removes it);
-  fails when a secret is missing.
-- `packaging/macos/sign` — signs every Mach-O file and app bundle with the
-  hardened runtime and a secure timestamp.
-- `packaging/macos/notarize` — submits the signed tree to Apple's notary
-  service with an API key, requires `Accepted`, and staples app bundles.
-- `packaging/macos/verify-signed` — verifies the signatures, team identifier,
-  hardened runtime, timestamps, stapled tickets, and Gatekeeper verdict.
-- `scripts/tests/test_macos_signing.py` — regression checks for the signing
-  tooling and the release workflow's credential handling, against shims.
+- `packaging/macos/sign` — ad-hoc signs every Mach-O file
+  (`codesign --force --sign -`) with the identifier
+  `io.github.zajca.pohunek.<name>`.
+- `packaging/macos/verify-signed` — verifies the signatures; `--adhoc` requires
+  `Signature=adhoc` and `codesign --verify --strict`, and rejects Developer ID,
+  unsigned, or broken signatures.
+- `scripts/tests/test_macos_signing.py` — regression checks for the ad-hoc
+  signing tooling and the release workflow's macOS and attestation jobs, against
+  shims.
 - `crates/cli/tests/daemon_packaging.rs`
 - `crates/cli/tests/service_lock.rs` — `pohunek service lock` and the lock it
   hands down, through the real binary.

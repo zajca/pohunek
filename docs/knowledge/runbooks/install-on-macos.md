@@ -2,7 +2,7 @@
 type: Runbook
 id: runbook/install-on-macos
 title: Install, upgrade, and remove Pohunek on macOS
-description: Install the daemon on Apple Silicon from release archives, upgrade without losing sessions, roll back, uninstall, and handle Gatekeeper.
+description: Install the daemon on Apple Silicon through Homebrew or a release archive, verify provenance, upgrade without losing sessions, roll back, uninstall, and handle Gatekeeper and Keychain prompts.
 source_kind: manual
 intents: [setup, update, debug, help]
 since: 0.31.6
@@ -13,10 +13,9 @@ since: 0.31.6
 Native macOS archives target Apple Silicon and macOS 14 or newer
 (`aarch64-apple-darwin`); Intel Macs and Rosetta shells are refused. macOS is not
 yet a published platform: public support is declared only when the final native
-acceptance gate passes. The release workflow builds the archives, and publishes
-them only when the repository's signing and notarization credentials exist, so a
-signed archive is the only macOS archive that is ever attached to a release.
-Everything runs as the logged-in owner: no `sudo`, no root service.
+acceptance gate passes. Release archives are ad-hoc signed, not notarized, and
+carry no Developer ID; every release asset has a GitHub build-provenance
+attestation. Everything runs as the logged-in owner: no `sudo`, no root service.
 
 ## What a release provides
 
@@ -25,23 +24,43 @@ Everything runs as the logged-in owner: no `sudo`, no root service.
 | `pohunek-cli-<v>-aarch64-apple-darwin` | `pohunek`, completions, offline docs | copy the binary onto `PATH` |
 | `pohunek-daemon-<v>-aarch64-apple-darwin` | `pohunek`, `pohunekd`, `pohunek-sessiond`, `packaging/install-daemon.sh` | `packaging/install-daemon.sh` |
 
-Every archive carries a `MANIFEST` (component, version, target, signing state,
-SHA-256 of each member) next to a `.sha256` of the archive itself. The installers
-verify the manifest, the host, and member permissions before they run or change
-anything. A build made with `packaging/macos/package --development` is unsigned,
+Every archive carries a `MANIFEST` (component, version, target, signing state
+`signing adhoc`, SHA-256 of each member) next to a `.sha256` of the archive
+itself. The installers verify the manifest, the host, and member permissions
+before they run or change anything. A build made with `packaging/macos/package --development` is unsigned,
 named `...-unsigned-development`, and not a release.
+
+## Install with Homebrew
+
+```bash
+brew install zajca/pohunek/pohunek
+pohunek service install
+```
+
+The tap is `zajca/homebrew-pohunek` and the formula is `pohunek`. It is a
+formula, not a cask, so Homebrew sets no quarantine attribute. It places
+`pohunek`, `pohunekd`, and `pohunek-sessiond` side by side and does no launchd
+work; `pohunek service install` registers the login agent.
+
+- After every `brew upgrade pohunek`, run `pohunek service upgrade`.
+- Before `brew uninstall pohunek`, run `pohunek service uninstall`.
 
 ## Verify a download
 
 ```bash
 shasum -a 256 -c pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz.sha256
+gh attestation verify pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz --repo zajca/pohunek
 ```
 
-After extracting, `codesign --verify --strict <binary>` and
-`codesign -dvv <binary>` show the Developer ID Application authority, the hardened
-runtime flag, and the team identifier.
+After extracting, `codesign --verify --strict <binary>` succeeds and
+`codesign -dvv <binary>` shows `Signature=adhoc` with identifier
+`io.github.zajca.pohunek.<name>`. There is no Developer ID authority and no
+team identifier.
 
-## Install the daemon
+## Install from the archive
+
+Download with `curl -fLO` (curl sets no quarantine attribute), verify the
+download as above, and extract it.
 
 Extract the daemon archive anywhere owner-controlled (not a group- or
 world-writable directory) and run its installer:
@@ -90,7 +109,8 @@ whole `gui/$(id -u)` domain: that ends every worker.
 
 ## Upgrade
 
-Extract the new daemon archive and run its installer again. It runs
+With Homebrew, run `brew upgrade pohunek` and then `pohunek service upgrade`.
+From an archive, extract the new daemon archive and run its installer again. The installer runs
 `pohunek service upgrade`, which stages the new versioned directory, probes every
 binary, and then restarts only the daemon agent. Live workers keep their process,
 PTY, and child, and keep running from the version directory they started in; that
@@ -145,12 +165,24 @@ reason `runtime_lost`. A reboot does the same. Sessions with a native resume
 reference can be recovered explicitly with `pohunek session resume <id>`. A sleeping
 Mac executes nothing; sessions continue when it wakes.
 
-## Gatekeeper
+## Troubleshooting
 
-Release archives are signed and notarized, so Gatekeeper accepts them. If macOS
-still refuses a download (an incomplete notarization, a quarantined archive from a
-browser, a tampered file), do not disable Gatekeeper and do not remove quarantine
-from a whole directory. Re-download, run the verification commands above, and only
-when they prove a valid Developer ID signature of the expected team, allow that
-one app in System Settings > Privacy & Security ("Open Anyway"). Downloading with
-`curl` creates no quarantine attribute at all.
+### Gatekeeper blocks a download
+
+Archives are not notarized, so Gatekeeper blocks a file that carries the
+`com.apple.quarantine` attribute, which browsers set. Homebrew and `curl -fLO`
+downloads carry no quarantine attribute. Do not disable Gatekeeper and do not
+remove quarantine from a whole directory. Verify the checksum and the
+attestation first (see "Verify a download"), and only then remove the attribute
+from that one file:
+
+```bash
+xattr -d com.apple.quarantine <file>
+```
+
+### Keychain asks for access again
+
+An ad-hoc signature has no stable designated requirement, so after an upgrade
+macOS may ask again whether `pohunek` may access its `pohunek-relay` Keychain
+items. Choosing "Always Allow" applies to that build only; expect the prompt
+again after the next upgrade.
