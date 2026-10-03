@@ -51,7 +51,6 @@ knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
 pohunek-assistant = { path = "crates/assistant" }
 pohunek-cli = { path = "crates/cli" }
 pohunek-client = { path = "crates/client" }
-pohunek-daemon = { path = "crates/daemon" }
 pohunek-hostcheck = { path = "crates/hostcheck" }
 pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-logging = { path = "crates/logging" }

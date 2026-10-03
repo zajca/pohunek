@@ -1746,8 +1746,11 @@ These helpers open the raw connection and write the prelude before returning a
 The native desktop GUI lives in
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work) and is an external
 client of this protocol and the SDKs; nothing in it is private. Three methods
-are public obligations that the clients in this repository do not call, so only
-core tests keep them honest:
+are public obligations whose callers are mostly UI clients, so core keeps
+server-side contract tests for each of them:
+`host.discover` and `worktree.remove` are called only by the UI clients (the
+web control center in `web/` and the native GUI), and `subscribe` is also
+called by the CLI (`pohunek subscribe`, `pohunek attach`, `pohunek notifications`).
 
 - `host.discover`: socket-level coverage in
   `crates/daemon/tests/health_socket.rs`
