@@ -138,8 +138,8 @@ Phase 4 so the desktop app and the browser app build on the same contract.
   public API is documented in [`docs/public-api.md`](public-api.md): methods,
   envelopes, error classes/codes, events, version negotiation, and the attach
   stream as public protocol surface.
-- **S.3 — TS SDK (`web/sdk`) — complete.** `ts-rs`-generated types
-  (`web/shared`) + a runtime client with pluggable transports (TCP for Node/Bun
+- **S.3 — TS SDK (`sdk/ts/sdk`) — complete.** `ts-rs`-generated types
+  (`sdk/ts/protocol`) + a runtime client with pluggable transports (TCP for Node/Bun
   → daemon direct; WebSocket for browser → backend). CI **drift check** fails if
   generated TS types diverge from the Rust source. Track B inherits
   `web/backend` (`@pohunek/backend`) as its tested WebSocket transport core

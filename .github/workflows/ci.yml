@@ -533,7 +533,6 @@ jobs:
           bun-version: 1.3.11
 
       - name: Install web dependencies
-        working-directory: web
         run: bun install --frozen-lockfile
 
       # The compiled backend for Apple Silicon (Bun runtime plus SPA), smoke
@@ -845,6 +844,12 @@ jobs:
             # binaries the real-daemon suites spawn.
             web_macos:
               - 'web/**'
+              - 'sdk/ts/**'
+              - 'package.json'
+              - 'bun.lock'
+              - '.bun-version'
+              - 'tsconfig*.json'
+              - 'eslint.config.js'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - '.cargo/**'
@@ -908,9 +913,9 @@ jobs:
               - 'crates/relay-protocol/**'
               - 'crates/xtask/Cargo.toml'
               - 'crates/xtask/src/**'
-              - 'web/shared/src/generated/**'
-              - 'web/shared/src/relay-generated/**'
-              - 'web/shared/fixtures/**'
+              - 'sdk/ts/protocol/src/generated/**'
+              - 'sdk/ts/protocol/src/relay-generated/**'
+              - 'sdk/ts/protocol/fixtures/**'
               - 'Cargo.lock'
               - '.github/workflows/ci.yml'
             # The release build catches a broken release profile before
@@ -1573,56 +1578,49 @@ jobs:
           bun-version: 1.3.11
 
       # `bun install` re-downloads every registry tarball without a cache.
-      # Reuse Bun's global package cache, keyed by web/bun.lock and the
+      # Reuse Bun's global package cache, keyed by bun.lock and the
       # setup-bun bun-version pin above, so repeat runs install from disk
       # instead of the network.
       - name: Cache Bun packages
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('web/bun.lock') }}
+          key: bun-${{ runner.os }}-1.3.11-${{ hashFiles('bun.lock') }}
           restore-keys: |
             bun-${{ runner.os }}-1.3.11-
 
       - name: Install web dependencies
-        working-directory: web
         run: bun install --frozen-lockfile
 
       - name: Typecheck web
-        working-directory: web
         run: bun run typecheck
 
       - name: Lint web
-        working-directory: web
         run: bun run lint
 
       - name: Test web
-        working-directory: web
         run: bun test
 
       # Build once, reuse for the Playwright e2e below. `bun run test:e2e`
       # rebuilds the frontend itself, so invoke the Playwright CLI directly.
       - name: Build web control center
-        working-directory: web
         run: bun run build:frontend
 
       # The lockfile pins the Playwright version, so its browser build is
-      # derived from web/bun.lock instead of a hand-maintained literal.
+      # derived from bun.lock instead of a hand-maintained literal.
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('web/bun.lock') }}
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('bun.lock') }}
           restore-keys: |
             playwright-chromium-${{ runner.os }}-
 
       - name: Install Playwright Chromium
-        working-directory: web
         run: bunx playwright install --only-shell chromium
 
       - name: Test web control center
-        working-directory: web
-        run: bun ./node_modules/@playwright/test/cli.js test --config frontend/playwright.config.ts
+        run: bun ./node_modules/@playwright/test/cli.js test --config web/frontend/playwright.config.ts
 
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries must be present.
@@ -1638,15 +1636,13 @@ jobs:
         run: chmod +x target/debug/pohunekd target/debug/pohunek-sessiond target/debug/pohunek
 
       - name: SDK e2e against real daemon
-        working-directory: web
-        run: bun test sdk/test/e2e.test.ts
+        run: bun test sdk/ts/sdk/test/e2e.test.ts
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
       - name: Backend e2e against real daemon
-        working-directory: web
-        run: bun test backend/test/real-daemon.e2e.test.ts
+        run: bun test web/backend/test/real-daemon.e2e.test.ts
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
@@ -1687,7 +1683,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ runner.arch }}-1.3.11-${{ hashFiles('web/bun.lock') }}
+          key: bun-${{ runner.os }}-${{ runner.arch }}-1.3.11-${{ hashFiles('bun.lock') }}
           restore-keys: |
             bun-${{ runner.os }}-${{ runner.arch }}-1.3.11-
 
@@ -1708,47 +1704,39 @@ jobs:
         run: cargo build --locked -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 
       - name: Install web dependencies
-        working-directory: web
         run: bun install --frozen-lockfile
 
       - name: Typecheck web
-        working-directory: web
         run: bun run typecheck
 
       - name: Lint web
-        working-directory: web
         run: bun run lint
 
       - name: Test web
-        working-directory: web
         run: bun test
 
       # The Playwright run drives the built Svelte SPA through the fixture stack.
       - name: Build web control center
-        working-directory: web
         run: bun run build:frontend
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/ms-playwright
-          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('web/bun.lock') }}
+          key: playwright-chromium-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
           restore-keys: |
             playwright-chromium-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install Playwright Chromium
-        working-directory: web
         run: bunx playwright install --only-shell chromium
 
       - name: Test web control center
-        working-directory: web
-        run: bun ./node_modules/@playwright/test/cli.js test --config frontend/playwright.config.ts
+        run: bun ./node_modules/@playwright/test/cli.js test --config web/frontend/playwright.config.ts
 
       # The release package ships this executable: compile it for the native
       # target and smoke it against a fixture daemon, outside the workspace
       # runtime.
       - name: Compile and smoke the packaged backend
-        working-directory: web
         shell: bash
         run: |
           set -euo pipefail
@@ -1757,20 +1745,18 @@ jobs:
           mkdir -p "$out"
           bun build --compile --target=bun-darwin-arm64 \
             --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
-            --outfile="$out/pohunek-web" ./backend/src/entrypoint.ts
+            --outfile="$out/pohunek-web" ./web/backend/src/entrypoint.ts
           file "$out/pohunek-web" | tee /dev/stderr | grep -q "arm64"
-          bun run release/smoke.ts "$out/pohunek-web" frontend/dist
+          bun run web/release/smoke.ts "$out/pohunek-web" web/frontend/dist
 
       - name: SDK e2e against real daemon
-        working-directory: web
-        run: bun test sdk/test/e2e.test.ts
+        run: bun test sdk/ts/sdk/test/e2e.test.ts
         env:
           POHUNEK_E2E: "1"
           POHUNEK_DAEMON_BIN: ${{ github.workspace }}/target/debug/pohunekd
 
       - name: Backend e2e against real daemon
-        working-directory: web
-        run: bun test backend/test/real-daemon.e2e.test.ts
+        run: bun test web/backend/test/real-daemon.e2e.test.ts
         env:
           POHUNEK_E2E: "1"
           POHUNEK_E2E_DEFAULT_RUNTIME: "1"

@@ -99,16 +99,16 @@ Launcher scripts:
 
 Web control center client:
 
-- `web/sdk/src/index.browser.ts`
-- `web/sdk/README.md`
-- `web/sdk/src/client.ts`
-- `web/sdk/src/envelope.ts`
-- `web/sdk/src/origin.ts`
-- `web/sdk/src/transport.ts`
+- `sdk/ts/sdk/src/index.browser.ts`
+- `sdk/ts/sdk/README.md`
+- `sdk/ts/sdk/src/client.ts`
+- `sdk/ts/sdk/src/envelope.ts`
+- `sdk/ts/sdk/src/origin.ts`
+- `sdk/ts/sdk/src/transport.ts`
 - `web/backend/src/config.ts`
-- `web/backend/src/runtime-paths.ts`
+- `sdk/ts/sdk/src/runtime-paths.ts`
 - `web/backend/src/log-files.ts`
-- `web/testkit/src/runtime-root.ts`
+- `sdk/ts/testkit/src/runtime-root.ts`
 - `web/scripts/node-executable.ts`
 - `web/backend/src/hosts.ts`
 - `web/backend/src/server.ts`
@@ -123,8 +123,8 @@ Web control center client:
 - `web/frontend/src/components/NewSessionDialog.svelte`
 - `web/scripts/dev.ts`
 - `web/scripts/typecheck.ts` — one-command typecheck: incremental `tsc -b` over
-  the composite source-only project graph (`shared`/`sdk`/`backend`/`testkit`/
-  `client-core`/tools) in `web/tsconfig.json`, then the standalone
+  the composite source-only project graph (`protocol`/`sdk`/`backend`/`testkit`/
+  `client-core`/tools) in the root `tsconfig.json`, then the standalone
   `frontend`/`release-test` checks and the per-package `test/tsconfig.json`
   projects; tests stay out of the composite graph because their sibling-package
   imports resolve to `.ts` sources.
@@ -198,7 +198,7 @@ Shipped host-local identity and governance:
 - `crates/gui/src/command.rs`
 - `crates/gui/src/view/hosts.rs`
 - `crates/xtask/src/generators/protocol.rs`
-- `web/sdk/src/governance.ts` — strict TypeScript validation of the public
+- `sdk/ts/sdk/src/governance.ts` — strict TypeScript validation of the public
   `host.governance.inspect` response and its fixed redacted contract-mismatch
   error.
 - `docs/knowledge/concepts/host-governance.md`
@@ -440,7 +440,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/store/mod.rs`
 - `crates/session-worker/src/journal.rs`
 - `crates/cli/src/hermes_integration/lifecycle.rs`
-- `web/backend/test/runtime-path-contract.test.ts`
+- `sdk/ts/sdk/test/runtime-path-contract.test.ts`
 - `.github/workflows/ci.yml`
 
 - `crates/daemon/src/assistant.rs`

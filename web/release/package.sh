@@ -10,7 +10,7 @@ readonly target="${2:-linux-x86_64}"
 readonly mode="${3:-}"
 
 if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  printf '%s\n' "usage: release/package.sh <X.Y.Z> [linux-x86_64|aarch64-apple-darwin [--input-only]]" >&2
+  printf '%s\n' "usage: web/release/package.sh <X.Y.Z> [linux-x86_64|aarch64-apple-darwin [--input-only]]" >&2
   exit 2
 fi
 
@@ -45,7 +45,8 @@ readonly input="${output_dir}/input-${target}"
 readonly archive="${output_dir}/${name}.tar.gz"
 readonly checksum="${archive}.sha256"
 
-cd "${web_root}"
+# The Bun workspace root is the repository root; every Bun command runs there.
+cd "${repository_root}"
 rm -rf -- "${input}"
 rm -f -- "${archive}" "${checksum}"
 mkdir -p "${input}/frontend"
@@ -57,12 +58,12 @@ bun build \
   --no-compile-autoload-dotenv \
   --no-compile-autoload-bunfig \
   --outfile="${input}/pohunek-web" \
-  ./backend/src/entrypoint.ts
+  ./web/backend/src/entrypoint.ts
 
-cp -R frontend/dist/. "${input}/frontend/"
-cp release/backend.env.example release/install.sh release/README.md "${input}/"
+cp -R web/frontend/dist/. "${input}/frontend/"
+cp web/release/backend.env.example web/release/install.sh web/release/README.md "${input}/"
 if [[ "${target}" == "linux-x86_64" ]]; then
-  cp backend/systemd/pohunek-backend.service.in "${input}/"
+  cp web/backend/systemd/pohunek-backend.service.in "${input}/"
 fi
 chmod 0755 "${input}/install.sh"
 
@@ -72,7 +73,7 @@ bash -n "${input}/install.sh"
 
 # The compiled backend serves the SPA with a fixture daemon. The macOS target
 # is built and run natively on an arm64 Mac.
-bun run release/smoke.ts "${input}/pohunek-web" "${input}/frontend"
+bun run web/release/smoke.ts "${input}/pohunek-web" "${input}/frontend"
 
 if [[ "${mode}" == "--input-only" ]]; then
   if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
@@ -82,7 +83,6 @@ if [[ "${mode}" == "--input-only" ]]; then
   exit 0
 fi
 
-cd "${repository_root}"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
 export SOURCE_DATE_EPOCH
 packaging/stage-archive web "${version}" "${target}" "${input}" "${web_root}" "${output_dir}" > /dev/null
