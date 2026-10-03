@@ -74,15 +74,20 @@ pub(crate) static FIXTURES: &[FixtureState] = &[
         id: "config-not-installed",
         description: "The daemon is running but the default config and prompt \
                        templates were never installed. A project action fails \
-                       with `prompt_not_found`.",
-        expected_outcome: "Assistant recommends `pohunek setup config` and \
-                           then verifying with `pohunek doctor --json`.",
+                       with `prompt_not_found` because \
+                       `prompts/<name>.tmpl` is missing from the config \
+                       directory.",
+        expected_outcome: "Assistant recommends `pohunek setup config` to \
+                           create the missing prompt templates, then \
+                           re-running the failed action and checking the \
+                           resolved actions with `pohunek project actions \
+                           <id-or-label> --json`.",
         assistant_command: "pohunek assistant setup config not installed",
         transcript_path: "target/pohunek-eval/transcripts/config-not-installed.md",
-        required_terms: &["setup", "config", "doctor"],
+        required_terms: &["setup", "config", "prompt"],
         example_commands: &[
             "pohunek setup config",
-            "pohunek doctor --json",
+            "pohunek project actions demo --json",
             "pohunek health --json",
         ],
         planned_commands: &[],
@@ -108,19 +113,20 @@ pub(crate) static FIXTURES: &[FixtureState] = &[
     },
     FixtureState {
         id: "stale-installation",
-        description: "The binary was updated but the installed config is stale. \
-                       `pohunek doctor` reports a version mismatch.",
+        description: "The CLI binary was updated but the running daemon was not \
+                       restarted. `pohunek health` reports a `daemon_version` \
+                       or `protocol_version` that differs from the updated \
+                       CLI.",
         expected_outcome: "Assistant recommends running the update-after-release \
-                           runbook: verify health, check capabilities, review \
-                           config.",
+                           runbook: verify health versions, check capabilities, \
+                           review config.",
         assistant_command: "pohunek assistant update stale installation",
         transcript_path: "target/pohunek-eval/transcripts/stale-installation.md",
         required_terms: &["config", "health", "capabilities"],
         example_commands: &[
-            "pohunek setup config",
             "pohunek health --json",
             "pohunek host inspect local --json",
-            "pohunek doctor --json",
+            "pohunek setup config",
         ],
         planned_commands: &[],
     },

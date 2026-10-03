@@ -104,7 +104,11 @@ Local configuration is installed through `pohunek setup`. The subcommands are:
 A bare `pohunek setup` is `pohunek setup config` without `--force`; `--json`
 returns the `created` and `skipped` file lists. Desktop launchers (rofi, sway)
 and the issue/PR pickers are not part of core; they live in `zajca/pohunek-work`
-and call the public `pohunek` CLI.
+and call the public `pohunek` CLI. Upgrading from a release that installed
+launchers: remove `<data_dir>/bin/{lib.sh,pohunek-rofi,pohunek-rofi-issue,pohunek-launch-issue,pohunek-launch-pr}`
+and `<config_home>/sway/config.d/pohunek.conf` as described in the
+[update-after-release runbook](../runbooks/update-after-release.md), or let the
+`pohunek-work` setup own them.
 
 ## Doctor checks by platform
 

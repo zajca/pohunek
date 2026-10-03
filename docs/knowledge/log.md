@@ -16,6 +16,13 @@
   `bin:rofi`, `bin:swaymsg`, `bin:python3`, `bin:timeout`, `terminal`,
   `launcher_scripts` or `sway_include`; hook interpreter readiness stays in
   `integration.doctor`. The launchers are developed in `zajca/pohunek-work`.
+- Documented the upgrade handoff for launcher assets that earlier releases
+  installed: the update-after-release runbook lists the exact
+  `<data_dir>/bin` scripts and the `<config_home>/sway/config.d/pohunek.conf`
+  drop-in to remove (or hand over to the `pohunek-work` setup); core deletes
+  nothing. Corrected the `stale-installation` and `config-not-installed` eval
+  scenarios to describe only signals `pohunek health` and `prompt_not_found`
+  actually produce.
 - Removed the native GUI from the bundle: the GUI setup guide, the GUI review
   guide, the GUI attach-template section of the environment guide, the GUI
   provider-token section of the secrets policy, and the macOS GUI app bundle
