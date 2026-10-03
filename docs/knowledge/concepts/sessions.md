@@ -276,8 +276,9 @@ identifies the PTY owner and `runtime_id` identifies one PTY generation. A
 daemon restart preserves both ids. Explicit native recovery preserves the
 logical session id but changes the worker and runtime ids.
 
-`SessionInfo.capabilities.resume` and `.fork` are independent, frozen flags.
-Clients must use them instead of guessing from the provider name. Long-lived
+`SessionInfo.capabilities.resume` and `.fork` are frozen flags derived from the
+session's native-session launch spec; fork is only offered together with
+resume. Clients must use them instead of guessing from the provider name. Long-lived
 wire counters (`runtime_generation`, output offsets, terminal watermarks, hook
 sequences, and subagent revisions) are canonical unsigned decimal strings so JavaScript clients do
 not lose precision.
@@ -590,8 +591,10 @@ boundaries.
 native agent conversation. The source may still be live; fork does not require a
 terminal state. With `cwd_mode: "same"`, the new session starts in the source
 cwd/worktree and carries the same launch-agent native metadata, so the fork is
-resumable too. Claude forks as `claude --resume <native_session_id>
---fork-session`. Codex fork is intentionally not enabled in this daemon contract;
+resumable too. The fork argv comes from the session's frozen native-session
+launch spec: Claude forks as `claude --resume <native_session_id>
+--fork-session`, and a host profile that declares `fork_args` forks with exactly
+those arguments. Codex fork is intentionally not enabled in this daemon contract;
 Codex-backed sessions return the typed `agent_fork_unsupported` error instead
 of fabricating an unsupported branch. Hermes-backed sessions return the same
 typed unsupported error.
