@@ -1744,7 +1744,12 @@ These helpers open the raw connection and write the prelude before returning a
 
 The web control center and the native desktop GUI live in
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work) and are external
-clients of this protocol and the SDKs; nothing in them is private. Three methods
+clients of this protocol and the SDKs; nothing in them is private. They pin
+core by git tag (Rust crates) and by release-tarball URL and integrity (the
+TypeScript SDK), and move in lockstep with the protocol version: the TypeScript
+SDK handshake requires the daemon's exact `PROTOCOL_VERSION`. Core crates beyond
+`pohunek-client` that a Rust client links are a pinned, not a stable, API with no
+back-compat shims. Three methods
 are public obligations whose callers are mostly those external UI clients, so
 core keeps server-side contract tests for each of them: `host.discover` and
 `worktree.remove` are called only by the UI clients, and `subscribe` is also

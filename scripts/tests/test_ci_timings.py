@@ -83,7 +83,7 @@ CACHE_LOG = "\n".join(
         f"\t2026-09-21T05:22:56Z {SCCACHE_JSON}",
         "tests (unit, fast)\tCache cargo build"
         "\t2026-09-21T05:17:40Z Cache not found for keys: Linux-x64-gnu",
-        "web SDK + control center\tCache Bun packages"
+        "SDK workspace\tCache Bun packages"
         "\t2026-09-21T05:17:40Z Cache restored successfully",
     ]
 )
@@ -1167,11 +1167,11 @@ class CacheTests(unittest.TestCase):
         )
 
     def test_parse_cache_log_ignores_unrelated_cache_steps(self):
-        # "Cache restored successfully" from an `actions/cache` step (Bun,
-        # Playwright) must not fabricate a rust-cache record; nor may an
-        # sccache-looking line outside the post-step.
+        # "Cache restored successfully" from an `actions/cache` step (Bun)
+        # must not fabricate a rust-cache record; nor may an sccache-looking
+        # line outside the post-step.
         records = {record["job"]: record for record in ci_timings.parse_cache_log(CACHE_LOG)}
-        self.assertNotIn("web SDK + control center", records)
+        self.assertNotIn("SDK workspace", records)
         unrelated = "\n".join(
             [
                 "tests (cli, fast)\tRun fast shard"

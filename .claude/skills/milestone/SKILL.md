@@ -26,6 +26,8 @@ The issue is the spec — there is no `NEXT.md`.
    evidence that refine the body. Extract the scope and the DoD items with
    their stable IDs — these are the testable success criteria. If they are
    ambiguous, resolve the ambiguity before implementation; do not invent scope.
+   Core ships no UI (AGENTS.md "Hard constraints"): a milestone that needs a
+   GUI, web, or launcher change is work for `zajca/pohunek-work`.
 2. **Create a worktree off `main`.** Use the script, which fetches
    `origin/main`, creates `pohunek-worktrees/<milestone-slug>` beside the
    primary checkout (from any checkout; it prints the absolute path) on

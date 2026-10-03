@@ -566,7 +566,7 @@ def parse_junit(paths, top=5):
 # Named `Swatinem/rust-cache@v2` steps in ci.yml use "Cache cargo build"; a
 # step left unnamed is logged under the action reference instead, so both
 # spellings identify rust-cache. Matching by step name keeps `actions/cache`
-# steps (e.g. "Cache Bun packages", "Cache Playwright browsers") out of the
+# steps (e.g. "Cache Bun packages") out of the
 # rust-cache evidence. The sccache statistics blob is printed by the
 # post-step of "Enable sccache" (`sccache-action` `--show-stats
 # --stats-format=json`); only that step's lines may set the sccache entry.
@@ -587,7 +587,7 @@ def parse_cache_log(text):
     Only lines from the responsible steps count: rust-cache outcomes from a
     step ``is_rust_cache_step`` recognizes, and the sccache JSON blob from
     ``SCCACHE_STEP`` (the sccache post-step). All other lines (including
-    `actions/cache` steps for Bun/Playwright and the cache-save upload steps)
+    `actions/cache` steps for Bun and the cache-save upload steps)
     are ignored.
     """
     jobs = {}

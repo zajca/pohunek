@@ -19,7 +19,8 @@ over a Unix socket and remotely over a NetBird/WireGuard mesh.
 control center, your own launcher — sits on top of the same versioned protocol.
 pohunek is fully usable from the CLI alone, and the Rust/TypeScript SDKs exist
 precisely so you can **build your own GUI or client** tailored to how you work.
-The web control center and the native desktop GUI are separate clients that live in
+This repository ships no user interface: the web control center, the native
+desktop GUI, and the desktop launchers are separate clients that live in
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). See [SDKs and building your own client](#sdks-and-building-your-own-client).
 
 Start Codex, Claude Code, or Hermes Agent on any of your machines, detach, walk away, and
@@ -604,6 +605,12 @@ entirely through this surface.
   [`docs/public-api.md`](docs/public-api.md); TS types are regenerated from
   Rust so the two SDKs never drift. The protocol is versioned, but pre-1.0 it
   may still change between releases (see the status note above).
+- **Distribution and pinning** — clients use public contracts only: the CLI
+  with `--json` and the public protocol through the SDKs. Rust crates are
+  consumed by git tag and the TypeScript packages as release tarballs pinned by
+  URL and integrity, never from a registry. Crates beyond `pohunek-client` that a
+  Rust client links are a pinned, not a stable, API (no back-compat shims), and
+  clients move in lockstep with the protocol version.
 - **Or skip a client entirely** — every CLI command supports `--json` and
   `subscribe` streams typed events, so a shell script is a legitimate way to
   drive pohunek.
