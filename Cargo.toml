@@ -28,6 +28,7 @@ members = [
     "crates/worker-protocol",
     "crates/session-worker",
     "crates/client",
+    "crates/assistant",
     "crates/gui-core",
     "crates/daemon",
     "crates/cli",
@@ -49,6 +50,7 @@ getrandom = "0.2"
 # its default features.
 cli = { package = "pohunek-cli", path = "crates/cli", default-features = false }
 knowledge = { package = "pohunek-knowledge", path = "crates/knowledge" }
+pohunek-assistant = { path = "crates/assistant" }
 pohunek-cli = { path = "crates/cli" }
 pohunek-client = { path = "crates/client" }
 pohunek-daemon = { path = "crates/daemon" }

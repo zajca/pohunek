@@ -10,6 +10,9 @@ Source of truth:
 
 - Wire types and method constants: `crates/protocol`
 - Rust SDK transport API: `crates/client`
+- Assistant launch orchestration and host connection types
+  (`HostConfig`, `ConnectionOptions`, `connect_client`, `AssistantError`):
+  `crates/assistant`
 - Daemon dispatch behavior: `crates/daemon/src/api`
 
 ## Status: Shipped v3, Implemented Relay Foundation, and Deferred Relay Evolution

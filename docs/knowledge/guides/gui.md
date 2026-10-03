@@ -423,7 +423,7 @@ unsupported.
 
 The Assistant entry opens a native launch modal with the same Project select as
 its first field and the same preselection rules. The shared
-`gui-core::assistant` launcher performs host inspection, snapshot creation,
+`pohunek-assistant` launcher (re-exported as `gui-core::assistant`) performs host inspection, snapshot creation,
 knowledge materialization, prompt composition, and `session.new`.
 
 ## Activity

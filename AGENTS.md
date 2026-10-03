@@ -61,6 +61,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
 | `crates/client`   | SDK client: typed errors, daemon transport, standalone configured-overlay discovery with bounded probing. |
+| `crates/assistant` | Assistant launch orchestration (agent selection, knowledge bundle, launch) and the host connection types (`HostConfig`, `ConnectionOptions`, `connect_client`) shared by the CLI and the GUI. |
 | `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |
 | `crates/worker-protocol` | Private versioned daemon-to-worker protocol and framing. |
 | `crates/session-worker` | Durable per-session PTY owner (`pohunek-sessiond`). |
