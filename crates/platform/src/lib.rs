@@ -2,7 +2,7 @@
 //!
 //! This crate owns process facts and kernel peer identity shared by the daemon
 //! and session worker. It deliberately excludes session policy, provider
-//! interpretation, public wire types, GUI state, and supervisor policy.
+//! interpretation, public wire types, client UI state, and supervisor policy.
 
 // The Darwin process and peer backends wrap `libproc`, `sysctl`, kqueue, and
 // the `LOCAL_PEERCRED`/`LOCAL_PEERPID` socket options, which have no safe

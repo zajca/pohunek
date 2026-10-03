@@ -15,7 +15,7 @@
 //!    must be absolute and is used as is; no search happens
 //!    ([`resolve_executable`]).
 //! 2. **An explicitly supplied environment `PATH`.** A validated
-//!    [`SearchPath`] passed by the caller (a GUI launched from a shell hands
+//!    [`SearchPath`] passed by the caller (a client launched from a shell hands
 //!    over its inherited one) is authoritative: no discovery runs. The
 //!    installer supplies none.
 //! 3. **Bounded login-shell discovery** ([`discover_login_shell_path`]). One

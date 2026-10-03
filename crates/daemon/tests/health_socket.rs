@@ -36,7 +36,7 @@ use protocol::{
     SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
-    PROTOCOL_VERSION,
+    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -3501,6 +3501,115 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
         serde_json::to_value(&created.id).expect("serialize id"),
     );
     let _ = exchange(&mut control, &stop_req).await;
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Sends `worktree.remove` for `path` over the control socket.
+async fn remove_worktree(framed: &mut Framed<UnixStream, LinesCodec>, path: &Path) -> Response {
+    let request = Request::make(
+        "worktree-remove",
+        method::WORKTREE_REMOVE,
+        serde_json::to_value(WorktreeRemoveParams {
+            path: path.to_path_buf(),
+        })
+        .expect("serialize worktree.remove params"),
+    );
+    exchange(framed, &request).await
+}
+
+/// `worktree.remove` is a public wire method with no in-repo client, so its
+/// success and fail-closed paths are pinned over the real control socket: an
+/// owned stopped worktree is removed, a live one is refused with
+/// `worktree_in_use`, an unowned path (the main checkout) is refused with
+/// `worktree_not_owned`, and malformed params are a `bad_request`.
+#[tokio::test]
+async fn worktree_remove_over_the_socket_succeeds_and_fails_closed() {
+    let repo = init_git_repo();
+    let worktree_root = temp_dir("wt-remove-root");
+    let store_dir = temp_dir("wt-remove-store");
+    let socket = temp_socket("wt-remove");
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "exec sleep 30"]),
+        worktree_root: Some(worktree_root.to_path_buf()),
+        store_path: Some(store_dir.join("metadata.jsonl")),
+        ..SessionRegistryConfig::default()
+    };
+    let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;
+    let mut control = connect(&socket).await;
+
+    let mut sessions = Vec::new();
+    for branch in ["feature/remove-stopped", "feature/remove-live"] {
+        let info: SessionInfo = serde_json::from_value(ok_payload(
+            create_worktree_session(
+                &mut control,
+                AgentKind::Shell,
+                repo.cwd().to_path_buf(),
+                branch,
+            )
+            .await,
+        ))
+        .expect("worktree session info");
+        sessions.push(info);
+    }
+    let live = sessions.pop().expect("live session");
+    let stopped = sessions.pop().expect("stopped session");
+    let stopped_path = stopped
+        .worktree_path
+        .clone()
+        .expect("stopped worktree path");
+    let live_path = live.worktree_path.clone().expect("live worktree path");
+
+    // A live session keeps its worktree: refused, directory untouched.
+    let refused = err_payload(remove_worktree(&mut control, &live_path).await);
+    assert_eq!(refused.code, "worktree_in_use");
+    assert!(
+        live_path.exists(),
+        "a live session's worktree stays on disk"
+    );
+
+    // The main checkout has no worktree binding: refused, checkout untouched.
+    let unowned = err_payload(remove_worktree(&mut control, repo.cwd()).await);
+    assert_eq!(unowned.code, "worktree_not_owned");
+    assert!(
+        repo.cwd().join("README.md").is_file(),
+        "the main checkout is untouched"
+    );
+
+    // Params that do not deserialize are rejected before any filesystem work.
+    let malformed = Request::make(
+        "worktree-remove-malformed",
+        method::WORKTREE_REMOVE,
+        serde_json::json!({ "path": 42 }),
+    );
+    let invalid = err_payload(exchange(&mut control, &malformed).await);
+    assert_eq!(invalid.code, "bad_request");
+    assert!(live_path.exists() && stopped_path.exists());
+
+    // Once the session is stopped its owned worktree is removed.
+    let stop_request = Request::make(
+        "worktree-remove-stop",
+        method::SESSION_STOP,
+        serde_json::to_value(&stopped.id).expect("serialize id"),
+    );
+    let stop_result: SessionStopResult =
+        serde_json::from_value(ok_payload(exchange(&mut control, &stop_request).await))
+            .expect("stop result");
+    assert!(stop_result.stopped);
+    let removed: WorktreeRemoveResult = serde_json::from_value(ok_payload(
+        remove_worktree(&mut control, &stopped_path).await,
+    ))
+    .expect("worktree.remove result");
+    assert!(removed.removed);
+    assert!(!stopped_path.exists(), "the worktree directory is gone");
+    assert!(live_path.exists(), "the other worktree is untouched");
+
+    let stop_live = Request::make(
+        "worktree-remove-stop-live",
+        method::SESSION_STOP,
+        serde_json::to_value(&live.id).expect("serialize id"),
+    );
+    let _ = exchange(&mut control, &stop_live).await;
     let _ = shutdown.send(());
     let _ = handle.await;
 }

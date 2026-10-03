@@ -15,7 +15,7 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 flaky-result = "fail"
 
 [profile.default.archive]
-# Daemon and gui-core tests spawn the real durable worker from the profile
+# Daemon tests spawn the real durable worker from the profile
 # directory of their own test binaries (`target/debug/pohunek-sessiond`), and
 # nothing in a nextest build guarantees that binary is produced. An archive without it is a build error, never a
 # run where those tests find no worker.
@@ -54,7 +54,6 @@ not (
     (kind(test) or test(/^(admission::|auth::service::|auth::parent_integrity_tests::|authorization::admin_tests::|lifecycle::|runtime::|server::credential_router_tests::|operator::)/)))
   or (package(=pohunek-cli) and
     (test(/^hermes_integration::/) or binary(/^hermes_/) or binary(=session_process_api)))
-  or (package(=pohunek-gui-core) and binary(=loopback))
   or (package(=pohunek-platform) and
     test(/^(shell_env::test_support::tests::|filesystem::tests::a_dropped_lock_is_free_while_|test_spawn::)/))
   or (package(=pohunek-test-support) and

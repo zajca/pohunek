@@ -29,10 +29,8 @@ members = [
     "crates/session-worker",
     "crates/client",
     "crates/assistant",
-    "crates/gui-core",
     "crates/daemon",
     "crates/cli",
-    "crates/gui",
 ]
 
 # Shared dependency versions. Individual crates opt in via `workspace = true`.
@@ -54,7 +52,6 @@ pohunek-assistant = { path = "crates/assistant" }
 pohunek-cli = { path = "crates/cli" }
 pohunek-client = { path = "crates/client" }
 pohunek-daemon = { path = "crates/daemon" }
-pohunek-gui-core = { path = "crates/gui-core" }
 pohunek-hostcheck = { path = "crates/hostcheck" }
 pohunek-knowledge = { path = "crates/knowledge" }
 pohunek-logging = { path = "crates/logging" }
@@ -72,7 +69,6 @@ pohunek-terminal = { path = "crates/terminal" }
 pohunek-test-support = { path = "crates/test-support" }
 pohunek-worker-protocol = { path = "crates/worker-protocol" }
 pohunek-session-worker = { path = "crates/session-worker" }
-iced = { version = "0.14", default-features = false }
 async-io = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

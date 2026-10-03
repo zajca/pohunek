@@ -461,7 +461,7 @@ fn candidate_for(
     if session.external != Some(false) {
         return None;
     }
-    // Same eligibility rule the GUI offers a remove action for; it rejects a
+    // Same eligibility rule clients use to offer a remove action; it rejects a
     // conflicting or protocol-incompatible runtime.
     if !session.can_remove() {
         return None;

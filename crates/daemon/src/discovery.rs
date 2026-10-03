@@ -2,7 +2,7 @@
 //!
 //! The protocol-aware peer probe lives in `pohunek-client` so standalone CLI
 //! calls do not need a local daemon. The daemon keeps this in-memory cache for
-//! its GUI, web, and `host.discover` RPC consumers.
+//! its web and `host.discover` RPC consumers.
 
 use std::sync::Arc;
 use std::time::Instant;

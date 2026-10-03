@@ -1037,8 +1037,8 @@ enum SessionAction {
         /// profile, resolved daemon-side on the target host.
         #[arg(long, default_value = "shell")]
         agent: String,
-        /// Owner-set display name for the session (cosmetic). Shown in the GUI
-        /// and `session list`; the daemon trims it and rejects a control
+        /// Owner-set display name for the session (cosmetic). Shown in
+        /// `session list` and other clients; the daemon trims it and rejects a control
         /// character or an over-long name.
         #[arg(long)]
         name: Option<String>,

@@ -2,7 +2,7 @@
 //!
 //! Cross-host notification aggregation is intentionally client-side. This module
 //! owns the CLI's target expansion and per-host result shape so command modules
-//! can fan out without importing GUI runtime types or inventing local variants.
+//! can fan out without importing client runtime types or inventing local variants.
 
 use std::collections::BTreeMap;
 use std::future::Future;

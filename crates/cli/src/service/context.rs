@@ -432,7 +432,7 @@ fn login_environment_error(error: LoginEnvironmentError) -> Error {
 /// Builds the managed policy from an environment lookup.
 ///
 /// The environment, its validation, and the failures are those of
-/// [`login_environment`], which the GUI shares. The lookup is injected so the
+/// [`login_environment`], which other clients share. The lookup is injected so the
 /// validation is type-checked and tested on every target.
 fn managed_discovery_from_env(
     lookup: impl Fn(&str) -> Option<std::ffi::OsString>,

@@ -8,7 +8,7 @@
 //! The CLI performs peer enumeration plus bounded concurrent probing directly,
 //! using a short owner-private persistent cache; it therefore needs local
 //! `NetBird` state but not a local daemon. The daemon retains this RPC and its
-//! own memory cache for GUI, web, and other protocol clients.
+//! own memory cache for web and other protocol clients.
 //!
 //! Like every other protocol payload these are additive: unknown fields are
 //! ignored and absent optional fields default, so a newer peer and an older peer

@@ -1,7 +1,7 @@
 //! Local prompt rendering commands.
 //!
 //! These commands are client-side only. They never connect to a daemon; scripts
-//! use them to share the same renderer as the native GUI.
+//! use them to share the same renderer as other pohunek clients.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -56,13 +56,6 @@ pub(crate) fn link_metadata(
     let (link_provider, link_kind) = match provider {
         Provider::LinearIssue => (SessionLinkProvider::Linear, SessionLinkKind::Issue),
         Provider::GitHubPr => (SessionLinkProvider::GitHub, SessionLinkKind::PullRequest),
-        // Unreachable in practice: `branch_from_provider_json` above already
-        // returns `Error::LinkUnsupportedProvider` for `Provider::Review` via
-        // the `?` on the previous line. Handled explicitly (not `unreachable!`)
-        // so this stays correct even if that call is ever reordered.
-        Provider::Review => {
-            return Err(pohunek_prompt::Error::LinkUnsupportedProvider(provider.as_str()).into())
-        }
     };
     let metadata = SessionLinkMetadata::new(link_provider, link_kind, item_id, url, branch)?;
 

@@ -2499,7 +2499,7 @@ impl SessionInfo {
     /// where the identity backing the session is unresolved and evicting the
     /// record would strand a live PTY. Everything else is removable once it is
     /// terminal, still stoppable, or lost. This is the single eligibility rule
-    /// shared by the GUI's affordances and the daemon's retention sweep.
+    /// shared by client remove affordances and the daemon's retention sweep.
     #[must_use]
     pub fn can_remove(&self) -> bool {
         if self.external == Some(true) {

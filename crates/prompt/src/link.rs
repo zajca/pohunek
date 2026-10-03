@@ -168,15 +168,11 @@ pub fn checked_link_value(field: &'static str, value: impl Into<String>) -> Resu
 ///
 /// Returns [`Error::InvalidJson`] when `raw_json` is invalid. Returns
 /// [`Error::MissingRequiredField`] when the provider JSON contains no branch
-/// field accepted by the selected provider. Returns
-/// [`Error::LinkUnsupportedProvider`] for [`Provider::Review`]: a dispatched
-/// review session copies `link.*` metadata verbatim from its source session
-/// (see `crates/gui-core`'s dispatch flow) rather than deriving it here.
+/// field accepted by the selected provider.
 pub fn branch_from_provider_json(provider: Provider, raw_json: &str) -> Result<String, Error> {
     let field = match provider {
         Provider::GitHubPr => GITHUB_BRANCH_FIELD,
         Provider::LinearIssue => LINEAR_BRANCH_FIELD,
-        Provider::Review => return Err(Error::LinkUnsupportedProvider(provider.as_str())),
     };
     let data: serde_json::Value = serde_json::from_str(raw_json).map_err(Error::InvalidJson)?;
     pick(&data, field)
@@ -343,13 +339,5 @@ mod tests {
         .expect("linear branch");
 
         assert_eq!(branch, "branch-name");
-    }
-
-    #[test]
-    fn review_provider_rejects_link_metadata_derivation() {
-        let err = branch_from_provider_json(Provider::Review, r#"{"branch":"b"}"#)
-            .expect_err("review provider is unsupported for link metadata");
-
-        assert!(matches!(err, Error::LinkUnsupportedProvider("review")));
     }
 }

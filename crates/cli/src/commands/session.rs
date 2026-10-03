@@ -43,7 +43,7 @@ use crate::target::{is_local_host, Target};
 const DEFAULT_FORK_COLS: u16 = 80;
 /// Default fork PTY height when the command is not launched from an attach view.
 ///
-/// Matches `session new`'s CLI default; attach and GUI surfaces send live size.
+/// Matches `session new`'s CLI default; attach and other interactive clients send live size.
 const DEFAULT_FORK_ROWS: u16 = 24;
 
 /// Default observation page balances useful output with compact CLI responses.

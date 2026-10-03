@@ -204,7 +204,7 @@ const MAX_SESSION_METADATA_VALUE_BYTES: usize = 4096;
 const MAX_SESSION_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
 
 /// Upper bound on a session display name, in bytes. Generous enough for a short
-/// human label (it renders in a single GUI row and one CLI table cell) while
+/// human label (it renders in a single client row and one CLI table cell) while
 /// bounding the per-session state the daemon stores and persists in the resume
 /// binding. A name is cosmetic, so the limit can change freely.
 const MAX_SESSION_NAME_BYTES: usize = 128;

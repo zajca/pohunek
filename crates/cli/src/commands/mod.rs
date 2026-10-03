@@ -75,7 +75,7 @@ pub(crate) fn parse_json_ok<T: serde::de::DeserializeOwned>(document: &str) -> T
 
 /// Build a unique correlation id for a single control request.
 ///
-/// Delegates to the public SDK helper so the CLI, GUI, and direct SDK callers
+/// Delegates to the public SDK helper so the CLI and direct SDK callers
 /// share one request-id convention.
 pub(crate) fn request_id(method: &str) -> String {
     pohunek_client::next_request_id(method)
