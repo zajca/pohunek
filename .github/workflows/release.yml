@@ -820,7 +820,8 @@ jobs:
             --pohunek-bin "$release_pohunek"
           PATH="/bin:$PATH" "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
-  # Build-provenance attestations for every published archive and tarball. The
+  # Build-provenance attestations for every published archive, tarball, and
+  # checksum file. The
   # only job with `id-token: write` and `attestations: write`: it checks out
   # nothing, only downloads the already built and verified assets, checks their
   # checksum files, and attests them, so no code from this repository or from an
@@ -871,6 +872,7 @@ jobs:
           subject-path: |
             ${{ runner.temp }}/attest-assets/*.tar.gz
             ${{ runner.temp }}/attest-assets/*.tgz
+            ${{ runner.temp }}/attest-assets/*.sha256
 
   publish-macos:
     name: Publish ${{ matrix.component }} for aarch64-apple-darwin

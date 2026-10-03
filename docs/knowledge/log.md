@@ -4,7 +4,8 @@
 
 - Documented the macOS release shape: `aarch64-apple-darwin` CLI and daemon
   archives are ad-hoc signed (`signing adhoc` in the `MANIFEST`), not notarized,
-  and every release asset has a GitHub build-provenance attestation
+  and every release asset, including the `.sha256` checksum files, has a
+  GitHub build-provenance attestation
   (`gh attestation verify <file> --repo zajca/pohunek`). The install-on-macos
   runbook covers the Homebrew formula (`zajca/pohunek/pohunek`, with
   `pohunek service install|upgrade|uninstall` around brew operations), the

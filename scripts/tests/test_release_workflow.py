@@ -341,8 +341,30 @@ class WriteTokenJobTests(unittest.TestCase):
 
     def test_attest_subjects_cover_every_archive_kind(self):
         attest = self.jobs[ATTEST_JOB]
-        for glob in ("*.tar.gz", "*.tgz"):
+        for glob in ("*.tar.gz", "*.tgz", "*.sha256"):
             self.assertIn(f"${{{{ runner.temp }}}}/attest-assets/{glob}", attest)
+
+    def test_attest_subjects_cover_every_published_asset_pattern(self):
+        attest = self.jobs[ATTEST_JOB]
+        subjects = re.findall(
+            r"^            \$\{\{ runner\.temp \}\}/attest-assets/(\S+)$", attest, re.M
+        )
+        self.assertTrue(subjects)
+        kinds = (".sha256", ".tar.gz", ".tgz")
+        for name in ("publish", "publish-macos", "sdk-publish"):
+            published = re.search(
+                r"(?m)^          files: \|\n((?:            \$\{\{ .*\n)+)", self.jobs[name]
+            )
+            self.assertIsNotNone(published, name)
+            for pattern in published.group(1).splitlines():
+                pattern = pattern.strip()
+                kind = next((kind for kind in kinds if pattern.endswith(kind)), None)
+                with self.subTest(job=name, pattern=pattern):
+                    self.assertIsNotNone(kind, f"unknown asset kind: {pattern}")
+                    self.assertTrue(
+                        any(subject.endswith(kind) for subject in subjects),
+                        f"no attest subject covers {kind}",
+                    )
 
     def test_every_publish_job_waits_for_the_attestation(self):
         for name in ("publish", "publish-macos", "sdk-publish"):
@@ -567,6 +589,7 @@ jobs:
           subject-path: |
             ${{ runner.temp }}/attest-assets/*.tar.gz
             ${{ runner.temp }}/attest-assets/*.tgz
+            ${{ runner.temp }}/attest-assets/*.sha256
 """
 
     def test_the_allowlisted_attest_job_passes(self):

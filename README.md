@@ -231,8 +231,8 @@ unsigned, named `...-unsigned-development`, and never released. The install,
 upgrade, rollback, uninstall, log, logout/reboot, and Gatekeeper procedures are
 in the [macOS install runbook](docs/knowledge/runbooks/install-on-macos.md).
 
-Every release asset (Linux, macOS, and SDK) has a GitHub build-provenance
-attestation. Verify a download with:
+Every release asset (Linux, macOS, and SDK archives and tarballs, and their
+`.sha256` checksum files) has a GitHub build-provenance attestation. Verify a download with:
 
 ```bash
 gh attestation verify <file> --repo zajca/pohunek
@@ -902,7 +902,7 @@ and MUSL x86_64 CLI and daemon archives, and ad-hoc signed `aarch64-apple-darwin
 CLI and daemon archives. No macOS job uses secrets or a protected environment.
 A download-only `attest` job, the only job holding `id-token: write` and
 `attestations: write`, creates a build-provenance attestation for every
-published asset (Linux, macOS, SDK); the publish jobs depend on it, so an
+published asset (Linux, macOS, SDK, and the `.sha256` checksum files); the publish jobs depend on it, so an
 unattested asset is never published. Developer ID signing and notarization are
 not part of the pipeline. The offline docs are
 bundled into every native component archive. CLI archives also contain
