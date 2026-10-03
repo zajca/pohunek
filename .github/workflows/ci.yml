@@ -1622,6 +1622,12 @@ jobs:
       - name: Test web control center
         run: bun ./node_modules/@playwright/test/cli.js test --config web/frontend/playwright.config.ts
 
+      # Real SDK release tarballs installed by URL into a throwaway consumer
+      # whose registry is unreachable, so a packaging break fails the PR instead
+      # of the release.
+      - name: SDK pack contract
+        run: bun test sdk/ts/scripts
+
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries must be present.
       # They come from the build-bins artifact (issue #122): no Rust toolchain

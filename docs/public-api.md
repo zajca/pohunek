@@ -1891,6 +1891,24 @@ event unions, constants, and generated protocol types come from
 request/subscription orchestration, attach helpers, and structured client
 errors.
 
+Distribution: the TypeScript packages are not published to an npm registry.
+Each release attaches three npm-pack tarballs, `pohunek-ts-protocol-X.Y.Z.tgz`,
+`pohunek-ts-sdk-X.Y.Z.tgz` (the `@pohunek/sdk` package) and
+`pohunek-ts-testkit-X.Y.Z.tgz`, each with a `.sha256` file in the same format as
+the other release checksums. A consumer pins the release asset URL in its
+`package.json`, for example
+`"@pohunek/sdk": "https://github.com/zajca/pohunek/releases/download/vX.Y.Z/pohunek-ts-sdk-X.Y.Z.tgz"`,
+and the lockfile records the tarball integrity. Inside each tarball every
+`@pohunek/*` dependency is rewritten to the exact release-asset URL of the
+sibling package for the same tag, so the closure resolves from one release and
+the `@pohunek` scope is never looked up on a registry. `devDependencies`,
+`scripts` and `private` are dropped from the packed manifests. The packages ship
+TypeScript sources (the export map points at `src/*.ts`, plus
+`@pohunek/protocol/fixtures/*`), so consumers run under Bun or a TypeScript-aware
+toolchain. The packages have no third-party runtime dependencies. The
+`sdk/ts/scripts/test/pack-contract.test.ts` contract test installs the packed
+tarballs by URL against an unreachable registry and imports every entry point.
+
 Public exports:
 
 - `Client`: framed request/response and subscription client.

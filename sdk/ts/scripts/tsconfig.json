@@ -1,0 +1,16 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "noEmit": true,
+    "types": [
+      "bun",
+      "node"
+    ]
+  },
+  "include": [
+    "*.ts",
+    "test/*.ts"
+  ]
+}
