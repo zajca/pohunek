@@ -10,7 +10,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-07-22
+// Rust guideline compliant 2026-10-03
 
 mod compositor;
 mod menu;
@@ -18,7 +18,7 @@ mod screen;
 mod snapshot;
 
 #[doc(inline)]
-pub use compositor::{Compositor, OverlayFrame, OverlayLine, BANNER_ROWS, MIN_ROWS_WITH_BANNER};
+pub use compositor::{Compositor, OverlayFrame, OverlayLine, MIN_ROWS};
 #[doc(inline)]
 pub use menu::{step, MenuEffect, MenuEvent, MenuKey, MenuOutcome, MenuState};
 pub use screen::{ScreenRegion, ScreenTracker};

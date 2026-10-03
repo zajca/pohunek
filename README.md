@@ -133,8 +133,9 @@ where they are doing it, and when they need you.
   prompt templates. The rofi/sway launchers are developed in
   [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work).
 - **Attach session menu**: raw terminal passthrough preserves native scrollback;
-  `Ctrl-\` temporarily shows a one-row status banner with a composited menu
-  (kill, detach, new session in the same worktree, fork, rename), then restores
+  `Ctrl-\` temporarily shows a composited dialog headed by the session's host,
+  project, branch, name, and live state, with a menu (kill, terminate and
+  delete, detach, new session in the same worktree, fork, rename), then restores
   the agent screen and raw passthrough when the menu closes.
 - Attach auto-reconnects after a daemon restart to the same worker, PTY, child
   PID, and runtime generation. Retries use a minimum interval and consecutive

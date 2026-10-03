@@ -378,9 +378,12 @@ inventory (`stale_worker_generation`).
 
 `pohunek attach` uses raw terminal passthrough, preserving the terminal's native
 scrollback. Ctrl-\ temporarily freezes the visible agent screen and opens a
-session menu together with a one-row status banner. The menu owns kill
-confirmation (`k` then `y`), detach (`d`), new session in the same worktree
-(`n`), fork (`f`), and rename (`r`). Agent output received while the menu is
+session menu dialog whose header shows the session name, host, project,
+branch (when the session has one), and live agent state. The menu owns kill
+confirmation (`k` then `y`), terminate and delete (`t` then `y`, which stops the
+session, removes it from the registry, and deletes its pohunek-owned worktree
+checkout including uncommitted changes while keeping the branch), detach (`d`),
+new session in the same worktree (`n`), fork (`f`), and rename (`r`). Agent output received while the menu is
 open is buffered; closing the menu restores the frozen screen, replays that raw
 output, and resumes passthrough without losing terminal modes or scroll margins.
 

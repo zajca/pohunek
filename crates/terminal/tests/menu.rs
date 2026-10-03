@@ -13,7 +13,7 @@ fn root_navigation_wraps_and_enter_runs_selected_action() {
     assert!(effects.is_empty());
 
     let (state, effects) = step(state, MenuEvent::Key(MenuKey::Up));
-    assert_eq!(state, MenuState::Root { selected: 4 });
+    assert_eq!(state, MenuState::Root { selected: 5 });
     assert!(effects.is_empty());
 
     let (state, effects) = step(state, MenuEvent::Key(MenuKey::Enter));
@@ -95,6 +95,65 @@ fn confirm_kill_requires_y_before_running_stop() {
         }
     );
     assert_eq!(effects, vec![MenuEffect::RunKill]);
+}
+
+#[test]
+fn confirm_remove_requires_y_before_running_remove() {
+    let (state, effects) = step(MenuState::open_root(), MenuEvent::Key(MenuKey::Byte(b't')));
+    assert_eq!(state, MenuState::ConfirmRemove);
+    assert!(effects.is_empty());
+
+    let (state, effects) = step(state, MenuEvent::Key(MenuKey::Esc));
+    assert_eq!(state, MenuState::Root { selected: 0 });
+    assert!(effects.is_empty());
+
+    let (state, _) = step(MenuState::open_root(), MenuEvent::Key(MenuKey::Byte(b't')));
+    let (state, effects) = step(state, MenuEvent::Key(MenuKey::Byte(b'n')));
+    assert_eq!(state, MenuState::Root { selected: 0 });
+    assert!(effects.is_empty());
+
+    let (state, _) = step(MenuState::open_root(), MenuEvent::Key(MenuKey::Byte(b't')));
+    let (state, effects) = step(state, MenuEvent::Key(MenuKey::Byte(b'x')));
+    assert_eq!(state, MenuState::ConfirmRemove);
+    assert!(effects.is_empty());
+
+    let (state, effects) = step(state, MenuEvent::Key(MenuKey::Byte(b'y')));
+    assert_eq!(
+        state,
+        MenuState::Busy {
+            label: "Terminating and deleting session".to_owned()
+        }
+    );
+    assert_eq!(effects, vec![MenuEffect::RunRemove]);
+}
+
+#[test]
+fn enter_on_the_remove_row_opens_its_confirmation() {
+    let (state, _) = step(MenuState::open_root(), MenuEvent::Key(MenuKey::Down));
+    let (state, effects) = step(state, MenuEvent::Key(MenuKey::Enter));
+    assert_eq!(state, MenuState::ConfirmRemove);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn removed_outcome_reports_worktree_cleanup() {
+    let (state, _) = step(
+        MenuState::Busy {
+            label: "x".to_owned(),
+        },
+        MenuEvent::RpcDone(MenuOutcome::Removed {
+            worktrees_removed: 1,
+            worktrees_failed: 2,
+        }),
+    );
+    assert_eq!(
+        state,
+        MenuState::Result {
+            message:
+                "Session terminated and deleted; worktrees removed: 1; worktrees left on disk: 2"
+                    .to_owned()
+        }
+    );
 }
 
 #[test]
@@ -207,7 +266,7 @@ fn rpc_done_and_failed_from_busy_render_result_messages() {
 
 #[test]
 fn overlay_frame_for_root_marks_selected_item() {
-    let frame = MenuState::Root { selected: 2 }
+    let frame = MenuState::Root { selected: 3 }
         .to_overlay_frame()
         .expect("root menu renders overlay");
 
@@ -217,6 +276,10 @@ fn overlay_frame_for_root_marks_selected_item() {
         vec![
             OverlayLine {
                 text: "k  Kill session".to_owned(),
+                highlighted: false
+            },
+            OverlayLine {
+                text: "t  Terminate and delete session".to_owned(),
                 highlighted: false
             },
             OverlayLine {
@@ -253,12 +316,13 @@ fn overlay_frame_for_rename_places_cursor_after_input_prefix() {
         frame,
         OverlayFrame {
             title: "Rename session".to_owned(),
+            header: Vec::new(),
             lines: vec![OverlayLine {
                 text: "Name: abc".to_owned(),
                 highlighted: true
             }],
             footer: Some("Enter save  Esc back".to_owned()),
-            cursor: Some((1, 9))
+            cursor: Some((0, 9))
         }
     );
 }

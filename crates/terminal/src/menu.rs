@@ -1,25 +1,27 @@
 //! Headless session-menu state machine for composited attach screens.
 
-// Rust guideline compliant 2026-07-07
+// Rust guideline compliant 2026-10-03
 
 use crate::{OverlayFrame, OverlayLine};
 
 /// Root-menu row selected when the modal opens or walks back.
 const ROOT_DEFAULT_SELECTED: usize = 0;
 /// Number of actions shown in the attach session menu.
-const ROOT_ITEM_COUNT: usize = 5;
+const ROOT_ITEM_COUNT: usize = 6;
 /// Root row for killing the current session.
 const ROOT_KILL_INDEX: usize = 0;
+/// Root row for stopping the current session and evicting it from the registry.
+const ROOT_REMOVE_INDEX: usize = 1;
 /// Root row for detaching from the current session.
-const ROOT_DETACH_INDEX: usize = 1;
+const ROOT_DETACH_INDEX: usize = 2;
 /// Root row for starting another session in the same worktree.
-const ROOT_NEW_SESSION_INDEX: usize = 2;
+const ROOT_NEW_SESSION_INDEX: usize = 3;
 /// Root row for forking the current native agent conversation.
-const ROOT_FORK_INDEX: usize = 3;
+const ROOT_FORK_INDEX: usize = 4;
 /// Root row for renaming the current session.
-const ROOT_RENAME_INDEX: usize = 4;
-/// Cursor row for the rename body line, relative to overlay interior.
-const RENAME_INPUT_CURSOR_ROW: u16 = 1;
+const ROOT_RENAME_INDEX: usize = 5;
+/// Cursor row of the rename input, relative to the first body line.
+const RENAME_INPUT_CURSOR_ROW: u16 = 0;
 /// Visible prompt before the editable rename buffer.
 const RENAME_INPUT_PREFIX: &str = "Name: ";
 /// Maximum session name accepted by the daemon validator.
@@ -41,6 +43,8 @@ pub enum MenuState {
     },
     /// Kill confirmation is visible.
     ConfirmKill,
+    /// Terminate-and-delete confirmation is visible.
+    ConfirmRemove,
     /// Rename input is visible with the current text buffer.
     RenameInput {
         /// Editable session-name buffer.
@@ -74,6 +78,7 @@ impl MenuState {
             Self::Closed => None,
             Self::Root { selected } => Some(root_overlay(*selected)),
             Self::ConfirmKill => Some(confirm_kill_overlay()),
+            Self::ConfirmRemove => Some(confirm_remove_overlay()),
             Self::RenameInput { buffer } => Some(rename_overlay(buffer)),
             Self::Busy { label } => Some(busy_overlay(label)),
             Self::Result { message } => Some(result_overlay(message)),
@@ -116,6 +121,13 @@ pub enum MenuEvent {
 pub enum MenuOutcome {
     /// A stop request completed.
     Killed,
+    /// The session was stopped and evicted from the registry.
+    Removed {
+        /// Pohunek-owned worktree checkouts the removal deleted.
+        worktrees_removed: u32,
+        /// Pohunek-owned worktree checkouts that could not be deleted.
+        worktrees_failed: u32,
+    },
     /// A new session was created.
     NewSession {
         /// New session id.
@@ -138,6 +150,8 @@ pub enum MenuOutcome {
 pub enum MenuEffect {
     /// Send `session.stop`.
     RunKill,
+    /// Send `session.remove`.
+    RunRemove,
     /// Send `session.detach`.
     RunDetach,
     /// Inspect the current session, then send `session.new`.
@@ -162,6 +176,7 @@ pub fn step(state: MenuState, event: MenuEvent) -> (MenuState, Vec<MenuEffect>) 
         (MenuState::Closed, _) => (MenuState::Closed, Vec::new()),
         (MenuState::Root { selected }, MenuEvent::Key(key)) => root_step(selected, key),
         (MenuState::ConfirmKill, MenuEvent::Key(key)) => confirm_kill_step(key),
+        (MenuState::ConfirmRemove, MenuEvent::Key(key)) => confirm_remove_step(key),
         (MenuState::RenameInput { buffer }, MenuEvent::Key(key)) => rename_step(buffer, key),
         (MenuState::Busy { label }, MenuEvent::Key(key)) => busy_key_step(label, key),
         (MenuState::Result { .. }, MenuEvent::Key(MenuKey::Esc)) => {
@@ -186,6 +201,7 @@ fn root_step(selected: usize, key: MenuKey) -> (MenuState, Vec<MenuEffect>) {
             Vec::new(),
         ),
         MenuKey::Byte(b'k') => (MenuState::ConfirmKill, Vec::new()),
+        MenuKey::Byte(b't') => (MenuState::ConfirmRemove, Vec::new()),
         MenuKey::Byte(b'd') => (
             MenuState::Closed,
             vec![MenuEffect::RunDetach, MenuEffect::Close],
@@ -211,6 +227,17 @@ fn confirm_kill_step(key: MenuKey) -> (MenuState, Vec<MenuEffect>) {
         MenuKey::Byte(b'y' | b'Y') => (busy("Killing session"), vec![MenuEffect::RunKill]),
         MenuKey::Esc | MenuKey::Byte(b'n' | b'N') => (MenuState::open_root(), Vec::new()),
         _ => (MenuState::ConfirmKill, Vec::new()),
+    }
+}
+
+fn confirm_remove_step(key: MenuKey) -> (MenuState, Vec<MenuEffect>) {
+    match key {
+        MenuKey::Byte(b'y' | b'Y') => (
+            busy("Terminating and deleting session"),
+            vec![MenuEffect::RunRemove],
+        ),
+        MenuKey::Esc | MenuKey::Byte(b'n' | b'N') => (MenuState::open_root(), Vec::new()),
+        _ => (MenuState::ConfirmRemove, Vec::new()),
     }
 }
 
@@ -246,6 +273,7 @@ fn busy_key_step(label: String, key: MenuKey) -> (MenuState, Vec<MenuEffect>) {
 fn run_selected(selected: usize) -> (MenuState, Vec<MenuEffect>) {
     match selected {
         ROOT_KILL_INDEX => (MenuState::ConfirmKill, Vec::new()),
+        ROOT_REMOVE_INDEX => (MenuState::ConfirmRemove, Vec::new()),
         ROOT_DETACH_INDEX => (
             MenuState::Closed,
             vec![MenuEffect::RunDetach, MenuEffect::Close],
@@ -287,11 +315,26 @@ fn result(message: String) -> MenuState {
 fn outcome_message(outcome: MenuOutcome) -> String {
     match outcome {
         MenuOutcome::Killed => "Session stopped".to_owned(),
+        MenuOutcome::Removed {
+            worktrees_removed,
+            worktrees_failed,
+        } => removed_message(worktrees_removed, worktrees_failed),
         MenuOutcome::NewSession { id } => format!("New session created: {id}"),
         MenuOutcome::Forked { id } => format!("Forked session created: {id}"),
         MenuOutcome::Renamed { name: Some(name) } => format!("Session renamed: {name}"),
         MenuOutcome::Renamed { name: None } => "Session name cleared".to_owned(),
     }
+}
+
+fn removed_message(worktrees_removed: u32, worktrees_failed: u32) -> String {
+    let mut parts = vec!["Session terminated and deleted".to_owned()];
+    if worktrees_removed > 0 {
+        parts.push(format!("worktrees removed: {worktrees_removed}"));
+    }
+    if worktrees_failed > 0 {
+        parts.push(format!("worktrees left on disk: {worktrees_failed}"));
+    }
+    parts.join("; ")
 }
 
 fn is_rename_text_byte(byte: u8) -> bool {
@@ -301,8 +344,13 @@ fn is_rename_text_byte(byte: u8) -> bool {
 fn root_overlay(selected: usize) -> OverlayFrame {
     OverlayFrame {
         title: "Session menu".to_owned(),
+        header: Vec::new(),
         lines: vec![
             overlay_line("k  Kill session", selected == ROOT_KILL_INDEX),
+            overlay_line(
+                "t  Terminate and delete session",
+                selected == ROOT_REMOVE_INDEX,
+            ),
             overlay_line("d  Detach", selected == ROOT_DETACH_INDEX),
             overlay_line(
                 "n  New session in this worktree",
@@ -319,9 +367,25 @@ fn root_overlay(selected: usize) -> OverlayFrame {
 fn confirm_kill_overlay() -> OverlayFrame {
     OverlayFrame {
         title: "Kill session?".to_owned(),
+        header: Vec::new(),
         lines: vec![
             overlay_line("This stops the PTY process.", false),
             overlay_line("y  Confirm kill", true),
+        ],
+        footer: Some("Esc/n back".to_owned()),
+        cursor: None,
+    }
+}
+
+fn confirm_remove_overlay() -> OverlayFrame {
+    OverlayFrame {
+        title: "Terminate and delete session?".to_owned(),
+        header: Vec::new(),
+        lines: vec![
+            overlay_line("Stops the process and removes the session.", false),
+            overlay_line("An owned worktree is deleted with any", false),
+            overlay_line("uncommitted changes; its branch is kept.", false),
+            overlay_line("y  Confirm terminate and delete", true),
         ],
         footer: Some("Esc/n back".to_owned()),
         cursor: None,
@@ -332,6 +396,7 @@ fn rename_overlay(buffer: &str) -> OverlayFrame {
     let cursor_col = RENAME_INPUT_PREFIX.chars().count() + buffer.chars().count();
     OverlayFrame {
         title: "Rename session".to_owned(),
+        header: Vec::new(),
         lines: vec![overlay_line(
             &format!("{RENAME_INPUT_PREFIX}{buffer}"),
             true,
@@ -347,6 +412,7 @@ fn rename_overlay(buffer: &str) -> OverlayFrame {
 fn busy_overlay(label: &str) -> OverlayFrame {
     OverlayFrame {
         title: "Working".to_owned(),
+        header: Vec::new(),
         lines: vec![overlay_line(label, false)],
         footer: Some("Esc close".to_owned()),
         cursor: None,
@@ -356,6 +422,7 @@ fn busy_overlay(label: &str) -> OverlayFrame {
 fn result_overlay(message: &str) -> OverlayFrame {
     OverlayFrame {
         title: "Result".to_owned(),
+        header: Vec::new(),
         lines: vec![overlay_line(message, false)],
         footer: Some("Esc back".to_owned()),
         cursor: None,
