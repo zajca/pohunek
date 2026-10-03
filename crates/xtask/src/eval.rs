@@ -115,8 +115,7 @@ pub(crate) static FIXTURES: &[FixtureState] = &[
         id: "stale-installation",
         description: "The CLI binary was updated but the running daemon was not \
                        restarted. `pohunek health` reports a `daemon_version` \
-                       or `protocol_version` that differs from the updated \
-                       CLI.",
+                       that differs from the updated CLI's version.",
         expected_outcome: "Assistant recommends running the update-after-release \
                            runbook: verify health versions, check capabilities, \
                            review config.",

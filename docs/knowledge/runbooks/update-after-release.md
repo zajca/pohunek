@@ -55,7 +55,9 @@ history does not widen the current supported range.
    set, otherwise `~/.local/share` and `~/.config`):
 
    ```sh
-   rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/pohunek/bin/"{lib.sh,pohunek-rofi,pohunek-rofi-issue,pohunek-launch-issue,pohunek-launch-pr}
+   for name in lib.sh pohunek-rofi pohunek-rofi-issue pohunek-launch-issue pohunek-launch-pr; do
+     rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/pohunek/bin/$name"
+   done
    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/sway/config.d/pohunek.conf"
    swaymsg reload
    ```
