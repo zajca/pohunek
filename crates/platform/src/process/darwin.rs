@@ -1076,6 +1076,12 @@ mod tests {
     /// Shorter than the observation window so the fixture always answers before
     /// the caller that waits on it gives up.
     const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+    /// How long the directly spawned `sleep` image lives unless it is killed.
+    ///
+    /// Far beyond the observation window so the image is still resident while
+    /// the test inspects it; the fixture kills it on drop, so the length only
+    /// bounds the leak if the test process itself is killed.
+    const IMAGE_SLEEP_SECONDS: &str = "600";
     /// Proves a watch on a live process stays pending without busy polling.
     const IDLE_WATCH_WINDOW: Duration = Duration::from_millis(250);
     /// Number of concurrent idle watches armed on one live process.
@@ -1187,6 +1193,21 @@ mod tests {
             command.current_dir(directory);
         }
         Fixture(command.spawn().expect("spawn shell fixture"), env)
+    }
+
+    /// Spawns `program` directly, without a shell, so its image is the one
+    /// the kernel reports for the process.
+    fn spawn_image(program: &Path, args: &[&str]) -> Fixture {
+        let env = TestEnv::new().expect("test environment");
+        let child = env
+            .command(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn image fixture");
+        Fixture(child, env)
     }
 
     /// Terminal type of the pseudoterminal shells: `dumb` keeps the shell from
@@ -1607,16 +1628,21 @@ mod tests {
     #[test]
     fn executable_reports_the_spawned_image() {
         let inspector = DarwinInspector::new();
-        let fixture = spawn_idle_shell();
+        // `/bin/sh` re-execs the configured shell, so the observed image would
+        // depend on timing; `sleep` keeps the image it was spawned with.
+        let expected = Path::new("/bin/sleep");
+        let fixture = spawn_image(expected, &[IMAGE_SLEEP_SECONDS]);
         let pid = fixture.pid();
 
         let executable = wait_for("the fixture executable path", || {
             inspector.executable(pid).expect("inspect executable")
         });
 
+        // Both sides are canonicalized because the kernel reports the resolved
+        // vnode path, which may differ from the spelling that was spawned.
         assert_eq!(
-            executable.file_name().and_then(|name| name.to_str()),
-            Some("sh")
+            executable.canonicalize().expect("canonical inspected path"),
+            expected.canonicalize().expect("canonical spawned path")
         );
     }
 
