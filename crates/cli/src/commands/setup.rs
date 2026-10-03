@@ -7,7 +7,7 @@
 //!
 //! - `setup scripts` writes the launcher scripts into `paths.launcher_bin_dir()`,
 //!   each made executable (the scripts source/spawn one another as siblings).
-//! - `setup config` writes a default `launcher.conf` plus prompt templates, never
+//! - `setup config` writes a default `attach.conf` plus prompt templates, never
 //!   overwriting an existing file unless `--force` is given.
 //! - `setup sway` writes (or prints) a sway drop-in binding a key to the launcher.
 //! - `setup completions` delegates to the completion module and writes one
@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use hostcheck::Platform;
 use serde::Serialize;
 
+use crate::commands::attach::ATTACH_CONF_FILE;
 use crate::error::CliError;
 use crate::paths::Paths;
 
@@ -86,48 +87,22 @@ const SCRIPTS: &[(&str, &str)] = &[
 /// owned by another path or removed entirely.
 const OBSOLETE_SCRIPTS: &[&str] = &["pohunek-session-banner"];
 
-/// Default `launcher.conf` contents read by the launcher scripts and `attach`.
-/// Keys must match what `pohunek_required_config`/`pohunek_optional_config` look
-/// up, plus reconnect keys read by the Rust attach path. The `terminal` value is
-/// intentionally left blank for the user to fill in (the scripts fail fast when
-/// a required value is empty).
-const LAUNCHER_CONF: &str = "# pohunek launcher configuration.
-# Lines are key=value; '#' starts a comment. Edit the values below.
+/// Default `attach.conf` contents read by `pohunek attach`. The keys match the
+/// ones `AttachConfig::load_from_config_dir` accepts and every value is
+/// commented out at its built-in default, so a fresh install changes no behavior.
+pub(crate) const ATTACH_CONF: &str = "# pohunek attach configuration.
+# Lines are key=value; '#' starts a comment. Uncomment a line to override it.
 
-# --- Required ---
-# Default host: 'local' or a NetBird peer name
-host=local
-# Terminal emulator command (falls back to $TERMINAL if empty)
-terminal=
-# Per-host timeout (seconds) for `session list` queries in the rofi switcher
-list_timeout_seconds=5
-# Linear CLI binary (required only for pohunek-launch-issue / pohunek-rofi-issue)
-linear_cli=linear
-
-# --- Optional (defaults shown) ---
-#pohunek_bin=pohunek
-#gh_bin=gh
-#rofi_bin=rofi
-#swaymsg_bin=swaymsg
-#yes=false
-# Issue picker (pohunek-rofi-issue): assignee whose issues are listed.
-# Empty = derive from `linear auth whoami`.
-#linear_assignee=
-# Issue picker: which Linear workflow-state types are 'actionable' (space-separated:
-# triage backlog unstarted started completed canceled).
-#linear_issue_states=started unstarted
 # Attach reconnect: after an unexpected stream close, retry with one shared time
 # window, linear backoff from the interval, and a bounded number of attempts.
 # Set seconds to 0 to disable.
 #attach_reconnect_seconds=20
 #attach_reconnect_interval_seconds=0.5
 #attach_reconnect_max_attempts=3
-#mark_retry_count=20
-#mark_retry_interval_seconds=0.1
 ";
 
-/// Default `prompts/issue.tmpl`. May only reference the variables the renderer in
-/// `lib.sh` knows: `provider, id, number, title, body, branch, url`.
+/// Default `prompts/issue.tmpl`. May only reference the variables
+/// `pohunek prompt render` supplies: `provider, id, number, title, body, branch, url`.
 const ISSUE_TMPL: &str = "You are working on ${provider} issue ${id}: ${title}
 
 ## Context
@@ -227,7 +202,7 @@ pub(crate) fn run_scripts(paths: &Paths, json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Write a default `launcher.conf` and prompt templates.
+/// Write a default `attach.conf` and prompt templates.
 ///
 /// # Errors
 ///
@@ -429,7 +404,7 @@ fn install_config(paths: &Paths, force: bool) -> Result<ConfigResult, CliError> 
     fs::create_dir_all(&prompts_dir)?;
 
     let files: &[(PathBuf, &str)] = &[
-        (paths.config_dir.join("launcher.conf"), LAUNCHER_CONF),
+        (paths.config_dir.join(ATTACH_CONF_FILE), ATTACH_CONF),
         (prompts_dir.join("issue.tmpl"), ISSUE_TMPL),
         (prompts_dir.join("pr.tmpl"), PR_TMPL),
     ];
@@ -696,7 +671,7 @@ mod tests {
             !tp.paths.sway_config_dir().exists(),
             "no sway drop-in written"
         );
-        assert!(tp.paths.config_dir.join("launcher.conf").is_file());
+        assert!(tp.paths.config_dir.join(ATTACH_CONF_FILE).is_file());
 
         let json = serde_json::to_value(&result).expect("serialize");
         assert!(json.get("scripts").is_none());
@@ -800,7 +775,7 @@ mod tests {
         assert_eq!(first.created.len(), 3, "first run creates 3 files");
         assert!(first.skipped.is_empty());
 
-        let conf = tp.paths.config_dir.join("launcher.conf");
+        let conf = tp.paths.config_dir.join(ATTACH_CONF_FILE);
         assert!(conf.is_file());
         let prompts_dir = tp.paths.config_dir.join("prompts");
         assert!(prompts_dir.join("issue.tmpl").is_file());
@@ -823,30 +798,30 @@ mod tests {
         assert!(third.skipped.is_empty());
         assert_eq!(
             fs::read_to_string(&conf).expect("read conf"),
-            LAUNCHER_CONF,
+            ATTACH_CONF,
             "forced run restored the default config"
         );
     }
 
     #[test]
-    fn launcher_conf_contains_only_host_level_launcher_keys() {
-        for removed in [
-            "project=",
-            "agent=",
-            "issue_action",
-            "pr_action",
-            "banner=",
-            "banner_interval_seconds",
+    fn attach_conf_template_comments_out_every_default() {
+        for key in [
+            "attach_reconnect_seconds=20",
+            "attach_reconnect_interval_seconds=0.5",
+            "attach_reconnect_max_attempts=3",
         ] {
             assert!(
-                !LAUNCHER_CONF.contains(removed),
-                "launcher.conf must not contain per-project/per-action key {removed:?}"
+                ATTACH_CONF.contains(&format!("#{key}")),
+                "attach.conf template lacks commented default {key:?}"
             );
         }
-        assert!(LAUNCHER_CONF.contains("host=local"));
-        assert!(LAUNCHER_CONF.contains("terminal="));
-        assert!(LAUNCHER_CONF.contains("linear_cli=linear"));
-        assert!(LAUNCHER_CONF.contains("attach_reconnect_max_attempts=3"));
+        assert!(
+            ATTACH_CONF.lines().all(|line| {
+                let line = line.trim();
+                line.is_empty() || line.starts_with('#')
+            }),
+            "every attach.conf template line must be a comment"
+        );
     }
 
     #[test]
@@ -974,8 +949,8 @@ mod tests {
 
     #[test]
     fn templates_only_reference_known_variables() {
-        // The renderer in lib.sh errors on any ${var} outside this set, so guard
-        // it here rather than discovering it at launcher runtime.
+        // `pohunek prompt render` rejects any ${var} outside this set, so guard
+        // it here rather than discovering it when a launcher renders the prompt.
         const KNOWN: &[&str] = &["provider", "id", "number", "title", "body", "branch", "url"];
         for (label, tmpl) in [("issue", ISSUE_TMPL), ("pr", PR_TMPL)] {
             let mut rest = tmpl;

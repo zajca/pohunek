@@ -387,7 +387,7 @@ static COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
         id: "setup-config",
         title: "pohunek setup config",
-        description: "Write a default launcher.conf and prompt templates.",
+        description: "Write a default attach.conf and prompt templates.",
         usage: "pohunek setup config [--force] [--json]",
         arguments: "- `--force`: Overwrite existing configuration files.\n\
                     - `--json`: Emit machine-readable JSON instead of human text.",

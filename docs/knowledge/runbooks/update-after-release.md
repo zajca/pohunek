@@ -43,7 +43,13 @@ history does not widen the current supported range.
    setup config should not overwrite existing files.
 7. Reprint or refresh sway integration with `pohunek setup sway --print` or
    `pohunek setup sway`.
-8. For important projects, verify `pohunek project show <id-or-label> --json`
+8. Attach reads its reconnect settings (`attach_reconnect_seconds`,
+   `attach_reconnect_interval_seconds`, `attach_reconnect_max_attempts`) only
+   from `<config_dir>/attach.conf`; it no longer reads them from
+   `launcher.conf`. If you tuned those keys, copy them into `attach.conf`
+   (`pohunek setup config` creates a template with every key commented at its
+   default). A value left in `launcher.conf` is silently ignored by attach.
+9. For important projects, verify `pohunek project show <id-or-label> --json`
    and resolved actions with `pohunek project actions <id-or-label> --json`.
 
 For the Hermes M2 runtime, inspect the `hermes` entry after upgrade. It is

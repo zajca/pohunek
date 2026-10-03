@@ -983,7 +983,7 @@ enum SetupAction {
         json: bool,
     },
 
-    /// Write a default `launcher.conf` and prompt templates (never overwrites
+    /// Write a default `attach.conf` and prompt templates (never overwrites
     /// existing files unless `--force`).
     Config {
         /// Overwrite existing config files instead of skipping them.

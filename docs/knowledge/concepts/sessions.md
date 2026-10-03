@@ -374,6 +374,39 @@ gone as well, even when the job itself already ended; while that worker runs or
 the session's journals cannot be read, the job stays `orphaned` in the runtime
 inventory (`stale_worker_generation`).
 
+## Attach terminal behavior
+
+`pohunek attach` uses raw terminal passthrough, preserving the terminal's native
+scrollback. Ctrl-\ temporarily freezes the visible agent screen and opens a
+session menu together with a one-row status banner. The menu owns kill
+confirmation (`k` then `y`), detach (`d`), new session in the same worktree
+(`n`), fork (`f`), and rename (`r`). Agent output received while the menu is
+open is buffered; closing the menu restores the frozen screen, replays that raw
+output, and resumes passthrough without losing terminal modes or scroll margins.
+
+Whenever an attach attempt ends (detach, session stop, typed failure, unexpected
+EOF, or reconnect) the CLI restores normal terminal output modes after replaying
+any buffered menu output. This disables mouse and focus reporting, bracketed
+paste, alternate-screen state, and TUI cursor/scroll modes before returning
+control to the parent shell.
+
+Attach retries automatically after an unexpected daemon stream close. The
+settings live in `<config_dir>/attach.conf` (key=value lines, `#` comments;
+`pohunek setup config` installs a template with every key commented at its
+default):
+
+- `attach_reconnect_seconds` is the retry window (default 20; `0` disables retry).
+- `attach_reconnect_interval_seconds` is the minimum delay between attempts
+  (default 0.5).
+- `attach_reconnect_max_attempts` caps consecutive attempts within the window
+  (default 3), including failures where inspect still reports a running session.
+
+The replacement daemon reconciles with the existing per-session worker, so
+Codex, Claude, Hermes, and plain shell sessions retain the same PTY, child PID,
+and runtime id. A typed worker-stream failure is surfaced once and is not
+retried. A lost worker cannot be reconstructed by retrying attach; inspect
+`runtime.state` and use explicit native recovery only when supported.
+
 ## Retention
 
 A host that runs agents for weeks accumulates logical records for sessions that

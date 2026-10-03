@@ -119,24 +119,28 @@ const MENU_ENTER_LF: u8 = b'\n';
 const MENU_BACKSPACE_DEL: u8 = 0x7f;
 /// Ctrl-H is another common delete-left byte.
 const MENU_BACKSPACE_CTRL_H: u8 = 0x08;
+/// File name, inside the config directory, of the attach settings read by
+/// `pohunek attach`. `pohunek setup config` installs a template with the
+/// reconnect keys commented at their defaults.
+pub(crate) const ATTACH_CONF_FILE: &str = "attach.conf";
 /// Default grace window for reattaching after a daemon restart.
 ///
 /// Long enough for systemd to restart `pohunekd`, reconcile the durable session
 /// worker, and restore the attach route, but short enough that a lost runtime
 /// does not leave a dead attach terminal hanging indefinitely. Operators can
-/// override it in `launcher.conf`; zero disables reconnect.
+/// override it in `attach.conf`; zero disables reconnect.
 const DEFAULT_ATTACH_RECONNECT_WINDOW: Duration = Duration::from_secs(20);
 /// Base delay for attach retry backoff and runtime-readiness polling.
 ///
 /// A half-second cadence keeps reconnect responsive without turning a restart
 /// outage into a tight socket-dial loop. Operators can override it in
-/// `launcher.conf`.
+/// `attach.conf`.
 const DEFAULT_ATTACH_RECONNECT_INTERVAL: Duration = Duration::from_millis(500);
 /// Maximum automatic attach attempts after one unexpected stream closure.
 ///
 /// Three attempts cover a normal daemon replacement without letting a
 /// deterministic stream failure reopen control and subscription sockets
-/// indefinitely. Operators can override the cap in `launcher.conf`.
+/// indefinitely. Operators can override the cap in `attach.conf`.
 const DEFAULT_ATTACH_RECONNECT_MAX_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,7 +214,7 @@ impl AttachConfig {
     }
 
     fn load_from_config_dir(config_dir: &Path) -> Result<Self, CliError> {
-        let path = config_dir.join("launcher.conf");
+        let path = config_dir.join(ATTACH_CONF_FILE);
         if !path.try_exists()? {
             return Ok(Self::defaults());
         }
@@ -2884,7 +2888,7 @@ mod tests {
         let guard = pohunek_test_support::tempdir().expect("create config dir");
         let root = guard.path().to_path_buf();
         std::fs::write(
-            root.join("launcher.conf"),
+            root.join(ATTACH_CONF_FILE),
             "attach_reconnect_seconds=12\n\
              attach_reconnect_interval_seconds=0.75\n\
              attach_reconnect_max_attempts=7\n",
@@ -2902,11 +2906,31 @@ mod tests {
     }
 
     #[test]
+    fn installed_attach_conf_template_parses_to_the_defaults() {
+        let guard = pohunek_test_support::tempdir().expect("create config dir");
+        let root = guard.path().to_path_buf();
+        let uncommented = crate::commands::setup::ATTACH_CONF
+            .lines()
+            .map(|line| {
+                line.strip_prefix('#')
+                    .filter(|rest| rest.contains('='))
+                    .unwrap_or(line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(root.join(ATTACH_CONF_FILE), uncommented).expect("write config");
+
+        let config = AttachConfig::load_from_config_dir(&root).expect("load config");
+
+        assert_eq!(config, AttachConfig::defaults());
+    }
+
+    #[test]
     fn attach_config_rejects_zero_reconnect_attempts() {
         let guard = pohunek_test_support::tempdir().expect("create config dir");
         let root = guard.path().to_path_buf();
         std::fs::write(
-            root.join("launcher.conf"),
+            root.join(ATTACH_CONF_FILE),
             "attach_reconnect_max_attempts=0\n",
         )
         .expect("write config");
