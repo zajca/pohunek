@@ -35,3 +35,10 @@ export type {
   DaemonProcessOptions,
   ExitStatus,
 } from "./real-daemon";
+export { startTestRelay } from "./test-relay";
+export type {
+  DaemonTarget,
+  DaemonTargetSource,
+  StartTestRelayOptions,
+  TestRelayHandle,
+} from "./test-relay";

@@ -5,8 +5,12 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "bun:test";
 import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolEvent } from "@pohunek/protocol";
-import { startRelay, type RelayHandle } from "@pohunek/backend";
-import { createFixtureRoot, startDurableWorkerFixture } from "@pohunek/testkit";
+import {
+  createFixtureRoot,
+  startDurableWorkerFixture,
+  startTestRelay,
+  type TestRelayHandle,
+} from "@pohunek/testkit";
 import {
   Client,
   attachRawLocal,
@@ -171,10 +175,9 @@ function socketTransport(daemon: DaemonHarness): E2eTransport {
 }
 
 async function wsTransport(daemon: DaemonHarness): Promise<E2eTransport> {
-  const relay = await startRelay({
+  const relay = await startTestRelay({
     bindHost: "127.0.0.1",
     port: 0,
-    allowLoopbackBind: true,
     targets: new Map([[E2E_HOST, { kind: "unix", socketPath: daemon.socketPath }]]),
   });
   return {
@@ -474,7 +477,7 @@ function connectOptions(): { connectTimeoutMs: number; requestTimeoutMs: number 
   };
 }
 
-async function closeRelay(relay: RelayHandle): Promise<void> {
+async function closeRelay(relay: TestRelayHandle): Promise<void> {
   await relay.close();
 }
 
