@@ -34,7 +34,8 @@ multi-team control plane without replacing either owner path.
   accounts, teams, roles, and session ACLs, while `pohunekd` enforces only the
   enrolled relay and host-approved `HostShare` ceilings.
 - The Rust SDK, native desktop app, and optional owner-path browser control
-  center are shipped. The accepted team relay adds a separate team web surface;
+  center are shipped; the desktop app and the browser control center live in
+  `zajca/pohunek-work`. The accepted team relay adds a separate team web surface;
   it does not replace the owner WebUI or require a relay local mode.
 
 ## Phases
@@ -58,7 +59,8 @@ multi-team control plane without replacing either owner path.
 
 - [Track B web control center plan](design/track-b-web-control-center-plan-2026-07-22.md)
   — milestone split and reconciled decisions for the browser control center
-  (thin owner gateway + browser-side aggregation in `web/client-core`).
+  (thin owner gateway + browser-side aggregation in the client-core package,
+  now in `zajca/pohunek-work`).
 
 - [Delegated task runs RFC](design/delegated-task-runs-rfc.md) — accepted:
   task and turn records over ordinary sessions, causal turn settlement, blocking

@@ -25,9 +25,10 @@ Hard constraints, decided on purpose — respect them in every change:
   clients keep talking to each host daemon without a relay dependency. Their
   trust boundary remains owner-only socket/file permissions plus the configured
   overlay, with NetBird as the production provider.
-- **The owner WebUI stays first-class.** The shipped Bun backend remains the
-  private local/NetBird browser gateway. It is not replaced by the relay and
-  must never become a second team-auth or relay-routing authority.
+- **The owner browser path stays first-class.** The web control center is an
+  external client (`zajca/pohunek-work`) that reaches the owner protocol through
+  a private local/NetBird gateway. It is not replaced by the relay and must
+  never become a second team-auth or relay-routing authority.
 - **The optional team relay is additive.** The accepted design introduces one
   trusted Rust `pohunek-relayd` authority for teams, end-user authorization,
   routing, audit, and quotas. Each host remains authoritative for its PTYs,
@@ -78,8 +79,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
 | `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
-| `sdk/ts/`         | TypeScript SDK packages in the Bun workspace: `protocol` (generated protocol types), `sdk` (runtime client and runtime-path resolver), and `testkit`. |
-| `web/`            | Retained owner-mode WebUI in the same Bun workspace: backend, client core, SPA, and release packaging. |
+| `sdk/ts/`         | TypeScript SDK packages in the Bun workspace: `protocol` (generated protocol types), `sdk` (runtime client and runtime-path resolver), and `testkit` (fixture daemon and loopback test relay). |
 
 Other top-level: `compat/` (pinned upstream compatibility locks and sanitized
 goldens), `docs/` (architecture, roadmap, phases, knowledge source), `scripts/`
@@ -130,15 +130,14 @@ the [macOS project](https://github.com/users/zajca/projects/4), and the issue
 hierarchy rooted at #94. `docs/design/macos-support-rfc.md` records design
 constraints and rationale, not live delivery state.
 
-Web workspace gates (one Bun workspace root at the repository root spans `sdk/ts/*` and `web/*`):
+SDK workspace gates (one Bun workspace root at the repository root spans `sdk/ts/*`):
 
 ```bash
 bun install --frozen-lockfile
-bun run typecheck   # one command: tsc -b source graph + test/frontend/release checks
+bun run typecheck   # one command: tsc -b source graph + test and release-script checks
 bun run lint
 bun test
-bunx playwright install --with-deps chromium  # prerequisite for browser e2e
-bun run test:e2e
+bun test sdk/ts/scripts   # SDK release pack contract
 ```
 
 Stale per-branch Cargo isolation dirs: `scripts/cargo-sweep-targets --dry-run`
@@ -152,7 +151,7 @@ The real-daemon suites are opt-in locally and mandatory in CI after building
 `pohunekd`, `pohunek-sessiond`, and `pohunek` (the suites run the daemon in
 subprocess worker mode, which spawns `pohunek-sessiond` from beside `pohunekd`).
 The Hermes plugin e2e lives in the SDK workspace
-(`sdk/ts/sdk/test/hermes-plugin.e2e.test.ts`), depends on no web package, and
+(`sdk/ts/sdk/test/hermes-plugin.e2e.test.ts`), depends on no client package, and
 drives the real CLI:
 
 ```bash
@@ -160,15 +159,8 @@ cargo build -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli
 POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
   POHUNEK_CLI_BIN=/absolute/path/to/target/debug/pohunek \
   POHUNEK_PYTHON_BIN=/usr/bin/python3 \
-  bun test sdk/ts/sdk/test/e2e.test.ts sdk/ts/sdk/test/hermes-plugin.e2e.test.ts \
-  web/backend/test/real-daemon.e2e.test.ts
+  bun test sdk/ts/sdk/test/e2e.test.ts sdk/ts/sdk/test/hermes-plugin.e2e.test.ts
 ```
-
-For control-center development, `bun run dev` starts two fixture daemons, the
-backend, and the Vite frontend from the repository root; it does not require a Rust daemon or
-NetBird. Bun remains the workspace runtime, but `node` must be available on
-`PATH` because the orchestrator runs Vite in a Node child process for WebSocket
-proxy compatibility; `POHUNEK_NODE_BIN` overrides a nonstandard Node path.
 
 The TypeScript SDK is released as three npm-pack tarballs
 (`pohunek-ts-protocol-X.Y.Z.tgz`, `pohunek-ts-sdk-X.Y.Z.tgz`,
@@ -219,7 +211,7 @@ so an archive runs from any absolute path (the CI test jobs check out into
 `env!("CARGO_MANIFEST_DIR")` in test code (an xtask scan test enforces it).
 `archive.include` in `.config/nextest.toml` makes archive creation fail when
 `pohunek-sessiond` is missing, so daemon tests never run without their worker.
-`build-bins` remains a separate default-feature build for the web and Hermes
+`build-bins` remains a separate default-feature build for the SDK and Hermes
 jobs, because the archive's `--all-features` build enables cli's `test-util`.
 In CI, the Postgres-backed
 relay job is gated by a paths filter and does not run (its PostgreSQL service
@@ -303,8 +295,8 @@ select those crates. It then runs `cargo t -E 'rdeps(=a) | ...'`, so dependents
 run too and the fast profile's default filter still applies. It fails safe:
 the root `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.config/nextest.toml`,
 `rust-toolchain*`, lint/format configs, and any path no rule covers run
-everything. Only a reviewed allowlist in `crates/xtask/src/affected.rs` (other
-`web/`, `sdk/ts/`, the root Bun workspace files, `docs/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
+everything. Only a reviewed allowlist in `crates/xtask/src/affected.rs` (other paths:
+`sdk/ts/`, the root Bun workspace files, `docs/`, `.github/`, `.claude/`, `.agents/`, `assets/`, root `*.md`,
 `LICENSE`, `bacon.toml`) selects no Rust tests; when nothing else changed it
 exits 0 without running nextest and names the follow-up checks (`cargo xtask
 docs check`, the `scripts/` unittests, the Bun gates). It narrows only which
@@ -338,10 +330,10 @@ exclusive with `--no-seed`), and a staleness signal that cannot be read keeps
 the seed. Refreshing the main checkout's `target/` is a plain `cargo build
 --workspace --all-targets --all-features` there.
 
-Web and SDK TypeScript (run from the repository root):
+SDK TypeScript (run from the repository root):
 
 ```bash
-bun test web/backend/test/real-daemon.e2e.test.ts    # one test file
+bun test sdk/ts/sdk/test/e2e.test.ts                 # one test file
 bun test -t "notifications"                          # only tests matching the name pattern
 bun test sdk/ts/sdk/test/config.test.ts -t "one case" # file plus name pattern
 cd sdk/ts/sdk && bun run typecheck                   # one package's tsc -b graph

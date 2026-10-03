@@ -56,8 +56,8 @@ work.
 ## 3. Forward tracks
 
 The shipped forward work built client surfaces on top of the owner-first
-chassis: **SDKs → mesh-local browser control center** (the native desktop app is a
-separate client). The
+chassis: **SDKs → mesh-local browser control center** (the browser control center and
+the native desktop app are separate clients in `zajca/pohunek-work`). The
 daemon remains provider-agnostic and presentation-agnostic.
 
 The accepted next product track is an **optional team relay**. It adds a
@@ -74,7 +74,7 @@ own delivery scope, sequencing, and status. The
 [accepted macOS RFC](design/macos-support-rfc.md) records the design constraints:
 native Apple Silicon hosts and clients, macOS 14.0 minimum target,
 launchd-owned durable workers, real PTYs and agent integrations,
-retained owner WebUI, direct overlay operation, installation, signing, and
+retained owner-path browser client, direct overlay operation, installation, signing, and
 cross-stack acceptance. Intel Macs are outside this release scope.
 
 The shared platform foundation in #95 is complete: `crates/platform` owns
@@ -141,10 +141,9 @@ Phase 4 so every client builds on the same contract.
   stream as public protocol surface.
 - **S.3 — TS SDK (`sdk/ts/sdk`) — complete.** `ts-rs`-generated types
   (`sdk/ts/protocol`) + a runtime client with pluggable transports (TCP for Node/Bun
-  → daemon direct; WebSocket for browser → backend). CI **drift check** fails if
-  generated TS types diverge from the Rust source. Track B inherits
-  `web/backend` (`@pohunek/backend`) as its tested WebSocket transport core
-  instead of starting from a spec.
+  → daemon direct; WebSocket for browser → relay). CI **drift check** fails if
+  generated TS types diverge from the Rust source. The SDK's `WsTransport`
+  is tested against the loopback test relay in `@pohunek/testkit`.
 
 **Stability:** no compatibility promise pre-1.0; SDK semver tracks the protocol
 version; breaking changes allowed with a version bump until the promise is made.
@@ -170,9 +169,9 @@ daemon state, session metadata, or the event log.
 Phase 4 as designed ([`phases/04`](phases/04-browser-control-center.md)),
 reconciled by the
 [Track B plan](design/track-b-web-control-center-plan-2026-07-22.md): a thin
-**Bun backend** (`@pohunek/backend` — pure transparent tunnels, host discovery via
-the local daemon, SPA serving) + browser-side aggregation in
-**`@pohunek/client-core`** + a **Svelte 5 SPA** (xterm.js) + optional
+**Bun backend** (pure transparent tunnels, host discovery via
+the local daemon, SPA serving) + browser-side aggregation in a
+client-core package + a **Svelte 5 SPA** (xterm.js) + optional
 single-cert **mobile PWA**, with the same provider seam. The browser speaks
 the public protocol verbatim over those tunnels; the backend holds no
 protocol state. It remains an optional surface for **mobile /
@@ -182,11 +181,12 @@ you), reusing **Track S** (TS SDK).
 **M1 is implemented:** Slices B + C, the notifications inbox, and the
 in-browser terminal provide the multi-host sessions workspace and live session
 lifecycle through one mesh-local backend origin. This is a shipped owner-path
-client, not the accepted public team relay.
+client, now maintained in [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work),
+not the accepted public team relay.
 
 The old M2/M3 plan to grow this owner gateway into a public multi-user backend
 is superseded by the [team-relay RFC](design/team-relay-control-plane-rfc.md).
-The shipped M1 owner WebUI remains supported permanently alongside the relay.
+The M1 owner WebUI remains supported permanently alongside the relay.
 The Rust relay and its separate team web/CLI surfaces are implemented by
 [#71](https://github.com/zajca/pohunek/issues/71) and
 [#86](https://github.com/zajca/pohunek/issues/86); later provider delivery is
@@ -244,7 +244,7 @@ live blocker graph:
 
 ## 4. Deferred / out of scope
 
-- **Application auth in the shipped mesh-local Bun backend** — intentionally
+- **Application auth in the mesh-local Bun backend (external client)** — intentionally
   absent under the owner-path NetBird/filesystem trust boundary. The separate
   relay foundation now provides generic OIDC, credential lifecycle, and account
   linking; its complete team administration and session ACLs remain

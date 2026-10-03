@@ -31,8 +31,8 @@ Start here:
   binary: the skill text verbatim by default, or with `--json` one envelope
   carrying the skill text and its `content_sha256`. The command is fully
   local, so the global `--host` flag is accepted and ignored.
-- [Web control center](guides/web-control-center.md) covers the browser client,
-  backend trust boundary, development stack, and TypeScript package surfaces.
+- [TypeScript SDK](guides/ts-sdk.md) covers the TypeScript package surfaces,
+  the WebSocket relay transport contract, the test relay, and runtime paths.
 - [Debug daemon](runbooks/debug-daemon.md),
   [debug session runtime](runbooks/debug-session-runtime.md),
   [debug launcher](runbooks/debug-launcher.md), and

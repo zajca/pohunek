@@ -14,7 +14,7 @@ CI is the source of truth for this repo. This skill mirrors the exact gate
 set AGENTS.md ("Build, test, lint — the gates that must pass") mirrors from
 CI, in the same order, so a local pass lines up with what CI will run. Never
 claim a gate passed without running it; report failures with the real command
-output. AGENTS.md lists the full, current gate set — including web workspace
+output. AGENTS.md lists the full, current gate set — including SDK workspace
 gates, the real-daemon suite, and `cargo xtask hermes compatibility` — and
 always wins over this summary.
 
@@ -37,8 +37,7 @@ cargo xtask hermes compatibility --pohunek-bin /abs/path/to/pohunek
 A local pass does not *guarantee* CI green — shard partitioning, macOS jobs,
 and CI-only services make CI the arbiter — but these are the same commands CI
 runs. Skipping a command is never silently green: a gate that genuinely
-cannot run in this environment (missing pinned Hermes executable, no
-Playwright browsers) is a failed/skipped gate to report explicitly, with the
+cannot run in this environment (missing pinned Hermes executable) is a failed/skipped gate to report explicitly, with the
 reason.
 
 `cargo xtask docs check` validates the assistant knowledge bundle (schema,
@@ -46,12 +45,11 @@ drift, source-map, runbooks, secret scan, release extras). Run it for every
 change; it is mandatory when the change touches anything under `docs/knowledge/`,
 a CLI command/flag, a protocol method/event, or `docs/public-api.md`.
 
-## When the change touches the web workspace
+## When the change touches the SDK workspace
 
 Run from the repository root (see AGENTS.md for the full commands): `bun install
---frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, and, for
-changes covered by the e2e suite, `bun run test:e2e` (after
-`bunx playwright install --with-deps chromium`). The real-daemon suite runs
+--frozen-lockfile`, `bun run typecheck`, `bun run lint`, `bun test`, and
+`bun test sdk/ts/scripts` (the SDK release pack contract). The real-daemon suite runs
 with the built `pohunekd`/`pohunek-sessiond`/`pohunek` binaries when the
 change can affect daemon/worker behavior.
 

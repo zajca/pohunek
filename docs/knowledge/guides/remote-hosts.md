@@ -34,7 +34,7 @@ Use these commands for orientation:
   daemons. Each record carries its overlay, optional provider peer identity,
   address, and that overlay's effective daemon port. Address-less peers remain
   visible as candidates instead of being discarded. Discovery emits remote
-  peers only; web and `--all-hosts` consumers add the explicit local target
+  peers only; browser and `--all-hosts` consumers add the explicit local target
   through its Unix socket.
 - `pohunek host list --json` to list known live peers. These commands need the
   local overlay CLI/state, but do not connect to local `pohunekd`; a short
@@ -93,8 +93,8 @@ never fall through to a colliding peer ID or short name. This keeps raw `/`, `+`
 `=`, and `@` characters out of target and exact-port grammar.
 A socket-address literal cannot bypass current overlay membership. NetBird uses
 `publicKey` or legacy `pubKey` as `peer_id`; when absent, `peer_id` stays null
-and clients fall back to FQDN. The current transparent Bun web backend forces a
-new local-daemon discovery before each remote tunnel upgrade and refuses an
+and clients fall back to FQDN. A client that tunnels to remote peers should force a
+new local-daemon discovery before each remote tunnel upgrade and refuse an
 identity that no longer owns the cached address. A bare IPv6 literal such as
 `fd00::2` remains an unqualified selector; only an explicit configured-overlay
 prefix such as `netbird:fd00::2` qualifies it. A failure in one configured

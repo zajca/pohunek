@@ -82,7 +82,7 @@ support is available. Intel Macs are outside the current release scope. Darwin
 kernel peer identity and the session worker's portable PTY readiness are in
 place: the worker waits for PTY output with one `poll(2)` implementation shared
 by both targets, and its complete test suite runs natively. The daemon and CLI
-build and test natively on macOS too. Client and WebUI integration, signed
+build and test natively on macOS too. Client integration, signed
 artifacts, and the remaining native acceptance stay explicitly deferred through
 issues #101-#105 under the `Complete macOS support` milestone and macOS
 Project. The issue hierarchy, milestone, and Project own delivery scope,
@@ -104,11 +104,11 @@ the next login reports those sessions `lost` without restarting them.
 ## Owner paths and the accepted relay direction
 
 Current protocol-v3 operation is owner-only. Local clients connect to the Unix
-socket, direct remote clients use a configured overlay such as NetBird, and the
-shipped Bun browser backend transparently maps one WebSocket to one daemon
-connection. Each host daemon remains authoritative for its sessions and each
-worker remains authoritative for one live PTY. This owner WebUI remains a
-supported local/direct-overlay path after the team relay ships.
+socket, direct remote clients use a configured overlay such as NetBird, and
+external clients such as a browser control center can map one WebSocket to one
+daemon connection through their own relay. Each host daemon remains
+authoritative for its sessions and each worker remains authoritative for one
+live PTY. The owner path remains supported after the team relay ships.
 
 Pohunek has an [optional team-relay design](team-relay.md) with an implemented
 reduced foundation. The PostgreSQL-backed relay provides fencing, recovery,
@@ -116,8 +116,8 @@ protected initial provisioning, generic OIDC browser/device authentication, and
 bounded HTTPS account and credential lifecycle. Standalone and direct NetBird
 modes remain independent. Host links, `HostShare`, session origin, routing,
 attach, team administration, and the team WebUI remain deferred. The relay has
-no local mode; its future team WebUI and the retained owner WebUI use separate
-explicit API adapters, credentials, state, and origins.
+no local mode; its future team WebUI and any owner-path browser client use
+separate explicit API adapters, credentials, state, and origins.
 
 Protocol v4 and the typed host/team API will arrive only through their linked
 implementation issues. The current bounded foundation API and native relay CLI

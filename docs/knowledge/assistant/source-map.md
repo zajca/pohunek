@@ -75,7 +75,8 @@ Launcher scripts:
 - `scripts/pohunek-launch-pr`
 - `docs/knowledge/guides/launcher.md`
 
-Web control center client:
+TypeScript SDK and test relay (the web control center is an external client in
+`zajca/pohunek-work`):
 
 - `sdk/ts/sdk/src/index.browser.ts`
 - `sdk/ts/sdk/README.md`
@@ -83,30 +84,16 @@ Web control center client:
 - `sdk/ts/sdk/src/envelope.ts`
 - `sdk/ts/sdk/src/origin.ts`
 - `sdk/ts/sdk/src/transport.ts`
-- `web/backend/src/config.ts`
 - `sdk/ts/sdk/src/runtime-paths.ts`
-- `web/backend/src/log-files.ts`
 - `sdk/ts/testkit/src/runtime-root.ts`
-- `web/scripts/node-executable.ts`
-- `web/backend/src/hosts.ts`
-- `web/backend/src/server.ts`
-- `web/backend/systemd/pohunek-backend.service`
-- `web/backend/systemd/pohunek-backend.service.in`
-- `web/release/`
-- `web/client-core/src/index.ts`
-- `web/client-core/src/reducer.ts`
-- `web/frontend/src/App.svelte`
-- `web/frontend/src/components/SessionMain.svelte`
-- `web/frontend/src/lib/agent-presentation.ts`
-- `web/frontend/src/components/NewSessionDialog.svelte`
-- `web/scripts/dev.ts`
-- `web/scripts/typecheck.ts` — one-command typecheck: incremental `tsc -b` over
-  the composite source-only project graph (`protocol`/`sdk`/`backend`/`testkit`/
-  `client-core`/tools) in the root `tsconfig.json`, then the standalone
-  `frontend`/`release-test` checks and the per-package `test/tsconfig.json`
-  projects; tests stay out of the composite graph because their sibling-package
-  imports resolve to `.ts` sources.
-- `docs/knowledge/guides/web-control-center.md`
+- `sdk/ts/testkit/src/test-relay.ts` — loopback-only WebSocket relay that the
+  SDK transport tests run against over real sockets.
+- `sdk/ts/scripts/typecheck.ts` — one-command typecheck: incremental `tsc -b`
+  over the composite source-only project graph (`protocol`/`sdk`/`testkit`) in
+  the root `tsconfig.json`, then the standalone `sdk-release` check and the
+  per-package `test/tsconfig.json` projects; tests stay out of the composite
+  graph because their sibling-package imports resolve to `.ts` sources.
+- `docs/knowledge/guides/ts-sdk.md`
 - `docs/design/track-b-web-control-center-plan-2026-07-22.md`
 - `docs/phases/04-browser-control-center.md`
 
@@ -124,7 +111,7 @@ verification, and team clients remain deferred:
 - `docs/knowledge/concepts/team-relay.md`
 - `docs/knowledge/safety/trust-model.md`
 - `docs/knowledge/guides/remote-hosts.md`
-- `docs/knowledge/guides/web-control-center.md`
+- `docs/knowledge/guides/ts-sdk.md`
 - `crates/relay-protocol/src/`
 - `crates/relay-protocol/src/link.rs` — typed account-link contracts: channel,
   state, safe revisioned record and page, browser/device start, poll request and
@@ -349,14 +336,8 @@ Release packaging and contributor verification:
   the extracted macOS archives against real launchd.
 - `packaging/verify-archive` — shared installer preflight: supported host,
   macOS minimum, MANIFEST component/target, and every member present, intact,
-  and not writable by another account; run by `packaging/install-daemon.sh` and
-  `web/release/install.sh` before they run or change anything.
-- `packaging/macos/entitlements/pohunek-web.plist` — the JIT entitlements the
-  signed Bun-based backend needs.
-- `web/release/install.sh` — Linux systemd user unit or macOS launchd agent
-  installer of the web backend, with `--uninstall` on macOS.
-- `web/release/test/install.test.ts` — its Linux and macOS behavior against
-  shims of `uname`, `launchctl`, `plutil`, and the daemon CLI.
+  and not writable by another account; run by `packaging/install-daemon.sh`
+  before it runs or changes anything.
 - `scripts/tests/test_macos_packaging.py` — regression checks for the audit
   (with `otool`/`lipo`/`strings` shims) and the packaging scripts.
 - `packaging/macos/signing-keychain` — creates the ephemeral keychain holding

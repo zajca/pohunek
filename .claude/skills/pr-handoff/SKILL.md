@@ -27,7 +27,7 @@ it.
   milestone that is the gate set in `.lh-harness/workflows/milestone-build.md`
   (already run by the milestone's audit); for a plain branch, run that same
   set by hand. Follow the `gates` skill together with the authoritative
-  AGENTS.md commands, including Hermes compatibility, web, and real-daemon
+  AGENTS.md commands, including Hermes compatibility, SDK workspace, and real-daemon
   checks. A partial run never authorizes this handoff.
 - You are on a milestone slice branch, not on `main` itself. The bottom
   slice is based on `main`; every other slice is based on the slice below it

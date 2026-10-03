@@ -205,8 +205,9 @@ const raw = await attachRawWs(relayUrl, host, attached.stream_id);
 ```
 
 The relay maps control traffic to `/daemon/<host>/control` text frames and raw
-attach traffic to `/daemon/<host>/attach` binary frames. The relay core lives in
-`web/backend` as `@pohunek/relay`.
+attach traffic to `/daemon/<host>/attach` binary frames. `@pohunek/testkit`
+exports `startTestRelay`, a loopback-only implementation of this relay for
+tests; production relays belong to the client that hosts them.
 
 ## Regenerating Protocol Types
 

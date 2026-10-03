@@ -16,9 +16,9 @@ HTTPS account and credential lifecycle, provider-neutral account linking, and a
 native HTTPS/keyring CLI. It has no host link, team client or WebUI, routing,
 attach path, host enrollment, or complete team-administration API. Current
 Pohunek releases otherwise use public protocol v3 through an owner-only Unix
-socket or a direct configured overlay such as NetBird. The shipped Bun web
-backend is a transparent mesh-local browser transport, not the team relay
-described here.
+socket or a direct configured overlay such as NetBird. A browser transport
+that bridges WebSockets to a daemon is an external client concern, not the team
+relay described here.
 
 ## Local foundation provisioning
 
@@ -55,11 +55,10 @@ transfer coordinates. Protocol v3 exposes only safe read-only inspection of
 that state. It does not connect to a relay, run OIDC, create a WireGuard key,
 publish a relay API, or provide a team UI.
 
-The owner WebUI remains supported alongside the relay. Its Bun backend discovers
-the local daemon and direct-overlay peers and transparently bridges browser
-WebSockets into the existing owner protocol. `pohunek-relayd` has no local mode;
-its future team WebUI will use a separate typed API, credential set, state
-adapter, and origin. Presentation components may be shared, but there is no
+The owner path remains supported alongside the relay. An external owner-path
+browser client bridges WebSockets into the existing owner protocol.
+`pohunek-relayd` has no local mode; its future team WebUI will use a separate
+typed API, credential set, state adapter, and origin. Presentation components may be shared, but there is no
 cross-mode fallback or session aggregation.
 
 The accepted design adds one optional public Rust `pohunek-relayd` authority.
