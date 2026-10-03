@@ -1,8 +1,8 @@
 //! `pohunek host` — discover, list, and inspect remote hosts over `NetBird`.
 //!
 //! `discover` and `list` enumerate the local host's `NetBird` peers and classify
-//! each by probing its daemon control port, so the operator (and the rofi
-//! switcher) sees which peers run a compatible daemon. Discovery is performed
+//! each by probing its daemon control port, so the operator (and any host-switching
+//! client) sees which peers run a compatible daemon. Discovery is performed
 //! directly by the CLI and uses its owner-private persistent cache, so it does
 //! not require a local daemon. `inspect <host>` is a
 //! *live* query against a specific host's daemon for its [`HostCapabilities`].

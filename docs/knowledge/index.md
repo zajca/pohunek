@@ -18,7 +18,7 @@ Start here:
   [worktrees](concepts/worktrees.md), and
   [agent profiles](concepts/agent-profiles.md) describe the operating model.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
-  [remote hosts](guides/remote-hosts.md), and [launcher](guides/launcher.md)
+  and [remote hosts](guides/remote-hosts.md)
   cover common configuration paths.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
@@ -35,7 +35,6 @@ Start here:
   the WebSocket relay transport contract, the test relay, and runtime paths.
 - [Debug daemon](runbooks/debug-daemon.md),
   [debug session runtime](runbooks/debug-session-runtime.md),
-  [debug launcher](runbooks/debug-launcher.md), and
   [update after release](runbooks/update-after-release.md), and
   [install on macOS](runbooks/install-on-macos.md) are operational runbooks.
 - [Trust model](safety/trust-model.md), [secrets](safety/secrets.md), and

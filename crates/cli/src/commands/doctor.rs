@@ -46,8 +46,6 @@ const JOB_FAILED: &str = "failed";
 /// Only returns an error if paths cannot be resolved at all; individual failed
 /// checks are reported in the output, not returned as errors.
 pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
-    let launcher_bin_dir = paths.launcher_bin_dir();
-    let sway_config_dir = paths.sway_config_dir();
     let home_dir = std::env::var_os(pohunek_paths::HOME).map(PathBuf::from);
     let worker = worker_candidate(&paths.config_dir);
     let supervision = supervision_mode(&paths.config_dir);
@@ -63,8 +61,6 @@ pub(crate) async fn run(paths: &Paths, json: bool) -> Result<bool, CliError> {
         socket_dir: &paths.runtime_dir,
         state_dir: &paths.data_dir,
         log_dir: &paths.log_dir,
-        launcher_bin_dir: &launcher_bin_dir,
-        sway_config_dir: &sway_config_dir,
         config_dir: &paths.config_dir,
         home_dir: home_dir.as_deref(),
         effective_uid: nix::unistd::Uid::effective().as_raw(),

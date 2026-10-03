@@ -1562,7 +1562,7 @@ async fn host_governance_inspect_requires_null_and_reports_never_enrolled_absenc
 
 #[tokio::test]
 async fn session_list_with_malformed_filter_returns_typed_error() {
-    // A foreign client (e.g. the rofi script or another CLI) can talk JSON to the
+    // A foreign client (e.g. a shell script or another CLI) can talk JSON to the
     // daemon directly, bypassing clap's value parser. An unknown filter key or an
     // out-of-range value must yield a typed usage error at the daemon boundary,
     // NOT a silently-empty list (Slice A: "typed usage error, not silent empty").

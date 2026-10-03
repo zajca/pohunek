@@ -2,7 +2,7 @@
 type: Runbook
 id: runbook/update-after-release
 title: Update after release
-description: Reconcile setup assets, host capabilities, projects, and launcher config after updating Pohunek.
+description: Reconcile setup assets, host capabilities, projects, and attach config after updating Pohunek.
 source_kind: manual
 intents: [update, setup, debug, help]
 since: 0.3.3
@@ -38,11 +38,37 @@ history does not widen the current supported range.
    version and protocol compatibility.
 4. Run `pohunek host inspect local --json` to inspect local runtimes and
    capabilities.
-5. Refresh launcher scripts with `pohunek setup scripts`.
-6. Review config changes before applying `pohunek setup config --force`; default
+5. Review config changes before applying `pohunek setup config --force`; default
    setup config should not overwrite existing files.
-7. Reprint or refresh sway integration with `pohunek setup sway --print` or
-   `pohunek setup sway`.
+6. Attach reads its reconnect settings (`attach_reconnect_seconds`,
+   `attach_reconnect_interval_seconds`, `attach_reconnect_max_attempts`) only
+   from `<config_dir>/attach.conf`; a value left in `launcher.conf` is
+   silently ignored. If you tuned those keys, copy them into `attach.conf`
+   (`pohunek setup config` creates a template with every key commented at its
+   default).
+7. Upgrading from a release that installed launchers: core owns no launcher
+   assets, and it deletes none, because you may have customised them. Remove
+   the files the former launcher scripts and sway drop-in setup steps wrote, or
+   keep them by installing the launchers from `zajca/pohunek-work`, whose setup
+   command owns those scripts and keybindings from then on. The paths are
+   the same on Linux and macOS (`XDG_DATA_HOME` and `XDG_CONFIG_HOME` when
+   set, otherwise `~/.local/share` and `~/.config`):
+
+   ```sh
+   for name in lib.sh pohunek-rofi pohunek-rofi-issue pohunek-launch-issue pohunek-launch-pr; do
+     rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/pohunek/bin/$name"
+   done
+   rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/sway/config.d/pohunek.conf"
+   swaymsg reload
+   ```
+
+   Run `swaymsg reload` only on a host that runs sway. A bare `pohunek setup`
+   on macOS never wrote the sway drop-in and skipped the scripts, so only an
+   explicit launcher scripts install leaves files there. The old drop-in bound
+   `$mod+p` and `$mod+i` to the removed scripts; drop any `include` line for
+   the `config.d` directory that you added only for it. Move the three
+   `attach_reconnect_*` keys from `launcher.conf` into `attach.conf` as in the
+   previous step; core never reads `launcher.conf`, so leave or delete it.
 8. For important projects, verify `pohunek project show <id-or-label> --json`
    and resolved actions with `pohunek project actions <id-or-label> --json`.
 

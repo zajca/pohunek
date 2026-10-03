@@ -53,7 +53,6 @@ Current CLI and command surface:
 - `crates/cli/tests/notifications_clap.rs`
 - `crates/cli/tests/agent_skill.rs`
 - `crates/cli/tests/prompt_link.rs`
-- `crates/cli/tests/scripts.rs`
 - `crates/cli/tests/standalone_discovery.rs`
 - `crates/cli/tests/session_process_api.rs`
 
@@ -67,13 +66,6 @@ Assistant launch and prompt rendering:
 - `crates/prompt/src/lib.rs`
 - `crates/prompt/src/link.rs`
 - `docs/knowledge/concepts/host-governance.md`
-
-Launcher scripts:
-
-- `scripts/lib.sh`
-- `scripts/pohunek-launch-issue`
-- `scripts/pohunek-launch-pr`
-- `docs/knowledge/guides/launcher.md`
 
 TypeScript SDK and test relay (the web control center is an external client in
 `zajca/pohunek-work`):

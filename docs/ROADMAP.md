@@ -24,7 +24,7 @@ Last reconciled: 2026-09-19.
 | **Milestone 10** | `--json` everywhere + `cli_usage` typed error envelope. | branch `milestone-10` (merged) |
 | **Projects** | Git-repo awareness; `project` commands; all 7 follow-ups (F1–F7) resolved. | [`design/projects*.md`](design/) |
 | **Per-project actions + worktree hooks + agent profiles** | All slices incl. session/agent-state hooks (B2, `ed6b778`); env-clear + allowlist; host agent profiles. | [`design/per-project-actions-*`](design/) |
-| **Phase 5 / Milestone 12 — rofi/sway launcher** | `session list --filter` (chassis); `session new --input` (atomic launch); `scripts/` (launch-issue/pr, rofi); transient attach menu and status banner; `pohunek setup` for sway/rofi. | [`phases/05`](phases/05-rofi-sway-launcher.md), `scripts/` |
+| **Phase 5 / Milestone 12 — rofi/sway launcher** | `session list --filter` (chassis); `session new --input` (atomic launch); transient attach menu and status banner. The rofi/sway launcher scripts moved to `zajca/pohunek-work`. | [`phases/05`](phases/05-rofi-sway-launcher.md) |
 
 > This roadmap supersedes older milestone notes. Use the recommended sequence
 > below for next work.

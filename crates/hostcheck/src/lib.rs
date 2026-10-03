@@ -1,17 +1,15 @@
 //! Host environment probes shared by `pohunek doctor` (CLI-local) and the
 //! `daemon.doctor` RPC.
 //!
-//! Both the CLI doctor and the daemon need to probe the same things — binaries
-//! on `PATH`, directory writability, `NetBird` state, the configured terminal,
-//! and the optional sway/rofi launcher assets — but on potentially different
-//! hosts (the CLI describes the local host; `daemon.doctor` describes the host
+//! Both the CLI doctor and the daemon need to probe the same things: binaries
+//! on `PATH`, directory writability, and `NetBird` state, but on potentially
+//! different hosts (the CLI describes the local host; `daemon.doctor` describes the host
 //! that owns the agent runtime). The probe logic is identical, so it lives here
 //! once and produces [`protocol::DoctorCheck`] values that both callers embed
 //! into a [`protocol::DoctorReport`].
 //!
-//! The probe list is platform specific. Linux keeps the optional sway/rofi
-//! launcher probes; macOS replaces them with runtime-path, worker, `launchd`,
-//! terminal, filesystem-privacy and optional desktop probes (see [`macos`]).
+//! The probe list is platform specific. macOS adds runtime-path, worker,
+//! `launchd`, filesystem-privacy and optional desktop probes (see [`macos`]).
 //! Platform selection is explicit input to the pure builders ([`linux_checks`],
 //! [`macos::standard_checks`]) so both are testable on any host;
 //! [`standard_checks`] passes the current platform.
@@ -83,11 +81,7 @@ pub struct StandardCheckInputs<'a> {
     pub state_dir: &'a Path,
     /// Directory where logs are written.
     pub log_dir: &'a Path,
-    /// Directory where launcher entrypoints are installed.
-    pub launcher_bin_dir: &'a Path,
-    /// Directory containing the user's sway configuration.
-    pub sway_config_dir: &'a Path,
-    /// pohunek's config directory holding `launcher.conf` (macOS terminal probe).
+    /// pohunek's config directory (macOS filesystem-access probe).
     pub config_dir: &'a Path,
     /// The user's home directory, used to recognize privacy-protected folders.
     pub home_dir: Option<&'a Path>,
@@ -116,7 +110,7 @@ pub const fn current_platform() -> Platform {
 /// Build the standard pohunek host probe list.
 ///
 /// The CLI-local doctor command and `daemon.doctor` RPC use this same ordered
-/// list so drift in warnings, required checks, and launcher probes is visible in
+/// list so drift in warnings and required checks is visible in
 /// one place. The list is selected by [`current_platform`]; on macOS this runs
 /// the bounded `launchctl` domain probe.
 #[must_use]
@@ -130,8 +124,7 @@ pub fn standard_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
     }
 }
 
-/// The Linux probe list: agents, directories, `NetBird`, and the optional
-/// sway/rofi launcher assets.
+/// The Linux probe list: agents, directories, and `NetBird`.
 #[must_use]
 pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
     vec![
@@ -155,13 +148,6 @@ pub fn linux_checks(inputs: StandardCheckInputs<'_>) -> Vec<DoctorCheck> {
             DoctorStatus::Warn,
             "not available yet (SQLite store is a later milestone)",
         ),
-        binary("rofi", false),
-        binary("swaymsg", false),
-        binary("python3", false),
-        binary("timeout", false),
-        terminal(),
-        launcher_scripts(inputs.launcher_bin_dir),
-        sway_include(inputs.sway_config_dir),
     ]
 }
 
@@ -250,24 +236,6 @@ pub fn netbird() -> DoctorCheck {
     }
 }
 
-/// Check that a terminal emulator is configured for the rofi launcher.
-///
-/// `ok` when `$TERMINAL` is set and non-empty; otherwise `warn` (the launcher
-/// also reads a `terminal=` key from `launcher.conf`, so this is optional).
-#[must_use]
-pub fn terminal() -> DoctorCheck {
-    match std::env::var("TERMINAL") {
-        Ok(value) if !value.is_empty() => {
-            DoctorCheck::new("terminal", DoctorStatus::Ok, format!("TERMINAL={value}"))
-        }
-        _ => DoctorCheck::new(
-            "terminal",
-            DoctorStatus::Warn,
-            "set $TERMINAL or 'terminal=' in launcher.conf (the rofi launcher needs a terminal)",
-        ),
-    }
-}
-
 /// Check that a directory exists (or can be created) and is writable, by
 /// creating it and writing a probe file (see [`write_probe`]).
 #[must_use]
@@ -342,68 +310,6 @@ pub(crate) fn write_probe(dir: &Path) -> std::io::Result<()> {
     Err(last.unwrap_or_else(|| std::io::Error::other("no probe name attempts")))
 }
 
-/// Check whether the launcher scripts have been materialized by
-/// `pohunek setup scripts`. `ok` when the `pohunek-rofi` entrypoint is present
-/// in `bin_dir`; otherwise `warn` (the launcher is optional).
-#[must_use]
-pub fn launcher_scripts(bin_dir: &Path) -> DoctorCheck {
-    if bin_dir.join("pohunek-rofi").is_file() {
-        DoctorCheck::new(
-            "launcher_scripts",
-            DoctorStatus::Ok,
-            format!("installed at {}", bin_dir.display()),
-        )
-    } else {
-        DoctorCheck::new(
-            "launcher_scripts",
-            DoctorStatus::Warn,
-            "not installed; run 'pohunek setup scripts'",
-        )
-    }
-}
-
-/// Check whether the user's sway config includes a `config.d` drop-in dir, which
-/// is where `pohunek setup sway` writes its launcher keybinding drop-in.
-///
-/// `ok` when the main config exists and has a non-comment line mentioning
-/// `config.d`; `warn` when the config exists without such a line, or when it is
-/// absent entirely. The launcher is optional, so this is never fatal.
-#[must_use]
-pub fn sway_include(sway_config_dir: &Path) -> DoctorCheck {
-    let config = sway_config_dir.join("config");
-    match std::fs::read_to_string(&config) {
-        Ok(contents) => {
-            // A "non-comment line mentioning config.d": trim each line, skip
-            // comment lines, and look for the `config.d` token.
-            let includes = contents.lines().any(|line| {
-                let trimmed = line.trim();
-                !trimmed.starts_with('#') && trimmed.contains("config.d")
-            });
-            if includes {
-                DoctorCheck::new(
-                    "sway_include",
-                    DoctorStatus::Ok,
-                    "sway config includes config.d",
-                )
-            } else {
-                DoctorCheck::new(
-                    "sway_include",
-                    DoctorStatus::Warn,
-                    format!(
-                        "add 'include {}/config.d/*' to your sway config (see 'pohunek setup sway')",
-                        sway_config_dir.display()
-                    ),
-                )
-            }
-        }
-        Err(_) => DoctorCheck::new(
-            "sway_include",
-            DoctorStatus::Warn,
-            format!("sway config not found at {}", config.display()),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -415,50 +321,6 @@ mod tests {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         pohunek_test_support::temp_root().join(format!("phc-lib-{pid}-{n}"))
-    }
-
-    #[test]
-    fn sway_include_warns_when_config_absent() {
-        let base = unique_temp_dir();
-
-        let check = sway_include(&base.join("sway"));
-        assert_eq!(check.status, DoctorStatus::Warn);
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn sway_include_ok_when_config_includes_config_d() {
-        let base = unique_temp_dir();
-        let sway_dir = base.join("sway");
-        std::fs::create_dir_all(&sway_dir).unwrap();
-        std::fs::write(
-            sway_dir.join("config"),
-            "include ~/.config/sway/config.d/*\n",
-        )
-        .unwrap();
-
-        let check = sway_include(&sway_dir);
-        assert_eq!(check.status, DoctorStatus::Ok);
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn sway_include_warns_when_only_commented_config_d() {
-        let base = unique_temp_dir();
-        let sway_dir = base.join("sway");
-        std::fs::create_dir_all(&sway_dir).unwrap();
-        std::fs::write(
-            sway_dir.join("config"),
-            "# include ~/.config/sway/config.d/*\n",
-        )
-        .unwrap();
-
-        let check = sway_include(&sway_dir);
-        assert_eq!(check.status, DoctorStatus::Warn);
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -529,16 +391,11 @@ mod tests {
         let socket_dir = base.join("runtime");
         let state_dir = base.join("data");
         let log_dir = base.join("logs");
-        let launcher_bin_dir = base.join("bin");
-        let sway_config_dir = base.join("sway");
-
         let config_dir = base.join("config");
         let checks = linux_checks(StandardCheckInputs {
             socket_dir: &socket_dir,
             state_dir: &state_dir,
             log_dir: &log_dir,
-            launcher_bin_dir: &launcher_bin_dir,
-            sway_config_dir: &sway_config_dir,
             config_dir: &config_dir,
             home_dir: None,
             effective_uid: 0,
@@ -562,13 +419,6 @@ mod tests {
                 "log_dir_writable",
                 "netbird_cli",
                 "schema_version",
-                "bin:rofi",
-                "bin:swaymsg",
-                "bin:python3",
-                "bin:timeout",
-                "terminal",
-                "launcher_scripts",
-                "sway_include",
             ]
         );
 

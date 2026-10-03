@@ -3,8 +3,8 @@
 /**
  * How a `NetBird` peer is classified for `host.discover`.
  *
- * Serializes with an internal `classification` tag so a `--json` consumer (and
- * the rofi switcher) can branch on it, e.g.
+ * Serializes with an internal `classification` tag so a `--json` consumer
+ * can branch on it, e.g.
  * `{"classification":"reachable_daemon","daemon_version":"0.1.0"}`.
  */
 export type HostClass =

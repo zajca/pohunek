@@ -126,11 +126,11 @@ where they are doing it, and when they need you.
   and physical JSONL compaction are daemon-enforced; unresolved actions and
   errors never expire automatically.
 
-**Launcher and terminal UX**
+**Terminal UX**
 
-- `pohunek setup` installs rofi/sway launcher scripts, default config, prompt
-  templates, and an optional sway keybinding drop-in — start or switch to any
-  session in two keystrokes.
+- `pohunek setup config` installs the default attach config and the issue/PR
+  prompt templates. The rofi/sway launchers are developed in
+  [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work).
 - **Attach session menu**: raw terminal passthrough preserves native scrollback;
   `Ctrl-\` temporarily shows a one-row status banner with a composited menu
   (kill, detach, new session in the same worktree, fork, rename), then restores
@@ -442,11 +442,11 @@ port is retained.
 | `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host`, or one explicitly selected local Hermes target. |
 | `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
-| `pohunek setup [scripts\|config\|sway]` | Install launcher scripts, default config + prompt templates, sway keybindings. |
+| `pohunek setup [config]` | Install the default `attach.conf` and prompt templates (a bare `setup` is `setup config`). |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
 | `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
 | `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
-| `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (used by launchers). |
+| `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
 
 ### Working across hosts
 

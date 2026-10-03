@@ -375,42 +375,20 @@ static COMMANDS: &[CommandDescriptor] = &[
     CommandDescriptor {
         id: "setup",
         title: "pohunek setup",
-        description: "Set up the sway/rofi launcher integration on this machine.",
+        description: "Install the default config and prompt templates, or shell completion, on this machine.",
         usage: "pohunek setup [--json]",
         arguments: "- `--json`: Emit machine-readable JSON instead of human text.",
         intents: &["setup", "help"],
         extra_body: "## Subcommands\n\n\
-                     - `pohunek setup scripts` — Materialize the launcher scripts into the data dir's bin/.\n\
-                     - `pohunek setup config` — Write a default launcher.conf and prompt templates.\n\
-                     - `pohunek setup sway` — Write the sway drop-in.",
+                     - `pohunek setup config` — Write a default attach.conf and prompt templates.\n\
+                     - `pohunek setup completions` — Install shell completion.",
     },
     CommandDescriptor {
         id: "setup-config",
         title: "pohunek setup config",
-        description: "Write a default launcher.conf and prompt templates.",
+        description: "Write a default attach.conf and prompt templates.",
         usage: "pohunek setup config [--force] [--json]",
         arguments: "- `--force`: Overwrite existing configuration files.\n\
-                    - `--json`: Emit machine-readable JSON instead of human text.",
-        intents: &["setup", "help"],
-        extra_body: "",
-    },
-    CommandDescriptor {
-        id: "setup-scripts",
-        title: "pohunek setup scripts",
-        description: "Materialize the launcher scripts into the data dir's bin/.",
-        usage: "pohunek setup scripts [--json]",
-        arguments: "- `--json`: Emit machine-readable JSON instead of human text.",
-        intents: &["setup", "help"],
-        extra_body: "",
-    },
-    CommandDescriptor {
-        id: "setup-sway",
-        title: "pohunek setup sway",
-        description: "Write the sway drop-in configuration fragment.",
-        usage: "pohunek setup sway [--print] [--keybind] [--issue-keybind] [--json]",
-        arguments: "- `--print`: Print the generated config instead of writing it.\n\
-                    - `--keybind <binding>`: Override the default session-switcher keybind.\n\
-                    - `--issue-keybind <binding>`: Override the default issue-picker keybind.\n\
                     - `--json`: Emit machine-readable JSON instead of human text.",
         intents: &["setup", "help"],
         extra_body: "",

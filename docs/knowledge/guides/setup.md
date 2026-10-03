@@ -2,7 +2,7 @@
 type: Guide
 id: guide/setup
 title: Local setup
-description: Configure a local Pohunek host enough to run daemon-backed sessions and launcher integration.
+description: Configure a local Pohunek host enough to run daemon-backed sessions.
 source_kind: manual
 intents: [setup, help]
 ---
@@ -92,24 +92,23 @@ The installer refuses a unit or `LaunchAgents` directory that is group- or
 world-writable and names the fix (`chmod go-w <path>`); it never changes
 permissions itself.
 
-Setup assets are installed through `pohunek setup`. The subcommands split the
-work into launcher scripts, config templates, sway integration, and shell
-completion:
+Local configuration is installed through `pohunek setup`. The subcommands are:
 
-- `pohunek setup scripts`
-- `pohunek setup config`
-- `pohunek setup sway`
-- `pohunek setup completions <bash|zsh|fish>`
+- `pohunek setup config` writes a default `attach.conf` (the `pohunek attach`
+  reconnect settings, every key commented at its default) and the
+  `prompts/issue.tmpl` and `prompts/pr.tmpl` templates the daemon resolves for
+  project actions. Existing files are never overwritten unless `--force` is
+  given.
+- `pohunek setup completions <bash|zsh|fish>` installs shell completion.
 
-sway and rofi are optional Linux capabilities. On macOS a bare `pohunek setup`
-writes only the platform-neutral `launcher.conf` and prompt templates, reports
-the launcher scripts and the sway drop-in as skipped (`skipped` array in
-`--json`, `skipped <step>: <reason>` lines in human output), and prints macOS
-next steps (`pohunek service install`, `pohunek doctor`). An explicit
-`pohunek setup sway` on macOS exits successfully without writing anything and
-returns `{"skipped": true, "step": "sway", "reason": ...}` with `--json`.
-`pohunek setup scripts` still installs the scripts when asked. On Linux the
-output is unchanged.
+A bare `pohunek setup` is `pohunek setup config` without `--force`; `--json`
+returns the `created` and `skipped` file lists. Desktop launchers (rofi, sway)
+and the issue/PR pickers are not part of core; they live in `zajca/pohunek-work`
+and call the public `pohunek` CLI. Upgrading from a release that installed
+launchers: remove `<data_dir>/bin/{lib.sh,pohunek-rofi,pohunek-rofi-issue,pohunek-launch-issue,pohunek-launch-pr}`
+and `<config_home>/sway/config.d/pohunek.conf` as described in the
+[update-after-release runbook](../runbooks/update-after-release.md), or let the
+`pohunek-work` setup own them.
 
 ## Doctor checks by platform
 
@@ -119,14 +118,11 @@ carries the remediation. When `pohunek doctor` reaches the daemon, a check both 
 fails; optional capabilities are at most `warn`.
 
 Linux: `bin:git` (required), `bin:codex`, `bin:claude`, the socket, state and
-log directory writability checks, `netbird_cli`, `schema_version`, and the
-optional launcher probes `bin:rofi`, `bin:swaymsg`, `bin:python3`,
-`bin:timeout`, `terminal` (`$TERMINAL`), `launcher_scripts` and `sway_include`.
+log directory writability checks, `netbird_cli`, and `schema_version`.
 Executables count only when they are regular files the effective user can execute according to the kernel (`faccessat` with `X_OK`); a file it cannot execute is skipped and the `PATH` search continues. The writability probes create a randomly named file exclusively (never following a planted symlink) and remove it.
 
-macOS omits the Linux-only launcher probes (rofi, swaymsg, `timeout`,
-`$TERMINAL`, launcher scripts, sway include) and `bin:python3` (hook
-interpreter readiness is reported by `pohunek integration doctor`), and adds:
+macOS adds the following checks. Hook interpreter readiness (`python3`) is
+reported by `pohunek integration doctor`, not by `pohunek doctor`:
 
 | Check | Failure status | Meaning and remediation |
 | --- | --- | --- |
@@ -143,7 +139,6 @@ interpreter readiness is reported by `pohunek integration doctor`), and adds:
 | `launchd_job` | `fail` for a failed job, or a loaded job without a process while no daemon answers; else `warn` | CLI doctor only: the installed daemon job's state from `pohunek service status`. launchd reports a loaded job as `running` or `unknown` (no process) and records no exit, so an `unknown` job is fatal only when the doctor also cannot reach the daemon. Not installed is a `warn`; a manually started daemon is valid. A pending install or upgrade is reported alongside the job state, never instead of it. |
 | `bin:codex`, `bin:claude` | `warn` | Optional agents. A daemon started by launchd does not read shell startup files, so use an absolute agent profile `program` or fix the service PATH. |
 | `login_shell` | `warn` | `$SHELL` must be an absolute executable listed in `/etc/shells`. |
-| `terminal` | `warn` | The stock `/System/Applications/Utilities/Terminal.app`, plus the optional `terminal=` key in `launcher.conf`, read like the launcher does (last assignment wins, an empty value means unset). The launcher runs the whole value as one executable name, so a value with arguments such as `kitty -e` is reported as unresolvable; use a wrapper script. |
 | `desktop_notifications` | `warn` only when `osascript` is missing | Reports `/usr/bin/osascript`; delivery and user denial cannot be confirmed for an unbundled binary. If banners do not appear, allow notifications for the sending app in System Settings > Notifications. |
 | `keychain` | `warn` | Presence of `/usr/bin/security` and the login keychain file only. No secret is read and lock state is not probed; a locked keychain is reported when a provider credential is first requested. |
 
@@ -154,7 +149,7 @@ deadline-bounded, do not start a daemon, and fail silently. Zsh installation
 prints the `fpath` line that must appear before `compinit`.
 
 Do not overwrite existing user config unless the user asks for that behavior and
-the command supports it. For launcher details, see [launcher](launcher.md). For
+the command supports it. For
 profile and secret boundaries, see [agent profiles](../concepts/agent-profiles.md)
 and [secrets](../safety/secrets.md). For the governance storage and lifecycle
 boundary, see [host identity and local governance](../concepts/host-governance.md).

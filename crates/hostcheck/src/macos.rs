@@ -24,7 +24,7 @@ use pohunek_paths::{
 use pohunek_platform::filesystem::{StageOutcome, TrustedDir};
 use protocol::{DoctorCheck, DoctorStatus};
 
-use crate::executable::{is_executable_file, resolve_executable};
+use crate::executable::is_executable_file;
 use crate::{binary_with_path, netbird, StandardCheckInputs};
 
 // Rust guideline compliant 2026-09-30
@@ -85,9 +85,6 @@ pub const WORKER_EXECUTABLE_CHECK: &str = "worker_executable";
 
 /// Shell registry consulted for the login-shell check.
 const ETC_SHELLS: &str = "/etc/shells";
-
-/// Stock macOS terminal application.
-const TERMINAL_APP: &str = "/System/Applications/Utilities/Terminal.app";
 
 /// Stock macOS scripting host the notification path is built on.
 const OSASCRIPT: &str = "/usr/bin/osascript";
@@ -329,19 +326,11 @@ pub fn probe_launchd_domain(runner: &dyn Runner, uid: u32, deadline: Duration) -
 
 /// Host facts the macOS checks evaluate.
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "independent host observations, each consumed by exactly one check"
-)]
 pub struct MacosFacts {
     /// Value of `$SHELL`, when set.
     pub shell: Option<OsString>,
     /// Contents of `/etc/shells`; `None` when unreadable.
     pub etc_shells: Option<String>,
-    /// Whether the stock Terminal application bundle exists.
-    pub terminal_app_present: bool,
-    /// `terminal=` value from `launcher.conf`, when set.
-    pub launcher_terminal: Option<String>,
     /// Value of `PATH`.
     pub path_var: Option<OsString>,
     /// Result of the `gui/<uid>` domain probe.
@@ -372,8 +361,6 @@ impl MacosFacts {
         Self {
             shell: std::env::var_os("SHELL"),
             etc_shells: std::fs::read_to_string(ETC_SHELLS).ok(),
-            terminal_app_present: Path::new(TERMINAL_APP).is_dir(),
-            launcher_terminal: read_launcher_terminal(inputs.config_dir),
             path_var: std::env::var_os("PATH"),
             launchd_domain: (inputs.supervision != Supervision::Subprocess)
                 .then(|| probe_launchd_domain(runner, inputs.effective_uid, LAUNCHCTL_DEADLINE)),
@@ -384,40 +371,10 @@ impl MacosFacts {
     }
 }
 
-/// Read the `terminal=` value from `<config_dir>/launcher.conf`.
-///
-/// Mirrors the launcher's `pohunek_config_get` (`scripts/lib.sh`): lines are
-/// stripped, blank and `#` lines are skipped, keys and values are stripped, and
-/// the last `terminal=` assignment wins even when empty (an empty value means
-/// unset, so the launcher falls back to `$TERMINAL`). A non-comment line
-/// without `=` makes the launcher's lookup fail, which reads as unset. An
-/// unreadable or absent file yields `None`.
-#[must_use]
-pub fn read_launcher_terminal(config_dir: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(config_dir.join("launcher.conf")).ok()?;
-    parse_launcher_terminal(&contents)
-}
-
-fn parse_launcher_terminal(contents: &str) -> Option<String> {
-    let mut value = None;
-    for line in contents.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, item) = line.split_once('=')?;
-        if key.trim() == "terminal" {
-            value = Some(item.trim());
-        }
-    }
-    value.filter(|value| !value.is_empty()).map(str::to_owned)
-}
-
 /// The ordered macOS probe list.
 ///
-/// Optional Linux capabilities (rofi, swaymsg, `timeout`, `$TERMINAL`, the
-/// launcher scripts, the sway include) and the launcher-only `python3` probe
-/// are omitted: they are not macOS capabilities, and hook interpreter
-/// readiness is reported by `pohunek integration doctor`.
+/// Hook interpreter readiness is not probed here; `pohunek integration doctor`
+/// reports it.
 #[must_use]
 pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> Vec<DoctorCheck> {
     let state_root = state_root(inputs.log_dir);
@@ -457,7 +414,6 @@ pub fn standard_checks(inputs: &StandardCheckInputs<'_>, facts: &MacosFacts) -> 
         ),
         check_worker_executable(inputs.worker),
         check_login_shell(facts),
-        check_terminal(facts),
         check_desktop_notifications(facts),
         check_keychain(facts),
     ];
@@ -969,58 +925,6 @@ fn shell_listed(listing: &str, shell: &Path) -> bool {
         .any(|line| Path::new(line) == shell)
 }
 
-/// Check the attach terminal: the stock Terminal application and the optional
-/// `terminal=` command from `launcher.conf`.
-///
-/// The configured terminal is optional. The launcher runs the whole `terminal=`
-/// value as one executable name (`"$terminal_bin" -e ...`), so the value is
-/// resolved as a single program, never split into words; a value such as
-/// `kitty -e` is unresolvable. A configured but unresolvable command is a
-/// `warn`, as is a host with neither the stock app nor a working configured
-/// command.
-#[must_use]
-pub fn check_terminal(facts: &MacosFacts) -> DoctorCheck {
-    const NAME: &str = "terminal";
-    let configured = facts.launcher_terminal.as_deref().map(|command| {
-        let resolved = resolve_executable(command, facts.path_var.as_deref());
-        (command, resolved.is_some())
-    });
-    match (facts.terminal_app_present, configured) {
-        (true, None) => DoctorCheck::new(
-            NAME,
-            DoctorStatus::Ok,
-            format!("stock terminal available at {TERMINAL_APP}; 'terminal=' in launcher.conf is optional"),
-        ),
-        (true, Some((command, true))) => DoctorCheck::new(
-            NAME,
-            DoctorStatus::Ok,
-            format!("configured terminal '{command}' resolves; stock {TERMINAL_APP} is also available"),
-        ),
-        (_, Some((command, false))) => DoctorCheck::new(
-            NAME,
-            DoctorStatus::Warn,
-            format!(
-                "configured terminal '{command}' (launcher.conf) does not resolve to one executable; \
-                 the launcher runs the whole value as a single program name, so put arguments in a \
-                 wrapper script, or fix or remove the 'terminal=' key"
-            ),
-        ),
-        (false, Some((command, true))) => DoctorCheck::new(
-            NAME,
-            DoctorStatus::Ok,
-            format!("configured terminal '{command}' resolves"),
-        ),
-        (false, None) => DoctorCheck::new(
-            NAME,
-            DoctorStatus::Warn,
-            format!(
-                "{TERMINAL_APP} not found and no 'terminal=' set in launcher.conf; set 'terminal=' \
-                 to a terminal command"
-            ),
-        ),
-    }
-}
-
 /// Report the outcome of the `gui/<uid>` launchd domain probe.
 ///
 /// A missing domain is a `fail` (native supervision needs a graphical login
@@ -1289,8 +1193,6 @@ mod tests {
         MacosFacts {
             shell: None,
             etc_shells: Some("# comment\n/bin/zsh\n/bin/bash\n".to_owned()),
-            terminal_app_present: true,
-            launcher_terminal: None,
             path_var: None,
             launchd_domain: Some(DomainProbe::Ready),
             osascript_present: true,
@@ -1706,8 +1608,6 @@ mod tests {
             socket_dir: &runtime,
             state_dir: &data,
             log_dir: &logs,
-            launcher_bin_dir: &root,
-            sway_config_dir: &root,
             config_dir: &config_dir,
             home_dir: Some(&home),
             effective_uid: std::fs::metadata(&root).unwrap().uid(),
@@ -1804,8 +1704,6 @@ mod tests {
                 socket_dir: &base.join("runtime"),
                 state_dir: &base.join("data"),
                 log_dir: &base.join("state").join("logs"),
-                launcher_bin_dir: &base,
-                sway_config_dir: &base,
                 config_dir: &config_dir,
                 home_dir: Some(&base),
                 effective_uid: 0,
@@ -2015,7 +1913,7 @@ mod tests {
         assert!(check.detail.contains("worker"), "{}", check.detail);
     }
 
-    // --- login shell / terminal ----------------------------------------------
+    // --- login shell ----------------------------------------------
 
     #[test]
     fn login_shell_reports_each_failure_mode_as_warn() {
@@ -2052,78 +1950,6 @@ mod tests {
         // A commented-out entry does not count as listed.
         f.etc_shells = Some(format!("#{}\n", zsh.display()));
         assert_eq!(check_login_shell(&f).status, DoctorStatus::Warn);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn launcher_terminal_mirrors_the_launcher_parser() {
-        assert_eq!(parse_launcher_terminal("# terminal=x\n"), None);
-        assert_eq!(parse_launcher_terminal("terminal=\n"), None);
-        assert_eq!(
-            parse_launcher_terminal("terminal=kitty\n  terminal = wezterm start \n"),
-            Some("wezterm start".to_owned())
-        );
-        // The last assignment wins even when empty: the launcher then falls
-        // back to $TERMINAL, so the earlier value is not in effect.
-        assert_eq!(
-            parse_launcher_terminal("host=local\nterminal=alacritty\nterminal=\n"),
-            None
-        );
-        // A non-comment line without `=` makes the launcher's lookup fail.
-        assert_eq!(
-            parse_launcher_terminal("terminal=kitty\nbroken line\n"),
-            None
-        );
-    }
-
-    #[test]
-    fn a_terminal_value_with_arguments_is_not_one_executable() {
-        let dir = temp_dir("term-args");
-        write_exec(&dir, "kitty", 0o755);
-        let mut f = facts();
-        f.path_var = Some(OsString::from(dir.as_os_str()));
-
-        f.launcher_terminal = Some("kitty".to_owned());
-        assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
-
-        // The launcher runs the whole value as one program name.
-        f.launcher_terminal = Some("kitty -e".to_owned());
-        let with_args = check_terminal(&f);
-        assert_eq!(with_args.status, DoctorStatus::Warn, "{}", with_args.detail);
-        assert!(
-            with_args.detail.contains("single program"),
-            "{}",
-            with_args.detail
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn terminal_check_covers_stock_and_configured_terminals() {
-        let dir = temp_dir("term");
-        write_exec(&dir, "kitty", 0o755);
-        let path = OsString::from(dir.as_os_str());
-
-        let mut f = facts();
-        f.path_var = Some(path);
-        assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
-
-        f.launcher_terminal = Some("kitty".to_owned());
-        let configured = check_terminal(&f);
-        assert_eq!(configured.status, DoctorStatus::Ok);
-        assert!(configured.detail.contains("kitty"));
-
-        f.launcher_terminal = Some("no-such-terminal --flag".to_owned());
-        let broken = check_terminal(&f);
-        assert_eq!(broken.status, DoctorStatus::Warn);
-        assert!(broken.detail.contains("launcher.conf"), "{}", broken.detail);
-
-        f.terminal_app_present = false;
-        f.launcher_terminal = None;
-        assert_eq!(check_terminal(&f).status, DoctorStatus::Warn);
-
-        f.launcher_terminal = Some("kitty".to_owned());
-        assert_eq!(check_terminal(&f).status, DoctorStatus::Ok);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2227,8 +2053,6 @@ mod tests {
             socket_dir: base,
             state_dir: base,
             log_dir: base,
-            launcher_bin_dir: base,
-            sway_config_dir: base,
             config_dir: base,
             home_dir: home,
             effective_uid: 0,
@@ -2383,8 +2207,6 @@ mod tests {
             state_dir: &base.join("data"),
             // `BasePaths` puts the log directory directly below the state root.
             log_dir: &base.join("state").join("logs"),
-            launcher_bin_dir: &base.join("bin"),
-            sway_config_dir: &base.join("sway"),
             config_dir: &config_dir,
             home_dir: Some(base),
             effective_uid: std::fs::metadata(base).unwrap().uid(),
@@ -2396,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_list_is_ordered_and_omits_linux_only_capabilities() {
+    fn macos_list_is_ordered() {
         let base = temp_dir("list");
         let bin = temp_dir("list-bin");
         write_exec(&bin, "git", 0o755);
@@ -2426,7 +2248,6 @@ mod tests {
                 "schema_version",
                 "worker_executable",
                 "login_shell",
-                "terminal",
                 "desktop_notifications",
                 "keychain",
                 "launchd_domain",
@@ -2435,16 +2256,6 @@ mod tests {
                 "launchd_agents_dir",
             ]
         );
-        for linux_only in [
-            "bin:rofi",
-            "bin:swaymsg",
-            "bin:python3",
-            "bin:timeout",
-            "launcher_scripts",
-            "sway_include",
-        ] {
-            assert!(!names.contains(&linux_only), "{linux_only} leaked");
-        }
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&bin);
     }

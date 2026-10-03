@@ -9,11 +9,11 @@ use crate::generators::common::{frontmatter, write_concept_file, ConceptFrontmat
 use crate::XtaskError;
 
 struct ConfigDescriptor {
-    /// File-system slug for the concept id and output file name, e.g. `launcher-conf`.
+    /// File-system slug for the concept id and output file name, e.g. `attach-conf`.
     id: &'static str,
-    /// Human-readable config file name, e.g. `launcher.conf`.
+    /// Human-readable config file name, e.g. `attach.conf`.
     file_name: &'static str,
-    /// Brief one-liner title suffix, e.g. `Main launcher configuration`.
+    /// Brief one-liner title suffix, e.g. `Attach reconnect configuration`.
     title_suffix: &'static str,
     /// Brief one-liner description.
     description: &'static str,
@@ -50,12 +50,16 @@ static CONFIGS: &[ConfigDescriptor] = &[
         intents: &["setup", "help"],
     },
     ConfigDescriptor {
-        id: "launcher-conf",
-        file_name: "launcher.conf",
-        title_suffix: "Main launcher configuration",
-        description: "Main launcher configuration file. Controls host, terminal, rofi integration.",
-        location: "Written to the pohunek data directory by `pohunek setup config`.",
-        format: "Key-value text file. Lines beginning with `#` are comments.",
+        id: "attach-conf",
+        file_name: "attach.conf",
+        title_suffix: "Attach reconnect configuration",
+        description: "Attach reconnect settings read by `pohunek attach`: retry window, \
+                      retry interval, and maximum attempts.",
+        location: "Written to the pohunek config directory by `pohunek setup config`; \
+                   existing files are never overwritten without `--force`.",
+        format: "Key-value text file. Lines beginning with `#` are comments. Recognised keys: \
+                 `attach_reconnect_seconds`, `attach_reconnect_interval_seconds`, \
+                 `attach_reconnect_max_attempts`.",
         intents: &["setup", "help"],
     },
     ConfigDescriptor {

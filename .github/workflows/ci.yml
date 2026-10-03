@@ -651,8 +651,6 @@ jobs:
               - 'crates/xtask/**'
               - 'rust-toolchain*'
               - 'compat/**'
-              - 'scripts/lib.sh'
-              - 'scripts/pohunek-*'
               - 'README.md'
               - 'LICENSE'
               - 'scripts/acceptance/macos-package-install'

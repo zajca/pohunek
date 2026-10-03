@@ -50,7 +50,6 @@ fn build_docs_copies_files_and_writes_deterministic_manifest() {
     assert!(second.bundle_dir.join("reference/cli").is_dir());
     assert!(second.bundle_dir.join("reference/protocol").is_dir());
     assert!(second.bundle_dir.join("reference/config").is_dir());
-    assert!(second.bundle_dir.join("reference/setup-assets").is_dir());
 
     let manifest: serde_json::Value =
         serde_json::from_str(&second_manifest).expect("manifest is json");

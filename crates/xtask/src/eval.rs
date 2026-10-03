@@ -71,18 +71,23 @@ pub(crate) static FIXTURES: &[FixtureState] = &[
         planned_commands: &[],
     },
     FixtureState {
-        id: "launcher-misconfigured",
-        description: "The daemon is running but launcher scripts are missing or \
-                       stale. `pohunek doctor` reports missing launcher binaries.",
-        expected_outcome: "Assistant recommends `pohunek setup scripts` and \
-                           then verifying with `pohunek doctor --json`.",
-        assistant_command: "pohunek assistant setup launcher misconfigured",
-        transcript_path: "target/pohunek-eval/transcripts/launcher-misconfigured.md",
-        required_terms: &["setup", "scripts", "doctor"],
+        id: "config-not-installed",
+        description: "The daemon is running but the default config and prompt \
+                       templates were never installed. A project action fails \
+                       with `prompt_not_found` because \
+                       `prompts/<name>.tmpl` is missing from the config \
+                       directory.",
+        expected_outcome: "Assistant recommends `pohunek setup config` to \
+                           create the missing prompt templates, then \
+                           re-running the failed action and checking the \
+                           resolved actions with `pohunek project actions \
+                           <id-or-label> --json`.",
+        assistant_command: "pohunek assistant setup config not installed",
+        transcript_path: "target/pohunek-eval/transcripts/config-not-installed.md",
+        required_terms: &["setup", "config", "prompt"],
         example_commands: &[
-            "pohunek setup scripts",
             "pohunek setup config",
-            "pohunek doctor --json",
+            "pohunek project actions demo --json",
             "pohunek health --json",
         ],
         planned_commands: &[],
@@ -107,22 +112,20 @@ pub(crate) static FIXTURES: &[FixtureState] = &[
         planned_commands: &[],
     },
     FixtureState {
-        id: "stale-setup-assets",
-        description: "The binary was updated but setup assets are stale. \
-                       `pohunek doctor` reports version mismatch in launcher \
-                       scripts.",
+        id: "stale-installation",
+        description: "The CLI binary was updated but the running daemon was not \
+                       restarted. `pohunek health` reports a `daemon_version` \
+                       that differs from the updated CLI's version.",
         expected_outcome: "Assistant recommends running the update-after-release \
-                           runbook: refresh scripts, verify health, check \
-                           capabilities.",
-        assistant_command: "pohunek assistant update stale setup assets",
-        transcript_path: "target/pohunek-eval/transcripts/stale-setup-assets.md",
-        required_terms: &["scripts", "health", "capabilities"],
+                           runbook: verify health versions, check capabilities, \
+                           review config.",
+        assistant_command: "pohunek assistant update stale installation",
+        transcript_path: "target/pohunek-eval/transcripts/stale-installation.md",
+        required_terms: &["config", "health", "capabilities"],
         example_commands: &[
-            "pohunek setup scripts",
-            "pohunek setup config",
             "pohunek health --json",
             "pohunek host inspect local --json",
-            "pohunek doctor --json",
+            "pohunek setup config",
         ],
         planned_commands: &[],
     },

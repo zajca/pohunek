@@ -3,7 +3,7 @@
 //! These types define the JSON shape carried by `host.discover` (see
 //! `crate::method::HOST_DISCOVER`). Discovery enumerates the local host's `NetBird`
 //! peers and classifies each by probing its daemon control port, so the operator
-//! (and the rofi switcher) sees which peers run a compatible daemon.
+//! (and any host-switching client) sees which peers run a compatible daemon.
 //!
 //! The CLI performs peer enumeration plus bounded concurrent probing directly,
 //! using a short owner-private persistent cache; it therefore needs local
@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 /// How a `NetBird` peer is classified for `host.discover`.
 ///
-/// Serializes with an internal `classification` tag so a `--json` consumer (and
-/// the rofi switcher) can branch on it, e.g.
+/// Serializes with an internal `classification` tag so a `--json` consumer
+/// can branch on it, e.g.
 /// `{"classification":"reachable_daemon","daemon_version":"0.1.0"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -45,7 +45,7 @@ pub enum HostClass {
 
 /// One enumerated host with its overlay identity and classification.
 ///
-/// Field order and names are part of the wire contract the rofi switcher parses.
+/// Field order and names are part of the wire contract `--json` consumers parse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostRecord.ts"))]

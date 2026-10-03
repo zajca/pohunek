@@ -439,8 +439,8 @@ fn store_error(err: io::Error) -> ProtocolError {
 
 /// Reject a blank or control-character-bearing custom name. A blank label leaves
 /// a project referenceable only by its `p-…` id; a tab/newline in a label would
-/// corrupt the rofi switcher's tab-delimited rows and — via a newline-split row —
-/// smuggle an unvalidated fragment into the switcher's sway criteria. The label is
+/// corrupt tab-delimited rows in line-oriented clients and — via a newline-split
+/// row — smuggle an unvalidated fragment into them. The label is
 /// attacker-influenceable on a remote host, so this is the trust boundary.
 fn validate_project_name(name: &str) -> Result<(), ProtocolError> {
     if name.trim().is_empty() {
@@ -700,8 +700,8 @@ mod tests {
         assert_eq!(err.code, "bad_request", "got: {err:?}");
 
         // A control char (tab/newline) in a name is rejected — it would corrupt
-        // the switcher's tab-delimited rows and split-row a fragment into sway
-        // criteria.
+        // tab-delimited rows in line-oriented clients and split-row a fragment
+        // into them.
         for bad in ["ui\tevil", "ui\nevil", "x\u{7f}y"] {
             let err = pm
                 .rename(&added.id, bad.to_owned())
