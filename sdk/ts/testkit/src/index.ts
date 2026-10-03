@@ -18,3 +18,20 @@ export { FixtureScenario } from "./scenario";
 export type { ScenarioNotificationInput, ScenarioResize } from "./scenario";
 export { MACOS_FIXTURE_ROOT_PARENT, createFixtureRoot, createFixtureRootSync } from "./runtime-root";
 export type { FixtureRootOptions } from "./runtime-root";
+export {
+  addDaemonContext,
+  daemonBinaryPath,
+  delay,
+  GIT_FIXTURE_SCRIPT,
+  errorFromUnknown,
+  isRecord,
+  startDaemonProcess,
+  withResource,
+  withTimeout,
+} from "./real-daemon";
+export type {
+  DaemonContext,
+  DaemonProcess,
+  DaemonProcessOptions,
+  ExitStatus,
+} from "./real-daemon";
