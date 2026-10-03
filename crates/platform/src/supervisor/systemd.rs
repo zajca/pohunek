@@ -1824,19 +1824,19 @@ mod tests {
     /// driven by callers that run it on a plain thread.
     #[test]
     fn connect_without_a_tokio_runtime_reports_an_unreachable_bus() {
-        let missing_bus = tempfile::tempdir()
-            .expect("scratch directory")
-            .path()
-            .join("no-such-bus");
+        /// Upper bound for the refused connect; a missing socket fails at
+        /// once, so the bound only matters if the connect path hangs.
+        const CONNECT_BOUND: Duration = Duration::from_secs(5);
+        let root = pohunek_test_support::tempdir().expect("scratch directory");
+        let missing_bus = root.path().join("no-such-bus");
         let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
         env.set(
             "DBUS_SESSION_BUS_ADDRESS",
             format!("unix:path={}", missing_bus.display()),
         );
-        let outcome =
-            std::thread::spawn(|| async_io::block_on(Bus::connect(Duration::from_secs(5))))
-                .join()
-                .expect("connecting outside a Tokio runtime must not panic");
+        let outcome = std::thread::spawn(|| async_io::block_on(Bus::connect(CONNECT_BOUND)))
+            .join()
+            .expect("connecting outside a Tokio runtime must not panic");
         assert!(matches!(outcome, Err(Error::Unavailable { .. })));
     }
 }
