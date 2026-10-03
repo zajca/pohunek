@@ -2,16 +2,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { constants } from "node:fs";
 import { access } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { isAbsolute } from "node:path";
 
 const DAEMON_READY_TIMEOUT_MS = 10_000;
 const DAEMON_READY_POLL_MS = 50;
 const DAEMON_TERM_GRACE_MS = 5_000;
-
-const TESTKIT_SRC_DIR = dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = resolve(TESTKIT_SRC_DIR, "../../../..");
-const DEFAULT_DAEMON_BIN = join(REPO_ROOT, "target", "debug", "pohunekd");
 
 /**
  * `git` shim for a daemon whose `PATH` holds only its fixture `bin` directory:
@@ -52,18 +47,19 @@ export interface DaemonContext {
 }
 
 /**
- * Path of the `pohunekd` under test: `POHUNEK_DAEMON_BIN` (absolute) when set,
- * otherwise the workspace's debug build.
+ * Path of the `pohunekd` under test, taken from `POHUNEK_DAEMON_BIN`. The
+ * variable is required and must be absolute: testkit also runs from an
+ * installed release tarball, where no workspace build exists to fall back to.
  */
 export function daemonBinaryPath(): string {
-  const override = process.env["POHUNEK_DAEMON_BIN"];
-  if (override !== undefined && override.length > 0) {
-    if (!isAbsolute(override)) {
-      throw new Error("POHUNEK_DAEMON_BIN must be an absolute path");
-    }
-    return override;
+  const configured = process.env["POHUNEK_DAEMON_BIN"];
+  if (configured === undefined || configured.length === 0) {
+    throw new Error("POHUNEK_DAEMON_BIN must name the pohunekd binary under test");
   }
-  return DEFAULT_DAEMON_BIN;
+  if (!isAbsolute(configured)) {
+    throw new Error("POHUNEK_DAEMON_BIN must be an absolute path");
+  }
+  return configured;
 }
 
 /**
