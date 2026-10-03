@@ -268,6 +268,16 @@ version_b=$(manifest_field "$dir_b" version)
 [ "$(manifest_field "$dir_a" component)" = daemon ] || die "$archive_a is not a daemon archive"
 [ "$(manifest_field "$dir_b" component)" = daemon ] || die "$archive_b is not a daemon archive"
 [ "$(manifest_field "$dir_a" target)" = aarch64-apple-darwin ] || die "$archive_a is not an aarch64-apple-darwin archive"
+# The archives are the release shape: an ad-hoc signed daemon tree whose MANIFEST
+# says so and whose programs still verify after extraction.
+for archive_dir in "$dir_a" "$dir_b"; do
+  [ "$(manifest_field "$archive_dir" signing)" = adhoc ] || die "$archive_dir MANIFEST does not say 'signing adhoc'"
+  for program in pohunek pohunekd pohunek-sessiond; do
+    codesign --verify --strict "$archive_dir/$program" || die "$archive_dir/$program has no valid signature"
+    codesign -dvv "$archive_dir/$program" 2>&1 | grep -q '^Signature=adhoc' ||
+      die "$archive_dir/$program is not ad-hoc signed"
+  done
+done
 printf 'version A %s, version B %s, prefix %s\n' "$version_a" "$version_b" "$prefix"
 
 installed_cli="$prefix/bin/pohunek"

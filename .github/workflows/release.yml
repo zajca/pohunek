@@ -19,8 +19,11 @@ name: Release
 # the gate is duplicated here: no binary is published from a commit that fails
 # fmt, clippy, or tests.
 #
-# The native Apple Silicon archives are built by `build-macos` on macOS runners,
-# signed with a Developer ID certificate, and notarized; see that job.
+# The native Apple Silicon archives are built on macOS runners and ad-hoc signed
+# (no Developer ID, no notarization, no secret); see the macOS job comment. Every
+# published asset (Linux, macOS, SDK) gets a build-provenance attestation from
+# the `attest` job, the only job that holds `id-token: write`, and the publish
+# jobs wait for it.
 on:
   push:
     tags:
@@ -287,7 +290,7 @@ jobs:
 
   sdk-publish:
     name: Publish TypeScript SDK release assets
-    needs: [sdk-pack]
+    needs: [sdk-pack, attest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -502,7 +505,7 @@ jobs:
 
   publish:
     name: Publish ${{ matrix.component }} for ${{ matrix.target }}
-    needs: [build]
+    needs: [build, attest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -544,25 +547,29 @@ jobs:
             ${{ runner.temp }}/release-download/*.tar.gz
             ${{ runner.temp }}/release-download/*.tar.gz.sha256
 
-  # Signed and notarized native Apple Silicon archives (issue #104), in three
-  # jobs so that signing credentials never share a runner with build code:
+  # Ad-hoc signed native Apple Silicon archives (issues #104, #481), in four
+  # jobs so that no built program runs after the final bytes are produced:
   #
   #   stage-macos    builds against the macOS 14.0 deployment target on the
   #                  maintained macos-15 image (packaging/macos/DEPLOYMENT_TARGET,
   #                  enforced by the Mach-O audit), runs the built `pohunek` for
-  #                  the completions, audits the tree, and uploads it. No secret.
-  #   sign-macos     a fresh runner in the protected `macos-signing` environment
-  #                  downloads the staged tree, checks it, and signs, notarizes,
-  #                  verifies, and archives it. It runs no program from the tree
-  #                  and uses only pinned actions. Missing credentials fail it
-  #                  before any work: a macOS archive is never published unsigned
-  #                  and the run stays red until the credentials exist.
-  #   verify-macos   extracts the signed archive outside the checkout, verifies
-  #                  its signatures, and runs the packaged smokes. Read-only
-  #                  token, no secret.
-  #   publish-macos  downloads the signed archive again on a fresh runner,
-  #                  checks its checksum, and attaches it without running
-  #                  anything from it. The only job with a write token.
+  #                  the completions, audits the tree, and uploads it.
+  #   package-macos  a fresh runner downloads the staged tree, checks it, ad-hoc
+  #                  signs every Mach-O file, verifies the signatures, writes the
+  #                  manifest over the signed bytes, and archives it. It is a
+  #                  separate job so that it runs nothing from the tree: the
+  #                  program that wrote the completions never shares a runner
+  #                  with the signing step that produces the final bytes.
+  #   verify-macos   extracts the archive outside the checkout, verifies its
+  #                  signatures, and runs the packaged smokes.
+  #   publish-macos  downloads the archive again on a fresh runner, checks its
+  #                  checksum, and attaches it without running anything from it.
+  #                  The only macOS job with a write token, and it waits for
+  #                  `attest`.
+  #
+  # No macOS job uses an environment, a secret, or a repository variable: an
+  # ad-hoc signature needs no credential. The archive's provenance comes from
+  # the `attest` job, not from a signer identity.
   #
   # Running the archives on macOS 14 itself is a separate acceptance gate.
   stage-macos:
@@ -633,12 +640,13 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  sign-macos:
-    name: Sign ${{ matrix.component }} for aarch64-apple-darwin
+  package-macos:
+    name: Package ${{ matrix.component }} for aarch64-apple-darwin
     needs: [stage-macos]
     runs-on: macos-15
-    environment: macos-signing
-    timeout-minutes: 90
+    timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -651,29 +659,6 @@ jobs:
       - name: Verify native runner architecture
         shell: bash
         run: test "$(uname -m)" = "arm64"
-
-      - name: Require signing and notarization credentials
-        shell: bash
-        env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          missing=()
-          for variable in MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD \
-            APPLE_NOTARY_KEY_P8_BASE64 APPLE_NOTARY_KEY_ID APPLE_NOTARY_ISSUER_ID MACOS_TEAM_ID; do
-            if [[ -z "${!variable}" ]]; then
-              missing+=("$variable")
-            fi
-          done
-          if (( ${#missing[@]} > 0 )); then
-            echo "::error::macOS release credentials are missing (${missing[*]}); the public macOS release gate stays failed and no unsigned macOS archive is published"
-            exit 1
-          fi
 
       - name: Download the staged tree
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -704,38 +689,20 @@ jobs:
           tar -xf "$RUNNER_TEMP/stage-download/stage.tar" -C dist
           test -d "dist/${name}"
 
-      - name: Create ephemeral signing keychain
-        shell: bash
-        env:
-          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        run: packaging/macos/signing-keychain create
-
-      # Signs, notarizes, verifies, and archives the staged tree. It runs no
-      # program from the tree.
-      - name: Sign, notarize, verify, and package
+      # Audits the tree again, ad-hoc signs it, verifies the signatures, and
+      # archives it. It runs no program from the tree.
+      - name: Ad-hoc sign, verify, and package
         id: package
         shell: bash
-        env:
-          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
-          archive="$(packaging/macos/package --sign-release "${{ matrix.component }}" "${version}" \
+          archive="$(packaging/macos/package --adhoc-release "${{ matrix.component }}" "${version}" \
             "dist/pohunek-${{ matrix.component }}-${version}-aarch64-apple-darwin")"
           mkdir -p "$RUNNER_TEMP/signed-upload"
           cp "$archive" "$archive.sha256" "$RUNNER_TEMP/signed-upload/"
-
-      # Always removes the keychain, restoring the runner's search list.
-      - name: Remove ephemeral signing keychain
-        if: always()
-        shell: bash
-        run: packaging/macos/signing-keychain delete
 
       - name: Upload the signed archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -747,7 +714,7 @@ jobs:
 
   verify-macos:
     name: Verify ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [sign-macos]
+    needs: [package-macos]
     runs-on: macos-15
     timeout-minutes: 120
     permissions:
@@ -774,8 +741,6 @@ jobs:
       - name: Extract the archive and verify its signatures
         id: extract
         shell: bash
-        env:
-          MACOS_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
@@ -791,8 +756,8 @@ jobs:
             echo "extracted archive is inside a Git worktree: $root" >&2
             exit 1
           fi
-          grep -q '^signing developer-id$' "$root/MANIFEST"
-          packaging/macos/verify-signed --notarized --team-id "$MACOS_TEAM_ID" "$root"
+          grep -q '^signing adhoc$' "$root/MANIFEST"
+          packaging/macos/verify-signed --adhoc "$root"
           echo "root=$root" >> "$GITHUB_OUTPUT"
 
       - name: Smoke-test the packaged daemon binaries
@@ -855,9 +820,63 @@ jobs:
             --pohunek-bin "$release_pohunek"
           PATH="/bin:$PATH" "$packaged_smoke" "$release_pohunek" "${{ steps.hermes.outputs.bin }}"
 
+  # Build-provenance attestations for every published archive, tarball, and
+  # checksum file. The
+  # only job with `id-token: write` and `attestations: write`: it checks out
+  # nothing, only downloads the already built and verified assets, checks their
+  # checksum files, and attests them, so no code from this repository or from an
+  # asset runs while the OIDC token is available. Every publish job waits for
+  # it, so an unattested asset is never attached to the release.
+  attest:
+    name: Attest release assets
+    needs: [build, verify-macos, sdk-pack]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the Linux archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/attest-assets
+
+      - name: Download the macOS archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: macos-signed-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/attest-assets
+
+      - name: Download the SDK tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-release-assets
+          path: ${{ runner.temp }}/attest-assets
+
+      # Every asset has exactly one checksum file, and each one matches.
+      - name: Check the asset checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/attest-assets"
+          sha256sum -c ./*.sha256
+          test "$(ls ./*.tar.gz ./*.tgz | wc -l)" = "$(ls ./*.sha256 | wc -l)"
+
+      - name: Attest the release assets
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/attest-assets/*.tar.gz
+            ${{ runner.temp }}/attest-assets/*.tgz
+            ${{ runner.temp }}/attest-assets/*.sha256
+
   publish-macos:
     name: Publish ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [verify-macos]
+    needs: [verify-macos, attest]
     runs-on: macos-15
     timeout-minutes: 30
     permissions:

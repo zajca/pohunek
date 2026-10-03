@@ -1,5 +1,19 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-03)
+
+- Documented the macOS release shape: `aarch64-apple-darwin` CLI and daemon
+  archives are ad-hoc signed (`signing adhoc` in the `MANIFEST`), not notarized,
+  and every release asset, including the `.sha256` checksum files, has a
+  GitHub build-provenance attestation
+  (`gh attestation verify <file> --repo zajca/pohunek`). The install-on-macos
+  runbook covers the Homebrew formula (`zajca/pohunek/pohunek`, with
+  `pohunek service install|upgrade|uninstall` around brew operations), the
+  `curl -fLO` archive path, and troubleshooting for Gatekeeper on browser
+  downloads and the Keychain re-prompt after an upgrade. The source map drops
+  the Developer ID keychain and notarization scripts and describes
+  `packaging/macos/sign`, `verify-signed --adhoc`, and `package --adhoc-release`.
+
 ## Unreleased (2026-09-29)
 
 - Moved the `pohunek attach` reconnect settings from `launcher.conf` to the

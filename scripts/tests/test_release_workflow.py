@@ -1,7 +1,9 @@
 """Structural checks on release.yml: write-token jobs run no repository code.
 
 A job holding `contents: write` may only download an artifact, check it, and
-attach it. The checks compare every action and every `run:` script of such a
+attach it. The one job holding `id-token: write` and `attestations: write`
+(`attest`) may only download artifacts, check their checksums, and attest them,
+and no other job may hold either scope. The checks compare every action and every `run:` script of such a
 job against exact allowlists, so any other step, any other pinned action, and
 any edit that smuggles a command into an allowed script (a substitution, a
 pipe into a shell, a redirect) fails the test until the allowlist is updated
@@ -19,6 +21,14 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "rele
 ALLOWED_WRITE_ACTIONS = {
     "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
     "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
+}
+
+# The only actions the attest job may use: the artifact download and the
+# attestation itself, both pinned to exact commits.
+ATTEST_JOB = "attest"
+ATTEST_ALLOWED_ACTIONS = {
+    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
 }
 
 # The only `run:` scripts a write-token job may contain, as normalized lines
@@ -47,6 +57,18 @@ ALLOWED_WRITE_SCRIPTS = {
     ),
 }
 
+# The only `run:` script of the attest job. It checks the downloaded checksums
+# and that every asset has exactly one checksum file; nothing in it executes
+# downloaded data.
+ATTEST_ALLOWED_SCRIPTS = {
+    (
+        "set -euo pipefail",
+        'cd "$RUNNER_TEMP/attest-assets"',
+        "sha256sum -c ./*.sha256",
+        'test "$(ls ./*.tar.gz ./*.tgz | wc -l)" = "$(ls ./*.sha256 | wc -l)"',
+    ),
+}
+
 JOB_HEADER = re.compile(r"^  ([a-z][a-z0-9-]*):\n", re.M)
 USES = re.compile(r"^\s+(?:- )?uses:\s*(\S+)", re.M)
 RUN = re.compile(r"^(\s+)(?:- )?run:\s*(.*)$", re.M)
@@ -59,6 +81,13 @@ PERMISSIONS_LINE = re.compile(r"^\s*['\"]?permissions['\"]?\s*:", re.M)
 CANONICAL_JOB_PERMISSIONS = re.compile(
     r"^    permissions:\n      contents: (read|write)\n(?!      \S)", re.M
 )
+# The attest job's token block: read access plus the two OIDC scopes, nothing
+# else. It is valid for the `attest` job only.
+ATTEST_JOB_PERMISSIONS = re.compile(
+    r"^    permissions:\n      contents: read\n      id-token: write\n      attestations: write\n(?!      \S)",
+    re.M,
+)
+OIDC_SCOPE = re.compile(r"^\s*['\"]?(id-token|attestations)['\"]?\s*:", re.M)
 # A plain scalar value: its first character may not open a flow collection,
 # an anchor, an alias, a tag, a block scalar, or a quoted string.
 _SCALAR = r"[^\s{}\[\]&*!|>'\"%@`][^\n]*"
@@ -81,6 +110,29 @@ CANONICAL_WRITE_JOB_LINES = [
         rf"          (name|path): {_SCALAR}",
         r"          fail_on_unmatched_files: true",
         r"          files: \|",
+        r"            \$\{\{ runner\.temp \}\}/[a-z-]+/[A-Za-z0-9_.*-]+",
+        r"        shell: bash",
+        r"        run: \|",
+        r"\s*#[^\n]*",
+    )
+]
+
+
+ATTEST_JOB_LINES = [
+    re.compile(pattern)
+    for pattern in (
+        rf"    (name|needs|runs-on|timeout-minutes): {_SCALAR}",
+        r"    needs: \[[a-z0-9, -]+\]",
+        r"    (permissions|steps):",
+        r"      contents: read",
+        r"      id-token: write",
+        r"      attestations: write",
+        rf"      - name: {_SCALAR}",
+        r"        uses: [a-z0-9_.-]+/[a-z0-9_.-]+@[0-9a-f]{40}( # v[0-9.]+)?",
+        r"        with:",
+        rf"          (name|path|pattern): {_SCALAR}",
+        r"          merge-multiple: true",
+        r"          subject-path: \|",
         r"            \$\{\{ runner\.temp \}\}/[a-z-]+/[A-Za-z0-9_.*-]+",
         r"        shell: bash",
         r"        run: \|",
@@ -129,12 +181,25 @@ def run_scripts(block: str) -> list[tuple[str, ...]]:
 
 
 def permission_violations(name: str, block: str) -> list[str]:
-    """A job's token grant must be absent or spelled canonically."""
+    """A job's token grant must be absent or spelled canonically.
+
+    The OIDC scopes belong to the attest job alone, in exactly one spelling.
+    """
     granted = len(PERMISSIONS_LINE.findall(block))
     canonical = len(CANONICAL_JOB_PERMISSIONS.findall(block + "\n"))
+    attest_grants = len(ATTEST_JOB_PERMISSIONS.findall(block + "\n"))
+    violations = []
+    if name == ATTEST_JOB:
+        if attest_grants != 1 or granted != 1 or len(OIDC_SCOPE.findall(block)) != 2:
+            violations.append(
+                f"{name} must declare exactly `contents: read`, `id-token: write`, `attestations: write`"
+            )
+        return violations
     if granted != canonical:
-        return [f"{name} declares permissions in a form the guard does not recognize"]
-    return []
+        violations.append(f"{name} declares permissions in a form the guard does not recognize")
+    if OIDC_SCOPE.search(block):
+        violations.append(f"{name} mentions id-token or attestations, which only {ATTEST_JOB} may hold")
+    return violations
 
 
 def lines_outside_run_bodies(block: str) -> list[str]:
@@ -180,6 +245,26 @@ def jobs_section_violations(text: str) -> list[str]:
     return violations
 
 
+def attest_job_violations(name: str, block: str) -> list[str]:
+    """Everything the attest job does beyond downloading, checking, and attesting.
+
+    Fails closed like the write-token check: every line outside run bodies must
+    match a canonical shape, every action must be allowlisted (so no checkout),
+    and every script must be the allowlisted checksum check.
+    """
+    violations = []
+    for line in lines_outside_run_bodies(block):
+        if line.strip() and not any(shape.fullmatch(line) for shape in ATTEST_JOB_LINES):
+            violations.append(f"{name} has a line outside the canonical shapes: {line!r}")
+    for action in USES.findall(block):
+        if action not in ATTEST_ALLOWED_ACTIONS:
+            violations.append(f"{name} uses {action} with an OIDC token")
+    for script in run_scripts(block):
+        if script not in ATTEST_ALLOWED_SCRIPTS:
+            violations.append(f"{name} runs a script outside the allowlist: {script!r}")
+    return violations
+
+
 def write_job_violations(text: str) -> list[str]:
     """Everything a write-token job does beyond the allowlisted steps.
 
@@ -192,9 +277,14 @@ def write_job_violations(text: str) -> list[str]:
         r"(?m)^permissions:\n  contents: read\n(?!  \S)", header + "\n"
     ):
         violations.append("the workflow default token is not exactly `contents: read`")
+    if OIDC_SCOPE.search(header):
+        violations.append("the workflow default token mentions id-token or attestations")
     violations.extend(jobs_section_violations(text))
     for name, block in jobs(text).items():
         violations.extend(permission_violations(name, block))
+        if name == ATTEST_JOB:
+            violations.extend(attest_job_violations(name, block))
+            continue
         if not holds_write_token(block):
             continue
         for line in lines_outside_run_bodies(block):
@@ -231,6 +321,61 @@ class WriteTokenJobTests(unittest.TestCase):
             ["publish", "publish-macos", "sdk-publish"],
         )
 
+    def test_only_the_attest_job_holds_oidc_scopes(self):
+        holders = sorted(
+            name for name, block in self.jobs.items() if OIDC_SCOPE.search(block)
+        )
+        self.assertEqual(holders, [ATTEST_JOB])
+        self.assertRegex(self.jobs[ATTEST_JOB], ATTEST_JOB_PERMISSIONS)
+        self.assertFalse(holds_write_token(self.jobs[ATTEST_JOB]))
+
+    def test_attest_job_waits_for_every_asset_producer(self):
+        self.assertRegex(
+            self.jobs[ATTEST_JOB], r"(?m)^    needs: \[build, verify-macos, sdk-pack\]$"
+        )
+
+    def test_attest_job_checks_out_nothing(self):
+        attest = self.jobs[ATTEST_JOB]
+        self.assertNotIn("actions/checkout", attest)
+        self.assertNotIn("persist-credentials", attest)
+
+    def test_attest_subjects_cover_every_archive_kind(self):
+        attest = self.jobs[ATTEST_JOB]
+        for glob in ("*.tar.gz", "*.tgz", "*.sha256"):
+            self.assertIn(f"${{{{ runner.temp }}}}/attest-assets/{glob}", attest)
+
+    def test_attest_subjects_cover_every_published_asset_pattern(self):
+        attest = self.jobs[ATTEST_JOB]
+        subjects = re.findall(
+            r"^            \$\{\{ runner\.temp \}\}/attest-assets/(\S+)$", attest, re.M
+        )
+        self.assertTrue(subjects)
+        kinds = (".sha256", ".tar.gz", ".tgz")
+        for name in ("publish", "publish-macos", "sdk-publish"):
+            published = re.search(
+                r"(?m)^          files: \|\n((?:            \$\{\{ .*\n)+)", self.jobs[name]
+            )
+            self.assertIsNotNone(published, name)
+            for pattern in published.group(1).splitlines():
+                pattern = pattern.strip()
+                kind = next((kind for kind in kinds if pattern.endswith(kind)), None)
+                with self.subTest(job=name, pattern=pattern):
+                    self.assertIsNotNone(kind, f"unknown asset kind: {pattern}")
+                    self.assertTrue(
+                        any(subject.endswith(kind) for subject in subjects),
+                        f"no attest subject covers {kind}",
+                    )
+
+    def test_every_publish_job_waits_for_the_attestation(self):
+        for name in ("publish", "publish-macos", "sdk-publish"):
+            with self.subTest(job=name):
+                needs = re.search(r"(?m)^    needs: \[([^\]]*)\]$", self.jobs[name])
+                self.assertIsNotNone(needs)
+                self.assertIn(ATTEST_JOB, [item.strip() for item in needs.group(1).split(",")])
+
+    def test_publish_macos_waits_for_verification_and_attestation(self):
+        self.assertRegex(self.jobs["publish-macos"], r"(?m)^    needs: \[verify-macos, attest\]$")
+
     def test_workflow_default_token_is_read_only(self):
         self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read$")
 
@@ -244,7 +389,7 @@ class WriteTokenJobTests(unittest.TestCase):
 
     def test_publish_job_mirrors_the_build_matrix(self):
         self.assertEqual(matrix_pairs(self.jobs["publish"]), matrix_pairs(self.jobs["build"]))
-        self.assertRegex(self.jobs["publish"], r"(?m)^    needs: \[build\]$")
+        self.assertRegex(self.jobs["publish"], r"(?m)^    needs: \[build, attest\]$")
 
 
 class LinkerSetupTests(unittest.TestCase):
@@ -405,6 +550,139 @@ jobs:
         self.assertTrue(
             self.violations("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", self.ALLOWED)
         )
+
+
+class AttestJobGuardRejectionTests(unittest.TestCase):
+    """The OIDC scopes stay on the attest job, in its allowlisted shape."""
+
+    WORKFLOW_TEXT = """name: Release
+permissions:
+  contents: read
+jobs:
+  build:
+    permissions:
+      contents: read
+    steps:
+      - run: cargo build
+  attest:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/attest-assets
+      - name: Check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/attest-assets"
+          sha256sum -c ./*.sha256
+          test "$(ls ./*.tar.gz ./*.tgz | wc -l)" = "$(ls ./*.sha256 | wc -l)"
+      - name: Attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/attest-assets/*.tar.gz
+            ${{ runner.temp }}/attest-assets/*.tgz
+            ${{ runner.temp }}/attest-assets/*.sha256
+"""
+
+    def test_the_allowlisted_attest_job_passes(self):
+        self.assertEqual(write_job_violations(self.WORKFLOW_TEXT), [])
+
+    def test_id_token_on_another_job_is_rejected(self):
+        for grant in (
+            "      contents: read\n      id-token: write\n",
+            "      contents: write\n      id-token: write\n",
+            "      id-token: write\n",
+        ):
+            text = self.WORKFLOW_TEXT.replace(
+                "  build:\n    permissions:\n      contents: read\n",
+                "  build:\n    permissions:\n" + grant,
+                1,
+            )
+            with self.subTest(grant=grant):
+                self.assertNotEqual(text, self.WORKFLOW_TEXT)
+                self.assertTrue(write_job_violations(text))
+
+    def test_attestations_on_another_job_is_rejected(self):
+        text = self.WORKFLOW_TEXT.replace(
+            "  build:\n    permissions:\n      contents: read\n",
+            "  build:\n    permissions:\n      contents: read\n      attestations: write\n",
+            1,
+        )
+        self.assertTrue(write_job_violations(text))
+
+    def test_a_flow_style_oidc_grant_is_rejected(self):
+        text = self.WORKFLOW_TEXT.replace(
+            "  build:\n    permissions:\n      contents: read\n",
+            "  build:\n    permissions: {id-token: write}\n",
+            1,
+        )
+        self.assertTrue(write_job_violations(text))
+
+    def test_an_oidc_scope_in_the_workflow_default_is_rejected(self):
+        text = self.WORKFLOW_TEXT.replace(
+            "permissions:\n  contents: read\njobs:",
+            "permissions:\n  contents: read\n  id-token: write\njobs:",
+            1,
+        )
+        self.assertTrue(write_job_violations(text))
+
+    def test_an_attest_job_with_an_extra_scope_is_rejected(self):
+        for extra in ("      contents: write\n", "      packages: write\n"):
+            text = self.WORKFLOW_TEXT.replace(
+                "      attestations: write\n", "      attestations: write\n" + extra, 1
+            )
+            with self.subTest(extra=extra):
+                self.assertTrue(write_job_violations(text))
+
+    def test_an_attest_job_missing_a_scope_is_rejected(self):
+        text = self.WORKFLOW_TEXT.replace("      attestations: write\n", "", 1)
+        self.assertTrue(write_job_violations(text))
+
+    def test_an_attest_job_that_checks_out_is_rejected(self):
+        text = self.WORKFLOW_TEXT.replace(
+            "    steps:\n      - name: Download\n",
+            "    steps:\n      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683\n"
+            "      - name: Download\n",
+            1,
+        )
+        self.assertNotEqual(text, self.WORKFLOW_TEXT)
+        self.assertTrue(write_job_violations(text))
+
+    def test_an_attest_job_that_runs_a_downloaded_file_is_rejected(self):
+        for command in (
+            "./attest-assets/pohunek --version",
+            "tar -xzf ./*.tar.gz && ./pohunek/pohunek",
+        ):
+            text = self.WORKFLOW_TEXT.replace(
+                "          sha256sum -c ./*.sha256\n",
+                "          sha256sum -c ./*.sha256\n          " + command + "\n",
+                1,
+            )
+            with self.subTest(command=command):
+                self.assertNotEqual(text, self.WORKFLOW_TEXT)
+                self.assertTrue(write_job_violations(text))
+
+    def test_an_attest_job_with_an_unlisted_action_is_rejected(self):
+        text = self.WORKFLOW_TEXT.replace(
+            "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6", "evil/payload@" + "0" * 40, 1
+        )
+        self.assertTrue(write_job_violations(text))
+
+    def test_an_attest_job_with_an_unlisted_step_key_is_rejected(self):
+        for extra in ("        env:\n          X: y\n", "        if: always()\n"):
+            text = self.WORKFLOW_TEXT.replace(
+                "      - name: Check\n", "      - name: Check\n" + extra, 1
+            )
+            with self.subTest(extra=extra):
+                self.assertTrue(write_job_violations(text))
 
 
 if __name__ == "__main__":

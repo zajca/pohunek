@@ -43,3 +43,8 @@ reading it afresh for every request and never caching it, logging it, putting it
 in an error, or writing it to config, session metadata, daemon state, or the
 event log. Relay credentials the CLI stores go through the same platform
 credential store and follow the same rule: references only, never values.
+
+On macOS the release binaries are ad-hoc signed, which gives them no stable
+designated requirement. After an upgrade the system may therefore ask again
+whether `pohunek` may access its `pohunek-relay` Keychain items; "Always Allow"
+applies to that build only. This is expected, not a sign of tampering.

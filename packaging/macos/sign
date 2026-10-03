@@ -1,17 +1,14 @@
 #!/bin/sh
-# Sign every Mach-O file and app bundle of an archive staging directory with
-# the Developer ID Application identity.
+# Ad-hoc sign every Mach-O file of an archive staging directory.
 #
 # usage: sign <staging-dir>
 #
-# The identity and keychain come from MACOS_SIGNING_IDENTITY and
-# MACOS_SIGNING_KEYCHAIN (set by `signing-keychain create`); both are required,
-# so a missing credential fails the build instead of producing an unsigned
-# artifact. Signatures use the hardened runtime and a secure timestamp, which
-# notarization requires. Bare binaries get the stable identifier
-# `io.github.zajca.pohunek.<file name>`; an app bundle is signed after its
-# executable and takes its identifier from its Info.plist. No entitlement is
-# requested unless `packaging/macos/entitlements/<file name>.plist` exists.
+# An ad-hoc signature (`codesign --sign -`) needs no certificate, keychain, or
+# secret: it seals the code so arm64 macOS will run it and a later modification
+# is detectable, but it names no signer. Every bare Mach-O file gets the stable
+# identifier `io.github.zajca.pohunek.<file name>`. Signing rewrites the file, so
+# it must run before the manifest hashes the tree. App bundles are not part of a
+# CLI or daemon archive and are refused.
 
 set -eu
 
@@ -23,14 +20,11 @@ fail() {
 [ "$#" -eq 1 ] || fail "usage: sign <staging-dir>"
 staging=$1
 [ -d "$staging" ] || fail "not a directory: $staging"
-[ -n "${MACOS_SIGNING_IDENTITY:-}" ] || fail "MACOS_SIGNING_IDENTITY is not set"
-[ -n "${MACOS_SIGNING_KEYCHAIN:-}" ] || fail "MACOS_SIGNING_KEYCHAIN is not set"
 for tool in codesign od find; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
 done
 
 identifier_prefix=io.github.zajca.pohunek
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 
 is_macho() {
     case $(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n') in
@@ -42,52 +36,18 @@ is_macho() {
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/pohunek-sign.XXXXXX")
 trap 'rm -rf -- "$scratch"' EXIT
 
-# Executables inside app bundles first, then the bundles; bare Mach-O files
-# outside any bundle are signed on their own.
-find "$staging" -type d -name '*.app' -prune -print | LC_ALL=C sort > "$scratch/apps"
+app=$(find "$staging" -type d -name '*.app' -print | head -n 1)
+[ -z "$app" ] || fail "app bundles are not signed here: $app"
 find "$staging" -type f -print | LC_ALL=C sort > "$scratch/files"
 signed=0
 while IFS= read -r file; do
-    inside_app=no
-    while IFS= read -r app; do
-        case $file in
-            "$app"/*) inside_app=yes ;;
-        esac
-    done < "$scratch/apps"
-    [ "$inside_app" = no ] || continue
     is_macho "$file" || continue
     name=$(basename "$file")
     printf 'signing %s\n' "$file"
-    entitlements=$script_dir/entitlements/$name.plist
-    if [ -f "$entitlements" ]; then
-        codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGNING_IDENTITY" --keychain "$MACOS_SIGNING_KEYCHAIN" \
-            --identifier "$identifier_prefix.$name" --entitlements "$entitlements" "$file"
-    else
-        codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGNING_IDENTITY" --keychain "$MACOS_SIGNING_KEYCHAIN" \
-            --identifier "$identifier_prefix.$name" "$file"
-    fi
+    codesign --force --sign - --identifier "$identifier_prefix.$name" "$file"
     codesign --verify --strict --verbose=2 "$file"
     signed=$((signed + 1))
 done < "$scratch/files"
-
-while IFS= read -r app; do
-    [ -n "$app" ] || continue
-    [ -d "$app/Contents/MacOS" ] || fail "$app has no Contents/MacOS"
-    for executable in "$app"/Contents/MacOS/*; do
-        [ -f "$executable" ] || continue
-        is_macho "$executable" || fail "$executable is not a Mach-O file"
-        printf 'signing %s\n' "$executable"
-        codesign --force --options runtime --timestamp \
-            --sign "$MACOS_SIGNING_IDENTITY" --keychain "$MACOS_SIGNING_KEYCHAIN" "$executable"
-    done
-    printf 'signing %s\n' "$app"
-    codesign --force --options runtime --timestamp \
-        --sign "$MACOS_SIGNING_IDENTITY" --keychain "$MACOS_SIGNING_KEYCHAIN" "$app"
-    codesign --verify --deep --strict --verbose=2 "$app"
-    signed=$((signed + 1))
-done < "$scratch/apps"
 
 [ "$signed" -gt 0 ] || fail "nothing to sign below $staging"
 printf 'sign: signed %s item(s)\n' "$signed"
