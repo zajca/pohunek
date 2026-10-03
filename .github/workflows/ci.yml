@@ -1622,6 +1622,30 @@ jobs:
       - name: Test web control center
         run: bun ./node_modules/@playwright/test/cli.js test --config web/frontend/playwright.config.ts
 
+      # Real SDK release tarballs installed by URL into a throwaway consumer
+      # whose registry is unreachable, so a packaging break fails the PR instead
+      # of the release.
+      # The packed tarballs must run under the oldest and the newest Node the
+      # docs promise (>= 20 for the socket transport, >= 22 for the WebSocket
+      # transport). The contract test runs its Node assertions with the binary
+      # named by POHUNEK_TEST_NODE_BIN (skipped when unset), so each step below
+      # runs the whole contract once per Node major.
+      - name: Install Node 20 for the SDK Node contract
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: SDK pack contract under Node 20
+        run: POHUNEK_TEST_NODE_BIN="$(command -v node)" bun test sdk/ts/scripts
+
+      - name: Install Node 22 for the SDK Node contract
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: SDK pack contract under Node 22
+        run: POHUNEK_TEST_NODE_BIN="$(command -v node)" bun test sdk/ts/scripts
+
       # The real daemon spawns `pohunek-sessiond` by path, and the Hermes plugin
       # e2e drives the real `pohunek` CLI, so all three binaries must be present.
       # They come from the build-bins artifact (issue #122): no Rust toolchain

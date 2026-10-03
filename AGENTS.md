@@ -172,6 +172,21 @@ NetBird. Bun remains the workspace runtime, but `node` must be available on
 `PATH` because the orchestrator runs Vite in a Node child process for WebSocket
 proxy compatibility; `POHUNEK_NODE_BIN` overrides a nonstandard Node path.
 
+The TypeScript SDK is released as three npm-pack tarballs
+(`pohunek-ts-protocol-X.Y.Z.tgz`, `pohunek-ts-sdk-X.Y.Z.tgz`,
+`pohunek-ts-testkit-X.Y.Z.tgz`, each with a `.sha256`) built by
+`sdk/ts/scripts/pack-release.ts` in the Release workflow's read-only `sdk-pack`
+job, which needs `sdk-gate`; the separate `sdk-publish` job attaches them. `bun test sdk/ts/scripts` is the pack contract: it
+packs, serves the tarballs from a local HTTP server and runs a real
+`bun install` of a consumer that pins them by URL against an unreachable
+registry. Run it after touching an SDK package manifest, export map or file
+layout. Manual pack:
+
+```bash
+SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" bun sdk/ts/scripts/pack-release.ts \
+  --version 0.0.0-test --base-url http://127.0.0.1:8765/rel --out /path/to/out
+```
+
 A protocol change is not done until `cargo xtask ts check` passes; regenerate
 with `cargo xtask ts generate`.
 

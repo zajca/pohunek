@@ -15,8 +15,18 @@ bun run lint
 bun test
 ```
 
-There is no npm publishing contract for this package and no stability promise
-before pohunek 1.0. Consume it from the Bun workspace or a local checkout.
+There is no npm registry publishing for this package and no stability promise
+before pohunek 1.0. Consume it from the Bun workspace, a local checkout, or the
+`pohunek-ts-sdk-X.Y.Z.tgz` release asset pinned by URL in `package.json`; its
+`@pohunek/protocol` dependency is rewritten to the sibling release asset of the
+same tag (see "TypeScript SDK Surface" in `docs/public-api.md`).
+
+The release asset contains compiled ES modules and `.d.ts` declarations (not
+TypeScript sources), so it runs under Bun and Node >= 20 (direct socket
+transport) and Node >= 22 (WebSocket transport), and type-checks under
+`moduleResolution` `bundler` and `nodenext`. The browser entry is
+`@pohunek/sdk/browser`. The Bun workspace inside this repository resolves the
+TypeScript sources directly.
 
 ## Connect and Call
 

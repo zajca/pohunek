@@ -65,6 +65,11 @@ const TASKS: readonly TypecheckTask[] = [
     args: [TSC_EXECUTABLE, "--noEmit", "-p", "web/release/test/tsconfig.json"],
   },
   {
+    name: "sdk-release",
+    cwd: REPO_ROOT,
+    args: [TSC_EXECUTABLE, "--noEmit", "-p", "sdk/ts/scripts/tsconfig.json"],
+  },
+  {
     name: "scripts-test",
     cwd: REPO_ROOT,
     args: [TSC_EXECUTABLE, "--noEmit", "-p", "web/scripts/test/tsconfig.json"],

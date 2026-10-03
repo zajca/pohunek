@@ -327,6 +327,12 @@ Release packaging and contributor verification:
   injected executor.
 - `.github/workflows/ci.yml`
 - `.github/workflows/release.yml`
+- `sdk/ts/scripts/pack-release.ts` — deterministic per-package npm-pack tarballs
+  of the TypeScript SDK (`pohunek-ts-{protocol,sdk,testkit}-X.Y.Z.tgz` plus
+  `.sha256`) whose inner `@pohunek/*` dependencies are rewritten to the
+  release-asset URLs.
+- `sdk/ts/scripts/test/pack-contract.test.ts` — real tarballs, a local HTTP
+  server and a real `bun install` of a URL-pinned consumer.
 - `README.md`
 - `packaging/install-daemon.sh` — release-archive wrapper that re-executes
   itself under `pohunek service lock` and retires a legacy template-unit
