@@ -7,10 +7,11 @@ name: Release
 # everything to a GitHub Release for that tag.
 #
 # The TypeScript SDK ships as three npm-pack tarballs (`pohunek-ts-protocol`,
-# `pohunek-ts-sdk`, `pohunek-ts-testkit`, each with a `.sha256`) built by
-# `sdk-release` after `sdk-gate`. Inner `@pohunek/*` dependencies inside the
-# tarballs are rewritten to this release's asset URLs, so a consumer pins one
-# URL and never resolves the `@pohunek` scope from a registry.
+# `pohunek-ts-sdk`, `pohunek-ts-testkit`, each with a `.sha256`), built by
+# `sdk-pack` after `sdk-gate` and attached by `sdk-publish`. Inner
+# `@pohunek/*` dependencies inside the tarballs are rewritten to this release's
+# asset URLs, so a consumer pins one URL and never resolves the `@pohunek`
+# scope from a registry.
 #
 # A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
 # the gate is duplicated here: no binary is published from a commit that fails
@@ -309,16 +310,21 @@ jobs:
           POHUNEK_CLI_BIN: ${{ github.workspace }}/target/debug/pohunek
           POHUNEK_PYTHON_BIN: /usr/bin/python3
 
-  sdk-release:
+  # The SDK tarballs are built with a read-only token and no persisted git
+  # credentials, because packing installs and runs npm dependencies. Only
+  # `sdk-publish`, which runs no repository or dependency code, can write.
+  sdk-pack:
     name: Pack TypeScript SDK release assets
     needs: [gate, docs-gate, sdk-gate, web-gate]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     env:
       SDK_ASSET_DIR: sdk-dist
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
@@ -346,17 +352,48 @@ jobs:
             --out "$SDK_ASSET_DIR"
           ( cd "$SDK_ASSET_DIR" && sha256sum -c ./*.sha256 )
 
+      - name: Upload SDK tarballs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sdk-release-assets
+          path: ${{ env.SDK_ASSET_DIR }}
+          if-no-files-found: error
+
+  sdk-publish:
+    name: Publish TypeScript SDK release assets
+    needs: [sdk-pack]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download SDK tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-release-assets
+          path: ${{ runner.temp }}/sdk-download
+
+      # One tarball per SDK package, each matching its checksum sidecar.
+      - name: Check the SDK tarball checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/sdk-download"
+          sha256sum -c ./*.tgz.sha256
+          for package in protocol sdk testkit; do
+            test "$(ls ./pohunek-ts-"$package"-*.tgz | wc -l)" = 1
+          done
+
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           fail_on_unmatched_files: true
           files: |
-            ${{ env.SDK_ASSET_DIR }}/pohunek-ts-protocol-*.tgz
-            ${{ env.SDK_ASSET_DIR }}/pohunek-ts-protocol-*.tgz.sha256
-            ${{ env.SDK_ASSET_DIR }}/pohunek-ts-sdk-*.tgz
-            ${{ env.SDK_ASSET_DIR }}/pohunek-ts-sdk-*.tgz.sha256
-            ${{ env.SDK_ASSET_DIR }}/pohunek-ts-testkit-*.tgz
-            ${{ env.SDK_ASSET_DIR }}/pohunek-ts-testkit-*.tgz.sha256
+            ${{ runner.temp }}/sdk-download/pohunek-ts-protocol-*.tgz
+            ${{ runner.temp }}/sdk-download/pohunek-ts-protocol-*.tgz.sha256
+            ${{ runner.temp }}/sdk-download/pohunek-ts-sdk-*.tgz
+            ${{ runner.temp }}/sdk-download/pohunek-ts-sdk-*.tgz.sha256
+            ${{ runner.temp }}/sdk-download/pohunek-ts-testkit-*.tgz
+            ${{ runner.temp }}/sdk-download/pohunek-ts-testkit-*.tgz.sha256
 
   web-release:
     name: Build web control center for Linux x86_64
