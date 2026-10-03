@@ -1306,7 +1306,7 @@ fn write_resume_agent_script(path: &std::path::Path, marker: &std::path::Path) {
 
 #[cfg(unix)]
 fn terminate_pid(pid: u32) {
-    let _ = std::process::Command::new("kill")
+    let _ = pohunek_test_support::process_env::command("kill")
         .arg("-TERM")
         .arg(pid.to_string())
         .status();
@@ -2212,7 +2212,7 @@ async fn wait_for_cwd_source(
 
 /// Run git in `dir`, asserting success (test helper for the worktree path).
 fn git_in(dir: &std::path::Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
+    let output = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -2233,7 +2233,7 @@ fn init_git_repo(tag: &str) -> PathBuf {
         .expect("store parent")
         .join("repo");
     std::fs::create_dir_all(&dir).expect("create repo dir");
-    let init = std::process::Command::new("git")
+    let init = pohunek_test_support::process_env::command("git")
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&dir)
         .output()
@@ -2257,7 +2257,7 @@ fn init_bare_git_repo(tag: &str) -> PathBuf {
         .parent()
         .expect("store parent")
         .join("bare.git");
-    let clone = std::process::Command::new("git")
+    let clone = pohunek_test_support::process_env::command("git")
         .args(["clone", "--bare", "-q"])
         .arg(&source)
         .arg(&bare)
@@ -2623,7 +2623,7 @@ async fn failed_launch_rolls_back_the_bound_worktree() {
     );
 
     // And git no longer holds feat/x in any worktree, so a fresh bind succeeds.
-    let listing = std::process::Command::new("git")
+    let listing = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(&repo)
         .args(["worktree", "list", "--porcelain"])
@@ -2707,7 +2707,7 @@ async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effe
                 .is_empty(),
             "no logical session record for {case}"
         );
-        let worktree_listing = std::process::Command::new("git")
+        let worktree_listing = pohunek_test_support::process_env::command("git")
             .arg("-C")
             .arg(repo)
             .args(["worktree", "list", "--porcelain"])
@@ -2768,7 +2768,7 @@ async fn failed_initial_input_rollback_frees_the_bound_worktree() {
     );
 
     // git no longer holds feat/x in any worktree, so a fresh bind succeeds.
-    let listing = std::process::Command::new("git")
+    let listing = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(&repo)
         .args(["worktree", "list", "--porcelain"])
@@ -16168,7 +16168,7 @@ async fn failed_commit_stop_and_retire_keep_the_session_reconnecting() {
 
     // The worker was killed, so its trapping child is an orphan now.
     if let Ok(pid) = fs::read_to_string(&pid_file) {
-        let _ = std::process::Command::new("kill")
+        let _ = pohunek_test_support::process_env::command("kill")
             .args(["-KILL", pid.trim()])
             .status();
     }

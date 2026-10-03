@@ -323,7 +323,6 @@ fn run_bounded(mut command: Command, timeout: Duration) -> Option<String> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
     use std::time::{Duration, Instant};
 
     use super::{detect, project_id, run_bounded};
@@ -334,7 +333,7 @@ mod tests {
     }
 
     fn git_ok(dir: &Path, args: &[&str]) {
-        let output = Command::new("git")
+        let output = pohunek_test_support::process_env::command("git")
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -348,7 +347,7 @@ mod tests {
     }
 
     fn git_stdout(dir: &Path, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let output = pohunek_test_support::process_env::command("git")
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -361,7 +360,7 @@ mod tests {
     /// Init a repo on branch `main` with one commit, returning its dir.
     fn init_repo(tag: &str) -> PathBuf {
         let dir = unique_dir(tag);
-        let init = Command::new("git")
+        let init = pohunek_test_support::process_env::command("git")
             .args(["-c", "init.defaultBranch=main", "init", "-q"])
             .arg(&dir)
             .output()
@@ -469,7 +468,7 @@ mod tests {
     fn detects_bare_repository() {
         let parent = unique_dir("bare");
         let bare = parent.join("repo.git");
-        let init = Command::new("git")
+        let init = pohunek_test_support::process_env::command("git")
             .args(["-c", "init.defaultBranch=main", "init", "--bare", "-q"])
             .arg(&bare)
             .output()
@@ -493,7 +492,7 @@ mod tests {
         // reader thread drains stdout concurrently with the wait — it must NOT
         // stall into the timeout and return None (which is what `git worktree
         // list --porcelain` on a busy repo would have done before the fix).
-        let mut cmd = Command::new("sh");
+        let mut cmd = pohunek_test_support::process_env::command("sh");
         cmd.arg("-c").arg("yes pohunek | head -c 200000");
         let out = run_bounded(cmd, Duration::from_secs(10)).expect("large output drains, not None");
         assert!(
@@ -515,7 +514,7 @@ mod tests {
         // reader would block for the full 30s. The direct child IS `sleep`, so the
         // kill closes the pipe at once — matching how `run_bounded` is really used
         // (it execs `git` directly, never through a shell).
-        let mut cmd = Command::new("sleep");
+        let mut cmd = pohunek_test_support::process_env::command("sleep");
         cmd.arg("30");
         let start = Instant::now();
         let out = run_bounded(cmd, Duration::from_millis(200));

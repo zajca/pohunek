@@ -245,7 +245,7 @@ fn daemon_worktree_add_ignores_command_scoped_hooks_path() {
 
     // Control: a git child that inherits the environment runs the hook, so the
     // override is effective for a Git that honors it.
-    let control = std::process::Command::new("git")
+    let control = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(&repo)
         .args(["worktree", "add", "-q", "--detach"])
@@ -382,7 +382,7 @@ fn daemon_fetch_under_exec_path() {
 
     // Control: a git child that inherits the environment runs the planted
     // helper, so the variable is effective for this Git.
-    let control = std::process::Command::new("git")
+    let control = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(&repo)
         .args(["fetch", "--no-tags", "origin", "main"])
@@ -531,7 +531,7 @@ fn daemon_git_subprocesses_under_user_variables() {
 
     // Control: a git child that inherits the environment hands every variable
     // to its transport, so the recorder observes them for this Git.
-    let control = std::process::Command::new("git")
+    let control = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(&repo)
         .args(["fetch", "--no-tags", "origin", "main"])
@@ -653,7 +653,7 @@ fn daemon_fetch_under_protocol_trust_marker() {
 
     // Control: a git child that inherits the marker refuses the fetch, so the
     // variable is effective for this Git.
-    let control = std::process::Command::new("git")
+    let control = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(&repo)
         .args(["fetch", "--no-tags", "origin", "main"])

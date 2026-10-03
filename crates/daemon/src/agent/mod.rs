@@ -623,9 +623,9 @@ mod tests {
     use std::ffi::OsStr;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
+    use pohunek_test_support::process_env::ProcessEnv;
     use protocol::{AgentActivity, ErrorClass};
 
     use super::{
@@ -636,8 +636,6 @@ mod tests {
         ValidatedLaunchProgram,
     };
     use crate::detect::{ManifestRegion, MatchContext};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn launch_opts(cwd: impl AsRef<Path>) -> LaunchOpts {
         LaunchOpts {
@@ -670,33 +668,15 @@ mod tests {
     }
 
     fn with_path<T>(path: &Path, run: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let old_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", path);
-        let result = run();
-        match old_path {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
-        result
+        let mut env = ProcessEnv::lock();
+        env.set("PATH", path);
+        run()
     }
 
     fn with_path_and_shell<T>(path: &Path, shell: &str, run: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let old_path = std::env::var_os("PATH");
-        let old_shell = std::env::var_os("SHELL");
-        std::env::set_var("PATH", path);
-        std::env::set_var("SHELL", shell);
-        let result = run();
-        match old_path {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
-        match old_shell {
-            Some(value) => std::env::set_var("SHELL", value),
-            None => std::env::remove_var("SHELL"),
-        }
-        result
+        let mut env = ProcessEnv::lock();
+        env.set("PATH", path).set("SHELL", shell);
+        run()
     }
 
     #[test]
@@ -774,7 +754,7 @@ mod tests {
         fs::create_dir(&relative_dir).expect("create relative bin");
         write_executable(&relative_dir, "hermes");
         write_executable(&cwd, "hermes");
-        let _cwd_guard = ENV_LOCK.lock().expect("env lock");
+        let _cwd_guard = ProcessEnv::lock();
         let old_cwd = std::env::current_dir().expect("cwd");
         std::env::set_current_dir(&cwd).expect("enter fixture cwd");
         let results = [
@@ -963,9 +943,8 @@ mod tests {
         fs::create_dir(&relative_dir).expect("create bin");
         write_executable(&relative_dir, "agent");
         write_executable(&cwd, "agent");
-        let _guard = ENV_LOCK.lock().expect("env lock");
+        let mut env = ProcessEnv::lock();
         let old_cwd = std::env::current_dir().expect("cwd");
-        let old_path = std::env::var_os("PATH");
         std::env::set_current_dir(&cwd).expect("enter fixture cwd");
         let refused = [
             ("bin", "agent"),
@@ -975,16 +954,12 @@ mod tests {
             ("/usr/bin", "bin/agent"),
         ]
         .map(|(path, program)| {
-            std::env::set_var("PATH", path);
+            env.set("PATH", path);
             (
                 resolve_binary(program).is_err(),
                 which_executable(program).is_none(),
             )
         });
-        match old_path {
-            Some(value) => std::env::set_var("PATH", value),
-            None => std::env::remove_var("PATH"),
-        }
         std::env::set_current_dir(old_cwd).expect("restore cwd");
         for (index, (launch, probe)) in refused.iter().enumerate() {
             assert!(*launch && *probe, "case {index}");

@@ -4438,6 +4438,7 @@ name = "pohunek-paths"
 version = "0.31.6"
 dependencies = [
  "nix 0.29.0",
+ "pohunek-test-support",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

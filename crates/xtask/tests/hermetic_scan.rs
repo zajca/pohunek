@@ -48,7 +48,21 @@
 //!   listener and is reported; hand the bound listener to the code under test
 //!   (`from_std`, a socket path from `TestEnv::socket_path`) instead.
 //!
-//! An occurrence on a line that carries, or follows a line that carries, a
+//! - `std::env::set_var` and `std::env::remove_var`, also written
+//!   `env::set_var`, a bare `set_var`/`remove_var` imported from `std::env`
+//!   (by name, aliased with `as`, or through a glob), in test code outside
+//!   `crates/test-support`. The process environment is shared by every test
+//!   thread of a binary, so a test that must change it does so through
+//!   `pohunek_test_support::process_env::ProcessEnv`, whose one binary-wide lock
+//!   and restore-on-drop make the change safe against concurrent writers and
+//!   readers; product code is not scanned. **No marker exempts this rule**: the
+//!   shared mechanism is the one sanctioned place, so a test that wants a
+//!   private lock or a bare mutation has to move onto `ProcessEnv` (or take the
+//!   value as an argument) instead of carrying an exception. Out of scope: a
+//!   mutation through `libc::setenv` or another FFI route, and a name that
+//!   `use` re-exports from a user module.
+//!
+//! Except for that rule, an occurrence on a line that carries, or follows a line that carries, a
 //! comment starting `// hermetic-allowed: #<issue> <reason>` is exempt. The
 //! marker must name an issue number and a non-empty reason; a malformed
 //! marker is itself a failure. The scan does not look the issue up.
@@ -105,6 +119,7 @@ enum Rule {
     TmpLiteral,
     Tempfile,
     PortZeroBind,
+    EnvMutation,
 }
 
 impl Rule {
@@ -114,7 +129,13 @@ impl Rule {
             Self::TmpLiteral => "host /tmp path literal",
             Self::Tempfile => "tempfile crate fixture outside pohunek_test_support",
             Self::PortZeroBind => "TcpListener::bind(..:0) whose listener is not kept",
+            Self::EnvMutation => "std::env::set_var/remove_var outside pohunek_test_support",
         }
+    }
+
+    /// Whether a `hermetic-allowed` marker may exempt an occurrence.
+    fn markable(self) -> bool {
+        self != Self::EnvMutation
     }
 
     fn fix(self) -> &'static str {
@@ -130,6 +151,11 @@ impl Rule {
                 "keep the bound listener and hand it to the code under test, or use a \
                  socket path from `TestEnv::socket_path`; never bind port 0, drop it and \
                  reuse the number"
+            }
+            Self::EnvMutation => {
+                "pass the value to the code under test, or change it through \
+                 `pohunek_test_support::process_env::ProcessEnv` (`lock()`, `set`, \
+                 `remove`); no marker exempts this rule"
             }
         }
     }
@@ -302,6 +328,138 @@ fn temp_dir_candidates(skeleton: &str) -> Vec<usize> {
         }
     }
     found
+}
+
+/// `std::env` mutators.
+const ENV_MUTATORS: [&str; 2] = ["set_var", "remove_var"];
+
+/// Whether a bare `set_var`/`remove_var` can denote the `std::env` function:
+/// imported by name, or through a glob of a path that ends in `env`.
+fn env_mutators_imported(skeleton: &str) -> bool {
+    if !imported_names(skeleton, "env", &ENV_MUTATORS).is_empty() {
+        return true;
+    }
+    let bytes = skeleton.as_bytes();
+    skeleton.match_indices("use ").any(|(at, _)| {
+        if !starts_word(bytes, at) {
+            return false;
+        }
+        let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+        let statement = &skeleton[at..end];
+        contains_word(statement, "env") && statement.contains('*')
+    })
+}
+
+/// `env::set_var` / `env::remove_var` uses, and an `as` alias of either in an
+/// import from `env`.
+fn env_mutation_candidates(skeleton: &str) -> Vec<usize> {
+    let bytes = skeleton.as_bytes();
+    let imported = env_mutators_imported(skeleton);
+    let aliases = env_module_aliases(skeleton);
+    let mut found = Vec::new();
+    for name in ENV_MUTATORS {
+        for (offset, qualifier) in named_uses(skeleton, name, false) {
+            let hit = match qualifier {
+                Qualifier::Path("env") => true,
+                Qualifier::Path(module) if aliases.contains(&module) => true,
+                Qualifier::Bare => imported && ident_before(bytes, offset) != "fn",
+                Qualifier::Path(_) | Qualifier::Method => false,
+            };
+            if hit {
+                found.push(offset);
+            }
+        }
+    }
+    // `use std::env::set_var as f;` hides every later call behind the alias.
+    for (at, _) in skeleton.match_indices("use ") {
+        if !starts_word(bytes, at) {
+            continue;
+        }
+        let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+        let statement = &skeleton[at..end];
+        if !contains_word(statement, "env") {
+            continue;
+        }
+        for name in ENV_MUTATORS {
+            for (offset, _) in statement.match_indices(name) {
+                let offset = at + offset;
+                let name_end = offset + name.len();
+                if starts_word(bytes, offset)
+                    && end_of_ident(bytes, offset) == name_end
+                    && expect_token(bytes, name_end, "as").is_some()
+                {
+                    found.push(offset);
+                }
+            }
+        }
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+/// Names that a `use` rooted at `std` binds to `std::env`: `use std::env as
+/// e;`, `use std::{env as e, fs};` and `use std::env::{self as e};`.
+///
+/// An import rooted elsewhere (`use crate::fixture::env as e;`) names another
+/// module and binds nothing here.
+fn env_module_aliases(skeleton: &str) -> Vec<&str> {
+    let bytes = skeleton.as_bytes();
+    let mut aliases = Vec::new();
+    for (at, _) in skeleton.match_indices("use ") {
+        if !starts_word(bytes, at) {
+            continue;
+        }
+        let end = skeleton[at..].find(';').map_or(skeleton.len(), |n| at + n);
+        let squeezed: String = skeleton[at..end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if !(squeezed.starts_with("usestd::") || squeezed.starts_with("use::std::")) {
+            continue;
+        }
+        for (offset, _) in skeleton[at..end].match_indices("env") {
+            let offset = at + offset;
+            let name_end = offset + "env".len();
+            if !starts_word(bytes, offset) || end_of_ident(bytes, offset) != name_end {
+                continue;
+            }
+            if let Some(alias) = alias_after(skeleton, name_end, end) {
+                aliases.push(alias);
+                continue;
+            }
+            // `env::{self as e, ..}` binds `e` to the module itself.
+            let Some(group) = expect_token(bytes, name_end, "::")
+                .and_then(|after| expect_token(bytes, after, "{"))
+            else {
+                continue;
+            };
+            let close = skeleton[group..end].find('}').map_or(end, |n| group + n);
+            for (self_at, _) in skeleton[group..close].match_indices("self") {
+                let self_at = group + self_at;
+                let self_end = self_at + "self".len();
+                if starts_word(bytes, self_at) && end_of_ident(bytes, self_at) == self_end {
+                    if let Some(alias) = alias_after(skeleton, self_end, close) {
+                        aliases.push(alias);
+                    }
+                }
+            }
+        }
+    }
+    aliases
+}
+
+/// The identifier in `as <ident>` right after `from`, when it ends before
+/// `limit`.
+fn alias_after(skeleton: &str, from: usize, limit: usize) -> Option<&str> {
+    let bytes = skeleton.as_bytes();
+    let after_as = expect_token(bytes, from, "as")?;
+    if bytes.get(after_as).copied().is_some_and(is_ident) {
+        return None;
+    }
+    let alias_start = skip_whitespace(bytes, after_as);
+    let alias_end = end_of_ident(bytes, alias_start);
+    (alias_end > alias_start && alias_end <= limit).then(|| &skeleton[alias_start..alias_end])
 }
 
 /// Whether the host temp path at `at` in `text` stands alone.
@@ -801,9 +959,15 @@ fn scan_files(files: &BTreeMap<String, String>) -> Scan {
                 .into_iter()
                 .map(|at| (at, Rule::PortZeroBind)),
         );
+        candidates.extend(
+            env_mutation_candidates(skeleton)
+                .into_iter()
+                .map(|at| (at, Rule::EnvMutation)),
+        );
         for (offset, rule) in candidates {
             let line = file.line_of(offset);
-            let allowed = valid.contains(&line) || valid.contains(&line.saturating_sub(1));
+            let allowed = rule.markable()
+                && (valid.contains(&line) || valid.contains(&line.saturating_sub(1)));
             if file.in_test_code(offset) && !allowed {
                 scan.violations.push(Violation {
                     path: path.clone(),
@@ -838,6 +1002,11 @@ fn evaluate(scan: &Scan) -> Vec<String> {
     failures
 }
 
+/// Whether any violation is of a rule a marker can exempt.
+fn rules_with_marker(violations: &[Violation]) -> bool {
+    violations.iter().any(|violation| violation.rule.markable())
+}
+
 /// How to fix each rule that `scan` broke, with the marker escape hatch.
 fn guidance(scan: &Scan) -> String {
     let rules: BTreeSet<Rule> = scan.violations.iter().map(|v| v.rule).collect();
@@ -845,12 +1014,14 @@ fn guidance(scan: &Scan) -> String {
     for rule in rules {
         let _ = writeln!(text, "- {}: {}", rule.label(), rule.fix());
     }
-    let _ = write!(
-        text,
-        "A case where the host state is the subject of the test takes \
-         `// {MARKER}: #<issue> <reason>` on or above the line."
-    );
-    text
+    if rules_with_marker(&scan.violations) {
+        let _ = write!(
+            text,
+            "A case where the host state is the subject of the test takes \
+             `// {MARKER}: #<issue> <reason>` on or above the line."
+        );
+    }
+    text.trim_end().to_owned()
 }
 
 fn scan_root(root: &std::path::Path) -> Scan {
@@ -1421,4 +1592,152 @@ fn tmp_followed_by_a_name_character_is_another_path() {
         assert_eq!(found.len(), 1, "{literal}: {found:?}");
         assert_eq!(found[0].1, Rule::TmpLiteral, "{literal}");
     }
+}
+
+#[test]
+fn every_env_mutation_call_form_is_flagged() {
+    for call in [
+        "std::env::set_var(\"K\", \"v\");",
+        "std::env::remove_var(\"K\");",
+        "env::set_var(\"K\", \"v\");",
+        "env::remove_var(\"K\");",
+        "::std::env::set_var(\"K\", \"v\");",
+        "std::env :: set_var(\"K\", \"v\");",
+        "unsafe { std::env::set_var(\"K\", \"v\") };",
+        "let f = std::env::set_var::<&str, &str>;",
+    ] {
+        let found = flagged(call);
+        assert_eq!(found.len(), 1, "{call}: {found:?}");
+        assert_eq!(found[0].1, Rule::EnvMutation, "{call}");
+    }
+}
+
+#[test]
+fn an_imported_bare_env_mutator_is_flagged_at_the_call() {
+    for (import, call) in [
+        ("use std::env::set_var;", "set_var(\"K\", \"v\");"),
+        ("use std::env::remove_var;", "remove_var(\"K\");"),
+        ("use std::env::{self, set_var};", "set_var(\"K\", \"v\");"),
+        ("use std::env::{remove_var, var};", "remove_var(\"K\");"),
+        ("use std::env::*;", "set_var(\"K\", \"v\");"),
+    ] {
+        let text = format!("{import}\n#[test]\nfn f() {{\n    {call}\n}}\n");
+        assert_eq!(
+            rules_of(&scan_one(DEMO, &text)),
+            [(4, Rule::EnvMutation)],
+            "{import}"
+        );
+    }
+}
+
+#[test]
+fn a_mutator_called_through_an_env_module_alias_is_flagged() {
+    for (import, call) in [
+        (
+            "use std::env as process_env;",
+            "process_env::set_var(\"K\", \"v\");",
+        ),
+        ("use std::env as e;", "e::remove_var(\"K\");"),
+        ("use std::{env as e, fs};", "e::set_var(\"K\", \"v\");"),
+        ("use std::env::{self as e};", "e::set_var(\"K\", \"v\");"),
+        ("use std::env::{self as e, var};", "e::remove_var(\"K\");"),
+        ("use ::std::env as e;", "e::set_var(\"K\", \"v\");"),
+    ] {
+        let text = format!("{import}\n#[test]\nfn f() {{\n    {call}\n}}\n");
+        assert_eq!(
+            rules_of(&scan_one(DEMO, &text)),
+            [(4, Rule::EnvMutation)],
+            "{import}"
+        );
+    }
+    let unrelated = "use std::env as e;\n#[test]\nfn f() {\n    other::set_var(\"K\", \"v\");\n    let v = e::var(\"K\");\n}\n";
+    assert!(rules_of(&scan_one(DEMO, unrelated)).is_empty());
+    let custom =
+        "use crate::fixture::env as e;\n#[test]\nfn f() {\n    e::set_var(\"K\", \"v\");\n}\n";
+    assert!(rules_of(&scan_one(DEMO, custom)).is_empty());
+}
+
+#[test]
+fn an_aliased_env_mutator_import_is_flagged_at_the_import() {
+    let text = "#[cfg(test)]\nmod tests {\n    use std::env::set_var as put;\n    #[test]\n    fn f() {\n        put(\"K\", \"v\");\n    }\n}\n";
+    assert_eq!(rules_of(&scan_one(DEMO, text)), [(3, Rule::EnvMutation)]);
+}
+
+#[test]
+fn env_mutation_lookalikes_and_the_shared_override_are_not_flagged() {
+    for call in [
+        "my_set_var(\"K\", \"v\");",
+        "set_var_checked(\"K\");",
+        "registry.set_var(\"K\", \"v\");",
+        "other::set_var(\"K\", \"v\");",
+        "set_var(\"K\", \"v\");",
+        "fn set_var() {}",
+        "let remove_var = 1;",
+        "let s = \"std::env::set_var(K, v)\";",
+        "// std::env::remove_var(\"K\");",
+        "let v = std::env::var(\"K\");",
+        "let mut env = ProcessEnv::lock();",
+        "let mut env = pohunek_test_support::process_env::ProcessEnv::lock();\n    env.set(\"K\", \"v\").remove(\"L\");",
+    ] {
+        assert!(flagged(call).is_empty(), "{call}: {:?}", flagged(call));
+    }
+    let local = "use other::set_var;\n#[test]\nfn f() {\n    set_var(\"K\", \"v\");\n}\n";
+    assert!(scan_one(DEMO, local).violations.is_empty());
+    let defined = "#[test]\nfn f() {\n    fn set_var(k: &str) {}\n    set_var(\"K\");\n}\n";
+    assert!(scan_one(DEMO, defined).violations.is_empty());
+}
+
+#[test]
+fn env_mutation_is_flagged_in_test_code_only_and_test_support_is_exempt() {
+    let body = "fn f() {\n    std::env::set_var(\"K\", \"v\");\n}\n";
+    assert!(scan_one(DEMO, body).violations.is_empty());
+    assert_eq!(
+        rules_of(&scan_one("crates/demo/tests/run.rs", body)),
+        [(2, Rule::EnvMutation)]
+    );
+    let mixed = format!("#[cfg(test)]\nmod tests {{\n{body}}}\n{body}");
+    assert_eq!(rules_of(&scan_one(DEMO, &mixed)), [(4, Rule::EnvMutation)]);
+    assert!(scan_one("crates/test-support/src/process_env.rs", body)
+        .violations
+        .is_empty());
+}
+
+#[test]
+fn no_marker_exempts_an_env_mutation() {
+    for form in [
+        "    std::env::set_var(\"K\", \"v\"); // hermetic-allowed: #405 reason\n",
+        "    // hermetic-allowed: #405 reason\n    std::env::set_var(\"K\", \"v\");\n",
+        "    // hermetic-allowed: #1 reason\n    std::env::remove_var(\"K\");\n",
+    ] {
+        let scan = scan_one(DEMO, &format!("#[test]\nfn f() {{\n{form}}}\n"));
+        assert_eq!(
+            rules_of(&scan),
+            [(
+                if form.starts_with("    //") { 4 } else { 3 },
+                Rule::EnvMutation
+            )],
+            "{form}"
+        );
+        assert!(scan.malformed.is_empty(), "{form}");
+    }
+}
+
+#[test]
+fn env_mutation_guidance_names_the_shared_override_and_no_marker() {
+    let scan = scan_one(DEMO, &in_test("std::env::set_var(\"K\", \"v\");"));
+    assert_eq!(
+        evaluate(&scan),
+        [format!(
+            "{DEMO}:3: std::env::set_var/remove_var outside pohunek_test_support"
+        )]
+    );
+    let advice = guidance(&scan);
+    assert!(advice.contains("ProcessEnv"));
+    assert!(advice.contains("no marker exempts this rule"));
+    assert!(!advice.contains("A case where the host state"));
+    let mixed = scan_one(
+        DEMO,
+        &in_test("std::env::set_var(\"K\", \"v\");\n    let p = std::env::temp_dir();"),
+    );
+    assert!(guidance(&mixed).contains("hermetic-allowed: #<issue> <reason>"));
 }

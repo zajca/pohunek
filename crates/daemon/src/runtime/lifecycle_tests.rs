@@ -1272,7 +1272,7 @@ async fn recovery_retires_a_previous_generation_whose_worker_never_journaled() {
 
 /// PID of a process that has exited and been reaped.
 fn exited_pid() -> u32 {
-    let mut child = std::process::Command::new("true")
+    let mut child = pohunek_test_support::process_env::command("true")
         .spawn()
         .expect("spawn short-lived process");
     let pid = child.id();

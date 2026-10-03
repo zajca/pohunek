@@ -29,6 +29,10 @@
 //! with a message naming the awaited condition instead of hanging until nextest
 //! terminates the test.
 //!
+//! The [`process_env`] module holds [`process_env::ProcessEnv`], the one
+//! binary-wide lock and unwind-safe override for tests that must change the
+//! process environment in-process.
+//!
 //! The [`time`] module holds [`time::AutoAdvanceInhibitor`] and
 //! [`time::TIMER_TICK`], which let a test on tokio's paused clock await real
 //! I/O without the clock racing ahead of it.
@@ -52,6 +56,7 @@
 
 pub mod env;
 pub mod fs;
+pub mod process_env;
 pub mod time;
 pub mod wait;
 

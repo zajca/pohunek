@@ -57,7 +57,19 @@ impl Paths {
     /// `XDG_STATE_HOME`/`XDG_DATA_HOME`/`XDG_CONFIG_HOME` nor `HOME` is available to
     /// derive the log/data/config directories.
     pub fn resolve() -> Result<Self, DaemonError> {
-        let base = pohunek_paths::BasePaths::resolve().map_err(path_error)?;
+        Self::resolve_from(&pohunek_paths::PathEnv::capture())
+    }
+
+    /// Resolves all daemon paths from explicit environment inputs.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Paths::resolve`].
+    pub(crate) fn resolve_from(env: &pohunek_paths::PathEnv) -> Result<Self, DaemonError> {
+        let platform = pohunek_paths::Platform::current().map_err(path_error)?;
+        let effective_uid = nix::unistd::Uid::effective().as_raw();
+        let base = pohunek_paths::BasePaths::resolve_for(platform, effective_uid, env)
+            .map_err(path_error)?;
 
         Ok(Self {
             runtime_dir: base.runtime_dir,
@@ -152,81 +164,43 @@ fn path_error(err: pohunek_paths::PathError) -> DaemonError {
 mod tests {
     use std::path::Path;
 
-    use pohunek_paths::{APP_DIR, ASSISTANT_RUNTIME_SUBDIR, KNOWLEDGE_CACHE_SUBDIR};
+    use pohunek_paths::{PathEnv, APP_DIR, ASSISTANT_RUNTIME_SUBDIR, KNOWLEDGE_CACHE_SUBDIR};
+    use pohunek_test_support::process_env::ProcessEnv;
 
     use super::*;
-
-    use crate::test_support::XDG_ENV_LOCK;
-
-    const VARS: [&str; 6] = [
-        "XDG_RUNTIME_DIR",
-        "XDG_STATE_HOME",
-        "XDG_DATA_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "HOME",
-    ];
-
-    /// Holds `ENV_LOCK` for the test's duration and restores every snapshotted var
-    /// on drop, so a panic mid-test cannot leak mutated env into a sibling.
-    struct EnvGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-
-    impl EnvGuard {
-        fn acquire() -> Self {
-            let lock = XDG_ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let saved = VARS.iter().map(|&k| (k, std::env::var(k).ok())).collect();
-            Self { _lock: lock, saved }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
 
     fn tmp_base(tag: &str) -> PathBuf {
         pohunek_test_support::temp_root()
             .join(format!("pohunek-paths-{tag}-{}", std::process::id()))
     }
 
-    /// Set every base var the resolver reads to temp paths, so a test can exercise
-    /// one variable in isolation without tripping an unrelated fail-fast.
-    fn set_all_present(base: &Path) {
-        std::env::set_var("XDG_RUNTIME_DIR", base.join("run"));
-        std::env::set_var("XDG_STATE_HOME", base.join("state"));
-        std::env::set_var("XDG_DATA_HOME", base.join("data"));
-        std::env::set_var("XDG_CONFIG_HOME", base.join("cfg"));
-        std::env::set_var("XDG_CACHE_HOME", base.join("cache"));
-        std::env::set_var("HOME", base.join("home"));
+    /// Every base variable the resolver reads, set to paths below `base`, so a
+    /// test can drop one variable without tripping an unrelated fail-fast.
+    fn all_present(base: &Path) -> PathEnv {
+        PathEnv {
+            xdg_runtime_dir: Some(base.join("run").into_os_string()),
+            xdg_state_home: Some(base.join("state").into_os_string()),
+            xdg_data_home: Some(base.join("data").into_os_string()),
+            xdg_config_home: Some(base.join("cfg").into_os_string()),
+            xdg_cache_home: Some(base.join("cache").into_os_string()),
+            home: Some(base.join("home").into_os_string()),
+        }
     }
 
     #[test]
     fn config_dir_from_xdg_config_home() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("xdg");
-        set_all_present(&base);
-        let paths = Paths::resolve().expect("resolve with all base vars set");
+        let env = all_present(&base);
+        let paths = Paths::resolve_from(&env).expect("resolve with all base vars set");
         assert_eq!(paths.config_dir, base.join("cfg").join(APP_DIR));
     }
 
     #[test]
     fn config_dir_falls_back_to_home_dot_config() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("home");
-        set_all_present(&base);
-        std::env::remove_var("XDG_CONFIG_HOME");
-        let paths = Paths::resolve().expect("resolve with XDG_CONFIG_HOME unset");
+        let mut env = all_present(&base);
+        env.xdg_config_home = None;
+        let paths = Paths::resolve_from(&env).expect("resolve with XDG_CONFIG_HOME unset");
         assert_eq!(
             paths.config_dir,
             base.join("home").join(".config").join(APP_DIR)
@@ -235,20 +209,18 @@ mod tests {
 
     #[test]
     fn cache_dir_from_xdg_cache_home() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("xdg-cache");
-        set_all_present(&base);
-        let paths = Paths::resolve().expect("resolve with all base vars set");
+        let env = all_present(&base);
+        let paths = Paths::resolve_from(&env).expect("resolve with all base vars set");
         assert_eq!(paths.cache_dir, base.join("cache").join(APP_DIR));
     }
 
     #[test]
     fn cache_dir_falls_back_to_home_dot_cache() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("home-cache");
-        set_all_present(&base);
-        std::env::remove_var("XDG_CACHE_HOME");
-        let paths = Paths::resolve().expect("resolve with XDG_CACHE_HOME unset");
+        let mut env = all_present(&base);
+        env.xdg_cache_home = None;
+        let paths = Paths::resolve_from(&env).expect("resolve with XDG_CACHE_HOME unset");
         assert_eq!(
             paths.cache_dir,
             base.join("home").join(".cache").join(APP_DIR)
@@ -257,10 +229,9 @@ mod tests {
 
     #[test]
     fn assistant_dirs_have_expected_shape() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("assistant");
-        set_all_present(&base);
-        let paths = Paths::resolve().expect("resolve with all base vars set");
+        let env = all_present(&base);
+        let paths = Paths::resolve_from(&env).expect("resolve with all base vars set");
         assert_eq!(
             paths.assistant_bundle_cache_dir(),
             base.join("cache")
@@ -280,10 +251,9 @@ mod tests {
 
     #[test]
     fn assistant_runtime_dir_rejects_unsafe_ids() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("assistant-unsafe");
-        set_all_present(&base);
-        let paths = Paths::resolve().expect("resolve with all base vars set");
+        let env = all_present(&base);
+        let paths = Paths::resolve_from(&env).expect("resolve with all base vars set");
 
         for id in ["", "/work/launch", "../launch", "launch/child", "launch/.."] {
             assert_eq!(
@@ -296,19 +266,35 @@ mod tests {
 
     #[test]
     fn missing_config_home_and_home_fails_fast() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("missing");
-        set_all_present(&base);
+        let mut env = all_present(&base);
         // XDG_STATE_HOME/XDG_DATA_HOME stay set so the earlier steps do not need
         // HOME; only the config step must fail, and with the actionable message.
-        std::env::remove_var("XDG_CONFIG_HOME");
-        std::env::remove_var("HOME");
-        match Paths::resolve() {
+        env.xdg_config_home = None;
+        env.home = None;
+        match Paths::resolve_from(&env) {
             Err(DaemonError::MissingEnv { var }) => {
                 assert_eq!(var, "XDG_CONFIG_HOME or HOME");
             }
             other => panic!("expected MissingEnv, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_reads_the_process_environment() {
+        let base = tmp_base("process-env");
+        let mut env = ProcessEnv::lock();
+        env.set("XDG_RUNTIME_DIR", base.join("run"))
+            .set("XDG_STATE_HOME", base.join("state"))
+            .set("XDG_DATA_HOME", base.join("data"))
+            .set("XDG_CONFIG_HOME", base.join("cfg"))
+            .set("XDG_CACHE_HOME", base.join("cache"))
+            .set("HOME", base.join("home"));
+
+        let paths = Paths::resolve().expect("resolve from the process environment");
+
+        assert_eq!(paths.config_dir, base.join("cfg").join(APP_DIR));
+        assert_eq!(paths.cache_dir, base.join("cache").join(APP_DIR));
     }
 
     #[test]
@@ -323,10 +309,9 @@ mod tests {
 
     #[test]
     fn host_state_paths_have_the_canonical_layout() {
-        let _env = EnvGuard::acquire();
         let base = tmp_base("host-state");
-        set_all_present(&base);
-        let paths = Paths::resolve().expect("resolve paths");
+        let env = all_present(&base);
+        let paths = Paths::resolve_from(&env).expect("resolve paths");
         let host = base
             .join("state")
             .join(APP_DIR)

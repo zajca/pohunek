@@ -609,7 +609,7 @@ mod tests {
         let root = directory.path();
         let program = root.join("netbird-test");
         let pid_path = root.join("pid");
-        fs::write(
+        pohunek_test_support::fs::write_file(
             &program,
             format!(
                 "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
@@ -657,7 +657,13 @@ mod tests {
         let dir = pohunek_test_support::tempdir_with_prefix(&format!("pohunek-netbird-{tag}-"))
             .expect("private test root");
         let program = dir.path().join("netbird");
-        fs::write(&program, format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\n")).expect("script");
+        // The helper keeps a write descriptor from leaking into a concurrent
+        // fork, which would make executing the script fail with `ETXTBSY`.
+        pohunek_test_support::fs::write_file(
+            &program,
+            format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\n"),
+        )
+        .expect("script");
         fs::set_permissions(&program, fs::Permissions::from_mode(mode)).expect("chmod");
         (dir, program)
     }

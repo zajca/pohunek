@@ -14,10 +14,9 @@ mod readable_host;
 mod support;
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -44,7 +43,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{oneshot, Mutex, MutexGuard};
+use tokio::sync::oneshot;
 use tokio_util::codec::{Framed, LinesCodec};
 
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
@@ -60,11 +59,9 @@ use pohunek_paths::{
     HOST_STATE_LOCK_NAME, HOST_STATE_SUBDIR, LOGS_SUBDIR, WORKERS_SUBDIR,
 };
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{self, wait_until, HANG_GUARD};
 use pohunek_test_support::{bin_exe, worker_binary};
-
-static PATH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static XDG_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // Sessions use the production stop grace, `SessionRegistryConfig::default()`:
 // a shorter grace reaches the forced-stop path on a loaded host, and no test
@@ -82,94 +79,58 @@ impl Request {
     }
 }
 
+/// Prepends a directory to `PATH` and holds the process-environment lock until
+/// dropped.
 struct PathGuard {
-    _guard: MutexGuard<'static, ()>,
-    old_path: Option<OsString>,
+    _env: ProcessEnv,
 }
 
 impl PathGuard {
-    async fn prepend(path: &Path) -> Self {
-        let guard = PATH_LOCK.lock().await;
-        let old_path = std::env::var_os("PATH");
+    fn prepend(path: &Path) -> Self {
+        let mut env = ProcessEnv::lock();
         let mut paths = vec![path.to_path_buf()];
-        if let Some(old_path) = &old_path {
-            paths.extend(std::env::split_paths(old_path));
+        if let Some(old_path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&old_path));
         }
         let joined = std::env::join_paths(paths).expect("join test PATH");
-        std::env::set_var("PATH", joined);
-        Self {
-            _guard: guard,
-            old_path,
-        }
+        env.set("PATH", joined);
+        Self { _env: env }
     }
 }
 
-impl Drop for PathGuard {
-    fn drop(&mut self) {
-        match &self.old_path {
-            Some(path) => std::env::set_var("PATH", path),
-            None => std::env::remove_var("PATH"),
-        }
-    }
-}
-
+/// Points every base directory and provider override at a fresh temp root and
+/// holds the process-environment lock until dropped.
 struct XdgGuard {
-    _guard: MutexGuard<'static, ()>,
-    saved: Vec<(&'static str, Option<String>)>,
+    /// Dropped first: restores the variables and releases the lock before the
+    /// root below is removed. Tests change further variables through it.
+    env: ProcessEnv,
     root: TestDir,
 }
 
 impl XdgGuard {
-    async fn set_all(tag: &str) -> Self {
-        Self::set_all_after(tag, || {}).await
+    fn set_all(tag: &str) -> Self {
+        Self::set_all_after(tag, |_| {})
     }
 
-    async fn set_all_after(tag: &str, before_isolation: impl FnOnce()) -> Self {
-        let guard = XDG_LOCK.lock().await;
-        let vars = [
-            "XDG_RUNTIME_DIR",
-            "XDG_STATE_HOME",
-            "XDG_DATA_HOME",
-            "XDG_CONFIG_HOME",
-            "XDG_CACHE_HOME",
-            "HOME",
-            "CLAUDE_CONFIG_DIR",
-            "CODEX_HOME",
-        ];
-        let saved = vars
-            .iter()
-            .map(|&key| (key, std::env::var(key).ok()))
-            .collect::<Vec<_>>();
-        before_isolation();
+    /// Runs `before_isolation` with the lock held, before the isolated
+    /// environment is applied.
+    fn set_all_after(tag: &str, before_isolation: impl FnOnce(&mut ProcessEnv)) -> Self {
+        let mut env = ProcessEnv::lock();
+        before_isolation(&mut env);
         let root = temp_dir(tag);
-        std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
-        std::env::set_var("XDG_STATE_HOME", root.join("state"));
-        std::env::set_var("XDG_DATA_HOME", root.join("data"));
-        std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
-        std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
-        std::env::set_var("HOME", root.join("home"));
-        std::env::set_var("CLAUDE_CONFIG_DIR", root.join("home/.claude"));
-        std::env::set_var("CODEX_HOME", root.join("home/.codex"));
-        Self {
-            _guard: guard,
-            saved,
-            root,
-        }
+        env.set("XDG_RUNTIME_DIR", root.join("runtime"))
+            .set("XDG_STATE_HOME", root.join("state"))
+            .set("XDG_DATA_HOME", root.join("data"))
+            .set("XDG_CONFIG_HOME", root.join("config"))
+            .set("XDG_CACHE_HOME", root.join("cache"))
+            .set("HOME", root.join("home"))
+            .set("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .set("CODEX_HOME", root.join("home/.codex"));
+        Self { env, root }
     }
 
     fn home(&self) -> PathBuf {
         self.root.join("home")
-    }
-}
-
-impl Drop for XdgGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
     }
 }
 
@@ -310,11 +271,10 @@ async fn integration_status_accepts_null_at_daemon_boundary() {
     let ambient_before = tree_snapshot(&ambient);
     let claude_override = ambient_claude.clone();
     let codex_override = ambient_codex.clone();
-    let xdg = XdgGuard::set_all_after("integration-status-rpc", move || {
-        std::env::set_var("CLAUDE_CONFIG_DIR", claude_override);
-        std::env::set_var("CODEX_HOME", codex_override);
-    })
-    .await;
+    let xdg = XdgGuard::set_all_after("integration-status-rpc", move |env| {
+        env.set("CLAUDE_CONFIG_DIR", claude_override)
+            .set("CODEX_HOME", codex_override);
+    });
     let claude = xdg.home().join(".claude");
     let codex = xdg.home().join(".codex");
     assert_eq!(
@@ -384,13 +344,14 @@ async fn integration_status_rejects_unknown_params_at_daemon_boundary() {
 
 #[tokio::test]
 async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
-    let xdg = XdgGuard::set_all("integration-uninstall-doctor-rpc").await;
+    let mut xdg = XdgGuard::set_all("integration-uninstall-doctor-rpc");
     let claude = xdg.home().join(".claude");
     let codex = xdg.home().join(".codex");
     std::fs::create_dir_all(&claude).expect("create isolated Claude config");
     std::fs::create_dir_all(&codex).expect("create isolated Codex config");
-    std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
-    std::env::set_var("CODEX_HOME", &codex);
+    xdg.env
+        .set("CLAUDE_CONFIG_DIR", &claude)
+        .set("CODEX_HOME", &codex);
     pohunek_daemon::integration::install_claude(&claude).expect("install Claude fixture");
     pohunek_daemon::integration::install_codex(&codex).expect("install Codex fixture");
     let socket = temp_socket("integration-uninstall-doctor-rpc");
@@ -1302,7 +1263,7 @@ async fn stop_real_daemon(
 async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _xdg = XdgGuard::set_all("daemon-startup-private-state").await;
+    let mut xdg = XdgGuard::set_all("daemon-startup-private-state");
     // The real worker nests its control socket below the XDG runtime root, and
     // `sockaddr_un` imposes a small platform path bound. Keep this fixture short
     // while retaining an isolated complete XDG environment.
@@ -1315,14 +1276,15 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     let cache_home = root.join("c");
     let config_home = root.join("g");
     let home = root.join("h");
-    std::env::set_var("XDG_RUNTIME_DIR", &runtime_home);
-    std::env::set_var("XDG_DATA_HOME", &data_home);
-    std::env::set_var("XDG_STATE_HOME", &state_home);
-    std::env::set_var("XDG_CACHE_HOME", &cache_home);
-    std::env::set_var("XDG_CONFIG_HOME", &config_home);
-    std::env::set_var("HOME", &home);
-    std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude"));
-    std::env::set_var("CODEX_HOME", home.join(".codex"));
+    xdg.env
+        .set("XDG_RUNTIME_DIR", &runtime_home)
+        .set("XDG_DATA_HOME", &data_home)
+        .set("XDG_STATE_HOME", &state_home)
+        .set("XDG_CACHE_HOME", &cache_home)
+        .set("XDG_CONFIG_HOME", &config_home)
+        .set("HOME", &home)
+        .set("CLAUDE_CONFIG_DIR", home.join(".claude"))
+        .set("CODEX_HOME", home.join(".codex"));
     std::fs::create_dir_all(&home).expect("create isolated home, the worker working directory");
     std::fs::create_dir_all(&state_home).expect("create ordinary XDG state home");
     std::fs::set_permissions(&state_home, std::fs::Permissions::from_mode(0o755))
@@ -1486,7 +1448,7 @@ async fn public_bind_serves_host_discover_with_supplied_registry() {
 
 #[tokio::test]
 async fn assistant_materialize_returns_readable_paths_over_socket() {
-    let _env = XdgGuard::set_all("assistant-materialize-socket").await;
+    let _env = XdgGuard::set_all("assistant-materialize-socket");
     let socket = temp_socket("assistant-materialize");
     let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
 
@@ -2110,7 +2072,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
 
     let mut control = connect(&socket).await;
     let created: SessionInfo = {
-        let _path = PathGuard::prepend(&bin_dir).await;
+        let _path = PathGuard::prepend(&bin_dir);
         serde_json::from_value(ok_payload(
             create_session_with_agent(&mut control, AgentKind::Codex, cwd.to_path_buf()).await,
         ))
@@ -2176,7 +2138,7 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
 
     let mut control = connect(&socket).await;
     let created: SessionInfo = {
-        let _path = PathGuard::prepend(&bin_dir).await;
+        let _path = PathGuard::prepend(&bin_dir);
         serde_json::from_value(ok_payload(
             create_session_with_agent(&mut control, AgentKind::Claude, cwd.to_path_buf()).await,
         ))
@@ -3468,7 +3430,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
         ..SessionRegistryConfig::default()
     };
 
-    let _path = PathGuard::prepend(&bin_dir).await;
+    let _path = PathGuard::prepend(&bin_dir);
 
     // --- Create phase: report a native id after the session commit. ---
     let (shutdown, handle) = spawn_server_with_config(&socket, "0.0.0", config).await;

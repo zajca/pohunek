@@ -169,10 +169,14 @@ pub(crate) fn command() -> Result<Command, String> {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use pohunek_test_support::process_env::ProcessEnv;
+
     use super::*;
 
     #[test]
     fn the_builder_drops_exactly_the_ambient_git_variables_outside_the_allow_list() {
+        // `command()` resolves `git` on `PATH` and reads the ambient variables.
+        let _env = ProcessEnv::lock();
         let command = command().expect("git on PATH");
         let mut removed: Vec<String> = command
             .get_envs()

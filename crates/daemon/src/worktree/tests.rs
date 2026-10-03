@@ -6,7 +6,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,7 +27,7 @@ fn unique_dir(tag: &str) -> PathBuf {
 }
 
 fn git_in(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
+    let output = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -44,7 +43,7 @@ fn git_in(dir: &Path, args: &[&str]) {
 /// Initialize a git repo on branch `main` with one commit.
 fn init_repo(tag: &str) -> PathBuf {
     let dir = unique_dir(tag);
-    let init = Command::new("git")
+    let init = pohunek_test_support::process_env::command("git")
         .args(["-c", "init.defaultBranch=main", "init", "-q"])
         .arg(&dir)
         .output()
@@ -68,7 +67,7 @@ fn init_repo(tag: &str) -> PathBuf {
 fn init_bare_repo(tag: &str) -> PathBuf {
     let source = init_repo(&format!("{tag}-src"));
     let bare = unique_dir(&format!("{tag}-bare")).join("repo.git");
-    let clone = Command::new("git")
+    let clone = pohunek_test_support::process_env::command("git")
         .args(["clone", "--bare", "-q"])
         .arg(&source)
         .arg(&bare)
@@ -134,7 +133,7 @@ fn manager_with_config_dir(tag: &str, config_dir: PathBuf) -> WorktreeManager {
 
 /// Run git in `dir` and return trimmed stdout (asserting success).
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = pohunek_test_support::process_env::command("git")
         .arg("-C")
         .arg(dir)
         .args(args)
@@ -150,7 +149,7 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
 
 #[test]
 fn bounded_command_times_out_and_kills_a_slow_child() {
-    let mut cmd = Command::new("sh");
+    let mut cmd = pohunek_test_support::process_env::command("sh");
     cmd.args(["-c", "sleep 5"]);
 
     let started = Instant::now();
@@ -173,7 +172,7 @@ fn bounded_command_timeout_kills_process_group_children() {
     let dir = unique_dir("bounded-command-process-group");
     let marker = dir.join("child-survived");
     let script = format!("(sleep 0.4; printf leaked > '{}') & wait", marker.display());
-    let mut cmd = Command::new("sh");
+    let mut cmd = pohunek_test_support::process_env::command("sh");
     cmd.args(["-c", &script]);
 
     let err =
@@ -192,7 +191,7 @@ fn bounded_command_timeout_kills_process_group_children() {
 
 #[test]
 fn bounded_command_drains_output_larger_than_pipe_buffer() {
-    let mut cmd = Command::new("sh");
+    let mut cmd = pohunek_test_support::process_env::command("sh");
     cmd.args(["-c", "head -c 200000 /dev/zero | tr '\\0' x"]);
 
     let output = run_output_bounded(cmd, TEST_SETUP_TIMEOUT).expect("large output drains");
@@ -485,7 +484,7 @@ fn successful_fetch_starts_the_worktree_from_the_fetched_commit() {
     // from the fetched tip, not the stale local ref.
     let upstream = init_repo("fetch-upstream");
     let downstream = unique_dir("fetch-downstream-parent").join("clone");
-    let clone = Command::new("git")
+    let clone = pohunek_test_support::process_env::command("git")
         .args(["clone", "-q"])
         .arg(&upstream)
         .arg(&downstream)
@@ -539,7 +538,7 @@ fn remote_only_base_branch_is_fetched_before_default_branch_fallback() {
     git_in(&upstream, &["checkout", "-q", "main"]);
 
     let downstream = unique_dir("remote-base-downstream-parent").join("clone");
-    let clone = Command::new("git")
+    let clone = pohunek_test_support::process_env::command("git")
         .args(["clone", "-q"])
         .arg(&upstream)
         .arg(&downstream)
@@ -820,7 +819,7 @@ fn read_setup_child_pid(worktree: &Path) -> i32 {
 fn wait_until_process_gone(pid: i32, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     loop {
-        let alive = Command::new("kill")
+        let alive = pohunek_test_support::process_env::command("kill")
             .arg("-0")
             .arg(pid.to_string())
             .output()

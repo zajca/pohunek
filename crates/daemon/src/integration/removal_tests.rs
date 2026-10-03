@@ -242,7 +242,7 @@ fn a_directory_or_fifo_at_a_managed_path_is_never_removed() {
     fs::remove_file(&state).expect("remove state");
     fs::create_dir(&state).expect("directory at state path");
     fs::remove_file(&notify).expect("remove notify");
-    let output = std::process::Command::new("mkfifo")
+    let output = pohunek_test_support::process_env::command("mkfifo")
         .arg(&notify)
         .output()
         .expect("run mkfifo");
