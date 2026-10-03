@@ -188,7 +188,6 @@ pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
     generators::cli::generate(&bundle_dir, since)?;
     generators::config::generate(&bundle_dir, since)?;
     generators::protocol::generate(&bundle_dir, since)?;
-    generators::setup_assets::generate(&bundle_dir, since)?;
 
     // Phase 2: copy manual docs into the bundle dir.
     let manual_files = collect_files(&source_dir)?;
@@ -211,7 +210,7 @@ pub fn build_docs(options: BuildOptions) -> Result<BuildSummary, XtaskError> {
         pohunek_version: &pohunek_version,
         knowledge_schema_version: CONCEPT_SCHEMA_VERSION,
         reference: GENERATED_REFERENCE,
-        sources: vec!["cli", "config", "manual_docs", "protocol", "setup_assets"],
+        sources: vec!["cli", "config", "manual_docs", "protocol"],
         content_hash: &content_hash,
     };
     write_manifest(&manifest_path, &manifest)?;

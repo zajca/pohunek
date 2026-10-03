@@ -208,7 +208,7 @@ const RULES: &[Rule] = &[
         Pattern::Dir("scripts"),
         Effect::Packages(&["pohunek-cli"]),
         &[Reminder::ScriptTests],
-        "launcher scripts embedded by `pohunek setup` and executed by pohunek-cli tests",
+        "scripts executed by pohunek-cli tests (the Hermes plugin release smoke suite)",
     ),
     rule(
         Pattern::Dir("packaging"),
@@ -984,7 +984,10 @@ mod tests {
                 &["pohunek-daemon", "xtask"],
             ),
             ("compat/codex/subagent-hooks.json", &["pohunek-daemon"]),
-            ("scripts/pohunek-rofi", &["pohunek-cli"]),
+            (
+                "scripts/tests/smoke-hermes-plugin-release.sh",
+                &["pohunek-cli"],
+            ),
             ("packaging/install-daemon.sh", &["pohunek-cli"]),
             (".github/workflows/release.yml", &["pohunek-cli"]),
             ("crates/relay/src/lib.rs", &["pohunek-relay", "xtask"]),

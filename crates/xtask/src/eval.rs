@@ -71,16 +71,16 @@ pub(crate) static FIXTURES: &[FixtureState] = &[
         planned_commands: &[],
     },
     FixtureState {
-        id: "launcher-misconfigured",
-        description: "The daemon is running but launcher scripts are missing or \
-                       stale. `pohunek doctor` reports missing launcher binaries.",
-        expected_outcome: "Assistant recommends `pohunek setup scripts` and \
+        id: "config-not-installed",
+        description: "The daemon is running but the default config and prompt \
+                       templates were never installed. A project action fails \
+                       with `prompt_not_found`.",
+        expected_outcome: "Assistant recommends `pohunek setup config` and \
                            then verifying with `pohunek doctor --json`.",
-        assistant_command: "pohunek assistant setup launcher misconfigured",
-        transcript_path: "target/pohunek-eval/transcripts/launcher-misconfigured.md",
-        required_terms: &["setup", "scripts", "doctor"],
+        assistant_command: "pohunek assistant setup config not installed",
+        transcript_path: "target/pohunek-eval/transcripts/config-not-installed.md",
+        required_terms: &["setup", "config", "doctor"],
         example_commands: &[
-            "pohunek setup scripts",
             "pohunek setup config",
             "pohunek doctor --json",
             "pohunek health --json",
@@ -107,18 +107,16 @@ pub(crate) static FIXTURES: &[FixtureState] = &[
         planned_commands: &[],
     },
     FixtureState {
-        id: "stale-setup-assets",
-        description: "The binary was updated but setup assets are stale. \
-                       `pohunek doctor` reports version mismatch in launcher \
-                       scripts.",
+        id: "stale-installation",
+        description: "The binary was updated but the installed config is stale. \
+                       `pohunek doctor` reports a version mismatch.",
         expected_outcome: "Assistant recommends running the update-after-release \
-                           runbook: refresh scripts, verify health, check \
-                           capabilities.",
-        assistant_command: "pohunek assistant update stale setup assets",
-        transcript_path: "target/pohunek-eval/transcripts/stale-setup-assets.md",
-        required_terms: &["scripts", "health", "capabilities"],
+                           runbook: verify health, check capabilities, review \
+                           config.",
+        assistant_command: "pohunek assistant update stale installation",
+        transcript_path: "target/pohunek-eval/transcripts/stale-installation.md",
+        required_terms: &["config", "health", "capabilities"],
         example_commands: &[
-            "pohunek setup scripts",
             "pohunek setup config",
             "pohunek health --json",
             "pohunek host inspect local --json",

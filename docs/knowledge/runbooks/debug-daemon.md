@@ -358,6 +358,6 @@ The durable store is under the daemon data directory in `notifications/`.
 current persisted notification policy. Both are host-local; `--all-hosts`
 commands perform client-side fan-out rather than reading a shared store.
 
-Do not treat setup assets as the daemon source of truth. Launcher scripts may be
-stale or missing while the daemon itself is healthy; verify daemon health first,
-then move to [debug launcher](debug-launcher.md).
+Do not treat installed config files as the daemon source of truth. A missing
+`attach.conf` or prompt template does not mean the daemon is unhealthy; verify
+daemon health first, then run `pohunek setup config` for the missing files.

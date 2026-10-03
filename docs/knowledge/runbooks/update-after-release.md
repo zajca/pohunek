@@ -2,7 +2,7 @@
 type: Runbook
 id: runbook/update-after-release
 title: Update after release
-description: Reconcile setup assets, host capabilities, projects, and launcher config after updating Pohunek.
+description: Reconcile setup assets, host capabilities, projects, and attach config after updating Pohunek.
 source_kind: manual
 intents: [update, setup, debug, help]
 since: 0.3.3
@@ -38,18 +38,15 @@ history does not widen the current supported range.
    version and protocol compatibility.
 4. Run `pohunek host inspect local --json` to inspect local runtimes and
    capabilities.
-5. Refresh launcher scripts with `pohunek setup scripts`.
-6. Review config changes before applying `pohunek setup config --force`; default
+5. Review config changes before applying `pohunek setup config --force`; default
    setup config should not overwrite existing files.
-7. Reprint or refresh sway integration with `pohunek setup sway --print` or
-   `pohunek setup sway`.
-8. Attach reads its reconnect settings (`attach_reconnect_seconds`,
+6. Attach reads its reconnect settings (`attach_reconnect_seconds`,
    `attach_reconnect_interval_seconds`, `attach_reconnect_max_attempts`) only
    from `<config_dir>/attach.conf`; it no longer reads them from
    `launcher.conf`. If you tuned those keys, copy them into `attach.conf`
    (`pohunek setup config` creates a template with every key commented at its
    default). A value left in `launcher.conf` is silently ignored by attach.
-9. For important projects, verify `pohunek project show <id-or-label> --json`
+7. For important projects, verify `pohunek project show <id-or-label> --json`
    and resolved actions with `pohunek project actions <id-or-label> --json`.
 
 For the Hermes M2 runtime, inspect the `hermes` entry after upgrade. It is
