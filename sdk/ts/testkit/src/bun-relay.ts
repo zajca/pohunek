@@ -1,3 +1,5 @@
+// Bun-only entry point, published as `@pohunek/testkit/bun-relay`: the root
+// `@pohunek/testkit` entry runs on Node and Bun, this one needs `Bun.serve`.
 // Loopback-only WebSocket relay for SDK transport tests. It speaks the relay
 // framing the SDK `WsTransport` implements: `/daemon/<host>/control` carries
 // newline-free text frames, `/daemon/<host>/attach` carries binary frames, and
@@ -489,7 +491,7 @@ function isIpv4Literal(host: string): boolean {
 function bunRuntime(): BunRuntime {
   const runtime = (globalThis as typeof globalThis & { Bun?: BunRuntime }).Bun;
   if (runtime === undefined) {
-    throw new Error("the test relay requires the Bun runtime");
+    throw new Error("@pohunek/testkit/bun-relay is Bun-only: run it under Bun (Bun.serve is unavailable)");
   }
   return runtime;
 }

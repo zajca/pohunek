@@ -270,9 +270,9 @@ tunnel:
 
 This transparent WebSocket framing contract is pre-1.0 transport
 infrastructure. It remains the owner browser path alongside the future
-team surface; it is not the accepted public team-relay contract. `@pohunek/testkit`
-ships `startTestRelay`, a loopback-only implementation of it used by the SDK
-transport tests.
+team surface; it is not the accepted public team-relay contract.
+`@pohunek/testkit/bun-relay` ships `startTestRelay`, a loopback-only,
+Bun-only implementation of it used by the SDK transport tests.
 
 ## Envelopes
 
@@ -1926,11 +1926,16 @@ a loader or bundler and type-check under both `moduleResolution: "bundler"` and
 repository workspace the manifests keep pointing at `src/*.ts` for the Bun dev
 loop; only the packed artifact is compiled, by
 `sdk/ts/scripts/build-package.ts`. `@pohunek/testkit` is shipped compiled the
-same way; it uses no Bun globals, and the contract test imports it under Node. The `sdk/ts/scripts/test/pack-contract.test.ts` contract test
+same way. Its root entry uses no Bun globals and runs on Node >= 20 and Bun; the
+explicit `@pohunek/testkit/bun-relay` subpath needs `Bun.serve` and is Bun-only
+(under Node it loads but `startTestRelay` fails fast, naming the subpath). The `sdk/ts/scripts/test/pack-contract.test.ts` contract test
 installs the packed tarballs by URL against an unreachable registry, imports
 every entry point under Bun and under the Node binary named by
 `POHUNEK_TEST_NODE_BIN`, type-checks a consumer with both resolvers, and checks
-that the browser entry reaches no `node:` module. CI and the release SDK gate run
+that the browser entry reaches no `node:` module. It also starts the installed
+`@pohunek/testkit/bun-relay` under Bun and tunnels a real WebSocket to a real
+Unix-socket server, and asserts the root testkit entry does not expose the
+relay. CI and the release SDK gate run
 it under Node 20 and Node 22.
 
 Public exports:
@@ -2071,8 +2076,9 @@ SDK error mapping:
 - `ClientError.toProtocolError()` returns the structured `ProtocolError` for
   CLI/API rendering, and `recoverHint()` returns the optional recovery text.
 
-The `@pohunek/testkit` package exports the loopback-only test relay used by the
-SDK transport tests:
+The Bun-only `@pohunek/testkit/bun-relay` subpath (not the root entry, which
+also runs on Node) exports the loopback-only test relay used by the SDK
+transport tests:
 `startTestRelay({bindHost, port, targets})` returns a `TestRelayHandle`
 (`url`, `port`, `close()`), with the `DaemonTarget`, `DaemonTargetSource`, and
 `StartTestRelayOptions` types. `bindHost` must be a loopback address; any other

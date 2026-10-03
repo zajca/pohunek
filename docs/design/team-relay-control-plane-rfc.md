@@ -20,7 +20,9 @@ audit, quotas, and the browser-facing API. It does not own PTYs or host session
 state. Each `pohunekd` remains authoritative for the sessions and processes on
 its machine.
 
-The shipped owner WebUI remains a separate supported path. Its Bun backend runs
+The owner WebUI remains a separate supported path, owned by the external
+`zajca/pohunek-work` repository ([#415](https://github.com/zajca/pohunek/issues/415)).
+Its Bun backend runs
 inside the owner trust domain, discovers the local daemon and direct-overlay
 peers, and transparently maps browser WebSockets to daemon connections. The
 relay neither replaces that backend nor needs a local mode. Owner and team web
@@ -86,8 +88,9 @@ The following decisions are final for the first complete team-relay release:
 17. The relay process and operator are trusted with transient plaintext and the
     full authority of every active `HostShare`. The design does not claim
     protection from a compromised relay.
-18. The existing owner WebUI and `web/backend` remain supported for local and
-    direct-overlay access. `pohunek-relayd` has no owner/local mode. Team and
+18. The existing owner WebUI and its Bun backend
+    (in `zajca/pohunek-work`) remain supported for local and direct-overlay
+    access. `pohunek-relayd` has no owner/local mode. Team and
     owner browser modes use separate explicit API adapters and credentials,
     even when they share Svelte presentation components.
 
@@ -188,8 +191,8 @@ only after explicit enrollment and exposes only locally approved shares.
 | `pohunek-relayd` | OIDC and service-account auth, teams, roles, groups, host registry, share requests, user authorization, routing, state catalog, audit, quotas, public API | Host PTYs, host worktrees, host profile bodies, durable terminal content |
 | `pohunek` | Explicit local/NetBird owner mode and explicit relay client mode | Hidden fallback between trust domains |
 | `pohunek-gui` | Existing direct-owner client behavior; future typed relay client behavior | Authorization authority |
-| `web/frontend` | Owner-mode browser presentation and reusable Svelte presentation components for the future team surface | Authorization authority, cross-mode fallback, durable terminal data |
-| `web/backend` | Supported owner-mode host discovery, SPA serving, and transparent one-WebSocket-to-one-daemon tunneling over local/direct-overlay paths | Relay routing, relay auth, team aggregation, or public-Internet exposure |
+| Owner WebUI frontend (`zajca/pohunek-work`) | Owner-mode browser presentation and reusable Svelte presentation components for the future team surface | Authorization authority, cross-mode fallback, durable terminal data |
+| Owner WebUI backend (`zajca/pohunek-work`) | Supported owner-mode host discovery, SPA serving, and transparent one-WebSocket-to-one-daemon tunneling over local/direct-overlay paths | Relay routing, relay auth, team aggregation, or public-Internet exposure |
 
 `pohunek-relayd` serves the team-mode SPA and its authenticated typed
 HTTP/WebSocket API. The separately deployed Bun backend remains the owner-mode
@@ -226,9 +229,9 @@ pohunekd -> separate TCP stream inside the same tunnel -> pohunek-relayd
 pohunek-relayd <-> principal WSS         (bounded opaque PTY bytes)
 
 Owner WebUI (independent of relay)
-owner browser -> private HTTP/WSS -> web/backend
-web/backend -> local Unix socket ------------------+-> pohunekd
-            -> direct overlay/NetBird TCP ---------+
+owner browser -> private HTTP/WSS -> owner WebUI backend
+owner WebUI backend -> local Unix socket ---------+-> pohunekd
+                    -> direct overlay/NetBird TCP -+
 ```
 
 The owner WebUI keeps the shipped transparent daemon protocol and `/api/hosts`
@@ -984,7 +987,7 @@ Shared host-link types live in `crates/protocol`. Relay-client API types live in
 a dedicated Rust crate and generate the TypeScript contract consumed by the CLI
 and team web workspace. Team browser clients never send arbitrary daemon NDJSON
 through a transparent tunnel. The existing owner browser client continues to
-use the transparent `web/backend` transport because browsers cannot dial the
+use the transparent owner WebUI backend transport (`zajca/pohunek-work`) because browsers cannot dial the
 owner Unix socket or direct daemon TCP listener themselves.
 
 ### 15.2 PostgreSQL

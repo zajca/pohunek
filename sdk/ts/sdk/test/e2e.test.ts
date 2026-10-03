@@ -8,9 +8,8 @@ import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolEvent } fro
 import {
   createFixtureRoot,
   startDurableWorkerFixture,
-  startTestRelay,
-  type TestRelayHandle,
 } from "@pohunek/testkit";
+import { startTestRelay, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 import {
   Client,
   attachRawLocal,

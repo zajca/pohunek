@@ -7,6 +7,7 @@
 // The packed artifact is checked under every runtime and resolver the docs
 // promise: Bun, the Node binary named by POHUNEK_TEST_NODE_BIN, and
 // `tsc --noEmit` with both `moduleResolution: "bundler"` and `"nodenext"`.
+// `@pohunek/testkit/bun-relay` is Bun-only and is exercised under Bun alone.
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -67,7 +68,61 @@ if (typeof testkit.startFixtureDaemon !== "function") {
 if (typeof fixture !== "object") {
   throw new Error("fixture did not load");
 }
+if ("startTestRelay" in testkit) {
+  throw new Error("the testkit root entry exposes the Bun-only relay");
+}
 console.log("consumer-ok");
+`;
+
+// Runs under Bun against the installed tarball: a real WebSocket through the
+// relay reaches a real Unix-socket daemon stand-in that echoes every byte, and
+// an unknown route is a 404.
+const RELAY_CONSUMER_SCRIPT = `
+import { createServer } from "node:net";
+import { join } from "node:path";
+import { startTestRelay } from "@pohunek/testkit/bun-relay";
+
+const [scratchDir] = process.argv.slice(2);
+const socketPath = join(scratchDir, "echo.sock");
+const daemon = createServer((socket) => {
+  socket.on("data", (chunk) => socket.write(chunk));
+});
+await new Promise((resolve, reject) => {
+  daemon.once("error", reject);
+  daemon.listen(socketPath, resolve);
+});
+const relay = await startTestRelay({
+  bindHost: "127.0.0.1",
+  port: 0,
+  targets: new Map([["local", { kind: "unix", socketPath }]]),
+});
+try {
+  const missing = await fetch(relay.url + "/not-a-relay-route");
+  if (missing.status !== 404) {
+    throw new Error("unknown route returned " + missing.status);
+  }
+  const socket = new WebSocket("ws://127.0.0.1:" + relay.port + "/daemon/local/control");
+  const echoed = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("no echo from the relay")), 10000);
+    socket.addEventListener("open", () => socket.send("hello"));
+    socket.addEventListener("message", (event) => {
+      clearTimeout(timer);
+      resolve(event.data);
+    });
+    socket.addEventListener("error", () => {
+      clearTimeout(timer);
+      reject(new Error("relay websocket failed"));
+    });
+  });
+  if (echoed !== "hello") {
+    throw new Error("relay echoed " + echoed);
+  }
+  socket.close();
+} finally {
+  await relay.close();
+  await new Promise((resolve) => daemon.close(resolve));
+}
+console.log("relay-consumer-ok");
 `;
 
 // Runs under plain Node: no TypeScript loader, no bundler, no Bun globals.
@@ -104,6 +159,18 @@ assert(MAX_CONTROL_LINE_BYTES > 0, "protocol line limit is not positive");
 assert(typeof relay.API_VERSION === "number", "relay constants did not load");
 assert(typeof testkit.startFixtureDaemon === "function", "testkit does not export startFixtureDaemon");
 assert(typeof fixture === "object" && fixture !== null, "fixture did not load");
+assert(!("startTestRelay" in testkit), "the testkit root entry exposes the Bun-only relay");
+
+// The Bun-only subpath loads under Node but refuses to start, naming itself.
+const bunRelay = await import("@pohunek/testkit/bun-relay");
+assert(typeof bunRelay.startTestRelay === "function", "bun-relay does not export startTestRelay");
+let relayError;
+try {
+  await bunRelay.startTestRelay({ bindHost: "127.0.0.1", port: 0, targets: new Map() });
+} catch (error) {
+  relayError = error;
+}
+assert(relayError instanceof Error && relayError.message.includes("@pohunek/testkit/bun-relay is Bun-only"), "bun-relay did not fail fast under Node");
 
 // node:net transport: dialling an absent socket fails with a structured client error.
 let socketError;
@@ -134,6 +201,7 @@ import { Client as BrowserClient } from "@pohunek/sdk/browser";
 import { PROTOCOL_VERSION, type SessionInfo } from "@pohunek/protocol";
 import { API_VERSION } from "@pohunek/protocol/relay";
 import { startFixtureDaemon } from "@pohunek/testkit";
+import { startTestRelay, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 
 export const version: number = PROTOCOL_VERSION;
 export const relayVersion: number = API_VERSION;
@@ -141,6 +209,8 @@ export const requestId: string = nextRequestId("probe");
 export const sameClient: typeof Client = BrowserClient;
 export const dial: typeof connectLocal = connectLocal;
 export const start: typeof startFixtureDaemon = startFixtureDaemon;
+export const relayStart: typeof startTestRelay = startTestRelay;
+export type RelayHandle = TestRelayHandle;
 export type RequestShape = Request;
 export async function listSessions(client: Client): Promise<SessionInfo[]> {
   const sessions = await client.call("session.list", {});
@@ -215,6 +285,7 @@ function installedConsumer(): Promise<string> {
     await writeFile(join(consumer, "consumer.ts"), CONSUMER_SCRIPT);
     await writeFile(join(consumer, "node-consumer.mjs"), NODE_CONSUMER_SCRIPT);
     await writeFile(join(consumer, "ts-consumer.ts"), TS_CONSUMER_SOURCE);
+    await writeFile(join(consumer, "relay-consumer.ts"), RELAY_CONSUMER_SCRIPT);
     await runBun(["install"], consumer);
     return consumer;
   })();
@@ -437,6 +508,14 @@ describe("SDK release pack contract", () => {
       await runBun([TSC_ENTRY, "-p", config], consumer);
     }, TSC_TIMEOUT_MS);
   }
+
+  test("the installed @pohunek/testkit/bun-relay subpath tunnels a real WebSocket to a real daemon socket under Bun", async () => {
+    const consumer = await installedConsumer();
+    const scratch = join(workDir, "relay-scratch");
+    await mkdir(scratch, { recursive: true });
+    const output = await runBun(["run", "relay-consumer.ts", scratch], consumer);
+    expect(output).toContain("relay-consumer-ok");
+  }, INSTALL_TIMEOUT_MS);
 
   test("the browser entry reaches no node: module while the root entry does", async () => {
     const consumer = await installedConsumer();

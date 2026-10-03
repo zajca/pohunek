@@ -86,7 +86,7 @@ TypeScript SDK and test relay (the web control center is an external client in
 - `sdk/ts/sdk/src/transport.ts`
 - `sdk/ts/sdk/src/runtime-paths.ts`
 - `sdk/ts/testkit/src/runtime-root.ts`
-- `sdk/ts/testkit/src/test-relay.ts` — loopback-only WebSocket relay that the
+- `sdk/ts/testkit/src/bun-relay.ts` — Bun-only loopback WebSocket relay that the
   SDK transport tests run against over real sockets.
 - `sdk/ts/scripts/typecheck.ts` — one-command typecheck: incremental `tsc -b`
   over the composite source-only project graph (`protocol`/`sdk`/`testkit`) in

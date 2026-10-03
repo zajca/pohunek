@@ -3,7 +3,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
-import { startTestRelay, type TestRelayHandle } from "@pohunek/testkit";
+import { startTestRelay, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
 
 const LOOPBACK_HOST = "127.0.0.1";
 const RELAY_HOST = "local";

@@ -49,11 +49,12 @@ hosts them. `@pohunek/sdk` implements only the client side of this contract
 
 ## Test relay
 
-`startTestRelay` from `@pohunek/testkit` is a real relay over real sockets for
+`startTestRelay` from `@pohunek/testkit/bun-relay` is a real relay over real sockets for
 transport tests: it implements the routes and framing above and tunnels each
 WebSocket to a Unix or TCP daemon target. It binds only to loopback and refuses
 any other bind address with an error. It is a testing helper, not a deployable
-relay.
+relay. The `@pohunek/testkit` root entry runs on Node >= 20 and Bun; the
+`bun-relay` subpath is Bun-only because it is built on `Bun.serve`.
 
 ## Runtime paths
 
