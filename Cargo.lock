@@ -5742,8 +5742,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eee682d202a77e4a9f3b2c2bdf48a7b28af5c08c34ddf66f98c93e5e39464285"
 dependencies = [
  "async-broadcast",
+ "async-executor",
+ "async-io",
+ "async-lock",
+ "async-process",
  "async-recursion",
+ "async-task",
  "async-trait",
+ "blocking",
  "enumflags2",
  "event-listener",
  "futures-core",
@@ -5754,7 +5760,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_repr",
- "tokio",
  "tracing",
  "uds_windows",
  "uuid",
