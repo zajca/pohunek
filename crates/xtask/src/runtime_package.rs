@@ -7,9 +7,9 @@
 // Rust guideline compliant 2026-10-04
 
 use std::fs;
-use std::io::Read as _;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use package::{
     build_archive, read_archive, ArchiveEntry, ArchiveError, EntryRejection, Limits, MAX_PATH_BYTES,
@@ -64,22 +64,30 @@ fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> XtaskError {
     move |source| XtaskError::Io { path, source }
 }
 
-/// Fails when the resolved destination of `output` is inside `dir`.
+/// Fails when `output` is a symlink or resolves to a place inside `dir`.
+///
+/// A symlink is rejected outright, dangling or not: the write would follow it
+/// to a destination this check cannot vouch for.
 fn reject_output_inside(dir: &Path, output: &Path) -> Result<(), XtaskError> {
     let root = fs::canonicalize(dir).map_err(io_error(dir))?;
-    let resolved = if output.exists() {
-        fs::canonicalize(output).map_err(io_error(output))?
-    } else {
-        let parent = match output.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        let name = output
-            .file_name()
-            .ok_or_else(|| XtaskError::InvalidPath(output.to_path_buf()))?;
-        fs::canonicalize(parent)
-            .map_err(io_error(parent))?
-            .join(name)
+    let resolved = match fs::symlink_metadata(output) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(XtaskError::OutputIsSymlink(output.to_path_buf()));
+        }
+        Ok(_) => fs::canonicalize(output).map_err(io_error(output))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = match output.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            let name = output
+                .file_name()
+                .ok_or_else(|| XtaskError::InvalidPath(output.to_path_buf()))?;
+            fs::canonicalize(parent)
+                .map_err(io_error(parent))?
+                .join(name)
+        }
+        Err(error) => return Err(io_error(output)(error)),
     };
     if resolved.starts_with(&root) {
         return Err(XtaskError::OutputInsideInput(output.to_path_buf()));
@@ -87,8 +95,12 @@ fn reject_output_inside(dir: &Path, output: &Path) -> Result<(), XtaskError> {
     Ok(())
 }
 
-/// Running totals of one directory walk, checked against the package limits
-/// before any file content is read.
+/// Running totals of one directory walk.
+///
+/// Sizes are charged from the bytes actually read, never from file metadata,
+/// and every read is limited by what remains of the aggregate budget, so a file
+/// that grows or is replaced during the walk cannot make the builder buffer
+/// more than the package limits allow.
 struct Budget<'a> {
     limits: &'a Limits,
     files: usize,
@@ -96,9 +108,8 @@ struct Budget<'a> {
 }
 
 impl Budget<'_> {
-    /// Accounts for one file of `len` bytes at a path of `path_len` bytes.
-    fn admit(&mut self, path_len: usize, len: u64) -> Result<(), XtaskError> {
-        let index = self.files;
+    /// Accounts for one more file at a path of `path_len` bytes.
+    fn admit(&mut self, path_len: usize) -> Result<(), XtaskError> {
         if self.files >= self.limits.max_files {
             return Err(XtaskError::Package(ArchiveError::TooManyFiles {
                 limit: self.limits.max_files,
@@ -106,30 +117,54 @@ impl Budget<'_> {
         }
         if path_len > self.limits.max_path_bytes.min(MAX_PATH_BYTES) {
             return Err(XtaskError::Package(ArchiveError::Entry {
-                index,
+                index: self.files,
                 reason: EntryRejection::PathTooLong,
-            }));
-        }
-        if len > self.limits.max_file_bytes {
-            return Err(XtaskError::Package(ArchiveError::Entry {
-                index,
-                reason: EntryRejection::FileTooLarge,
-            }));
-        }
-        let cost = len
-            .div_ceil(TAR_BLOCK_BYTES)
-            .saturating_mul(TAR_BLOCK_BYTES)
-            .saturating_add(TAR_BLOCK_BYTES);
-        // The two-block end marker is not counted here; the archive builder
-        // applies the exact limit.
-        self.expanded = self.expanded.saturating_add(cost);
-        if self.expanded > self.limits.max_expanded_bytes {
-            return Err(XtaskError::Package(ArchiveError::ExpandedTooLarge {
-                limit: self.limits.max_expanded_bytes,
             }));
         }
         self.files += 1;
         Ok(())
+    }
+
+    /// Reads one admitted file from `source`, charging its canonical size.
+    ///
+    /// At most `min(per-file limit, remaining aggregate)` plus one byte is
+    /// buffered. The two-block end marker is not counted here; the archive
+    /// builder applies the exact aggregate limit.
+    fn read_charged(&mut self, source: impl Read) -> Result<Vec<u8>, XtaskError> {
+        let index = self.files.saturating_sub(1);
+        let remaining = self
+            .limits
+            .max_expanded_bytes
+            .saturating_sub(self.expanded)
+            .saturating_sub(TAR_BLOCK_BYTES);
+        let limit = self.limits.max_file_bytes.min(remaining);
+        let mut contents = Vec::new();
+        source
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut contents)
+            .map_err(|source| XtaskError::Io {
+                path: PathBuf::new(),
+                source,
+            })?;
+        let len = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+        if len > limit {
+            return Err(XtaskError::Package(if limit < self.limits.max_file_bytes {
+                ArchiveError::ExpandedTooLarge {
+                    limit: self.limits.max_expanded_bytes,
+                }
+            } else {
+                ArchiveError::Entry {
+                    index,
+                    reason: EntryRejection::FileTooLarge,
+                }
+            }));
+        }
+        self.expanded = self.expanded.saturating_add(
+            len.div_ceil(TAR_BLOCK_BYTES)
+                .saturating_mul(TAR_BLOCK_BYTES)
+                .saturating_add(TAR_BLOCK_BYTES),
+        );
+        Ok(contents)
     }
 }
 
@@ -142,23 +177,6 @@ fn build_bytes(dir: &Path, limits: &Limits) -> Result<Vec<u8>, XtaskError> {
     };
     collect(dir, dir, &mut budget, &mut entries)?;
     build_archive(&entries, limits).map_err(XtaskError::Package)
-}
-
-/// Reads at most `limit` bytes of `path`; a file that grows past the limit
-/// after its metadata was checked is rejected instead of buffered.
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, XtaskError> {
-    let file = fs::File::open(path).map_err(io_error(path))?;
-    let mut contents = Vec::new();
-    file.take(limit.saturating_add(1))
-        .read_to_end(&mut contents)
-        .map_err(io_error(path))?;
-    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > limit {
-        return Err(XtaskError::Package(ArchiveError::Entry {
-            index: 0,
-            reason: EntryRejection::FileTooLarge,
-        }));
-    }
-    Ok(contents)
 }
 
 /// Collects regular files below `dir`; symlinks and special files are errors.
@@ -183,10 +201,18 @@ fn collect(
                 .collect::<Option<Vec<&str>>>()
                 .ok_or_else(|| XtaskError::InvalidPath(path.clone()))?
                 .join("/");
-            budget.admit(name.len(), metadata.len())?;
+            budget.admit(name.len())?;
+            let file = fs::File::open(&path).map_err(io_error(&path))?;
+            let contents = budget.read_charged(file).map_err(|error| match error {
+                XtaskError::Io { source, .. } => XtaskError::Io {
+                    path: path.clone(),
+                    source,
+                },
+                other => other,
+            })?;
             entries.push(ArchiveEntry {
                 path: name,
-                contents: read_bounded(&path, budget.limits.max_file_bytes)?,
+                contents,
                 executable: metadata.permissions().mode() & EXECUTE_BITS != 0,
             });
         } else {
@@ -292,17 +318,59 @@ mod tests {
         ));
     }
 
+    fn budget(limits: &Limits) -> Budget<'_> {
+        Budget {
+            limits,
+            files: 1,
+            expanded: 0,
+        }
+    }
+
     #[test]
-    fn bounded_read_rejects_a_file_larger_than_the_limit() {
-        let dir = package_dir();
-        let path = dir.path().join("runtime.toml");
-        assert_eq!(read_bounded(&path, 11).expect("at the limit").len(), 11);
+    fn read_is_charged_from_bytes_read_not_metadata() {
+        // The source yields far more than any metadata would have promised.
+        let limits = Limits {
+            max_file_bytes: 1024,
+            ..Limits::DEFAULT
+        };
+        let mut budget = budget(&limits);
+        assert_eq!(
+            budget
+                .read_charged(std::io::repeat(1).take(1024))
+                .expect("at the limit")
+                .len(),
+            1024
+        );
+        assert_eq!(budget.expanded, 512 + 1024);
         assert!(matches!(
-            read_bounded(&path, 10),
+            budget.read_charged(std::io::repeat(1)),
             Err(XtaskError::Package(ArchiveError::Entry {
                 reason: EntryRejection::FileTooLarge,
                 ..
             }))
+        ));
+    }
+
+    #[test]
+    fn reads_are_limited_by_the_remaining_aggregate_budget() {
+        // Each read is valid for the per-file limit; the aggregate is not.
+        let limits = Limits {
+            max_file_bytes: 4096,
+            max_expanded_bytes: 2 * (512 + 4096) + 512 + 100,
+            ..Limits::DEFAULT
+        };
+        let mut budget = budget(&limits);
+        budget
+            .read_charged(std::io::repeat(1).take(4096))
+            .expect("first");
+        budget
+            .read_charged(std::io::repeat(1).take(4096))
+            .expect("second");
+        // 100 bytes remain after a third header: a 4096-byte file must fail
+        // after buffering only 101 bytes, even from an endless source.
+        assert!(matches!(
+            budget.read_charged(std::io::repeat(1)),
+            Err(XtaskError::Package(ArchiveError::ExpandedTooLarge { .. }))
         ));
     }
 
@@ -374,5 +442,31 @@ mod tests {
         let path = out.path().join("a.tar.zst");
         let first = build(dir.path(), &path).expect("build");
         assert_eq!(build(dir.path(), &path).expect("rebuild"), first);
+    }
+
+    #[test]
+    fn output_symlinks_are_rejected_even_when_dangling_into_the_tree() {
+        let dir = package_dir();
+        let out = pohunek_test_support::tempdir().expect("tempdir");
+
+        let dangling = out.path().join("dangling.tar.zst");
+        let target = dir.path().join("future.tar.zst");
+        symlink(&target, &dangling).expect("symlink");
+        assert!(matches!(
+            build(dir.path(), &dangling),
+            Err(XtaskError::OutputIsSymlink(_))
+        ));
+        assert!(!target.exists(), "nothing was written into the tree");
+
+        let existing = out.path().join("existing.tar.zst");
+        symlink(dir.path().join("runtime.toml"), &existing).expect("symlink");
+        assert!(matches!(
+            build(dir.path(), &existing),
+            Err(XtaskError::OutputIsSymlink(_))
+        ));
+        assert_eq!(
+            fs::read(dir.path().join("runtime.toml")).expect("read"),
+            b"schema = 1\n"
+        );
     }
 }
