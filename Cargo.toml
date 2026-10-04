@@ -10,6 +10,7 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/package",
     "crates/relay-protocol",
     "crates/relay",
     "crates/relay-client",
@@ -58,6 +59,7 @@ pohunek-netbird = { path = "crates/netbird" }
 netbird = { package = "pohunek-netbird", path = "crates/netbird" }
 overlay = { package = "pohunek-overlay", path = "crates/overlay" }
 pohunek-platform = { path = "crates/platform" }
+pohunek-package = { path = "crates/package" }
 pohunek-paths = { path = "crates/paths" }
 pohunek-prompt = { path = "crates/prompt" }
 pohunek-service-config = { path = "crates/service-config" }
@@ -75,6 +77,10 @@ serde_yaml = "0.9"
 httparse = "1.10"
 include_dir = "0.7"
 sha2 = "0.10"
+# Pure-Rust zstd codec: the package archive builder and reader stay C-free so MUSL
+# release builds need no C toolchain, and the encoder output is pinned by the
+# exact version so the canonical archive bytes stay reproducible.
+ruzstd = "=0.9.0"
 thiserror = "2"
 toml = "0.8"
 toml_edit = "0.22"

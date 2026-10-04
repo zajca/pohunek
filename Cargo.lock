@@ -2938,6 +2938,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pohunek-package"
+version = "0.33.0"
+dependencies = [
+ "pohunek-protocol",
+ "ruzstd",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "pohunek-paths"
 version = "0.33.1"
 dependencies = [
@@ -3357,7 +3367,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3685,6 +3695,15 @@ dependencies = [
  "quick-error",
  "tempfile",
  "wait-timeout",
+]
+
+[[package]]
+name = "ruzstd"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a252f5e20f038fe7b4ea53e073e65398d652c864cc162fc77c56c2f13717b888"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -5049,6 +5068,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "twox-hash"
+version = "2.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5660,6 +5685,7 @@ dependencies = [
  "nix 0.29.0",
  "pohunek-cli",
  "pohunek-knowledge",
+ "pohunek-package",
  "pohunek-protocol",
  "pohunek-relay-protocol",
  "pohunek-test-support",

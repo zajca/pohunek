@@ -1,0 +1,23 @@
+[package]
+name = "pohunek-package"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Canonical runtime package archive format, builder and strict reader for pohunek."
+
+[lib]
+name = "package"
+path = "src/lib.rs"
+
+[dependencies]
+pohunek-protocol = { workspace = true }
+ruzstd = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+ruzstd = { workspace = true }
+
+[lints]
+workspace = true

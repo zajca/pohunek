@@ -17,6 +17,8 @@ Start here:
 - [Sessions](concepts/sessions.md), [projects](concepts/projects.md),
   [worktrees](concepts/worktrees.md), and
   [agent profiles](concepts/agent-profiles.md) describe the operating model.
+  The [runtime package archive](concepts/runtime-package-archive.md) defines the
+  canonical deterministic `tar.zst` format, its strict reader, and its limits.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   and [remote hosts](guides/remote-hosts.md)
   cover common configuration paths.
