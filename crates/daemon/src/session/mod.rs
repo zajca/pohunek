@@ -131,8 +131,9 @@ const ACTIVITY_EVIDENCE_RETENTION: Duration =
     Duration::from_millis(protocol::MAX_SESSION_WAIT_MS as u64);
 /// Final runtime retention while no daemon is present.
 const DEFAULT_WORKER_TERMINAL_RETENTION: Duration = Duration::from_hours(24);
-/// Initial durable logical-session record schema.
-const SESSION_RECORD_SCHEMA_VERSION: u32 = 1;
+/// Durable logical-session record schema; every persisted record kind shares the
+/// store-wide schema version.
+const SESSION_RECORD_SCHEMA_VERSION: u32 = crate::store::STORE_SCHEMA_VERSION;
 /// Bound on how long a graceful shutdown waits for the event-log drain to flush
 /// its backlog, so a wedged log write can never hang shutdown.
 const EVENT_LOG_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);

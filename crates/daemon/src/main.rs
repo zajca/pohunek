@@ -58,7 +58,7 @@ use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::ServiceConfig;
 
 /// File name of the unified logical-session metadata store under the data dir.
-const STORE_NAME: &str = "metadata.jsonl";
+const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
 
 /// Subdirectory under the data dir holding per-session git worktrees.
 const WORKTREES_SUBDIR: &str = "worktrees";
@@ -213,9 +213,13 @@ async fn run() -> Result<(), DaemonError> {
     //    report native identity, logical sessions survive a restart, a
     //    repo+branch session binds a dedicated worktree, and the lifecycle is
     //    recorded to the append-only event log.
+    let store_path = paths.data_dir.join(STORE_NAME);
+    // The schema migration runs before the registry exists so reconciliation and
+    // adoption only ever see a store at the current schema.
+    pohunek_daemon::store::migrate_at_startup(&store_path)?;
     let config = SessionRegistryConfig {
         socket_path: Some(paths.socket.clone()),
-        store_path: Some(paths.data_dir.join(STORE_NAME)),
+        store_path: Some(store_path),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
         retention_policy_path: Some(paths.data_dir.join(RETENTION_POLICY_NAME)),

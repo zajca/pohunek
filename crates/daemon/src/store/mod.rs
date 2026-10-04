@@ -65,6 +65,10 @@ use crate::agent::host::{LaunchPin, RESERVED_RUNTIME_IDS};
 use crate::agent::{InputRules, NativeReferenceProvenance, NativeSessionLaunch, SessionRefKind};
 use crate::project::detect::project_id;
 
+mod schema;
+
+pub use schema::{migrate_at_startup, SchemaMigration, StoreSchemaError, STORE_SCHEMA_VERSION};
+
 #[cfg(unix)]
 const OWNER_PRIVATE_FILE_MODE: u32 = 0o600;
 const OWNER_PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -1163,10 +1167,7 @@ impl Store {
         })
     }
 
-    /// Read and partition every record. A missing file yields three empty lists;
-    /// malformed lines are skipped (a corrupt line must not block loading the
-    /// rest).
-    /// The metadata file's text, `None` when the store has no file yet.
+    /// Reads the store file. A missing file or directory yields `None`.
     fn read_content(&self) -> io::Result<Option<String>> {
         let parent = parent_directory(&self.path);
         if !parent.exists() {
@@ -1215,8 +1216,14 @@ impl Store {
                 digests.push(package_digest.clone());
             }
         };
-        for line in content.lines().filter(|line| !line.trim().is_empty()) {
-            match serde_json::from_str::<Record>(line) {
+        for line in self.checked_lines(&content)? {
+            let schema::ParsedLine::Record { value, .. } = line else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the metadata store holds a record that cannot be interpreted",
+                ));
+            };
+            match serde_json::from_value::<Record>(value) {
                 Ok(Record::Session(record)) => {
                     if let Some(recovery) = &record.recovery {
                         pin(&recovery.launch_binding);
@@ -1235,16 +1242,47 @@ impl Store {
         Ok(digests)
     }
 
+    /// Splits the store text into lines and refuses a store whose schema is not
+    /// the current one, before any record is interpreted.
+    fn checked_lines<'a>(&self, content: &'a str) -> io::Result<Vec<schema::ParsedLine<'a>>> {
+        let lines = schema::parse_lines(&self.path, content)?;
+        if let schema::SchemaState::Migratable { oldest } = schema::classify(&self.path, &lines)? {
+            return Err(StoreSchemaError::MigrationRequired {
+                path: self.path.clone(),
+                found: oldest,
+                supported: STORE_SCHEMA_VERSION,
+            }
+            .into());
+        }
+        Ok(lines)
+    }
+
+    /// Read and partition every record. A missing file yields four empty lists;
+    /// unparseable lines are skipped (a corrupt line must not block loading the
+    /// rest).
+    ///
+    /// The schema version of every line is checked first: a store newer than
+    /// this daemon, older without a kept migration, or not yet migrated is
+    /// refused with a [`StoreSchemaError`], so no mutation can rewrite records it
+    /// does not understand.
     fn read_all(&self) -> io::Result<StoreRecords> {
         let Some(content) = self.read_content()? else {
             return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
         };
+        let lines = self.checked_lines(&content)?;
         let mut resume = Vec::new();
         let mut worktrees = Vec::new();
         let mut projects = Vec::new();
         let mut sessions = Vec::new();
-        for line in content.lines().filter(|line| !line.trim().is_empty()) {
-            match serde_json::from_str::<Record>(line) {
+        for line in lines {
+            let (text, parsed) = match line {
+                schema::ParsedLine::Record { text, value, .. } => (
+                    text,
+                    serde_json::from_value::<Record>(value).map_err(|e| e.to_string()),
+                ),
+                schema::ParsedLine::Corrupt { text, error } => (text, Err(error)),
+            };
+            match parsed {
                 Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
                     mirror_worker_instance_id(&mut record);
                     sessions.push(*record);
@@ -1263,8 +1301,8 @@ impl Store {
                 // metadata, and a dropped project line forgets a known repo. The
                 // store holds no secrets, so logging the offending line is safe
                 // and aids debugging.
-                Err(err) => {
-                    warn!(error = %err, line = %line, "skipping unparseable metadata-store line");
+                Err(error) => {
+                    warn!(error = %error, line = %text, "skipping unparseable metadata-store line");
                 }
             }
         }
@@ -1309,6 +1347,14 @@ impl Store {
         for record in sessions {
             append_line(&mut body, &Record::Session(Box::new(record.clone())))?;
         }
+        self.commit_body(&body)
+    }
+
+    /// Atomically replaces the store file with `body`.
+    ///
+    /// One `rename(2)` commits the whole body; a body over the durable read
+    /// limit is refused so the store never becomes unreadable.
+    fn commit_body(&self, body: &str) -> io::Result<MetadataWriteOutcome> {
         if body.len() > MAX_METADATA_STORE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1571,7 +1617,10 @@ fn record_agents_are_persistable(record: &SessionRecord) -> bool {
 /// Serialize one record onto `body` as a single JSON line. Our own types
 /// serialize infallibly; any error is mapped to io for the caller.
 fn append_line(body: &mut String, record: &Record) -> io::Result<()> {
-    let line = serde_json::to_string(record)
+    let mut value = serde_json::to_value(record)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    schema::stamp_current_schema(&mut value)?;
+    let line = serde_json::to_string(&value)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     body.push_str(&line);
     body.push('\n');
@@ -1929,7 +1978,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -1945,7 +1994,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -1962,7 +2011,7 @@ mod tests {
     fn resume_line_with_removed_mode_fields_loads_as_non_recoverable() {
         let store = Store::new(temp_store_path("resume-removed-fields"));
         let old = concat!(
-            r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","program":"claude","#,
             r#""resume_mode":"flag","ref_kind":"id","resumable":true}"#,
             "\n"
@@ -1977,7 +2026,7 @@ mod tests {
     fn resume_provenance_defaults_to_reported_and_roundtrips_when_assigned() {
         let store = Store::new(temp_store_path("resume-provenance"));
         let legacy = concat!(
-            r#"{"kind":"resume","session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
             "\n"
         );
@@ -2046,7 +2095,7 @@ mod tests {
         // than inferring current compiled provider behavior.
         let store = Store::new(temp_store_path("resume-legacy"));
         let legacy = concat!(
-            r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-old"}"#,
             "\n"
         );
@@ -2070,10 +2119,10 @@ mod tests {
     fn resume_legacy_line_without_agent_base_infers_base_kind_from_agent_name() {
         let store = Store::new(temp_store_path("resume-legacy-agent-base"));
         let legacy = concat!(
-            r#"{"kind":"resume","session_id":"s-codex","agent":"codex","#,
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-codex","agent":"codex","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-codex"}"#,
             "\n",
-            r#"{"kind":"resume","session_id":"s-claude","agent":"claude","#,
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-claude","agent":"claude","#,
             r#""cwd":"/w","cols":100,"rows":30,"native_session_id":"native-claude"}"#,
             "\n"
         );
@@ -2110,7 +2159,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":2,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2151,7 +2200,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
+                r#"{"kind":"resume","schema_version":2,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
                 r#""cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2619,7 +2668,7 @@ mod tests {
         // still loads, defaulting project_id to None — the store's only
         // compatibility concession (serde default), not a guarantee.
         let legacy = concat!(
-            r#"{"kind":"worktree","session_id":"s-2","repository":"/r","branch":"feat/y","#,
+            r#"{"kind":"worktree","schema_version":2,"session_id":"s-2","repository":"/r","branch":"feat/y","#,
             r#""base_branch":"main","branch_slug":"feat-y","path":"/p","status":"active","#,
             r#""created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}"#,
             "\n"
@@ -2715,18 +2764,15 @@ mod tests {
     fn a_corrupt_line_is_skipped_preserving_every_valid_record_kind() {
         let store = Store::new(temp_store_path("corrupt-line"));
         // A valid project, a garbage line, and a valid resume — interleaved.
-        let body = format!(
-            "{}\n{}\n{}\n",
-            serde_json::to_string(&super::Record::Project(project(
-                "/code/ui/.git",
-                "/code/ui",
-                None
-            )))
-            .expect("project json"),
-            "{not valid json at all",
-            serde_json::to_string(&super::Record::Resume(resume("s-1", "native-1")))
-                .expect("resume json"),
-        );
+        let mut body = String::new();
+        super::append_line(
+            &mut body,
+            &super::Record::Project(project("/code/ui/.git", "/code/ui", None)),
+        )
+        .expect("project line");
+        body.push_str("{not valid json at all\n");
+        super::append_line(&mut body, &super::Record::Resume(resume("s-1", "native-1")))
+            .expect("resume line");
         write_private(store.path(), body);
 
         assert_eq!(
