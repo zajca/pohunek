@@ -31,12 +31,13 @@
 //! git mechanics (path computation, `git worktree add`, the non-fatal warning
 //! paths, the ownership gate) and persists through that shared store.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -88,6 +89,12 @@ pub(crate) const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Matches the setup-script poll cadence: prompt enough for tests and short
 /// hangs, with negligible CPU overhead on the blocking worktree thread.
 const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Poll interval while waiting for another worktree operation on the same
+/// repository. Short because the holder is a local `git worktree` command that
+/// finishes in tens of milliseconds, and every queued operation pays this
+/// latency once per handoff.
+const ADMIN_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Fallback directory-name component when a repository path has no usable file
 /// name (e.g. the filesystem root) or it sanitizes to empty.
@@ -1369,7 +1376,7 @@ fn worktree_add_new(
         .arg("--end-of-options")
         .arg(path)
         .arg(start_point);
-    run_command(cmd).map(|_| ())
+    run_admin_command(repo, cmd)
 }
 
 /// `git worktree add <path> <branch>` — check out an existing branch.
@@ -1380,13 +1387,88 @@ fn worktree_add_existing(repo: &Path, path: &Path, branch: &str) -> Result<(), S
         .arg("--end-of-options")
         .arg(path)
         .arg(branch);
-    run_command(cmd).map(|_| ())
+    run_admin_command(repo, cmd)
 }
 
 /// `git worktree remove --force <path>` — remove the checkout (not the branch).
 fn worktree_remove(repo: &Path, path: &Path) -> Result<(), String> {
     let mut cmd = git_command(repo)?;
     cmd.arg("worktree").arg("remove").arg("--force").arg(path);
+    run_admin_command(repo, cmd)
+}
+
+/// Locks serializing the git commands that write a repository's
+/// `worktrees/` admin directory, keyed by the canonical git common dir.
+///
+/// `git worktree add` creates `worktrees/<name>/` and fills it file by file
+/// (`commondir`, `gitdir`, ...). A concurrent `add` scans every sibling entry
+/// to check branch and path uniqueness, and a concurrent `prune` deletes
+/// entries it judges stale, so either can observe or destroy a half-written
+/// entry (`fatal: failed to read .git/worktrees/<name>/commondir`). Git has no
+/// lock for this. Entries are one small `Arc` per repository the daemon has
+/// touched and live for the process lifetime.
+static ADMIN_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<()>>>>> = Mutex::new(None);
+
+/// The lock guarding the `worktrees/` admin directory of the repository that
+/// `repo` (any checkout, linked worktree or bare repo path) belongs to.
+///
+/// Every spelling of one repository resolves to the same lock; distinct
+/// repositories get distinct locks and so never wait on each other.
+fn admin_lock(repo: &Path) -> Result<Arc<Mutex<()>>, String> {
+    let common_dir = git_capture(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let key = canonical_or_original(Path::new(&common_dir));
+    // The registry guards only the map insert; a poisoned map is still intact.
+    let mut registry = ADMIN_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    let lock = registry
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_default();
+    Ok(Arc::clone(lock))
+}
+
+/// Take `lock`, waiting at most `timeout` for the holder to finish.
+///
+/// The wait is bounded like every other git step: the holder is itself bound by
+/// [`GIT_COMMAND_TIMEOUT`], so a stuck sibling cannot pin this blocking thread
+/// forever. The lock protects no data, so a poisoned lock (a panicking holder)
+/// is still usable.
+fn lock_within(lock: &Mutex<()>, timeout: Duration) -> Result<MutexGuard<'_, ()>, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out after {timeout:?} waiting for another worktree operation \
+                         on the same repository"
+                    ));
+                }
+                thread::sleep(ADMIN_LOCK_POLL_INTERVAL);
+            }
+        }
+    }
+}
+
+/// Run a git command that rewrites `repo`'s `worktrees/` admin directory while
+/// holding that repository's [`admin_lock`]. The command keeps its own
+/// [`GIT_COMMAND_TIMEOUT`]; the lock wait is bounded by the same value.
+fn run_admin_command(repo: &Path, cmd: Command) -> Result<(), String> {
+    run_admin_command_within(repo, cmd, GIT_COMMAND_TIMEOUT)
+}
+
+/// [`run_admin_command`] with an explicit bound on the lock wait.
+fn run_admin_command_within(
+    repo: &Path,
+    cmd: Command,
+    lock_timeout: Duration,
+) -> Result<(), String> {
+    let lock = admin_lock(repo)?;
+    let _guard = lock_within(&lock, lock_timeout)?;
     run_command(cmd).map(|_| ())
 }
 
@@ -1415,7 +1497,9 @@ fn checkout_released(binding: &WorktreeBinding) -> bool {
 
 /// `git worktree prune` — drop admin entries for vanished worktrees.
 fn worktree_prune(repo: &Path) -> Result<(), String> {
-    git_run(repo, &["worktree", "prune"]).map(|_| ())
+    let mut cmd = git_command(repo)?;
+    cmd.args(["worktree", "prune"]);
+    run_admin_command(repo, cmd)
 }
 
 /// Reports whether removing the checkout at `path` would destroy work.
