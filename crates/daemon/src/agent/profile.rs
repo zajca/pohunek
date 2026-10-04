@@ -527,34 +527,57 @@ fn scanned_profile_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> 
     Ok(files)
 }
 
-/// Largest profile file the retention scan reads: 1 MiB.
+/// Largest profile file read, by a launch and by the retention scan alike: 1 MiB.
 ///
-/// The scan runs while the package lifecycle authority is held, so a file that
-/// is huge or endless must not stall package mutations and fresh launches. A
-/// profile is a few hundred bytes of launch settings; the ceiling is far above
-/// any real one.
-const MAX_SCANNED_PROFILE_BYTES: u64 = 1024 * 1024;
+/// A profile is a few hundred bytes of launch settings; the ceiling is far
+/// above any real one. The retention scan runs under the package lifecycle
+/// authority, so a huge or endless file must not stall package mutations and
+/// fresh launches, and a launch applies the same bound so the two always
+/// agree on what a loadable profile is.
+const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 
-/// Reads a profile file for the retention scan without following a final
-/// symlink and without blocking on a fifo or device swapped in after the
-/// listing, refusing anything that is not a regular file within
-/// [`MAX_SCANNED_PROFILE_BYTES`].
-fn read_bounded_profile(path: &Path) -> std::io::Result<String> {
+/// Reads the text of the profile file `path` of profile `name`.
+///
+/// This is the one acceptance rule for a profile file, shared by profile
+/// loading and the retention scan so a profile that launches is always seen by
+/// retention. The path must resolve inside the agents tree (a symlink that
+/// stays inside is followed, one that escapes is refused), the file it resolves
+/// to must be owner-secure, be a regular file and fit [`MAX_PROFILE_BYTES`].
+/// The resolved file is opened without following a further link and without
+/// blocking on a fifo or device swapped in after the check.
+fn read_profile_text(dir: &Path, name: &str, path: &Path) -> Result<String, ProtocolError> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
 
+    // Containment first: a symlinked `<name>.toml` that escapes the tree must be
+    // rejected before its contents are read or exec'd (C.5).
+    assert_contained(dir, path, name)?;
+    if !file_is_owner_secure(path) {
+        return Err(invalid_profile(
+            name,
+            "profile file is not owner-secure (wrong owner or group/world-writable)",
+        ));
+    }
+    let unreadable = |error: &std::io::Error| invalid_profile(name, &error.to_string());
+    let resolved = std::fs::canonicalize(path).map_err(|error| unreadable(&error))?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        .open(&resolved)
+        .map_err(|error| unreadable(&error))?;
+    if !file
+        .metadata()
+        .map_err(|error| unreadable(&error))?
+        .is_file()
+    {
+        return Err(invalid_profile(name, "profile file is not a regular file"));
     }
     let mut text = String::new();
-    file.take(MAX_SCANNED_PROFILE_BYTES + 1)
-        .read_to_string(&mut text)?;
-    if u64::try_from(text.len()).map_or(true, |read| read > MAX_SCANNED_PROFILE_BYTES) {
-        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    file.take(MAX_PROFILE_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|error| unreadable(&error))?;
+    if u64::try_from(text.len()).map_or(true, |read| read > MAX_PROFILE_BYTES) {
+        return Err(invalid_profile(name, "profile file is too large"));
     }
     Ok(text)
 }
@@ -580,15 +603,7 @@ struct FileBinding {
 /// pins nothing.
 fn read_binding(dir: &Path, name: &str, path: &Path) -> Result<Option<FileBinding>, ProtocolError> {
     validate_name("agent", name)?;
-    assert_contained(dir, path, name)?;
-    if !file_is_owner_secure(path) {
-        return Err(invalid_profile(
-            name,
-            "profile file is not owner-secure (wrong owner or group/world-writable)",
-        ));
-    }
-    let content =
-        read_bounded_profile(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
+    let content = read_profile_text(dir, name, path)?;
     let raw: RawBinding = toml::from_str(&content)
         .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
     let Some(digest) = raw.digest else {
@@ -676,17 +691,7 @@ fn load_profile(
     runtimes: &RuntimeHost,
     pinned: Option<&Arc<RuntimeDefinition>>,
 ) -> Result<ResolvedAgent, ProtocolError> {
-    // Containment first: a symlinked `<name>.toml` that escapes the tree must be
-    // rejected before its contents are read or exec'd (C.5).
-    assert_contained(dir, path, name)?;
-    if !file_is_owner_secure(path) {
-        return Err(invalid_profile(
-            name,
-            "profile file is not owner-secure (wrong owner or group/world-writable)",
-        ));
-    }
-    let content =
-        std::fs::read_to_string(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
+    let content = read_profile_text(dir, name, path)?;
     let raw: RawProfile = toml::from_str(&content)
         .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
     let base_id = RuntimeId::parse(&raw.base)

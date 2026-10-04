@@ -545,7 +545,7 @@ fn host_inspect_reports_a_pinned_profile_unavailable_when_its_package_is_uninsta
 }
 
 #[test]
-fn the_retention_scan_never_blocks_on_a_fifo_or_follows_a_symlink() {
+fn the_profile_reader_never_blocks_on_a_fifo() {
     let fixture = Fixture::new();
     let fifo = fixture.agents.join("fifo.toml");
     nix::unistd::mkfifo(
@@ -555,24 +555,56 @@ fn the_retention_scan_never_blocks_on_a_fifo_or_follows_a_symlink() {
     .expect("create a fifo");
     // The listing already skips a fifo; the reader itself must also refuse one
     // that replaces a listed regular file, without waiting for a writer.
-    super::read_bounded_profile(&fifo).expect_err("refused");
-
-    let target = fixture.agents.join("target.toml");
-    fs::write(&target, "base = \"pi\"\n").expect("write");
-    let link = fixture.agents.join("link.toml");
-    std::os::unix::fs::symlink(&target, &link).expect("symlink");
-    super::read_bounded_profile(&link).expect_err("refused");
-    assert!(pinned_set(&fixture.profiles()).iter().next().is_none());
+    super::read_profile_text(&fixture.agents, "fifo", &fifo).expect_err("refused");
 }
 
 #[test]
-fn the_retention_scan_refuses_an_oversized_profile() {
+fn launch_and_retention_agree_on_a_contained_symlink_profile() {
     let fixture = Fixture::new();
-    let big = fixture.agents.join("big.toml");
-    let file = fs::File::create(&big).expect("create");
-    file.set_len(super::MAX_SCANNED_PROFILE_BYTES + 1)
-        .expect("sparse file");
-    super::read_bounded_profile(&big).expect_err("refused");
+    let definitions = fixture.agents.join("definitions");
+    fs::create_dir(&definitions).expect("definitions directory");
+    fs::write(
+        definitions.join("work.txt"),
+        format!(
+            "base = \"pi\"\n{}",
+            Fixture::pin(PI_SHAPED_PACKAGE_ID, &fixture.digest)
+        ),
+    )
+    .expect("the pinned profile");
+    std::os::unix::fs::symlink(
+        definitions.join("work.txt"),
+        fixture.agents.join("work.toml"),
+    )
+    .expect("a contained symlink");
+    let profiles = fixture.profiles();
+
+    // The launch path loads it, so retention must hold its digest.
+    let agent = profiles.resolve_agent("work").expect("the profile loads");
+    assert!(agent.profile.is_some());
+    assert_eq!(
+        pinned_set(&profiles).iter().collect::<Vec<_>>(),
+        [&fixture.digest]
+    );
+}
+
+#[test]
+fn launch_and_retention_agree_on_an_oversized_profile() {
+    let fixture = Fixture::new();
+    fixture.write_pinned("big", &fixture.digest);
+    let path = fixture.agents.join("big.toml");
+    let file = fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open the profile");
+    file.set_len(super::MAX_PROFILE_BYTES + 1).expect("grow");
+    let profiles = fixture.profiles();
+
+    // Neither accepts it, and the digest it would pin is not silently lost: the
+    // profile does not load, so nothing launches from it.
+    profiles
+        .resolve_agent("big")
+        .expect_err("too large to load");
+    super::read_profile_text(&fixture.agents, "big", &path).expect_err("refused");
 }
 
 #[test]

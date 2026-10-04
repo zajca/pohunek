@@ -268,3 +268,40 @@ async fn a_profile_pin_refuses_removal_of_a_modified_root() {
         .await
         .expect("unpinned, the modified root is removed");
 }
+
+#[tokio::test]
+async fn every_profile_a_launch_can_load_retains_its_package() {
+    let dir = temp_dir("pin-symlinked");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let pinned = Pinned::new("pin-symlinked", &script, &dir);
+    // The profile a launch resolves is a symlink into a subdirectory of the
+    // agents tree.
+    let definitions = pinned.agents.join("definitions");
+    fs::create_dir(&definitions).expect("definitions directory");
+    fs::rename(
+        pinned.agents.join("pinned.toml"),
+        definitions.join("work.txt"),
+    )
+    .expect("move the profile body");
+    std::os::unix::fs::symlink(
+        definitions.join("work.txt"),
+        pinned.agents.join("work.toml"),
+    )
+    .expect("a contained symlink");
+    let registry = pinned.registry();
+
+    registry
+        .profiles()
+        .resolve_agent("work")
+        .expect("the symlinked profile loads, so a launch can use it");
+    // No session references the package, so only the profile can retain it.
+    let refused = registry
+        .uninstall_package(&pinned.digest)
+        .await
+        .expect_err("the loadable profile pins the package");
+    assert!(matches!(
+        refused,
+        PackageUninstallError::Registry(RegistryError::StillReferenced)
+    ));
+}
