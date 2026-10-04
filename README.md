@@ -9,915 +9,248 @@
   <img src="https://img.shields.io/badge/rust-1.96%2B-orange.svg" alt="MSRV 1.96" />
 </p>
 
-**pohunek** is a single-user control plane for durable coding-agent sessions
-across your own machines. A Rust daemon (`pohunekd`) owns logical session state
-and the public API on each host; one isolated `pohunek-sessiond` worker owns
-each live PTY and agent process. The CLI (`pohunek`) drives the daemon locally
-over a Unix socket and remotely over a NetBird/WireGuard mesh.
-
-**The daemon and its protocol are the product.** Every client — the CLI, the web
-control center, your own launcher — sits on top of the same versioned protocol.
-pohunek is fully usable from the CLI alone, and the Rust/TypeScript SDKs exist
-precisely so you can **build your own GUI or client** tailored to how you work.
-This repository ships no user interface: the web control center, the native
-desktop GUI, and the desktop launchers are separate clients that live in
-[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work). See [SDKs and building your own client](#sdks-and-building-your-own-client).
-
-Start Codex, Claude Code, or Hermes Agent on any of your machines, detach, walk away, and
-come back later — from any terminal, from the web, or from a keyboard
-launcher. The agents keep working; pohunek keeps track of what they are doing,
-where they are doing it, and when they need you.
+**pohunek** is a headless, multihost backbone for coding agents. One small Rust
+daemon per machine. One durable terminal per Codex, Claude Code, or Hermes
+Agent session. One versioned JSON contract for everything you build on top.
 
 > A *pohunek* is the farmhand boy who drives the draft animals. He does not
 > plow himself — he keeps the team moving.
 
+The agents do the plowing. pohunek keeps them running on the right machine, in
+the right worktree, and tells you or your tooling when one of them needs
+attention.
+
 > **Status: pre-1.0, experimental.** Wire shapes, config files, and on-disk
-> metadata may change freely between releases. Linux-first.
+> metadata may change freely between releases. Linux-first; macOS on Apple
+> Silicon is in progress.
 
-## Features
+## Two machines, one minute
 
-**Durable agent sessions**
+```bash
+# Which of your NetBird peers already run a daemon? No tokens, no server.
+pohunek host discover
 
-- A dedicated worker owns every PTY, so sessions survive client detach,
-  terminal crashes, daemon restart, daemon failure, and daemon binary upgrade.
-  Attach from any terminal with `pohunek attach`, detach with `Ctrl-]`, and
-  reattach later. Multiple clients can attach to one session.
-- Codex, Claude Code, and Hermes Agent are first-class agents (plus plain
-  `shell`), with
-  per-host **agent profiles** that define the program, arguments, environment,
-  and input rules for custom runtimes (e.g. `claude-otel`).
-- Hermes Agent `0.20.0` is supported only through its local interactive terminal
-  backend. Docker, SSH, browser, desktop, gateway, ACP, and other Hermes
-  backends are outside Pohunek's PTY ownership model. The selected Hermes
-  profile can additionally host the owner-private Pohunek operator plugin:
-  bounded typed tools, a generated skill, and best-effort lifecycle hooks.
-- **Live agent state detection** — `working` / `blocked` / `idle` — derived
-  from OSC terminal titles, screen-content pattern matching, and PTY activity.
-  Detection rules are TOML manifests, so new agents can be added without
-  recompiling.
-- **Native recovery**: hooks capture the launch agent's own session id, so a
-  lost or terminal runtime can be recovered explicitly. Recovery creates a new
-  PTY generation; ordinary daemon restart reconnects to the existing worker and
-  never invokes provider-native resume.
-- **Session fork** — branch a Claude Code conversation into a new session and
-  PTY without disturbing the original.
-- **Prompt injection done right**: `session input` and `--input` use per-agent
-  framing (bracketed paste, delayed submit) so multi-line prompts actually
-  submit into Ink/TUI agents instead of being half-swallowed.
-- **Provider-neutral observation**: read a bounded rendered screen, page through
-  retained binary-safe output with exact runtime cursors, or wait up to eight
-  seconds for state/activity/output changes without taking attach ownership.
-- Rename sessions, attach arbitrary `key=value` metadata, and inspect
-  everything as JSON.
+# Start Codex on the build box, in a fresh worktree, with its first prompt.
+# The project name resolves on buildbox; no filesystem path crosses the wire.
+pohunek session new --host buildbox --project myapp --agent codex \
+  --branch feat/parser --input "Fix the parser fuzz failures." --yes
 
-**Multi-host, no central server**
+# Go do something else. When the agent waits for an approval or is blocked,
+# the record lands here, from every host at once.
+pohunek notifications watch --all-hosts
 
-- Every command takes `--host <name>`; session targets accept
-  `<host>/<session-id>`. The CLI talks **directly** to each host's daemon —
-  there is no coordinator, no SaaS, no state sync.
-- Remote transport is one TCP listener per configured overlay, bound **only**
-  to that provider's validated member address and port, never `0.0.0.0`.
-  NetBird/WireGuard is the default provider; local access is an owner-only Unix
-  socket.
-- **Tokenless discovery**: `pohunek host discover` aggregates configured
-  overlay peers and probes which run a reachable daemon. It needs provider-local
-  state but not local `pohunekd`, and uses a short owner-private cache;
-  `--refresh` re-probes.
-  Status loading and peer probing have explicit bounded deadlines.
-  `host inspect` queries live capabilities straight from the selected daemon.
-- **Stable host identity and safe governance inspection**: every daemon keeps a
-  stable opaque `HostId` and an owner-private local governance record. Inspect
-  it with `pohunek host governance inspect <host> [--json]` to see the safe
-  host ID, approval-key reference, explicit never-enrolled absence or one
-  enrolled relay/owner/revisions/quarantine state. This is read-only: no relay,
-  enrollment, ownership-transfer, or team-management command ships here.
-  It adds no required configuration; the daemon manages the owner-private state
-  under its existing XDG state directory.
-- **Shell completion**: generate static Bash, Zsh, or Fish completion from the
-  clap command tree. An explicit `--dynamic` mode adds bounded, failure-silent
-  host and session-target lookup without starting a daemon.
+# Take over the terminal across the mesh; Ctrl-] leaves the agent running.
+pohunek attach buildbox/s-01J00000000000000000000000
 
-**Projects and worktree isolation**
+# What did it change? Diff of the remote worktree, untracked files included.
+pohunek session diff buildbox/s-01J00000000000000000000000
+```
 
-- The daemon notices when a session starts inside a git repository and records
-  a lightweight **project** (keyed by the canonical git common dir, so a repo
-  and all its worktrees collapse into one project). No filesystem scanning.
-- Start a session with `--branch` and the daemon creates a
-  **worktree-per-session** off the base branch, so two agents never share a
-  working tree by accident. Worktree ownership is recorded and checked before
-  any reuse or cleanup.
-- Per-project **actions and prompt templates**: an in-repo `.pohunek/`
-  directory shadows host-level config, so `pohunek project action <ref> <name>`
-  resolves a full launch recipe (agent, base branch, branch rule, rendered
-  prompt) for launchers and scripts.
-- `pohunek session diff` renders a unified diff of a session's worktree
-  against its base — including untracked files — over the wire.
+Close the terminal, restart or upgrade the daemon: the session keeps the same
+PTY and child PID. Logout, a host reboot, or a worker failure ends that runtime
+generation; the session then shows `runtime.state=lost`, is never restarted
+behind your back, and `pohunek session resume` recovers it on purpose when the
+agent's native session id was captured.
 
-**Durable notification activity**
+## Why not a multiplexer and ssh
 
-- Agent events (approval required, agent blocked, turn completed, session
-  finished, errors) become **durable notification records** with lifecycle
-  states (`unread → read → acknowledged → archived → deleted`).
-- Fed by installed Codex/Claude hooks *and* daemon-side state projection, with
-  source-priority dedupe, a debounce window that drops notifications the agent
-  resolves itself, and resolve-on-resume so stale "blocked" entries disappear
-  when the agent returns to working or its normal ready prompt.
-- `pohunek notifications list|watch --all-hosts` fans out across every
-  reachable host client-side. Per-kind/provider policy, automatic age retention,
-  and physical JSONL compaction are daemon-enforced; unresolved actions and
-  errors never expire automatically.
+A multiplexer keeps a shell alive. It does not know that the process inside is
+an agent, so every agent-aware need lands on whoever writes the tool. pohunek
+handles it once, for every agent CLI:
 
-**Terminal UX**
+| You need to | pohunek gives you |
+|---|---|
+| Know whether the agent is working, blocked on an approval, or idle | Live `working` / `blocked` / `idle` detection from OSC titles, screen patterns, and PTY activity. Detection rules are TOML manifests, so a new agent needs no recompile. |
+| Submit a multi-line prompt into an Ink TUI without it being half-swallowed | `session input` with per-agent framing (bracketed paste, delayed submit). Prompts can come from stdin so they never appear in argv or logs. |
+| Hear about it when something needs you, on any machine | Durable notification records (`unread → read → acknowledged → archived`), fed by agent hooks and daemon-side detection, deduped and debounced, fanned out with `--all-hosts`. |
+| Keep two agents out of one working tree | `--branch` creates a worktree per session off the base branch; ownership is recorded and checked before any reuse or cleanup. |
+| Get a conversation back, or branch it | Hooks capture the agent's own session id for explicit `session resume`; `session fork` branches a Claude Code conversation into a new session and PTY. |
+| Watch without stealing the terminal | `session screen`, paged `session output` with exact runtime cursors, and `session wait` for bounded change polling. |
+| Drive it from a script or another agent | One versioned `--json` envelope, typed errors with recovery hints, `subscribe` event streams, Rust and TypeScript SDKs. |
 
-- `pohunek setup config` installs the default attach config and the issue/PR
-  prompt templates. The rofi/sway launchers are developed in
-  [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work).
-- **Attach session menu**: raw terminal passthrough preserves native scrollback;
-  `Ctrl-\` temporarily shows a composited dialog headed by the session's host,
-  project, branch, name, and live state, with a menu (kill, terminate and
-  delete, detach, new session in the same worktree, fork, rename), then restores
-  the agent screen and raw passthrough when the menu closes.
-- Attach auto-reconnects after a daemon restart to the same worker, PTY, child
-  PID, and runtime generation. Retries use a minimum interval and consecutive
-  attempt cap, while typed worker-stream failures stop immediately. A changed
-  runtime generation is shown as explicit native recovery, not seamless
-  continuation.
+## What pohunek is built for
 
-**Built to be driven by agents, not just humans**
+- **Headless by design.** This repository ships no user interface. The daemon,
+  its protocol, the CLI with `--json`, and the SDKs are the product. Every GUI,
+  launcher, or dashboard is a client of the same public contract: the Rust
+  crate `pohunek-client` and the TypeScript packages `@pohunek/protocol`,
+  `@pohunek/sdk` (with a node-free browser entry), and `@pohunek/testkit`
+  speak one newline-delimited JSON protocol, with the TypeScript types
+  generated from the Rust source of truth. A shell script around `--json` is a
+  legitimate client too. [docs/sdk.md](docs/sdk.md) has the examples.
+- **A stable base for tooling you build yourself.** Each agent CLI has its own
+  TUI quirks, prompt framing, hooks, session ids, and resume and fork rules.
+  pohunek absorbs those differences once, so your scripts, launchers, review
+  bots, and manager agents talk to one contract instead of every harness.
+- **Multihost from the start.** Every host is authoritative for its own
+  sessions. The CLI and SDKs talk directly to each host's daemon: an owner-only
+  Unix socket locally, a NetBird/WireGuard overlay remotely, bound only to the
+  overlay address. No central server, no SaaS, no state sync. `--host buildbox`
+  or a `buildbox/<session-id>` target is all it takes.
+- **Driven by agents, not only by people.** Every automation command returns
+  one versioned JSON envelope with typed errors. `pohunek agent-skill` prints
+  the complete operating skill an agent needs, and `pohunek assistant` starts
+  an agent session that already knows pohunek and your hosts.
 
-- Automation commands have a versioned `--json` process envelope with exactly
-  one `ok` or `err` document on stdout; diagnostics stay on stderr. Errors are
-  structured (`class`/`code`/`msg` plus a recovery hint), and `subscribe`
-  streams typed events over the same protocol. Session creation and input can
-  read bounded UTF-8 payloads from stdin so prompts do not need to appear in
-  argv, diagnostics, or logs.
-- **Bundled agent skill**: `pohunek agent-skill` prints the complete
-  agent-facing operating skill embedded in the binary — discovery, explicit
-  targeting, JSON state reads, subscriptions, send-and-wait flows, and the
-  safety boundaries — with `--json` emitting one envelope carrying the skill
-  text and its sha256. It is fully local: no daemon contact, no filesystem
-  reads, no network access; `--host` is accepted and ignored.
-- **Universal assistant**: `pohunek assistant "how do I …"` launches a capable
-  agent session preloaded with an offline knowledge bundle about pohunek
-  itself and a redacted live snapshot of your hosts — self-hosted support for
-  setup, project configuration, updates, and debugging.
-- **SDKs — build your own GUI or client**: a Rust client crate
-  (`pohunek-client`) and TypeScript packages (`@pohunek/protocol`,
-  `@pohunek/sdk`, and `@pohunek/testkit`) speak the same versioned
-  newline-delimited JSON protocol every client uses — nothing is private
-  to any one client. Browsers use the node-free `@pohunek/sdk/browser` entry through
-  a WebSocket relay. TS protocol types are generated from the Rust
-  source of truth. If the bundled clients do not fit your workflow, wire up your
-  own control plane on these SDKs instead of forking one.
-
-## How it works
+```bash
+# An agent, or your script, working a session on another host:
+printf '%s' 'Run the focused tests.' \
+  | pohunek session input buildbox/s-01J00000000000000000000000 --stdin --json
+pohunek session wait buildbox/s-01J00000000000000000000000 \
+  --activity idle --timeout-ms 8000 --json     # wakes on idle, or reports a timeout
+pohunek agent-skill --json                     # the full skill text plus its sha256
+pohunek assistant "why does attach fail on my laptop?"
+```
 
 ```text
-  CLI / client (local)                CLI / client (remote)
-       |                                   |
-       | Unix socket                       | TCP over NetBird/WireGuard
-       | (resolved private runtime root)   | (daemon binds ONLY to the 100.x iface)
-       v                                   v
- +-----------------------------------------------------------+
- |                    host daemon (pohunekd)                  |
- |  public protocol | logical state | reconciliation | mesh   |
- +-----------------------------------------------------------+
-       |
-       | owner-private local worker protocol
-       v
- +-----------------------------------------------------------+
- |  pohunek-sessiond: one native job per worker generation    |
- |  (systemd transient unit on Linux, launchd job on macOS)   |
- |  PTY master | child process | output ring | terminal state |
- +-----------------------------------------------------------+
-       |
-   Codex / Claude Code / Hermes Agent running in worker-owned PTYs
+        your tooling: agents, scripts, launchers, GUIs, dashboards
+                 |  pohunek CLI --json  ·  protocol  ·  SDKs
+     +-----------+---------------+---------------------+
+     | Unix socket               | NetBird/WireGuard   | NetBird/WireGuard
+     v                           v                     v
+  laptop: pohunekd         workstation: pohunekd    buildbox: pohunekd
+     |                           |                     |
+  durable PTY workers      durable PTY workers      durable PTY workers
+  claude · codex           codex · hermes           claude · shell
 ```
 
-Each host is authoritative for its own sessions, projects, worktrees, and
-notifications. Control traffic is newline-delimited JSON; attaching to a
-session opens a **separate raw byte connection**, so JSON stays JSON and
-terminal bytes stay bytes.
+Each daemon hands every session to its own `pohunek-sessiond` worker (a
+systemd transient unit on Linux, a launchd job on macOS), which owns the PTY.
+pohunek is built for one operator on machines they own: owner-only permissions
+locally, your overlay's policies remotely, no multi-user auth, no hosted control
+plane. [Features and architecture](docs/features.md) has the full list and the
+trust boundary.
 
-Durability is tiered and explicit: detach, terminal close, screen lock,
-client restart, daemon restart, daemon crash, and daemon binary upgrade
-preserve the same live PTY and child PID. Logout, a host reboot, user-manager
-shutdown, or worker failure loses that runtime generation; after the next login
-the logical session remains visible as `runtime.state=lost` with
-`loss_reason=runtime_lost`, is never restarted automatically, and may be
-recovered explicitly with `pohunek session resume` when it has valid native
-recovery metadata.
+## Install with an agent
 
-## Install
+The easiest way to install pohunek is to let the coding agent you already use
+do it. Open Claude Code, Codex, or another agent with shell access on the
+machine that should become a pohunek host, and paste:
 
-Each release publishes `pohunek-cli-*` and `pohunek-daemon-*` archives for
-x86_64 Linux with both glibc and MUSL. Every
-archive contains its license and offline documentation under `docs/offline/`.
-Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
-`packaging/install-daemon.sh` wrapper around `pohunek service install`.
-Every CLI, daemon, and relay archive is packed deterministically
-(members sorted, root-owned, stamped with the tagged commit time) and carries a
-`MANIFEST` with the SHA-256 of every member; the daemon installer verifies
-it, the host OS and architecture, and member permissions before they run or
-change anything.
+```text
+Install pohunek (https://github.com/zajca/pohunek) on this machine and set it up
+so you can drive it.
 
-macOS on Apple Silicon (macOS 14 or newer) is not yet a published platform:
-public macOS support is declared only when the final native acceptance gate
-(#105) passes. Each release already publishes
-`pohunek-cli-<v>-aarch64-apple-darwin.tar.gz` and
-`pohunek-daemon-<v>-aarch64-apple-darwin.tar.gz`, each with a `.sha256`. They are
-ad-hoc signed (the `MANIFEST` says `signing adhoc`), not notarized, and carry no
-Developer ID. A build made with `packaging/macos/package --development` is
-unsigned, named `...-unsigned-development`, and never released. The install,
-upgrade, rollback, uninstall, log, logout/reboot, and Gatekeeper procedures are
-in the [macOS install runbook](docs/knowledge/runbooks/install-on-macos.md).
+Read these first and follow them, they are the source of truth:
+- https://raw.githubusercontent.com/zajca/pohunek/main/docs/install.md
+- https://raw.githubusercontent.com/zajca/pohunek/main/docs/knowledge/guides/setup.md
+- on macOS also https://raw.githubusercontent.com/zajca/pohunek/main/docs/knowledge/runbooks/install-on-macos.md
 
-Every release asset (Linux, macOS, and SDK archives and tarballs, and their
-`.sha256` checksum files) has a GitHub build-provenance attestation. Verify a download with:
-
-```bash
-gh attestation verify <file> --repo zajca/pohunek
+Rules:
+1. Detect the OS and CPU. Linux x86_64 uses the latest release's
+   pohunek-daemon-<version>-x86_64-unknown-linux-gnu.tar.gz (or -musl).
+   macOS 14+ on Apple Silicon uses `brew install zajca/pohunek/pohunek`;
+   tell me that macOS support is not declared final yet. For anything else,
+   stop and tell me.
+2. Verify every download with its .sha256 file and, when `gh` is available,
+   `gh attestation verify <file> --repo zajca/pohunek`. Stop on any mismatch.
+3. Before changing anything, run `pohunek service check --json` (from the
+   extracted archive on Linux), show me what will be installed where, and wait
+   for my approval. Then install the login service (`./packaging/install-daemon.sh`
+   on Linux, `pohunek service install` on macOS). Never pass
+   --accept-runtime-loss, --stop-sessions, or --purge.
+4. Verify with `pohunek doctor --json`, `pohunek service status --json`,
+   `pohunek health --json`, and `pohunek host inspect local --json`. Report
+   every warning; fix only what I approve.
+5. Ask me before running `pohunek integration install`: it has no dry run and
+   installs a SessionStart hook into the Claude Code and Codex configuration of
+   every agent present (`--agent` limits it to one). Tell me which agents and
+   configuration files it will touch and wait for my approval.
+6. Run `pohunek agent-skill` and save its output as a skill or instruction file
+   in your own harness, so later sessions know how to drive pohunek. Tell me
+   where you saved it.
+7. If this machine is in a NetBird network, run
+   `pohunek host discover --refresh --json` and list the hosts that already run
+   pohunek.
+8. Never put secrets into commands, logs, or your summary. End with the
+   installed version, paths, open warnings, and next steps.
 ```
 
-Install on macOS with Homebrew:
+Repeat it on every machine that should host sessions. Each host needs its own
+daemon, and remote hosts must be members of the same NetBird network. Once the
+daemon runs, `pohunek assistant setup` starts an agent session with the offline
+knowledge bundle and a redacted snapshot of your hosts. Use it to finish
+projects, agent profiles, and remote hosts.
+
+## Install manually
+
+- **Linux x86_64:** each [release](https://github.com/zajca/pohunek/releases)
+  publishes glibc and MUSL CLI and daemon archives. Unpack the daemon archive
+  and run `./packaging/install-daemon.sh`.
+- **macOS (Apple Silicon, macOS 14+):** `brew install zajca/pohunek/pohunek`,
+  then `pohunek service install`. The archives are published, but macOS support
+  is declared only after its acceptance gate
+  ([#105](https://github.com/zajca/pohunek/issues/105)) passes.
+- **From source (Rust 1.96+):**
+  `cargo build --release --locked --bin pohunek --bin pohunekd --bin pohunek-sessiond`.
 
 ```bash
-brew install zajca/pohunek/pohunek    # tap zajca/homebrew-pohunek, formula pohunek
-pohunek service install
-```
-
-Run `pohunek service upgrade` after every `brew upgrade pohunek`, and
-`pohunek service uninstall` before `brew uninstall pohunek`. The formula does not
-touch launchd itself.
-
-Or install from the archive: download the daemon archive with `curl -fLO` (curl
-sets no quarantine attribute), check it with `shasum -a 256 -c` and
-`gh attestation verify`, extract it, and run `./packaging/install-daemon.sh`.
-A file downloaded through a browser gets `com.apple.quarantine`, and Gatekeeper
-blocks it because it is not notarized; see the runbook before removing the
-attribute. After an upgrade macOS may ask again whether `pohunek` may access its
-`pohunek-relay` Keychain items, because an ad-hoc signature has no stable
-designated requirement.
-
-On Linux, download from [Releases](https://github.com/zajca/pohunek/releases),
-unpack, and put the binaries on your `PATH`.
-
-Protocol v2 was a one-time coordinated pre-1.0 boundary. Before that M1
-transition, every CLI, SDK, custom client, and local or remote
-daemon had to cross together. The legacy integer-v1 envelope and fixed
-`codex`/`claude` notification-policy fields have no compatibility shim. Once a
-fleet is on v2, peers negotiate their highest overlap: M2 and this M3 plugin do
-not raise the public protocol version or require a second coordinated boundary.
-Do not binary-downgrade a host after it has persisted Hermes enum values or the
-provider-keyed notification policy; recover by upgrading forward instead.
-
-For the daemon component, run the included `packaging/install-daemon.sh`. It
-calls `pohunek service install` (or `pohunek service upgrade` when a service is
-already installed and no interrupted install is pending), which:
-
-- copies `pohunek`, `pohunekd`, and `pohunek-sessiond` into
-  `<prefix>/libexec/pohunek/<version>/` and installs `<prefix>/bin/pohunek`; a
-  fresh install uses `POHUNEK_INSTALL_PREFIX` (default `~/.local`), an upgrade
-  keeps the prefix recorded in `service.toml` and refuses a different
-  `POHUNEK_INSTALL_PREFIX`;
-- writes `~/.config/pohunek/service.toml` (mode `0600`) with every deadline,
-  the agent environment allowlist, and the installation namespace;
-- registers the daemon as the only login service: the systemd user unit
-  `pohunek-<ns>-daemon.service` and slice `pohunek-<ns>-sessions.slice` on Linux
-  (systemd 255 or newer), or the launchd agent
-  `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist` on macOS;
-- waits until the daemon job's own process answers on the socket, and journals
-  every step in `~/.local/state/pohunek/service-install.json` so an interrupted
-  run resumes or rolls back (an install that fails from the registration step on
-  is kept pending for a rerun or `pohunek service uninstall` instead).
-
-The daemon starts each session worker as its own native job per worker
-generation (a systemd transient unit, or a launchd job whose definition stays in
-`~/.local/state/pohunek/launchd/`), so an upgrade restarts only the daemon while
-live workers keep running from their versioned directory. Agents receive only
-an allowlisted base environment (`[environment] allowlist` in `service.toml`)
-rather than the daemon's whole environment. `pohunek service uninstall` refuses
-while sessions are live unless `--stop-sessions` is given, and keeps durable
-metadata unless `--purge` is given.
-
-The first upgrade from a legacy daemon-owned PTY release refuses live sessions
-by default because those open PTYs cannot be transferred. Let them finish; use
-`--accept-runtime-loss` only after reviewing the affected ids and knowingly
-accepting the destructive boundary. An install that still runs the older
-`pohunek-session@` template workers is retired only after the wrapper has
-closed new connections to the legacy daemon, run the migration preflight, and
-re-checked every not-inactive worker state after the daemon stopped; any
-detected worker aborts the installer without removing legacy files. The whole
-run holds the service transaction lock (`pohunek service lock`), and
-`pohunek service check` first confirms that the final install or upgrade would
-accept `HOME`, the XDG roots, the prefix, and every directory it writes. See the
-[migration guide](docs/migrations/durable-session-workers.md) and
-[operations runbook](docs/runbooks/durable-session-workers.md).
-
-Or build from source (Rust 1.96+):
-
-```bash
-git clone https://github.com/zajca/pohunek.git
-cd pohunek
-cargo build --release --locked \
-  --bin pohunek --bin pohunekd --bin pohunek-sessiond
-```
-
-## Quick start
-
-```bash
-# 1. Check the environment (binaries, socket paths, writable state dirs)
-pohunek doctor
-
-# 2. Install the host daemon as a login service. Run the pohunek that sits next
-#    to pohunekd and pohunek-sessiond (unpacked daemon archive or target/release);
-#    --from defaults to its directory.
-./target/release/pohunek service install
-pohunek service status
-pohunek health
-pohunek host governance inspect local --json
-
-# 3. Install agent hooks (native session-id capture + notifications)
-pohunek integration install
-
-# 4. Start an agent session and attach to it
+pohunek doctor                              # environment check
+pohunek service status && pohunek health    # daemon installed and answering
+pohunek integration install                 # Codex/Claude hooks: session ids + notifications
 pohunek session new --agent claude --name "fix-login-bug"
-pohunek session list
-pohunek attach <session-id>        # Ctrl-] detaches, the agent keeps running
+pohunek attach <session-id>                 # Ctrl-] detaches, the agent keeps running
 ```
 
-For an isolated feature branch, let the daemon create a dedicated worktree:
+[docs/install.md](docs/install.md) covers archive verification, what the login
+service installs, upgrades, and the first worktree-isolated session.
 
-```bash
-pohunek session new --agent codex \
-  --repo ~/Code/myapp --branch feat/retry-logic --base-branch main \
-  --input "Add retry logic to the API client, then run the tests."
-```
+## Experiments built on pohunek
 
-### Hermes Agent and operator plugin
+[`zajca/pohunek-work`](https://github.com/zajca/pohunek-work) holds the author's
+own tooling on top of the core, and is the test that the core works as a
+backbone: every surface there uses only the CLI with `--json` and the public
+protocol through the SDKs, pinned to one core release. They show one way to
+build on pohunek, not the way.
 
-Pohunek manages the local interactive Hermes terminal as `--agent hermes`. Before
-launching, inspect the target host: the `hermes` runtime must be `available`
-and report `version=0.20.0` with `supported=true`.
+- **Workflow plugin.** Joins Linear or GitHub Issues, pull request state, and
+  pohunek sessions into one table with a derived `on_turn` column (me, an
+  agent, or a reviewer); named actions such as `implement`, `babysit`, `fix-ci`,
+  and `review` launch linked sessions in fresh worktrees. Merging stays manual.
+- **Native GUI** (`pohunek-gui`, Iced) for Linux (Wayland) and macOS; opening a
+  session launches your own terminal.
+- **Web control center**: Bun backend, Svelte SPA with an in-browser terminal,
+  usable from a phone over the mesh.
+- **Launchers**: rofi and sway scripts plus Linear and GitHub issue pickers.
 
-```bash
-pohunek host inspect local --json
-pohunek session new --agent hermes --name "investigate-login-bug"
-```
+The core never learns about Linear, GitHub, or work items. It knows sessions,
+worktrees, projects, events, notifications, and opaque metadata, and leaves
+everything domain-specific to clients like these.
 
-Pohunek launches exactly `hermes chat`. A valid reported native Hermes reference
-is resumed only as `hermes chat --resume <reference>`; it never uses
-`--continue` or `--pass-session-id`. Hermes has no supported native fork, so a
-fork request returns typed `agent_fork_unsupported` data before a worktree or
-child session is created. Pohunek never reads Hermes `state.db`.
+## Roadmap
 
-Install the operator plugin only into a target you name explicitly. The default
-profile is valid only when stated as `--hermes-profile default`; named profiles
-and a custom absolute home are isolated alternatives. The installer creates a
-Pohunek-owned owner-private policy outside the plugin checksum set, and binds
-its exact absolute path into the managed plugin asset.
+A sketch of the main tracks. The
+[GitHub Projects](https://github.com/zajca?tab=projects) and the linked epics are
+the source of truth for scope, order, and status.
 
-```bash
-# Observation plus constrained peer-session management in one named profile.
-pohunek integration install --agent hermes --hermes-profile work \
-  --access-mode manage --allow-host local --json
+| Track | Where it is heading | Status |
+|---|---|---|
+| **Runtime plugin packages** — [#139](https://github.com/zajca/pohunek/issues/139), [project](https://github.com/users/zajca/projects/5) | Codex, Claude Code, and Hermes become signed, content-addressed runtime packages installed per host, with their own CI and compatibility matrix. Only `shell` stays built in. | In progress: the runtime registry, the package archive format, the signed catalog, and the content-addressed package store have landed; the CLI lifecycle and the three extractions are next. |
+| **Workflow plugins** — [#148](https://github.com/zajca/pohunek/issues/148), [#325](https://github.com/zajca/pohunek/issues/325), [#326](https://github.com/zajca/pohunek/issues/326) | Bounded out-of-process plugins with declared actions and event reactions, invoked from the CLI. This is the packaging path for `pohunek-work`-style tooling. | Planned |
+| **More agents** — [#50](https://github.com/zajca/pohunek/issues/50), [#227](https://github.com/zajca/pohunek/issues/227) | Pi and OpenCode 2.x as further first-class runtimes. | Planned |
+| **Delegated task runs** — [#182](https://github.com/zajca/pohunek/issues/182), [WS1–WS8](https://github.com/zajca/pohunek/issues/219) | Tasks and turns over ordinary sessions: causal turn settlement, a blocking `task.wait`, typed results with repository evidence and checks, and an optional MCP adapter. Agents can then delegate work to other agents reliably. | Design: the RFC is being revised |
+| **Durability and detection** — [#420–#426](https://github.com/zajca/pohunek/issues/426), [#59–#67](https://github.com/zajca/pohunek/issues/67) | Recovery from crashes and host-wide session loss in one action, and explainable, arbitrated `working` / `blocked` / `idle` detection. | Planned |
+| **macOS** — [#94](https://github.com/zajca/pohunek/issues/94), [project](https://github.com/users/zajca/projects/4) | Native Apple Silicon hosts with launchd-owned durable workers. | In progress: archives and a Homebrew tap ship; support is declared after [#105](https://github.com/zajca/pohunek/issues/105). |
+| **Optional team relay** — [#56](https://github.com/zajca/pohunek/issues/56), [project](https://github.com/users/zajca/projects/2) | A public, multi-team control plane: hosts open the WireGuard link to the relay themselves, and the relay adds team ACLs, routing, and audit. The direct owner path stays first-class, and the relay is to move to its own repository ([#417](https://github.com/zajca/pohunek/issues/417)). | Foundation (authentication, credentials) implemented; transport and team surfaces pending |
+| **Dark factory** — [#185](https://github.com/zajca/pohunek/issues/185), [FS0–FS8](https://github.com/zajca/pohunek/issues/233) | Unattended manager/auditor delegation over the team relay, built as a client of the relay. | Design |
 
-# A default profile must still be selected explicitly.
-pohunek integration status --agent hermes --hermes-profile default --json
-pohunek integration doctor --agent hermes --hermes-profile work --json
+The longer narrative and the shipped foundations are in
+[docs/ROADMAP.md](docs/ROADMAP.md).
 
-# A relocated profile must be an explicit absolute, owner-private target.
-pohunek integration install --agent hermes \
-  --hermes-home /absolute/private/hermes-home \
-  --access-mode read_only --allow-host local --json
-```
+## Documentation
 
-`read_only` registers observation tools; `manage` adds constrained session
-management; `full` alone registers stop and remove. Remote host access is
-restricted by the explicit allowlist and goes directly to that daemon over
-NetBird, never through SSH. `*` needs `--confirm-wildcard`. Use
-`integration update` for a version/policy refresh and `integration uninstall`
-to remove only managed assets; add `--confirm-modified` when the ownership
-check reports changed assets. `status`, `doctor`, `update`, and `uninstall` are
-local for Hermes. Codex and Claude expose daemon-backed `integration status`
-and `integration doctor` on the effective `--host`, and a local `integration
-uninstall`; `update` remains Hermes-only and returns a typed unsupported-action
-error for those agents. A
-remote status recovery hint names the daemon host where the local-only installer
-must run; `--host` never turns `integration install` into a remote mutation.
-
-The plugin is a delegated-tool guardrail, not a sandbox against a same-user
-Hermes process with shell or file-write access. It repeats the daemon's exact
-origin-session denial for `session.stop`, `session.resume`, `session.remove`,
-`session.fork`, `session.resize`, `session.set_metadata`, `session.rename`, and
-`session.input` (the daemon also denies `session.remove_accepting_unconfirmed`, which the plugin never offers). Only `session.report_agent`, `session.release_agent`, and
-`session.report_native_id` remain lifecycle-report exceptions. Hooks use
-bounded local reporting, never a subprocess, network connection, or Hermes
-database; if they fail, turns remain usable and daemon process/screen detection
-is the fallback.
-
-Hermes programmatic input preserves multiline prompts with bracketed paste and
-a separate submit. It accepts LF and tab, rejects other terminal control
-characters without rewriting them, and refuses input while Hermes is visibly
-waiting for owner approval.
-
-## CLI guide
-
-Every command accepts `--host <name>` (default `local`), and nearly all of
-them `--json` for machine-readable output (the exceptions are `attach`,
-`daemon start`, and `prompt render`). Session targets are `<session-id>` or
-`<host>/<session-id>`. A discovered route uses
-`<overlay>:<canonical-identity>@<port>`. Canonical identities are typed
-`peer~<base64url>` or `fqdn~<base64url>` selectors without padding, so provider
-keys containing `/`, `+`, `=`, or the route separator `@` remain safe inside
-session targets and URLs. The selector is decoded and re-resolved through
-current provider state before every new connection while the discovered daemon
-port is retained.
-
-| Command | What it does |
+| Document | Content |
 |---|---|
-| `pohunek doctor` | Environment health: binaries, socket, state dirs, NetBird, agents. |
-| `pohunek service install [--from <dir>] [--prefix <dir>] [--json]` | Install the daemon as a native login service (systemd user unit or launchd agent) from staged binaries into a versioned `libexec` directory and write `service.toml`. |
-| `pohunek service upgrade [--from <dir>] [--json]` | Switch to the staged version, restarting only the daemon; live workers keep their PID and PTY, and unreferenced old versions are removed. |
-| `pohunek service uninstall [--stop-sessions] [--purge] [--json]` | Remove the service; refuses while sessions are live unless `--stop-sessions`, and keeps durable metadata unless `--purge`. |
-| `pohunek service status [--json]` | Daemon job, namespace, installed versions, worker jobs per generation, and any interrupted or running install transaction. |
-| `pohunek service check [--prefix <dir>] [--json]` | Run every check the install (or, for an existing service, the upgrade) of this version makes before its first effect — `HOME` and XDG roots, the prefix, every directory it writes, a pending transaction, the recorded installation — without changing anything; fails with the error code that command would. |
-| `pohunek service lock -- <command> [args...]` | Run a command while holding the service transaction lock; `pohunek service` commands it runs reuse the lock with the holder token in `POHUNEK_SERVICE_LOCK_TOKEN`, every other one is refused until it exits; the lock ends with this process, never with a process the command left behind. Exits with the command's status. |
-| `pohunek daemon start [--detach] [--dev-subprocess]` | Run the installed daemon by hand (needs `service.toml`), or with `--dev-subprocess` a development daemon with plain subprocess workers. |
-| `pohunek health` / `status` | Daemon liveness, build, and protocol version. |
-| `pohunek session new` | Start a session: `--agent`, `--name`, `--project`/`--repo`, `--branch`, `--base-branch`, `--cwd`, `--input`, `--request-timeout-ms`, `--meta k=v`. |
-| `pohunek session list` | List sessions, including a `running/recent` subagent count; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
-| `pohunek session inspect <target>` | Full logical session record: agent state, current/recent subagents, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
-| `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
-| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
-| `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
-| `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
-| `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `worker_instance_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
-| `pohunek session wait <target>` | Long-poll up to 8000 ms for explicit state, activity, metadata, terminal, output, or runtime predicates. |
-| `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (currently Claude Code). |
-| `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |
-| `pohunek session rename / stop / rm` | Rename, stop, or evict a session. |
-| `pohunek session rm <target> --accept-unconfirmed-cleanup` | Evict a session that `rm` refused with `runtime_supervision_ambiguous` only because same-user processes with unreadable environments may belong to its runtime (the refusal lists them). Those candidates are never signalled and, if one carries the runtime marker, keep running unsupervised after the worktree, logs, and record are deleted. The consent covers one call, is never automatic, and without it the removal stays refused; inspect and end the listed processes, then retry, as the safe path. The result lists the accepted processes; a daemon without the method answers `method_not_found`. |
-| `pohunek project add / list / show / rename / rm` | Manage git-repo-aware project records. |
-| `pohunek project actions / action / prompt` | Resolve per-project launch recipes and prompt templates. |
-| `pohunek host discover / list / inspect` | Find NetBird peers running daemons (standalone cache; `--refresh`) and query live capabilities. |
-| `pohunek host governance inspect <host>` | Read the safe stable host identity and local governance state; `--json` preserves explicit absence and canonical revisions. It does not mutate enrollment or ownership. |
-| `pohunek completions <bash\|zsh\|fish>` | Print static shell completion; add `--dynamic` for bounded host/session candidates. |
-| `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
-| `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
-| `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
-| `pohunek integration install` | Install Codex/Claude hooks, or a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
-| `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host`, or one explicitly selected local Hermes target. |
-| `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
-| `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
-| `pohunek setup [config]` | Install the default `attach.conf` and prompt templates (a bare `setup` is `setup config`). |
-| `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
-| `pohunek assistant [intent] [request…]` | Launch the self-help assistant with knowledge bundle + live snapshot. |
-| `pohunek agent-skill` | Print the complete bundled agent skill; `--json` wraps the skill text and its `content_sha256` in the process envelope. Fully local — `--host` is accepted and ignored. |
-| `pohunek prompt render / link` | Render provider prompt templates and work-item link metadata (called by external launchers). |
-
-### Working across hosts
-
-```bash
-pohunek host discover                          # which NetBird peers run a daemon?
-pohunek host inspect buildbox --json           # agents/worktree capabilities, live
-
-pohunek session new --host buildbox --project myapp --agent codex \
-  --branch feat/parser --input "Fix the parser fuzz failures."
-
-pohunek session list --host buildbox
-pohunek attach buildbox/s-01J00000000000000000000000 # raw PTY over the mesh
-
-pohunek notifications watch --all-hosts        # one triage stream for every machine
-```
-
-Remote session starts ask for confirmation (skip with `--yes`); project
-references resolve on the *target* host, so no filesystem path ever crosses
-the wire.
-
-### Shell completion
-
-Print a static script for manual loading, or install it in the shell's
-conventional per-user directory:
-
-```bash
-pohunek completions bash > pohunek.bash
-pohunek setup completions zsh
-pohunek setup completions fish --dynamic
-```
-
-Static completion performs no I/O beyond script generation. Dynamic completion
-is opt-in: it reads the existing owner-private host-discovery cache and makes a
-live, deadline-bounded `session.list` call for session targets. Every remote
-candidate has a provider-qualified `<overlay>:<address>` form; a short host name
-is offered only when it identifies one reachable route. A qualified `host/id`
-target overrides `--host`; otherwise an explicit `--host` selects the session
-source and the default is local. Missing daemons, unavailable overlays, name
-collisions, and timeouts produce no shell diagnostics or unsafe fallback
-candidates. The setup command does not edit shell startup files; for Zsh it
-prints the `fpath` step required before `compinit`.
-
-### Automation and bounded observation
-
-Use stdin for prompts that must not appear in the process list. The creation
-forms `--input` and `--input-stdin` (alias `--stdin`) are mutually exclusive;
-`session input` likewise accepts either positional text or `--stdin`:
-
-```bash
-printf '%s' 'Review the failing test and propose a fix.' \
-  | pohunek session new --agent codex --input-stdin --json
-
-printf '%s' 'Run the focused tests.' \
-  | pohunek session input s-01J00000000000000000000000 --stdin --json
-```
-
-Every `--json` success is one document shaped as
-`{cli_version, protocol: {minimum, maximum}, ok}`; failures use the same prefix
-with `err` instead of `ok` and exit non-zero. Human diagnostics remain on
-stderr. Long counters such as `runtime_generation`, offsets, and watermarks are
-decimal JSON strings.
-
-Start observation with a screen or newest output tail, then carry the returned
-runtime identity and cursor into later calls:
-
-```bash
-pohunek session screen s-01J00000000000000000000000 --json
-pohunek session detection s-01J00000000000000000000000 --json
-pohunek session output s-01J00000000000000000000000 --max-bytes 65536 --json
-pohunek session output s-01J00000000000000000000000 \
-  --worker-instance-id runtime-1 --runtime-generation 3 --after-offset 4096 \
-  --max-bytes 65536 --wait-ms 5000 --json
-pohunek session wait s-01J00000000000000000000000 \
-  --worker-instance-id runtime-1 --runtime-generation 3 --after-output-offset 4096 \
-  --timeout-ms 8000 --json
-```
-
-Detection manifests support `osc_title`, `osc_progress`, `whole_recent`,
-`bottom_lines(N)`, `bottom_non_empty_lines(N)`, `top_non_empty_lines(N)`,
-`last_non_empty_above_prompt_box`, `after_last_prompt_marker`,
-`prompt_box_body`, and `after_last_horizontal_rule`. The detection diagnostic
-shows the current matcher text for only the active manifest's required regions;
-screen previews preserve the same wide-glyph and soft-wrap behavior as live
-matching.
-
-Waiting output and `session wait` use dedicated connections. Re-issue short
-waits as needed; a killed client does not promise immediate daemon-side waiter
-cancellation, so the requested timeout is the release bound.
-
-If `session output` returns a structured `gap`, retained history no longer
-contains the requested range: discard that cursor and restart from a current
-screen or newest tail. If it reports `session_runtime_changed`, discard the old
-runtime identity and cursor before retrying. A `session wait` result with
-`reason: "timeout"` is a bounded no-change outcome, not proof of idle or
-health; a wake reports the changed runtime/session snapshot and watermark.
-
-TypeScript clients running inside a managed session configure the atomic origin
-pair explicitly; the SDK copies it to ordinary, subscription, and dedicated
-observation connections and never reads `process.env`:
-
-```ts
-const client = await connectLocal(socketPath, {
-  origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
-});
-```
-
-### Notifications triage
-
-```bash
-pohunek notifications list --unread
-pohunek notifications ack buildbox/n-42
-pohunek notifications policy set --provider claude --kind turn_completed --enabled
-pohunek notifications policy set --provider hermes --kind agent_blocked --enabled
-pohunek notifications retention prune --status archived --before 2026-06-01T00:00:00Z --apply
-```
-
-### Assistant
-
-```bash
-pohunek assistant "why does attach fail on my laptop?"
-pohunek assistant setup                # steer toward host setup
-pohunek assistant debug --host buildbox --no-snapshot
-pohunek assistant --agent hermes "Explain the current session runtime."
-```
-
-The assistant is an ordinary agent session — the same PTY, attach, and
-notification machinery — launched with a materialized offline knowledge
-bundle and a redacted snapshot of live state. No secrets enter the prompt. Its
-automatic preference order is `pohunek-assistant`, `codex`, `claude`, then
-`hermes`; explicit Hermes selection still requires the supported runtime on the
-selected host.
-
-## SDKs and building your own client
-
-pohunek's real interface is its **protocol**, not any one client. The CLI, the
-web control center, and the native GUI in `zajca/pohunek-work` are consumers of
-a versioned, newline-delimited JSON protocol that every client speaks — and the
-same protocol and SDKs are available to you. You are encouraged to **build your
-own GUI, TUI, launcher, or automation** on top of them rather than being tied
-to a bundled app.
-
-Nothing a bundled client does is private to it: hosts, sessions, projects,
-worktrees, notifications, diffs, and `subscribe` event streams are all driven
-entirely through this surface.
-
-- **Rust** — the `pohunek-client` crate: a typed `Client`, transports for local
-  Unix sockets and NetBird/WireGuard TCP, raw attach helpers, typed
-  `ClientError`s, and `subscribe` streams. It re-exports the `protocol` crate,
-  the source of truth for every request, response, and event type.
-- **TypeScript** — `@pohunek/protocol` (types generated from the Rust protocol),
-  `@pohunek/sdk` (Bun/Node plus shared runtime), its browser-safe
-  `@pohunek/sdk/browser` entry, and `@pohunek/testkit` (the stateful fixture
-  daemon and loopback test relay used by tests).
-- **Contract** — the wire surface is documented in
-  [`docs/public-api.md`](docs/public-api.md); TS types are regenerated from
-  Rust so the two SDKs never drift. The protocol is versioned, but pre-1.0 it
-  may still change between releases (see the status note above).
-- **Distribution and pinning** — clients use public contracts only: the CLI
-  with `--json` and the public protocol through the SDKs. Rust crates are
-  consumed by git tag and the TypeScript packages as release tarballs pinned by
-  URL and integrity, never from a registry. Crates beyond `pohunek-client` that a
-  Rust client links are a pinned, not a stable, API (no back-compat shims), and
-  clients move in lockstep with the protocol version.
-- **Or skip a client entirely** — every CLI command supports `--json` and
-  `subscribe` streams typed events, so a shell script is a legitimate way to
-  drive pohunek.
-
-Connecting and listing sessions is the same call in both SDKs:
-
-First-party Rust components resolve the platform runtime path centrally. Custom
-SDK clients should receive the exact local socket endpoint from configuration;
-the examples use `POHUNEK_SOCKET` rather than reconstructing a Linux-only path.
-With an explicit `XDG_RUNTIME_DIR`, Pohunek uses its `pohunek` child on Linux and
-macOS. Linux requires that variable, while macOS without it uses
-`/private/tmp/pohunek-<effective-uid>` and ignores `TMPDIR` for this decision.
-`@pohunek/sdk` derives the same default and checks the runtime directory
-before connecting.
-
-```rust
-// Rust — `pohunek-client`
-use pohunek_client::{protocol::method::SessionList, Client};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let sock = std::env::var_os("POHUNEK_SOCKET")
-        .ok_or_else(|| anyhow::anyhow!("set POHUNEK_SOCKET to the daemon socket path"))?;
-    // Local daemon over its owner-only Unix socket.
-    let mut client = Client::connect_local(&sock).await?;
-    // ...or a remote host over the NetBird/WireGuard mesh:
-    // let mut client = Client::connect("workstation", &sock).await?;
-
-    let sessions = client.call::<SessionList>(Default::default()).await?;
-    for s in sessions {
-        println!("{} {:?} {:?}", s.id.0, s.state, s.activity);
-    }
-    Ok(())
-}
-```
-
-```ts
-// TypeScript — `@pohunek/sdk`
-import { connectLocal } from "@pohunek/sdk";
-
-const sock = process.env.POHUNEK_SOCKET;
-if (!sock) throw new Error("set POHUNEK_SOCKET to the daemon socket path");
-const client = await connectLocal(sock);
-
-const sessions = await client.call("session.list", {});
-for (const s of sessions) {
-  console.log(s.id, s.state, s.activity);
-}
-await client.close();
-```
-
-Browsers use the node-free entry and reach a daemon through a WebSocket relay origin:
-
-```ts
-import { Client } from "@pohunek/sdk/browser";
-
-const client = await Client.connectWs(window.location.origin, "workstation");
-```
-
-Or subscribe to the same live event stream the CLI and other clients consume — session
-lifecycle, agent state, and notifications, decoded into typed events:
-
-```rust
-// Rust — subscribe consumes the client and hands back an event stream.
-use pohunek_client::{next_request_id, protocol::{method, Request}, Client};
-use serde_json::Value;
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let sock = std::env::var_os("POHUNEK_SOCKET")
-        .ok_or_else(|| anyhow::anyhow!("set POHUNEK_SOCKET to the daemon socket path"))?;
-    let client = Client::connect_local(&sock).await?;
-
-    let request = Request::new(next_request_id(method::SUBSCRIBE), method::SUBSCRIBE, Value::Null);
-    let mut events = client.subscribe(&request).await?;
-    // Runs until the daemon closes the stream.
-    while let Some(ev) = events.next_event().await? {
-        // `event` is the name (e.g. "agent_state"); `payload` is the flattened JSON body.
-        println!("{}: {}", ev.event, ev.payload);
-    }
-    Ok(())
-}
-```
-
-```ts
-// TypeScript — same event stream.
-import { connectLocal, nextRequestId } from "@pohunek/sdk";
-import { PROTOCOL_VERSION } from "@pohunek/protocol";
-
-const client = await connectLocal(sock);
-const subscription = await client.subscribe({
-  v: PROTOCOL_VERSION,
-  id: nextRequestId("subscribe"),
-  method: "subscribe",
-  params: null,
-});
-
-for (let ev = await subscription.nextEvent(); ev !== null; ev = await subscription.nextEvent()) {
-  console.log(ev.event, ev);
-}
-```
-
-## Trust boundary
-
-pohunek is built for **one operator on machines they own**:
-
-- Local access control is owner-only socket and file permissions.
-- Remote access control is your NetBird/WireGuard network and its policies;
-  the daemon never binds a public interface.
-- There is no multi-user auth, no hosted control plane, and no tenant model —
-  by design, not omission.
-- Secrets stay out of structured state: metadata, events, notifications,
-  prompts, and logs are secret-free; provider tokens live in the OS keyring or
-  provider CLIs (`gh`). Raw terminal scrollback is the one honest exception —
-  it is stored owner-private.
-- The private host approval signing key is stored separately from the safe
-  governance response. Public inspection exposes only its verification-key
-  reference, never a seed, signing key, proposal nonce, signature, or transfer
-  outcome.
-
-## Development
-
-The workspace is a Cargo monorepo (edition 2021, MSRV 1.96) plus a Bun
-workspace (rooted at the repository root, spanning `sdk/ts/*`) for the TypeScript packages.
-
-| Crate | Role |
-|-------|------|
-| `crates/protocol` | Wire contract: envelopes, methods, events, version negotiation. |
-| `crates/package`| Canonical runtime package archive: deterministic `tar.zst` builder, strict reader, size limits, package digest, and the signed runtime catalog verifier. |
-| `crates/client` | Rust SDK: typed errors, transports, attach helpers. |
-| `crates/daemon` | `pohunekd`: public control plane, logical session registry, reconciliation, detection, notifications. |
-| `crates/worker-protocol` | Versioned owner-private daemon-to-worker protocol and framing. |
-| `crates/session-worker` | `pohunek-sessiond`: one durable PTY runtime owner per live session. |
-| `crates/cli` | `pohunek`: every command over the control protocol. |
-| `crates/prompt` | Shared prompt rendering + `link.*` metadata schema (CLI and scripts). |
-| `crates/knowledge` | Knowledge-bundle primitives for the assistant and offline docs. |
-| `crates/terminal` | VT screen tracking and attach compositing. |
-| `crates/netbird` | NetBird status parsing, host resolution, bind validation, and overlay adapter. |
-| `crates/overlay` | Provider-neutral overlay contract, configured registry, and per-overlay routing. |
-| `crates/paths` / `crates/hostcheck` | XDG/socket contract; host environment probes. |
-| `crates/xtask` | Workspace automation: docs build/check, TS type generation. |
-| `sdk/ts/` | `@pohunek/protocol` (`sdk/ts/protocol`), `@pohunek/sdk` (`sdk/ts/sdk`), `@pohunek/testkit` (`sdk/ts/testkit`). |
-
-Read **[AGENTS.md](AGENTS.md)** first — it is the canonical contributor guide.
-Authoritative design lives in [docs/architecture.md](docs/architecture.md);
-the protocol contract in [docs/public-api.md](docs/public-api.md).
-
-### Gates
-
-CI treats warnings as errors. Run the full set before calling anything done:
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features
-cargo build -p pohunek-session-worker --bin pohunek-sessiond  # daemon tests spawn it by path
-cargo nextest run --profile ci --test-threads 4 --workspace --all-features
-cargo test --doc --workspace --all-features  # nextest excludes doctests
-cargo build --workspace --release
-cargo xtask docs check          # knowledge bundle: schema/drift/secrets/runbooks
-```
-
-Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see
-`AGENTS.md` "Fast loops" for watcher, and CI-timing variants):
-
-```bash
-cargo t                        # all fast unit + integration tests, no PTY/DB fixtures
-cargo t -p pohunek-daemon       # fast tests in one crate
-cargo ti                       # fast daemon/client/session-worker surface
-cargo tw                       # unfiltered full suite, four test processes
-bun test sdk/ts/sdk/test/config.test.ts -t "one case"  # one TypeScript test file, name pattern
-bacon                          # watcher: profile-fast nextest loop (bacon.toml)
-python3 scripts/test-partitions run cli    # exact CI shard (unit/daemon/relay/cli/relay-db/heavy)
-python3 scripts/test-partitions check      # verify all tests belong to exactly one shard
-scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
-    --event pull_request --conclusion success   # reproduce CI timing evidence
-```
-
-Requires cargo-nextest >= 0.9.131 (`flaky-result`) and Python >= 3.11
-for the shard helper. `profile.fast.default-filter` is the cost boundary;
-`scripts/test-partitions` subdivides it by package ownership, with an exact
-complement for heavy tests. Whole fixture-owning modules stay heavy: real
-PTY/worker lifecycle, PostgreSQL, Hermes subprocess suites,
-and nested Cargo integration checks. Fast includes short filesystem, mock-socket,
-and CLI integration tests; `--lib` alone is **not** a cost boundary.
-
-CI runs four fast matrix shards and separate heavy jobs without waiting for
-Clippy or release builds. Heavy uses four test processes and the real worker
-binary. Relay heavy tests (the only PostgreSQL fixture consumers) run in a
-dedicated `relay-db` job whose `POHUNEK_RELAY_TEST_DATABASE_URL` points at a
-disposable PostgreSQL service; a `paths-filter` job skips that job — including
-the Postgres service — when no relay-relevant file (`crates/relay*/**`,
-`migrations/**`, `Cargo.lock`, the CI workflow) changed. The full
-The full `ci`/`local` profiles remain unfiltered. Existing ignored tests retain
-their opt-in status. Each CI shard uploads a uniquely named JUnit artifact;
-sequential local fast shards overwrite `target/nextest/ci/junit.xml`, while heavy
-writes `target/nextest/heavy/junit.xml`.
-
-The target is fast feedback in about two minutes for routine changes, not a
-promise for cold builds or the complete required CI suite. Review JUnit execution
-times separately from compile/setup time; validating the 90%-of-changes target
-requires representative CI history. When adding a costly fixture, update the
-cost filter, run the partition coverage check, and measure the fast loop again.
-
-SDK workspace:
-
-```bash
-bun install --frozen-lockfile
-bun run typecheck && bun run lint && bun test
-```
-
-`bun run typecheck` is one command: `tsc -b` over the composite (source-only)
-`protocol → sdk → testkit` graph (incremental via
-`.tsbuildinfo` in each `dist-types/`), then the standalone checks — the SDK
-release scripts and the per-package `test/tsconfig.json`
-projects — run concurrently. Tests stay out of the composite graph because
-their imports of sibling packages resolve to `.ts` sources and would otherwise
-be pulled into non-referenced projects (and form reference cycles). Each
-package also supports `tsc -b` on its own (`cd sdk/ts/sdk && bun run typecheck`,
-which also typechecks that package's tests). Per-package `dist-types/` output
-is git-ignored.
-
-Stale per-branch Cargo target isolation directories (`target/<name>` shaped
-like a Cargo target dir, untouched for 30+ days) are removed with:
-
-```bash
-scripts/cargo-sweep-targets --dry-run   # preview
-scripts/cargo-sweep-targets --days 30   # delete; --cron prints a monthly line
-```
-
-Only entries shaped like Cargo target dirs are deleted. `target/debug`,
-`target/release`, nextest/doc scratch dirs, manual `pohunek-eval`
-transcripts, `doc`/`package` output, and cross-compile triples are kept, and
-a `--target-dir` that is not a Cargo target dir refuses to run.
-
-A protocol change is not done until the generated TypeScript types match:
-
-```bash
-cargo xtask ts generate   # regenerate sdk/ts/protocol/src/generated/**
-cargo xtask ts check      # CI gate
-```
-
-### Conventions that matter here
-
-- **Rust guidelines are mandatory.** The Microsoft Pragmatic Rust Guidelines
-  are vendored at `.agents/rust-guidelines/`; read the relevant files before
-  touching any `.rs` file (`SKILL.md` is the index).
-- **Typed errors** (`thiserror`) per crate; no bare catch-alls. Library crates
-  `#![forbid(unsafe_code)]`.
-- **Config fails fast** — required values are validated at load; no silent
-  defaults. No hardcoded magic values.
-- **Secrets never enter code, logs, errors, or agent context.** Keyring
-  references only; `gh` output is redacted before it can reach an error.
-- **Protocol ripples**: touching `crates/protocol` means updating `client`,
-  `daemon`, `cli`, the generated TS types, `docs/public-api.md`,
-  and the `docs/knowledge/` bundle in the same change.
-- **Tests for all new logic**; the protocol and state machines have rich
-  suites — extend them.
-
-### Release
-
-`scripts/release` bumps the workspace version, tags `vX.Y.Z`, and pushes; the
-Release workflow re-runs the gates on the tag, then builds and publishes glibc
-and MUSL x86_64 CLI and daemon archives, and ad-hoc signed `aarch64-apple-darwin`
-CLI and daemon archives. No macOS job uses secrets or a protected environment.
-A download-only `attest` job, the only job holding `id-token: write` and
-`attestations: write`, creates a build-provenance attestation for every
-published asset (Linux, macOS, SDK, and the `.sha256` checksum files); the publish jobs depend on it, so an
-unattested asset is never published. Developer ID signing and notarization are
-not part of the pipeline. The offline docs are
-bundled into every native component archive. CLI archives also contain
-`packaging/smoke-hermes-plugin-release`. Release automation provisions the
-source-locked Hermes runtime without provider credentials, runs the model-free
-compatibility gate, extracts each CLI archive, and executes its packaged smoke
-script against the extracted `pohunek` binary. Operators can repeat the same
-script with an explicitly supplied, preinstalled pinned Hermes executable. It
-creates an isolated temporary profile/state, requires that executable rather
-than downloading it, and fails if install, status, doctor, or uninstall cannot
-prove the embedded plugin and generated skill.
-
-After a published stable release, `.github/workflows/notify-tap.yml` (a `workflow_run` of `Release`, the only workflow with a secret, `TAP_DISPATCH_PAT`) sends the Homebrew tap `zajca/homebrew-pohunek` a `pohunek-work-release` repository dispatch for the `pohunek` formula and the tag, and the tap bumps it; pre-releases are skipped. `scripts/tests/test_notify_tap_workflow.py` pins it.
+| [Features and architecture](docs/features.md) | Everything the core does, the daemon/worker split, and the trust boundary |
+| [Manual installation](docs/install.md) | Release archives, login service, upgrades, building from source, and a first session |
+| [CLI guide](docs/cli.md) | Every command, multihost targeting, automation and observation, notifications, the assistant, and Hermes |
+| [SDKs and your own client](docs/sdk.md) | Rust and TypeScript SDKs, connection, and event subscription examples |
+| [Development](docs/development.md) | Workspace layout, gates, fast test loops, and release |
+| [Knowledge guides](docs/knowledge/index.md) | Setup, remote hosts, project setup, agent skill, Hermes operator, and runbooks |
+| [Public API](docs/public-api.md) | The versioned wire protocol |
+| [Architecture](docs/architecture.md) | The authoritative design |
+
+Contributors start with [AGENTS.md](AGENTS.md).
 
 ## License
 

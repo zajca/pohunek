@@ -2,6 +2,19 @@
 
 This directory turns the product idea into implementation-oriented planning.
 
+## Reference
+
+- [Features and architecture overview](features.md) — what the core does,
+  how a host is put together, and the trust boundary.
+- [Manual installation](install.md) — release archives, the login service,
+  upgrades, building from source, and a first session.
+- [CLI guide](cli.md) — every command, multihost targeting, automation,
+  notifications, the assistant, and Hermes.
+- [SDKs and building your own client](sdk.md) — Rust and TypeScript SDK
+  examples.
+- [Development](development.md) — workspace layout, gates, fast loops, and
+  release.
+
 ## Source of Truth
 
 - [Project idea](../idea.md) — the original, broad brainstorm (kept for context).

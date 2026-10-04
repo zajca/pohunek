@@ -552,7 +552,7 @@ feature — `--all-features` only covers the everything-on case.
   safety contract: static generation performs no daemon or NetBird I/O, while
   dynamic lookups are opt-in, deadline-bounded, do not autostart the daemon, and
   fail silently. In the same change, update the CLI tables/examples in
-  `README.md`, matching `docs/knowledge/` guidance and source map entries, and
+  `docs/cli.md`, matching `docs/knowledge/` guidance and source map entries, and
   release/install coverage when those surfaces change. Run at least
   `cargo test -p pohunek-cli` and `cargo xtask docs check` before the full gates.
 - Comments and all repository text are in **English**.
@@ -662,4 +662,7 @@ do not re-report them as review findings:
   config).
 - `.claude/skills/` — milestone-loop skills, including the shared
   `github-workflow` tracking rules.
-- `README.md` — install, quick start, trust boundary.
+- `README.md` — what pohunek is, the agent install prompt, the pohunek-work
+  experiments, and the roadmap sketch. Reference material lives in
+  `docs/features.md`, `docs/install.md`, `docs/cli.md`, `docs/sdk.md`, and
+  `docs/development.md`.
