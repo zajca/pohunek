@@ -515,23 +515,31 @@ Unix and overlay owner contexts remain relay-independent.
 
 ### Upgrade window
 
-The no-shim rule has one bounded exception: release N carries release N-1 in
-four places so that an update never strands live work (the same contract is in
-`AGENTS.md`, "Upgrade window").
+The no-shim rule has one bounded exception. The contract is that release N
+carries release N-1 in four places so that an update never strands live work
+(the same contract is in `AGENTS.md`, "Upgrade window"). Each place below
+states the contract and then the current state.
 
 - **Live workers.** The private worker protocol negotiates the range
   `PREVIOUS_VERSION..=CURRENT_VERSION` (`crates/worker-protocol/src/version.rs`,
   currently 5 and 6), so a worker started by N-1 keeps serving through a daemon
   update.
-- **Worker journal.** The daemon reads the journal schema of N-1
-  (`WORKER_JOURNAL_SCHEMA_VERSION`); an older journal is skipped with a typed
-  reason and a WARN, never used as generation evidence.
-- **Public-protocol clients.** The daemon serves the N-1 protocol version
-  through adapters in addition to the current one, so the advertised range is
-  `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.
-  An adapter translates shape only. A semantic change raises
+- **Worker journal.** The daemon reads the previous journal schema. The
+  readable schemas are the explicit list `WORKER_JOURNAL_READABLE_SCHEMAS`
+  (`crates/daemon/src/runtime/lifecycle.rs`); a schema is listed only when its
+  layout names the worker generation, because a generation is never inferred
+  from the path, the persisted record or the supervisor job. Today only the
+  current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is listed; any other schema gets
+  a typed reason and a WARN and is never used as generation evidence.
+- **Public-protocol clients.** The contract: a protocol change keeps the
+  previous version served through daemon-side adapters, so the advertised range
+  is `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the
+  maximum. An adapter translates shape only. A semantic change raises
   `MIN_PROTOCOL_VERSION` as well and is an announced break. The oldest adapter
-  is deleted on the next bump.
+  is deleted on the next bump. The current state: no adapters exist and
+  `MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`, so the supported public
+  window is `4..=4` and every peer must upgrade in one pass. The adapters are
+  delivered by [#526](https://github.com/zajca/pohunek/issues/526).
 - **Persisted daemon state.** Migrates from any older kept schema (see below).
 
 Everything else stays unshimmed. A record that cannot be migrated or adopted is

@@ -23,22 +23,32 @@ except inside the upgrade window below.
 
 ### Upgrade window
 
-Release N stays compatible with release N-1 in exactly four places, and
-nowhere else; everything outside this window keeps the no-shim rule.
+The contract: release N stays compatible with release N-1 in exactly four
+places, and nowhere else; everything outside this window keeps the no-shim
+rule. The current state of each place is stated separately.
 
-- **Live workers:** the private worker protocol accepts `PREVIOUS_VERSION` as
-  well as `CURRENT_VERSION` (`crates/worker-protocol/src/version.rs`), so a
-  daemon update leaves running sessions alone.
-- **Worker journal:** the daemon reads the journal schema of N-1
-  (`WORKER_JOURNAL_SCHEMA_VERSION`, `crates/daemon/src/runtime/lifecycle.rs`);
-  an older one is skipped with a typed reason and a WARN.
-- **Public-protocol clients:** the daemon serves the N-1 protocol version
-  through protocol adapters. An adapter translates shape only. A semantic
-  change raises `MIN_PROTOCOL_VERSION` too and is an announced break; the oldest
-  adapter is deleted on the next bump.
-- **Persisted daemon state:** `metadata.jsonl` migrates from any older kept
-  schema, because skipping releases is normal with `update-pohunek`. A
-  persisted shape change requires a schema bump and a migration step.
+- **Live workers.** Contract and state: the private worker protocol accepts
+  `PREVIOUS_VERSION` as well as `CURRENT_VERSION`
+  (`crates/worker-protocol/src/version.rs`), so a daemon update leaves running
+  sessions alone.
+- **Worker journal.** Contract: the daemon reads the previous journal schema.
+  State: the readable schemas are the explicit list
+  `WORKER_JOURNAL_READABLE_SCHEMAS` (`crates/daemon/src/runtime/lifecycle.rs`);
+  a schema is listed only when its layout names the worker generation, so today
+  only the current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is readable. Any other
+  schema gets a typed reason and a WARN.
+- **Public-protocol clients.** Contract: a protocol change keeps the previous
+  version served through daemon-side adapters. An adapter translates shape
+  only. A semantic change raises `MIN_PROTOCOL_VERSION` too and is an announced
+  break; the oldest adapter is deleted on the next bump. State: no adapters
+  exist yet and `MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`, so the
+  supported public window is `4..=4` and all peers upgrade in one pass. The
+  adapters are delivered by
+  [#526](https://github.com/zajca/pohunek/issues/526).
+- **Persisted daemon state.** Contract and state: `metadata.jsonl` migrates
+  from any older kept schema, because skipping releases is normal with
+  `update-pohunek`. A persisted shape change requires a schema bump and a
+  migration step.
 
 Every persisted record that cannot be migrated or adopted is logged at WARN,
 surfaced to the operator, and carries a recovery hint. A store newer than the

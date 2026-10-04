@@ -110,6 +110,7 @@ class ReleaseCompatCheckTest(unittest.TestCase):
         notes = self.tmp / "notes.md"
         notes.write_text(
             "- STORE_SCHEMA_VERSION 2 -> 3\n- PROTOCOL_VERSION 4 -> 5\n"
+            "- MIN_PROTOCOL_VERSION 4 -> 5\n"
         )
         result = self.release("--notes", str(notes))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -122,6 +123,52 @@ class ReleaseCompatCheckTest(unittest.TestCase):
         result = self.release("--notes", str(notes))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("lack a line for: PROTOCOL_VERSION", result.stderr)
+
+    def test_an_alias_changes_with_its_target(self):
+        self.change(store=2, protocol=5)
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MIN_PROTOCOL_VERSION changed", result.stdout)
+        notes = self.tmp / "notes.md"
+        notes.write_text("- PROTOCOL_VERSION 4 -> 5\n")
+        result = self.release("--notes", str(notes))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lack a line for: MIN_PROTOCOL_VERSION", result.stderr)
+
+    def test_offset_alias_resolves_and_detects_a_move(self):
+        write(
+            self.repo, PROTOCOL_FILE,
+            "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(5);\n"
+            "pub const MIN_PROTOCOL_VERSION: ProtocolVersion = PROTOCOL_VERSION - 1;\n",
+        )
+        self.git("add", "-A")
+        self.commit("minimum follows the maximum")
+        self.git("tag", "-a", "v0.1.1", "-m", "v0.1.1")
+        write(
+            self.repo, PROTOCOL_FILE,
+            "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(6);\n"
+            "pub const MIN_PROTOCOL_VERSION: ProtocolVersion = PROTOCOL_VERSION - 1;\n",
+        )
+        self.git("add", "-A")
+        self.commit("bump protocol")
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MIN_PROTOCOL_VERSION changed since v0.1.1 "
+                      "(ProtocolVersion(4) -> ProtocolVersion(5))", result.stdout)
+
+    def test_an_initializer_it_cannot_evaluate_fails_closed(self):
+        write(
+            self.repo, PROTOCOL_FILE,
+            "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(4);\n"
+            "pub const MIN_PROTOCOL_VERSION: ProtocolVersion = "
+            "ProtocolVersion(PROTOCOL_VERSION.0 / 2);\n",
+        )
+        self.git("add", "-A")
+        self.commit("opaque minimum")
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot evaluate the initializer of MIN_PROTOCOL_VERSION",
+                      result.stderr)
 
     def test_constant_absent_at_the_previous_tag_counts_as_changed(self):
         (self.repo / STORE_FILE).unlink()

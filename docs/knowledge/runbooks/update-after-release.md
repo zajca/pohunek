@@ -38,11 +38,17 @@ the v3 overlay-routing change) do not widen the supported range.
 
 ## Upgrade window and the metadata store
 
-Release N stays compatible with release N-1 for live workers (private worker
-protocol versions `PREVIOUS_VERSION` and `CURRENT_VERSION`), for the worker
-journal, and for public-protocol clients; nothing else is shimmed. The daemon's
-persisted state, `<data_dir>/metadata.jsonl`, migrates from any older kept
-schema, so skipping releases is safe. Each release's notes name every schema or
+The contract is that release N stays compatible with release N-1 for live
+workers (private worker protocol versions `PREVIOUS_VERSION` and
+`CURRENT_VERSION`), for the worker journal, and for public-protocol clients;
+nothing else is shimmed. The current state differs for the last two. The worker
+journal reader accepts an explicit list of schemas, which today holds only the
+current one. The public protocol window is currently `4..=4` because the
+daemon-side N-1 adapters are not delivered yet
+([#526](https://github.com/zajca/pohunek/issues/526)), so upgrade every host
+and client in one pass, as the protocol v4 boundary above describes. The
+daemon's persisted state, `<data_dir>/metadata.jsonl`, does migrate from any
+older kept schema, so skipping releases is safe for it. Each release's notes name every schema or
 protocol constant that changed (`STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`,
 `MIN_PROTOCOL_VERSION`, the worker protocol `CURRENT_VERSION` and
 `PREVIOUS_VERSION`, `WORKER_JOURNAL_SCHEMA_VERSION`,
