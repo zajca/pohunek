@@ -179,6 +179,10 @@ pub(crate) enum CliError {
     #[error(transparent)]
     Service(#[from] crate::service::Error),
 
+    /// A `pohunek plugin` command was refused or could not resolve its target.
+    #[error(transparent)]
+    Plugin(#[from] crate::commands::plugin::Error),
+
     /// Generic I/O error.
     #[error("io error: {0}")]
     Io(#[from] io::Error),
@@ -346,6 +350,12 @@ impl CliError {
                 error.code(),
                 error.to_string(),
                 error.hint().map(str::to_owned),
+            ),
+            CliError::Plugin(error) => ProtocolError::new(
+                error.class(),
+                error.code(),
+                error.to_string(),
+                Some(error.hint().to_owned()),
             ),
             CliError::Spawn(msg) => ProtocolError::new(
                 ErrorClass::Daemon,

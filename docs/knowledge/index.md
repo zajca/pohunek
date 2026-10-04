@@ -23,7 +23,10 @@ Start here:
   catalog authorizes official packages and how local digest trust differs.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   and [remote hosts](guides/remote-hosts.md)
-  cover common configuration paths.
+  cover common configuration paths. The
+  [runtime packages guide](guides/runtime-packages.md) covers installing,
+  updating, selecting, disabling, and removing runtime packages with
+  `pohunek plugin`.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

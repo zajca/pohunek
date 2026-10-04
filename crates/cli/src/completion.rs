@@ -20,7 +20,7 @@ use clap::{Command, CommandFactory, ValueEnum};
 use clap_complete::engine::ValueCompleter;
 use clap_complete::{ArgValueCompleter, CompleteEnv, CompletionCandidate};
 use pohunek_client::{Client, ClientOptions};
-use protocol::{HostRecord, SessionInfo, SessionListParams};
+use protocol::{HostRecord, PackageId, PackageInfo, SessionInfo, SessionListParams};
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -209,9 +209,61 @@ fn install_next_steps(shell: CompletionShell, path: &Path) -> Vec<String> {
     }
 }
 
+/// Digest prefix every package digest carries.
+const PACKAGE_DIGEST_PREFIX: &str = "sha256:";
+
+/// Flags of `pohunek plugin` whose next word is a value, never a package id.
+const PLUGIN_VALUE_FLAGS: [&str; 4] = ["--digest", "--version", "--sha256", "--catalog"];
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CompletionContext {
     explicit_host: Option<String>,
+    /// Package id already typed on the `pohunek plugin` line being completed.
+    plugin_package: Option<String>,
+}
+
+/// Completes the `<PACKAGE>` argument of `pohunek plugin` with installed ids.
+#[derive(Clone, Copy, Debug)]
+struct PackageCompleter;
+
+impl ValueCompleter for PackageCompleter {
+    fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
+        let Some(current) = current.to_str() else {
+            return Vec::new();
+        };
+        let current = current.to_owned();
+        run_bounded(async move {
+            let packages = query_packages().await?;
+            Some(package_id_candidates(&packages, &current))
+        })
+        .unwrap_or_default()
+    }
+}
+
+/// Completes `--digest` of `pohunek plugin` with installed package digests,
+/// narrowed to the package id already typed.
+#[derive(Clone, Debug)]
+struct DigestCompleter {
+    package: Option<String>,
+}
+
+impl ValueCompleter for DigestCompleter {
+    fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
+        let Some(current) = current.to_str() else {
+            return Vec::new();
+        };
+        let current = current.to_owned();
+        let package = self.package.clone();
+        run_bounded(async move {
+            let packages = query_packages().await?;
+            Some(package_digest_candidates(
+                &packages,
+                package.as_deref(),
+                &current,
+            ))
+        })
+        .unwrap_or_default()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -273,18 +325,49 @@ impl CompletionContext {
             }
             index += 1;
         }
-        Self { explicit_host }
+        Self {
+            explicit_host,
+            plugin_package: plugin_package_from_words(words),
+        }
     }
+}
+
+/// The package id typed after `pohunek plugin <subcommand>`, if any.
+///
+/// Only narrows digest candidates, so a miss is harmless: every installed
+/// digest is offered instead.
+fn plugin_package_from_words(words: &[OsString]) -> Option<String> {
+    let start = words.iter().position(|word| word == "plugin")?;
+    let mut rest = words[start + 1..].iter().filter_map(|word| word.to_str());
+    // The first word is the subcommand.
+    rest.next()?;
+    while let Some(word) = rest.next() {
+        if word == "--" {
+            return None;
+        }
+        if PLUGIN_VALUE_FLAGS.contains(&word) {
+            rest.next();
+        } else if !word.starts_with('-') {
+            return PackageId::parse(word).ok().map(|id| id.to_string());
+        }
+    }
+    None
 }
 
 fn dynamic_command(context: CompletionContext) -> Command {
     let host_context = context.clone();
+    let plugin_context = context.clone();
     let target_context = context;
     Cli::command()
         .mut_arg("host", |arg| arg.add(ArgValueCompleter::new(HostCompleter)))
         .mut_subcommand("attach", {
             let context = target_context.clone();
             move |command| with_target_completer(command, &context)
+        })
+        .mut_subcommand("plugin", move |command| {
+            command.mut_subcommands(move |subcommand| {
+                with_plugin_completers(subcommand, &plugin_context)
+            })
         })
         .mut_subcommand("session", move |command| {
             command.mut_subcommands({
@@ -301,6 +384,16 @@ fn dynamic_command(context: CompletionContext) -> Command {
                 }
             })
         })
+}
+
+fn with_plugin_completers(command: Command, context: &CompletionContext) -> Command {
+    command.mut_args(|arg| match arg.get_id().as_str() {
+        "package" => arg.add(ArgValueCompleter::new(PackageCompleter)),
+        "digest" => arg.add(ArgValueCompleter::new(DigestCompleter {
+            package: context.plugin_package.clone(),
+        })),
+        _ => arg,
+    })
 }
 
 fn with_target_completer(command: Command, context: &CompletionContext) -> Command {
@@ -426,6 +519,73 @@ async fn query_sessions(host: &str) -> Option<Vec<SessionInfo>> {
         .call::<protocol::method::SessionList>(SessionListParams::default())
         .await
         .ok()
+}
+
+/// Query the local daemon for installed packages.
+///
+/// Package commands are local-only, so this ignores `--host`. It never starts
+/// the daemon and returns `None` on any failure.
+async fn query_packages() -> Option<Vec<PackageInfo>> {
+    let paths = Paths::resolve().ok()?;
+    let options = ClientOptions::default()
+        .with_origin_source(paths.origin_source)
+        .with_connect_timeout(COMPLETION_DEADLINE)
+        .with_request_timeout(COMPLETION_DEADLINE);
+    let mut client = Client::connect_local_with_options(&paths.socket, options)
+        .await
+        .ok()?;
+    client
+        .call::<protocol::method::PackageList>(())
+        .await
+        .ok()
+        .map(|result| result.packages)
+}
+
+fn package_id_candidates(packages: &[PackageInfo], current: &str) -> Vec<CompletionCandidate> {
+    let mut versions: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for info in packages {
+        versions
+            .entry(info.package.id.as_str())
+            .or_default()
+            .push(info.package.version.as_str());
+    }
+    versions
+        .into_iter()
+        .filter(|(id, _)| id.starts_with(current))
+        .map(|(id, versions)| CompletionCandidate::new(id).help(Some(versions.join(", ").into())))
+        .collect()
+}
+
+/// Digest candidates for `--digest`: full `sha256:` values, or bare hex when
+/// the typed text is hex only (the flag accepts both).
+fn package_digest_candidates(
+    packages: &[PackageInfo],
+    package: Option<&str>,
+    current: &str,
+) -> Vec<CompletionCandidate> {
+    let bare = !current.is_empty()
+        && !PACKAGE_DIGEST_PREFIX.starts_with(current)
+        && !current.starts_with(PACKAGE_DIGEST_PREFIX);
+    let mut candidates: Vec<_> = packages
+        .iter()
+        .filter(|info| package.is_none_or(|id| info.package.id.as_str() == id))
+        .filter_map(|info| {
+            let full = info.digest.as_str();
+            let value = if bare {
+                full.strip_prefix(PACKAGE_DIGEST_PREFIX)?
+            } else {
+                full
+            };
+            value.starts_with(current).then(|| {
+                CompletionCandidate::new(value).help(Some(
+                    format!("{} {}", info.package.id, info.package.version).into(),
+                ))
+            })
+        })
+        .collect();
+    candidates.sort_by(|left, right| left.get_value().cmp(right.get_value()));
+    candidates
 }
 
 fn host_names(records: &[HostRecord]) -> Vec<String> {
@@ -599,7 +759,8 @@ mod tests {
         assert_eq!(
             CompletionContext::from_words(&words),
             CompletionContext {
-                explicit_host: Some("host-b".to_owned())
+                explicit_host: Some("host-b".to_owned()),
+                plugin_package: None,
             }
         );
     }
@@ -617,6 +778,7 @@ mod tests {
     fn qualified_target_overrides_selected_host() {
         let context = CompletionContext {
             explicit_host: Some("host-a".to_owned()),
+            plugin_package: None,
         };
         assert_eq!(
             target_scope("host-b/s-4", &context),
@@ -911,5 +1073,184 @@ mod tests {
             command.find_subcommand("agent-skill").is_some(),
             "agent-skill must stay completable in dynamic completion mode"
         );
+    }
+
+    fn plugin_info(id: &str, version: &str, digest_hex_char: char) -> PackageInfo {
+        PackageInfo {
+            digest: protocol::PackageDigest::parse(&format!(
+                "sha256:{}",
+                digest_hex_char.to_string().repeat(64)
+            ))
+            .expect("digest"),
+            package: protocol::PackageIdentity {
+                id: PackageId::parse(id).expect("id"),
+                version: protocol::PackageVersion::parse(version).expect("version"),
+            },
+            origin: protocol::PackageOrigin::ExplicitDigest,
+            enabled: true,
+            selected: true,
+            installed_at_unix_seconds: 1,
+            runtime_id: None,
+            fault: None,
+            referenced: false,
+        }
+    }
+
+    /// `plugin` and its subcommands are in every static script, and its path
+    /// arguments carry file or directory hints.
+    #[test]
+    fn plugin_commands_are_completable_statically() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
+            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
+            for word in [
+                "plugin",
+                "inspect",
+                "uninstall",
+                "no-enable",
+                "sha256",
+                "catalog",
+                "remove-modified",
+                "digest",
+            ] {
+                assert!(
+                    script.contains(word),
+                    "static {shell:?} completion lacks {word:?}"
+                );
+            }
+        }
+        let command = Cli::command();
+        let plugin = command.find_subcommand("plugin").expect("plugin command");
+        let names: Vec<_> = plugin.get_subcommands().map(Command::get_name).collect();
+        assert_eq!(
+            names,
+            [
+                "list",
+                "inspect",
+                "install",
+                "link",
+                "update",
+                "select",
+                "enable",
+                "disable",
+                "uninstall",
+                "doctor"
+            ]
+        );
+        for (subcommand, argument, hint) in [
+            ("install", "archive", clap::ValueHint::FilePath),
+            ("install", "catalog", clap::ValueHint::FilePath),
+            ("update", "archive", clap::ValueHint::FilePath),
+            ("update", "catalog", clap::ValueHint::FilePath),
+            ("link", "directory", clap::ValueHint::DirPath),
+        ] {
+            let arg = plugin
+                .find_subcommand(subcommand)
+                .and_then(|command| command.get_arguments().find(|arg| arg.get_id() == argument))
+                .expect("path argument");
+            assert_eq!(arg.get_value_hint(), hint, "{subcommand} {argument}");
+        }
+    }
+
+    /// Every `package` and `digest` argument of `plugin` has a dynamic
+    /// completer; path arguments keep their shell hints and get none.
+    #[test]
+    fn dynamic_command_marks_plugin_package_and_digest_arguments() {
+        let command = dynamic_command(CompletionContext::default());
+        command.clone().debug_assert();
+        let plugin = command.find_subcommand("plugin").expect("plugin command");
+        let mut package_arguments = 0;
+        for subcommand in plugin.get_subcommands() {
+            for arg in subcommand.get_arguments() {
+                let completable = arg.get::<ArgValueCompleter>().is_some();
+                match arg.get_id().as_str() {
+                    "package" => {
+                        package_arguments += 1;
+                        assert!(completable, "{} package", subcommand.get_name());
+                    }
+                    "digest" => assert!(completable, "{} digest", subcommand.get_name()),
+                    "archive" | "directory" | "catalog" => {
+                        assert!(!completable, "{} {}", subcommand.get_name(), arg.get_id());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // inspect, update, select, enable, disable, uninstall, doctor.
+        assert_eq!(package_arguments, 7);
+    }
+
+    #[test]
+    fn package_id_candidates_are_unique_prefix_filtered_and_list_versions() {
+        let packages = vec![
+            plugin_info("acme.pi", "1.0.0", 'a'),
+            plugin_info("acme.pi", "2.0.0", 'b'),
+            plugin_info("other.tool", "1.0.0", 'c'),
+        ];
+        let candidates = package_id_candidates(&packages, "ac");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].get_value(), "acme.pi");
+        assert_eq!(
+            candidates[0].get_help().map(ToString::to_string).as_deref(),
+            Some("1.0.0, 2.0.0")
+        );
+        assert_eq!(package_id_candidates(&packages, "").len(), 2);
+        assert!(package_id_candidates(&packages, "zzz").is_empty());
+    }
+
+    #[test]
+    fn package_digest_candidates_narrow_by_package_and_follow_the_typed_form() {
+        let packages = vec![
+            plugin_info("acme.pi", "1.0.0", 'a'),
+            plugin_info("other.tool", "1.0.0", 'c'),
+        ];
+        let all = package_digest_candidates(&packages, None, "");
+        assert_eq!(all.len(), 2);
+        assert!(all[0].get_value().to_string_lossy().starts_with("sha256:"));
+
+        let narrowed = package_digest_candidates(&packages, Some("acme.pi"), "sha256:a");
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(
+            narrowed[0].get_help().map(ToString::to_string).as_deref(),
+            Some("acme.pi 1.0.0")
+        );
+
+        let bare = package_digest_candidates(&packages, None, "cc");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].get_value().to_string_lossy(), "c".repeat(64));
+
+        assert!(package_digest_candidates(&packages, None, "sha256:f").is_empty());
+    }
+
+    #[test]
+    fn context_extracts_the_plugin_package_already_typed() {
+        let words = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        let package = |list: &[&str]| CompletionContext::from_words(&words(list)).plugin_package;
+        assert_eq!(
+            package(&["pohunek", "plugin", "enable", "acme.pi", "--digest"]),
+            Some("acme.pi".to_owned())
+        );
+        assert_eq!(
+            package(&[
+                "pohunek",
+                "--host",
+                "x",
+                "plugin",
+                "select",
+                "--version",
+                "1.0.0",
+                "acme.pi"
+            ]),
+            Some("acme.pi".to_owned())
+        );
+        assert_eq!(package(&["pohunek", "plugin", "enable"]), None);
+        assert_eq!(
+            package(&["pohunek", "plugin", "enable", "--digest", "abc"]),
+            None
+        );
+        assert_eq!(package(&["pohunek", "session", "inspect", "s-1"]), None);
     }
 }
