@@ -112,4 +112,10 @@ empty or control-character token, `fork_args` without `args` or on a base withou
 session record, or worktree exists. Parse errors report the message and line
 only, never profile environment values. The resolved spec is stored in the
 session's recovery binding as `native_launch`; recovery and fork use that frozen
-copy even after the profile changes.
+copy even after the profile changes. The binding also records the base runtime's
+launch binding (runtime id plus where its definition came from). A profile whose
+`base` is a valid runtime id that is not installed fails with
+`runtime_not_installed`; a `base` that is not a runtime id fails with
+`invalid_profile`. A recovery binding whose runtime is not installed stays in the
+store, refuses resume and fork with `runtime_not_installed`, and works again once
+the runtime is installed.

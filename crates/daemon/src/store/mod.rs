@@ -37,7 +37,12 @@
 //! launch-time shape after a daemon restart. The profile's **`env` is deliberately NOT among them** —
 //! it may hold secrets, so it is re-resolved by agent name at resume, never
 //! persisted (a deleted profile resumes from the structural snapshot with no env).
-//! An absent `native_launch` means the session has no native recovery. Persisted
+//! An absent `native_launch` means the session has no native recovery. The
+//! snapshot is frozen together with the [`LaunchPin`] of the runtime definition
+//! it came from; a line without one loads as unpinned. Load and write checks on
+//! the agent kind are syntactic (a valid runtime id): a record whose runtime is
+//! not installed stays in the file untouched and is refused at resume time.
+//! Persisted
 //! bindings from earlier pre-1.0 builds do not infer capabilities from current
 //! code.
 
@@ -52,10 +57,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
-use protocol::{AgentKind, ProjectSource, RuntimeState, SessionInfo};
+use protocol::{AgentKind, ProjectSource, RuntimeRef, RuntimeState, SessionInfo};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use crate::agent::host::{LaunchPin, RESERVED_RUNTIME_IDS};
 use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
 use crate::project::detect::project_id;
 
@@ -131,6 +137,10 @@ pub struct ResumeBinding {
     /// `None` for a session without native recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_launch: Option<NativeSessionLaunch>,
+    /// The runtime identity the structural snapshot above was frozen with. A
+    /// line written without one is [`LaunchPin::Unpinned`].
+    #[serde(default, skip_serializing_if = "LaunchPin::is_unpinned")]
+    pub launch_binding: LaunchPin,
 }
 
 impl ResumeBinding {
@@ -191,6 +201,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             input_rules: StoredInputRules,
             #[serde(default)]
             native_launch: Option<NativeSessionLaunch>,
+            #[serde(default)]
+            launch_binding: LaunchPin,
         }
 
         let raw = RawResumeBinding::deserialize(deserializer)?;
@@ -198,9 +210,13 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             .agent_base
             .or_else(|| legacy_agent_base_from_agent(&raw.agent))
             .ok_or_else(|| serde::de::Error::missing_field("agent_base"))?;
-        agent_base
-            .validate_persistence()
-            .map_err(serde::de::Error::custom)?;
+        // Syntactic check only: whether the runtime is installed is decided
+        // when the binding is used, so an unresolvable runtime keeps its line.
+        if !kind_is_persistable(&agent_base) {
+            return Err(serde::de::Error::custom(
+                "agent_base is not a valid runtime id",
+            ));
+        }
 
         Ok(Self {
             session_id: raw.session_id,
@@ -219,18 +235,23 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             args: raw.args,
             input_rules: raw.input_rules,
             native_launch: raw.native_launch,
+            launch_binding: raw.launch_binding,
         })
     }
 }
 
+/// Infers the base of a line written without `agent_base` from its agent
+/// name; only a built-in runtime id names its own base.
 fn legacy_agent_base_from_agent(agent: &str) -> Option<AgentKind> {
-    match agent {
-        "shell" => Some(AgentKind::Shell),
-        "codex" => Some(AgentKind::Codex),
-        "claude" => Some(AgentKind::Claude),
-        "hermes" => Some(AgentKind::Hermes),
-        _ => None,
-    }
+    RESERVED_RUNTIME_IDS
+        .contains(&agent)
+        .then(|| AgentKind::from_wire(agent))
+}
+
+/// Whether a record may carry `kind`: a grammar-valid runtime id, installed or
+/// not. An uninstalled runtime keeps its record inert instead of dropping it.
+fn kind_is_persistable(kind: &AgentKind) -> bool {
+    matches!(kind.as_runtime_ref(), RuntimeRef::Id(_))
 }
 
 /// Serializable mirror of [`crate::agent::InputRules`] for the resume snapshot
@@ -258,10 +279,11 @@ impl From<InputRules> for StoredInputRules {
 }
 
 impl StoredInputRules {
-    /// Rebuild the in-memory [`InputRules`] from the persisted snapshot.
+    /// Rebuild the in-memory [`InputRules`] from the persisted snapshot,
+    /// keeping the safety contract of the runtime's `base` rules.
     #[must_use]
-    pub fn to_input_rules(self, base: &AgentKind) -> InputRules {
-        crate::agent::adapter_for(base).input_rules().with_framing(
+    pub fn to_input_rules(self, base: InputRules) -> InputRules {
+        base.with_framing(
             self.bracketed_paste,
             Duration::from_millis(self.submit_delay_ms),
         )
@@ -1143,14 +1165,14 @@ impl Store {
         let mut sessions = Vec::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             match serde_json::from_str::<Record>(line) {
-                Ok(Record::Session(record)) if record_agents_are_known(&record) => {
+                Ok(Record::Session(record)) if record_agents_are_persistable(&record) => {
                     sessions.push(*record);
                 }
-                Ok(Record::Resume(binding)) if binding.agent_base.is_known() => {
+                Ok(Record::Resume(binding)) if kind_is_persistable(&binding.agent_base) => {
                     resume.push(binding);
                 }
                 Ok(Record::Session(_) | Record::Resume(_)) => {
-                    warn!("skipping metadata-store record with an unsupported agent kind");
+                    warn!("skipping metadata-store record whose agent kind is not a runtime id");
                 }
                 Ok(Record::Worktree(binding)) => worktrees.push(binding),
                 Ok(Record::Project(record)) => projects.push(record),
@@ -1177,14 +1199,16 @@ impl Store {
         projects: &[ProjectRecord],
         sessions: &[SessionRecord],
     ) -> io::Result<MetadataWriteOutcome> {
-        if resume.iter().any(|binding| !binding.agent_base.is_known())
+        if resume
+            .iter()
+            .any(|binding| !kind_is_persistable(&binding.agent_base))
             || sessions
                 .iter()
-                .any(|record| !record_agents_are_known(record))
+                .any(|record| !record_agents_are_persistable(record))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "metadata records cannot persist unsupported agent kinds",
+                "metadata records cannot persist agent kinds that are not runtime ids",
             ));
         }
         if let Some(parent) = self.path.parent() {
@@ -1430,17 +1454,17 @@ fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord)
     current_id.is_some() && candidate_id != current_id
 }
 
-fn record_agents_are_known(record: &SessionRecord) -> bool {
-    record.info.agent_base.is_known()
+fn record_agents_are_persistable(record: &SessionRecord) -> bool {
+    kind_is_persistable(&record.info.agent_base)
         && record
             .info
             .active_agent_base
             .as_ref()
-            .is_none_or(AgentKind::is_known)
+            .is_none_or(kind_is_persistable)
         && record
             .recovery
             .as_ref()
-            .is_none_or(|binding| binding.agent_base.is_known())
+            .is_none_or(|binding| kind_is_persistable(&binding.agent_base))
 }
 
 /// Serialize one record onto `body` as a single JSON line. Our own types
@@ -1522,6 +1546,7 @@ mod tests {
         SessionRefKind, SessionTransaction, Store, StoreMutation, StoredInputRules,
         WorktreeBinding, WorktreeStatus,
     };
+    use crate::agent::host::LaunchPin;
     use crate::agent::{NativeArgs, NativeSessionLaunch};
 
     /// Persisted runtime records keep the `runtime_id` key for the worker
@@ -1610,6 +1635,24 @@ mod tests {
                 &["--resume", "{reference}"],
                 Some(&["--resume", "{reference}", "--fork-session"]),
             )),
+            launch_binding: LaunchPin::Unpinned,
+        }
+    }
+
+    /// A binding to a package-provided runtime.
+    fn package_binding(runtime_id: &str) -> protocol::LaunchBinding {
+        protocol::LaunchBinding {
+            runtime_id: protocol::RuntimeId::parse(runtime_id).expect("runtime id"),
+            provenance: protocol::BindingProvenance::Package {
+                package: protocol::PackageIdentity {
+                    id: protocol::PackageId::parse("acme.runtime").expect("package id"),
+                    version: protocol::PackageVersion::parse("1.2.3").expect("version"),
+                },
+                package_digest: protocol::PackageDigest::parse(
+                    "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                )
+                .expect("digest"),
+            },
         }
     }
 
@@ -1702,6 +1745,7 @@ mod tests {
                 &["--session", "{reference}"],
                 Some(&["--fork", "{reference}"]),
             )),
+            launch_binding: LaunchPin::Unpinned,
         };
         store.record_resume(&binding).expect("record");
         let loaded = store.load_resume().expect("load");
@@ -1772,7 +1816,12 @@ mod tests {
             bracketed_paste: false,
             submit_delay_ms: 25,
         };
-        let rules = stored.to_input_rules(&AgentKind::Hermes);
+        let rules = stored.to_input_rules(
+            crate::agent::host::builtin_host()
+                .resolve_kind(&AgentKind::Hermes)
+                .expect("Hermes resolves")
+                .input_rules(),
+        );
 
         assert!(!rules.bracketed_paste);
         assert_eq!(rules.submit_delay, std::time::Duration::from_millis(25));
@@ -1849,29 +1898,87 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_agent_kinds_are_neither_loaded_nor_persisted() {
-        let path = temp_store_path("unknown-agent-kind");
+    fn kinds_outside_the_runtime_id_grammar_are_neither_loaded_nor_persisted() {
+        let path = temp_store_path("invalid-agent-kind");
         let store = Store::new(path.clone());
         let mut binding = resume("s-future", "native-future");
-        binding.agent_base = AgentKind::Unknown("future-agent".to_owned());
+        binding.agent_base = AgentKind::Unknown("Future Agent".to_owned());
 
         let error = store
             .record_resume(&binding)
-            .expect_err("unknown agent kind must fail closed on write");
+            .expect_err("a non-runtime-id kind must fail closed on write");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(!path.exists(), "rejected record must not create the store");
 
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","session_id":"s-future","agent":"future-agent",#,
-                r#""agent_base":"future-agent","cwd":"/w","cols":80,"rows":24}"#,
+                r#"{"kind":"resume","session_id":"s-future","agent":"future-agent","#,
+                r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
         );
         assert!(
             store.load_resume().expect("load future record").is_empty(),
-            "unsupported persisted record must be ignored"
+            "a persisted record whose kind is not a runtime id must be ignored"
+        );
+    }
+
+    #[test]
+    fn an_uninstalled_runtime_keeps_its_binding_across_unrelated_writes() {
+        let path = temp_store_path("inert-binding");
+        let store = Store::new(path);
+        let mut inert = resume("s-inert", "native-inert");
+        inert.agent_base = AgentKind::Unknown("acme".to_owned());
+        inert.launch_binding = LaunchPin::Pinned(Box::new(package_binding("acme")));
+        store.record_resume(&inert).expect("record inert binding");
+
+        // Every mutation rewrites the whole file, so an unrelated write is the
+        // moment a binding that failed to resolve would be erased.
+        store
+            .record_resume(&resume("s-other", "native-other"))
+            .expect("record unrelated resume binding");
+        store
+            .record_worktree(&worktree("s-other", "x"))
+            .expect("record unrelated worktree binding");
+        store.remove_resume("s-other").expect("remove unrelated");
+
+        let loaded = store.load_resume().expect("load");
+        assert_eq!(loaded, vec![inert], "the inert binding survives untouched");
+    }
+
+    #[test]
+    fn a_line_without_a_launch_binding_loads_unpinned_and_a_pin_round_trips() {
+        let path = temp_store_path("launch-pin");
+        let store = Store::new(path.clone());
+        write_private(
+            &path,
+            concat!(
+                r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
+                r#""cwd":"/w","cols":80,"rows":24}"#,
+                "\n"
+            ),
+        );
+        let loaded = store.load_resume().expect("load");
+        assert_eq!(loaded[0].launch_binding, LaunchPin::Unpinned);
+
+        let mut pinned = resume("s-new", "native-new");
+        pinned.launch_binding = LaunchPin::Pinned(Box::new(package_binding("claude")));
+        store.record_resume(&pinned).expect("record pinned");
+        let loaded = store.load_resume().expect("reload");
+        let found = loaded
+            .iter()
+            .find(|binding| binding.session_id == "s-new")
+            .expect("pinned binding present");
+        assert_eq!(found.launch_binding, pinned.launch_binding);
+        assert!(
+            loaded
+                .iter()
+                .find(|binding| binding.session_id == "s-old")
+                .expect("old line present")
+                .launch_binding
+                .is_unpinned(),
+            "rewriting does not invent a pin for a line that had none"
         );
     }
 

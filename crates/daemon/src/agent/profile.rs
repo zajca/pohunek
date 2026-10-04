@@ -13,15 +13,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{AgentKind, ErrorClass, ProtocolError};
+use protocol::{AgentKind, ErrorClass, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::{
-    adapter_for, base_native_launch, InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind,
-};
+use super::host::{RuntimeDefinition, RuntimeHost};
+use super::{InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::Manifest;
 use crate::project::config::validate_name;
 
@@ -179,6 +179,8 @@ pub(crate) struct ResolvedAgent {
     pub name: String,
     /// The base kind this resolves to (drives detection/resume/handshake env).
     pub base: AgentKind,
+    /// The definition of the base runtime.
+    pub definition: Arc<RuntimeDefinition>,
     /// Host-profile overrides; `None` for a bare base kind.
     pub profile: Option<ResolvedProfile>,
 }
@@ -188,8 +190,28 @@ impl ResolvedAgent {
     #[must_use]
     pub(crate) fn native_launch(&self) -> Option<NativeSessionLaunch> {
         self.profile.as_ref().map_or_else(
-            || base_native_launch(&self.base),
+            || self.definition.native().cloned(),
             |profile| profile.native.clone(),
+        )
+    }
+
+    /// The program the agent launches: the profile's, else the base runtime's.
+    #[must_use]
+    pub(crate) fn program(&self) -> &str {
+        self.profile.as_ref().map_or_else(
+            || self.definition.program().as_str(),
+            |profile| profile.program.as_str(),
+        )
+    }
+
+    /// The launch arguments frozen into the resume snapshot: the profile's,
+    /// else the base descriptor's fixed arguments (never the host shell
+    /// command's, which is not part of the runtime).
+    #[must_use]
+    pub(crate) fn snapshot_args(&self) -> Vec<String> {
+        self.profile.as_ref().map_or_else(
+            || self.definition.default_args().to_vec(),
+            |profile| profile.args.clone(),
         )
     }
 }
@@ -207,10 +229,23 @@ pub(crate) struct ProfileRegistry {
     /// The `agents/` directory, or `None` when the host-config layer is disabled
     /// (unconfigured, absent, or failing the owner-only gate).
     dir: Option<PathBuf>,
+    /// Resolves the base runtime a name or profile extends.
+    runtimes: RuntimeHost,
 }
 
 impl ProfileRegistry {
+    /// A registry over the built-in runtimes with the host's login shell.
+    #[cfg(test)]
     pub(crate) fn new(dir: Option<PathBuf>) -> Self {
+        Self::with_runtimes(dir, RuntimeHost::default())
+    }
+
+    /// The runtime host this registry resolves base runtimes from.
+    pub(crate) fn runtimes(&self) -> &RuntimeHost {
+        &self.runtimes
+    }
+
+    pub(crate) fn with_runtimes(dir: Option<PathBuf>, runtimes: RuntimeHost) -> Self {
         // C.5: gate the whole tree once at boot. An insecure `agents/` OR
         // `agents/manifests/` disables every host profile (fail-closed) — a
         // world-writable manifests dir means no manifest can be trusted, so no
@@ -227,26 +262,30 @@ impl ProfileRegistry {
             }
             secure
         });
-        Self { dir }
+        Self { dir, runtimes }
     }
 
     /// Resolve an agent name (4-step chain, fail-closed):
     /// 1. A.2.1 single-segment charset guard (`invalid_name`).
     /// 2. `<dir>/<name>.toml` exists → that profile.
-    /// 3. `name ∈ {shell,codex,claude,hermes}` → the bare base kind.
+    /// 3. `name` is an installed runtime id → the bare base runtime.
     /// 4. else → `agent_profile_not_found` (no silent fallback).
     pub(crate) fn resolve_agent(&self, name: &str) -> Result<ResolvedAgent, ProtocolError> {
         validate_name("agent", name)?;
         if let Some(dir) = &self.dir {
             let path = dir.join(format!("{name}.toml"));
             if path.is_file() {
-                return load_profile(name, &path, dir);
+                return load_profile(name, &path, dir, &self.runtimes);
             }
         }
-        if let Some(base) = base_kind_from_name(name) {
+        if let Some(definition) = RuntimeId::parse(name)
+            .ok()
+            .and_then(|runtime_id| self.runtimes.resolve_id(&runtime_id).ok())
+        {
             return Ok(ResolvedAgent {
                 name: name.to_owned(),
-                base,
+                base: AgentKind::from_wire(definition.runtime_id().as_str()),
+                definition: Arc::clone(definition),
                 profile: None,
             });
         }
@@ -353,40 +392,12 @@ fn assert_contained(base_dir: &Path, candidate: &Path, name: &str) -> Result<(),
     Ok(())
 }
 
-/// Map a base-kind name to its [`AgentKind`]; `None` for anything else.
-pub(crate) fn base_kind_from_name(name: &str) -> Option<AgentKind> {
-    match name {
-        "shell" => Some(AgentKind::Shell),
-        "codex" => Some(AgentKind::Codex),
-        "claude" => Some(AgentKind::Claude),
-        "hermes" => Some(AgentKind::Hermes),
-        _ => None,
-    }
-}
-
-/// The default launch program for a bare base kind (used when a profile omits
-/// `program`, and as the frozen snapshot program for a profile-less session).
-pub(crate) fn default_program(base: &AgentKind) -> String {
-    match base {
-        AgentKind::Shell => super::host_login_shell(),
-        AgentKind::Codex => "codex".to_owned(),
-        AgentKind::Claude => "claude".to_owned(),
-        AgentKind::Hermes => "hermes".to_owned(),
-        AgentKind::Unknown(_) => "pohunek-unsupported-agent".to_owned(),
-    }
-}
-
-/// The compiled launch arguments for a bare base kind.
-pub(crate) fn default_args(base: &AgentKind) -> Vec<String> {
-    match base {
-        AgentKind::Hermes => vec!["chat".to_owned()],
-        AgentKind::Shell | AgentKind::Codex | AgentKind::Claude | AgentKind::Unknown(_) => {
-            Vec::new()
-        }
-    }
-}
-
-fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, ProtocolError> {
+fn load_profile(
+    name: &str,
+    path: &Path,
+    dir: &Path,
+    runtimes: &RuntimeHost,
+) -> Result<ResolvedAgent, ProtocolError> {
     // Containment first: a symlinked `<name>.toml` that escapes the tree must be
     // rejected before its contents are read or exec'd (C.5).
     assert_contained(dir, path, name)?;
@@ -400,10 +411,12 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
         std::fs::read_to_string(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
     let raw: RawProfile = toml::from_str(&content)
         .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
-    let base = base_kind_from_name(&raw.base)
-        .ok_or_else(|| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
-    // A shell has no native resume; a `base = "shell"` profile may never claim one.
-    if base == AgentKind::Shell
+    let base_id = RuntimeId::parse(&raw.base)
+        .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
+    let definition = Arc::clone(runtimes.resolve_id(&base_id)?);
+    let base = AgentKind::from_wire(base_id.as_str());
+    // A runtime without native resume (the shell) cannot have a profile claim one.
+    if definition.native().is_none()
         && raw
             .resume
             .as_ref()
@@ -411,10 +424,15 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
     {
         return Err(invalid_profile(
             name,
-            "base = \"shell\" cannot declare a [resume] spec (a shell has no native resume)",
+            &format!(
+                "base = \"{}\" cannot declare a [resume] spec (the runtime has no native resume)",
+                raw.base
+            ),
         ));
     }
-    let program = raw.program.unwrap_or_else(|| default_program(&base));
+    let program = raw
+        .program
+        .unwrap_or_else(|| definition.program().as_str().to_owned());
     let args = raw.args.unwrap_or_default();
     // Every `POHUNEK_`-prefixed key is reserved for the daemon handshake; strip the
     // whole prefix so a profile can never shadow `POHUNEK_ENV`/`_PROTOCOL_VERSION`/…
@@ -426,16 +444,17 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
         .map(|(key, value)| (key, value.0))
         .collect();
     let input_rules = raw.input_rules.map(|rules| {
-        adapter_for(&base).input_rules().with_framing(
+        definition.input_rules().with_framing(
             rules.bracketed_paste.unwrap_or(false),
             Duration::from_millis(rules.submit_delay_ms.unwrap_or(0)),
         )
     });
-    let native = resolve_native(name, &base, raw.resume.as_ref())?;
+    let native = resolve_native(name, &definition, raw.resume.as_ref())?;
     let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
     Ok(ResolvedAgent {
         name: name.to_owned(),
         base,
+        definition,
         profile: Some(ResolvedProfile {
             program,
             args,
@@ -457,11 +476,11 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
 /// profile fails before any session is created.
 fn resolve_native(
     name: &str,
-    base: &AgentKind,
+    definition: &RuntimeDefinition,
     raw: Option<&RawResume>,
 ) -> Result<Option<NativeSessionLaunch>, ProtocolError> {
     let Some(raw) = raw else {
-        return Ok(base_native_launch(base));
+        return Ok(definition.native().cloned());
     };
     if raw.resumable == Some(false) {
         if raw.reference_kind.is_some() || raw.args.is_some() || raw.fork_args.is_some() {
@@ -485,7 +504,9 @@ fn resolve_native(
     // Fork semantics are owned by the compiled base: a profile may restate or
     // omit its base's fork, but cannot grant fork to a base that has none.
     if raw.fork_args.is_some()
-        && !base_native_launch(base).is_some_and(|compiled| compiled.supports_fork())
+        && !definition
+            .native()
+            .is_some_and(NativeSessionLaunch::supports_fork)
     {
         return Err(invalid_profile(
             name,
@@ -710,19 +731,38 @@ mod tests {
         assert_eq!(input_rules.submit_delay, Duration::from_millis(25));
         assert!(input_rules.validate_text("unsafe\u{1b}[201~").is_err());
         assert!(!input_rules.allows_while_blocked());
-        assert_eq!(profile.native, base_native_launch(&AgentKind::Hermes));
+        assert_eq!(
+            profile.native,
+            crate::agent::builtin_native_launch(&AgentKind::Hermes)
+        );
         assert!(!profile.native.expect("Hermes recovers").supports_fork());
     }
 
     #[test]
-    fn unknown_base_kind_is_invalid_profile() {
+    fn an_uninstalled_base_runtime_is_runtime_not_installed() {
         let dir = tmp_agents_dir("bad-base");
         std::fs::write(dir.join("weird.toml"), "base = \"emacs\"\n").expect("write profile");
         let reg = ProfileRegistry::new(Some(dir.clone()));
         let err = reg
             .resolve_agent("weird")
-            .expect_err("unknown base rejected");
-        assert_eq!(err.code, "invalid_profile");
+            .expect_err("uninstalled base rejected");
+        assert_eq!(err.code, "runtime_not_installed");
+    }
+
+    #[test]
+    fn a_base_that_is_not_a_runtime_id_is_invalid_profile() {
+        let dir = tmp_agents_dir("bad-base-grammar");
+        for (name, base) in [("upper", "Emacs"), ("spaced", "my agent"), ("empty", "")] {
+            std::fs::write(
+                dir.join(format!("{name}.toml")),
+                format!("base = \"{base}\"\n"),
+            )
+            .expect("write profile");
+            let err = ProfileRegistry::new(Some(dir.clone()))
+                .resolve_agent(name)
+                .expect_err("grammar-invalid base rejected");
+            assert_eq!(err.code, "invalid_profile", "{base:?}");
+        }
     }
 
     #[test]
@@ -804,10 +844,14 @@ mod tests {
             let agent = ProfileRegistry::new(Some(dir.clone()))
                 .resolve_agent(name)
                 .expect("resolves");
-            assert_eq!(agent.native_launch(), base_native_launch(&base), "{name}");
+            assert_eq!(
+                agent.native_launch(),
+                crate::agent::builtin_native_launch(&base),
+                "{name}"
+            );
             assert_eq!(
                 agent.profile.expect("profile").native,
-                base_native_launch(&base)
+                crate::agent::builtin_native_launch(&base)
             );
         }
     }
@@ -874,7 +918,7 @@ mod tests {
         );
         assert_eq!(
             resolve(&dir, "with-fork").expect("resolves").native,
-            base_native_launch(&AgentKind::Claude)
+            crate::agent::builtin_native_launch(&AgentKind::Claude)
         );
         let no_fork = resolve(&dir, "no-fork")
             .expect("resolves")

@@ -613,10 +613,18 @@ Important fields:
 - `exit_code`: optional process exit code.
 
 `AgentKind` wire values are forward-compatible for presentation. An unknown
-string round-trips through Rust and TypeScript clients as a neutral value, but
-it is rejected with `runtime/agent_kind_unsupported` by agent-targeted mutation
-and persistence paths. Unknown values never silently become a supported launch,
-resume, or fork adapter.
+string round-trips through Rust and TypeScript clients as a neutral value.
+Agent-targeted mutation, resume and fork resolve the value through the daemon's
+runtime registry: a value outside the runtime-id grammar is rejected with
+`runtime/agent_kind_unsupported`, and a grammar-valid id that no enabled runtime
+resolves is rejected with `runtime/runtime_not_installed`. Unknown values never
+silently become a supported launch, resume, or fork runtime. A session or
+recovery record whose runtime is not installed is kept inert: it stays listed
+with its stored recovery binding, refuses resume, fork and mutation with
+`runtime_not_installed`, and resumes again once the runtime is installed. The
+binding records the runtime identity (`LaunchBinding`) the session was
+launched with; a binding written without one may only resume through a
+built-in runtime.
 
 Agent runtime identities use three Rust types over the same string namespace.
 `RuntimeId` is always valid: lowercase ASCII alphanumerics plus `.`, `_` and
@@ -1414,8 +1422,12 @@ observation behavior: `agent_kind_unsupported`,
 `session_input_rejected`, `session_input_blocked`, `session_agent_blocked`,
 `session_input_invalid_wait`, `session_input_wait_unsupported`,
 `session_input_timeout`, and the CLI-local `session_input_interrupted`. Daemon startup may additionally return
-`observation_limits_invalid`. `runtime_not_installed` is reserved and not yet emitted: the daemon returns it
-once session creation resolves runtimes through the registry.
+`observation_limits_invalid`. `runtime_not_installed` is emitted when a runtime
+id resolves to no enabled runtime: a host profile whose `base` names an
+uninstalled runtime, and resume, fork or mutation of a session whose runtime is
+not installed or no longer matches its recorded launch binding. A bare
+`session.new` agent name that is neither a profile nor an installed runtime
+stays `agent_profile_not_found`.
 Observation request errors intentionally carry no terminal
 payload or current-runtime payload; refresh `session.inspect` or restart
 observation from a fresh screen/tail when recovery requires new coordinates.

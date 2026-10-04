@@ -22,8 +22,7 @@ use protocol::{
 use serde::Deserialize;
 
 use crate::agent::host::{
-    BuiltinSource, HandlerId, LaunchProgram, RuntimeDefinition, RuntimeRegistry,
-    RESERVED_RUNTIME_IDS,
+    HandlerId, LaunchProgram, RuntimeDefinition, RuntimeRegistry, RESERVED_RUNTIME_IDS,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
 
@@ -83,18 +82,6 @@ impl VersionProbe {
     }
 }
 
-/// Process-wide registry of the built-in runtimes.
-///
-/// The descriptors are embedded in the binary and validated by the registry
-/// tests, so a build failure here is a defect of the binary, not of the host.
-fn builtin_registry() -> &'static RuntimeRegistry {
-    static REGISTRY: OnceLock<RuntimeRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(|| {
-        RuntimeRegistry::from_sources(&[&BuiltinSource::from_host_environment()])
-            .expect("embedded built-in runtime definitions must be valid")
-    })
-}
-
 /// Resolves the definition a compiled base kind launches, when one is registered.
 fn definition_for_base<'a>(
     registry: &'a RuntimeRegistry,
@@ -138,7 +125,7 @@ pub(crate) fn host_capabilities(
     daemon_version: &str,
     profiles: &ProfileRegistry,
 ) -> HostCapabilities {
-    host_capabilities_for(daemon_version, profiles, builtin_registry())
+    host_capabilities_for(daemon_version, profiles, profiles.runtimes().registry())
 }
 
 /// [`host_capabilities`] against an explicit runtime registry.
@@ -305,13 +292,29 @@ fn probe_versioned_runtime(
 /// for the pinned supported release. A parser id this daemon does not compile in
 /// refuses the launch. Probe output, configured paths, and detected versions
 /// never enter the error.
+#[cfg(test)]
 pub(crate) fn validate_launch_runtime(
     base: &AgentKind,
     binary: &str,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    let Some(parser) = definition_for_base(builtin_registry(), base)
-        .and_then(|definition| definition.version_probe_parser())
-    else {
+    let host = crate::agent::host::builtin_host();
+    match definition_for_base(host.registry(), base) {
+        Some(definition) => validate_definition_launch(definition, binary),
+        None => Ok(None),
+    }
+}
+
+/// [`validate_launch_runtime`] for an already resolved definition.
+///
+/// # Errors
+///
+/// Returns `agent_runtime_unsupported` when the probe rejects the executable
+/// or the definition names a parser this daemon does not provide.
+pub(crate) fn validate_definition_launch(
+    definition: &RuntimeDefinition,
+    binary: &str,
+) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
+    let Some(parser) = definition.version_probe_parser() else {
         return Ok(None);
     };
 
@@ -712,6 +715,7 @@ mod tests {
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 
     use super::*;
+    use crate::agent::host::BuiltinSource;
     use crate::procwatch::{HostInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 
     /// How long fixture processes block; well beyond `HANG_GUARD` so a fixture
@@ -889,7 +893,7 @@ mod tests {
 
     #[test]
     fn builtin_definitions_name_only_compiled_version_probes() {
-        for definition in builtin_registry().definitions() {
+        for definition in crate::agent::host::builtin_host().registry().definitions() {
             if let Some(parser) = definition.version_probe_parser() {
                 assert!(
                     VersionProbe::from_parser_id(parser).is_some(),
@@ -898,7 +902,8 @@ mod tests {
                 );
             }
         }
-        let hermes = builtin_registry()
+        let hermes = crate::agent::host::builtin_host()
+            .registry()
             .resolve(&RuntimeId::parse("hermes").expect("id"))
             .expect("hermes registered");
         assert_eq!(

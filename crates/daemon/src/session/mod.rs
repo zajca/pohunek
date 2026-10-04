@@ -31,10 +31,10 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
+use crate::agent::host::{self, RuntimeHost};
 use crate::agent::{
-    adapter_for, agent_fork_unsupported, agent_not_resumable, base_native_launch,
-    build_pty_command, default_args, default_program, fork_pty_command_from_launch,
-    launch_adapter_for, resume_pty_command_from_launch, AgentAdapter, InputRules, LaunchCommand,
+    adapter_for, agent_fork_unsupported, agent_not_resumable, build_pty_command,
+    fork_pty_command_from_launch, resume_pty_command_from_launch, InputRules, LaunchCommand,
     LaunchOpts, NativeSessionLaunch, ProfileRegistry, ResolvedAgent, SessionRef, SessionRefKind,
     ValidatedLaunchProgram,
 };
@@ -231,6 +231,18 @@ impl ShellCommand {
     }
 }
 
+impl ShellCommand {
+    /// The program the shell runtime launches.
+    pub(crate) fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// The arguments the shell runtime launches its program with.
+    pub(crate) fn args(&self) -> &[String] {
+        &self.args
+    }
+}
+
 impl Default for ShellCommand {
     fn default() -> Self {
         Self::from_login_shell(std::env::var("SHELL").ok())
@@ -245,24 +257,6 @@ impl ShellCommand {
             crate::agent::resolve_login_shell(raw),
             std::iter::empty::<String>(),
         )
-    }
-}
-
-impl AgentAdapter for ShellCommand {
-    fn id(&self) -> &'static str {
-        "shell"
-    }
-
-    fn launch(&self, opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError> {
-        crate::agent::build_pty_command(&self.program, self.args.clone(), opts)
-    }
-
-    fn input_rules(&self) -> InputRules {
-        InputRules::unrestricted(false, Duration::ZERO)
-    }
-
-    fn manifest(&self) -> &crate::detect::Manifest {
-        crate::detect::generic_shell_manifest()
     }
 }
 
@@ -1306,7 +1300,12 @@ impl SessionRegistry {
             .map(|store| Arc::new(ProjectManager::new(store)));
         // Host agent profiles resolve the free-string `agent` name; built from the
         // configured agents dir (a bare base kind still resolves when it is unset).
-        let profiles = ProfileRegistry::new(config.agents_dir.clone());
+        // The configured shell command decides what a bare shell session launches.
+        let runtimes = RuntimeHost::from_host_environment().with_shell_command(
+            config.shell_command.program(),
+            config.shell_command.args().to_vec(),
+        );
+        let profiles = ProfileRegistry::with_runtimes(config.agents_dir.clone(), runtimes);
         let retention = retention::RetentionState::new(config.retention_policy_path.clone());
         let registry = Self {
             inner: Arc::new(SessionRegistryInner {
@@ -1771,13 +1770,8 @@ impl SessionRegistry {
         // Resolve and validate the runtime before allocating a logical id or
         // resolving a target: target resolution may bind a git worktree.
         let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
-        let base = resolved.base.clone();
-        let configured_program = resolved
-            .profile
-            .as_ref()
-            .map_or_else(|| default_program(&base), |profile| profile.program.clone());
         let validated_program =
-            crate::capabilities::validate_launch_runtime(&base, &configured_program)?;
+            host::validate_launch_runtime(&resolved.definition, resolved.program())?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's
         // own cwd for a local session, else the daemon's. A resolved project
         // overrides this with its checkout (or worktree) path.
@@ -2044,15 +2038,10 @@ impl SessionRegistry {
         // the launch program/args plus the native-session launch spec (a profile's
         // override, else the base kind's).
         let snapshot = ResumeSnapshot {
-            program: resolved
-                .profile
-                .as_ref()
-                .map_or_else(|| default_program(&base), |profile| profile.program.clone()),
-            args: resolved
-                .profile
-                .as_ref()
-                .map_or_else(|| default_args(&base), |profile| profile.args.clone()),
+            program: resolved.program().to_owned(),
+            args: resolved.snapshot_args(),
             native,
+            launch_binding: host::LaunchPin::of(&resolved.definition),
         };
         // The detection-manifest override is consumed only by the detector, on
         // both the launch and resume paths; never persisted (re-resolved by name).
@@ -2078,7 +2067,7 @@ impl SessionRegistry {
         };
         let plan = build_launch_command(
             resolved,
-            &self.inner.config.shell_command,
+            self.inner.profiles.runtimes(),
             &opts,
             params.input.clone(),
         )?;
@@ -2579,11 +2568,7 @@ impl SessionRegistry {
 
     pub(crate) async fn ensure_known_agent(&self, id: &str) -> Result<(), ProtocolError> {
         let info = self.inspect_str(id).await?;
-        info.agent_base.validate_mutation()?;
-        if let Some(active) = &info.active_agent_base {
-            active.validate_mutation()?;
-        }
-        Ok(())
+        self.ensure_mutable_kinds(&info)
     }
 
     #[cfg(test)]
@@ -4008,10 +3993,23 @@ impl SessionRegistry {
         }
         let sessions = self.inner.sessions.lock().await;
         if let Some(entry) = sessions.get(id) {
-            entry.info.agent_base.validate_mutation()?;
-            if let Some(active) = &entry.info.active_agent_base {
-                active.validate_mutation()?;
-            }
+            self.ensure_mutable_kinds(&entry.info)?;
+        }
+        Ok(())
+    }
+
+    /// Rejects a mutation of a session whose base or active agent is not a
+    /// launchable runtime on this host.
+    ///
+    /// # Errors
+    ///
+    /// Returns `agent_kind_unsupported` for a kind that is not a runtime id and
+    /// `runtime_not_installed` for a runtime id no definition backs.
+    fn ensure_mutable_kinds(&self, info: &SessionInfo) -> Result<(), ProtocolError> {
+        let runtimes = self.inner.profiles.runtimes();
+        runtimes.resolve_kind(&info.agent_base)?;
+        if let Some(active) = &info.active_agent_base {
+            runtimes.resolve_kind(active)?;
         }
         Ok(())
     }
@@ -4773,13 +4771,7 @@ fn is_terminal(state: SessionState) -> bool {
 }
 
 fn agent_kind_label(agent: &AgentKind) -> &str {
-    match agent {
-        AgentKind::Shell => "shell",
-        AgentKind::Codex => "codex",
-        AgentKind::Claude => "claude",
-        AgentKind::Hermes => "hermes",
-        AgentKind::Unknown(value) => value,
-    }
+    agent.as_wire()
 }
 
 fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfig {

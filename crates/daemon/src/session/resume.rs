@@ -1,16 +1,17 @@
 //! Native recovery metadata and explicit provider-native relaunch.
 
 use super::{
-    agent_fork_unsupported, agent_not_resumable, base_native_launch, default_program,
-    fork_pty_command_from_launch, input_rules_for_agent, is_terminal,
-    resume_pty_command_from_launch, runtime_error, session_not_found, validate_session_name, warn,
-    LaunchOpts, NativeSessionLaunch, Ordering, PathBuf, ProtocolError, PtySessionSpec,
-    ResumeBinding, SessionEntry, SessionForkParams, SessionId, SessionInfo, SessionRef,
-    SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
+    agent_fork_unsupported, agent_not_resumable, fork_pty_command_from_launch, host,
+    input_rules_for_agent, is_terminal, resume_pty_command_from_launch, runtime_error,
+    session_not_found, validate_session_name, warn, LaunchOpts, NativeSessionLaunch, Ordering,
+    PathBuf, ProtocolError, PtySessionSpec, ResumeBinding, SessionEntry, SessionForkParams,
+    SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
 };
 
 use std::io;
 use std::sync::Arc;
+
+use crate::agent::host::RuntimeDefinition;
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -28,6 +29,8 @@ pub(super) struct ResumeSnapshot {
     /// Resolved native-session launch spec; `None` ⇒ this session neither resumes
     /// nor forks natively.
     pub(super) native: Option<NativeSessionLaunch>,
+    /// The runtime identity this launch shape was frozen with.
+    pub(super) launch_binding: host::LaunchPin,
 }
 
 impl ResumeSnapshot {
@@ -37,6 +40,7 @@ impl ResumeSnapshot {
             program: String::new(),
             args: Vec::new(),
             native: None,
+            launch_binding: host::LaunchPin::Unpinned,
         }
     }
 
@@ -46,6 +50,7 @@ impl ResumeSnapshot {
             program: binding.program.clone(),
             args: binding.args.clone(),
             native: binding.native_launch.clone(),
+            launch_binding: binding.launch_binding.clone(),
         }
     }
 
@@ -131,9 +136,13 @@ impl SessionRegistry {
     pub async fn resume(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
         self.ensure_not_external(id).await?;
         let guard = self.lock_lifecycle(id).await;
-        let (binding, registration) = {
+        let (binding, definition, registration) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
+            let binding = Self::resume_binding_from_entry(id, entry);
+            // The runtime is resolved before the capability gate: a session whose
+            // runtime is not installed reports that, and its binding stays as is.
+            let definition = self.binding_definition(&binding)?;
             if !entry.info.capabilities.resume {
                 return Err(agent_not_resumable(&entry.info.agent));
             }
@@ -156,7 +165,8 @@ impl SessionRegistry {
                 ));
             }
             (
-                Self::resume_binding_from_entry(id, entry),
+                binding,
+                definition,
                 super::target::PtyRegistration::Recover {
                     transaction_id: format!(
                         "recover-{}",
@@ -185,9 +195,8 @@ impl SessionRegistry {
                 },
             )
         };
-        let configured_program = binding_program(&binding);
-        let validated_program =
-            crate::capabilities::validate_launch_runtime(&binding.agent_base, &configured_program)?;
+        let configured_program = binding_program(&binding, &definition);
+        let validated_program = host::validate_launch_runtime(&definition, &configured_program)?;
 
         let info = match self
             .resume_binding_with_registration(binding, registration, validated_program, guard)
@@ -201,6 +210,30 @@ impl SessionRegistry {
         };
         self.persist_resume_binding(&info.id).await;
         Ok(info)
+    }
+
+    /// Resolves the runtime a binding relaunches with and checks that it may
+    /// serve the binding's frozen launch pin.
+    ///
+    /// A runtime that is not installed, or that no longer matches the pin,
+    /// refuses the relaunch; the stored binding is left untouched so it
+    /// resumes once the runtime is available again.
+    ///
+    /// # Errors
+    ///
+    /// Returns `agent_kind_unsupported` for a value that is not a runtime id
+    /// and `runtime_not_installed` for an unresolvable or mismatching runtime.
+    fn binding_definition(
+        &self,
+        binding: &ResumeBinding,
+    ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+        let definition = self
+            .inner
+            .profiles
+            .runtimes()
+            .resolve_kind(&binding.agent_base)?;
+        host::check_pin(&binding.launch_binding, definition)?;
+        Ok(Arc::clone(definition))
     }
 
     async fn persist_failed_recovery_rollback(&self, id: &SessionId) {
@@ -233,6 +266,7 @@ impl SessionRegistry {
         self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;
         let (binding, repo, branch, worktree_path) = self.fork_source(&params.session_id).await?;
+        let definition = self.binding_definition(&binding)?;
 
         // Fork is fail-closed: only a spec frozen into the binding can fork, never
         // the base kind's compiled spec.
@@ -246,9 +280,9 @@ impl SessionRegistry {
         let id = Self::allocate_session_id();
         self.ensure_worker_socket(&id)?;
         let has_snapshot = !binding.program.is_empty();
-        let program = binding_program(&binding);
+        let program = binding_program(&binding, &definition);
         let input_rules = if has_snapshot {
-            binding.input_rules.to_input_rules(&binding.agent_base)
+            binding.input_rules.to_input_rules(definition.input_rules())
         } else {
             input_rules_for_agent(&binding.agent_base, &self.inner.config)
         };
@@ -291,6 +325,7 @@ impl SessionRegistry {
             program,
             args: binding.args.clone(),
             native: Some(launch),
+            launch_binding: binding.launch_binding.clone(),
         };
         let guard = self.lock_lifecycle(&id).await;
         let info = self
@@ -377,6 +412,7 @@ impl SessionRegistry {
             args: entry.snapshot.args.clone(),
             input_rules: entry.input_rules.into(),
             native_launch: entry.snapshot.native.clone(),
+            launch_binding: entry.snapshot.launch_binding.clone(),
         }
     }
 
@@ -386,9 +422,9 @@ impl SessionRegistry {
         &self,
         binding: ResumeBinding,
     ) -> Result<SessionInfo, ProtocolError> {
-        let configured_program = binding_program(&binding);
-        let validated_program =
-            crate::capabilities::validate_launch_runtime(&binding.agent_base, &configured_program)?;
+        let definition = self.binding_definition(&binding)?;
+        let configured_program = binding_program(&binding, &definition);
+        let validated_program = host::validate_launch_runtime(&definition, &configured_program)?;
         let id = SessionId(binding.session_id.clone());
         let guard = self.lock_lifecycle(&id).await;
         let registration = match self.load_durable_session_record(&id).await? {
@@ -427,8 +463,9 @@ impl SessionRegistry {
         // The resume mechanics come from the frozen structural snapshot (C.4). A
         // binding without a snapshot program falls back to the base kind's
         // compiled spec.
-        let launch =
-            binding_native_launch(&binding).ok_or_else(|| agent_not_resumable(&binding.agent))?;
+        let definition = self.binding_definition(&binding)?;
+        let launch = binding_native_launch(&binding, &definition)
+            .ok_or_else(|| agent_not_resumable(&binding.agent))?;
         // Build the native reference from the field the frozen reference kind
         // names, so a `path`-kind spec applies the absolute-path guard and an
         // `id`-kind spec the leading-dash guard (the documented asymmetry).
@@ -440,9 +477,9 @@ impl SessionRegistry {
         // default so it still relaunches. `program`/`input_rules` are frozen
         // structural fields — never re-resolved from the profile.
         let has_snapshot = !binding.program.is_empty();
-        let program = binding_program(&binding);
+        let program = binding_program(&binding, &definition);
         let input_rules = if has_snapshot {
-            binding.input_rules.to_input_rules(&binding.agent_base)
+            binding.input_rules.to_input_rules(definition.input_rules())
         } else {
             input_rules_for_agent(&binding.agent_base, &self.inner.config)
         };
@@ -492,6 +529,7 @@ impl SessionRegistry {
             program,
             args: binding.args.clone(),
             native: Some(launch),
+            launch_binding: binding.launch_binding.clone(),
         };
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
@@ -575,9 +613,9 @@ impl SessionRegistry {
     }
 }
 
-fn binding_program(binding: &ResumeBinding) -> String {
+fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {
     if binding.program.is_empty() {
-        default_program(&binding.agent_base)
+        definition.program().as_str().to_owned()
     } else {
         binding.program.clone()
     }
@@ -586,14 +624,17 @@ fn binding_program(binding: &ResumeBinding) -> String {
 /// Return the native-session launch spec frozen into a persisted binding.
 ///
 /// A binding written without a snapshot program carries no frozen spec and
-/// resolves to its base kind's compiled spec; a binding with a snapshot is
+/// resolves to its runtime definition's spec; a binding with a snapshot is
 /// authoritative, so an absent spec means the session does not recover natively.
-fn binding_native_launch(binding: &ResumeBinding) -> Option<NativeSessionLaunch> {
+fn binding_native_launch(
+    binding: &ResumeBinding,
+    definition: &RuntimeDefinition,
+) -> Option<NativeSessionLaunch> {
     if binding.program.is_empty() {
         binding
             .native_launch
             .clone()
-            .or_else(|| base_native_launch(&binding.agent_base))
+            .or_else(|| definition.native().cloned())
     } else {
         binding.native_launch.clone()
     }
