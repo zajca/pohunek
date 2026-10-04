@@ -899,3 +899,41 @@ fn the_package_cap_is_enforced() {
         RegistryError::TooManyPackages
     );
 }
+
+#[test]
+fn a_no_op_enable_or_select_still_verifies_the_root() {
+    let fixture = PluginFixture::new();
+    let registry = fixture.open();
+    let sample = sample();
+    registry
+        .install(&InstallRequest {
+            select: true,
+            ..request(&sample)
+        })
+        .unwrap();
+    // Already enabled and selected: valid no-ops keep the generation.
+    assert_eq!(registry.set_enabled(&sample.digest, true).unwrap(), 1);
+    assert_eq!(registry.select(&sample.digest).unwrap(), 1);
+
+    let license = fixture.root(&sample.digest).join("files/LICENSE");
+    std::fs::write(&license, b"GPL\n").unwrap();
+    assert!(matches!(
+        registry.set_enabled(&sample.digest, true).unwrap_err(),
+        RegistryError::RootInvalid(VerifyError::Modified { .. })
+    ));
+    assert!(matches!(
+        registry.select(&sample.digest).unwrap_err(),
+        RegistryError::RootInvalid(VerifyError::Modified { .. })
+    ));
+
+    std::fs::remove_dir_all(fixture.root(&sample.digest)).unwrap();
+    assert!(matches!(
+        registry.set_enabled(&sample.digest, true).unwrap_err(),
+        RegistryError::RootInvalid(VerifyError::RootMissing)
+    ));
+    assert!(matches!(
+        registry.select(&sample.digest).unwrap_err(),
+        RegistryError::RootInvalid(VerifyError::RootMissing)
+    ));
+    assert_eq!(registry.state().unwrap().generation(), 1);
+}

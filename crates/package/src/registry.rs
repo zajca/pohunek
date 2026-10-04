@@ -548,8 +548,9 @@ impl Registry {
 
     /// Enables or disables an installed package and returns the generation.
     ///
-    /// Enabling requires a root that verifies; disabling never reads the
-    /// root. Setting the state a package already has changes nothing.
+    /// Enabling requires a root that verifies, even when the package is already
+    /// enabled; disabling never reads the root. Setting the state a package
+    /// already has changes nothing else.
     ///
     /// # Errors
     ///
@@ -562,12 +563,12 @@ impl Registry {
             .state
             .position(digest)
             .ok_or(RegistryError::NotInstalled)?;
-        if transaction.state.packages[index].enabled == enabled {
-            return Ok(transaction.state.generation);
-        }
         if enabled {
             self.verify_record(&transaction.state.packages[index])
                 .map_err(RegistryError::RootInvalid)?;
+        }
+        if transaction.state.packages[index].enabled == enabled {
+            return Ok(transaction.state.generation);
         }
         transaction.state.packages[index].enabled = enabled;
         transaction.commit()?;
@@ -588,11 +589,11 @@ impl Registry {
             .package(digest)
             .cloned()
             .ok_or(RegistryError::NotInstalled)?;
+        self.verify_record(&record)
+            .map_err(RegistryError::RootInvalid)?;
         if transaction.state.selected.get(&record.identity.id) == Some(digest) {
             return Ok(transaction.state.generation);
         }
-        self.verify_record(&record)
-            .map_err(RegistryError::RootInvalid)?;
         transaction
             .state
             .selected
