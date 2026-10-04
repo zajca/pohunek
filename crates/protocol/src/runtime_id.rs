@@ -325,16 +325,49 @@ pub enum RuntimeRef {
     /// have installed.
     Id(RuntimeId),
     /// A label that is not a valid [`RuntimeId`]: displayable, never
-    /// launchable. Build it only through [`RuntimeRef::from_wire`] or
-    /// deserialization so a valid string never lands here.
-    Historical(String),
+    /// launchable. [`HistoricalRuntime`] cannot hold a grammar-valid string,
+    /// so the variant always survives a wire roundtrip.
+    Historical(HistoricalRuntime),
+}
+
+/// A runtime label that is not a grammar-valid [`RuntimeId`].
+///
+/// The private field makes the invariant unbreakable: the only constructors
+/// reject any string that parses as a [`RuntimeId`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HistoricalRuntime(String);
+
+impl HistoricalRuntime {
+    /// Wraps `value`, or returns `None` when it is a valid [`RuntimeId`] and
+    /// therefore belongs in [`RuntimeRef::Id`].
+    #[must_use]
+    pub fn new(value: &str) -> Option<Self> {
+        RuntimeId::parse(value)
+            .is_err()
+            .then(|| Self(value.to_owned()))
+    }
+
+    /// The label text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for HistoricalRuntime {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 impl RuntimeRef {
     /// Classifies a wire string.
     #[must_use]
     pub fn from_wire(value: &str) -> Self {
-        RuntimeId::parse(value).map_or_else(|_error| Self::Historical(value.to_owned()), Self::Id)
+        RuntimeId::parse(value).map_or_else(
+            |_error| Self::Historical(HistoricalRuntime(value.to_owned())),
+            Self::Id,
+        )
     }
 
     /// Returns the wire value.
@@ -342,7 +375,7 @@ impl RuntimeRef {
     pub fn as_wire(&self) -> &str {
         match self {
             Self::Id(id) => id.as_str(),
-            Self::Historical(label) => label,
+            Self::Historical(label) => label.as_str(),
         }
     }
 
@@ -399,7 +432,7 @@ impl<'de> Deserialize<'de> for RuntimeRef {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Ok(RuntimeId::parse(&value).map_or(Self::Historical(value), Self::Id))
+        Ok(Self::from_wire(&value))
     }
 }
 
@@ -587,10 +620,7 @@ mod tests {
     #[test]
     fn historical_references_are_inert_and_displayable() {
         let historical: RuntimeRef = serde_json::from_str(r#""Legacy Agent!""#).expect("lenient");
-        assert_eq!(
-            historical,
-            RuntimeRef::Historical("Legacy Agent!".to_owned())
-        );
+        assert_eq!(historical, RuntimeRef::from_wire("Legacy Agent!"));
         assert_eq!(historical.to_string(), "Legacy Agent!");
         let error = historical.launchable().expect_err("never launchable");
         assert_eq!(error.code, "agent_kind_unsupported");
@@ -612,6 +642,23 @@ mod tests {
         RuntimeRef::from_wire(&over)
             .launchable()
             .expect_err("must be rejected");
+    }
+
+    #[test]
+    fn historical_runtime_cannot_hold_a_valid_id() {
+        for valid in ["codex", "shell", "future-agent", "a"] {
+            assert_eq!(HistoricalRuntime::new(valid), None, "{valid}");
+        }
+        for invalid in ["", "Codex", "a b", "a..b", ".x"] {
+            let label = HistoricalRuntime::new(invalid).expect(invalid);
+            assert_eq!(label.as_str(), invalid);
+            assert_eq!(label.to_string(), invalid);
+            let reference = RuntimeRef::Historical(label);
+            let json = serde_json::to_string(&reference).expect("serialize");
+            let back: RuntimeRef = serde_json::from_str(&json).expect("roundtrip");
+            assert_eq!(back, reference);
+            assert!(matches!(back, RuntimeRef::Historical(_)));
+        }
     }
 
     #[test]
@@ -667,7 +714,8 @@ mod tests {
         );
 
         let invalid = AgentKind::Unknown("Not Valid".to_owned()).as_runtime_ref();
-        assert_eq!(invalid, RuntimeRef::Historical("Not Valid".to_owned()));
+        assert_eq!(invalid, RuntimeRef::from_wire("Not Valid"));
+        assert!(matches!(invalid, RuntimeRef::Historical(_)));
         let json = serde_json::to_string(&invalid).expect("serialize");
         assert_eq!(
             serde_json::from_str::<RuntimeRef>(&json).expect("roundtrip"),
