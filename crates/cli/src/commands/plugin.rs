@@ -779,8 +779,43 @@ async fn ingest_package(
         }
         .into());
     }
-    let result = send_ingest(client, source, enable, select, false).await?;
+    let mut result = send_ingest(client, source, enable, select, false).await?;
+    if ingest == Ingest::Update {
+        converge_update(client, &mut result).await?;
+    }
     print_output(json, &result, || render_install_result(&result, ingest))?;
+    Ok(())
+}
+
+/// Makes an already recorded version enabled and selected, as `update`
+/// promises.
+///
+/// The daemon keeps the recorded enabled and selected state of a package that
+/// is already installed, so an update to a version that was installed earlier
+/// and left disabled or unselected would otherwise report success and change
+/// nothing.
+async fn converge_update(
+    client: &mut Client,
+    result: &mut PackageInstallResult,
+) -> Result<(), CliError> {
+    let digest = result.package.digest.clone();
+    if !result.package.enabled {
+        let change = client
+            .call::<method::PackageSetEnabled>(PackageSetEnabledParams {
+                digest: digest.clone(),
+                enabled: true,
+            })
+            .await?;
+        result.package = change.package;
+        result.reloaded = change.reloaded;
+    }
+    if !result.package.selected {
+        let change = client
+            .call::<method::PackageSelect>(PackageSelectParams { digest })
+            .await?;
+        result.package = change.package;
+        result.reloaded = change.reloaded;
+    }
     Ok(())
 }
 
