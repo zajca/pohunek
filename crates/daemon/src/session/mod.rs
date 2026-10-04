@@ -13,7 +13,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use protocol::{
     event, ActivityRevision, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource,
-    ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeInventoryEntry,
+    ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId, RuntimeInventoryEntry,
     RuntimeInventoryResult, RuntimeState, SessionAttachParams, SessionEvent, SessionForkParams,
     SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
     SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
@@ -33,10 +33,9 @@ use ulid::Ulid;
 
 use crate::agent::host::{self, RuntimeHost};
 use crate::agent::{
-    adapter_for, agent_fork_unsupported, agent_not_resumable, build_pty_command,
-    fork_pty_command_from_launch, resume_pty_command_from_launch, InputRules, LaunchCommand,
-    LaunchOpts, NativeSessionLaunch, ProfileRegistry, ResolvedAgent, SessionRef, SessionRefKind,
-    ValidatedLaunchProgram,
+    agent_fork_unsupported, agent_not_resumable, build_pty_command, fork_pty_command_from_launch,
+    resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchOpts, NativeSessionLaunch,
+    ProfileRegistry, ResolvedAgent, SessionRef, SessionRefKind, ValidatedLaunchProgram,
 };
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
 use crate::external::{
@@ -88,7 +87,7 @@ use hooks::SessionHookRequest;
 use hooks::{parse_agent_activity, spawn_agent_state_hook_dispatcher};
 #[cfg(test)]
 use input::{build_input_writes, InputSubmission};
-use input::{input_rules_for_agent, plan_initial_input_delivery};
+use input::{input_rules_for_agent, input_rules_for_definition, plan_initial_input_delivery};
 use lag::{log_lag_warn, LagWarnThrottle};
 use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
@@ -291,8 +290,9 @@ pub struct SessionRegistryConfig {
     pub observation_global_waiters: usize,
     /// Maximum concurrent bounded waiters for one session.
     pub observation_session_waiters: usize,
-    /// Delay before sending Claude Code's Ink submit byte as a separate write.
-    pub claude_submit_delay: Duration,
+    /// Submit delay per runtime id, replacing the descriptor's delay for
+    /// runtimes whose descriptor marks it configurable.
+    pub submit_delay_overrides: BTreeMap<RuntimeId, Duration>,
     /// Upper bound on how long [`SessionRegistry::create`] waits for a freshly
     /// spawned agent to emit its first PTY output before injecting a
     /// `session.new --input` prompt. The wait short-circuits as soon as the
@@ -388,7 +388,7 @@ impl Default for SessionRegistryConfig {
             observation_screen_bytes: protocol::MAX_SESSION_SCREEN_RESPONSE_BYTES,
             observation_global_waiters: DEFAULT_GLOBAL_WAITERS,
             observation_session_waiters: DEFAULT_SESSION_WAITERS,
-            claude_submit_delay: crate::agent::DEFAULT_CLAUDE_SUBMIT_DELAY,
+            submit_delay_overrides: BTreeMap::new(),
             initial_input_startup_grace: DEFAULT_INITIAL_INPUT_STARTUP_GRACE,
             socket_path: None,
             store_path: None,
@@ -2033,7 +2033,9 @@ impl SessionRegistry {
             .profile
             .as_ref()
             .and_then(|profile| profile.input_rules)
-            .unwrap_or_else(|| input_rules_for_agent(&base, &self.inner.config));
+            .unwrap_or_else(|| {
+                input_rules_for_definition(&resolved.definition, &self.inner.config)
+            });
         // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
         // the launch program/args plus the native-session launch spec (a profile's
         // override, else the base kind's).
@@ -4032,7 +4034,7 @@ impl SessionRegistry {
             if owned_pids.contains(&fact.pid) {
                 continue;
             }
-            let Some(agent_base) = identify_agent(&fact) else {
+            let Some(agent_base) = identify_agent(self.inner.profiles.runtimes(), &fact) else {
                 continue;
             };
             // A process carrying pohunek ownership markers is a PTY child of
@@ -4775,13 +4777,17 @@ fn agent_kind_label(agent: &AgentKind) -> &str {
 }
 
 fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfig {
-    DetectorConfig::for_profile(
-        &resolved.base,
-        resolved
-            .profile
-            .as_ref()
-            .and_then(|profile| profile.manifest.clone()),
-    )
+    match resolved
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.manifest.clone())
+    {
+        Some(manifest) => DetectorConfig {
+            manifest: Some(manifest),
+            ..DetectorConfig::default()
+        },
+        None => DetectorConfig::for_definition(&resolved.definition),
+    }
 }
 
 fn bind_report_process(

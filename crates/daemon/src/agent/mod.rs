@@ -47,9 +47,6 @@ pub(crate) fn host_login_shell() -> String {
     resolve_login_shell(std::env::var("SHELL").ok())
 }
 
-/// Default submit delay for Claude Code's Ink TUI.
-pub const DEFAULT_CLAUDE_SUBMIT_DELAY: Duration = Duration::from_millis(150);
-
 /// A launch executable resolved and canonicalized before provider validation.
 ///
 /// The private path invariant lets the session launch path consume the exact
@@ -311,32 +308,22 @@ impl SessionRef {
 /// kind without native recovery or without an installed definition.
 #[cfg(test)]
 pub(crate) fn builtin_native_launch(kind: &protocol::AgentKind) -> Option<NativeSessionLaunch> {
-    host::builtin_host()
+    host::RuntimeHost::default()
         .resolve_kind(kind)
         .ok()
         .and_then(|definition| definition.native().cloned())
 }
 
-/// Input rules of a built-in runtime, selected by agent kind.
-///
-/// Serves `session/input.rs`, which still selects rules by [`AgentKind`]; a
-/// kind without an installed definition gets unrestricted, unframed input.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct InputAdapter(InputRules);
-
-impl InputAdapter {
-    /// The rules this adapter frames input with.
-    pub(crate) const fn input_rules(self) -> InputRules {
-        self.0
-    }
-}
-
-/// Returns the input adapter for an agent kind.
-pub(crate) fn adapter_for(agent: &protocol::AgentKind) -> InputAdapter {
-    InputAdapter(host::builtin_host().resolve_kind(agent).map_or_else(
+/// Input rules of the runtime `agent` names; a kind without an installed
+/// definition gets unrestricted, unframed input.
+pub(crate) fn input_rules_for_kind(
+    host: &host::RuntimeHost,
+    agent: &protocol::AgentKind,
+) -> InputRules {
+    host.resolve_kind(agent).map_or_else(
         |_unresolved| InputRules::unrestricted(false, Duration::ZERO),
         |definition| definition.input_rules(),
-    ))
+    )
 }
 
 /// Resolve `program` on `PATH` and build a PTY launch command in `opts`.
@@ -834,7 +821,8 @@ mod tests {
 
     #[test]
     fn built_in_runtimes_return_expected_input_rules() {
-        let rules = |kind: protocol::AgentKind| super::adapter_for(&kind).input_rules();
+        let host = RuntimeHost::default();
+        let rules = |kind: protocol::AgentKind| super::input_rules_for_kind(&host, &kind);
         let shell = rules(protocol::AgentKind::Shell);
         assert!(!shell.bracketed_paste);
         assert_eq!(shell.submit_delay, Duration::ZERO);
@@ -1259,7 +1247,7 @@ mod tests {
     #[test]
     fn built_in_manifests_match_agent_specific_rules() {
         let manifest = |kind: protocol::AgentKind| {
-            (**super::host::builtin_host()
+            (**super::host::RuntimeHost::default()
                 .resolve_kind(&kind)
                 .expect("built-in resolves")
                 .manifest())

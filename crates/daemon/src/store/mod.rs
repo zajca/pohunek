@@ -1817,7 +1817,7 @@ mod tests {
             submit_delay_ms: 25,
         };
         let rules = stored.to_input_rules(
-            crate::agent::host::builtin_host()
+            crate::agent::host::RuntimeHost::default()
                 .resolve_kind(&AgentKind::Hermes)
                 .expect("Hermes resolves")
                 .input_rules(),

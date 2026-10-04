@@ -26,7 +26,7 @@ use super::supervision::{
     RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::{
-    adapter_for, current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
+    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
     preserve_durable_worker_metadata, preserve_newer_updated_at, runtime_error, sort_subagents,
     terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport, CancellationToken,
     DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex,
@@ -2437,11 +2437,20 @@ impl SessionRegistry {
 
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
-            || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
+            || {
+                super::input_rules_for_agent(
+                    self.inner.profiles.runtimes(),
+                    &record.info.agent_base,
+                    &self.inner.config,
+                )
+            },
             |binding| {
                 binding
                     .input_rules
-                    .to_input_rules(adapter_for(&binding.agent_base).input_rules())
+                    .to_input_rules(crate::agent::input_rules_for_kind(
+                        self.inner.profiles.runtimes(),
+                        &binding.agent_base,
+                    ))
             },
         );
         let snapshot = recovery
@@ -2453,8 +2462,11 @@ impl SessionRegistry {
             .resolve_agent(&record.info.agent)
             .ok()
             .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
-        let default_detector_config =
-            DetectorConfig::for_profile(&record.info.agent_base, manifest_override);
+        let default_detector_config = DetectorConfig::for_profile(
+            self.inner.profiles.runtimes(),
+            &record.info.agent_base,
+            manifest_override,
+        );
         let detector_cancel = CancellationToken::new();
         let procwatch_cancel = CancellationToken::new();
         let runtime_watch_cancel = CancellationToken::new();
@@ -2587,17 +2599,27 @@ impl SessionRegistry {
         record.info.updated_at = now;
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
-            || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
+            || {
+                super::input_rules_for_agent(
+                    self.inner.profiles.runtimes(),
+                    &record.info.agent_base,
+                    &self.inner.config,
+                )
+            },
             |binding| {
                 binding
                     .input_rules
-                    .to_input_rules(adapter_for(&binding.agent_base).input_rules())
+                    .to_input_rules(crate::agent::input_rules_for_kind(
+                        self.inner.profiles.runtimes(),
+                        &binding.agent_base,
+                    ))
             },
         );
         let relaunch = recovery
             .as_ref()
             .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
-        let default_detector_config = DetectorConfig::for_agent(&record.info.agent_base);
+        let default_detector_config =
+            DetectorConfig::for_agent(self.inner.profiles.runtimes(), &record.info.agent_base);
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
         let (detector_config, _) = watch::channel(DetectorConfigUpdate {
             generation: 0,

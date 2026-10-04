@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use protocol::{AgentActivity, AgentKind, DetectionRegionPreview, StateSource};
 
+use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::procwatch::ProcessFact;
 
 mod machine;
@@ -55,57 +56,43 @@ impl DetectorConfig {
         }
     }
 
-    /// Production detector config for a specific agent kind.
+    /// Production detector config for the runtime `agent` names: that
+    /// runtime's manifest, or the generic shell manifest when no installed
+    /// runtime backs the kind.
     #[must_use]
-    pub fn for_agent(agent: &AgentKind) -> Self {
-        match agent {
-            AgentKind::Shell | AgentKind::Unknown(_) => Self::generic_shell(),
-            AgentKind::Codex => Self::codex(),
-            AgentKind::Claude => Self::claude(),
-            AgentKind::Hermes => Self::hermes(),
+    pub fn for_agent(host: &RuntimeHost, agent: &AgentKind) -> Self {
+        host.resolve_kind(agent).map_or_else(
+            |_unresolved| Self::generic_shell(),
+            |definition| Self::for_definition(definition),
+        )
+    }
+
+    /// Production detector config driven by `definition`'s manifest.
+    #[must_use]
+    pub fn for_definition(definition: &RuntimeDefinition) -> Self {
+        Self {
+            detection: DetectionConfig::default(),
+            manifest: Some((**definition.manifest()).clone()),
         }
     }
 
     /// Detector config for a host agent profile (Part C): use the profile's
     /// override manifest when it declares one, else inherit the base kind's
-    /// embedded manifest. The override is already parsed via the capped,
+    /// manifest. The override is already parsed via the capped,
     /// non-panicking [`Manifest::parse_str`] (a malformed one disabled the profile
     /// before this point), so detection never `.expect`-panics on host input.
     #[must_use]
-    pub fn for_profile(base: &AgentKind, override_manifest: Option<Manifest>) -> Self {
+    pub fn for_profile(
+        host: &RuntimeHost,
+        base: &AgentKind,
+        override_manifest: Option<Manifest>,
+    ) -> Self {
         match override_manifest {
             Some(manifest) => Self {
                 detection: DetectionConfig::default(),
                 manifest: Some(manifest),
             },
-            None => Self::for_agent(base),
-        }
-    }
-
-    /// Production detector config using the embedded Codex manifest.
-    #[must_use]
-    pub fn codex() -> Self {
-        Self {
-            detection: DetectionConfig::default(),
-            manifest: Some(codex_manifest().clone()),
-        }
-    }
-
-    /// Production detector config using the embedded Claude Code manifest.
-    #[must_use]
-    pub fn claude() -> Self {
-        Self {
-            detection: DetectionConfig::default(),
-            manifest: Some(claude_manifest().clone()),
-        }
-    }
-
-    /// Production detector config using the embedded Hermes Agent manifest.
-    #[must_use]
-    pub fn hermes() -> Self {
-        Self {
-            detection: DetectionConfig::default(),
-            manifest: Some(hermes_manifest().clone()),
+            None => Self::for_agent(host, base),
         }
     }
 }
@@ -142,27 +129,22 @@ pub fn hermes_manifest() -> &'static Manifest {
         .get_or_init(|| Manifest::parse_str(HERMES_MANIFEST).expect("Hermes manifest must parse"))
 }
 
-/// Identifies a built-in agent from process facts.
+/// Identifies the runtime a process belongs to from the process matchers its
+/// installed definitions declare.
+///
+/// Definitions are tried in runtime-id order, so a process that two runtimes
+/// both claim resolves deterministically.
 #[must_use]
-pub fn identify_agent(fact: &ProcessFact) -> Option<AgentKind> {
-    if codex_manifest()
-        .process_matchers()
-        .is_some_and(|matchers| matchers.matches(fact))
-    {
-        Some(AgentKind::Codex)
-    } else if claude_manifest()
-        .process_matchers()
-        .is_some_and(|matchers| matchers.matches(fact))
-    {
-        Some(AgentKind::Claude)
-    } else if hermes_manifest()
-        .process_matchers()
-        .is_some_and(|matchers| matchers.matches(fact))
-    {
-        Some(AgentKind::Hermes)
-    } else {
-        None
-    }
+pub fn identify_agent(host: &RuntimeHost, fact: &ProcessFact) -> Option<AgentKind> {
+    host.registry()
+        .definitions()
+        .find(|definition| {
+            definition
+                .manifest()
+                .process_matchers()
+                .is_some_and(|matchers| matchers.matches(fact))
+        })
+        .map(|definition| AgentKind::from_wire(definition.runtime_id().as_str()))
 }
 
 #[derive(Debug)]
@@ -551,7 +533,21 @@ mod tests {
         ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest, ManifestRegion,
         MatchContext,
     };
+    use std::sync::Arc;
+
+    use protocol::{PackageId, PackageIdentity, PackageVersion, RuntimeId};
+
+    use crate::agent::host::{
+        DefinitionError, DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition,
+        RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust,
+    };
+    use crate::agent::InputRules;
     use crate::procwatch::{Pid, ProcessFact};
+
+    /// Detector config of a built-in runtime, selected through the registry.
+    fn builtin_config(kind: &AgentKind) -> DetectorConfig {
+        DetectorConfig::for_agent(&RuntimeHost::default(), kind)
+    }
 
     fn instant() -> Instant {
         Instant::now()
@@ -613,19 +609,24 @@ mod tests {
     #[test]
     fn identify_agent_matches_builtin_process_sections() {
         assert_eq!(
-            super::identify_agent(&fact(100, "codex", &["/usr/bin/codex"])),
+            super::identify_agent(
+                &RuntimeHost::default(),
+                &fact(100, "codex", &["/usr/bin/codex"])
+            ),
             Some(AgentKind::Codex)
         );
         assert_eq!(
-            super::identify_agent(&fact(
-                101,
-                "node",
-                &["node", "/opt/claude-code/bin/claude.js"],
-            )),
+            super::identify_agent(
+                &RuntimeHost::default(),
+                &fact(101, "node", &["node", "/opt/claude-code/bin/claude.js"],)
+            ),
             Some(AgentKind::Claude)
         );
         assert_eq!(
-            super::identify_agent(&fact(102, "sleep", &["sleep", "30"])),
+            super::identify_agent(
+                &RuntimeHost::default(),
+                &fact(102, "sleep", &["sleep", "30"])
+            ),
             None
         );
 
@@ -648,7 +649,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::identify_agent(&fact(pid, comm, &cmdline)),
+                super::identify_agent(&RuntimeHost::default(), &fact(pid, comm, &cmdline)),
                 Some(AgentKind::Hermes)
             );
         }
@@ -679,7 +680,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::identify_agent(&fact(pid, comm, &cmdline)),
+                super::identify_agent(&RuntimeHost::default(), &fact(pid, comm, &cmdline)),
                 None,
                 "unrelated process must not be identified as Hermes"
             );
@@ -1336,19 +1337,19 @@ mod tests {
     #[test]
     fn embedded_codex_manifest_parses() {
         let _ = super::codex_manifest();
-        let _ = super::DetectorConfig::codex();
+        let _ = builtin_config(&AgentKind::Codex);
     }
 
     #[test]
     fn embedded_claude_manifest_parses() {
         let _ = super::claude_manifest();
-        let _ = super::DetectorConfig::claude();
+        let _ = builtin_config(&AgentKind::Claude);
     }
 
     #[test]
     fn embedded_hermes_manifest_parses() {
         let _ = super::hermes_manifest();
-        let _ = super::DetectorConfig::hermes();
+        let _ = builtin_config(&AgentKind::Hermes);
     }
 
     #[test]
@@ -1413,7 +1414,7 @@ mod tests {
     #[test]
     fn detector_config_for_agent_loads_agent_manifest() {
         let started_at = instant();
-        let mut codex_config = super::DetectorConfig::for_agent(&protocol::AgentKind::Codex);
+        let mut codex_config = builtin_config(&AgentKind::Codex);
         codex_config.detection = config().detection;
         let mut codex = Detector::new(3, 80, started_at, codex_config);
         assert_eq!(
@@ -1421,12 +1422,108 @@ mod tests {
             vec![transition(AgentActivity::Blocked, StateSource::OscTitle)]
         );
 
-        let mut claude_config = super::DetectorConfig::for_agent(&protocol::AgentKind::Claude);
+        let mut claude_config = builtin_config(&AgentKind::Claude);
         claude_config.detection = config().detection;
         let mut claude = Detector::new(3, 80, started_at, claude_config);
         assert_eq!(
             claude.feed(started_at, "\x1b]2;\u{280b} thinking\x07".as_bytes()),
             vec![transition(AgentActivity::Working, StateSource::OscTitle)]
+        );
+    }
+
+    /// Source of one custom runtime whose manifest is `manifest_source`.
+    #[derive(Debug)]
+    struct CustomSource {
+        manifest_source: &'static str,
+    }
+
+    impl RuntimeSource for CustomSource {
+        fn trust(&self) -> SourceTrust {
+            SourceTrust::Builtin
+        }
+
+        fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
+            Ok(vec![RuntimeDefinition::new(DefinitionParts {
+                runtime_id: RuntimeId::parse("acme").expect("runtime id"),
+                origin: DefinitionOrigin::Builtin {
+                    package: Some(PackageIdentity {
+                        id: PackageId::parse("acme.runtime").expect("package id"),
+                        version: PackageVersion::parse("1.0.0").expect("package version"),
+                    }),
+                },
+                display_name: "Acme".to_owned(),
+                program: LaunchProgram::Fixed("acme".to_owned()),
+                default_args: Vec::new(),
+                input_rules: InputRules::unrestricted(false, Duration::ZERO),
+                submit_delay_configurable: false,
+                manifest: Arc::new(manifest(self.manifest_source)),
+                native: None,
+                prompt_arg: false,
+                version_probe_parser: None,
+                integration_handler: None,
+            })
+            .expect("valid definition")])
+        }
+    }
+
+    const ACME_MANIFEST: &str = r#"
+        [process]
+        comm = ["^acme-agent$"]
+        cmdline = ['(^|/)acme-agent($| )']
+
+        [[rules]]
+        id = "acme-blocked"
+        state = "blocked"
+        priority = 1
+        region = "whole_recent"
+        contains = "acme needs you"
+        "#;
+
+    fn acme_host() -> RuntimeHost {
+        let source = CustomSource {
+            manifest_source: ACME_MANIFEST,
+        };
+        RuntimeHost::new(RuntimeRegistry::from_sources(&[&source]).expect("registry"))
+    }
+
+    #[test]
+    fn detector_config_follows_the_definitions_manifest() {
+        let host = acme_host();
+        let mut config = DetectorConfig::for_agent(&host, &AgentKind::from_wire("acme"));
+        config.detection = self::config().detection;
+        let started_at = instant();
+        let mut detector = Detector::new(3, 80, started_at, config);
+
+        assert_eq!(
+            detector.feed(started_at, b"acme needs you\r\n"),
+            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
+        );
+    }
+
+    #[test]
+    fn detector_config_for_a_kind_without_a_definition_is_the_generic_shell_manifest() {
+        let host = acme_host();
+
+        let config = DetectorConfig::for_agent(&host, &AgentKind::from_wire("missing"));
+
+        assert_eq!(
+            format!("{:?}", config.manifest),
+            format!("{:?}", Some(super::generic_shell_manifest().clone()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_uses_the_process_matchers_of_installed_definitions() {
+        let host = acme_host();
+
+        assert_eq!(
+            super::identify_agent(&host, &fact(200, "acme-agent", &["/usr/bin/acme-agent"])),
+            Some(AgentKind::from_wire("acme"))
+        );
+        assert_eq!(
+            super::identify_agent(&host, &fact(201, "codex", &["/usr/bin/codex"])),
+            None,
+            "a runtime absent from the registry is never identified"
         );
     }
 
@@ -1444,6 +1541,7 @@ mod tests {
         );
 
         let mut config = super::DetectorConfig::for_profile(
+            &RuntimeHost::default(),
             &protocol::AgentKind::Codex,
             Some(override_manifest),
         );
@@ -1463,10 +1561,13 @@ mod tests {
         // detector config holds an owned manifest (not the &'static), so assert by
         // behavior: feeding a Claude blocking pattern yields the same blocked
         // transition the base Claude config produces.
-        let mut profile_config =
-            super::DetectorConfig::for_profile(&protocol::AgentKind::Claude, None);
+        let mut profile_config = super::DetectorConfig::for_profile(
+            &RuntimeHost::default(),
+            &protocol::AgentKind::Claude,
+            None,
+        );
         profile_config.detection = self::config().detection;
-        let mut base_config = super::DetectorConfig::claude();
+        let mut base_config = builtin_config(&AgentKind::Claude);
         base_config.detection = self::config().detection;
         assert!(
             profile_config.manifest.is_some(),
@@ -1526,7 +1627,7 @@ mod tests {
 
         detector.reconfigure(
             started_at + Duration::from_millis(10),
-            DetectorConfig::codex(),
+            builtin_config(&AgentKind::Codex),
         );
 
         assert_eq!(
@@ -1563,7 +1664,7 @@ mod tests {
     #[test]
     fn codex_manifest_maps_action_required_title_to_blocked() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::codex();
+        let mut detector_config = builtin_config(&AgentKind::Codex);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(3, 80, started_at, detector_config);
 
@@ -1576,7 +1677,7 @@ mod tests {
     #[test]
     fn codex_manifest_maps_braille_title_spinner_to_working() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::codex();
+        let mut detector_config = builtin_config(&AgentKind::Codex);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(3, 80, started_at, detector_config);
 
@@ -1589,7 +1690,7 @@ mod tests {
     #[test]
     fn codex_manifest_maps_bounded_workspace_trust_prompt_to_blocked() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::codex();
+        let mut detector_config = builtin_config(&AgentKind::Codex);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(12, 100, started_at, detector_config);
 
@@ -1605,7 +1706,7 @@ mod tests {
     #[test]
     fn codex_manifest_ignores_workspace_trust_phrase_in_transcript() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::codex();
+        let mut detector_config = builtin_config(&AgentKind::Codex);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(12, 100, started_at, detector_config);
 
@@ -1625,7 +1726,7 @@ mod tests {
     #[test]
     fn claude_manifest_maps_ink_selection_form_to_blocked() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::claude();
+        let mut detector_config = builtin_config(&AgentKind::Claude);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(8, 80, started_at, detector_config);
 
@@ -1641,7 +1742,7 @@ mod tests {
     #[test]
     fn claude_manifest_maps_braille_title_spinner_to_working() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::claude();
+        let mut detector_config = builtin_config(&AgentKind::Claude);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(3, 80, started_at, detector_config);
 
@@ -1654,7 +1755,7 @@ mod tests {
     #[test]
     fn claude_manifest_maps_live_status_spinner_to_working() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::claude();
+        let mut detector_config = builtin_config(&AgentKind::Claude);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(8, 120, started_at, detector_config);
 
@@ -1673,7 +1774,7 @@ mod tests {
     #[test]
     fn claude_manifest_finished_status_line_resolves_prompt_box_idle() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::claude();
+        let mut detector_config = builtin_config(&AgentKind::Claude);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(8, 120, started_at, detector_config);
 
@@ -1704,7 +1805,7 @@ mod tests {
     #[test]
     fn claude_manifest_permission_dialog_outranks_stale_spinner_line() {
         let started_at = instant();
-        let mut detector_config = super::DetectorConfig::claude();
+        let mut detector_config = builtin_config(&AgentKind::Claude);
         detector_config.detection = config().detection;
         let mut detector = Detector::new(10, 120, started_at, detector_config);
 

@@ -13,18 +13,22 @@ use time::OffsetDateTime;
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use protocol::{
     method, AgentActivity, AgentKind, CwdSource, DetectionRegionKind, DetectionRegionPreview,
-    ErrorClass, Event, ForkCwdMode, OutputOffset, ProcessStartIdentity, ProjectSource,
-    ReportSequence, Request, Response, RuntimeGeneration, RuntimeState, SessionAttachParams,
-    SessionDetectionParams, SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent,
-    SessionNewParams, SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
-    SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity, SessionState,
-    SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo, SubagentLifecycle,
-    SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    ErrorClass, Event, ForkCwdMode, OutputOffset, PackageId, PackageIdentity, PackageVersion,
+    ProcessStartIdentity, ProjectSource, ReportSequence, Request, Response, RuntimeGeneration,
+    RuntimeId, RuntimeState, SessionAttachParams, SessionDetectionParams, SessionForkParams,
+    SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams, SessionOutputParams,
+    SessionReadFormat, SessionReadParams, SessionReadSource, SessionReleaseAgentParams,
+    SessionReportAgentParams, SessionReportNativeIdParams, SessionRetentionPolicy, SessionRuntime,
+    SessionRuntimeIdentity, SessionState, SessionWaitParams, SessionWaitReason, StateSource,
+    SubagentInfo, SubagentLifecycle, SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES,
+    MAX_REQUEST_ID_BYTES,
 };
 
-use crate::agent::LaunchCommand;
+use crate::agent::host::{
+    DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition, RuntimeHost,
+};
 use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
+use crate::agent::{LaunchCommand, ResolvedAgent};
 use crate::api::{dispatch_line, DaemonState, HealthInfo};
 use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
 use crate::external::{external_session_id, TranscriptIndex};
@@ -2182,7 +2186,7 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
     assert_eq!(replaced.state_source, StateSource::Process);
     assert_eq!(
         replacement_detector.borrow().config.detection,
-        DetectorConfig::for_agent(&AgentKind::Claude).detection
+        DetectorConfig::for_agent(&RuntimeHost::default(), &AgentKind::Claude).detection
     );
 
     let _ = registry.stop(&created.id).await;
@@ -5075,7 +5079,7 @@ fn delayed_submit_input_frame_splits_text_and_submit() {
 
 #[test]
 fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
-    let rules = super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
     let writes = super::build_input_writes("first line\nsecond line", rules)
         .expect("Hermes multiline safe text");
 
@@ -5088,7 +5092,7 @@ fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
 
 #[test]
 fn hermes_input_rejects_terminal_controls_without_mutating_text() {
-    let rules = super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
     for unsafe_text in [
         "prompt\u{1b}[201~\rsubmit",
         "prompt\0suffix",
@@ -5109,7 +5113,7 @@ fn hermes_input_rejects_terminal_controls_without_mutating_text() {
 
 #[test]
 fn hermes_input_enforces_shared_byte_ceiling() {
-    let rules = super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
     let at_limit = "x".repeat(protocol::MAX_SESSION_INPUT_BYTES);
     super::build_input_writes(&at_limit, rules).expect("Hermes input at the ceiling is accepted");
 
@@ -5121,7 +5125,7 @@ fn hermes_input_enforces_shared_byte_ceiling() {
 
 #[test]
 fn codex_input_control_behavior_is_unchanged() {
-    let rules = super::input_rules_for_agent(&AgentKind::Codex, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&AgentKind::Codex, &SessionRegistryConfig::default());
     let text = "prompt\u{1b}[201~\rsubmit";
     let writes = super::build_input_writes(text, rules).expect("Codex remains unrestricted");
 
@@ -5133,8 +5137,7 @@ fn codex_input_control_behavior_is_unchanged() {
 
 #[test]
 fn hermes_programmatic_input_fails_closed_while_blocked() {
-    let hermes =
-        super::input_rules_for_agent(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let hermes = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
     let error = hermes
         .validate_activity(Some(AgentActivity::Blocked))
         .expect_err("Hermes input must be denied while approval is visible");
@@ -5144,7 +5147,7 @@ fn hermes_programmatic_input_fails_closed_while_blocked() {
     hermes
         .validate_activity(Some(AgentActivity::Idle))
         .expect("Hermes input is allowed after approval clears");
-    let codex = super::input_rules_for_agent(&AgentKind::Codex, &SessionRegistryConfig::default());
+    let codex = builtin_input_rules(&AgentKind::Codex, &SessionRegistryConfig::default());
     codex
         .validate_activity(Some(AgentActivity::Blocked))
         .expect("Codex blocked-input behavior remains unchanged");
@@ -5798,7 +5801,7 @@ async fn session_input_wait_timeout_after_atomic_plan_does_not_stage_body() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::ZERO,
+        submit_delay_overrides: submit_delay_override("claude", Duration::ZERO),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -5896,7 +5899,7 @@ async fn session_input_serializes_waited_transactions() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::ZERO,
+        submit_delay_overrides: submit_delay_override("claude", Duration::ZERO),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -5967,7 +5970,7 @@ async fn session_input_serializes_waited_and_fire_and_forget_transactions() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::ZERO,
+        submit_delay_overrides: submit_delay_override("claude", Duration::ZERO),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -6036,7 +6039,7 @@ async fn session_input_wait_accepts_activity_between_submit_flush_and_ack() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
         agents_dir: Some(agents_dir),
-        claude_submit_delay: Duration::ZERO,
+        submit_delay_overrides: submit_delay_override("claude", Duration::ZERO),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
@@ -13259,18 +13262,144 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
     assert!(!terminal.recorded);
 }
 
+/// Input rules of a built-in runtime resolved through a default host.
+fn builtin_input_rules(agent: &AgentKind, config: &SessionRegistryConfig) -> InputRules {
+    super::input_rules_for_agent(&RuntimeHost::default(), agent, config)
+}
+
+/// A submit-delay override map holding one runtime.
+fn submit_delay_override(runtime: &str, delay: Duration) -> BTreeMap<RuntimeId, Duration> {
+    BTreeMap::from([(RuntimeId::parse(runtime).expect("runtime id"), delay)])
+}
+
 #[test]
 fn claude_input_rules_use_configured_submit_delay() {
     let config = SessionRegistryConfig {
         shell_command: hermetic_shell(),
-        claude_submit_delay: Duration::from_millis(75),
+        submit_delay_overrides: submit_delay_override("claude", Duration::from_millis(75)),
         ..SessionRegistryConfig::default()
     };
 
-    let rules = super::input_rules_for_agent(&AgentKind::Claude, &config);
+    let rules = builtin_input_rules(&AgentKind::Claude, &config);
 
     assert!(!rules.bracketed_paste);
     assert_eq!(rules.submit_delay, Duration::from_millis(75));
+}
+
+/// A definition with an arbitrary runtime id, used to prove selection is by
+/// definition data and never by a built-in id.
+fn acme_definition(submit_delay_configurable: bool, prompt_arg: bool) -> RuntimeDefinition {
+    RuntimeDefinition::new(DefinitionParts {
+        runtime_id: RuntimeId::parse("acme").expect("runtime id"),
+        origin: DefinitionOrigin::Builtin {
+            package: Some(PackageIdentity {
+                id: PackageId::parse("acme.runtime").expect("package id"),
+                version: PackageVersion::parse("1.0.0").expect("package version"),
+            }),
+        },
+        display_name: "Acme".to_owned(),
+        program: LaunchProgram::Fixed("acme".to_owned()),
+        default_args: Vec::new(),
+        input_rules: InputRules::unrestricted(true, Duration::from_millis(150)),
+        submit_delay_configurable,
+        manifest: Arc::new(crate::detect::generic_shell_manifest().clone()),
+        native: None,
+        prompt_arg,
+        version_probe_parser: None,
+        integration_handler: None,
+    })
+    .expect("valid definition")
+}
+
+#[test]
+fn only_a_host_shell_runtime_is_not_an_agent_launch_root() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        ..SessionRegistryConfig::default()
+    });
+
+    assert!(!registry.launch_root_is_agent(&AgentKind::Shell));
+    assert!(registry.launch_root_is_agent(&AgentKind::Claude));
+    assert!(registry.launch_root_is_agent(&AgentKind::Unknown("acme".to_owned())));
+}
+
+#[test]
+fn submit_delay_override_applies_to_the_configured_runtime_id() {
+    let config = SessionRegistryConfig {
+        submit_delay_overrides: submit_delay_override("acme", Duration::from_millis(40)),
+        ..SessionRegistryConfig::default()
+    };
+
+    let rules = super::input::input_rules_for_definition(&acme_definition(true, false), &config);
+
+    assert!(rules.bracketed_paste);
+    assert_eq!(rules.submit_delay, Duration::from_millis(40));
+}
+
+#[test]
+fn submit_delay_override_is_ignored_unless_the_definition_allows_it() {
+    let config = SessionRegistryConfig {
+        submit_delay_overrides: BTreeMap::from([
+            (
+                RuntimeId::parse("acme").expect("runtime id"),
+                Duration::from_millis(40),
+            ),
+            (
+                RuntimeId::parse("codex").expect("runtime id"),
+                Duration::from_millis(40),
+            ),
+        ]),
+        ..SessionRegistryConfig::default()
+    };
+
+    let acme = super::input::input_rules_for_definition(&acme_definition(false, false), &config);
+    let codex = builtin_input_rules(&AgentKind::Codex, &config);
+
+    assert_eq!(acme.submit_delay, Duration::from_millis(150));
+    assert_eq!(codex.submit_delay, Duration::from_millis(150));
+}
+
+#[test]
+fn submit_delay_without_an_override_is_the_descriptor_value() {
+    let config = SessionRegistryConfig::default();
+
+    let rules = builtin_input_rules(&AgentKind::Claude, &config);
+    let other_runtime_override = SessionRegistryConfig {
+        submit_delay_overrides: submit_delay_override("acme", Duration::ZERO),
+        ..SessionRegistryConfig::default()
+    };
+
+    assert_eq!(rules.submit_delay, Duration::from_millis(150));
+    assert_eq!(
+        builtin_input_rules(&AgentKind::Claude, &other_runtime_override).submit_delay,
+        Duration::from_millis(150)
+    );
+}
+
+#[test]
+fn initial_prompt_is_a_launch_argument_only_when_the_definition_says_so() {
+    let resolved = |prompt_arg| ResolvedAgent {
+        name: "acme".to_owned(),
+        base: AgentKind::Unknown("acme".to_owned()),
+        definition: Arc::new(acme_definition(false, prompt_arg)),
+        profile: None,
+    };
+
+    let as_argument = super::input::plan_initial_input_delivery(
+        &resolved(true),
+        pty_command("acme", []),
+        Some("hello".to_owned()),
+    );
+    let typed = super::input::plan_initial_input_delivery(
+        &resolved(false),
+        pty_command("acme", []),
+        Some("hello".to_owned()),
+    );
+
+    assert_eq!(as_argument.command.args, vec!["hello".to_owned()]);
+    assert_eq!(as_argument.pending_initial_input, None);
+    assert!(typed.command.args.is_empty());
+    assert_eq!(typed.pending_initial_input.as_deref(), Some("hello"));
 }
 
 // ---------------------------------------------------------------------------
