@@ -42,7 +42,9 @@ the registry and the CLI are separate layers.
   makes the catalog invalid.
 - **Anti-rollback**: `sequence` is a signed, monotonically increasing counter.
   The caller persists the highest accepted sequence and passes it as the
-  high-water mark; a lower sequence is rejected, an equal one is accepted so an
+  high-water mark (`Registry::record_catalog` persists it together with the
+  accumulated revoked key ids in `catalog-state.json`, and
+  `Registry::catalog_state` reads them back); a lower sequence is rejected, an equal one is accepted so an
   installed catalog can be re-verified. `expires_at` bounds how long a frozen
   catalog is honored.
 

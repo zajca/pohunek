@@ -58,7 +58,7 @@ use crate::session::{RedeemedAttach, RedeemedRuntime, SessionRegistry};
 use handler::Dispatch;
 #[cfg(test)]
 pub(crate) use handler::{dispatch_line, Dispatch};
-pub use handler::{handle_request, DaemonState, HealthInfo};
+pub use handler::{handle_request, ControlTransport, DaemonState, HealthInfo};
 
 /// Directory mode for the runtime dir: owner rwx only (`0700`).
 ///
@@ -233,7 +233,7 @@ impl ControlServer {
             socket_dir,
             socket_name,
             socket_identity,
-            state,
+            state: state.with_transport(ControlTransport::Local),
         })
     }
 
@@ -419,7 +419,7 @@ impl RemoteServer {
         Ok(Self {
             listener,
             local_addr,
-            state,
+            state: state.with_transport(ControlTransport::Remote),
         })
     }
 
@@ -441,7 +441,7 @@ impl RemoteServer {
         Self {
             listener,
             local_addr,
-            state,
+            state: state.with_transport(ControlTransport::Remote),
         }
     }
 

@@ -302,12 +302,9 @@ fn verification_detects_a_file_replaced_by_a_directory_or_fifo() {
     ));
     std::fs::remove_dir(&license).unwrap();
 
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
+    nix::unistd::mkfifo(
         &license,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::from_raw_mode(0o600),
-        0,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
     )
     .unwrap();
     assert!(matches!(

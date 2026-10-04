@@ -69,6 +69,7 @@ mod hooks;
 mod input;
 mod lag;
 mod observation;
+mod package_lifecycle;
 mod packages;
 mod procwatch;
 mod read;
@@ -79,6 +80,7 @@ mod supervision;
 mod target;
 
 pub use attach::{RedeemedAttach, RedeemedRuntime};
+pub use package_lifecycle::HostTrustAnchor;
 pub use retention::{SessionRetentionTask, POLICY_FILE_NAME as RETENTION_POLICY_NAME};
 
 pub(crate) use observation::{observation_worker_error, runtime_identity};
@@ -348,6 +350,10 @@ pub struct SessionRegistryConfig {
     /// Owner-private runtime package store (`<state>/plugins`). `None` serves
     /// the built-in runtimes only, with no package store to reload or verify.
     pub plugins_dir: Option<PathBuf>,
+    /// Root keys and revocations the host trusts to authorize official
+    /// packages through a signed catalog. `None` means the host has no anchor,
+    /// so every catalog install fails closed with `official_trust_unavailable`.
+    pub catalog_trust_anchor: Option<HostTrustAnchor>,
     /// Minimum interval between per-session "PTY output lag" WARN logs. The first
     /// lag in each window logs immediately; further lags are folded into one
     /// summary WARN when the window elapses, so a runaway session cannot flood the
@@ -410,6 +416,7 @@ impl Default for SessionRegistryConfig {
             agents_dir: None,
             host_state_dir: None,
             plugins_dir: None,
+            catalog_trust_anchor: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
             procwatch_poll: DEFAULT_PROCWATCH_POLL,
             active_agent_claim_ttl: DEFAULT_ACTIVE_AGENT_CLAIM_TTL,

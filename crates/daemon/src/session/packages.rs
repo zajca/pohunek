@@ -97,6 +97,24 @@ impl SessionRegistry {
         &self,
         digest: &PackageDigest,
     ) -> Result<(), PackageUninstallError> {
+        self.remove_package(digest, false).await
+    }
+
+    /// Removes the package `digest` unless a session still references it, then
+    /// rebuilds the runtime registry.
+    ///
+    /// With `remove_modified` the package must fail root verification, which a
+    /// normal uninstall refuses to touch; a root that verifies is refused with
+    /// [`RegistryError::RootIntact`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::uninstall_package`].
+    pub async fn remove_package(
+        &self,
+        digest: &PackageDigest,
+        remove_modified: bool,
+    ) -> Result<(), PackageUninstallError> {
         let runtimes = self.inner.profiles.runtimes().clone();
         let store = runtimes
             .package_store()
@@ -114,20 +132,32 @@ impl SessionRegistry {
                 .retained_package_digests()
                 .await
                 .map_err(PackageUninstallError::Retention)?;
-            tokio::task::spawn_blocking(move || {
-                store
-                    .registry()
-                    .uninstall(&digest, &retained)
-                    .map(|_generation| ())
+            let removal = tokio::task::spawn_blocking(move || {
+                let registry = store.registry();
+                if remove_modified {
+                    registry.remove_modified(&digest, &retained)
+                } else {
+                    registry.uninstall(&digest, &retained)
+                }
+                .map(|_generation| ())
             })
             .await
             .map_err(|join_error| {
                 PackageUninstallError::Retention(io::Error::other(join_error.to_string()))
-            })??;
-            runtimes
-                .reload()
-                .map(|_report| ())
-                .map_err(PackageUninstallError::Reload)
+            })?;
+            // The record is already replaced when the root could not be fully
+            // deleted or the commit's durability is uncertain, so the runtime
+            // registry must follow it before the error is returned.
+            let committed = matches!(
+                removal,
+                Ok(()) | Err(RegistryError::RemovalIncomplete | RegistryError::CommitUncertain)
+            );
+            let reload = committed.then(|| runtimes.reload());
+            removal?;
+            match reload {
+                Some(Err(error)) => Err(PackageUninstallError::Reload(error)),
+                _ => Ok(()),
+            }
         })
         .await
         .map_err(|join_error| {

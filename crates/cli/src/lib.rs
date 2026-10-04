@@ -105,6 +105,15 @@ enum Commands {
         action: commands::service::Action,
     },
 
+    /// Install, inspect, update, and remove runtime packages on this machine.
+    ///
+    /// Purely local: packages extend what the daemon on this machine may
+    /// launch, so a remote `--host` is rejected before anything runs.
+    Plugin {
+        #[command(subcommand)]
+        action: commands::plugin::Action,
+    },
+
     /// Query daemon health over the control socket.
     Health {
         /// Emit machine-readable JSON instead of a table.
@@ -1401,6 +1410,7 @@ impl Commands {
                 MigrationAction::Preflight { json, .. } => *json,
             },
             Commands::Service { action } => action.wants_json(),
+            Commands::Plugin { action } => action.wants_json(),
             Commands::Setup { action, json } => {
                 action.as_ref().map_or(*json, SetupAction::wants_json)
             }
@@ -1428,6 +1438,7 @@ impl Commands {
             | Commands::Doctor { .. }
             | Commands::Daemon { .. }
             | Commands::Service { .. }
+            | Commands::Plugin { .. }
             | Commands::Health { .. }
             | Commands::Status { .. }
             | Commands::Session { .. }
@@ -1714,6 +1725,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Commands::Service { action } => {
             // Service management is inherently local; `--host` is ignored.
             commands::service::run(action).await
+        }
+        Commands::Plugin { action } => {
+            // Package lifecycle is local-only; the global `--host` is checked,
+            // not ignored.
+            commands::plugin::run(action, &global_host).await
         }
         Commands::Health { json } | Commands::Status { json } => {
             let paths = Paths::resolve()?;

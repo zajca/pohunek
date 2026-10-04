@@ -17,22 +17,25 @@ use crate::{
     NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult,
     NotificationListParams, NotificationListResult, NotificationPolicyParams,
     NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
-    NotificationUpdateParams, NotificationUpdateResult, ProjectActionParams, ProjectActionResult,
-    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams,
-    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
-    ProjectRenameParams, ProjectShowParams, ProjectShowResult, RuntimeInventoryResult,
-    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
-    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionDiffResult,
-    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
-    SessionOutputResult, SessionPolicyParams, SessionPolicyResult, SessionReadParams,
-    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionRetentionParams, SessionRetentionResult,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionStopResult, SessionWaitParams, SessionWaitResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    NotificationUpdateParams, NotificationUpdateResult, PackageChangeResult, PackageDoctorParams,
+    PackageDoctorResult, PackageInspectParams, PackageInspectResult, PackageInstallParams,
+    PackageInstallResult, PackageLinkParams, PackageListResult, PackageSelectParams,
+    PackageSetEnabledParams, PackageUninstallParams, PackageUninstallResult, ProjectActionParams,
+    ProjectActionResult, ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo,
+    ProjectListParams, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
+    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
+    RuntimeInventoryResult, SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionDiffParams,
+    SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
+    SessionOutputParams, SessionOutputResult, SessionPolicyParams, SessionPolicyResult,
+    SessionReadParams, SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionRetentionParams,
+    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
+    WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -614,6 +617,80 @@ method_table!(
     WorktreeRemoveResult,
     "WorktreeRemoveParams",
     "WorktreeRemoveResult";
+    /// List installed runtime packages with their health (local-only).
+    PackageList,
+    PACKAGE_LIST,
+    "package.list",
+    (),
+    PackageListResult,
+    "null",
+    "PackageListResult";
+
+    /// Inspect one installed runtime package (local-only).
+    PackageInspect,
+    PACKAGE_INSPECT,
+    "package.inspect",
+    PackageInspectParams,
+    PackageInspectResult,
+    "PackageInspectParams",
+    "PackageInspectResult";
+
+    /// Verify every installed runtime package root and report problems
+    /// (local-only).
+    PackageDoctor,
+    PACKAGE_DOCTOR,
+    "package.doctor",
+    PackageDoctorParams,
+    PackageDoctorResult,
+    "PackageDoctorParams",
+    "PackageDoctorResult";
+
+    /// Install a runtime package archive (local-only).
+    PackageInstall,
+    PACKAGE_INSTALL,
+    "package.install",
+    PackageInstallParams,
+    PackageInstallResult,
+    "PackageInstallParams",
+    "PackageInstallResult";
+
+    /// Copy a developer package directory into content-addressed storage
+    /// (local-only).
+    PackageLink,
+    PACKAGE_LINK,
+    "package.link",
+    PackageLinkParams,
+    PackageInstallResult,
+    "PackageLinkParams",
+    "PackageInstallResult";
+
+    /// Enable or disable an installed runtime package (local-only).
+    PackageSetEnabled,
+    PACKAGE_SET_ENABLED,
+    "package.set_enabled",
+    PackageSetEnabledParams,
+    PackageChangeResult,
+    "PackageSetEnabledParams",
+    "PackageChangeResult";
+
+    /// Select the installed package bare runtime requests resolve to
+    /// (local-only).
+    PackageSelect,
+    PACKAGE_SELECT,
+    "package.select",
+    PackageSelectParams,
+    PackageChangeResult,
+    "PackageSelectParams",
+    "PackageChangeResult";
+
+    /// Uninstall a runtime package nothing references (local-only).
+    PackageUninstall,
+    PACKAGE_UNINSTALL,
+    "package.uninstall",
+    PackageUninstallParams,
+    PackageUninstallResult,
+    "PackageUninstallParams",
+    "PackageUninstallResult";
 );
 
 #[cfg(test)]

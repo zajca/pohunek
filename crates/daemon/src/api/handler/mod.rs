@@ -20,6 +20,7 @@ mod governance;
 mod host;
 mod integration;
 mod notification;
+mod package;
 mod project;
 mod session;
 mod util;
@@ -49,6 +50,19 @@ pub struct HealthInfo {
     pub daemon_version: String,
 }
 
+/// The transport a control connection arrived on.
+///
+/// Owner-only methods that extend the host's launch authority, such as the
+/// `package.*` lifecycle, are served on the local socket only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ControlTransport {
+    /// The local Unix control socket, and in-process dispatch.
+    #[default]
+    Local,
+    /// A remote overlay TCP connection.
+    Remote,
+}
+
 /// Shared daemon state available to every control connection.
 #[derive(Debug, Clone)]
 pub struct DaemonState {
@@ -64,6 +78,8 @@ pub struct DaemonState {
     pub attention: Option<AttentionCoordinator>,
     /// TTL-cached `NetBird` host discovery, shared across connections.
     pub discovery: DiscoveryCache,
+    /// The transport the connections served with this state arrive on.
+    pub transport: ControlTransport,
 }
 
 impl DaemonState {
@@ -93,7 +109,15 @@ impl DaemonState {
             notifications: None,
             attention: None,
             discovery,
+            transport: ControlTransport::default(),
         }
+    }
+
+    /// Mark the connections served with this state as arriving on `transport`.
+    #[must_use]
+    pub fn with_transport(mut self, transport: ControlTransport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Attach the durable notification service to shared daemon state.
@@ -300,6 +324,14 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
             integration::handle_integration_doctor(request, state.sessions.profiles().runtimes())
                 .await
         }
+        method::PACKAGE_LIST => package::handle_package_list(request, state).await,
+        method::PACKAGE_INSPECT => package::handle_package_inspect(request, state).await,
+        method::PACKAGE_DOCTOR => package::handle_package_doctor(request, state).await,
+        method::PACKAGE_INSTALL => package::handle_package_install(request, state).await,
+        method::PACKAGE_LINK => package::handle_package_link(request, state).await,
+        method::PACKAGE_SET_ENABLED => package::handle_package_set_enabled(request, state).await,
+        method::PACKAGE_SELECT => package::handle_package_select(request, state).await,
+        method::PACKAGE_UNINSTALL => package::handle_package_uninstall(request, state).await,
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_GOVERNANCE_INSPECT => {
             governance::handle_host_governance_inspect(request, &state.governance).await

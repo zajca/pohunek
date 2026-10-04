@@ -436,6 +436,14 @@ All params and result type names below refer to structs exported by
 | `project.action` | `ProjectActionParams` | `ProjectActionResult` | Resolves one action recipe plus prompt content. |
 | `project.actions` | `ProjectActionsParams` | `ProjectActionsResult` | Lists available project actions after layer shadowing. |
 | `worktree.remove` | `WorktreeRemoveParams` | `WorktreeRemoveResult` | Removes one owned worktree binding, refusing live sessions unless forced by the method contract. |
+| `package.list` | `null` | `PackageListResult` | Local-only. Lists installed runtime packages in ascending digest order with the registry `generation` and per-package health. See [Runtime Package Methods](#runtime-package-methods). |
+| `package.inspect` | `PackageInspectParams` | `PackageInspectResult` | Local-only. Returns one installed package record and what its runtime descriptor declares. |
+| `package.doctor` | `PackageDoctorParams` or `null` | `PackageDoctorResult` | Local-only. Verifies every installed package root and reports faults, unregistered roots and pinned digests that are not installed. |
+| `package.install` | `PackageInstallParams` | `PackageInstallResult` | Local-only. Installs a runtime package archive under explicit-digest or catalog trust, or previews it with `dry_run`. |
+| `package.link` | `PackageLinkParams` | `PackageInstallResult` | Local-only. Copies a developer package directory into content-addressed storage and installs it disabled and unselected. |
+| `package.set_enabled` | `PackageSetEnabledParams` | `PackageChangeResult` | Local-only. Enables or disables an installed package for fresh launches. |
+| `package.select` | `PackageSelectParams` | `PackageChangeResult` | Local-only. Selects the installed version bare requests of its package id resolve to. |
+| `package.uninstall` | `PackageUninstallParams` | `PackageUninstallResult` | Local-only. Removes an installed package that no session or host profile pins. |
 
 `status` exists as a method constant in `crates/protocol` but is not a supported
 daemon method in this API version. It returns `daemon/method_not_found`.
@@ -466,6 +474,106 @@ replace that canonical file between probe and exec; eliminating that residual
 would require an fd-based execution contract. An absent `agent_base` is compatible with legacy custom
 profile inventory, but a present historical label (a value outside the runtime-id
 grammar) is presentation-only and not launchable.
+
+### Runtime Package Methods
+
+The `package.*` methods manage the runtime packages installed on the host the
+daemon runs on. They are local-only: the daemon serves them on its local Unix
+control socket and refuses them on a remote overlay TCP connection with
+`local_only_method`, because installing a package extends the owner's launch
+authority on that machine. They are additive: the protocol version does not
+change. A package is addressed by `digest` (`sha256:` plus 64 hex characters),
+the content address of its verified archive. Payloads never carry file
+contents, package paths or secret values.
+
+Shared payloads:
+
+- `PackageInfo`: `digest`, `package` (`{id, version}` from the runtime
+  descriptor), `origin` (`official`, `explicit_digest` or `link`), `enabled`,
+  `selected`, `installed_at_unix_seconds`, optional `runtime_id`, optional
+  `fault`, and `referenced` (a live, lost or resumable session or a host
+  profile pins the digest).
+- `PackageFault`: `root_missing`, `root_modified`, `root_unsafe`,
+  `root_unreadable`, `descriptor_missing`, `descriptor_invalid`,
+  `identity_mismatch`, `runtime_not_claimable`, `runtime_conflict`. `fault` is
+  absent when the root verified and the descriptor loaded.
+- `PackageRuntimeInfo`: `runtime_id`, `display_name`, `program`, `args`,
+  `resumable`, `forkable`, `prompt_argument` and the optional `launch_args`
+  (the arguments appended at a fresh launch to pass the generated reference),
+  `resume_args`, `fork_args` (templates in which `{reference}` marks the
+  reference slot), `version_probe` and `integration_handler`. The program, the
+  fixed arguments and every template are exactly what the daemon can put in
+  the argv of a process it launches as the owner (the first prompt is appended
+  when `prompt_argument` is true), so all of it can be reviewed before an
+  install. A descriptor carries no environment values, setup commands or hooks.
+- `PackageTrust`, a tagged object: `{"kind":"explicit_digest","digest":...}`
+  requires the archive digest to equal `digest` and never authorizes an
+  official runtime alias; `{"kind":"catalog","catalog_path":...}` names a
+  signed catalog at an absolute path on the daemon host.
+
+| Method | Params | Result | Behavior |
+|---|---|---|---|
+| `package.list` | `null` | `{generation, packages[]}` | `generation` counts committed registry changes. |
+| `package.inspect` | `{digest}` | `{package, runtime?}` | `runtime` is absent when the descriptor cannot be loaded. |
+| `package.doctor` | `{package?}` or `null` | `{generation, findings[]}` | `package` restricts the report to one package id. A finding is `{kind, digest, package?, fault?, referenced}`; `kind` is `fault`, `unregistered_root` (a root on disk without a record; installing the same archive again adopts it after verification) or `pinned_not_installed` (a session or host profile pins a digest the registry does not record). An empty list means everything verified. |
+| `package.install` | `{archive_path, trust, enable, select, dry_run}` | `{status, package, runtime, reloaded}` | All fields are required. `archive_path` is absolute on the daemon host. `status` is `preview` (dry run, nothing changed), `installed`, `already_installed` (recorded with a verified root) or `root_restored` (recorded, root was missing and extracted again). A package that is already recorded keeps its recorded `enabled`, `selected` and origin: `enable`, `select` and `trust` apply to a new record only. |
+| `package.link` | `{directory, dry_run}` | `{status, package, runtime, reloaded}` | Copies the directory into content-addressed storage and installs it disabled and unselected; the daemon never loads the directory itself. |
+| `package.set_enabled` | `{digest, enabled}` | `{package, reloaded}` | Disabling blocks fresh launches only; a session already pinned to the digest still resumes. Enabling first proves the package root verifies and the package may serve its runtime id, so it cannot create a runtime id conflict. |
+| `package.select` | `{digest}` | `{package, reloaded}` | Bare requests of the package id resolve to this version afterwards. The same root and runtime id checks as enabling apply. |
+| `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest. `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
+
+Install and link validate the package in memory before anything is extracted:
+`runtime.toml` is parsed from the verified archive, and the package identity
+(id and version) comes from that descriptor. `shell` is never claimable. The
+official aliases (the reserved runtime ids other than `shell`) are served only
+by a package the signed catalog authorizes as official, and only while no
+built-in runtime serves them. A runtime id served by a loaded package of a
+different package id is a conflict. The runtime registry reserves the official
+aliases for built-in runtimes, so an alias claim is answered with
+`package_runtime_conflict` even for an official package, and a claim by an
+explicit-digest or linked package with `package_runtime_not_claimable`; a
+descriptor that names `shell` is `package_runtime_not_claimable` as well.
+Catalog trust fails closed with
+`official_trust_unavailable` on a host without a trust anchor, which is every
+production host today.
+
+A catalog install checks the catalog signature, the persisted high-water
+sequence and revoked key ids, then that an entry binds the package id, runtime
+id, version and digest and supports this core version and platform; before the
+package is published it persists the catalog's sequence and revocations, and a
+failure to do so is answered with `package_registry_failed` with nothing
+installed, enabled or reloaded.
+
+After each committed change the daemon rebuilds its runtime registry and
+reports `reloaded`. Every mutation holds the lifecycle guard, so launches never
+interleave with it. A modified root makes enable, select and uninstall fail with
+`package_root_invalid`; reinstall the package or uninstall it with
+`remove_modified`.
+
+Errors use the error contract below. Every code has fixed message and
+`recover` text that carries no path, package content or caller-supplied value.
+
+| Code | Class | Meaning |
+|---|---|---|
+| `local_only_method` | `daemon` | The request arrived on a remote overlay connection. |
+| `package_archive_invalid` | `runtime` | The archive is not a valid canonical package archive, breaks a limit or has another digest than the trust names. |
+| `package_source_unreadable` | `runtime` | The archive file, package directory or catalog could not be read or is not an absolute path. |
+| `package_untrusted` | `runtime` | The trust does not authorize the archive. |
+| `official_trust_unavailable` | `configuration` | The host has no catalog trust anchor, so an official package cannot be authorized. |
+| `package_incompatible` | `runtime` | The package does not support this core version or platform. |
+| `package_descriptor_invalid` | `runtime` | The package's runtime descriptor is not a valid runtime definition. |
+| `package_runtime_not_claimable` | `runtime` | The package claims a runtime id it may not serve. |
+| `package_runtime_conflict` | `runtime` | Another package or a built-in runtime serves the runtime id. |
+| `package_not_installed` | `runtime` | The digest is not installed. |
+| `package_identity_installed` | `runtime` | The package id and version are installed from another archive. |
+| `package_identity_conflict` | `runtime` | The digest is installed under another package identity. |
+| `package_referenced` | `runtime` | A session or host profile still pins the digest. |
+| `package_root_invalid` | `runtime` | The recorded package root fails verification. |
+| `package_root_intact` | `runtime` | The recorded package root verifies, so it is not removed as modified. |
+| `package_registry_busy` | `daemon` | Another writer holds the package registry. |
+| `package_registry_failed` | `runtime` | The package registry or its storage failed. |
+| `package_limit_reached` | `runtime` | The registry holds the maximum number of packages. |
+| `package_reload_failed` | `daemon` | The change was committed but the runtime registry was not rebuilt. |
 
 ### Daemon Runtime Configuration
 

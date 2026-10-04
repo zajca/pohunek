@@ -32,6 +32,7 @@ mod integration;
 mod limits;
 pub mod method;
 mod notification;
+mod package;
 mod project;
 mod runtime_id;
 mod session;
@@ -98,6 +99,14 @@ pub use notification::{
     NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
     NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
     NotificationUpdateResult, NotificationUpdatedEvent,
+};
+#[doc(inline)]
+pub use package::{
+    PackageChangeResult, PackageDoctorParams, PackageDoctorResult, PackageErrorKind, PackageFault,
+    PackageFinding, PackageFindingKind, PackageInfo, PackageInspectParams, PackageInspectResult,
+    PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
+    PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
+    PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
 };
 #[doc(inline)]
 pub use project::{

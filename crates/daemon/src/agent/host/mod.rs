@@ -6,6 +6,7 @@
 //! descriptors, which reserve their ids against every other source.
 
 mod builtin;
+mod claim;
 mod definition;
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -16,6 +17,7 @@ mod registry;
 mod source;
 
 pub use builtin::BuiltinSource;
+pub use claim::{decide_claim, is_reserved, Authority, ClaimRefusal, ServedBy};
 pub use definition::{
     DefinitionError, DefinitionInvariant, DefinitionOrigin, DefinitionParts, HandlerId,
     LaunchProgram, RuntimeDefinition, MAX_ARG_BYTES, MAX_DEFINITION_BYTES, MAX_LABEL_BYTES,
@@ -27,8 +29,8 @@ pub(crate) use launch::check_pin;
 pub use launch::LaunchPin;
 pub(crate) use launch::{launch_command, validate_launch_runtime};
 pub use package::{
-    PackageLoad, PackageRejection, PackageSource, PackageStore, RejectedPackage,
-    RUNTIME_DESCRIPTOR_PATH,
+    definition_from_archive, PackageLoad, PackageRejection, PackageSource, PackageStore,
+    RejectedPackage, RUNTIME_DESCRIPTOR_PATH,
 };
 pub use registry::{
     InventoryEntry, RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust,

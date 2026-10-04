@@ -24,11 +24,13 @@ thiserror = { workspace = true }
 # exist on Unix only.
 [target.'cfg(unix)'.dependencies]
 pohunek-platform = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 ruzstd = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
 pohunek-test-support = { workspace = true }
 rustix = { workspace = true, features = ["process"] }
 tempfile = { workspace = true }

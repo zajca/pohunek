@@ -2788,9 +2788,11 @@ dependencies = [
  "pohunek-assistant",
  "pohunek-cli",
  "pohunek-client",
+ "pohunek-daemon",
  "pohunek-hostcheck",
  "pohunek-logging",
  "pohunek-overlay",
+ "pohunek-package",
  "pohunek-paths",
  "pohunek-platform",
  "pohunek-prompt",
@@ -2864,6 +2866,7 @@ dependencies = [
  "pohunek-worker-protocol",
  "regex",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2944,6 +2947,7 @@ name = "pohunek-package"
 version = "0.33.1"
 dependencies = [
  "ed25519-dalek",
+ "nix 0.29.0",
  "pohunek-platform",
  "pohunek-protocol",
  "pohunek-test-support",

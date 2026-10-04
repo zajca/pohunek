@@ -20,7 +20,12 @@
 //! - [`install`] extracts a [`VerifiedArchive`] into an owner-private,
 //!   content-addressed package root through directory descriptors.
 //! - [`verify`] re-verifies a root against its per-file [`manifest`].
-//! - [`registry`] keeps the transactional record of installed packages.
+//! - [`registry`] keeps the transactional record of installed packages and, in
+//!   the same plugin root, the monotonic catalog state ([`catalog_state`]) the
+//!   catalog verifier needs from its caller: the sequence high-water mark and
+//!   the accumulated revoked key ids.
+//! - [`directory`] builds the canonical archive of a developer directory, the
+//!   input of `plugin link` and `package build`.
 //!
 //! Signatures are covered by the signed runtime catalog; the runtime manifest
 //! inside a package is a separate concern. The formats are described in
@@ -41,6 +46,10 @@ mod limits;
 
 // Extraction, verification and the registry need descriptor-relative
 // filesystem primitives.
+#[cfg(unix)]
+pub mod catalog_state;
+#[cfg(unix)]
+pub mod directory;
 #[cfg(unix)]
 mod hash;
 #[cfg(unix)]

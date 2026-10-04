@@ -405,6 +405,182 @@ fn uninstall_refuses_a_modified_root_and_unrecords_a_missing_one() {
     assert!(registry.state().unwrap().packages().is_empty());
 }
 
+/// Installs `sample` selected, tampers with it through `tamper` and returns
+/// the registry state before the removal.
+fn tampered(
+    fixture: &PluginFixture,
+    sample: &Sample,
+    tamper: impl FnOnce(&std::path::Path),
+) -> package::registry::RegistryState {
+    let registry = fixture.open();
+    registry
+        .install(&InstallRequest {
+            select: true,
+            ..request(sample)
+        })
+        .unwrap();
+    tamper(&fixture.root(&sample.digest).join("files"));
+    registry.state().unwrap()
+}
+
+fn assert_removed_as_modified(fixture: &PluginFixture, sample: &Sample, before_generation: u64) {
+    let registry = fixture.open();
+    let generation = registry
+        .remove_modified(&sample.digest, &no_references())
+        .unwrap();
+    assert_eq!(generation, before_generation + 1, "one commit");
+    let state = registry.state().unwrap();
+    assert_eq!(state.generation(), generation);
+    assert!(state.package(&sample.digest).is_none());
+    assert_eq!(state.selected(&sample.identity.id), None);
+    assert!(!fixture.root(&sample.digest).exists());
+    assert!(names(&fixture.packages())
+        .iter()
+        .all(|name| !name.starts_with('.')));
+}
+
+#[test]
+fn remove_modified_removes_a_root_with_changed_content() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let before = tampered(&fixture, &sample, |files| {
+        std::fs::write(files.join("LICENSE"), b"GPL\n").unwrap();
+    });
+    assert_removed_as_modified(&fixture, &sample, before.generation());
+}
+
+#[test]
+fn remove_modified_removes_a_root_with_an_added_file() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let before = tampered(&fixture, &sample, |files| {
+        std::fs::write(files.join("detect/extra.toml"), b"x").unwrap();
+        std::fs::create_dir(files.join("surplus")).unwrap();
+        std::fs::write(files.join("surplus/inner"), b"x").unwrap();
+    });
+    assert_removed_as_modified(&fixture, &sample, before.generation());
+}
+
+#[test]
+fn remove_modified_removes_a_root_with_a_changed_mode() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let before = tampered(&fixture, &sample, |files| {
+        set_mode(&files.join("LICENSE"), 0o644);
+    });
+    assert_removed_as_modified(&fixture, &sample, before.generation());
+}
+
+#[test]
+fn remove_modified_removes_a_root_with_a_missing_file() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let before = tampered(&fixture, &sample, |files| {
+        std::fs::remove_file(files.join("LICENSE")).unwrap();
+    });
+    assert_removed_as_modified(&fixture, &sample, before.generation());
+}
+
+#[test]
+fn remove_modified_removes_a_root_with_a_changed_manifest() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let registry = fixture.open();
+    registry.install(&request(&sample)).unwrap();
+    let manifest = fixture.root(&sample.digest).join("manifest.json");
+    let text = std::fs::read_to_string(&manifest).unwrap();
+    std::fs::write(&manifest, format!("{text} ")).unwrap();
+    assert!(matches!(
+        registry.verify(&sample.digest).unwrap_err(),
+        RegistryError::RootInvalid(_)
+    ));
+
+    registry
+        .remove_modified(&sample.digest, &no_references())
+        .unwrap();
+    assert!(!fixture.root(&sample.digest).exists());
+}
+
+#[test]
+fn remove_modified_refuses_a_root_that_verifies_or_is_missing() {
+    let fixture = PluginFixture::new();
+    let registry = fixture.open();
+    let sample = sample();
+    registry.install(&request(&sample)).unwrap();
+    let before = registry.state().unwrap();
+
+    assert_eq!(
+        registry
+            .remove_modified(&sample.digest, &no_references())
+            .unwrap_err(),
+        RegistryError::RootIntact
+    );
+    assert_eq!(registry.state().unwrap(), before);
+    registry.verify(&sample.digest).unwrap();
+
+    std::fs::remove_dir_all(fixture.root(&sample.digest)).unwrap();
+    assert_eq!(
+        registry
+            .remove_modified(&sample.digest, &no_references())
+            .unwrap_err(),
+        RegistryError::RootIntact
+    );
+    assert_eq!(registry.state().unwrap(), before);
+}
+
+#[test]
+fn remove_modified_refuses_a_retained_root_and_leaves_it_untouched() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let before = tampered(&fixture, &sample, |files| {
+        std::fs::write(files.join("LICENSE"), b"GPL\n").unwrap();
+    });
+    let registry = fixture.open();
+    let retained: RetainedDigests = [sample.digest.clone()].into_iter().collect();
+
+    assert_eq!(
+        registry
+            .remove_modified(&sample.digest, &retained)
+            .unwrap_err(),
+        RegistryError::StillReferenced
+    );
+    assert_eq!(registry.state().unwrap(), before);
+    assert_eq!(
+        std::fs::read(fixture.root(&sample.digest).join("files/LICENSE")).unwrap(),
+        b"GPL\n"
+    );
+}
+
+#[test]
+fn remove_modified_refuses_an_unknown_digest() {
+    let fixture = PluginFixture::new();
+    let registry = fixture.open();
+    assert_eq!(
+        registry
+            .remove_modified(&sample().digest, &no_references())
+            .unwrap_err(),
+        RegistryError::NotInstalled
+    );
+    assert_eq!(registry.state().unwrap().generation(), 0);
+}
+
+#[test]
+fn remove_modified_only_honors_the_digest_it_names() {
+    let fixture = PluginFixture::new();
+    let registry = fixture.open();
+    let (sample, other) = (sample(), other());
+    registry.install(&request(&sample)).unwrap();
+    registry.install(&request(&other)).unwrap();
+    std::fs::write(fixture.root(&sample.digest).join("files/LICENSE"), b"GPL\n").unwrap();
+
+    registry
+        .remove_modified(&sample.digest, &no_references())
+        .unwrap();
+    let state = registry.state().unwrap();
+    assert!(state.package(&other.digest).is_some());
+    registry.verify(&other.digest).unwrap();
+}
+
 #[test]
 fn retained_roots_report_ready_and_typed_incompatible_states() {
     let fixture = PluginFixture::new();
@@ -936,4 +1112,49 @@ fn a_no_op_enable_or_select_still_verifies_the_root() {
         RegistryError::RootInvalid(VerifyError::RootMissing)
     ));
     assert_eq!(registry.state().unwrap().generation(), 1);
+}
+
+#[test]
+fn remove_modified_of_a_hard_linked_root_never_wedges_the_registry() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let other = other();
+    let registry = fixture.open();
+    registry.install(&request(&sample)).unwrap();
+    let files = fixture.root(&sample.digest).join("files");
+    let alias = fixture.base.join("alias");
+    std::fs::hard_link(files.join("LICENSE"), &alias).unwrap();
+
+    let outcome = registry.remove_modified(&sample.digest, &no_references());
+    assert!(
+        matches!(outcome, Ok(_) | Err(RegistryError::RemovalIncomplete)),
+        "unexpected outcome {outcome:?}"
+    );
+    assert!(registry.state().unwrap().package(&sample.digest).is_none());
+
+    // A later mutation still runs: residue the removal could not delete does
+    // not fail every transaction.
+    registry.install(&request(&other)).unwrap();
+    registry.uninstall(&other.digest, &no_references()).unwrap();
+}
+
+#[test]
+fn remove_modified_of_an_unreadable_directory_never_wedges_the_registry() {
+    let fixture = PluginFixture::new();
+    let sample = sample();
+    let other = other();
+    let registry = fixture.open();
+    registry.install(&request(&sample)).unwrap();
+    let directory = fixture.root(&sample.digest).join("files/detect");
+    set_mode(&directory, 0o000);
+
+    let outcome = registry.remove_modified(&sample.digest, &no_references());
+    if directory.exists() {
+        set_mode(&directory, 0o700);
+    }
+    assert!(
+        matches!(outcome, Ok(_) | Err(RegistryError::RemovalIncomplete)),
+        "unexpected outcome {outcome:?}"
+    );
+    registry.install(&request(&other)).unwrap();
 }

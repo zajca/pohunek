@@ -329,6 +329,14 @@ pub enum RegistryError {
     /// The recorded package root fails verification and is left untouched.
     #[error("the package root is invalid: {0}")]
     RootInvalid(#[source] VerifyError),
+    /// [`Registry::remove_modified`] refuses a root that still verifies;
+    /// [`Registry::uninstall`] removes such a package.
+    #[error("the package root verifies; use uninstall")]
+    RootIntact,
+    /// Recording the catalog would exceed [`crate::MAX_REVOKED_KEYS`]
+    /// persisted revoked key ids; nothing was written.
+    #[error("the catalog state would exceed the revoked key limit")]
+    TooManyRevokedKeys,
     /// The registry holds [`MAX_PACKAGES`] packages.
     #[error("the registry holds the maximum number of packages")]
     TooManyPackages,
@@ -395,7 +403,7 @@ pub struct InstallReport {
 /// The package registry of one plugin root.
 #[derive(Debug)]
 pub struct Registry {
-    root: TrustedDir,
+    pub(crate) root: TrustedDir,
     packages: TrustedDir,
     limits: Limits,
 }
@@ -645,6 +653,59 @@ impl Registry {
         Ok(transaction.state.generation)
     }
 
+    /// Removes a package whose root fails verification, which
+    /// [`Registry::uninstall`] refuses to touch.
+    ///
+    /// A tampered root (changed, added or retyped entries, a changed mode or a
+    /// changed manifest) would otherwise stay installed forever. The record,
+    /// and the selection of the digest if any, is replaced first; the root is
+    /// deleted afterwards through the same quarantine as an uninstall. A root
+    /// the platform cannot delete (for example one holding a hard-linked file)
+    /// is reported as [`RegistryError::RemovalIncomplete`] after the package is
+    /// already unrecorded. Returns the generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::NotInstalled`] for an unknown digest,
+    /// [`RegistryError::StillReferenced`] when `retained` contains the digest,
+    /// and [`RegistryError::RootIntact`] when the root verifies or is missing;
+    /// use [`Registry::uninstall`] for those.
+    pub fn remove_modified(
+        &self,
+        digest: &PackageDigest,
+        retained: &RetainedDigests,
+    ) -> Result<u64, RegistryError> {
+        let mut transaction = self.begin()?;
+        let index = transaction
+            .state
+            .position(digest)
+            .ok_or(RegistryError::NotInstalled)?;
+        if retained.contains(digest) {
+            return Err(RegistryError::StillReferenced);
+        }
+        match self.verify_record(&transaction.state.packages[index]) {
+            Ok(_) | Err(VerifyError::RootMissing) => return Err(RegistryError::RootIntact),
+            // A read failure other than a refused permission says nothing
+            // about the content, so it never justifies deleting the root; a
+            // refused permission is the mode tampering verification reports.
+            Err(error @ VerifyError::Unreadable { kind })
+                if kind != ErrorKind::PermissionDenied =>
+            {
+                return Err(RegistryError::RootInvalid(error));
+            }
+            Err(_failure) => {}
+        }
+        transaction.state.packages.remove(index);
+        transaction
+            .state
+            .selected
+            .retain(|_id, selected| selected != digest);
+        transaction.commit()?;
+        remove_directory(&self.packages, digest_hex(digest))
+            .map_err(|_cause| RegistryError::RemovalIncomplete)?;
+        Ok(transaction.state.generation)
+    }
+
     /// Verifies one installed package against its recorded manifest.
     ///
     /// # Errors
@@ -735,18 +796,23 @@ impl Registry {
         }
     }
 
-    /// Takes the exclusive lock, recovers interrupted work and loads the
-    /// record.
-    fn begin(&self) -> Result<Transaction<'_>, RegistryError> {
-        let lock = self
-            .root
+    /// Takes the exclusive advisory lock that serializes every mutation of the
+    /// plugin root.
+    pub(crate) fn acquire_lock(&self) -> Result<AdvisoryLock, RegistryError> {
+        self.root
             .acquire_lock(LOCK_NAME, FILE_MODE)
             .map_err(|error| match error {
                 FsError::LockContended { .. } => RegistryError::Busy,
                 other => registry_fs(&other),
-            })?;
+            })
+    }
+
+    /// Takes the exclusive lock, recovers interrupted work and loads the
+    /// record.
+    fn begin(&self) -> Result<Transaction<'_>, RegistryError> {
+        let lock = self.acquire_lock()?;
         collect_staging(&self.packages).map_err(RegistryError::Install)?;
-        self.remove_stale_temporary()?;
+        self.remove_stale_temporary(REGISTRY_TEMP_NAME)?;
         let state = self.state()?;
         Ok(Transaction {
             registry: self,
@@ -757,17 +823,17 @@ impl Registry {
 
     /// Removes a record temporary left by a writer that stopped before the
     /// rename; a leftover would make the next exclusive create fail.
-    fn remove_stale_temporary(&self) -> Result<(), RegistryError> {
+    pub(crate) fn remove_stale_temporary(&self, name: &str) -> Result<(), RegistryError> {
         let Some(identity) = self
             .root
-            .entry_identity(REGISTRY_TEMP_NAME, EntryKind::RegularFile)
+            .entry_identity(name, EntryKind::RegularFile)
             .map_err(|error| registry_fs(&error))?
         else {
             return Ok(());
         };
         match self
             .root
-            .stage_random(REGISTRY_TEMP_NAME, COLLECT_PREFIX, identity)
+            .stage_random(name, COLLECT_PREFIX, identity)
             .map_err(|error| registry_fs(&error))?
         {
             StageOutcome::Staged(entry) => {
@@ -791,20 +857,21 @@ impl Transaction<'_> {
         if bytes.len() > MAX_REGISTRY_BYTES {
             return Err(RegistryError::TooManyPackages);
         }
-        match self
-            .registry
+        self.registry
             .root
             .replace_file(REGISTRY_NAME, REGISTRY_TEMP_NAME, &bytes, FILE_MODE)
-        {
-            Ok(()) => Ok(()),
-            Err(AtomicReplaceError::BeforeCommit(error)) => Err(registry_fs(&error)),
-            Err(AtomicReplaceError::CommittedDurabilityUncertain(_)) => {
-                Err(RegistryError::CommitUncertain)
-            }
-            Err(_) => Err(RegistryError::Filesystem {
-                kind: ErrorKind::Other,
-            }),
-        }
+            .map_err(replace_failure)
+    }
+}
+
+/// Classifies a failed atomic replace of a plugin-root file.
+pub(crate) fn replace_failure(error: AtomicReplaceError) -> RegistryError {
+    match error {
+        AtomicReplaceError::BeforeCommit(error) => registry_fs(&error),
+        AtomicReplaceError::CommittedDurabilityUncertain(_) => RegistryError::CommitUncertain,
+        _ => RegistryError::Filesystem {
+            kind: ErrorKind::Other,
+        },
     }
 }
 
@@ -829,7 +896,7 @@ fn parse_state(bytes: &[u8]) -> Result<RegistryState, RegistryError> {
 }
 
 /// Classifies a filesystem failure without carrying its path or text.
-fn registry_fs(error: &FsError) -> RegistryError {
+pub(crate) fn registry_fs(error: &FsError) -> RegistryError {
     match error {
         FsError::UnsafeType { .. }
         | FsError::UnsafeMode { .. }

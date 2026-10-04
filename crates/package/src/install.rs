@@ -237,7 +237,7 @@ fn write_tree(staging: &TrustedDir, archive: &VerifiedArchive) -> Result<(), Ins
 }
 
 /// Removes every staging residue of `packages` and returns how many it
-/// removed.
+/// removed. Residue whose deletion the filesystem refuses is left in place.
 ///
 /// The caller must hold the lock that serializes installs: a staging directory
 /// seen under it belongs to an interrupted install, never to a running one.
@@ -254,8 +254,14 @@ pub fn collect_staging(packages: &TrustedDir) -> Result<usize, InstallError> {
         if !(name.starts_with(STAGING_PREFIX) || name.starts_with(COLLECT_PREFIX)) {
             continue;
         }
-        if remove_directory(packages, name)? {
-            removed += 1;
+        match remove_directory(packages, name) {
+            Ok(true) => removed += 1,
+            // Residue whose content the platform refuses to delete (a hard
+            // link or a foreign owner planted by tampering) stays quarantined
+            // under its own name; it must not make every later transaction
+            // fail.
+            Ok(false) | Err(InstallError::Filesystem { .. }) => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(removed)

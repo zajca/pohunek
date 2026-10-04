@@ -90,6 +90,14 @@ prints its digest. `verify` builds the directory twice and requires identical
 bytes. The release pipeline uses `verify` semantics to require byte-for-byte
 reproducibility from independent clean roots.
 
+Both commands call `package::directory::build_directory_archive(dir, limits)`
+(Unix), which the CLI's `plugin link` also uses. It walks regular files only
+(a symlink or special file is `UnsupportedFileType`, a non-UTF-8 name is
+`InvalidPath`), charges every file against the limits from the bytes actually
+read, and compares the opened file's device, inode and type with the listing so
+a file swapped for a symlink during the walk is `Changed` instead of followed.
+`DirectoryError` carries no path or content.
+
 ## Install and verify a package root
 
 `package::install::install_archive` extracts a verified archive into
@@ -167,6 +175,14 @@ the clock or parse the runtime manifest; the caller supplies both.
   live or lost sessions and durable resume bindings, supplied by the daemon) and
   refuses while the digest is in it. A modified root is refused; a missing root
   is simply unrecorded. The record is replaced before the root is deleted.
+- `remove_modified` is the separate removal for a package whose root fails
+  verification (changed, added, retyped or missing-entry content, a changed
+  mode or manifest), which `uninstall` refuses. It applies the same
+  retained-digest refusal, acts only on a failing root (a verifying or missing
+  root is `RootIntact`; use `uninstall`), un-records the package and any
+  selection of it in one commit, then deletes the root through the same
+  quarantine. A root the platform cannot delete (for example a hard-linked
+  file) yields `RemovalIncomplete` after the package is already unrecorded.
 - `retained_roots` verifies each referenced digest and returns `Ready` or
   `Incompatible` with a typed reason: not registered, root missing, or root
   invalid (including a manifest that differs from the recorded one). The
@@ -177,6 +193,18 @@ the clock or parse the runtime manifest; the caller supplies both.
 
 Install publishes the root before it records it, and uninstall un-records
 before it deletes, so the record never names a root that was never published.
+
+### Catalog state
+
+The registry also persists what the catalog verifier needs from its caller, in
+`catalog-state.json` (schema 1, unknown fields denied, `0600`, at most 16 KiB)
+beside the record and under the same lock. `catalog_state()` reads it without
+the lock (a missing file is the empty state) and `record_catalog(&verified)`
+merges a verified catalog: the high-water mark becomes the maximum of the
+stored mark and the catalog sequence and revoked key ids are united (at most
+`MAX_REVOKED_KEYS`, else `TooManyRevokedKeys`). A sequence below the stored mark
+changes nothing and a merge that changes nothing writes nothing. A corrupt or
+unknown-schema file is a typed error and is never replaced.
 
 ## Daemon host
 
@@ -197,8 +225,9 @@ and is reported by the host (package-pinned sessions are then incompatible).
   left out and reported with a typed reason; it never fails other packages or
   the built-ins.
 - Reload is explicit (`SessionRegistry::reload_runtimes`); nothing watches the
-  directory. A failed rebuild keeps the previous registry. The wire methods
-  that call it arrive with the CLI lifecycle (#143).
+  directory. A failed rebuild keeps the previous registry. Each committed
+  `package.*` change (install, link, enable, disable, select, uninstall) calls
+  it and reports `reloaded`.
 - Fresh launches and integration changes re-verify the package root and require
   it to be enabled; a package modified, disabled or uninstalled after load
   never launches. Disabling or selecting another version retires a package for
@@ -227,3 +256,27 @@ and is reported by the host (package-pinned sessions are then incompatible).
   and detector rules of its observed agent, resolve against the definition the
   session was launched from (kept on the session entry), not the registry's
   current selection.
+- The `package.list|inspect|doctor|install|link|set_enabled|select|uninstall`
+  wire methods are local-only: the daemon refuses them on a remote overlay
+  connection with `local_only_method`. They are additive and do not change the
+  protocol version. Every mutation holds the lifecycle guard, so launches never
+  interleave with it.
+- Install and link validate the package in memory (`runtime.toml` parsed from
+  the verified archive) before anything is extracted; the package identity (id
+  and version) comes from the descriptor. `package.link` copies a developer
+  directory into content-addressed storage and installs it disabled and
+  unselected; the directory itself is never loaded.
+- Claim rules: `shell` is never claimable. An official alias (a reserved runtime
+  id other than `shell`) is served only by a package the signed catalog
+  authorizes as official and only while no built-in runtime serves it. A runtime
+  id served by a loaded package of a different package id is a conflict. Trust
+  `explicit_digest` requires the archive digest to equal the supplied digest and
+  is never official. The runtime registry reserves the aliases for built-in
+  runtimes, so an alias claim is a conflict even for an official package; trust `catalog` fails closed with
+  `official_trust_unavailable` on a host without a trust anchor.
+- `package.uninstall` is refused with `package_referenced` while a live, lost or
+  resumable session or a host profile pins the digest. `remove_modified` removes
+  only a root that fails verification; a verified root answers
+  `package_root_intact`. A modified root makes enable, select and uninstall fail
+  with `package_root_invalid`. `package.doctor` reports faults, unregistered
+  roots on disk and pinned digests that are not installed.

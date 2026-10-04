@@ -232,6 +232,9 @@ async fn run() -> Result<(), DaemonError> {
         agents_dir: Some(paths.config_dir.join("agents")),
         host_state_dir: Some(paths.state_dir.clone()),
         plugins_dir: Some(paths.plugins_dir()),
+        // No catalog trust anchor ships yet, so catalog installs fail closed
+        // with `official_trust_unavailable`.
+        catalog_trust_anchor: None,
         observe_external_agents: env_bool(OBSERVE_EXTERNAL_AGENTS_ENV)?,
         worker_runtime_root: Some(paths.runtime_dir.join(WORKERS_SUBDIR)),
         worker_state_root: Some(paths.state_dir.join(WORKERS_SUBDIR)),
