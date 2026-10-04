@@ -40,7 +40,7 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::{bin_exe, worker_binary};
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 use protocol::{
-    method, AgentKind, AttachHeader, CwdSource, RuntimeInventoryResult, RuntimeState,
+    method, AttachHeader, CwdSource, RuntimeInventoryResult, RuntimeRef, RuntimeState,
     SessionAttachParams, SessionCapabilities, SessionId, SessionInfo, SessionNewParams,
     SessionRuntime, SessionState, StateSource,
 };
@@ -706,7 +706,7 @@ impl Installation {
             },
             name: Some(format!("seeded {session_id}")),
             agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: self.home(),
             cwd_source: Some(CwdSource::Launch),
             pid: 0,
@@ -759,7 +759,7 @@ impl Installation {
                     session_id: session_id.to_owned(),
                     name: Some(format!("seeded {session_id}")),
                     agent: "claude".to_owned(),
-                    agent_base: AgentKind::Claude,
+                    agent_base: RuntimeRef::claude(),
                     cwd: self.home(),
                     cols: 80,
                     rows: 24,

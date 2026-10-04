@@ -205,8 +205,8 @@ TTL. After a sweep appends deletion events, the daemon atomically compacts the
 JSONL action log once its configured action threshold is reached.
 
 Every session has an immutable launch identity: `agent` is the selected profile
-name and `agent_base` is the base kind (`shell`, `codex`, `claude`, or
-`hermes`). A shell session can temporarily host a nested Codex or Claude Code
+name and `agent_base` is the `RuntimeRef` of the runtime backing the session (for
+example `shell`, `codex`, `claude`, or `hermes`). A shell session can temporarily host a nested Codex or Claude Code
 process. The daemon
 now treats active nested-agent state as an evidence tripod: process facts from
 procwatch are authoritative for start/stop, hooks are the fast path for rich

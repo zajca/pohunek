@@ -2,11 +2,11 @@
 
 use pohunek_assistant::launch as assistant;
 use pohunek_assistant::runtime_is_launchable;
-use pohunek_client::protocol::{AgentKind, AgentRuntime, HostCapabilities, PROTOCOL_VERSION};
+use pohunek_client::protocol::{AgentRuntime, HostCapabilities, RuntimeRef, PROTOCOL_VERSION};
 
 fn runtime(
     name: &str,
-    agent_base: Option<AgentKind>,
+    agent_base: Option<RuntimeRef>,
     available: bool,
     supported: Option<bool>,
 ) -> AgentRuntime {
@@ -74,7 +74,7 @@ fn auto_agent_uses_hermes_after_codex_and_claude() {
     let selected = assistant::select_agent(
         &capabilities(vec![runtime(
             "hermes",
-            Some(AgentKind::Hermes),
+            Some(RuntimeRef::hermes()),
             true,
             Some(true),
         )]),
@@ -106,8 +106,8 @@ fn explicit_runtime_with_refused_version_policy_is_rejected() {
     // The refusal comes from the reported policy, not from the runtime's name
     // or compiled base.
     for (name, base) in [
-        ("hermes", Some(AgentKind::Hermes)),
-        ("pinned-tool", Some(AgentKind::Codex)),
+        ("hermes", Some(RuntimeRef::hermes())),
+        ("pinned-tool", Some(RuntimeRef::codex())),
         ("unlabelled", None),
     ] {
         let capabilities = capabilities(vec![runtime(name, base, true, Some(false))]);
@@ -124,7 +124,7 @@ fn explicit_runtime_with_confirmed_version_policy_is_selected() {
     for name in ["hermes", "hermes-review", "pinned-tool"] {
         let capabilities = capabilities(vec![runtime(
             name,
-            Some(AgentKind::Hermes),
+            Some(RuntimeRef::hermes()),
             true,
             Some(true),
         )]);
@@ -147,7 +147,7 @@ fn launchability_follows_availability_and_version_policy_only() {
         (true, None, true),
     ];
     for (available, supported, expected) in cases {
-        for base in [None, Some(AgentKind::Hermes), Some(AgentKind::Claude)] {
+        for base in [None, Some(RuntimeRef::hermes()), Some(RuntimeRef::claude())] {
             let candidate = runtime("any-name", base.clone(), available, supported);
             assert_eq!(
                 runtime_is_launchable(&candidate),
@@ -161,8 +161,8 @@ fn launchability_follows_availability_and_version_policy_only() {
 #[test]
 fn auto_agent_skips_a_refused_runtime_for_a_later_candidate() {
     let capabilities = capabilities(vec![
-        runtime("hermes", Some(AgentKind::Hermes), true, Some(false)),
-        runtime("shell-profile", Some(AgentKind::Shell), true, None),
+        runtime("hermes", Some(RuntimeRef::hermes()), true, Some(false)),
+        runtime("shell-profile", Some(RuntimeRef::shell()), true, None),
         runtime("legacy-custom", None, true, None),
     ]);
 
@@ -176,7 +176,7 @@ fn auto_agent_skips_a_refused_runtime_for_a_later_candidate() {
 fn auto_agent_rejects_shell_backed_profiles() {
     let capabilities = capabilities(vec![runtime(
         "shell-profile",
-        Some(AgentKind::Shell),
+        Some(RuntimeRef::shell()),
         true,
         None,
     )]);
@@ -188,18 +188,30 @@ fn auto_agent_rejects_shell_backed_profiles() {
 }
 
 #[test]
-fn explicit_unknown_agent_base_fails_closed() {
+fn explicit_historical_agent_base_fails_closed() {
     let capabilities = capabilities(vec![runtime(
         "future-profile",
-        Some(AgentKind::Unknown("future".to_owned())),
+        Some(RuntimeRef::from_wire("Future Agent")),
         true,
         Some(true),
     )]);
 
     let err = assistant::select_agent(&capabilities, Some("future-profile"))
-        .expect_err("unknown compiled agent base must fail closed");
+        .expect_err("historical agent base must fail closed");
 
     assert_eq!(err.code, "no_capable_agent");
+}
+
+#[test]
+fn grammar_valid_third_party_base_is_launchable() {
+    let candidate = runtime(
+        "acme-profile",
+        Some(RuntimeRef::from_wire("acme")),
+        true,
+        Some(true),
+    );
+
+    assert!(runtime_is_launchable(&candidate));
 }
 
 #[test]

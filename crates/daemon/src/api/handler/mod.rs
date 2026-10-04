@@ -284,10 +284,22 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
             daemon::handle_daemon_doctor(request, &state.governance, &state.sessions).await
         }
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
-        method::INTEGRATION_INSTALL => integration::handle_integration_install(request).await,
-        method::INTEGRATION_STATUS => integration::handle_integration_status(request).await,
-        method::INTEGRATION_UNINSTALL => integration::handle_integration_uninstall(request).await,
-        method::INTEGRATION_DOCTOR => integration::handle_integration_doctor(request).await,
+        method::INTEGRATION_INSTALL => {
+            integration::handle_integration_install(request, state.sessions.profiles().runtimes())
+                .await
+        }
+        method::INTEGRATION_STATUS => {
+            integration::handle_integration_status(request, state.sessions.profiles().runtimes())
+                .await
+        }
+        method::INTEGRATION_UNINSTALL => {
+            integration::handle_integration_uninstall(request, state.sessions.profiles().runtimes())
+                .await
+        }
+        method::INTEGRATION_DOCTOR => {
+            integration::handle_integration_doctor(request, state.sessions.profiles().runtimes())
+                .await
+        }
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_GOVERNANCE_INSPECT => {
             governance::handle_host_governance_inspect(request, &state.governance).await
@@ -392,8 +404,8 @@ mod tests {
 
     use pohunek_test_support::process_env::ProcessEnv;
     use protocol::{
-        method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult,
-        DaemonDoctorResult, DetectionRegionKind, ForkCwdMode, ProtocolError, Request,
+        method, AssistantMaterializeParams, AssistantMaterializeResult, DaemonDoctorResult,
+        DetectionRegionKind, ForkCwdMode, ProtocolError, Request, RuntimeRef,
         SessionDetectionParams, SessionDetectionResult, SessionForkParams, SessionId, SessionInfo,
         SessionNewParams, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
         StateSource,
@@ -418,7 +430,7 @@ mod tests {
             external: Some(false),
             name: None,
             agent: "shell".to_owned(),
-            agent_base: AgentKind::Shell,
+            agent_base: RuntimeRef::shell(),
             cwd: path.clone(),
             cwd_source: Some(protocol::CwdSource::Launch),
             pid: 0,
@@ -783,7 +795,7 @@ mod tests {
             body: "Codex is waiting for a tool approval.".to_owned(),
             metadata: BTreeMap::new(),
             session_id: Some(SessionId("s-1".to_owned())),
-            agent_kind: Some(AgentKind::Codex),
+            agent_kind: Some(RuntimeRef::codex()),
             source_id: Some("codex:s-1:permission:1".to_owned()),
             dedupe_key: Some("attention:s-1".to_owned()),
             project_id: Some("p-1".to_owned()),
@@ -808,7 +820,7 @@ mod tests {
             body: "Codex reported an error.".to_owned(),
             metadata: BTreeMap::new(),
             session_id: Some(SessionId("s-1".to_owned())),
-            agent_kind: Some(AgentKind::Codex),
+            agent_kind: Some(RuntimeRef::codex()),
             source_id: Some("codex:s-1:error:1".to_owned()),
             dedupe_key: None,
             project_id: Some("p-1".to_owned()),
@@ -833,7 +845,7 @@ mod tests {
             body: "Codex completed a turn.".to_owned(),
             metadata: BTreeMap::new(),
             session_id: Some(SessionId("s-1".to_owned())),
-            agent_kind: Some(AgentKind::Codex),
+            agent_kind: Some(RuntimeRef::codex()),
             source_id: Some("codex:s-1:stop:1".to_owned()),
             dedupe_key: Some("turn:s-1".to_owned()),
             project_id: Some("p-1".to_owned()),

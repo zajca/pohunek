@@ -27,7 +27,7 @@ use pohunek_worker_protocol::{
     DEFAULT_ENVIRONMENT_ALLOWLIST,
 };
 use protocol::{
-    method, AgentActivity, AgentKind, AttachHeader, CwdSource, RuntimeState, SessionAttachParams,
+    method, AgentActivity, AttachHeader, CwdSource, RuntimeRef, RuntimeState, SessionAttachParams,
     SessionCapabilities, SessionId, SessionInfo, SessionInputParams, SessionResizeParams,
     SessionRuntime, SessionState, StateSource, PROTOCOL_VERSION,
 };
@@ -692,7 +692,7 @@ impl Fixture {
             },
             name: Some("systemd durability e2e".to_owned()),
             agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: self.root.clone(),
             cwd_source: Some(CwdSource::Launch),
             pid: child_pid,
@@ -742,7 +742,7 @@ impl Fixture {
                     session_id: session_id.to_owned(),
                     name: Some("systemd durability e2e".to_owned()),
                     agent: "claude".to_owned(),
-                    agent_base: AgentKind::Claude,
+                    agent_base: RuntimeRef::claude(),
                     cwd: self.root.clone(),
                     cols: 80,
                     rows: 24,

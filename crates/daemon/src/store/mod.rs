@@ -57,7 +57,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use pohunek_platform::filesystem::{AtomicReplaceError, FsError, TrustedDir};
-use protocol::{AgentKind, ProjectSource, RuntimeRef, RuntimeState, SessionInfo};
+use protocol::{ProjectSource, RuntimeRef, RuntimeState, SessionInfo};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -87,7 +87,7 @@ pub struct ResumeBinding {
     pub agent: String,
     /// Resolved base kind for the agent (drives resume/handshake on relaunch, and
     /// `session list --filter agent=<base>` grouping after a restart).
-    pub agent_base: AgentKind,
+    pub agent_base: RuntimeRef,
     /// Working directory to relaunch in.
     pub cwd: PathBuf,
     /// Terminal width at capture time.
@@ -179,7 +179,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             name: Option<String>,
             agent: String,
             #[serde(default)]
-            agent_base: Option<AgentKind>,
+            agent_base: Option<RuntimeRef>,
             cwd: PathBuf,
             cols: u16,
             rows: u16,
@@ -242,16 +242,16 @@ impl<'de> Deserialize<'de> for ResumeBinding {
 
 /// Infers the base of a line written without `agent_base` from its agent
 /// name; only a built-in runtime id names its own base.
-fn legacy_agent_base_from_agent(agent: &str) -> Option<AgentKind> {
+fn legacy_agent_base_from_agent(agent: &str) -> Option<RuntimeRef> {
     RESERVED_RUNTIME_IDS
         .contains(&agent)
-        .then(|| AgentKind::from_wire(agent))
+        .then(|| RuntimeRef::from_wire(agent))
 }
 
 /// Whether a record may carry `kind`: a grammar-valid runtime id, installed or
 /// not. An uninstalled runtime keeps its record inert instead of dropping it.
-fn kind_is_persistable(kind: &AgentKind) -> bool {
-    matches!(kind.as_runtime_ref(), RuntimeRef::Id(_))
+fn kind_is_persistable(kind: &RuntimeRef) -> bool {
+    matches!(kind, RuntimeRef::Id(_))
 }
 
 /// Serializable mirror of [`crate::agent::InputRules`] for the resume snapshot
@@ -1539,7 +1539,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use protocol::{AgentActivity, AgentKind, ProjectSource, RuntimeState};
+    use protocol::{AgentActivity, ProjectSource, RuntimeRef, RuntimeState};
 
     use super::{
         NativeIdentityOrdering, ProjectRecord, ProjectResolution, ResumeBinding, RuntimeRecord,
@@ -1615,7 +1615,7 @@ mod tests {
             session_id: session_id.to_owned(),
             name: None,
             agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: PathBuf::from("/workspace/project"),
             cols: 120,
             rows: 40,
@@ -1722,7 +1722,7 @@ mod tests {
             session_id: "s-path".to_owned(),
             name: Some("triage build".to_owned()),
             agent: "claude-sonnet".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: PathBuf::from("/workspace"),
             cols: 100,
             rows: 30,
@@ -1818,7 +1818,7 @@ mod tests {
         };
         let rules = stored.to_input_rules(
             crate::agent::host::RuntimeHost::default()
-                .resolve_kind(&AgentKind::Hermes)
+                .resolve_ref(&RuntimeRef::hermes())
                 .expect("Hermes resolves")
                 .input_rules(),
         );
@@ -1893,8 +1893,8 @@ mod tests {
             .iter()
             .find(|binding| binding.session_id == "s-claude")
             .expect("claude legacy binding");
-        assert_eq!(codex.agent_base, AgentKind::Codex);
-        assert_eq!(claude.agent_base, AgentKind::Claude);
+        assert_eq!(codex.agent_base, RuntimeRef::codex());
+        assert_eq!(claude.agent_base, RuntimeRef::claude());
     }
 
     #[test]
@@ -1902,7 +1902,7 @@ mod tests {
         let path = temp_store_path("invalid-agent-kind");
         let store = Store::new(path.clone());
         let mut binding = resume("s-future", "native-future");
-        binding.agent_base = AgentKind::Unknown("Future Agent".to_owned());
+        binding.agent_base = RuntimeRef::from_wire("Future Agent");
 
         let error = store
             .record_resume(&binding)
@@ -1929,7 +1929,7 @@ mod tests {
         let path = temp_store_path("inert-binding");
         let store = Store::new(path);
         let mut inert = resume("s-inert", "native-inert");
-        inert.agent_base = AgentKind::Unknown("acme".to_owned());
+        inert.agent_base = RuntimeRef::from_wire("acme");
         inert.launch_binding = LaunchPin::Pinned(Box::new(package_binding("acme")));
         store.record_resume(&inert).expect("record inert binding");
 

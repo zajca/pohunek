@@ -12,11 +12,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use protocol::{
-    event, ActivityRevision, AgentActivity, AgentKind, AgentStateEvent, AttachEvent, CwdSource,
-    ErrorClass, Event, ProjectRemoveResult, ProtocolError, RuntimeId, RuntimeInventoryEntry,
-    RuntimeInventoryResult, RuntimeState, SessionAttachParams, SessionEvent, SessionForkParams,
-    SessionId, SessionInfo, SessionInputParams, SessionInputResult, SessionInputWait,
-    SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
+    event, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, CwdSource, ErrorClass,
+    Event, ProjectRemoveResult, ProtocolError, RuntimeId, RuntimeInventoryEntry,
+    RuntimeInventoryResult, RuntimeRef, RuntimeState, SessionAttachParams, SessionEvent,
+    SessionForkParams, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionInputWait, SessionNativeRecoveredEvent, SessionNewParams, SessionReleaseAgentParams,
     SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
     SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
     SessionRuntime, SessionRuntimeIdentity, SessionSetMetadataResult, SessionState,
@@ -208,7 +208,7 @@ const MAX_SESSION_METADATA_SERIALIZED_BYTES: usize = 16 * 1024;
 /// binding. A name is cosmetic, so the limit can change freely.
 const MAX_SESSION_NAME_BYTES: usize = 128;
 
-/// Shell command configuration used for `AgentKind::Shell`.
+/// Shell command configuration used for the shell runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellCommand {
     program: String,
@@ -262,7 +262,7 @@ impl ShellCommand {
 /// Runtime configuration for the in-memory registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRegistryConfig {
-    /// Command used for `AgentKind::Shell`.
+    /// Command used for the shell runtime.
     pub shell_command: ShellCommand,
     /// Grace period after SIGTERM before falling back to a hard kill.
     pub stop_grace: Duration,
@@ -724,7 +724,7 @@ struct ObservedAgent {
     pid: Pid,
     pgid: Pid,
     start_identity: u64,
-    agent_base: AgentKind,
+    agent_base: RuntimeRef,
     first_seen: Instant,
     cwd: Option<PathBuf>,
 }
@@ -2035,7 +2035,7 @@ impl SessionRegistry {
             warnings,
             ..
         } = target;
-        let base = resolved.base.clone();
+        let base = RuntimeRef::from(resolved.base.clone());
         let native = resolved.native_launch();
         let input_rules = resolved
             .profile
@@ -2400,7 +2400,8 @@ impl SessionRegistry {
                 return not_recorded;
             }
 
-            let (pid, start_identity) = bind_report_process(entry, params.pid, &resolved.base);
+            let (pid, start_identity) =
+                bind_report_process(entry, params.pid, &RuntimeRef::from(resolved.base.clone()));
             let report = ActiveAgentReport {
                 source: params.source.clone(),
                 agent: resolved.name.clone(),
@@ -2413,7 +2414,7 @@ impl SessionRegistry {
             entry.active_agent = Some(report.clone());
             entry.last_agent_report = Some(report);
             entry.info.active_agent = Some(resolved.name.clone());
-            entry.info.active_agent_base = Some(resolved.base);
+            entry.info.active_agent_base = Some(RuntimeRef::from(resolved.base));
             entry.info.active_agent_pid = pid;
             entry.info.active_agent_session_id = valid_session_id;
             entry.info.active_agent_session_path = valid_session_path;
@@ -4017,9 +4018,9 @@ impl SessionRegistry {
     /// `runtime_not_installed` for a runtime id no definition backs.
     fn ensure_mutable_kinds(&self, info: &SessionInfo) -> Result<(), ProtocolError> {
         let runtimes = self.inner.profiles.runtimes();
-        runtimes.resolve_kind(&info.agent_base)?;
+        runtimes.resolve_ref(&info.agent_base)?;
         if let Some(active) = &info.active_agent_base {
-            runtimes.resolve_kind(active)?;
+            runtimes.resolve_ref(active)?;
         }
         Ok(())
     }
@@ -4460,7 +4461,7 @@ fn apply_cwd_change(
 
 fn external_session_info(
     fact: &ProcessFact,
-    agent_base: AgentKind,
+    agent_base: RuntimeRef,
     cwd: PathBuf,
     candidate: Option<TranscriptCandidate>,
     association: Option<CwdAssociation>,
@@ -4639,7 +4640,7 @@ fn create_intent_record(
         },
         name: validate_session_name(params.name.as_deref())?,
         agent: resolved.name.clone(),
-        agent_base: resolved.base.clone(),
+        agent_base: RuntimeRef::from(resolved.base.clone()),
         cwd: cwd.to_path_buf(),
         cwd_source: Some(CwdSource::Launch),
         pid: 0,
@@ -4780,7 +4781,7 @@ fn is_terminal(state: SessionState) -> bool {
     state.is_terminal()
 }
 
-fn agent_kind_label(agent: &AgentKind) -> &str {
+fn agent_kind_label(agent: &RuntimeRef) -> &str {
     agent.as_wire()
 }
 
@@ -4801,7 +4802,7 @@ fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfi
 fn bind_report_process(
     entry: &SessionEntry,
     reported_pid: Option<Pid>,
-    agent_base: &AgentKind,
+    agent_base: &RuntimeRef,
 ) -> (Option<Pid>, Option<u64>) {
     if let Some(pid) = reported_pid {
         // PID-bearing hooks are exact claims. If procwatch has not observed the

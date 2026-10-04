@@ -198,7 +198,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use protocol::{AgentKind, CwdSource, RuntimeState, SessionId, SessionRuntime, StateSource};
+    use protocol::{CwdSource, RuntimeRef, RuntimeState, SessionId, SessionRuntime, StateSource};
 
     use super::*;
 
@@ -295,7 +295,7 @@ mod tests {
             external: Some(false),
             capabilities: protocol::SessionCapabilities::default(),
             agent: "codex".to_owned(),
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             cwd: PathBuf::from("/repo"),
             cwd_source: Some(CwdSource::Launch),
             pid: 42,

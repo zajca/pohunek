@@ -13,8 +13,8 @@ use std::thread;
 
 use pohunek_paths::{BasePaths, PathEnv, PathError, Platform, DARWIN_SOCKET_PATH_MAX_BYTES};
 use protocol::{
-    AgentKind, ErrorClass, IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams,
-    ProtocolError,
+    ErrorClass, IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams,
+    ProtocolError, RuntimeId, RuntimeRef,
 };
 use serde_json::{json, Value};
 
@@ -119,16 +119,16 @@ fn managed_commands(settings: &Value) -> Vec<String> {
     commands
 }
 
-fn status_of(dir: &Path, agent: AgentKind) -> protocol::IntegrationAgentStatus {
+fn status_of(dir: &Path, agent: RuntimeRef) -> protocol::IntegrationAgentStatus {
     explicit_status(dir, agent)
 }
 
 #[test]
 fn installer_lock_rejects_a_second_installer_without_touching_the_tree() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("lock-contention");
-        let install = |dir: &Path| match agent {
-            AgentKind::Claude => install_claude(dir).map(|_paths| ()),
+        let install = |dir: &Path| match agent.as_wire() {
+            RuntimeId::CLAUDE => install_claude(dir).map(|_paths| ()),
             _ => install_codex(dir).map(|_paths| ()),
         };
         install(&dir).expect("first install");
@@ -189,20 +189,20 @@ fn concurrent_installers_neither_lose_user_hooks_nor_duplicate_registrations() {
             .contains("echo user-start"),
         "user hook lost: {settings}"
     );
-    let report = status_of(&dir, AgentKind::Claude);
+    let report = status_of(&dir, RuntimeRef::claude());
     assert_eq!(report.state, IntegrationInstallState::Current);
 }
 
 /// Step names committed by a successful install into a fresh directory.
-fn committed_step_names(agent: &AgentKind) -> Vec<String> {
+fn committed_step_names(agent: &RuntimeRef) -> Vec<String> {
     let dir = scoped_dir("step-names");
     let mut seen = Vec::new();
     let mut gate = |_index: usize, name: &str| {
         seen.push(name.to_owned());
         Ok(())
     };
-    match agent {
-        AgentKind::Claude => install_claude_gated(&dir, &mut gate).map(|_paths| ()),
+    match agent.as_wire() {
+        RuntimeId::CLAUDE => install_claude_gated(&dir, &mut gate).map(|_paths| ()),
         _ => install_codex_gated(&dir, &mut gate).map(|_paths| ()),
     }
     .expect("install for step names");
@@ -212,7 +212,7 @@ fn committed_step_names(agent: &AgentKind) -> Vec<String> {
 #[test]
 fn commit_steps_run_scripts_before_registration() {
     assert_eq!(
-        committed_step_names(&AgentKind::Claude),
+        committed_step_names(&RuntimeRef::claude()),
         [
             STATE_HOOK_INSTALL_NAME,
             NOTIFY_HOOK_INSTALL_NAME,
@@ -220,7 +220,7 @@ fn commit_steps_run_scripts_before_registration() {
         ]
     );
     assert_eq!(
-        committed_step_names(&AgentKind::Codex),
+        committed_step_names(&RuntimeRef::codex()),
         [
             STATE_HOOK_INSTALL_NAME,
             NOTIFY_HOOK_INSTALL_NAME,
@@ -232,8 +232,8 @@ fn commit_steps_run_scripts_before_registration() {
 
 /// Installs, then rewrites the tree into an older-looking drifted state so the
 /// next install replaces existing content instead of creating it.
-fn prepare_existing(agent: &AgentKind, dir: &Path) {
-    if *agent == AgentKind::Claude {
+fn prepare_existing(agent: &RuntimeRef, dir: &Path) {
+    if *agent == RuntimeRef::claude() {
         write_json(&dir.join("settings.json"), &user_claude_settings());
         install_claude(dir).expect("seed install");
         fs::write(dir.join("hooks").join(STATE_HOOK_INSTALL_NAME), "# old\n")
@@ -248,7 +248,7 @@ fn prepare_existing(agent: &AgentKind, dir: &Path) {
 
 #[test]
 fn injected_failure_at_every_commit_step_restores_the_exact_prior_tree() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let steps = committed_step_names(&agent).len();
         for existing in [false, true] {
             for fail_at in 0..steps {
@@ -265,8 +265,8 @@ fn injected_failure_at_every_commit_step_restores_the_exact_prior_tree() {
                     }
                 };
 
-                let error = match agent {
-                    AgentKind::Claude => install_claude_gated(&dir, &mut gate).map(|_paths| ()),
+                let error = match agent.as_wire() {
+                    RuntimeId::CLAUDE => install_claude_gated(&dir, &mut gate).map(|_paths| ()),
                     _ => install_codex_gated(&dir, &mut gate).map(|_paths| ()),
                 }
                 .expect_err("gate failure aborts the install");
@@ -347,7 +347,7 @@ fn a_written_file_replaced_before_the_rollback_is_kept_and_reported_as_a_collisi
     for existing in [false, true] {
         let dir = scoped_dir("recovery");
         if existing {
-            prepare_existing(&AgentKind::Codex, &dir);
+            prepare_existing(&RuntimeRef::codex(), &dir);
         }
         let state = dir.join(STATE_HOOK_INSTALL_NAME);
         let mut gate = |_index: usize, name: &str| {
@@ -405,11 +405,11 @@ fn a_displaced_managed_symlink_is_restored_when_a_later_step_fails() {
 
 #[test]
 fn reinstall_and_upgrade_are_idempotent_for_each_agent() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("idempotent");
         prepare_existing(&agent, &dir);
-        let install = |dir: &Path| match agent {
-            AgentKind::Claude => install_claude(dir).map(|_paths| ()),
+        let install = |dir: &Path| match agent.as_wire() {
+            RuntimeId::CLAUDE => install_claude(dir).map(|_paths| ()),
             _ => install_codex(dir).map(|_paths| ()),
         };
 
@@ -506,7 +506,7 @@ fn profiles_are_isolated_by_directory_and_exact_command_ownership() {
     assert_eq!(tree_snapshot(&profile_b), settled_b);
     assert_ne!(untouched_b, settled_b);
     assert_eq!(
-        status_of(&profile_a, AgentKind::Claude).state,
+        status_of(&profile_a, RuntimeRef::claude()).state,
         IntegrationInstallState::Current
     );
 }
@@ -517,11 +517,13 @@ fn explicit_agent_home_selects_exactly_the_targeted_directory() {
     let codex = scoped_dir("target-codex");
     let codex_before = tree_snapshot(&codex);
 
-    let result = with_config_dirs(&claude, &codex, || super::install(Some(AgentKind::Claude)))
-        .expect("install Claude only");
+    let result = with_config_dirs(&claude, &codex, || {
+        super::install(Some(RuntimeRef::claude()))
+    })
+    .expect("install Claude only");
 
     assert_eq!(result.installed.len(), 1);
-    assert_eq!(result.installed[0].agent, AgentKind::Claude);
+    assert_eq!(result.installed[0].agent, RuntimeRef::claude());
     assert_eq!(
         tree_snapshot(&codex),
         codex_before,
@@ -532,7 +534,7 @@ fn explicit_agent_home_selects_exactly_the_targeted_directory() {
     let result = with_config_dirs(&missing_claude, &codex, || super::install(None))
         .expect("install every present agent");
     assert_eq!(result.installed.len(), 1);
-    assert_eq!(result.installed[0].agent, AgentKind::Codex);
+    assert_eq!(result.installed[0].agent, RuntimeRef::codex());
     assert!(
         !missing_claude.exists(),
         "absent agent dir is never created"
@@ -567,7 +569,7 @@ fn a_symlinked_config_root_is_rejected_and_its_canonical_path_installs() {
     let canonical = fs::canonicalize(&alias).expect("canonicalize alias");
     install_codex(&canonical).expect("canonical path installs");
     assert_eq!(
-        status_of(&canonical, AgentKind::Codex).state,
+        status_of(&canonical, RuntimeRef::codex()).state,
         IntegrationInstallState::Current
     );
 }
@@ -579,14 +581,14 @@ fn a_missing_optional_agent_is_informational_and_a_broken_config_root_is_a_failu
     let not_a_directory = root.join("file");
     fs::write(&not_a_directory, "").expect("write file");
 
-    let optional = status_of(&absent, AgentKind::Claude);
+    let optional = status_of(&absent, RuntimeRef::claude());
     assert!(!optional.available);
     assert_eq!(optional.state, IntegrationInstallState::NotInstalled);
     assert_eq!(optional.recovery, IntegrationRecovery::None);
     assert!(optional.warnings.is_empty(), "{:?}", optional.warnings);
     assert!(!absent.exists(), "status never creates the directory");
 
-    let broken = status_of(&not_a_directory, AgentKind::Codex);
+    let broken = status_of(&not_a_directory, RuntimeRef::codex());
     assert!(!broken.available);
     assert_eq!(broken.state, IntegrationInstallState::Outdated);
     assert_eq!(broken.recovery, IntegrationRecovery::RepairConfiguration);
@@ -600,7 +602,7 @@ fn an_unresolvable_config_root_is_a_failure_not_an_absent_agent() {
         Path::new("/nonexistent"),
         || {
             super::status(IntegrationStatusParams {
-                agent: Some(AgentKind::Claude),
+                agent: Some(RuntimeRef::claude()),
             })
         },
     )
@@ -877,7 +879,7 @@ fn provider_secrets_never_reach_install_status_or_error_output() {
     outputs.push(error_text(
         &install_codex(&codex).expect_err("malformed TOML aborts"),
     ));
-    outputs.push(format!("{:?}", status_of(&codex, AgentKind::Codex)));
+    outputs.push(format!("{:?}", status_of(&codex, RuntimeRef::codex())));
 
     fs::write(
         claude.join("settings.json"),
@@ -887,7 +889,7 @@ fn provider_secrets_never_reach_install_status_or_error_output() {
     outputs.push(error_text(
         &install_claude(&claude).expect_err("malformed JSON aborts"),
     ));
-    outputs.push(format!("{:?}", status_of(&claude, AgentKind::Claude)));
+    outputs.push(format!("{:?}", status_of(&claude, RuntimeRef::claude())));
 
     for (index, text) in outputs.iter().enumerate() {
         assert_no_sentinel(&format!("output {index}"), text);
@@ -988,7 +990,7 @@ fn a_hooks_directory_holding_another_file_survives_a_failed_install() {
 ///
 /// An unchanged Codex `config.toml` adds verification steps, so the indices
 /// differ per agent and are read from a dry run instead of assumed.
-fn reseed_steps(agent: &AgentKind) -> Vec<String> {
+fn reseed_steps(agent: &RuntimeRef) -> Vec<String> {
     let dir = scoped_dir("reseed-steps");
     install_gated(agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
     let mut seen = Vec::new();
@@ -1014,8 +1016,8 @@ fn oversized_script() -> Vec<u8> {
 }
 
 /// Path of the state hook script for `agent` inside `dir`.
-fn state_script(agent: &AgentKind, dir: &Path) -> PathBuf {
-    if *agent == AgentKind::Claude {
+fn state_script(agent: &RuntimeRef, dir: &Path) -> PathBuf {
+    if *agent == RuntimeRef::claude() {
         dir.join("hooks").join(STATE_HOOK_INSTALL_NAME)
     } else {
         dir.join(STATE_HOOK_INSTALL_NAME)
@@ -1023,11 +1025,11 @@ fn state_script(agent: &AgentKind, dir: &Path) -> PathBuf {
 }
 
 fn install_gated(
-    agent: &AgentKind,
+    agent: &RuntimeRef,
     dir: &Path,
     gate: super::StepGate<'_>,
 ) -> Result<(), ProtocolError> {
-    if *agent == AgentKind::Claude {
+    if *agent == RuntimeRef::claude() {
         install_claude_gated(dir, gate).map(|_paths| ())
     } else {
         install_codex_gated(dir, gate).map(|_paths| ())
@@ -1036,7 +1038,7 @@ fn install_gated(
 
 #[test]
 fn a_later_failure_restores_an_oversized_managed_script_exactly() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let steps = reseed_steps(&agent);
         for fail_at in (state_script_index(&steps) + 1)..steps.len() {
             let dir = scoped_dir("oversized-rollback");
@@ -1065,7 +1067,7 @@ fn a_later_failure_restores_an_oversized_managed_script_exactly() {
 
 #[test]
 fn installing_over_an_oversized_managed_script_replaces_it_without_residue() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("oversized-replace");
         install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
         fs::write(state_script(&agent, &dir), oversized_script()).expect("oversize script");
@@ -1091,7 +1093,7 @@ fn installing_over_an_oversized_managed_script_replaces_it_without_residue() {
 
 #[test]
 fn an_unrestorable_oversized_original_is_reported_and_kept_never_silently_lost() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("oversized-recovery");
         install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
         let script = state_script(&agent, &dir);
@@ -1127,12 +1129,12 @@ fn an_unrestorable_oversized_original_is_reported_and_kept_never_silently_lost()
 
 #[test]
 fn a_rollback_that_cannot_put_an_original_back_requires_recovery_and_names_it() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("recovery-vanished");
         install_gated(&agent, &dir, &mut |_index, _name| Ok(())).expect("seed install");
         let script = state_script(&agent, &dir);
         let scripts_dir = script.parent().expect("script parent").to_path_buf();
-        let fail_at = if agent == AgentKind::Claude {
+        let fail_at = if agent == RuntimeRef::claude() {
             "settings.json"
         } else {
             "hooks.json"

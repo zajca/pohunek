@@ -17,7 +17,7 @@ use std::thread;
 mod interpreter;
 
 use pohunek_test_support::env::TestEnv;
-use protocol::{AgentKind, Request, Response, PROTOCOL_VERSION};
+use protocol::{Request, Response, RuntimeRef, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
 struct Fixture {
@@ -373,8 +373,8 @@ fn binary_legacy_install_preserves_daemon_rpc_for_each_selector() {
             let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
             let agent = request.params()["agent"].as_str();
             let report_agent = match agent {
-                Some("codex") | None => AgentKind::Codex,
-                Some("claude") => AgentKind::Claude,
+                Some("codex") | None => RuntimeRef::codex(),
+                Some("claude") => RuntimeRef::claude(),
                 other => panic!("unexpected agent: {other:?}"),
             };
             captured.push(request.params().clone());

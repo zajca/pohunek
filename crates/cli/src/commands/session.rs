@@ -2005,7 +2005,7 @@ fn session_agent_label(info: &SessionInfo) -> String {
     }
 }
 
-fn agent_kind_label(agent: &protocol::AgentKind) -> &str {
+fn agent_kind_label(agent: &protocol::RuntimeRef) -> &str {
     agent.as_wire()
 }
 
@@ -2075,7 +2075,7 @@ mod tests {
             external: Some(false),
             capabilities: protocol::SessionCapabilities::default(),
             agent: "shell".to_owned(),
-            agent_base: protocol::AgentKind::Shell,
+            agent_base: protocol::RuntimeRef::shell(),
             cwd: PathBuf::from("/workspace/project"),
             cwd_source: Some(protocol::CwdSource::Launch),
             pid: 4242,
@@ -2468,7 +2468,7 @@ mod tests {
     fn list_filter_matches_active_agent_identity() {
         let mut session = running_session("s-42");
         session.active_agent = Some("codex".to_owned());
-        session.active_agent_base = Some(protocol::AgentKind::Codex);
+        session.active_agent_base = Some(protocol::RuntimeRef::codex());
 
         assert!(
             parse_list_filter("agent=codex")
@@ -2993,7 +2993,7 @@ mod tests {
     fn renders_active_agent_in_session_list_table() {
         let mut session = running_session("s-42");
         session.active_agent = Some("codex".to_owned());
-        session.active_agent_base = Some(protocol::AgentKind::Codex);
+        session.active_agent_base = Some(protocol::RuntimeRef::codex());
 
         let output = render_list_human(&[session]);
 
@@ -3041,7 +3041,7 @@ mod tests {
             protocol::SubagentInfo {
                 id: "child-running".to_owned(),
                 parent_id: None,
-                provider: protocol::AgentKind::Claude,
+                provider: protocol::RuntimeRef::claude(),
                 agent_type: Some("Explore".to_owned()),
                 lifecycle: protocol::SubagentLifecycle::Running,
                 activity: Some(AgentActivity::Working),
@@ -3053,7 +3053,7 @@ mod tests {
             protocol::SubagentInfo {
                 id: "child-done".to_owned(),
                 parent_id: None,
-                provider: protocol::AgentKind::Codex,
+                provider: protocol::RuntimeRef::codex(),
                 agent_type: None,
                 lifecycle: protocol::SubagentLifecycle::Completed,
                 activity: None,
@@ -3163,7 +3163,7 @@ mod tests {
     fn renders_active_agent_fields_in_session_inspect_table() {
         let mut session = running_session("s-42");
         session.active_agent = Some("codex".to_owned());
-        session.active_agent_base = Some(protocol::AgentKind::Codex);
+        session.active_agent_base = Some(protocol::RuntimeRef::codex());
         session.active_agent_pid = Some(9001);
         session.active_agent_session_id = Some("codex-native".to_owned());
         session.active_agent_session_path = Some("/work/codex/session.json".to_owned());

@@ -10,8 +10,8 @@
 use std::path::Path;
 
 use protocol::{
-    AgentKind, IntegrationUninstallReport, IntegrationUninstallResult, IntegrationUninstallState,
-    ProtocolError,
+    IntegrationUninstallReport, IntegrationUninstallResult, IntegrationUninstallState,
+    ProtocolError, RuntimeId, RuntimeRef,
 };
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item};
@@ -42,18 +42,19 @@ const CODEX_OWNERSHIP_MARKER: &str = "# POHUNEK_INTEGRATION_ID=codex";
 ///
 /// # Errors
 ///
-/// `agent_not_installable` for `AgentKind::Shell` and Hermes, a typed
+/// `agent_not_installable` for the shell runtime and Hermes, a typed
 /// configuration error for an unresolvable or unsafe config path (including a
 /// symlink), the transaction errors of [`super::commit`], or any underlying I/O
 /// or settings error.
-pub fn uninstall(agent: AgentKind) -> Result<IntegrationUninstallResult, ProtocolError> {
-    let report = match agent {
-        AgentKind::Claude => uninstall_claude(&claude_config_dir()?)?,
-        AgentKind::Codex => uninstall_codex(&codex_config_dir()?)?,
-        AgentKind::Shell => return Err(super::status_unsupported(&AgentKind::Shell)),
-        AgentKind::Hermes => return Err(super::status_unsupported(&AgentKind::Hermes)),
-        AgentKind::Unknown(value) => {
-            return Err(ProtocolError::agent_kind_unsupported(&value));
+pub fn uninstall(agent: &RuntimeRef) -> Result<IntegrationUninstallResult, ProtocolError> {
+    let report = match agent.as_wire() {
+        RuntimeId::CLAUDE => uninstall_claude(&claude_config_dir()?)?,
+        RuntimeId::CODEX => uninstall_codex(&codex_config_dir()?)?,
+        unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES) => {
+            return Err(super::status_unsupported(unsupported));
+        }
+        other => {
+            return Err(super::status_unsupported(other));
         }
     };
     Ok(IntegrationUninstallResult {
@@ -79,7 +80,7 @@ pub fn uninstall_codex(codex_dir: &Path) -> Result<IntegrationUninstallReport, P
     uninstall_codex_gated(codex_dir, &mut |_index, _name| Ok(()))
 }
 
-fn empty_report(agent: AgentKind) -> IntegrationUninstallReport {
+fn empty_report(agent: RuntimeRef) -> IntegrationUninstallReport {
     IntegrationUninstallReport {
         agent,
         state: IntegrationUninstallState::NotInstalled,
@@ -247,7 +248,7 @@ fn push_verifications<'a>(
 
 /// Builds the report from the executed steps' outcomes.
 fn report(
-    agent: AgentKind,
+    agent: RuntimeRef,
     steps: &[Step<'_>],
     committed: &Committed,
     dir: &Path,
@@ -284,7 +285,7 @@ pub(super) fn uninstall_claude_gated(
     gate: StepGate<'_>,
 ) -> Result<IntegrationUninstallReport, ProtocolError> {
     if !config_dir_present(claude_dir, "Claude config directory")? {
-        return Ok(empty_report(AgentKind::Claude));
+        return Ok(empty_report(RuntimeRef::claude()));
     }
     let root = TrustedDir::open(claude_dir, "Claude config directory")?;
     let _lock = root.lock_installer()?;
@@ -348,7 +349,7 @@ pub(super) fn uninstall_claude_gated(
     }
     let committed = commit::commit(&steps, gate, Operation::Uninstall)?;
     Ok(report(
-        AgentKind::Claude,
+        RuntimeRef::claude(),
         &steps,
         &committed,
         claude_dir,
@@ -362,7 +363,7 @@ pub(super) fn uninstall_codex_gated(
     gate: StepGate<'_>,
 ) -> Result<IntegrationUninstallReport, ProtocolError> {
     if !config_dir_present(codex_dir, "Codex config directory")? {
-        return Ok(empty_report(AgentKind::Codex));
+        return Ok(empty_report(RuntimeRef::codex()));
     }
     let root = TrustedDir::open(codex_dir, "Codex config directory")?;
     let _lock = root.lock_installer()?;
@@ -449,7 +450,7 @@ pub(super) fn uninstall_codex_gated(
     }
     let committed = commit::commit(&steps, gate, Operation::Uninstall)?;
     Ok(report(
-        AgentKind::Codex,
+        RuntimeRef::codex(),
         &steps,
         &committed,
         codex_dir,

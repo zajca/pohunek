@@ -5,45 +5,45 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use proptest::prelude::*;
 use protocol::{
-    event, method, negotiate, ActivityRevision, AgentActivity, AgentKind, AgentRuntime,
-    ApprovalKeyReference, AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader,
-    ConceptDeprecation, ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult,
-    DetectionRegionKind, DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus,
-    EnrollmentInfo, EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ForkCwdMode,
-    HostApprovalSignature, HostCapabilities, HostGovernanceStatus, HostId, HostOwner,
-    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
-    IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
-    IntegrationFindingSeverity, IntegrationInstallParams, IntegrationInstallReport,
-    IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
-    IntegrationUninstallParams, IntegrationUninstallReport, IntegrationUninstallResult,
-    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
-    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeleteResult,
-    NotificationDeletedEvent, NotificationId, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
-    NotificationPolicyResult, NotificationRecord, NotificationRetentionParams,
-    NotificationRetentionPolicy, NotificationRetentionResult, NotificationSeverity,
-    NotificationSource, NotificationStatus, NotificationUpdateParams, NotificationUpdateResult,
-    NotificationUpdatedEvent, ObservationParamsError, OutputOffset, OwnerRevision, PrincipalId,
-    ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId, ProposalNonce, ProtocolError,
-    ProtocolVersion, ProtocolVersionRange, ProviderKind, QuarantineReason, RelayId, ReportSequence,
-    Request, Response, RuntimeGeneration, SessionAttachParams, SessionAttachResult,
-    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
-    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntimeIdentity,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionState, SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult,
-    SessionWarning, SessionWarningKind, ShareSuspensionIntent, SignedTransferOutcome, StateSource,
-    TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark, TransferCoordinates,
-    TransferOutcomeCandidate, TransferOutcomeId, TransferProposal, UnconfirmedProcess,
-    GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
-    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
-    MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
+    event, method, negotiate, ActivityRevision, AgentActivity, AgentRuntime, ApprovalKeyReference,
+    AssistantMaterializeParams, AssistantMaterializeResult, AttachHeader, ConceptDeprecation,
+    ConceptIntent, ConceptMeta, ConceptType, CwdSource, DaemonDoctorResult, DetectionRegionKind,
+    DetectionRegionPreview, DoctorCheck, DoctorReport, DoctorStatus, EnrollmentInfo,
+    EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ForkCwdMode, HostApprovalSignature,
+    HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
+    IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
+    IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallParams,
+    IntegrationInstallReport, IntegrationInstallResult, IntegrationInstallState,
+    IntegrationRecovery, IntegrationUninstallParams, IntegrationUninstallReport,
+    IntegrationUninstallResult, IntegrationUninstallState, NotificationCreateParams,
+    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
+    NotificationDeleteResult, NotificationDeletedEvent, NotificationId, NotificationKind,
+    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
+    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
+    OwnerRevision, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
+    ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
+    QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
+    RuntimeRef, SessionAttachParams, SessionAttachResult, SessionCapabilities, SessionDetachParams,
+    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionForkParams,
+    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
+    SessionOutputParams, SessionOutputResult, SessionReadFormat, SessionReadParams,
+    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId, TerminalCursor,
+    TerminalDimensions, TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate,
+    TransferOutcomeId, TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES,
+    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES,
+    MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
+    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::{json, Value};
@@ -108,7 +108,7 @@ fn running_shell_session(exit_code: Option<i32>) -> SessionInfo {
         external: Some(false),
         capabilities: SessionCapabilities::default(),
         agent: "shell".to_owned(),
-        agent_base: AgentKind::Shell,
+        agent_base: RuntimeRef::shell(),
         cwd: PathBuf::from("/workspace/project"),
         cwd_source: Some(CwdSource::Launch),
         pid: 4242,
@@ -217,12 +217,12 @@ fn notification_policy() -> NotificationPolicy {
 }
 
 #[test]
-fn agent_kind_json_shape_roundtrips() {
+fn runtime_ref_json_shape_roundtrips() {
     let cases = [
-        (AgentKind::Shell, json!("shell")),
-        (AgentKind::Codex, json!("codex")),
-        (AgentKind::Claude, json!("claude")),
-        (AgentKind::Hermes, json!("hermes")),
+        (RuntimeRef::shell(), json!("shell")),
+        (RuntimeRef::codex(), json!("codex")),
+        (RuntimeRef::claude(), json!("claude")),
+        (RuntimeRef::hermes(), json!("hermes")),
     ];
 
     for (agent, expected) in cases {
@@ -235,17 +235,30 @@ fn agent_kind_json_shape_roundtrips() {
 }
 
 #[test]
-fn unknown_agent_kind_roundtrips_neutrally_and_is_rejected_for_mutation() {
-    let agent: AgentKind = serde_json::from_value(json!("future-agent")).expect("deserialize");
-    assert_eq!(agent, AgentKind::Unknown("future-agent".to_owned()));
+fn grammar_invalid_runtime_ref_roundtrips_neutrally_and_is_rejected_for_mutation() {
+    let agent: RuntimeRef = serde_json::from_value(json!("Future Agent")).expect("deserialize");
+    assert_eq!(agent, RuntimeRef::from_wire("Future Agent"));
+    assert_eq!(
+        serde_json::to_value(&agent).expect("serialize"),
+        json!("Future Agent")
+    );
+    let error = agent
+        .launchable()
+        .expect_err("a historical label must be presentation-only");
+    assert_eq!(error.code, "agent_kind_unsupported");
+}
+
+#[test]
+fn grammar_valid_runtime_ref_roundtrips_as_an_id() {
+    let agent: RuntimeRef = serde_json::from_value(json!("future-agent")).expect("deserialize");
+    assert_eq!(
+        agent,
+        RuntimeRef::Id(RuntimeId::parse("future-agent").unwrap())
+    );
     assert_eq!(
         serde_json::to_value(&agent).expect("serialize"),
         json!("future-agent")
     );
-    for validation in [agent.validate_mutation(), agent.validate_persistence()] {
-        let error = validation.expect_err("unknown agent must be presentation-only");
-        assert_eq!(error.code, "agent_kind_unsupported");
-    }
 }
 
 #[test]
@@ -445,7 +458,7 @@ fn notification_create_params_json_shape_roundtrips() {
         title: "Approval required".to_owned(),
         body: "Codex is waiting for a tool approval.".to_owned(),
         session_id: Some(SessionId("s-42".to_owned())),
-        agent_kind: Some(AgentKind::Codex),
+        agent_kind: Some(RuntimeRef::codex()),
         source_id: Some("provider-event-7".to_owned()),
         dedupe_key: None,
         project_id: Some("p-42".to_owned()),
@@ -527,7 +540,7 @@ fn notification_create_params_metadata_roundtrips_when_present() {
         title: "Approval required".to_owned(),
         body: "Codex is waiting for a tool approval.".to_owned(),
         session_id: Some(SessionId("s-42".to_owned())),
-        agent_kind: Some(AgentKind::Codex),
+        agent_kind: Some(RuntimeRef::codex()),
         source_id: Some("provider-event-7".to_owned()),
         dedupe_key: None,
         project_id: Some("p-42".to_owned()),
@@ -556,7 +569,7 @@ fn notification_create_params_carries_source_independent_dedupe_key() {
         title: "Agent blocked".to_owned(),
         body: "The agent is waiting for input.".to_owned(),
         session_id: Some(SessionId("s-42".to_owned())),
-        agent_kind: Some(AgentKind::Codex),
+        agent_kind: Some(RuntimeRef::codex()),
         source_id: Some("provider-event-7".to_owned()),
         dedupe_key: Some("attention:s-42:approval".to_owned()),
         project_id: Some("p-42".to_owned()),
@@ -1184,9 +1197,9 @@ fn session_list_params_roundtrips_with_filters() {
 fn session_list_agent_filter_roundtrips_and_matches_launch_or_active_agent_identity() {
     let session = SessionInfo {
         agent: "shell-main".to_owned(),
-        agent_base: AgentKind::Shell,
+        agent_base: RuntimeRef::shell(),
         active_agent: Some("codex-gpt-5".to_owned()),
-        active_agent_base: Some(AgentKind::Codex),
+        active_agent_base: Some(RuntimeRef::codex()),
         ..running_shell_session(None)
     };
 
@@ -1657,7 +1670,7 @@ fn session_info_roundtrips_with_native_session_id() {
 fn session_info_roundtrips_with_active_agent_fields() {
     let info = SessionInfo {
         active_agent: Some("codex".to_owned()),
-        active_agent_base: Some(AgentKind::Codex),
+        active_agent_base: Some(RuntimeRef::codex()),
         active_agent_pid: Some(9001),
         active_agent_session_id: Some("codex-native".to_owned()),
         active_agent_session_path: None,
@@ -1807,7 +1820,7 @@ fn integration_install_method_name_is_stable() {
 #[test]
 fn integration_install_params_roundtrips_with_and_without_agent() {
     let with_agent = IntegrationInstallParams {
-        agent: Some(AgentKind::Claude),
+        agent: Some(RuntimeRef::claude()),
     };
     let value = serde_json::to_value(&with_agent).expect("serialize install params");
     assert_eq!(value, json!({ "agent": "claude" }));
@@ -1830,13 +1843,13 @@ fn integration_install_result_roundtrips() {
     let result = IntegrationInstallResult {
         installed: vec![
             IntegrationInstallReport {
-                agent: AgentKind::Claude,
+                agent: RuntimeRef::claude(),
                 hook_path: "/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/user/.claude/settings.json".to_owned()],
                 cleanup_incomplete: vec![],
             },
             IntegrationInstallReport {
-                agent: AgentKind::Codex,
+                agent: RuntimeRef::codex(),
                 hook_path: "/home/user/.codex/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec![
                     "/home/user/.codex/hooks.json".to_owned(),
@@ -1850,7 +1863,7 @@ fn integration_install_result_roundtrips() {
     let back = line_roundtrip(&result);
     assert_eq!(back, result);
     assert_eq!(back.installed.len(), 2);
-    assert_eq!(back.installed[0].agent, AgentKind::Claude);
+    assert_eq!(back.installed[0].agent, RuntimeRef::claude());
     assert_eq!(back.installed[1].config_paths.len(), 2);
 }
 
@@ -1863,7 +1876,7 @@ fn integration_uninstall_and_doctor_method_names_are_stable() {
 #[test]
 fn integration_uninstall_params_and_result_roundtrip() {
     let params = IntegrationUninstallParams {
-        agent: AgentKind::Codex,
+        agent: RuntimeRef::codex(),
     };
     assert_eq!(
         serde_json::to_value(&params).expect("serialize uninstall params"),
@@ -1877,7 +1890,7 @@ fn integration_uninstall_params_and_result_roundtrip() {
 
     let result = IntegrationUninstallResult {
         uninstalled: vec![IntegrationUninstallReport {
-            agent: AgentKind::Claude,
+            agent: RuntimeRef::claude(),
             state: IntegrationUninstallState::Removed,
             removed_paths: vec!["/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned()],
             updated_paths: vec!["/home/user/.claude/settings.json".to_owned()],
@@ -1891,7 +1904,7 @@ fn integration_uninstall_params_and_result_roundtrip() {
 #[test]
 fn integration_doctor_params_and_result_roundtrip() {
     let params = IntegrationDoctorParams {
-        agent: Some(AgentKind::Claude),
+        agent: Some(RuntimeRef::claude()),
     };
     assert_eq!(line_roundtrip(&params), params);
     assert_eq!(
@@ -1902,10 +1915,10 @@ fn integration_doctor_params_and_result_roundtrip() {
     let result = IntegrationDoctorResult {
         ok: false,
         agents: vec![IntegrationAgentDoctor {
-            agent: AgentKind::Codex,
+            agent: RuntimeRef::codex(),
             ok: false,
             status: Some(IntegrationAgentStatus {
-                agent: AgentKind::Codex,
+                agent: RuntimeRef::codex(),
                 available: true,
                 expected_asset_paths: vec!["/h/.codex/pohunek-agent-state.sh".to_owned()],
                 present_asset_paths: vec![],
@@ -3580,7 +3593,7 @@ fn daemon_doctor_report_json_shape_roundtrips() {
 fn agent_runtime_json_shape_roundtrips_with_path() {
     let runtime = AgentRuntime {
         agent: "codex".to_owned(),
-        agent_base: Some(AgentKind::Codex),
+        agent_base: Some(RuntimeRef::codex()),
         available: true,
         path: Some("/usr/local/bin/codex".to_owned()),
         version: None,
@@ -3606,7 +3619,7 @@ fn agent_runtime_json_shape_roundtrips_with_path() {
 fn agent_runtime_omits_absent_path() {
     let runtime = AgentRuntime {
         agent: "shell".to_owned(),
-        agent_base: Some(AgentKind::Shell),
+        agent_base: Some(RuntimeRef::shell()),
         available: true,
         path: None,
         version: None,
@@ -3638,7 +3651,7 @@ fn agent_runtime_omits_absent_path() {
 fn agent_runtime_roundtrips_optional_version_support() {
     let runtime = AgentRuntime {
         agent: "hermes".to_owned(),
-        agent_base: Some(AgentKind::Hermes),
+        agent_base: Some(RuntimeRef::hermes()),
         available: true,
         path: Some("/usr/local/bin/hermes".to_owned()),
         version: Some("0.20.0".to_owned()),
@@ -3683,7 +3696,7 @@ fn host_capabilities_json_shape_roundtrips() {
         runtimes: vec![
             AgentRuntime {
                 agent: "shell".to_owned(),
-                agent_base: Some(AgentKind::Shell),
+                agent_base: Some(RuntimeRef::shell()),
                 available: true,
                 path: None,
                 version: None,
@@ -3691,7 +3704,7 @@ fn host_capabilities_json_shape_roundtrips() {
             },
             AgentRuntime {
                 agent: "codex".to_owned(),
-                agent_base: Some(AgentKind::Codex),
+                agent_base: Some(RuntimeRef::codex()),
                 available: true,
                 path: Some("/usr/local/bin/codex".to_owned()),
                 version: None,
@@ -3699,7 +3712,7 @@ fn host_capabilities_json_shape_roundtrips() {
             },
             AgentRuntime {
                 agent: "claude".to_owned(),
-                agent_base: Some(AgentKind::Claude),
+                agent_base: Some(RuntimeRef::claude()),
                 available: false,
                 path: None,
                 version: None,
@@ -3707,7 +3720,7 @@ fn host_capabilities_json_shape_roundtrips() {
             },
             AgentRuntime {
                 agent: "hermes".to_owned(),
-                agent_base: Some(AgentKind::Hermes),
+                agent_base: Some(RuntimeRef::hermes()),
                 available: true,
                 path: Some("/usr/local/bin/hermes".to_owned()),
                 version: Some("0.20.0".to_owned()),

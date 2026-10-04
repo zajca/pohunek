@@ -21,22 +21,22 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    event, method, AgentActivity, AgentKind, AssistantMaterializeParams,
-    AssistantMaterializeResult, AttachHeader, ErrorClass, Event, HostDiscoverParams, HostRecord,
-    IntegrationDoctorResult, IntegrationInstallState, IntegrationStatusResult,
-    IntegrationUninstallResult, IntegrationUninstallState, NotificationCreateParams,
-    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
-    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
-    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
-    NotificationUpdateParams, NotificationUpdateResult, ProcessStartIdentity, ReportSequence,
-    Request as ProtocolRequest, Response, SessionAttachParams, SessionAttachResult,
-    SessionDetachParams, SessionDetachResult, SessionId, SessionInfo, SessionInputParams,
-    SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
-    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
-    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    event, method, AgentActivity, AssistantMaterializeParams, AssistantMaterializeResult,
+    AttachHeader, ErrorClass, Event, HostDiscoverParams, HostRecord, IntegrationDoctorResult,
+    IntegrationInstallState, IntegrationStatusResult, IntegrationUninstallResult,
+    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
+    NotificationDeleteParams, NotificationDeleteResult, NotificationKind, NotificationKindPolicy,
+    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
+    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
+    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
+    NotificationUpdateResult, ProcessStartIdentity, ReportSequence, Request as ProtocolRequest,
+    Response, RuntimeId, RuntimeRef, SessionAttachParams, SessionAttachResult, SessionDetachParams,
+    SessionDetachResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
+    SessionListFilter, SessionListParams, SessionNewParams, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionState,
+    SessionStopResult, StateSource, TerminalDimensions, WorktreeRemoveParams, WorktreeRemoveResult,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -367,7 +367,7 @@ async fn integration_uninstall_and_doctor_run_at_daemon_boundary() {
         serde_json::from_value(ok_payload(exchange(&mut framed, &doctor).await))
             .expect("deserialize doctor result");
     assert_eq!(doctor.agents.len(), 1);
-    assert_eq!(doctor.agents[0].agent, AgentKind::Codex);
+    assert_eq!(doctor.agents[0].agent, RuntimeRef::codex());
     assert_eq!(
         doctor.agents[0].status.as_ref().expect("status").state,
         IntegrationInstallState::Current
@@ -634,14 +634,14 @@ async fn exchange_line(framed: &mut Framed<UnixStream, LinesCodec>, line: String
 }
 
 /// Map a base kind to its wire name (the `agent` field is a free string since
-/// Part C; the helpers below still take an `AgentKind` for convenience).
-fn agent_name(agent: &AgentKind) -> &'static str {
-    match agent {
-        AgentKind::Shell => "shell",
-        AgentKind::Codex => "codex",
-        AgentKind::Claude => "claude",
-        AgentKind::Hermes => "hermes",
-        AgentKind::Unknown(_) => "unknown",
+/// Part C; the helpers below still take an `RuntimeRef` for convenience).
+fn agent_name(agent: &RuntimeRef) -> &'static str {
+    match agent.as_wire() {
+        RuntimeId::SHELL => "shell",
+        RuntimeId::CODEX => "codex",
+        RuntimeId::CLAUDE => "claude",
+        RuntimeId::HERMES => "hermes",
+        _ => "unknown",
     }
 }
 
@@ -665,7 +665,7 @@ fn session_params_in(cwd: PathBuf) -> SessionNewParams {
     }
 }
 
-fn session_params_for_agent(agent: &AgentKind, cwd: PathBuf) -> SessionNewParams {
+fn session_params_for_agent(agent: &RuntimeRef, cwd: PathBuf) -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: agent_name(agent).to_owned(),
@@ -682,7 +682,11 @@ fn session_params_for_agent(agent: &AgentKind, cwd: PathBuf) -> SessionNewParams
 }
 
 /// `session.new` params binding a worktree for `repo` + `branch`.
-fn session_params_for_worktree(agent: &AgentKind, repo: PathBuf, branch: &str) -> SessionNewParams {
+fn session_params_for_worktree(
+    agent: &RuntimeRef,
+    repo: PathBuf,
+    branch: &str,
+) -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: agent_name(agent).to_owned(),
@@ -701,7 +705,7 @@ fn session_params_for_worktree(agent: &AgentKind, repo: PathBuf, branch: &str) -
 /// Create a worktree-bound session and return the daemon's response.
 async fn create_worktree_session(
     framed: &mut Framed<UnixStream, LinesCodec>,
-    agent: AgentKind,
+    agent: RuntimeRef,
     repo: PathBuf,
     branch: &str,
 ) -> Response {
@@ -779,7 +783,7 @@ async fn create_session_with_params(
 
 async fn create_session_with_agent(
     framed: &mut Framed<UnixStream, LinesCodec>,
-    agent: AgentKind,
+    agent: RuntimeRef,
     cwd: PathBuf,
 ) -> Response {
     let req = Request::make(
@@ -1726,7 +1730,7 @@ async fn session_new_for_missing_agent_binary_returns_typed_error() {
     // rather than a generic spawn failure.
     let resp = tokio::time::timeout(
         DAEMON_CONTROL_REQUEST_TIMEOUT,
-        create_session_with_agent(&mut client, AgentKind::Claude, env.cwd().to_path_buf()),
+        create_session_with_agent(&mut client, RuntimeRef::claude(), env.cwd().to_path_buf()),
     )
     .await
     .expect("session.new returns before control timeout");
@@ -2074,7 +2078,7 @@ async fn codex_stub_session_publishes_blocked_and_receives_bracketed_input() {
     let created: SessionInfo = {
         let _path = PathGuard::prepend(&bin_dir);
         serde_json::from_value(ok_payload(
-            create_session_with_agent(&mut control, AgentKind::Codex, cwd.to_path_buf()).await,
+            create_session_with_agent(&mut control, RuntimeRef::codex(), cwd.to_path_buf()).await,
         ))
         .expect("codex session info")
     };
@@ -2140,7 +2144,7 @@ async fn claude_stub_session_publishes_screen_blocked_and_receives_plain_input()
     let created: SessionInfo = {
         let _path = PathGuard::prepend(&bin_dir);
         serde_json::from_value(ok_payload(
-            create_session_with_agent(&mut control, AgentKind::Claude, cwd.to_path_buf()).await,
+            create_session_with_agent(&mut control, RuntimeRef::claude(), cwd.to_path_buf()).await,
         ))
         .expect("claude session info")
     };
@@ -2525,7 +2529,7 @@ async fn notification_create_enriches_live_session_context() {
         create_notification(&mut control, notification_params(Some(session.id.clone()))).await;
 
     assert_eq!(created.record.session_id, Some(session.id));
-    assert_eq!(created.record.agent_kind, Some(AgentKind::Shell));
+    assert_eq!(created.record.agent_kind, Some(RuntimeRef::shell()));
 
     let _ = shutdown.send(());
     let _ = handle.await;
@@ -3198,7 +3202,7 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     let alpha: SessionInfo = serde_json::from_value(ok_payload(
         create_worktree_session(
             &mut control,
-            AgentKind::Shell,
+            RuntimeRef::shell(),
             repo.cwd().to_path_buf(),
             "feature/alpha",
         )
@@ -3208,7 +3212,7 @@ async fn two_sessions_on_one_repo_get_distinct_worktrees() {
     let beta: SessionInfo = serde_json::from_value(ok_payload(
         create_worktree_session(
             &mut control,
-            AgentKind::Shell,
+            RuntimeRef::shell(),
             repo.cwd().to_path_buf(),
             "feature/beta",
         )
@@ -3409,7 +3413,7 @@ async fn event_log_records_notification_control_events() {
 /// metadata in the same atomic store.
 #[tokio::test]
 async fn worktree_session_persists_recovery_and_worktree_metadata() {
-    let agent = AgentKind::Claude;
+    let agent = RuntimeRef::claude();
     let bin_name = "claude";
     let native_id = "native-claude-wt-1";
 
@@ -3543,7 +3547,7 @@ async fn worktree_remove_over_the_socket_succeeds_and_fails_closed() {
         let info: SessionInfo = serde_json::from_value(ok_payload(
             create_worktree_session(
                 &mut control,
-                AgentKind::Shell,
+                RuntimeRef::shell(),
                 repo.cwd().to_path_buf(),
                 branch,
             )

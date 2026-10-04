@@ -15,8 +15,8 @@ use knowledge::{
 };
 use pohunek_client::Client;
 use protocol::{
-    method, AgentKind, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent,
-    ConceptMeta, HostCapabilities, ProtocolError, SessionInfo, SessionNewParams,
+    method, AssistantMaterializeParams, AssistantMaterializeResult, ConceptIntent, ConceptMeta,
+    HostCapabilities, ProtocolError, RuntimeRef, SessionInfo, SessionNewParams,
 };
 use serde::Serialize;
 
@@ -371,10 +371,10 @@ fn explicit_agent_is_allowed(capabilities: &HostCapabilities, agent: &str) -> bo
     else {
         return true;
     };
-    // A refused version policy or an unknown base is decided by the host's
+    // A refused version policy or a historical base is decided by the host's
     // report; every other case stays with the daemon's own launch checks.
     runtime.supported != Some(false)
-        && !matches!(runtime.agent_base.as_ref(), Some(AgentKind::Unknown(_)))
+        && !matches!(runtime.agent_base.as_ref(), Some(RuntimeRef::Historical(_)))
 }
 
 fn validate_target(config: &HostConfig, params: &LaunchParams) -> Result<(), AssistantError> {

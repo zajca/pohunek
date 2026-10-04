@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::AgentKind;
+use crate::RuntimeRef;
 
 /// Gate flag the daemon sets so the agent hook knows it was launched by pohunek.
 ///
@@ -61,7 +61,7 @@ pub struct IntegrationInstallParams {
     /// hook for every supported agent whose config dir is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub agent: Option<AgentKind>,
+    pub agent: Option<RuntimeRef>,
 }
 
 /// Result returned by `integration.install`.
@@ -85,7 +85,7 @@ pub struct IntegrationStatusParams {
     /// supported hook agent regardless of whether its config dir exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub agent: Option<AgentKind>,
+    pub agent: Option<RuntimeRef>,
 }
 
 /// Result returned by `integration.status`.
@@ -103,7 +103,7 @@ pub struct IntegrationStatusResult {
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationAgentStatus.ts"))]
 pub struct IntegrationAgentStatus {
     /// Agent the report describes.
-    pub agent: AgentKind,
+    pub agent: RuntimeRef,
     /// Whether the agent's configuration directory exists.
     pub available: bool,
     /// Expected managed asset paths, including files that are absent.
@@ -159,7 +159,7 @@ pub enum IntegrationInstallState {
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallReport.ts"))]
 pub struct IntegrationInstallReport {
     /// Agent the hook was installed for.
-    pub agent: AgentKind,
+    pub agent: RuntimeRef,
     /// Absolute path of the installed hook script.
     pub hook_path: String,
     /// Config files the installer created or merged into (settings.json /
@@ -186,7 +186,7 @@ pub struct IntegrationInstallReport {
 )]
 pub struct IntegrationUninstallParams {
     /// Agent to remove the managed hooks for.
-    pub agent: AgentKind,
+    pub agent: RuntimeRef,
 }
 
 /// Outcome of removing one agent's managed hooks.
@@ -210,7 +210,7 @@ pub enum IntegrationUninstallState {
 )]
 pub struct IntegrationUninstallReport {
     /// Agent whose managed hooks were removed.
-    pub agent: AgentKind,
+    pub agent: RuntimeRef,
     /// Whether anything was removed.
     pub state: IntegrationUninstallState,
     /// Managed hook scripts that were deleted.
@@ -252,7 +252,7 @@ pub struct IntegrationDoctorParams {
     /// every supported hook agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub agent: Option<AgentKind>,
+    pub agent: Option<RuntimeRef>,
 }
 
 /// Stable identifier of one doctor finding.
@@ -345,7 +345,7 @@ pub struct IntegrationFinding {
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationAgentDoctor.ts"))]
 pub struct IntegrationAgentDoctor {
     /// Agent the diagnosis describes.
-    pub agent: AgentKind,
+    pub agent: RuntimeRef,
     /// Whether the diagnosis has no error finding.
     pub ok: bool,
     /// The read-only status the findings were derived from; absent when an

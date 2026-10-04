@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{version::ProtocolVersion, AgentKind};
+use crate::{version::ProtocolVersion, RuntimeRef};
 
 /// One agent runtime's availability on a host.
 ///
@@ -27,10 +27,10 @@ use crate::{version::ProtocolVersion, AgentKind};
 pub struct AgentRuntime {
     /// Agent profile or built-in base name this runtime entry describes.
     pub agent: String,
-    /// Compiled adapter used to launch this runtime, when reported by the daemon.
+    /// Runtime identity this entry launches, when reported by the daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub agent_base: Option<AgentKind>,
+    pub agent_base: Option<RuntimeRef>,
     /// Whether the agent's backing binary is available on the host.
     pub available: bool,
     /// Resolved path to the agent binary, when one was found.

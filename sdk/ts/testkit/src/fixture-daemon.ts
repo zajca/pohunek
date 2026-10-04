@@ -19,7 +19,7 @@ import {
   MAX_WORKER_INSTANCE_ID_BYTES,
   PROTOCOL_VERSION,
   type AgentActivity,
-  type AgentKind,
+  type RuntimeRef,
   type AgentRuntime,
   type ErrorClass,
   type HostCapabilities,
@@ -1439,7 +1439,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return Array.from(this.projects.values()).find((project) => project.id === reference || project.label === reference);
   }
 
-  private buildSession(params: SessionNewParams, agentBase: AgentKind): SessionInfo {
+  private buildSession(params: SessionNewParams, agentBase: RuntimeRef): SessionInfo {
     const now = timestamp();
     const id = `${SESSION_ID_PREFIX}${this.nextSessionId}`;
     this.nextSessionId += 1;
@@ -2096,7 +2096,7 @@ function isNotificationCreateParams(value: NotificationCreateParams): boolean {
     typeof value.body === "string" &&
     optionalStringRecord(value.metadata) &&
     optionalString(value.session_id) &&
-    optionalAgentKind(value.agent_kind) &&
+    optionalRuntimeRef(value.agent_kind) &&
     optionalString(value.source_id) &&
     optionalString(value.dedupe_key) &&
     optionalString(value.project_id)
@@ -2515,7 +2515,7 @@ function protocolError(errorClass: ErrorClass, code: string, msg: string, recove
   return { class: errorClass, code, msg, recover };
 }
 
-function agentBaseFor(agent: string): AgentKind {
+function agentBaseFor(agent: string): RuntimeRef {
   if (agent === "codex") {
     return "codex";
   }
@@ -2528,7 +2528,7 @@ function agentBaseFor(agent: string): AgentKind {
   return "shell";
 }
 
-function agentCapabilities(base: AgentKind): { readonly resume: boolean; readonly fork: boolean } {
+function agentCapabilities(base: RuntimeRef): { readonly resume: boolean; readonly fork: boolean } {
   if (base === "hermes") {
     return { resume: true, fork: false };
   }
@@ -2538,7 +2538,7 @@ function agentCapabilities(base: AgentKind): { readonly resume: boolean; readonl
   return { resume: false, fork: false };
 }
 
-function isLaunchableAgentBase(agent: AgentKind): boolean {
+function isLaunchableAgentBase(agent: RuntimeRef): boolean {
   return agent === "shell" || agent === "codex" || agent === "claude" || agent === "hermes";
 }
 
@@ -2570,7 +2570,7 @@ function optionalStringRecord(value: unknown): boolean {
   return value === undefined || isStringRecord(value);
 }
 
-function optionalAgentKind(value: unknown): boolean {
+function optionalRuntimeRef(value: unknown): boolean {
   return value === undefined || typeof value === "string";
 }
 

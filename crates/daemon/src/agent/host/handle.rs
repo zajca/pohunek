@@ -3,12 +3,12 @@
 //! One [`RuntimeHost`] is built when the session registry starts and is
 //! cloned wherever a runtime identity has to be resolved: agent-name
 //! resolution, launch, resume, fork and the mutation guards. It is the only
-//! place that turns an [`AgentKind`] into a launchable [`RuntimeDefinition`],
+//! place that turns an [`RuntimeRef`] into a launchable [`RuntimeDefinition`],
 //! so every caller answers an unknown runtime with the same stable error.
 
 use std::sync::Arc;
 
-use protocol::{AgentKind, ProtocolError, RuntimeId};
+use protocol::{ProtocolError, RuntimeId, RuntimeRef};
 
 use super::builtin::BuiltinSource;
 use super::definition::{LaunchProgram, RuntimeDefinition};
@@ -119,16 +119,17 @@ impl RuntimeHost {
         self.registry.resolve(runtime_id)
     }
 
-    /// Resolves the runtime an [`AgentKind`] names.
+    /// Resolves the runtime a [`RuntimeRef`] names.
     ///
     /// # Errors
     ///
     /// Returns `agent_kind_unsupported` for a value that is not a valid runtime
     /// id and `runtime_not_installed` for a valid id no definition backs.
-    pub fn resolve_kind(&self, kind: &AgentKind) -> Result<&Arc<RuntimeDefinition>, ProtocolError> {
-        let reference = kind.as_runtime_ref();
-        let runtime_id = reference.launchable()?;
-        self.registry.resolve(runtime_id)
+    pub fn resolve_ref(
+        &self,
+        reference: &RuntimeRef,
+    ) -> Result<&Arc<RuntimeDefinition>, ProtocolError> {
+        self.registry.resolve(reference.launchable()?)
     }
 }
 

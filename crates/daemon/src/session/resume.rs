@@ -231,7 +231,7 @@ impl SessionRegistry {
             .inner
             .profiles
             .runtimes()
-            .resolve_kind(&binding.agent_base)?;
+            .resolve_ref(&binding.agent_base)?;
         host::check_pin(&binding.launch_binding, definition)?;
         Ok(Arc::clone(definition))
     }

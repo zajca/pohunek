@@ -670,7 +670,7 @@ mod tests {
     use std::{collections::BTreeMap, path::PathBuf};
 
     use protocol::{
-        AgentKind, RuntimeGeneration, RuntimeState, SessionCapabilities, SessionId, SessionInfo,
+        RuntimeGeneration, RuntimeRef, RuntimeState, SessionCapabilities, SessionId, SessionInfo,
         SessionRetentionPolicy, SessionRetentionReason, SessionRuntime, SessionState, StateSource,
     };
     use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
@@ -703,7 +703,7 @@ mod tests {
             capabilities: SessionCapabilities::default(),
             name: None,
             agent: "shell".to_owned(),
-            agent_base: AgentKind::Shell,
+            agent_base: RuntimeRef::shell(),
             cwd: PathBuf::from("/work"),
             cwd_source: None,
             pid: 1,

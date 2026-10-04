@@ -9,8 +9,8 @@ use crate::runtime::WriteReservation;
 
 use super::{
     broadcast, session_not_found, session_not_running, unavailable_runtime_error, warn,
-    worker_error_to_protocol, ActivityEvidence, AgentActivity, AgentKind, Duration, ErrorClass,
-    InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle,
+    worker_error_to_protocol, ActivityEvidence, AgentActivity, Duration, ErrorClass, InputRules,
+    LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle, RuntimeRef,
     SessionEntry, SessionId, SessionInputParams, SessionInputResult, SessionInputWait,
     SessionRegistry, SessionRegistryConfig, SessionState, Worker,
 };
@@ -649,10 +649,10 @@ pub(super) fn input_rules_for_definition(
 /// without an installed definition gets unrestricted, unframed input.
 pub(super) fn input_rules_for_agent(
     host: &RuntimeHost,
-    agent: &AgentKind,
+    agent: &RuntimeRef,
     config: &SessionRegistryConfig,
 ) -> InputRules {
-    host.resolve_kind(agent).map_or_else(
+    host.resolve_ref(agent).map_or_else(
         |_unresolved| crate::agent::input_rules_for_kind(host, agent),
         |definition| input_rules_for_definition(definition, config),
     )

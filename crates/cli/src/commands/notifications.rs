@@ -73,7 +73,7 @@ pub(crate) struct ListFilters {
     pub(crate) provider: Option<String>,
     /// Agent kind filter; applied client-side because the daemon list API does
     /// not expose an agent filter.
-    pub(crate) agent: Option<protocol::AgentKind>,
+    pub(crate) agent: Option<protocol::RuntimeRef>,
     /// Session id filter.
     pub(crate) session: Option<String>,
     /// Maximum number of records to return.
@@ -221,15 +221,12 @@ pub(crate) fn parse_notification_severity(value: &str) -> Result<NotificationSev
     }
 }
 
-/// Parse an agent kind wire value.
-pub(crate) fn parse_agent_kind(value: &str) -> Result<protocol::AgentKind, String> {
-    match value {
-        "shell" => Ok(protocol::AgentKind::Shell),
-        "codex" => Ok(protocol::AgentKind::Codex),
-        "claude" => Ok(protocol::AgentKind::Claude),
-        "hermes" => Ok(protocol::AgentKind::Hermes),
-        other => Err(format!("invalid agent kind '{other}'")),
-    }
+/// Parse an agent kind: any grammar-valid runtime id, installed or not, since
+/// the filter only compares against the kinds notification records carry.
+pub(crate) fn parse_agent_kind(value: &str) -> Result<protocol::RuntimeRef, String> {
+    protocol::RuntimeId::parse(value)
+        .map(protocol::RuntimeRef::from)
+        .map_err(|_error| format!("invalid agent kind '{value}'"))
 }
 
 /// Parse a policy provider selector.
@@ -556,7 +553,7 @@ async fn list_on_target(
     paths: &Paths,
     target: HostTarget,
     params: NotificationListParams,
-    agent: Option<protocol::AgentKind>,
+    agent: Option<protocol::RuntimeRef>,
 ) -> Result<NotificationListResult, protocol::ProtocolError> {
     let client = connect_target(paths, &target)
         .await
@@ -745,7 +742,7 @@ fn set_kind_enabled(
 #[cfg(test)]
 fn filter_rows_by_agent(
     rows: &[HostedNotification],
-    agent: Option<&protocol::AgentKind>,
+    agent: Option<&protocol::RuntimeRef>,
 ) -> Vec<HostedNotification> {
     rows.iter()
         .filter(|row| agent.is_none_or(|wanted| row.record.agent_kind.as_ref() == Some(wanted)))
@@ -1097,7 +1094,7 @@ mod tests {
             metadata: BTreeMap::new(),
             created_at: "2026-07-03T10:00:00Z".to_owned(),
             session_id: Some(protocol::SessionId("s-1".to_owned())),
-            agent_kind: Some(protocol::AgentKind::Codex),
+            agent_kind: Some(protocol::RuntimeRef::codex()),
             source_id: Some(format!("codex:{id}")),
             dedupe_key: Some("attention:s-1".to_owned()),
             project_id: None,
@@ -1154,7 +1151,7 @@ mod tests {
             kind: Some(NotificationKind::ApprovalRequired),
             severity: Some(NotificationSeverity::ActionRequired),
             provider: Some("codex".to_owned()),
-            agent: Some(protocol::AgentKind::Codex),
+            agent: Some(protocol::RuntimeRef::codex()),
             session: Some("s-1".to_owned()),
             limit: Some(25),
             cursor: Some("next".to_owned()),
@@ -1308,7 +1305,10 @@ mod tests {
 
     #[test]
     fn hermes_is_a_selectable_agent_and_policy_provider() {
-        assert_eq!(parse_agent_kind("hermes"), Ok(protocol::AgentKind::Hermes));
+        assert_eq!(
+            parse_agent_kind("hermes"),
+            Ok(protocol::RuntimeRef::hermes())
+        );
         assert_eq!(parse_policy_provider("hermes"), Ok(PolicyProvider::Hermes));
 
         let mut policy = policy();
@@ -1369,14 +1369,46 @@ mod tests {
             HostedNotification {
                 host_id: "host-b".to_owned(),
                 record: protocol::NotificationRecord {
-                    agent_kind: Some(protocol::AgentKind::Claude),
+                    agent_kind: Some(protocol::RuntimeRef::claude()),
                     ..record("n-2", NotificationStatus::Unread)
                 },
             },
         ];
 
-        let filtered = filter_rows_by_agent(&rows, Some(&protocol::AgentKind::Codex));
+        let filtered = filter_rows_by_agent(&rows, Some(&protocol::RuntimeRef::codex()));
 
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].record.id, NotificationId("n-1".to_owned()));
+    }
+
+    #[test]
+    fn agent_filter_accepts_any_valid_runtime_id_and_rejects_the_rest() {
+        let custom = parse_agent_kind("acme").expect("a valid runtime id parses");
+        assert_eq!(custom, protocol::RuntimeRef::from_wire("acme"));
+        for invalid in ["Not An Id", "", "a/b"] {
+            assert_eq!(
+                parse_agent_kind(invalid),
+                Err(format!("invalid agent kind '{invalid}'"))
+            );
+        }
+
+        let rows = vec![
+            HostedNotification {
+                host_id: "host-b".to_owned(),
+                record: protocol::NotificationRecord {
+                    agent_kind: Some(custom.clone()),
+                    ..record("n-1", NotificationStatus::Unread)
+                },
+            },
+            HostedNotification {
+                host_id: "host-b".to_owned(),
+                record: protocol::NotificationRecord {
+                    agent_kind: Some(protocol::RuntimeRef::codex()),
+                    ..record("n-2", NotificationStatus::Unread)
+                },
+            },
+        ];
+        let filtered = filter_rows_by_agent(&rows, Some(&custom));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].record.id, NotificationId("n-1".to_owned()));
     }

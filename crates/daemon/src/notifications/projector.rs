@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use protocol::{
-    event, AgentActivity, AgentKind, Event, NotificationCreateParams, NotificationKind,
-    NotificationSeverity, NotificationSource, SessionId, SessionInfo, SessionState,
+    event, AgentActivity, Event, NotificationCreateParams, NotificationKind, NotificationSeverity,
+    NotificationSource, RuntimeRef, SessionId, SessionInfo, SessionState,
 };
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -586,7 +586,7 @@ struct DerivedNotification {
     title: String,
     body: String,
     metadata: BTreeMap<String, String>,
-    agent_kind: Option<AgentKind>,
+    agent_kind: Option<RuntimeRef>,
     project_id: Option<String>,
     dedupe_key: Option<String>,
 }
@@ -619,7 +619,7 @@ where
     }
 }
 
-fn session_agent_kind(session: &SessionInfo) -> AgentKind {
+fn session_agent_kind(session: &SessionInfo) -> RuntimeRef {
     session
         .active_agent_base
         .clone()
@@ -631,9 +631,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use protocol::{
-        event, AgentActivity, AgentKind, Event, NotificationCreateParams, NotificationKind,
+        event, AgentActivity, Event, NotificationCreateParams, NotificationKind,
         NotificationKindPolicy, NotificationListParams, NotificationSeverity, NotificationSource,
-        NotificationStatus, SessionId, SessionInfo, SessionState, StateSource,
+        NotificationStatus, RuntimeRef, SessionId, SessionInfo, SessionState, StateSource,
     };
     use serde_json::json;
 
@@ -700,7 +700,7 @@ mod tests {
             external: Some(false),
             name: None,
             agent: "codex".to_owned(),
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             cwd: std::path::PathBuf::from("/workspace/project"),
             cwd_source: Some(protocol::CwdSource::Launch),
             pid: 1234,
@@ -767,7 +767,7 @@ mod tests {
             body: "Codex needs approval.".to_owned(),
             metadata: BTreeMap::new(),
             session_id: Some(session_id.clone()),
-            agent_kind: Some(AgentKind::Codex),
+            agent_kind: Some(RuntimeRef::codex()),
             source_id: Some("codex:s-1:permission:1".to_owned()),
             dedupe_key: Some(attention_dedupe_key(&session_id)),
             project_id: Some("p-test".to_owned()),
@@ -788,7 +788,7 @@ mod tests {
             body: "Codex completed a turn.".to_owned(),
             metadata: BTreeMap::new(),
             session_id: Some(session_id.clone()),
-            agent_kind: Some(AgentKind::Codex),
+            agent_kind: Some(RuntimeRef::codex()),
             source_id: Some("codex:s-1:stop:1".to_owned()),
             dedupe_key: Some(format!("turn:{}", session_id.0)),
             project_id: Some("p-test".to_owned()),

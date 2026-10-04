@@ -34,8 +34,8 @@ is not sufficient for launch decisions. If runtime inventory is unavailable, a
 client fails closed instead of inventing a fallback set.
 
 `host.inspect.runtimes` is the availability and support decision point. Each
-entry has a user-facing `agent`; optional `agent_base` identifies its compiled
-adapter. For Hermes, `version` and `supported` enforce the pinned 0.20.0 policy:
+entry has a user-facing `agent`; optional `agent_base` is the `RuntimeRef` of the runtime
+it launches. For Hermes, `version` and `supported` enforce the pinned 0.20.0 policy:
 an unavailable executable omits them, while a detected unparseable or other
 version reports `supported: false`. Launch a runtime only when `available` is true and `supported` is not
 `false`; a present runtime with a version policy (Hermes) always reports

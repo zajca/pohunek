@@ -18,9 +18,9 @@ use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use protocol::{
-    AgentKind, ErrorClass, IntegrationAgentStatus, IntegrationInstallReport,
-    IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
-    IntegrationStatusParams, IntegrationStatusResult, ProtocolError, EXPECTED_INTEGRATION_VERSION,
+    ErrorClass, IntegrationAgentStatus, IntegrationInstallReport, IntegrationInstallResult,
+    IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams, IntegrationStatusResult,
+    ProtocolError, RuntimeId, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -208,45 +208,42 @@ pub struct InstallPaths {
 ///
 /// # Errors
 ///
-/// `agent_not_installable` for `AgentKind::Shell`, `agent_config_dir_missing`
+/// `agent_not_installable` for the shell runtime, `agent_config_dir_missing`
 /// when a requested (or, for `None`, every) agent config dir is absent, or any
 /// underlying I/O / settings error.
-pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, ProtocolError> {
+pub fn install(agent: Option<RuntimeRef>) -> Result<IntegrationInstallResult, ProtocolError> {
     let installed = match agent {
-        Some(AgentKind::Claude) => {
-            vec![report(
-                AgentKind::Claude,
-                &install_claude(&claude_config_dir()?)?,
-            )]
-        }
-        Some(AgentKind::Codex) => {
-            vec![report(
-                AgentKind::Codex,
-                &install_codex(&codex_config_dir()?)?,
-            )]
-        }
-        Some(AgentKind::Shell) => {
-            return Err(ProtocolError::new(
-                ErrorClass::Runtime,
-                "agent_not_installable",
-                "shell sessions have no hook integration",
-                None,
-            ));
-        }
-        Some(AgentKind::Hermes) => {
-            return Err(ProtocolError::new(
-                ErrorClass::Runtime,
-                "agent_not_installable",
-                "Hermes integration is not available in this milestone",
-                None,
-            ));
-        }
-        Some(AgentKind::Unknown(agent)) => {
-            return Err(ProtocolError::agent_kind_unsupported(&agent));
-        }
+        Some(agent) => install_one(&agent)?,
         None => install_all_present()?,
     };
     Ok(IntegrationInstallResult { installed })
+}
+
+/// Installs the hook for the one agent a caller named.
+fn install_one(agent: &RuntimeRef) -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
+    match agent.as_wire() {
+        RuntimeId::CLAUDE => Ok(vec![report(
+            RuntimeRef::claude(),
+            &install_claude(&claude_config_dir()?)?,
+        )]),
+        RuntimeId::CODEX => Ok(vec![report(
+            RuntimeRef::codex(),
+            &install_codex(&codex_config_dir()?)?,
+        )]),
+        RuntimeId::SHELL => Err(ProtocolError::new(
+            ErrorClass::Runtime,
+            "agent_not_installable",
+            "shell sessions have no hook integration",
+            None,
+        )),
+        RuntimeId::HERMES => Err(ProtocolError::new(
+            ErrorClass::Runtime,
+            "agent_not_installable",
+            "Hermes integration is not available in this milestone",
+            None,
+        )),
+        other => Err(status_unsupported(other)),
+    }
 }
 
 /// Inspect managed Codex and Claude hook files without writing anything.
@@ -260,13 +257,15 @@ pub fn install(agent: Option<AgentKind>) -> Result<IntegrationInstallResult, Pro
 /// Returns [`ProtocolError`] for unsupported agents or when the agent config
 /// directory cannot be resolved.
 pub fn status(params: IntegrationStatusParams) -> Result<IntegrationStatusResult, ProtocolError> {
-    let agents = match params.agent {
-        Some(AgentKind::Claude) => vec![reported_agent_status(StatusAgent::Claude)],
-        Some(AgentKind::Codex) => vec![reported_agent_status(StatusAgent::Codex)],
-        Some(AgentKind::Shell) => return Err(status_unsupported(&AgentKind::Shell)),
-        Some(AgentKind::Hermes) => return Err(status_unsupported(&AgentKind::Hermes)),
-        Some(AgentKind::Unknown(value)) => {
-            return Err(ProtocolError::agent_kind_unsupported(&value));
+    let IntegrationStatusParams { agent } = params;
+    let agents = match agent.as_ref().map(RuntimeRef::as_wire) {
+        Some(RuntimeId::CLAUDE) => vec![reported_agent_status(StatusAgent::Claude)],
+        Some(RuntimeId::CODEX) => vec![reported_agent_status(StatusAgent::Codex)],
+        Some(unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES)) => {
+            return Err(status_unsupported(unsupported));
+        }
+        Some(other) => {
+            return Err(status_unsupported(other));
         }
         None => vec![
             reported_agent_status(StatusAgent::Claude),
@@ -305,19 +304,22 @@ enum StatusAgent {
 }
 
 impl StatusAgent {
-    fn kind(self) -> AgentKind {
+    fn kind(self) -> RuntimeRef {
         match self {
-            Self::Claude => AgentKind::Claude,
-            Self::Codex => AgentKind::Codex,
+            Self::Claude => RuntimeRef::claude(),
+            Self::Codex => RuntimeRef::codex(),
         }
     }
 }
 
-fn status_unsupported(agent: &AgentKind) -> ProtocolError {
+/// `agent_not_installable` for an agent whose runtime is installed but has no
+/// daemon-managed hook integration. Callers validate the runtime against the
+/// registry first, so a non-installed or historical value never reaches it.
+fn status_unsupported(agent: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         "agent_not_installable",
-        format!("{} has no daemon-managed hook integration", agent.as_wire()),
+        format!("{agent} has no daemon-managed hook integration"),
         None,
     )
 }
@@ -1601,14 +1603,14 @@ fn install_all_present() -> Result<Vec<IntegrationInstallReport>, ProtocolError>
         return Err(config_dir_is_symlink(&claude_dir));
     }
     if claude_dir.is_dir() {
-        installed.push(report(AgentKind::Claude, &install_claude(&claude_dir)?));
+        installed.push(report(RuntimeRef::claude(), &install_claude(&claude_dir)?));
     }
     let codex_dir = codex_config_dir()?;
     if config_path_kind(&codex_dir) == ConfigPath::Symlink {
         return Err(config_dir_is_symlink(&codex_dir));
     }
     if codex_dir.is_dir() {
-        installed.push(report(AgentKind::Codex, &install_codex(&codex_dir)?));
+        installed.push(report(RuntimeRef::codex(), &install_codex(&codex_dir)?));
     }
     if installed.is_empty() {
         return Err(ProtocolError::new(
@@ -1625,7 +1627,7 @@ fn install_all_present() -> Result<Vec<IntegrationInstallReport>, ProtocolError>
     Ok(installed)
 }
 
-fn report(agent: AgentKind, paths: &InstallPaths) -> IntegrationInstallReport {
+fn report(agent: RuntimeRef, paths: &InstallPaths) -> IntegrationInstallReport {
     IntegrationInstallReport {
         agent,
         hook_path: paths.hook_path.display().to_string(),
@@ -1673,7 +1675,7 @@ fn install_claude_gated(
         return Err(config_dir_is_symlink(claude_dir));
     }
     if !claude_dir.is_dir() {
-        return Err(config_dir_missing(&AgentKind::Claude, claude_dir));
+        return Err(config_dir_missing(&RuntimeRef::claude(), claude_dir));
     }
 
     let config_root = TrustedDir::open(claude_dir, "Claude config directory")?;
@@ -1851,7 +1853,7 @@ fn install_codex_gated(
         return Err(config_dir_is_symlink(codex_dir));
     }
     if !codex_dir.is_dir() {
-        return Err(config_dir_missing(&AgentKind::Codex, codex_dir));
+        return Err(config_dir_missing(&RuntimeRef::codex(), codex_dir));
     }
 
     let config_root = TrustedDir::open(codex_dir, "Codex config directory")?;
@@ -2910,17 +2912,17 @@ fn json_pretty(path: &Path, value: &Value) -> Result<String, ProtocolError> {
         .map_err(|error| settings_invalid(path, &format!("could not serialize settings: {error}")))
 }
 
-fn config_dir_missing(agent: &AgentKind, dir: &Path) -> ProtocolError {
-    let (name, hint) = match agent {
-        AgentKind::Claude => ("claude", "install Claude Code first"),
-        AgentKind::Codex => ("codex", "install Codex first"),
-        AgentKind::Shell => ("shell", "shells have no hook integration"),
-        AgentKind::Hermes => (
+fn config_dir_missing(agent: &RuntimeRef, dir: &Path) -> ProtocolError {
+    let (name, hint) = match agent.as_wire() {
+        RuntimeId::CLAUDE => ("claude", "install Claude Code first"),
+        RuntimeId::CODEX => ("codex", "install Codex first"),
+        RuntimeId::SHELL => ("shell", "shells have no hook integration"),
+        RuntimeId::HERMES => (
             "hermes",
             "Hermes integration is not available in this milestone",
         ),
-        AgentKind::Unknown(ref value) => {
-            return ProtocolError::agent_kind_unsupported(value);
+        other => {
+            return status_unsupported(other);
         }
     };
     ProtocolError::new(
@@ -2977,7 +2979,7 @@ mod tests {
 
     use pohunek_test_support::process_env::ProcessEnv;
     use protocol::method;
-    use protocol::AgentKind;
+    use protocol::{RuntimeId, RuntimeRef};
     use serde_json::{json, Value};
 
     use super::{
@@ -4538,19 +4540,23 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         for (name, agent, relative_path) in [
-            ("Claude settings.json", AgentKind::Claude, "settings.json"),
-            ("Codex hooks.json", AgentKind::Codex, "hooks.json"),
-            ("Codex config.toml", AgentKind::Codex, "config.toml"),
+            (
+                "Claude settings.json",
+                RuntimeRef::claude(),
+                "settings.json",
+            ),
+            ("Codex hooks.json", RuntimeRef::codex(), "hooks.json"),
+            ("Codex config.toml", RuntimeRef::codex(), "config.toml"),
         ] {
             let config_dir = scoped_dir(&format!("status-registration-mode-{name}"));
-            match agent {
-                AgentKind::Claude => {
+            match agent.as_wire() {
+                RuntimeId::CLAUDE => {
                     install_claude(&config_dir).expect("install Claude fixture");
                 }
-                AgentKind::Codex => {
+                RuntimeId::CODEX => {
                     install_codex(&config_dir).expect("install Codex fixture");
                 }
-                AgentKind::Shell | AgentKind::Hermes | AgentKind::Unknown(_) => {
+                _ => {
                     unreachable!("test uses managed agents")
                 }
             }
@@ -4590,19 +4596,23 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         for (name, agent, relative_path) in [
-            ("Claude settings.json", AgentKind::Claude, "settings.json"),
-            ("Codex hooks.json", AgentKind::Codex, "hooks.json"),
-            ("Codex config.toml", AgentKind::Codex, "config.toml"),
+            (
+                "Claude settings.json",
+                RuntimeRef::claude(),
+                "settings.json",
+            ),
+            ("Codex hooks.json", RuntimeRef::codex(), "hooks.json"),
+            ("Codex config.toml", RuntimeRef::codex(), "config.toml"),
         ] {
             let config_dir = scoped_dir(&format!("status-registration-symlink-{name}"));
-            match agent {
-                AgentKind::Claude => {
+            match agent.as_wire() {
+                RuntimeId::CLAUDE => {
                     install_claude(&config_dir).expect("install Claude fixture");
                 }
-                AgentKind::Codex => {
+                RuntimeId::CODEX => {
                     install_codex(&config_dir).expect("install Codex fixture");
                 }
-                AgentKind::Shell | AgentKind::Hermes | AgentKind::Unknown(_) => {
+                _ => {
                     unreachable!("test uses managed agents")
                 }
             }
@@ -4791,7 +4801,7 @@ mod tests {
     fn missing_claude_hooks_directory_is_reinstallable_not_installed() {
         let claude = scoped_dir("status-missing-claude-hooks-parent");
 
-        let report = explicit_status(&claude, AgentKind::Claude);
+        let report = explicit_status(&claude, RuntimeRef::claude());
 
         assert_eq!(
             report.state,
@@ -4864,7 +4874,7 @@ mod tests {
         let codex = scoped_dir("status-safe-config-trust-anchor");
         install_codex(&codex).expect("install Codex fixture");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Current);
         assert_eq!(report.recovery, protocol::IntegrationRecovery::None);
@@ -4877,20 +4887,20 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         for (name, agent, mode) in [
-            ("codex config root", AgentKind::Codex, 0o775),
-            ("claude hooks directory", AgentKind::Claude, 0o757),
+            ("codex config root", RuntimeRef::codex(), 0o775),
+            ("claude hooks directory", RuntimeRef::claude(), 0o757),
         ] {
             let config_dir = scoped_dir(&format!("status-writable-parent-{name}"));
-            let parent = match agent {
-                AgentKind::Codex => {
+            let parent = match agent.as_wire() {
+                RuntimeId::CODEX => {
                     install_codex(&config_dir).expect("install Codex fixture");
                     config_dir.clone()
                 }
-                AgentKind::Claude => {
+                RuntimeId::CLAUDE => {
                     install_claude(&config_dir).expect("install Claude fixture");
                     config_dir.join("hooks")
                 }
-                AgentKind::Shell | AgentKind::Hermes | AgentKind::Unknown(_) => {
+                _ => {
                     unreachable!("test uses managed agents")
                 }
             };
@@ -4948,7 +4958,7 @@ mod tests {
                 None => fs::remove_file(&path).expect("remove managed asset"),
             }
 
-            let report = explicit_status(&codex, AgentKind::Codex);
+            let report = explicit_status(&codex, RuntimeRef::codex());
 
             assert_eq!(
                 report.state,
@@ -4986,7 +4996,7 @@ mod tests {
         );
         fs::write(notify_path, invalid_asset).expect("write invalid marker fixture");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.installed_version, None);
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
@@ -5003,7 +5013,7 @@ mod tests {
         )
         .expect("write oversized asset");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
@@ -5023,7 +5033,7 @@ mod tests {
         )
         .expect("write oversized config");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(
@@ -5086,7 +5096,7 @@ mod tests {
         fs::remove_file(&hook_path).expect("remove managed hook");
         symlink(&sentinel_path, &hook_path).expect("link managed hook to sentinel");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(
@@ -5124,7 +5134,7 @@ mod tests {
         fs::rename(&hooks_path, &real_hooks_path).expect("move real hooks directory");
         symlink(&real_hooks_path, &hooks_path).expect("link managed asset parent");
 
-        let report = explicit_status(&claude, AgentKind::Claude);
+        let report = explicit_status(&claude, RuntimeRef::claude());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(
@@ -5144,7 +5154,7 @@ mod tests {
         fs::write(claude.join("hooks"), "not a directory\n")
             .expect("replace managed asset parent with a file");
 
-        let report = explicit_status(&claude, AgentKind::Claude);
+        let report = explicit_status(&claude, RuntimeRef::claude());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(
@@ -5171,7 +5181,7 @@ mod tests {
         permissions.set_mode(0o777);
         fs::set_permissions(&hook_path, permissions).expect("make managed hook unsafe");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(
@@ -5201,7 +5211,7 @@ mod tests {
         fs::set_permissions(&hook_path, fs::Permissions::from_mode(0o4755))
             .expect("set managed hook setuid bit");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
@@ -5253,7 +5263,7 @@ mod tests {
         )
         .expect("write modified settings");
 
-        let report = explicit_status(&claude, AgentKind::Claude);
+        let report = explicit_status(&claude, RuntimeRef::claude());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert!(report
@@ -5276,7 +5286,7 @@ mod tests {
         )
         .expect("write hooks with duplicate");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         let warning = report
@@ -5311,7 +5321,7 @@ mod tests {
         )
         .expect("write sibling handler fixture");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
@@ -5321,7 +5331,7 @@ mod tests {
             .any(|warning| warning.contains("Codex SessionStart registration")));
 
         install_codex(&codex).expect("normalize managed Codex group");
-        let repaired = explicit_status(&codex, AgentKind::Codex);
+        let repaired = explicit_status(&codex, RuntimeRef::codex());
         assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
         let repaired_hooks = read_json(&hooks_path);
         assert_eq!(
@@ -5360,7 +5370,7 @@ mod tests {
         .expect("append stale trust table");
         fs::write(&config_path, config).expect("append stale trust entry");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
@@ -5370,7 +5380,7 @@ mod tests {
             .any(|warning| warning.contains("stale or unexpected keys")));
 
         install_codex(&codex).expect("remove stale managed trust table");
-        let repaired = explicit_status(&codex, AgentKind::Codex);
+        let repaired = explicit_status(&codex, RuntimeRef::codex());
         let repaired_config = fs::read_to_string(&config_path).expect("read repaired config");
         assert_eq!(repaired.state, protocol::IntegrationInstallState::Current);
         assert!(!repaired_config.contains(&stale_key));
@@ -5392,7 +5402,7 @@ mod tests {
         )
         .expect("write invalid hooks structure");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(
             report.recovery,
@@ -5409,14 +5419,14 @@ mod tests {
 
     #[test]
     fn non_object_registration_root_requires_manual_repair_for_each_provider() {
-        for agent in [AgentKind::Claude, AgentKind::Codex] {
+        for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
             let config_dir = scoped_dir(&format!("status-non-object-root-{}", agent.as_wire()));
-            let registration_path = match &agent {
-                AgentKind::Claude => {
+            let registration_path = match agent.as_wire() {
+                RuntimeId::CLAUDE => {
                     install_claude(&config_dir).expect("install Claude fixture");
                     config_dir.join("settings.json")
                 }
-                AgentKind::Codex => {
+                RuntimeId::CODEX => {
                     install_codex(&config_dir).expect("install Codex fixture");
                     config_dir.join("hooks.json")
                 }
@@ -5432,9 +5442,9 @@ mod tests {
                 "{}",
                 agent.as_wire()
             );
-            let error = match &agent {
-                AgentKind::Claude => install_claude(&config_dir),
-                AgentKind::Codex => install_codex(&config_dir),
+            let error = match agent.as_wire() {
+                RuntimeId::CLAUDE => install_claude(&config_dir),
+                RuntimeId::CODEX => install_codex(&config_dir),
                 _ => unreachable!("test uses only managed hook agents"),
             }
             .expect_err("non-object registration root must fail install");
@@ -5444,14 +5454,14 @@ mod tests {
 
     #[test]
     fn missing_hooks_object_is_reinstallable_for_each_provider() {
-        for agent in [AgentKind::Claude, AgentKind::Codex] {
+        for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
             let config_dir = scoped_dir(&format!("status-missing-hooks-{}", agent.as_wire()));
-            let registration_path = match &agent {
-                AgentKind::Claude => {
+            let registration_path = match agent.as_wire() {
+                RuntimeId::CLAUDE => {
                     install_claude(&config_dir).expect("install Claude fixture");
                     config_dir.join("settings.json")
                 }
-                AgentKind::Codex => {
+                RuntimeId::CODEX => {
                     install_codex(&config_dir).expect("install Codex fixture");
                     config_dir.join("hooks.json")
                 }
@@ -5463,9 +5473,9 @@ mod tests {
 
             assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
             assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
-            match &agent {
-                AgentKind::Claude => install_claude(&config_dir),
-                AgentKind::Codex => install_codex(&config_dir),
+            match agent.as_wire() {
+                RuntimeId::CLAUDE => install_claude(&config_dir),
+                RuntimeId::CODEX => install_codex(&config_dir),
                 _ => unreachable!("test uses only managed hook agents"),
             }
             .expect("reinstall missing hooks object");
@@ -5478,14 +5488,14 @@ mod tests {
 
     #[test]
     fn reinstall_replaces_owned_command_with_missing_type_for_each_provider() {
-        for agent in [AgentKind::Claude, AgentKind::Codex] {
+        for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
             let config_dir = scoped_dir(&format!("status-owned-command-{}", agent.as_wire()));
-            let registration_path = match &agent {
-                AgentKind::Claude => {
+            let registration_path = match agent.as_wire() {
+                RuntimeId::CLAUDE => {
                     install_claude(&config_dir).expect("install Claude fixture");
                     config_dir.join("settings.json")
                 }
-                AgentKind::Codex => {
+                RuntimeId::CODEX => {
                     install_codex(&config_dir).expect("install Codex fixture");
                     config_dir.join("hooks.json")
                 }
@@ -5505,9 +5515,9 @@ mod tests {
             let report = explicit_status(&config_dir, agent.clone());
 
             assert_eq!(report.recovery, protocol::IntegrationRecovery::Reinstall);
-            match &agent {
-                AgentKind::Claude => install_claude(&config_dir),
-                AgentKind::Codex => install_codex(&config_dir),
+            match agent.as_wire() {
+                RuntimeId::CLAUDE => install_claude(&config_dir),
+                RuntimeId::CODEX => install_codex(&config_dir),
                 _ => unreachable!("test uses only managed hook agents"),
             }
             .expect("reinstall exact owned command identity");
@@ -5527,7 +5537,7 @@ mod tests {
         fs::write(codex.join("config.toml"), "features = true\n")
             .expect("write invalid Codex config structure");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(
             report.recovery,
@@ -5564,7 +5574,7 @@ mod tests {
         )
         .expect("write scalar managed trust key");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(
             report.recovery,
@@ -5615,7 +5625,7 @@ mod tests {
             .insert(&trust_key, toml_edit::value("sha256:invalid"));
         fs::write(&config_path, config.to_string()).expect("write scalar future trust key");
 
-        let report = explicit_status(&codex, AgentKind::Codex);
+        let report = explicit_status(&codex, RuntimeRef::codex());
 
         assert_eq!(report.state, protocol::IntegrationInstallState::Outdated);
         assert_eq!(
@@ -5668,7 +5678,7 @@ mod tests {
                 other => panic!("unknown fixture failure: {other}"),
             }
 
-            let report = explicit_status(&codex, AgentKind::Codex);
+            let report = explicit_status(&codex, RuntimeRef::codex());
 
             assert_eq!(
                 report.state,
@@ -5696,7 +5706,7 @@ mod tests {
         .expect("aggregate status");
 
         assert_eq!(result.agents.len(), 2);
-        assert_eq!(result.agents[0].agent, AgentKind::Claude);
+        assert_eq!(result.agents[0].agent, RuntimeRef::claude());
         assert_eq!(
             result.agents[0].state,
             protocol::IntegrationInstallState::Outdated
@@ -5706,7 +5716,7 @@ mod tests {
             result.agents[0].recovery,
             protocol::IntegrationRecovery::RepairConfiguration
         );
-        assert_eq!(result.agents[1].agent, AgentKind::Codex);
+        assert_eq!(result.agents[1].agent, RuntimeRef::codex());
         assert_eq!(
             result.agents[1].state,
             protocol::IntegrationInstallState::Current
@@ -5717,7 +5727,7 @@ mod tests {
     fn explicit_status_degrades_resolution_failure_to_warning() {
         let report = with_status_env(None, None, None, || {
             super::status(protocol::IntegrationStatusParams {
-                agent: Some(AgentKind::Claude),
+                agent: Some(RuntimeRef::claude()),
             })
         })
         .expect("explicit status")
@@ -5735,11 +5745,23 @@ mod tests {
 
     #[test]
     fn explicit_unsupported_status_agents_return_typed_errors() {
-        for agent in [AgentKind::Shell, AgentKind::Hermes] {
+        for agent in [RuntimeRef::shell(), RuntimeRef::hermes()] {
             let error = super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
                 .expect_err("unsupported agent must fail");
             assert_eq!(error.code, "agent_not_installable");
         }
+    }
+
+    #[test]
+    fn install_and_status_report_an_installed_runtime_without_a_hook_integration() {
+        let status = super::status(protocol::IntegrationStatusParams {
+            agent: Some(RuntimeRef::from_wire("pi")),
+        })
+        .expect_err("status must reject the agent");
+        assert_eq!(status.code, "agent_not_installable");
+        let install = super::install(Some(RuntimeRef::from_wire("pi")))
+            .expect_err("install must reject the agent");
+        assert_eq!(install.code, "agent_not_installable");
     }
 
     /// The `PATH` a hook child inherits, read under the process-environment lock
@@ -5796,7 +5818,7 @@ mod tests {
 
     pub(super) fn explicit_status(
         config_dir: &Path,
-        agent: AgentKind,
+        agent: RuntimeRef,
     ) -> protocol::IntegrationAgentStatus {
         with_config_dirs(config_dir, config_dir, || {
             super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
@@ -6012,7 +6034,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = explicit_status(&codex_dir, AgentKind::Codex);
+        let report = explicit_status(&codex_dir, RuntimeRef::codex());
         let err = install_codex(&codex_dir).expect_err("inline features table is refused");
 
         assert_eq!(
