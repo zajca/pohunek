@@ -115,11 +115,72 @@ pub const DEV_SWEEP_GRACE: Duration = Duration::from_secs(5);
 /// launcher records it in the definition but inherits the caller's limit.
 pub const DEV_OPEN_FILES: u64 = 8_192;
 
-/// Durable worker journal schema this daemon understands.
+/// Durable worker journal schema written by `pohunek-sessiond`.
 ///
-/// Written by `pohunek-sessiond`; a journal with another schema is never used
-/// as generation evidence.
+/// The daemon does not link the worker crate, so a test ties this value to
+/// the worker's `JOURNAL_SCHEMA_VERSION`.
 pub(crate) const WORKER_JOURNAL_SCHEMA_VERSION: u32 = 4;
+
+/// Oldest worker journal schema still accepted as generation evidence.
+///
+/// A daemon reads the schema before its own (N-1) so that workers started
+/// by the previous release stay adoptable across an upgrade. Anything older
+/// or newer is refused with [`UnsupportedJournalSchema`].
+pub(crate) const WORKER_JOURNAL_OLDEST_SCHEMA_VERSION: u32 = WORKER_JOURNAL_SCHEMA_VERSION - 1;
+
+/// A worker journal names a schema this daemon does not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "worker journal schema {found} is unsupported (this daemon reads \
+     {WORKER_JOURNAL_OLDEST_SCHEMA_VERSION} to {WORKER_JOURNAL_SCHEMA_VERSION})"
+)]
+pub(crate) struct UnsupportedJournalSchema {
+    /// Schema the journal declares.
+    pub(crate) found: u32,
+}
+
+/// Whether a journal of `schema_version` is read as generation evidence.
+pub(crate) const fn journal_schema_supported(schema_version: u32) -> bool {
+    schema_version >= WORKER_JOURNAL_OLDEST_SCHEMA_VERSION
+        && schema_version <= WORKER_JOURNAL_SCHEMA_VERSION
+}
+
+/// Refuses a journal whose declared schema this daemon does not read.
+///
+/// Only the schema number is decoded, so a schema whose other fields differ
+/// is still named instead of surfacing as a missing-field error. An
+/// unsupported schema is logged: its journal is evidence the daemon cannot
+/// use, never an absence of evidence.
+///
+/// # Errors
+///
+/// Returns `InvalidData` carrying [`UnsupportedJournalSchema`] for an
+/// unsupported schema, or the decoding error when no schema is declared.
+pub(crate) fn require_supported_journal_schema(
+    bytes: &[u8],
+    session_id: &str,
+    worker_id: &str,
+) -> std::io::Result<()> {
+    #[derive(Deserialize)]
+    struct SchemaProbe {
+        schema_version: u32,
+    }
+    let SchemaProbe { schema_version } = serde_json::from_slice(bytes)?;
+    if journal_schema_supported(schema_version) {
+        return Ok(());
+    }
+    let reason = UnsupportedJournalSchema {
+        found: schema_version,
+    };
+    tracing::warn!(
+        session_id,
+        worker.id = worker_id,
+        journal.schema_version = schema_version,
+        error = %reason,
+        "worker journal schema is unsupported; it is not used as generation evidence"
+    );
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+}
 
 /// Largest worker journal read as lifecycle evidence.
 ///
@@ -1487,8 +1548,9 @@ fn read_journal(
         .map_err(|error| {
             std::io::Error::new(error.io_kind().unwrap_or(std::io::ErrorKind::Other), error)
         })?;
+    require_supported_journal_schema(&bytes, session_id, worker_id)?;
     let journal = serde_json::from_slice::<JournalFacts>(&bytes)?;
-    if journal.schema_version != WORKER_JOURNAL_SCHEMA_VERSION
+    if !journal_schema_supported(journal.schema_version)
         || journal.session_id != session_id
         || journal.worker_id != worker_id
     {

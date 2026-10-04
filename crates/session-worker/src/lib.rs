@@ -41,7 +41,7 @@ pub use input::{InputError, InputFragment, InputPlan, WriteCoordinator};
 pub use journal::{
     ActiveIdentity, ChildIdentity, Journal, JournalError, JournalRecord, LaunchIdentity,
     LoadedJournal, OutdatedJournal, PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome,
-    RuntimePhase, WorkerOrigin,
+    RuntimePhase, WorkerOrigin, JOURNAL_SCHEMA_VERSION,
 };
 #[doc(inline)]
 pub use lease::{ControllerLease, LeaseError, LeaseOwner};
