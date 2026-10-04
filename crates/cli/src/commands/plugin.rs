@@ -26,6 +26,7 @@ use protocol::{
 };
 
 use crate::client::Client;
+use crate::commands::plugin_profile::{self, ProfileAction};
 use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -140,6 +141,16 @@ pub(crate) enum Action {
         #[arg(long)]
         json: bool,
     },
+
+    /// Inspect and migrate host agent profiles that run on a package.
+    ///
+    /// A profile whose base runtime is served by an installed package pins
+    /// that package by `package` and `digest`; it moves to another digest only
+    /// through `pohunek plugin profile migrate`.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
 }
 
 impl Action {
@@ -152,6 +163,7 @@ impl Action {
             | Self::Enable { json, .. }
             | Self::Disable { json, .. }
             | Self::Doctor { json, .. } => *json,
+            Self::Profile { action } => action.wants_json(),
             Self::Install(args) => args.json,
             Self::Link(args) => args.json,
             Self::Update(args) => args.json,
@@ -269,7 +281,7 @@ pub(crate) enum DigestSelector {
 }
 
 impl DigestSelector {
-    fn matches(&self, digest: &PackageDigest) -> bool {
+    pub(super) fn matches(&self, digest: &PackageDigest) -> bool {
         match self {
             Self::Full(full) => full == digest,
             Self::Prefix(prefix) => digest
@@ -379,6 +391,58 @@ pub(crate) enum Error {
         /// The package id the archive declares.
         found: String,
     },
+
+    /// The agents directory is missing its safety properties or unreadable.
+    #[error("the agent profiles directory cannot be used: {detail}")]
+    ProfileDirectory {
+        /// What is wrong, without file content.
+        detail: String,
+    },
+
+    /// No profile file has the requested name.
+    #[error("no agent profile named {name} exists on this host")]
+    ProfileNotFound {
+        /// The requested profile name.
+        name: String,
+    },
+
+    /// The profile file fails the safety policy, cannot be read, or does not parse.
+    #[error("profile {name} cannot be used: {detail}")]
+    ProfileUnusable {
+        /// The profile name.
+        name: String,
+        /// The reason, naming a key or line but never a value.
+        detail: String,
+    },
+
+    /// No installed package serves the profile's base runtime.
+    #[error(
+        "profile {name} extends base runtime {base}, which no installed package serves; there is nothing to migrate"
+    )]
+    ProfileBaseBuiltin {
+        /// The profile name.
+        name: String,
+        /// The profile's base runtime id.
+        base: String,
+    },
+
+    /// The migration target does not resolve to one usable package.
+    #[error("profile {name}: {detail}")]
+    ProfileTarget {
+        /// The profile name.
+        name: String,
+        /// Why no single target resolves.
+        detail: String,
+    },
+
+    /// Rewriting the profile failed.
+    #[error("profile {name} was not rewritten: {detail}")]
+    ProfileWrite {
+        /// The profile name.
+        name: String,
+        /// What failed.
+        detail: String,
+    },
 }
 
 impl Error {
@@ -391,6 +455,12 @@ impl Error {
             Self::NotInstalled { .. } | Self::NoMatchingVersion { .. } => "package_not_installed",
             Self::Ambiguous { .. } => "plugin_selector_ambiguous",
             Self::UpdateIdMismatch { .. } => "plugin_update_id_mismatch",
+            Self::ProfileDirectory { .. } => "profile_directory_unusable",
+            Self::ProfileNotFound { .. } => "profile_not_found",
+            Self::ProfileUnusable { .. } => "profile_unusable",
+            Self::ProfileBaseBuiltin { .. } => "profile_base_builtin",
+            Self::ProfileTarget { .. } => "profile_target_invalid",
+            Self::ProfileWrite { .. } => "profile_write_failed",
         }
     }
 
@@ -411,6 +481,22 @@ impl Error {
             Self::Ambiguous { .. } => "narrow the selection with --digest or --version",
             Self::UpdateIdMismatch { .. } => {
                 "name the package id the archive declares, or use `pohunek plugin install`"
+            }
+            Self::ProfileDirectory { .. } => {
+                "the agents directory must be owned by you and not group- or world-writable"
+            }
+            Self::ProfileNotFound { .. } => "list profiles with `pohunek plugin profile list`",
+            Self::ProfileUnusable { .. } => {
+                "fix the profile file: it must be a regular file you own, not writable by others, with valid TOML"
+            }
+            Self::ProfileBaseBuiltin { .. } => {
+                "install a package that serves the base runtime with `pohunek plugin install`"
+            }
+            Self::ProfileTarget { .. } => {
+                "list installed packages with `pohunek plugin list` and pass --digest"
+            }
+            Self::ProfileWrite { .. } => {
+                "check the agents directory and run `pohunek plugin profile list`"
             }
         }
     }
@@ -566,6 +652,7 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             print_output(json, &result, || render_change("Disabled", &result))?;
         }
         Action::Uninstall(args) => run_uninstall(&args).await?,
+        Action::Profile { action } => plugin_profile::run(action).await?,
         Action::Doctor { package, json } => {
             let mut client = connect().await?;
             let result = client
@@ -663,7 +750,7 @@ async fn connect() -> Result<Client, CliError> {
     Client::connect(LOCAL_HOST, &paths).await
 }
 
-async fn list(client: &mut Client) -> Result<PackageListResult, CliError> {
+pub(super) async fn list(client: &mut Client) -> Result<PackageListResult, CliError> {
     client.call::<method::PackageList>(()).await
 }
 
@@ -850,7 +937,7 @@ async fn send_ingest(
 }
 
 /// Print `value` as the JSON envelope, or the human text `human` builds.
-fn print_output<T, F>(json: bool, value: &T, human: F) -> Result<(), CliError>
+pub(super) fn print_output<T, F>(json: bool, value: &T, human: F) -> Result<(), CliError>
 where
     T: serde::Serialize,
     F: FnOnce() -> String,
@@ -864,7 +951,7 @@ where
 }
 
 /// First hex characters of a digest, with the `sha256:` prefix.
-fn short_digest(digest: &PackageDigest) -> String {
+pub(super) fn short_digest(digest: &PackageDigest) -> String {
     let hex = digest
         .as_str()
         .strip_prefix(DIGEST_PREFIX)
@@ -876,7 +963,7 @@ fn short_digest(digest: &PackageDigest) -> String {
     format!("{DIGEST_PREFIX}{}", &hex[..end])
 }
 
-fn summary(id: &PackageId, version: &PackageVersion, digest: &PackageDigest) -> String {
+pub(super) fn summary(id: &PackageId, version: &PackageVersion, digest: &PackageDigest) -> String {
     format!("{id} {version} ({})", short_digest(digest))
 }
 
@@ -884,7 +971,7 @@ fn summary(id: &PackageId, version: &PackageVersion, digest: &PackageDigest) -> 
 ///
 /// Package descriptors are untrusted until the owner consents, so their text
 /// never reaches the terminal raw.
-fn sanitize(text: &str) -> String {
+pub(super) fn sanitize(text: &str) -> String {
     text.chars()
         .flat_map(|character| {
             if character.is_control() {
@@ -926,7 +1013,7 @@ fn fault_label(fault: PackageFault) -> &'static str {
     }
 }
 
-fn state_label(info: &PackageInfo) -> String {
+pub(super) fn state_label(info: &PackageInfo) -> String {
     let mut parts = vec![if info.enabled { "enabled" } else { "disabled" }];
     if info.selected {
         parts.push("selected");
@@ -987,7 +1074,7 @@ fn render_list(result: &PackageListResult) -> String {
 }
 
 /// Render rows as a left-aligned table whose last column is unpadded.
-fn render_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> String {
+pub(super) fn render_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> String {
     let mut widths = header.map(str::len);
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
@@ -1624,6 +1711,24 @@ mod tests {
             Error::UpdateIdMismatch {
                 expected: "a".into(),
                 found: "b".into(),
+            },
+            Error::ProfileDirectory { detail: "d".into() },
+            Error::ProfileNotFound { name: "n".into() },
+            Error::ProfileUnusable {
+                name: "n".into(),
+                detail: "d".into(),
+            },
+            Error::ProfileBaseBuiltin {
+                name: "n".into(),
+                base: "b".into(),
+            },
+            Error::ProfileTarget {
+                name: "n".into(),
+                detail: "d".into(),
+            },
+            Error::ProfileWrite {
+                name: "n".into(),
+                detail: "d".into(),
             },
         ];
         for error in &errors {

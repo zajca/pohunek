@@ -104,9 +104,61 @@ refused on that path (`package_root_intact`), so uninstall it without the flag.
 package roots on disk without a registry record, and pins of digests that are
 not installed. It exits with status 1 when any finding exists and 0 otherwise.
 
+## Profile migration
+
+A host agent profile (`<config dir>/agents/<name>.toml`) keeps `base =
+"<runtime id>"`. When an installed package serves that runtime, the profile
+must also carry an explicit pin: `package = "<package id>"` and `digest =
+"sha256:<64 hex>"`. A profile whose base is served by no installed package
+carries neither. A profile moves to another digest only through
+`pohunek plugin profile migrate`, never through `plugin update` or `plugin
+select`.
+
+`pohunek plugin profile list [--json]` shows every `agents/*.toml` with its
+base, pinned package, and digest (abbreviated in the table, whole in JSON) and
+one state:
+
+- `builtin`: no installed package serves the base; nothing to do.
+- `pinned`: the pinned digest is installed and serves the base.
+- `needs_migration`: an installed package serves the base but the pin is
+  missing, incomplete, or names a package that does not serve the base.
+- `pin_not_installed`: the pinned digest is not installed.
+- `unreadable`: the file is a symlink or special file, is not owned by you, is
+  group- or world-writable, is not valid TOML, or has an invalid `base`,
+  `package`, or `digest`.
+
+`pohunek plugin profile migrate <name> [--digest <d>] [--yes] [--json]` pins
+the profile. The target is the installed package with the given digest (the full
+`sha256:<64 hex>` or a unique prefix of at least 12 hex characters), which must
+serve the profile's base. Without `--digest` it is the one selected, enabled
+package serving the base; none or several is an error, never a guess, and a
+faulted package is refused. The command prints the profile, base, package
+version, digest, and current pin and changes nothing until repeated with
+`--yes` (`consent_required` otherwise). It refuses a profile whose base no
+installed package serves (`profile_base_builtin`) and reports `unchanged` with
+exit status 0 when the profile already pins the target.
+
+Only the `package` and `digest` keys are rewritten: existing ones are updated in
+place, missing ones are inserted directly after `base`, and every other byte of
+the file (comments, `[env]` values, ordering) is kept. The write is atomic: the
+new file is created exclusively in the same directory, synchronized, and renamed
+over the original, which is displaced aside first so a profile edited since it
+was read is detected instead of overwritten, and is removed only after the
+rewritten file re-reads and verifies. The new file keeps the original mode
+narrowed to at most `0600`. Profiles can hold secret `[env]` values, so no
+command prints file content or values; a parse failure is reported as a line
+number and message only.
+
+The commands work on this machine only (`--host` is rejected) and need the
+agents directory to be owned by you and not group- or world-writable. A
+migration changes the profile's revision on the daemon side, so a relay approval
+of the previous revision goes stale.
+
 ## Shell completion
 
 Dynamic completion (`pohunek completions <shell> --dynamic`) completes package
-ids and `--digest` values from the local daemon within a short deadline. It
-never starts the daemon and stays silent when the daemon is unreachable. Archive
-and catalog arguments complete as files, `link` as a directory.
+ids and `--digest` values from the local daemon within a short deadline, and
+`plugin profile migrate` completes profile names from the agents directory
+(names only, no daemon). Completion never starts the daemon and stays silent
+when the daemon is unreachable. Archive and catalog arguments complete as files,
+`link` as a directory.

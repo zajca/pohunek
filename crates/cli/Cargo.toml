@@ -53,6 +53,7 @@ libc = { workspace = true }
 nix = { workspace = true, features = ["process", "signal", "term"] }
 tracing = { workspace = true }
 time = { workspace = true }
+toml_edit = { workspace = true }
 
 [lints]
 workspace = true
