@@ -2448,13 +2448,12 @@ impl SessionRegistry {
                 )
             },
             |binding| {
-                binding
-                    .input_rules
-                    .to_input_rules(crate::agent::input_rules_for_pin(
-                        self.inner.profiles.runtimes(),
-                        &binding.agent_base,
-                        &binding.launch_binding,
-                    ))
+                crate::agent::recovered_input_rules(
+                    self.inner.profiles.runtimes(),
+                    &binding.agent_base,
+                    &binding.launch_binding,
+                    binding.input_rules,
+                )
             },
         );
         let snapshot = recovery
@@ -2624,13 +2623,12 @@ impl SessionRegistry {
                 )
             },
             |binding| {
-                binding
-                    .input_rules
-                    .to_input_rules(crate::agent::input_rules_for_pin(
-                        self.inner.profiles.runtimes(),
-                        &binding.agent_base,
-                        &binding.launch_binding,
-                    ))
+                crate::agent::recovered_input_rules(
+                    self.inner.profiles.runtimes(),
+                    &binding.agent_base,
+                    &binding.launch_binding,
+                    binding.input_rules,
+                )
             },
         );
         let relaunch = recovery

@@ -274,6 +274,12 @@ pub struct StoredInputRules {
     /// Delay before the submit byte, in whole milliseconds.
     #[serde(default)]
     pub submit_delay_ms: u64,
+    /// Whether the runtime's safety contract (safe-text validation and no
+    /// automated input while blocked) applies. Kept so a session whose runtime
+    /// definition cannot be resolved again keeps the protections it launched
+    /// with.
+    #[serde(default)]
+    pub restricted: bool,
 }
 
 impl From<InputRules> for StoredInputRules {
@@ -283,11 +289,25 @@ impl From<InputRules> for StoredInputRules {
             // Submit delays are small (≤ a few hundred ms); saturate defensively
             // rather than truncate, so a pathological value can never wrap.
             submit_delay_ms: u64::try_from(rules.submit_delay.as_millis()).unwrap_or(u64::MAX),
+            restricted: rules.is_restricted(),
         }
     }
 }
 
 impl StoredInputRules {
+    /// Rebuilds the rules when the runtime definition cannot be resolved: the
+    /// persisted framing plus the safety contract recorded at launch, so a
+    /// runtime that was restricted never becomes unrestricted.
+    #[must_use]
+    pub fn to_standalone_rules(self) -> InputRules {
+        let delay = Duration::from_millis(self.submit_delay_ms);
+        if self.restricted {
+            InputRules::restricted(self.bracketed_paste, delay)
+        } else {
+            InputRules::unrestricted(self.bracketed_paste, delay)
+        }
+    }
+
     /// Rebuild the in-memory [`InputRules`] from the persisted snapshot,
     /// keeping the safety contract of the runtime's `base` rules.
     #[must_use]
@@ -1751,6 +1771,7 @@ mod tests {
             input_rules: StoredInputRules {
                 bracketed_paste: false,
                 submit_delay_ms: 150,
+                restricted: false,
             },
             native_launch: Some(launch(
                 SessionRefKind::Id,
@@ -1862,6 +1883,7 @@ mod tests {
             input_rules: StoredInputRules {
                 bracketed_paste: true,
                 submit_delay_ms: 42,
+                restricted: false,
             },
             native_launch: Some(launch(
                 SessionRefKind::Path,
@@ -1989,6 +2011,7 @@ mod tests {
         let stored = StoredInputRules {
             bracketed_paste: false,
             submit_delay_ms: 25,
+            restricted: false,
         };
         let rules = stored.to_input_rules(
             crate::agent::host::RuntimeHost::default()

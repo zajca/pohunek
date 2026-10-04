@@ -849,3 +849,53 @@ fn observation_follows_the_pinned_package_after_disable_or_a_newer_selection() {
     let degraded = crate::detect::DetectorConfig::for_pinned(&host, &reference, &pin, None);
     assert_eq!(regions(&degraded), regions(&generic));
 }
+
+#[test]
+fn a_recovered_safe_text_runtime_keeps_its_input_safety_when_its_package_fails_verification() {
+    let plugins = Plugins::new();
+    let built = build(
+        &descriptor("acme.agent", "1.0.0", "acme").replace(
+            "text_policy = \"unrestricted\"",
+            "text_policy = \"hermes_safe_text\"",
+        ),
+        "safe",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &built, true, true);
+    let host = plugins.host();
+    let reference = RuntimeRef::from_wire("acme");
+    let pin = pin_of(&built, "acme");
+    let launched = host
+        .resolve_id(&runtime("acme"))
+        .expect("loaded")
+        .input_rules();
+    assert!(launched.is_restricted());
+    let stored = crate::store::StoredInputRules::from(launched);
+    let check = |rules: crate::agent::InputRules| {
+        (
+            rules.validate_text("bad\u{1b}[31m").is_err(),
+            rules
+                .validate_activity(Some(protocol::AgentActivity::Blocked))
+                .is_err(),
+        )
+    };
+
+    // Verified: the pinned definition supplies the contract.
+    let verified = crate::agent::recovered_input_rules(&host, &reference, &pin, stored);
+    assert_eq!(check(verified), (true, true));
+
+    // Verification fails: the contract persisted at launch still applies.
+    tamper(&plugins, &built.digest, &Tamper::Append);
+    host.definition_for_pin(&reference, &pin)
+        .expect_err("the pinned package no longer verifies");
+    let degraded = crate::agent::recovered_input_rules(&host, &reference, &pin, stored);
+    assert_eq!(check(degraded), (true, true));
+    assert_eq!(degraded.submit_delay, launched.submit_delay);
+
+    // An unrestricted runtime stays unrestricted.
+    let open = crate::store::StoredInputRules::from(crate::agent::InputRules::unrestricted(
+        true,
+        std::time::Duration::from_millis(5),
+    ));
+    assert!(!open.to_standalone_rules().is_restricted());
+}
