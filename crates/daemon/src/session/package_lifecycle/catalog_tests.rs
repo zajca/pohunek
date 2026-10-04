@@ -424,3 +424,100 @@ async fn unreadable_catalog_and_archive_paths_are_source_errors() {
         assert_eq!(refused, PackageErrorKind::SourceUnreadable);
     }
 }
+
+/// `count` distinct well-formed key ids derived from `label`.
+fn revoked_ids(label: &str, count: usize) -> Vec<KeyId> {
+    (0..count)
+        .map(|index| {
+            let digest = Sha256::digest(format!("{label}-{index}").as_bytes());
+            KeyId::parse(&hex(&digest)).expect("a 64-digit key id")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_failed_trust_state_write_installs_enables_and_reloads_nothing() {
+    let key = signing_key("root");
+    let fixture = Fixture::with_anchor("catalog-record-failure", anchor(&[&key], Vec::new()));
+    let one = Package::pi();
+    let two = Package::build("acme.runtime.two", "1.0.0", "two", INERT_PROGRAM);
+    let mut first = default_catalog(&one, 1);
+    first.revoked_key_ids = revoked_ids("first", 40);
+    fixture
+        .registry
+        .package_install(catalog_install(
+            &fixture,
+            &one,
+            &signed_by(&key, first),
+            false,
+        ))
+        .await
+        .expect("the first catalog installs");
+    let before = fixture.snapshot();
+    let state_before = state(&fixture);
+    // The union with the first catalog's revocations exceeds the persisted
+    // bound, so the trust state cannot be written.
+    let mut second = catalog(2, vec![entry(&two, "acme.runtime.two", "two", "1.0.0")]);
+    second.revoked_key_ids = revoked_ids("second", 40);
+
+    let refused = fixture
+        .registry
+        .package_install(catalog_install(
+            &fixture,
+            &two,
+            &signed_by(&key, second),
+            false,
+        ))
+        .await
+        .expect_err("the trust state cannot be recorded");
+
+    assert_eq!(refused, PackageErrorKind::RegistryFailed);
+    assert_eq!(fixture.snapshot(), before, "nothing was installed");
+    assert_eq!(
+        state(&fixture),
+        state_before,
+        "the trust state is unchanged"
+    );
+    assert_eq!(
+        fixture.serving("two"),
+        None,
+        "nothing was enabled or reloaded"
+    );
+}
+
+#[tokio::test]
+async fn trust_state_is_persisted_before_a_package_that_then_fails_to_install() {
+    let key = signing_key("root");
+    let fixture = Fixture::with_anchor("catalog-record-first", anchor(&[&key], Vec::new()));
+    let package = Package::pi();
+    fixture
+        .registry
+        .package_install(catalog_install(
+            &fixture,
+            &package,
+            &signed_by(&key, default_catalog(&package, 5)),
+            false,
+        ))
+        .await
+        .expect("sequence 5 installs");
+    // The same identity from another archive: the install is refused after the
+    // catalog was verified and recorded.
+    let rival = Package::build(PACKAGE, "1.0.0", RUNTIME, "/bin/true");
+    let refused = fixture
+        .registry
+        .package_install(catalog_install(
+            &fixture,
+            &rival,
+            &signed_by(
+                &key,
+                catalog(7, vec![entry(&rival, PACKAGE, RUNTIME, "1.0.0")]),
+            ),
+            false,
+        ))
+        .await
+        .expect_err("the identity is installed from another archive");
+
+    assert_eq!(refused, PackageErrorKind::IdentityInstalled);
+    assert_eq!(state(&fixture).high_water(), Some(7), "recorded first");
+    assert!(!fixture.root(&rival.digest).exists());
+}

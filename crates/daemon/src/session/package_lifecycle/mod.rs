@@ -66,7 +66,7 @@ struct Prepared {
     identity: PackageIdentity,
     authority: Authority,
     source: RecordSource,
-    /// The catalog that authorized the package, recorded after the install.
+    /// The catalog that authorized the package, recorded before the install.
     catalog: Option<VerifiedCatalog>,
 }
 
@@ -719,6 +719,16 @@ fn commit_install(
     }
 
     let registry = context.store.registry();
+    // The catalog's sequence and revocations are persisted before anything is
+    // published: the update only tightens the trust state, so a failure or a
+    // crash after it leaves nothing installed under a stale watermark, while
+    // the reverse order would leave a package authorized by state that was
+    // never recorded.
+    if let Some(catalog) = prepared.catalog.as_ref() {
+        registry
+            .record_catalog(catalog)
+            .map_err(|error| registry_kind(&error))?;
+    }
     let report = registry
         .install(&InstallRequest {
             archive: &prepared.bytes,
@@ -736,13 +746,6 @@ fn commit_install(
         InstallStatus::RootRestored => PackageInstallStatus::RootRestored,
         _ => return Err(PackageErrorKind::RegistryFailed),
     };
-    // The catalog's sequence and revocations are persisted so a replayed older
-    // catalog cannot authorize a later install; a failure surfaces after the
-    // runtime registry is rebuilt.
-    let recorded = prepared.catalog.as_ref().map_or(Ok(()), |catalog| {
-        registry.record_catalog(catalog).map(|_state| ())
-    });
-
     let reloaded = context.runtimes.reload().map_err(|error| {
         warn!(%error, "the runtime registry was not rebuilt after an install");
         PackageErrorKind::ReloadFailed
@@ -763,8 +766,6 @@ fn commit_install(
             return Err(kind);
         }
     }
-    recorded.map_err(|error| registry_kind(&error))?;
-
     let state = read_state(context)?;
     let record = state
         .package(&prepared.digest)
