@@ -213,9 +213,13 @@ async fn run() -> Result<(), DaemonError> {
     //    report native identity, logical sessions survive a restart, a
     //    repo+branch session binds a dedicated worktree, and the lifecycle is
     //    recorded to the append-only event log.
+    let store_path = paths.data_dir.join(STORE_NAME);
+    // The schema migration runs before the registry exists so reconciliation and
+    // adoption only ever see a store at the current schema.
+    pohunek_daemon::store::migrate_at_startup(&store_path)?;
     let config = SessionRegistryConfig {
         socket_path: Some(paths.socket.clone()),
-        store_path: Some(paths.data_dir.join(STORE_NAME)),
+        store_path: Some(store_path),
         worktree_root: Some(paths.data_dir.join(WORKTREES_SUBDIR)),
         event_log_dir: Some(paths.data_dir.join(EVENTS_SUBDIR)),
         retention_policy_path: Some(paths.data_dir.join(RETENTION_POLICY_NAME)),

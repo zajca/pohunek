@@ -57,6 +57,21 @@ pub enum DaemonError {
         source: io::Error,
     },
 
+    /// The metadata store has a schema this daemon cannot use (newer than the
+    /// binary, or without a kept migration path).
+    #[error("{0}")]
+    StoreSchema(#[from] crate::store::StoreSchemaError),
+
+    /// The metadata store could not be read, backed up, or migrated at startup.
+    #[error("failed to migrate metadata store {path}: {source}")]
+    StoreMigration {
+        /// The store path.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+
     /// Bounded structured logging could not be initialized.
     #[error("failed to initialize bounded structured logging: {0}")]
     Logging(#[from] pohunek_logging::Error),
