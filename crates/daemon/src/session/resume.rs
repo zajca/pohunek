@@ -224,25 +224,26 @@ impl SessionRegistry {
     /// Resolves the runtime a binding relaunches with and checks that it may
     /// serve the binding's frozen launch pin.
     ///
-    /// A runtime that is not installed, or that no longer matches the pin,
-    /// refuses the relaunch; the stored binding is left untouched so it
-    /// resumes once the runtime is available again.
+    /// A package pin resolves from exactly its package digest, verified again
+    /// now, whatever the registry currently selects. A runtime that is not
+    /// installed, or that no longer matches the pin, refuses the relaunch; the
+    /// stored binding is left untouched so it resumes once the runtime is
+    /// available again.
     ///
     /// # Errors
     ///
-    /// Returns `agent_kind_unsupported` for a value that is not a runtime id
-    /// and `runtime_not_installed` for an unresolvable or mismatching runtime.
+    /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
+    /// `runtime_not_installed` for an unresolvable or mismatching runtime and
+    /// `runtime_incompatible` for a pinned package whose root fails
+    /// verification.
     fn binding_definition(
         &self,
         binding: &ResumeBinding,
     ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
-        let definition = self
-            .inner
+        self.inner
             .profiles
             .runtimes()
-            .resolve_ref(&binding.agent_base)?;
-        host::check_pin(&binding.launch_binding, &definition)?;
-        Ok(definition)
+            .resolve_pinned(&binding.agent_base, &binding.launch_binding)
     }
 
     async fn persist_failed_recovery_rollback(&self, id: &SessionId) {

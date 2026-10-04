@@ -19,7 +19,10 @@ use crate::agent::host::RuntimeHost;
 /// runtime backs is `runtime_not_installed`; the integration operations only see
 /// installed runtimes.
 fn check_agent(runtimes: &RuntimeHost, agent: Option<&RuntimeRef>) -> Result<(), ProtocolError> {
-    agent.map_or(Ok(()), |agent| runtimes.resolve_ref(agent).map(|_| ()))
+    agent.map_or(Ok(()), |agent| {
+        let definition = runtimes.resolve_ref(agent)?;
+        runtimes.verify_launchable(&definition)
+    })
 }
 
 pub(super) async fn handle_integration_install(
@@ -162,6 +165,38 @@ mod tests {
         for wire in ["codex", "claude", "hermes", "shell"] {
             classify(wire).unwrap_or_else(|error| panic!("{wire} is installed: {error:?}"));
         }
+    }
+
+    #[test]
+    fn a_package_runtime_modified_after_install_is_refused_before_any_integration_change() {
+        let dir = pohunek_test_support::tempdir().expect("private test directory");
+        let plugins = dir.path().join("plugins");
+        let (host, digest) = crate::agent::host::fixture::installed_pi_host(
+            &plugins,
+            std::path::Path::new("/bin/sh"),
+        );
+        let agent = RuntimeRef::from_wire("pi");
+        check_agent(&host, Some(&agent)).expect("an intact package passes");
+
+        let hex = digest
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("digest prefix");
+        let descriptor = plugins
+            .join("packages")
+            .join(hex)
+            .join("files")
+            .join("runtime.toml");
+        let mut bytes = std::fs::read(&descriptor).expect("read descriptor");
+        bytes.extend_from_slice(b"\n# tampered\n");
+        std::fs::write(&descriptor, bytes).expect("write descriptor");
+
+        assert_eq!(
+            check_agent(&host, Some(&agent))
+                .expect_err("a modified package")
+                .code,
+            "runtime_incompatible"
+        );
     }
 
     #[test]

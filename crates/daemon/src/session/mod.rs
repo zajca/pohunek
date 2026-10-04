@@ -69,6 +69,7 @@ mod hooks;
 mod input;
 mod lag;
 mod observation;
+mod packages;
 mod procwatch;
 mod read;
 mod reconcile;
@@ -343,6 +344,9 @@ pub struct SessionRegistryConfig {
     /// Application state directory whose host-state subdirectory holds the
     /// secret that keys profile revisions. `None` makes revisions unavailable.
     pub host_state_dir: Option<PathBuf>,
+    /// Owner-private runtime package store (`<state>/plugins`). `None` serves
+    /// the built-in runtimes only, with no package store to reload or verify.
+    pub plugins_dir: Option<PathBuf>,
     /// Minimum interval between per-session "PTY output lag" WARN logs. The first
     /// lag in each window logs immediately; further lags are folded into one
     /// summary WARN when the window elapses, so a runaway session cannot flood the
@@ -404,6 +408,7 @@ impl Default for SessionRegistryConfig {
             config_dir: None,
             agents_dir: None,
             host_state_dir: None,
+            plugins_dir: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
             procwatch_poll: DEFAULT_PROCWATCH_POLL,
             active_agent_claim_ttl: DEFAULT_ACTIVE_AGENT_CLAIM_TTL,
@@ -472,6 +477,11 @@ struct SessionRegistryInner {
     /// wins with the freshest size. Held across the (blocking) store I/O instead
     /// of the sessions lock, keeping that hot lock free of file writes.
     persist_lock: Mutex<()>,
+    /// Shared by every fresh launch from verification until its durable record
+    /// exists, exclusive for a package uninstall, so a launch cannot pin a
+    /// package digest between the retained set being computed and the
+    /// package being removed.
+    package_lifecycle: tokio::sync::RwLock<()>,
     /// Serializes create, native recovery, stop, and remove per session, so
     /// one session never runs two lifecycle transactions at once.
     lifecycle_locks: SessionLocks,
@@ -1217,10 +1227,16 @@ impl SessionRegistry {
                 "production session registry requires durable worker roots and supervision",
             ));
         }
-        Ok(Self::new_with_launcher_and_inspector(
+        let runtimes = config
+            .plugins_dir
+            .as_deref()
+            .map(open_runtime_host)
+            .transpose()?;
+        Ok(Self::build(
             config,
-            supervisor,
+            Some(supervisor),
             Arc::new(crate::procwatch::HostInspector::new()),
+            runtimes,
         ))
     }
 
@@ -1389,6 +1405,7 @@ impl SessionRegistry {
                 events,
                 store,
                 persist_lock: Mutex::new(()),
+                package_lifecycle: tokio::sync::RwLock::new(()),
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
                 supervision_retries: supervision::SupervisionRetries::default(),
@@ -2026,6 +2043,9 @@ impl SessionRegistry {
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         fallback_cwd: PathBuf,
     ) -> Result<(SessionInfo, Option<String>), ProtocolError> {
+        // Verified and held before anything is persisted, so a package that
+        // fails verification launches nothing and leaves no record.
+        let _package_launch = self.guard_package_launch(&resolved.definition).await?;
         let guard = self.lock_lifecycle(&id).await;
         let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
         self.write_session_record(intent).await?;
@@ -2669,7 +2689,15 @@ impl SessionRegistry {
 
     pub(crate) async fn ensure_known_agent(&self, id: &str) -> Result<(), ProtocolError> {
         let info = self.inspect_str(id).await?;
-        self.ensure_mutable_kinds(&info)
+        let pin = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&info.id)
+            .map(|entry| entry.snapshot.launch_binding.clone())
+            .unwrap_or_default();
+        self.ensure_mutable_kinds(&info, &pin)
     }
 
     #[cfg(test)]
@@ -4097,7 +4125,7 @@ impl SessionRegistry {
         }
         let sessions = self.inner.sessions.lock().await;
         if let Some(entry) = sessions.get(id) {
-            self.ensure_mutable_kinds(&entry.info)?;
+            self.ensure_mutable_kinds(&entry.info, &entry.snapshot.launch_binding)?;
         }
         Ok(())
     }
@@ -4105,13 +4133,20 @@ impl SessionRegistry {
     /// Rejects a mutation of a session whose base or active agent is not a
     /// launchable runtime on this host.
     ///
+    /// A session pinned to a package that is still installed stays mutable
+    /// while that package is disabled or another version is selected.
+    ///
     /// # Errors
     ///
     /// Returns `agent_kind_unsupported` for a kind that is not a runtime id and
     /// `runtime_not_installed` for a runtime id no definition backs.
-    fn ensure_mutable_kinds(&self, info: &SessionInfo) -> Result<(), ProtocolError> {
+    fn ensure_mutable_kinds(
+        &self,
+        info: &SessionInfo,
+        pin: &host::LaunchPin,
+    ) -> Result<(), ProtocolError> {
         let runtimes = self.inner.profiles.runtimes();
-        runtimes.resolve_ref(&info.agent_base)?;
+        runtimes.ensure_session_runtime(&info.agent_base, pin)?;
         if let Some(active) = &info.active_agent_base {
             runtimes.resolve_ref(active)?;
         }
@@ -5164,6 +5199,34 @@ fn runtime_state_label(state: RuntimeState) -> &'static str {
 
 fn runtime_error(code: impl Into<String>, msg: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ErrorClass::Runtime, code, msg, None)
+}
+
+/// Builds the runtime host over the built-in runtimes and the package store at
+/// `plugins_dir`.
+///
+/// An unsafe or uncreatable store directory fails startup instead of serving a
+/// registry that silently lacks the installed packages; an unreadable
+/// registry record inside a safe directory degrades to the built-in runtimes
+/// with the fault reported by the host.
+fn open_runtime_host(plugins_dir: &Path) -> Result<RuntimeHost, ProtocolError> {
+    let store = host::PackageStore::open(plugins_dir).map_err(|error| {
+        warn!(error = %error, "the runtime package store cannot be opened");
+        runtime_error(
+            "plugin_store_unavailable",
+            "the runtime package store cannot be opened safely",
+        )
+    })?;
+    RuntimeHost::with_packages(
+        host::BuiltinSource::from_host_environment(),
+        host::PackageSource::new(store),
+    )
+    .map_err(|error| {
+        warn!(error = %error, "the built-in runtime registry is invalid");
+        runtime_error(
+            "runtime_registry_invalid",
+            "the built-in runtime registry is invalid",
+        )
+    })
 }
 
 fn validate_observation_config(config: &SessionRegistryConfig) -> Result<(), ProtocolError> {
