@@ -481,7 +481,7 @@ struct SessionRegistryInner {
     /// exists, exclusive for a package uninstall, so a launch cannot pin a
     /// package digest between the retained set being computed and the
     /// package being removed.
-    package_lifecycle: tokio::sync::RwLock<()>,
+    package_lifecycle: Arc<tokio::sync::RwLock<()>>,
     /// Serializes create, native recovery, stop, and remove per session, so
     /// one session never runs two lifecycle transactions at once.
     lifecycle_locks: SessionLocks,
@@ -1405,7 +1405,7 @@ impl SessionRegistry {
                 events,
                 store,
                 persist_lock: Mutex::new(()),
-                package_lifecycle: tokio::sync::RwLock::new(()),
+                package_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
                 supervision_retries: supervision::SupervisionRetries::default(),
@@ -2203,6 +2203,7 @@ impl SessionRegistry {
             metadata: params.metadata.clone(),
             warnings,
             initial_input_pending: plan.pending_initial_input.is_some(),
+            package_authority: None,
         };
         Ok((spec, plan.pending_initial_input))
     }
@@ -4148,7 +4149,13 @@ impl SessionRegistry {
         let runtimes = self.inner.profiles.runtimes();
         runtimes.ensure_session_runtime(&info.agent_base, pin)?;
         if let Some(active) = &info.active_agent_base {
-            runtimes.resolve_ref(active)?;
+            // An active agent that is the session's own runtime is covered by
+            // the session's pin; any other runtime must resolve on its own.
+            let own = active == &info.agent_base;
+            runtimes.ensure_session_runtime(
+                active,
+                if own { pin } else { &host::LaunchPin::Unpinned },
+            )?;
         }
         Ok(())
     }

@@ -1146,10 +1146,11 @@ impl Store {
     /// Read and partition every record. A missing file yields three empty lists;
     /// malformed lines are skipped (a corrupt line must not block loading the
     /// rest).
-    fn read_all(&self) -> io::Result<StoreRecords> {
+    /// The metadata file's text, `None` when the store has no file yet.
+    fn read_content(&self) -> io::Result<Option<String>> {
         let parent = parent_directory(&self.path);
         if !parent.exists() {
-            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+            return Ok(None);
         }
         let directory = TrustedDir::open_absolute(parent, OWNER_PRIVATE_DIRECTORY_MODE)
             .map_err(fs_error_to_io)?;
@@ -1162,13 +1163,62 @@ impl Store {
         let bytes =
             match directory.read_file(name, OWNER_PRIVATE_FILE_MODE, MAX_METADATA_STORE_BYTES) {
                 Ok(bytes) => bytes,
-                Err(error) if error.io_kind() == Some(io::ErrorKind::NotFound) => {
-                    return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()))
-                }
+                Err(error) if error.io_kind() == Some(io::ErrorKind::NotFound) => return Ok(None),
                 Err(error) => return Err(fs_error_to_io(error)),
             };
-        let content = String::from_utf8(bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// Package digests that any durable session record or resume binding
+    /// pinned.
+    ///
+    /// Unlike [`Self::load_sessions`] and [`Self::load_resume`], which skip a
+    /// damaged line so the rest still loads, this scan fails on a line it
+    /// cannot interpret: the line might pin a package, and a caller deciding
+    /// whether content may be deleted must not treat it as absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read or a non-empty line is
+    /// not a valid record.
+    pub fn pinned_package_digests(&self) -> io::Result<Vec<protocol::PackageDigest>> {
+        let Some(content) = self.read_content()? else {
+            return Ok(Vec::new());
+        };
+        let mut digests = Vec::new();
+        let mut pin = |pin: &LaunchPin| {
+            if let Some(protocol::BindingProvenance::Package { package_digest, .. }) =
+                pin.binding().map(|binding| &binding.provenance)
+            {
+                digests.push(package_digest.clone());
+            }
+        };
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            match serde_json::from_str::<Record>(line) {
+                Ok(Record::Session(record)) => {
+                    if let Some(recovery) = &record.recovery {
+                        pin(&recovery.launch_binding);
+                    }
+                }
+                Ok(Record::Resume(binding)) => pin(&binding.launch_binding),
+                Ok(Record::Worktree(_) | Record::Project(_)) => {}
+                Err(_error) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the metadata store holds a record that cannot be interpreted",
+                    ));
+                }
+            }
+        }
+        Ok(digests)
+    }
+
+    fn read_all(&self) -> io::Result<StoreRecords> {
+        let Some(content) = self.read_content()? else {
+            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        };
         let mut resume = Vec::new();
         let mut worktrees = Vec::new();
         let mut projects = Vec::new();

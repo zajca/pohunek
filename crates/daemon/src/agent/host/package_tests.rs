@@ -811,3 +811,41 @@ fn a_running_session_stays_controllable_while_its_package_is_installed() {
         "runtime_not_installed"
     );
 }
+
+#[test]
+fn observation_follows_the_pinned_package_after_disable_or_a_newer_selection() {
+    let plugins = Plugins::new();
+    let registry = plugins.registry();
+    let first = acme("1.0.0");
+    install(&registry, &first, true, true);
+    let host = plugins.host();
+    let reference = RuntimeRef::from_wire("acme");
+    let pin = pin_of(&first, "acme");
+    let regions = |config: &crate::detect::DetectorConfig| {
+        format!(
+            "{:?}",
+            config
+                .manifest
+                .as_ref()
+                .expect("manifest")
+                .required_regions()
+        )
+    };
+    let expected = regions(&crate::detect::DetectorConfig::for_definition(
+        &host.resolve_id(&runtime("acme")).expect("loaded"),
+    ));
+
+    registry.set_enabled(&first.digest, false).expect("disable");
+    host.reload().expect("reload");
+
+    let pinned = crate::detect::DetectorConfig::for_pinned(&host, &reference, &pin, None);
+    assert_eq!(regions(&pinned), expected);
+    let generic =
+        crate::detect::DetectorConfig::for_pinned(&host, &reference, &LaunchPin::Unpinned, None);
+    assert_ne!(regions(&generic), expected, "no pin, no package rules");
+    // A tampered pinned package falls back to generic observation; launching
+    // it is refused elsewhere.
+    tamper(&plugins, &first.digest, &Tamper::Append);
+    let degraded = crate::detect::DetectorConfig::for_pinned(&host, &reference, &pin, None);
+    assert_eq!(regions(&degraded), regions(&generic));
+}

@@ -321,6 +321,19 @@ pub(crate) fn builtin_native_launch(kind: &protocol::RuntimeId) -> Option<Native
         .and_then(|definition| definition.native().cloned())
 }
 
+/// Input rules of the runtime a session launched with `pin` runs; a runtime
+/// that does not resolve gets unrestricted, unframed input.
+pub(crate) fn input_rules_for_pin(
+    host: &host::RuntimeHost,
+    agent: &protocol::RuntimeRef,
+    pin: &host::LaunchPin,
+) -> InputRules {
+    host.definition_for_pin(agent, pin).map_or_else(
+        |_unresolved| InputRules::unrestricted(false, Duration::ZERO),
+        |definition| definition.input_rules(),
+    )
+}
+
 /// Input rules of the runtime `agent` names; a kind without an installed
 /// definition gets unrestricted, unframed input.
 pub(crate) fn input_rules_for_kind(

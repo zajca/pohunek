@@ -61,23 +61,21 @@ impl SessionRegistry {
     ///
     /// The set is the union of the durable records (logical sessions and
     /// resume bindings) and the sessions held in memory, so a registry without
-    /// persistence still protects its live sessions.
+    /// persistence still protects its live sessions. The durable scan is
+    /// strict: a record that cannot be interpreted may pin a package, so it is
+    /// an error rather than an omission.
     ///
     /// # Errors
     ///
-    /// Returns the I/O error when the durable store cannot be read.
+    /// Returns the I/O error when the durable store cannot be read or holds a
+    /// record that cannot be interpreted.
     pub async fn retained_package_digests(&self) -> io::Result<RetainedDigests> {
         let mut retained = RetainedDigests::new();
         if let Some(store) = self.inner.store.clone() {
-            let (records, bindings) = tokio::task::spawn_blocking(move || {
-                Ok::<_, io::Error>((store.load_sessions()?, store.load_resume()?))
-            })
-            .await
-            .map_err(|join_error| io::Error::other(join_error.to_string()))??;
-            let recovered = records.iter().filter_map(|record| record.recovery.as_ref());
-            for binding in recovered.chain(bindings.iter()) {
-                retained.extend(pinned_digest(&binding.launch_binding));
-            }
+            let pinned = tokio::task::spawn_blocking(move || store.pinned_package_digests())
+                .await
+                .map_err(|join_error| io::Error::other(join_error.to_string()))??;
+            retained.extend(pinned);
         }
         let sessions = self.inner.sessions.lock().await;
         for entry in sessions.values() {
@@ -104,26 +102,37 @@ impl SessionRegistry {
             .package_store()
             .ok_or(PackageUninstallError::NoPackageStore)?
             .clone();
-        let _exclusive = self.inner.package_lifecycle.write().await;
-        let retained = self
-            .retained_package_digests()
-            .await
-            .map_err(PackageUninstallError::Retention)?;
+        let registry = self.clone();
         let digest = digest.clone();
-        tokio::task::spawn_blocking(move || {
-            store
-                .registry()
-                .uninstall(&digest, &retained)
-                .map(|_generation| ())
+        // The whole transaction runs in a task of its own: the exclusive
+        // authority is held by the task that computes the retained set,
+        // removes the package and reloads, so a caller that stops waiting
+        // cannot release it while the removal is still in flight.
+        tokio::spawn(async move {
+            let _exclusive = registry.inner.package_lifecycle.write().await;
+            let retained = registry
+                .retained_package_digests()
+                .await
+                .map_err(PackageUninstallError::Retention)?;
+            tokio::task::spawn_blocking(move || {
+                store
+                    .registry()
+                    .uninstall(&digest, &retained)
+                    .map(|_generation| ())
+            })
+            .await
+            .map_err(|join_error| {
+                PackageUninstallError::Retention(io::Error::other(join_error.to_string()))
+            })??;
+            runtimes
+                .reload()
+                .map(|_report| ())
+                .map_err(PackageUninstallError::Reload)
         })
         .await
         .map_err(|join_error| {
             PackageUninstallError::Retention(io::Error::other(join_error.to_string()))
-        })??;
-        runtimes
-            .reload()
-            .map(|_report| ())
-            .map_err(PackageUninstallError::Reload)
+        })?
     }
 
     /// Verifies that `definition` may serve a fresh launch and holds the

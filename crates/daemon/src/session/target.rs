@@ -87,6 +87,9 @@ pub(super) struct PtySessionSpec {
     /// Whether an initial input follows the commit; the committed record
     /// then carries the `initial_input` marker until it is delivered.
     pub(super) initial_input_pending: bool,
+    /// Shared package authority a launch holds until its registration ends,
+    /// for launches that pin a package outside the create transaction.
+    pub(super) package_authority: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 fn next_runtime_generation(
@@ -618,6 +621,7 @@ impl SessionRegistry {
             metadata,
             warnings,
             initial_input_pending,
+            package_authority: _package_authority,
         } = spec;
 
         let created_at = match &registration {
@@ -801,9 +805,10 @@ impl SessionRegistry {
         let runtime_watch_cancel = CancellationToken::new();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
-        let default_detector_config = DetectorConfig::for_profile(
+        let default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &agent_base,
+            &snapshot.launch_binding,
             manifest_override,
         );
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {

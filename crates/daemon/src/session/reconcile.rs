@@ -2450,24 +2450,38 @@ impl SessionRegistry {
             |binding| {
                 binding
                     .input_rules
-                    .to_input_rules(crate::agent::input_rules_for_kind(
+                    .to_input_rules(crate::agent::input_rules_for_pin(
                         self.inner.profiles.runtimes(),
                         &binding.agent_base,
+                        &binding.launch_binding,
                     ))
             },
         );
         let snapshot = recovery
             .as_ref()
             .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
-        let manifest_override = self
+        let pin = recovery
+            .as_ref()
+            .map(|binding| binding.launch_binding.clone())
+            .unwrap_or_default();
+        let manifest_override = match self
             .inner
             .profiles
-            .resolve_agent(&record.info.agent)
-            .ok()
-            .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
-        let default_detector_config = DetectorConfig::for_profile(
+            .runtimes()
+            .definition_for_pin(&record.info.agent_base, &pin)
+        {
+            Ok(pinned) => self
+                .inner
+                .profiles
+                .resolve_agent_pinned(&record.info.agent, &pinned),
+            Err(_unresolved) => self.inner.profiles.resolve_agent(&record.info.agent),
+        }
+        .ok()
+        .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
+        let default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &record.info.agent_base,
+            &pin,
             manifest_override,
         );
         let detector_cancel = CancellationToken::new();
@@ -2612,17 +2626,25 @@ impl SessionRegistry {
             |binding| {
                 binding
                     .input_rules
-                    .to_input_rules(crate::agent::input_rules_for_kind(
+                    .to_input_rules(crate::agent::input_rules_for_pin(
                         self.inner.profiles.runtimes(),
                         &binding.agent_base,
+                        &binding.launch_binding,
                     ))
             },
         );
         let relaunch = recovery
             .as_ref()
             .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
-        let default_detector_config =
-            DetectorConfig::for_agent(self.inner.profiles.runtimes(), &record.info.agent_base);
+        let default_detector_config = DetectorConfig::for_pinned(
+            self.inner.profiles.runtimes(),
+            &record.info.agent_base,
+            &recovery
+                .as_ref()
+                .map(|binding| binding.launch_binding.clone())
+                .unwrap_or_default(),
+            None,
+        );
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
         let (detector_config, _) = watch::channel(DetectorConfigUpdate {
             generation: 0,

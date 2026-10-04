@@ -395,6 +395,33 @@ impl RuntimeHost {
         }
     }
 
+    /// The definition that describes a session launched with `pin` for
+    /// observation: detection rules and input framing.
+    ///
+    /// A package pin resolves from exactly its digest, verified again, so a
+    /// disabled package or another selected version never changes how a
+    /// session is observed. Every other pin resolves through the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable protocol error of [`Self::resolve_pinned`] or
+    /// [`Self::resolve_ref`].
+    pub fn definition_for_pin(
+        &self,
+        reference: &RuntimeRef,
+        pin: &LaunchPin,
+    ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+        let packaged = matches!(
+            pin.binding().map(|binding| &binding.provenance),
+            Some(BindingProvenance::Package { .. })
+        );
+        if packaged && self.package_store().is_some() {
+            self.resolve_pinned(reference, pin)
+        } else {
+            self.resolve_ref(reference)
+        }
+    }
+
     fn snapshot(&self) -> Arc<HostState> {
         Arc::clone(&self.state.read().unwrap_or_else(PoisonError::into_inner))
     }

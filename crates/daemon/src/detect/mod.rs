@@ -67,6 +67,28 @@ impl DetectorConfig {
         )
     }
 
+    /// Detector config for a session launched with `pin`: the override
+    /// manifest when there is one, else the manifest of the definition the pin
+    /// resolves to, else the generic shell manifest.
+    #[must_use]
+    pub fn for_pinned(
+        host: &RuntimeHost,
+        base: &RuntimeRef,
+        pin: &crate::agent::host::LaunchPin,
+        override_manifest: Option<Manifest>,
+    ) -> Self {
+        match override_manifest {
+            Some(manifest) => Self {
+                detection: DetectionConfig::default(),
+                manifest: Some(manifest),
+            },
+            None => host.definition_for_pin(base, pin).map_or_else(
+                |_unresolved| Self::generic_shell(),
+                |definition| Self::for_definition(&definition),
+            ),
+        }
+    }
+
     /// Production detector config driven by `definition`'s manifest.
     #[must_use]
     pub fn for_definition(definition: &RuntimeDefinition) -> Self {
