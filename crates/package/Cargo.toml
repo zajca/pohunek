@@ -30,6 +30,7 @@ rustix = { workspace = true, features = ["fs"] }
 ruzstd = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
 pohunek-test-support = { workspace = true }
 rustix = { workspace = true, features = ["process"] }
 tempfile = { workspace = true }

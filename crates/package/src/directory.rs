@@ -252,11 +252,30 @@ fn collect(
 ) -> Result<(), DirectoryError> {
     let listing = Dir::read_from(dir).map_err(open_error)?;
     let mut names = Vec::new();
+    // Names are buffered only up to what the archive could still admit, so a
+    // directory with millions of entries is rejected as soon as the budget is
+    // exceeded instead of being held in memory first. Files are charged
+    // against the remaining file budget; subdirectories hold no file by
+    // themselves and are bounded by the whole-archive file limit.
+    let file_room = budget.limits.max_files.saturating_sub(budget.files);
+    let directory_room = budget.limits.max_files;
+    let (mut files_seen, mut directories_seen) = (0_usize, 0_usize);
     for item in listing {
         let item = item.map_err(open_error)?;
         let bytes = item.file_name().to_bytes();
         if bytes == b"." || bytes == b".." {
             continue;
+        }
+        let (seen, room) = if item.file_type() == FileType::Directory {
+            (&mut directories_seen, directory_room)
+        } else {
+            (&mut files_seen, file_room)
+        };
+        *seen += 1;
+        if *seen > room {
+            return Err(DirectoryError::Archive(ArchiveError::TooManyFiles {
+                limit: budget.limits.max_files,
+            }));
         }
         let name = std::str::from_utf8(bytes).map_err(|_cause| DirectoryError::InvalidPath)?;
         names.push(name.to_owned());
@@ -270,6 +289,14 @@ fn collect(
         };
         match listed.kind {
             FileType::Directory => {
+                // A directory deeper than the path limit cannot hold a file,
+                // which also bounds the descriptors the walk keeps open.
+                if relative.len() > budget.limits.max_path_bytes.min(MAX_PATH_BYTES) {
+                    return Err(DirectoryError::Archive(ArchiveError::Entry {
+                        index: budget.files,
+                        reason: EntryRejection::PathTooLong,
+                    }));
+                }
                 let child = open_listed_dir(dir, &name, listed)?;
                 collect(&child, &relative, budget, entries)?;
             }
@@ -539,8 +566,11 @@ mod tests {
         let root = open_root(dir.path());
         let listed = list_entry(&root, "victim").expect("list");
         fs::remove_file(dir.path().join("victim")).expect("remove");
-        rustix::fs::mknodat(&root, "victim", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
-            .expect("mkfifo");
+        nix::unistd::mkfifo(
+            &dir.path().join("victim"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("mkfifo");
 
         let limits = Limits::DEFAULT;
         let mut budget = budget(&limits);
@@ -558,8 +588,11 @@ mod tests {
         let root = open_root(dir.path());
         let listed = list_entry(&root, "victim").expect("list");
         fs::remove_file(dir.path().join("victim")).expect("remove");
-        rustix::fs::mknodat(&root, "pipe", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
-            .expect("mkfifo");
+        nix::unistd::mkfifo(
+            &dir.path().join("pipe"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("mkfifo");
         symlink(dir.path().join("pipe"), dir.path().join("victim")).expect("symlink");
 
         let limits = Limits::DEFAULT;
@@ -573,9 +606,11 @@ mod tests {
     #[test]
     fn a_fifo_in_the_tree_is_an_unsupported_file_type() {
         let dir = package_dir();
-        let root = open_root(dir.path());
-        rustix::fs::mknodat(&root, "pipe", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
-            .expect("mkfifo");
+        nix::unistd::mkfifo(
+            &dir.path().join("pipe"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("mkfifo");
         assert_eq!(
             build_directory_archive(dir.path(), &Limits::DEFAULT),
             Err(DirectoryError::UnsupportedFileType)
@@ -626,6 +661,59 @@ mod tests {
             build_directory_archive(&link, &Limits::DEFAULT),
             Err(DirectoryError::Changed)
         );
+    }
+
+    #[test]
+    fn a_directory_with_more_files_than_the_budget_is_rejected_while_listing() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        for index in 0..5 {
+            fs::write(dir.path().join(format!("f{index}")), b"x").expect("write");
+        }
+        let limits = Limits {
+            max_files: 3,
+            ..Limits::DEFAULT
+        };
+        assert_eq!(
+            build_directory_archive(dir.path(), &limits),
+            Err(DirectoryError::Archive(ArchiveError::TooManyFiles {
+                limit: 3
+            }))
+        );
+    }
+
+    #[test]
+    fn a_directory_with_more_subdirectories_than_the_budget_is_rejected() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        for index in 0..5 {
+            fs::create_dir(dir.path().join(format!("d{index}"))).expect("mkdir");
+        }
+        let limits = Limits {
+            max_files: 3,
+            ..Limits::DEFAULT
+        };
+        assert_eq!(
+            build_directory_archive(dir.path(), &limits),
+            Err(DirectoryError::Archive(ArchiveError::TooManyFiles {
+                limit: 3
+            }))
+        );
+    }
+
+    #[test]
+    fn a_chain_of_empty_directories_deeper_than_the_path_limit_is_rejected() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        let limits = Limits {
+            max_path_bytes: 8,
+            ..Limits::DEFAULT
+        };
+        fs::create_dir_all(dir.path().join("aaaa/bbbb/cccc")).expect("mkdir");
+        assert!(matches!(
+            build_directory_archive(dir.path(), &limits),
+            Err(DirectoryError::Archive(ArchiveError::Entry {
+                reason: EntryRejection::PathTooLong,
+                ..
+            }))
+        ));
     }
 
     #[test]
