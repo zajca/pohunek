@@ -34,6 +34,16 @@ file_name = "_{reference}.jsonl"
 name_match = "ends_with"
 max_depth = 1"#;
 
+/// Like [`PI_SHAPED_FILE_CHECK`], rooted at `XDG_CONFIG_HOME` with a
+/// home-relative fallback.
+pub(crate) const PI_SHAPED_XDG_CHECK: &str = r#"check = "file"
+root_env = "XDG_CONFIG_HOME"
+root_home = ".config/pi"
+dir = "sessions"
+file_name = "_{reference}.jsonl"
+name_match = "ends_with"
+max_depth = 1"#;
+
 /// `[native_reference.existence]` body that skips verification.
 pub(crate) const PI_SHAPED_NO_CHECK: &str = r#"check = "none""#;
 

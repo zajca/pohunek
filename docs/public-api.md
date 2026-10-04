@@ -596,9 +596,10 @@ max_depth = 1                                    # directory levels below dir
   `session.fork` launches anything, the declared `existence` check runs against
   the frozen declaration. `check = "none"` skips verification and relaunches
   from the reference unchecked. `check = "file"` lists directories below the
-  config home (the environment variable named by `root_env`, read from the session's
-  profile environment only because the agent sees no other custom variables,
-  else `root_home` below the daemon's `$HOME`), descends at most `max_depth` levels below `dir`
+  config home (the environment variable named by `root_env`, else `root_home` below `HOME`;
+  both are read from the environment the agent is launched with: the daemon's
+  allowlist-filtered base environment, overridden by the session's profile
+  environment, so a variable or `HOME` the agent would not see is not used), descends at most `max_depth` levels below `dir`
   (at most 4) visiting at most 50 000 entries, and matches regular files whose
   name equals (`exact`) or ends with (`ends_with`) `file_name` with the
   reference substituted. It runs no shell, expands no glob, never follows a

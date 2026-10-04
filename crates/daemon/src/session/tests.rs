@@ -17203,3 +17203,180 @@ async fn a_report_labels_the_reference_it_writes_reported() {
 
     let _ = registry.stop(&created.id).await;
 }
+
+/// A fixed base-environment source: the thread fixture's variables plus
+/// `extra`, with `HOME` set to `home`.
+#[cfg(unix)]
+fn assigned_environment(
+    home: &std::path::Path,
+    extra: &[(&str, &std::path::Path)],
+) -> crate::runtime::EnvironmentSource {
+    let crate::runtime::EnvironmentSource::Fixed(mut variables) =
+        crate::test_support::thread_environment_source()
+    else {
+        panic!("a test fixture supplies an explicit environment");
+    };
+    variables.remove(std::ffi::OsStr::new("XDG_CONFIG_HOME"));
+    variables.insert("HOME".into(), home.into());
+    for (name, value) in extra {
+        variables.insert((*name).into(), (*value).into());
+    }
+    crate::runtime::EnvironmentSource::Fixed(variables)
+}
+
+/// Writes `<root>/sessions/proj/<stamp>_<reference>.jsonl`.
+#[cfg(unix)]
+fn write_conversation(root: &std::path::Path, reference: &str) {
+    let project = root.join("sessions").join("proj");
+    fs::create_dir_all(&project).expect("session store dir");
+    fs::write(
+        project.join(format!("2026-10-04T10-00-00Z_{reference}.jsonl")),
+        "{}",
+    )
+    .expect("conversation file");
+}
+
+/// Creates an assigned session of agent `agent`, lets it exit and returns its
+/// reference with the recovery outcome. The registry's base environment is
+/// `source` filtered by `allowlist`.
+#[cfg(unix)]
+async fn recover_assigned(
+    tag: &str,
+    agents_dir: Option<PathBuf>,
+    source: crate::runtime::EnvironmentSource,
+    allowlist: &[&str],
+    prepare: impl FnOnce(&str),
+) -> Result<(), String> {
+    let dir = temp_dir(tag);
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    if let Some(template) = &agents_dir {
+        let body = fs::read_to_string(template.join("pi-env.toml"))
+            .expect("profile template")
+            .replace("SCRIPT", &script.display().to_string());
+        fs::write(template.join("pi-env.toml"), body).expect("profile");
+    }
+    let registry = SessionRegistry::new_with_runtimes_and_environment(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            agents_dir,
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_host(
+            &script,
+            crate::agent::host::fixture::PI_SHAPED_XDG_CHECK,
+        ),
+        source,
+        allowlist.iter().map(|name| (*name).to_owned()).collect(),
+    );
+    let agent = if registry.inner.profiles.resolve_agent("pi-env").is_ok() {
+        "pi-env"
+    } else {
+        "pi"
+    };
+    let created = registry
+        .create(SessionNewParams {
+            agent: agent.to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    let reference = created
+        .native_session_id
+        .clone()
+        .expect("assigned reference");
+    prepare(&reference);
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    let outcome = registry.resume(&created.id).await.map(|_| ());
+    let _ = registry.stop(&created.id).await;
+    outcome.map_err(|error| error.code)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_reads_a_config_home_forwarded_through_the_base_environment() {
+    let home = temp_dir("assigned-env-home");
+    let xdg = temp_dir("assigned-env-xdg");
+    let source = assigned_environment(&home, &[("XDG_CONFIG_HOME", &xdg)]);
+    let outcome = recover_assigned(
+        "assigned-env-forwarded",
+        None,
+        source,
+        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+        |reference| write_conversation(&xdg, reference),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        Ok(()),
+        "the forwarded XDG_CONFIG_HOME is the store"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_profile_variable_wins_over_the_base_environment_for_recovery() {
+    let home = temp_dir("assigned-env-profile-home");
+    let base_xdg = temp_dir("assigned-env-profile-base");
+    let profile_xdg = temp_dir("assigned-env-profile-own");
+    let agents_dir = temp_agents_dir_with(
+        "assigned-env-profile",
+        "pi-env",
+        &format!(
+            "base = \"pi\"\nprogram = \"SCRIPT\"\n[env]\nXDG_CONFIG_HOME = \"{}\"\n",
+            profile_xdg.display()
+        ),
+    );
+    let source = assigned_environment(&home, &[("XDG_CONFIG_HOME", &base_xdg)]);
+    let outcome = recover_assigned(
+        "assigned-env-profile-run",
+        Some(agents_dir),
+        source,
+        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+        |reference| write_conversation(&profile_xdg, reference),
+    )
+    .await;
+    assert_eq!(outcome, Ok(()), "the profile's XDG_CONFIG_HOME wins");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_falls_back_to_the_declared_home_relative_store() {
+    let home = temp_dir("assigned-env-fallback-home");
+    let source = assigned_environment(&home, &[]);
+    let outcome = recover_assigned(
+        "assigned-env-fallback",
+        None,
+        source,
+        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+        |reference| write_conversation(&home.join(".config").join("pi"), reference),
+    )
+    .await;
+    assert_eq!(outcome, Ok(()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_home_the_allowlist_does_not_forward_is_not_used_for_recovery() {
+    let spoofed_home = temp_dir("assigned-env-spoofed-home");
+    let source = assigned_environment(&spoofed_home, &[]);
+    let outcome = recover_assigned(
+        "assigned-env-spoofed",
+        None,
+        source,
+        &["PATH"],
+        |reference| write_conversation(&spoofed_home.join(".config").join("pi"), reference),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        Err("agent_native_reference_missing".to_owned()),
+        "the agent would not see this HOME, so it is not the store"
+    );
+}

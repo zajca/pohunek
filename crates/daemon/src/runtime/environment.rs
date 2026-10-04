@@ -63,6 +63,25 @@ pub(crate) fn base_environment<P: AsRef<str>>(
     }
 }
 
+/// The value `name` has in the agent child's environment.
+///
+/// The child starts from `base`, then the profile environment overrides it (a
+/// later profile entry wins); reserved `POHUNEK_*` names never come from the
+/// profile. Recovery reads variables through this function so it sees what the
+/// launched agent sees.
+pub(crate) fn effective_variable(
+    base: &BaseEnv,
+    profile: &[(String, String)],
+    name: &str,
+) -> Option<OsString> {
+    profile
+        .iter()
+        .rev()
+        .find(|(key, _)| key == name && !key.starts_with("POHUNEK_"))
+        .map(|(_, value)| OsString::from(value))
+        .or_else(|| base.get(name).map(OsString::from))
+}
+
 #[cfg(test)]
 mod tests {
     use pohunek_worker_protocol::{is_denylisted, DEFAULT_ENVIRONMENT_ALLOWLIST};
@@ -151,5 +170,26 @@ mod tests {
             base_environment(&["*"], &source),
             Err(EnvError::InvalidPattern { .. })
         ));
+    }
+
+    #[test]
+    fn a_profile_variable_overrides_the_base_and_the_base_fills_the_rest() {
+        let source = EnvironmentSource::fixed([
+            pair("HOME", "/fixture/home"),
+            pair("XDG_CONFIG_HOME", "/fixture/xdg"),
+            pair("NOT_ALLOWLISTED_NAME", "dropped"),
+        ]);
+        let base = base_environment(DEFAULT_ENVIRONMENT_ALLOWLIST, &source).expect("base");
+        let profile = vec![
+            ("XDG_CONFIG_HOME".to_owned(), "/profile/old".to_owned()),
+            ("XDG_CONFIG_HOME".to_owned(), "/profile/xdg".to_owned()),
+            ("POHUNEK_SESSION_ID".to_owned(), "spoofed".to_owned()),
+        ];
+
+        let get = |name| effective_variable(&base, &profile, name);
+        assert_eq!(get("XDG_CONFIG_HOME"), Some(OsString::from("/profile/xdg")));
+        assert_eq!(get("HOME"), Some(OsString::from("/fixture/home")));
+        assert_eq!(get("NOT_ALLOWLISTED_NAME"), None);
+        assert_eq!(get("POHUNEK_SESSION_ID"), None);
     }
 }

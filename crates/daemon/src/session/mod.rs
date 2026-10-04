@@ -1236,7 +1236,7 @@ impl SessionRegistry {
     ) -> Self {
         #[cfg(test)]
         {
-            Self::new_for_test(config, inspector, None)
+            Self::new_for_test(config, inspector, None, None)
         }
         #[cfg(not(test))]
         {
@@ -1251,6 +1251,7 @@ impl SessionRegistry {
         config: SessionRegistryConfig,
         inspector: Arc<dyn ProcessInspector>,
         runtimes: Option<RuntimeHost>,
+        environment: Option<(crate::runtime::EnvironmentSource, Vec<String>)>,
     ) -> Self {
         let mut config = config;
         let (runtime_root, state_root, test_dirs) = owned_test_worker_roots(&config);
@@ -1258,6 +1259,12 @@ impl SessionRegistry {
         config.worker_state_root = Some(state_root.clone());
         if config.supervision.is_none() {
             config.supervision = Some(test_supervision(&runtime_root, &state_root));
+        }
+        if let (Some((source, allowlist)), Some(supervision)) =
+            (environment, config.supervision.as_mut())
+        {
+            supervision.environment_source = source;
+            supervision.environment_allowlist = allowlist;
         }
         let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
             runtime_root,
@@ -1280,6 +1287,24 @@ impl SessionRegistry {
             config,
             Arc::new(crate::procwatch::readable_host::ReadableHost::new()),
             Some(runtimes),
+            None,
+        )
+    }
+
+    /// [`Self::new_with_runtimes`] with the base-environment source and
+    /// allowlist workers launch their agents with.
+    #[cfg(test)]
+    pub(crate) fn new_with_runtimes_and_environment(
+        config: SessionRegistryConfig,
+        runtimes: RuntimeHost,
+        source: crate::runtime::EnvironmentSource,
+        allowlist: Vec<String>,
+    ) -> Self {
+        Self::new_for_test(
+            config,
+            Arc::new(crate::procwatch::readable_host::ReadableHost::new()),
+            Some(runtimes),
+            Some((source, allowlist)),
         )
     }
 

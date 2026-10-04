@@ -8,16 +8,14 @@ use super::{
     SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
 };
 
-use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 
 use crate::agent::host::RuntimeDefinition;
 use crate::agent::NativeReferenceProvenance;
-
-/// Base environment variable naming the home directory the agent runs with.
-const HOME_ENV: &str = "HOME";
 use crate::detect::Manifest;
+use crate::runtime::environment::{base_environment, effective_variable};
+use pohunek_worker_protocol::BaseEnv;
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -300,7 +298,15 @@ impl SessionRegistry {
 
         let (profile_env, manifest_override) = self.recovery_profile(&binding, "fork");
         // Fork is fail-closed on a reference that no longer names a conversation.
-        verify_assigned_reference(&launch, &binding, &session_ref, &profile_env).await?;
+        let base_environment = self.launch_base_environment()?;
+        verify_assigned_reference(
+            &launch,
+            &binding,
+            &session_ref,
+            &base_environment,
+            &profile_env,
+        )
+        .await?;
         let mut env_extra = profile_env;
         env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
         let opts = LaunchOpts {
@@ -368,6 +374,16 @@ impl SessionRegistry {
             .await?;
         self.persist_resume_binding(&info.id).await;
         Ok(info)
+    }
+
+    /// The base environment a launch of this registry hands to the agent.
+    fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
+        let lifecycle = self.lifecycle()?;
+        base_environment(
+            &lifecycle.config.environment_allowlist,
+            &lifecycle.config.environment_source,
+        )
+        .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))
     }
 
     /// The environment and detection-manifest override of the profile
@@ -531,7 +547,15 @@ impl SessionRegistry {
         // A reference core assigned is only as good as the conversation behind
         // it: relaunching into a conversation the agent never wrote, or one it
         // left, would silently start an empty session.
-        verify_assigned_reference(&launch, &binding, &session_ref, &profile_env).await?;
+        let base_environment = self.launch_base_environment()?;
+        verify_assigned_reference(
+            &launch,
+            &binding,
+            &session_ref,
+            &base_environment,
+            &profile_env,
+        )
+        .await?;
         // Profile env first, daemon handshake env appended last (POHUNEK_* wins).
         let mut env_extra = profile_env;
         env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
@@ -644,9 +668,9 @@ impl SessionRegistry {
 /// conversation, through the check the runtime declared at launch.
 ///
 /// A reference that arrived through an integration report is not checked here.
-/// The check resolves its config-home variable from the session's profile
-/// environment and the home directory from the daemon's `HOME`, and runs off the async runtime
-/// because it lists directories.
+/// The check reads its config-home variable and `HOME` from the environment the
+/// agent is launched with (the filtered base environment, then the profile
+/// environment), and runs off the async runtime because it lists directories.
 ///
 /// # Errors
 ///
@@ -656,6 +680,7 @@ async fn verify_assigned_reference(
     launch: &NativeSessionLaunch,
     binding: &ResumeBinding,
     session_ref: &SessionRef,
+    base_environment: &BaseEnv,
     profile_env: &[(String, String)],
 ) -> Result<(), ProtocolError> {
     if binding.native_reference_provenance != NativeReferenceProvenance::Assigned {
@@ -667,17 +692,9 @@ async fn verify_assigned_reference(
     let existence = assigned.existence().clone();
     let session_ref = session_ref.clone();
     let profile_env = profile_env.to_vec();
+    let base_environment = base_environment.clone();
     let verdict = tokio::task::spawn_blocking(move || {
-        // The agent only sees its profile environment plus the base variables
-        // the worker passes through, so the config-home variable is read from
-        // the profile alone; `HOME` is a base variable and comes from the daemon.
-        let lookup = |name: &str| -> Option<OsString> {
-            profile_env
-                .iter()
-                .find(|(key, _)| key == name)
-                .map(|(_, value)| OsString::from(value))
-                .or_else(|| (name == HOME_ENV).then(|| std::env::var_os(name)).flatten())
-        };
+        let lookup = |name: &str| effective_variable(&base_environment, &profile_env, name);
         existence.verify(&session_ref, &lookup)
     })
     .await
