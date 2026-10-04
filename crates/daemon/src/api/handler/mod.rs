@@ -26,7 +26,7 @@ mod util;
 mod worktree;
 
 use protocol::{
-    compat, method, negotiate, ProtocolError, Request, Response, PROTOCOL_VERSION,
+    compat, method, negotiate, ProtocolError, ProtocolVersion, Request, Response, PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::json;
@@ -142,13 +142,23 @@ pub(crate) enum Dispatch {
 /// mismatches are turned into typed error responses (`Reply`) so the connection
 /// can stay open for the next request. A valid `subscribe` request yields
 /// `Subscribe` with the OK ack line for the caller to write before streaming.
-pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
+///
+/// `connection_version` is the version already frozen for this connection. A
+/// line that cannot be parsed has no range of its own, so its error is stamped
+/// with that version; before the first successful request nothing is negotiated
+/// yet and the daemon's current version is the only honest stamp.
+pub(crate) async fn dispatch_line(
+    line: &str,
+    state: &DaemonState,
+    connection_version: Option<ProtocolVersion>,
+) -> Dispatch {
+    let error_version = connection_version.unwrap_or(PROTOCOL_VERSION);
     let trimmed = line.trim();
     if trimmed.is_empty() {
         // Tolerate blank keep-alive lines; reply with a framing error tied to a
         // synthetic id so the client still gets a parseable line.
         let resp = Response::err(
-            PROTOCOL_VERSION,
+            error_version,
             "invalid-request",
             ProtocolError::bad_request("empty request line"),
         )
@@ -166,7 +176,7 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
             warn!(error = %err, "failed to parse control request");
             // We cannot recover the request id from unparseable JSON; use empty.
             let resp = Response::err(
-                PROTOCOL_VERSION,
+                error_version,
                 "invalid-request",
                 ProtocolError::bad_request(format!("invalid request JSON: {err}")),
             )
@@ -442,7 +452,7 @@ pub(crate) fn serialize_response(resp: &Response) -> String {
         warn!(error = %err, "failed to serialize response; sending fallback error");
         format!(
             r#"{{"v":{},"id":"{}","err":{{"class":"daemon","code":"serialize_failed","msg":"response serialization failed"}}}}"#,
-            PROTOCOL_VERSION.get(),
+            resp.version().get(),
             resp.id().replace('"', "")
         )
     })

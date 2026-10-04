@@ -594,6 +594,38 @@ async fn next_event_with_runtime(subscriber: &mut Client) -> Value {
 }
 
 #[tokio::test]
+async fn invalid_input_on_a_previous_version_connection_is_answered_in_that_version() {
+    let daemon = Daemon::start("window-invalid").await;
+    let mut client = daemon.connect().await;
+    let health = exchange(
+        &mut client,
+        &previous_request("health-1", method::DAEMON_HEALTH, Value::Null),
+    )
+    .await;
+    assert_eq!(previous_ok(&health)["protocol_version"], PREVIOUS_VERSION);
+
+    for line in ["", "not json", "{\"v\":1}"] {
+        client
+            .send(line.to_owned())
+            .await
+            .expect("send invalid input");
+        let reply = next_line(&mut client).await;
+        assert_eq!(reply["v"], PREVIOUS_VERSION, "{line:?}: {reply}");
+        assert_eq!(reply["err"]["code"], "bad_request", "{line:?}: {reply}");
+    }
+
+    // Before anything is negotiated the daemon's current version is stamped.
+    let mut fresh = daemon.connect().await;
+    fresh
+        .send("not json".to_owned())
+        .await
+        .expect("send invalid input");
+    let reply = next_line(&mut fresh).await;
+    assert_eq!(reply["v"], PROTOCOL_VERSION.get(), "{reply}");
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn a_client_two_versions_back_is_rejected_with_a_typed_mismatch() {
     let daemon = Daemon::start("window-below").await;
     let mut client = daemon.connect().await;

@@ -530,7 +530,7 @@ where
             }
         }
 
-        match handler::dispatch_line(&line, &state).await {
+        match handler::dispatch_line(&line, &state, negotiated_version).await {
             Dispatch::Reply(response_line) => {
                 framed.send(response_line).await.map_err(codec_to_io)?;
             }
@@ -615,6 +615,9 @@ where
     let mut attach = match registry.redeem_attach(&stream_id).await {
         Ok(attach) => attach,
         Err(err) => {
+            // An attach connection starts with a prelude that carries no version
+            // range and no request precedes it, so nothing is negotiated for it
+            // and the daemon's current version is the only honest stamp.
             let response = Response::err(protocol::PROTOCOL_VERSION, stream_id, err)
                 .expect("validated stream ids satisfy response validation");
             framed

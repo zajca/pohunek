@@ -3665,7 +3665,8 @@ mod tests {
     /// and returns the daemon's one-shot reply.
     async fn dispatch_hook_request(state: &crate::api::DaemonState, request: &Value) -> Value {
         let line = serde_json::to_string(request).expect("hook request serializes");
-        let crate::api::Dispatch::Reply(reply) = crate::api::dispatch_line(&line, state).await
+        let crate::api::Dispatch::Reply(reply) =
+            crate::api::dispatch_line(&line, state, None).await
         else {
             panic!("notification.create returns a one-shot reply");
         };

@@ -97,6 +97,17 @@ impl Request {
         })
     }
 
+    /// Replaces the advertised range with the exact `version`.
+    ///
+    /// A daemon-backed probe uses it to speak the version of the connection it
+    /// answers for instead of the client's current version.
+    #[must_use]
+    pub fn with_exact_version(mut self, version: ProtocolVersion) -> Self {
+        self.v = ProtocolVersionRange::new(version, version)
+            .expect("a protocol version is always a valid exact range");
+        self
+    }
+
     /// Replaces the method parameters, keeping every other envelope coordinate.
     ///
     /// The daemon uses it to hand a handler the current-shape parameters of a
