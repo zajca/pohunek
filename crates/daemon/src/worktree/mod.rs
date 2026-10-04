@@ -96,13 +96,6 @@ const GIT_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// latency once per handoff.
 const ADMIN_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
-/// How long git's output streams may stay open after git itself has exited.
-///
-/// A hook's background job inherits the pipes and would otherwise hold the
-/// caller (and the per-repository admin lock) until it ends. Long enough for the
-/// reader threads to flush buffered output, short against [`GIT_COMMAND_TIMEOUT`].
-const GIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Fallback directory-name component when a repository path has no usable file
 /// name (e.g. the filesystem root) or it sanitizes to empty.
 const REPO_NAME_FALLBACK: &str = "repo";
@@ -1465,7 +1458,7 @@ fn lock_within(lock: &Mutex<()>, timeout: Duration) -> Result<MutexGuard<'_, ()>
 /// holding that repository's [`admin_lock`]. The command keeps its own
 /// [`GIT_COMMAND_TIMEOUT`]; the lock wait is bounded by the same value.
 fn run_admin_command(repo: &Path, cmd: Command) -> Result<(), String> {
-    run_admin_command_within(repo, cmd, GIT_COMMAND_TIMEOUT, GIT_OUTPUT_DRAIN_TIMEOUT)
+    run_admin_command_within(repo, cmd, GIT_COMMAND_TIMEOUT)
 }
 
 /// [`run_admin_command`] with an explicit bound on the lock wait.
@@ -1473,15 +1466,81 @@ fn run_admin_command_within(
     repo: &Path,
     cmd: Command,
     lock_timeout: Duration,
-    drain_timeout: Duration,
 ) -> Result<(), String> {
     let lock = admin_lock(repo)?;
     let _guard = lock_within(&lock, lock_timeout)?;
-    let output = run_output_bounded_with_drain(cmd, GIT_COMMAND_TIMEOUT, drain_timeout)?;
+    let output = run_output_via_files(cmd, GIT_COMMAND_TIMEOUT)?;
     if output.status.success() {
         return Ok(());
     }
     Err(output_failure_message(&output))
+}
+
+/// Largest stdout or stderr a command run by [`run_output_via_files`] returns;
+/// anything beyond is dropped. Git's own diagnostics are a few lines, so this
+/// only limits what a hook writes into the same streams.
+const ADMIN_OUTPUT_CAP_BYTES: u64 = 64 * 1024;
+
+/// Run a command like [`run_output_bounded`], but with stdout and stderr going
+/// to anonymous owner-only temporary files instead of pipes.
+///
+/// A hook may leave a background process that inherits the output descriptors.
+/// With pipes that process holds end-of-stream open and stalls the reader; with
+/// unlinked files it only writes into a file nobody waits on, so the call
+/// returns as soon as git exits, with no reader threads and no signal to any
+/// process. The files are read back once git has exited, truncated to
+/// [`ADMIN_OUTPUT_CAP_BYTES`]. A timeout kills the still-unreaped process
+/// group exactly as [`run_output_bounded`] does.
+///
+/// A surviving descendant can keep appending to its unlinked file, so disk use
+/// is bounded only by that process's own lifetime and the filesystem holding
+/// the temporary directory: the space is released when the last descriptor
+/// closes, and is never read by the daemon.
+fn run_output_via_files(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+    let stdout = tempfile::tempfile()
+        .map_err(|err| format!("failed to create a temporary file for git output: {err}"))?;
+    let stderr = tempfile::tempfile()
+        .map_err(|err| format!("failed to create a temporary file for git output: {err}"))?;
+    let stdout_reader = stdout
+        .try_clone()
+        .map_err(|err| format!("failed to duplicate the git output file: {err}"))?;
+    let stderr_reader = stderr
+        .try_clone()
+        .map_err(|err| format!("failed to duplicate the git output file: {err}"))?;
+    configure_process_group(&mut cmd);
+    cmd.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to run git: {err}"))?;
+    // Release the parent's copies of the child's descriptors held by `cmd`.
+    drop(cmd);
+
+    let status = match wait_child_with_timeout(&mut child, timeout) {
+        GitOutcome::Exited(status) => status,
+        GitOutcome::TimedOut => {
+            return Err(format!("git command timed out after {timeout:?}"));
+        }
+        GitOutcome::WaitError(err) => {
+            return Err(format!("failed to wait for git: {err}"));
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: read_capped(stdout_reader, "stdout")?,
+        stderr: read_capped(stderr_reader, "stderr")?,
+    })
+}
+
+/// Read at most [`ADMIN_OUTPUT_CAP_BYTES`] from the start of `file`.
+fn read_capped(mut file: fs::File, stream_name: &str) -> Result<Vec<u8>, String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("failed to rewind git {stream_name}: {err}"))?;
+    let mut buf = Vec::new();
+    file.take(ADMIN_OUTPUT_CAP_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|err| format!("failed to read git {stream_name}: {err}"))?;
+    Ok(buf)
 }
 
 /// Whether the checkout of `binding` is gone: its directory is absent, and
@@ -1989,23 +2048,7 @@ fn run_command(cmd: Command) -> Result<String, String> {
 /// timeout is `Err`. Callers branch on `Output::status` for command-specific
 /// success/failure semantics (e.g. `session::diff`'s `git diff --no-index`,
 /// which uses exit code 1 to mean "files differ", not "failed").
-pub(crate) fn run_output_bounded(cmd: Command, timeout: Duration) -> Result<Output, String> {
-    run_output_bounded_with_drain(cmd, timeout, GIT_OUTPUT_DRAIN_TIMEOUT)
-}
-
-/// [`run_output_bounded`] with an explicit bound on how long output draining may
-/// outlast the process.
-///
-/// A descendant that survives the command (a hook's background job) keeps the
-/// output pipes open after git exits, so end-of-stream never arrives. Once the
-/// command has exited, the streams get `drain_timeout` to finish; after that the
-/// process group is killed to release the pipes, and whatever was read until
-/// then is returned as the (possibly truncated) output.
-fn run_output_bounded_with_drain(
-    mut cmd: Command,
-    timeout: Duration,
-    drain_timeout: Duration,
-) -> Result<Output, String> {
+pub(crate) fn run_output_bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
     configure_process_group(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
@@ -2013,8 +2056,8 @@ fn run_output_bounded_with_drain(
         .map_err(|err| format!("failed to run git: {err}"))?;
     let stdout = child.stdout.take().expect("stdout was piped before spawn");
     let stderr = child.stderr.take().expect("stderr was piped before spawn");
-    let stdout_drain = PipeDrain::start(stdout);
-    let stderr_drain = PipeDrain::start(stderr);
+    let stdout_reader = thread::spawn(move || read_pipe(stdout));
+    let stderr_reader = thread::spawn(move || read_pipe(stderr));
 
     let status = match wait_child_with_timeout(&mut child, timeout) {
         GitOutcome::Exited(status) => status,
@@ -2026,28 +2069,12 @@ fn run_output_bounded_with_drain(
         }
     };
 
-    let deadline = Instant::now() + drain_timeout;
-    let mut stdout_done = stdout_drain.wait_until(deadline);
-    let mut stderr_done = stderr_drain.wait_until(deadline);
-    if !(stdout_done && stderr_done) {
-        warn!(
-            drain_timeout = ?drain_timeout,
-            "git output pipes stayed open after git exited; killing the process group"
-        );
-        terminate_process_group(&mut child);
-        // Killing the group closes the pipes of every member; a descendant that
-        // left the group keeps them open and its output is cut off here.
-        let grace = Instant::now() + drain_timeout;
-        stdout_done = stdout_drain.wait_until(grace);
-        stderr_done = stderr_drain.wait_until(grace);
-        if !(stdout_done && stderr_done) {
-            warn!("git output pipes are held by a process outside the group; output truncated");
-        }
-    }
+    let stdout = join_pipe_reader(stdout_reader, "stdout")?;
+    let stderr = join_pipe_reader(stderr_reader, "stderr")?;
     Ok(Output {
         status,
-        stdout: stdout_drain.take()?,
-        stderr: stderr_drain.take()?,
+        stdout,
+        stderr,
     })
 }
 
@@ -2074,71 +2101,24 @@ fn wait_child_with_timeout(child: &mut Child, timeout: Duration) -> GitOutcome {
     }
 }
 
-/// Incremental reader of one child output pipe.
-///
-/// A background thread appends to a shared buffer until end-of-stream, so a
-/// caller that gives up waiting still holds everything read so far. A reader
-/// stuck on a pipe nobody closes is abandoned and ends with the pipe.
-struct PipeDrain {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    finished: std::sync::mpsc::Receiver<io::Result<()>>,
-    outcome: Mutex<Option<io::Result<()>>>,
+fn read_pipe(mut pipe: impl io::Read) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    pipe.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
-impl PipeDrain {
-    fn start(mut pipe: impl io::Read + Send + 'static) -> Self {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let (sender, finished) = std::sync::mpsc::channel();
-        let shared = Arc::clone(&buffer);
-        thread::spawn(move || {
-            let mut chunk = [0_u8; 8192];
-            let result = loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break Ok(()),
-                    Ok(read) => shared
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .extend_from_slice(&chunk[..read]),
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                    Err(err) => break Err(err),
-                }
-            };
-            // The receiver is gone when the caller stopped waiting.
-            let _ = sender.send(result);
-        });
-        Self {
-            buffer,
-            finished,
-            outcome: Mutex::new(None),
+fn join_pipe_reader(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>, String> {
+    let result = match reader.join() {
+        Ok(result) => result,
+        Err(payload) => {
+            drop(payload);
+            return Err(format!("git {stream_name} reader panicked"));
         }
-    }
-
-    /// Whether the stream reached end-of-stream (or failed) before `deadline`.
-    fn wait_until(&self, deadline: Instant) -> bool {
-        let mut outcome = self.outcome.lock().unwrap_or_else(PoisonError::into_inner);
-        if outcome.is_some() {
-            return true;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match self.finished.recv_timeout(remaining) {
-            Ok(result) => {
-                *outcome = Some(result);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// The bytes read so far; a read error other than a cut-off is returned.
-    fn take(&self) -> Result<Vec<u8>, String> {
-        let outcome = self.outcome.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(Err(err)) = outcome.as_ref() {
-            return Err(format!("failed to read git output: {err}"));
-        }
-        Ok(std::mem::take(
-            &mut *self.buffer.lock().unwrap_or_else(PoisonError::into_inner),
-        ))
-    }
+    };
+    result.map_err(|err| format!("failed to read git {stream_name}: {err}"))
 }
 
 /// Run `git -C <repo> <args>` capturing trimmed stdout on success.

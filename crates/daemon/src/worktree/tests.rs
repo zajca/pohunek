@@ -12,13 +12,15 @@ use std::time::{Duration, Instant};
 use protocol::{SessionRetentionHold, SessionWarningKind};
 
 use super::{
-    admin_lock, git_command, lock_within, run_admin_command_within, run_output_bounded_with_drain,
-    worktree_add_new, worktree_prune,
+    admin_lock, git_command, lock_within, run_admin_command_within, worktree_add_new,
+    worktree_prune,
 };
 use super::{
     branch_slug, hook_env, is_valid_worktree, run_output_bounded, HookContext, HookEvent,
     WorktreeCleanup, WorktreeManager, WorktreeRequest, WorktreeWork,
 };
+#[cfg(target_os = "linux")]
+use super::{run_output_via_files, ADMIN_OUTPUT_CAP_BYTES};
 use crate::store::{Store, WorktreeStatus};
 
 /// Generous setup-script timeout for tests whose script finishes promptly; long
@@ -795,7 +797,7 @@ fn admin_commands_wait_for_the_repository_lock_before_running_git() {
     cmd.args(["worktree", "add", "-b", "feat/locked", "--end-of-options"])
         .arg(&checkout)
         .arg("main");
-    let message = run_admin_command_within(&repo, cmd, Duration::ZERO, TEST_DRAIN_TIMEOUT)
+    let message = run_admin_command_within(&repo, cmd, Duration::ZERO)
         .expect_err("the held lock keeps the command from running");
 
     assert!(
@@ -809,53 +811,110 @@ fn admin_commands_wait_for_the_repository_lock_before_running_git() {
     drop(held);
 }
 
-/// Drain bound for the lingering-descendant tests: long enough for output to
-/// flush on a loaded host, short enough to keep the tests quick.
-const TEST_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
+/// Generous bound on the command itself in the lingering-descendant tests.
+const TEST_GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[test]
-fn output_draining_is_bounded_when_a_descendant_keeps_the_pipes_open() {
-    let marker = unique_dir("drain-marker").join("started");
+/// Open file descriptors and threads of this process, for leak checks. Each
+/// nextest test runs in its own process, so nothing else moves these counts.
+#[cfg(target_os = "linux")]
+fn fd_and_thread_counts() -> (usize, usize) {
+    let count = |dir: &str| fs::read_dir(dir).expect("read /proc/self").count();
+    (count("/proc/self/fd"), count("/proc/self/task"))
+}
+
+/// Runs `script` under `sh` through [`run_output_via_files`], where the script
+/// leaves a background process holding the output descriptors.
+#[cfg(target_os = "linux")]
+fn run_script_with_lingering_descendant(script: &str) -> std::process::Output {
     let mut cmd = pohunek_test_support::process_env::command("sh");
-    // The background job inherits stdout/stderr and outlives the shell.
-    cmd.arg("-c").arg(format!(
-        "echo partial; (touch '{}'; exec sleep 300) & exit 0",
-        marker.display()
-    ));
-
-    let output = run_output_bounded_with_drain(cmd, TEST_GIT_TIMEOUT, TEST_DRAIN_TIMEOUT)
+    cmd.arg("-c").arg(script);
+    let before = fd_and_thread_counts();
+    let output = run_output_via_files(cmd, TEST_GIT_TIMEOUT)
         .expect("the command completes despite the lingering descendant");
+    assert_eq!(
+        fd_and_thread_counts(),
+        before,
+        "no descriptor or reader thread is left behind"
+    );
+    output
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_descendant_in_the_same_group_holding_the_output_cannot_stall_the_command() {
+    let output = run_script_with_lingering_descendant("echo partial; (exec sleep 30) & exit 0");
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "partial");
-    assert!(marker.exists(), "the descendant was started");
 }
 
-/// Generous bound on the command itself in the drain tests.
-const TEST_GIT_TIMEOUT: Duration = Duration::from_secs(30);
-
+#[cfg(target_os = "linux")]
 #[test]
-fn worktree_add_with_a_lingering_hook_descendant_releases_the_repository_lock() {
+fn a_descendant_that_left_the_group_holding_the_output_cannot_stall_the_command() {
+    let output = run_script_with_lingering_descendant("echo partial; setsid sleep 30 & exit 0");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "partial");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn command_output_is_capped_when_a_descendant_keeps_writing() {
+    let cap = usize::try_from(ADMIN_OUTPUT_CAP_BYTES).expect("cap fits usize");
+    // Writes twice the cap to each stream, then leaves a writer behind.
+    let script = format!(
+        "head -c {n} /dev/zero >&1; head -c {n} /dev/zero >&2; \
+         (i=0; while [ $i -lt 2000 ]; do echo more; i=$((i+1)); done) & exit 0",
+        n = cap * 2
+    );
+
+    let output = run_script_with_lingering_descendant(&script);
+
+    assert_eq!(output.stdout.len(), cap, "stdout is truncated to the cap");
+    assert_eq!(output.stderr.len(), cap, "stderr is truncated to the cap");
+}
+
+#[cfg(unix)]
+fn install_post_checkout_hook(repo: &Path, body: &str) {
     use std::os::unix::fs::PermissionsExt;
 
-    let repo = init_repo("lock-hook");
     let hooks = repo.join(".git").join("hooks");
     fs::create_dir_all(&hooks).expect("hooks dir");
     let hook = hooks.join("post-checkout");
-    fs::write(&hook, "#!/bin/sh\n(exec sleep 300) &\nexit 0\n").expect("write hook");
+    fs::write(&hook, format!("#!/bin/sh\n{body}\nexit 0\n")).expect("write hook");
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
-    let checkout = unique_dir("lock-hook-checkout").join("wt");
+}
+
+/// Adds a worktree whose `post-checkout` hook runs `body`, then checks the add
+/// succeeded and the repository lock is free again.
+#[cfg(unix)]
+fn assert_add_with_hook_releases_the_lock(tag: &str, body: &str) {
+    let repo = init_repo(&format!("lock-hook-{tag}"));
+    install_post_checkout_hook(&repo, body);
+    let checkout = unique_dir(&format!("lock-hook-{tag}-checkout")).join("wt");
     let mut cmd = git_command(&repo).expect("git command");
     cmd.args(["worktree", "add", "-b", "feat/hook", "--end-of-options"])
         .arg(&checkout)
         .arg("main");
 
-    run_admin_command_within(&repo, cmd, TEST_GIT_TIMEOUT, TEST_DRAIN_TIMEOUT)
+    run_admin_command_within(&repo, cmd, TEST_GIT_TIMEOUT)
         .expect("add succeeds although the hook left a background job");
 
     assert!(is_valid_worktree(&checkout));
     let lock = admin_lock(&repo).expect("lock");
     drop(lock_within(&lock, Duration::ZERO).expect("the lock was released after the add"));
+}
+
+#[cfg(unix)]
+#[test]
+fn worktree_add_with_a_same_group_hook_descendant_releases_the_repository_lock() {
+    assert_add_with_hook_releases_the_lock("group", "(exec sleep 30) &");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worktree_add_with_a_setsid_hook_descendant_releases_the_repository_lock() {
+    assert_add_with_hook_releases_the_lock("setsid", "setsid sleep 30 &");
 }
 
 #[test]

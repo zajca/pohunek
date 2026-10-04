@@ -46,6 +46,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 libc = { workspace = true }
+# `tempfile::tempfile` gives git's admin-command output an anonymous owner-only file.
+tempfile = { workspace = true }
 nix = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 time = { workspace = true }
@@ -63,7 +65,6 @@ pohunek-session-worker = { workspace = true }
 # `test-util` enables tokio's paused clock (`start_paused`) so the attention
 # debounce coordinator tests advance time deterministically instead of sleeping.
 tokio = { workspace = true, features = ["test-util"] }
-tempfile = { workspace = true }
 pohunek-test-support = { workspace = true }
 wait-timeout = "0.2"
 
