@@ -1,5 +1,14 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-04, upgrade window and store schema)
+
+- The update runbook states the upgrade window (release N carries N-1 for live
+  workers, the worker journal and public-protocol clients; persisted state
+  migrates from any older kept schema), the `metadata.jsonl.pre-schema-<old>`
+  backup, and the recovery from a newer-schema refusal. The daemon debug
+  runbook points at it, and the source map lists the schema and shape-guard
+  sources.
+
 ## Unreleased (2026-10-04, README and reference pages)
 
 - The README is an agent-focused entry point; the human reference lives in

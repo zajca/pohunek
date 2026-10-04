@@ -151,7 +151,8 @@ refuses while sessions are live and names them; end them yourself, or accept the
 destructive path explicitly with `pohunek service uninstall --stop-sessions`. The
 default keeps the durable host identity, governance keys, session history, and
 worktrees. `pohunek service uninstall --purge` additionally removes the session
-store, event logs, worker journals, and host identity: it is never implicit.
+store and its schema-migration backups (`metadata.jsonl.pre-schema-<n>`), event
+logs, worker journals, and host identity: it is never implicit.
 
 ## Logs
 

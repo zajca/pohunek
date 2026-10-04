@@ -37,6 +37,11 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    workers' working directory, must exist. The fatal error names the variable;
    a relative `HOME` such as `.` fails this way even when every `XDG_*` root is
    absolute.
+   It also refuses to start when `<data_dir>/metadata.jsonl` has a schema it
+   cannot use: the fatal error names both schema versions. A store newer than
+   the daemon needs the newer release (or the `metadata.jsonl.pre-schema-<old>`
+   backup restored); see [update after
+   release](update-after-release.md#upgrade-window-and-the-metadata-store).
 3. If health cannot connect, run `pohunek service status --json`. An installed
    service reports its daemon job (`daemon.state`, `daemon.pid`) and
    `daemon_error` when the service manager cannot be queried. On macOS a

@@ -36,6 +36,36 @@ instead of the `{minimum, maximum}` range, so the daemon drops their
 notifications until they are reinstalled. Earlier protocol transitions (integer-v1 to range negotiation,
 the v3 overlay-routing change) do not widen the supported range.
 
+## Upgrade window and the metadata store
+
+Release N stays compatible with release N-1 for live workers (private worker
+protocol versions `PREVIOUS_VERSION` and `CURRENT_VERSION`), for the worker
+journal, and for public-protocol clients; nothing else is shimmed. The daemon's
+persisted state, `<data_dir>/metadata.jsonl`, migrates from any older kept
+schema, so skipping releases is safe. Each release's notes name every schema or
+protocol constant that changed (`STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`,
+`MIN_PROTOCOL_VERSION`, the worker protocol `CURRENT_VERSION` and
+`PREVIOUS_VERSION`, `WORKER_JOURNAL_SCHEMA_VERSION`,
+`EXPECTED_INTEGRATION_VERSION`); read those lines before updating.
+
+On its first start after an update the daemon migrates an older store before
+it serves anything and first copies the original to
+`<data_dir>/metadata.jsonl.pre-schema-<old>`, where `<old>` is the oldest
+schema it found (owner-only; an existing backup is never overwritten). Keep
+that file until the updated daemon has run correctly for a while, then delete
+it (`pohunek service uninstall --purge` removes it with the store); to roll
+back, stop the daemon, put the old binaries back, and copy the backup over
+`metadata.jsonl`.
+
+A daemon that finds a store written by a newer release refuses to start with a
+`StoreSchemaError` ("has schema version N, newer than the schema version M this
+daemon supports") and leaves the store untouched. This happens after a
+downgrade or after running an older binary against a newer data directory.
+Recovery: install the newer release again, or restore the
+`metadata.jsonl.pre-schema-<old>` backup taken by the migration (losing the
+changes made since it). A store older than every migration the daemon keeps is
+refused the same way; migrate it with an intermediate release.
+
 1. Download the component archive for the binary being updated: CLI (`pohunek`),
    daemon (`pohunekd`, `pohunek-sessiond`, and the `pohunek` CLI that installs
    them as a native service).
