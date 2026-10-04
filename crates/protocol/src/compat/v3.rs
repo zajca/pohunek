@@ -58,6 +58,7 @@ pub(super) const INTRODUCED_METHODS: &[&str] = &[
     method::PACKAGE_SET_ENABLED,
     method::PACKAGE_SELECT,
     method::PACKAGE_UNINSTALL,
+    method::PACKAGE_BIND_PROFILE,
 ];
 
 /// Event names protocol 3 defined; every other event is withheld from a
