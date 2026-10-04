@@ -412,7 +412,7 @@ fn documents_are_strict() {
         assert!(
             matches!(
                 parse(&base.replace(from, to)),
-                Err(DefinitionError::Malformed(_))
+                Err(DefinitionError::Malformed { .. })
             ),
             "{to}"
         );
@@ -604,4 +604,176 @@ fn definitions_reject_unsafe_launch_text() {
             ..
         })
     ));
+}
+
+fn builtin_parts() -> DefinitionParts {
+    DefinitionParts {
+        runtime_id: id("demo"),
+        origin: DefinitionOrigin::Builtin { package: None },
+        display_name: "Demo".to_owned(),
+        program: LaunchProgram::Fixed("demo".to_owned()),
+        default_args: Vec::new(),
+        input_rules: InputRules::unrestricted(false, Duration::ZERO),
+        submit_delay_configurable: false,
+        manifest: shell_manifest(),
+        native: None,
+        prompt_arg: false,
+        version_probe_parser: None,
+        integration_handler: None,
+    }
+}
+
+fn field_of(result: Result<RuntimeDefinition, DefinitionError>) -> (&'static str, &'static str) {
+    match result {
+        Err(DefinitionError::Field { field, reason }) => (field, reason),
+        other => panic!("expected a field error, got {other:?}"),
+    }
+}
+
+#[test]
+fn fixed_programs_are_bare_names_or_absolute_paths() {
+    let with_program = |program: &str| {
+        RuntimeDefinition::new(DefinitionParts {
+            program: LaunchProgram::Fixed(program.to_owned()),
+            ..builtin_parts()
+        })
+    };
+    for accepted in ["demo", "/usr/bin/demo", "demo.sh"] {
+        with_program(accepted).expect(accepted);
+    }
+    for rejected in ["./demo", "bin/demo", "../demo", "a/"] {
+        assert_eq!(
+            field_of(with_program(rejected)).0,
+            "runtime.program",
+            "{rejected}"
+        );
+    }
+    let toml = document("supported = false", "supported = false");
+    parse(&toml.replace("program = \"demo\"", "program = \"bin/demo\"")).expect_err("relative");
+    parse(&toml.replace("program = \"demo\"", "program = \"/opt/demo\"")).expect("absolute");
+}
+
+#[test]
+fn malformed_documents_never_reflect_their_text() {
+    let base = document("supported = false", "supported = false");
+    let sentinel = "sentinel-secret-value";
+    let cases = [
+        base.replace("unrestricted", sentinel),
+        base.replace("schema = 1", &format!("schema = 1\n\"{sentinel}\" = 1")),
+        base.replace("name = \"Demo\"", &format!("name = {sentinel}")),
+    ];
+    for source in cases {
+        let error = parse(&source).expect_err("malformed");
+        assert!(
+            matches!(error, DefinitionError::Malformed { .. }),
+            "{error}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains(sentinel), "{rendered}");
+        }
+    }
+    let error = parse(&base.replace("unrestricted", "bogus")).expect_err("malformed");
+    assert!(error.to_string().contains("line"), "{error}");
+}
+
+#[test]
+fn submit_delay_must_be_exactly_representable() {
+    let with_delay = |delay: Duration| {
+        RuntimeDefinition::new(DefinitionParts {
+            input_rules: InputRules::unrestricted(false, delay),
+            ..builtin_parts()
+        })
+    };
+    let digest = |delay: Duration| {
+        with_delay(delay)
+            .expect("representable")
+            .binding()
+            .provenance
+            .clone()
+    };
+    assert_ne!(
+        digest(Duration::from_millis(150)),
+        digest(Duration::from_millis(151))
+    );
+    for rejected in [
+        Duration::from_micros(1500),
+        Duration::from_nanos(1),
+        Duration::new(u64::MAX, 0),
+        Duration::new(u64::MAX / 1000 + 1, 0),
+    ] {
+        assert_eq!(
+            field_of(with_delay(rejected)).0,
+            "input.submit_delay",
+            "{rejected:?}"
+        );
+    }
+}
+
+#[test]
+fn native_templates_are_bounded_on_every_path() {
+    let template = |count: usize, size: usize| {
+        let mut tokens = vec!["x".repeat(size); count - 1];
+        tokens.push("{reference}".to_owned());
+        tokens
+    };
+    let parts_with = |resume: Vec<String>, fork: Option<Vec<String>>| {
+        let native = NativeSessionLaunch::from_templates(
+            crate::agent::SessionRefKind::Id,
+            &resume,
+            fork.as_deref(),
+        )
+        .expect("structurally valid template");
+        RuntimeDefinition::new(DefinitionParts {
+            native: Some(native),
+            ..builtin_parts()
+        })
+    };
+    parts_with(
+        template(super::MAX_LAUNCH_ARGS, super::MAX_ARG_BYTES),
+        Some(template(super::MAX_LAUNCH_ARGS, super::MAX_ARG_BYTES)),
+    )
+    .expect("boundary is accepted");
+    assert_eq!(
+        field_of(parts_with(template(super::MAX_LAUNCH_ARGS + 1, 1), None)),
+        ("resume.args", "has too many arguments")
+    );
+    assert_eq!(
+        field_of(parts_with(template(2, super::MAX_ARG_BYTES + 1), None)),
+        ("resume.args", "has a token over 1024 bytes")
+    );
+    assert_eq!(
+        field_of(parts_with(
+            template(2, 1),
+            Some(template(super::MAX_LAUNCH_ARGS + 1, 1))
+        ))
+        .0,
+        "fork.args"
+    );
+    assert_eq!(
+        field_of(parts_with(
+            template(2, 1),
+            Some(template(2, super::MAX_ARG_BYTES + 1))
+        ))
+        .0,
+        "fork.args"
+    );
+
+    let toml_args = |count: usize| {
+        let tokens: Vec<String> = template(count, 1)
+            .iter()
+            .map(|token| format!("\"{token}\""))
+            .collect();
+        parse(&document(
+            &format!(
+                "supported = true\nreference_kind = \"id\"\nargs = [{}]",
+                tokens.join(", ")
+            ),
+            "supported = false",
+        ))
+    };
+    toml_args(super::MAX_LAUNCH_ARGS).expect("boundary is accepted");
+    assert_eq!(
+        field_of(toml_args(super::MAX_LAUNCH_ARGS + 1)).0,
+        "resume.args"
+    );
 }

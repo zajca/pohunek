@@ -9,6 +9,7 @@
 //! slot is always one whole argv token.
 
 use std::fmt::Write as _;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,9 @@ pub const MAX_ARG_BYTES: usize = 1024;
 /// Maximum size of a display name or opaque handler id, in bytes.
 pub const MAX_LABEL_BYTES: usize = 64;
 
+/// Nanoseconds in one millisecond.
+const NANOS_PER_MILLI: u32 = 1_000_000;
+
 /// Domain tag mixed into every descriptor digest.
 ///
 /// Changing the set of hashed fields requires a new tag so digests produced by
@@ -57,9 +61,14 @@ const DESCRIPTOR_DIGEST_DOMAIN: &str = "pohunek.runtime-descriptor.v1";
 /// echo argument text.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DefinitionError {
-    /// The document is not valid TOML or does not match the schema.
-    #[error("runtime definition is malformed: {0}")]
-    Malformed(String),
+    /// The document is not valid TOML or does not match the schema. The
+    /// diagnostic never reflects document text; `line` is the one-based line of
+    /// the first problem when the parser reports it.
+    #[error("runtime definition is malformed{}", line.map_or_else(String::new, |line| format!(" at line {line}")))]
+    Malformed {
+        /// One-based line of the first problem, if known.
+        line: Option<usize>,
+    },
     /// The document exceeds [`MAX_DEFINITION_BYTES`].
     #[error("runtime definition exceeds {MAX_DEFINITION_BYTES} bytes")]
     TooLarge,
@@ -258,6 +267,18 @@ impl RuntimeDefinition {
         } = parts;
         validate_label(&display_name, "runtime.name")?;
         validate_token(program.as_str(), "runtime.program")?;
+        if let LaunchProgram::Fixed(program) = &program {
+            if program.contains('/') && !Path::new(program).is_absolute() {
+                return Err(DefinitionError::Field {
+                    field: "runtime.program",
+                    reason: "must be a bare program name or an absolute path",
+                });
+            }
+        }
+        let submit_delay_ms = submit_delay_millis(input_rules.submit_delay)?;
+        if let Some(native) = &native {
+            validate_native(native)?;
+        }
         if default_args.len() > MAX_LAUNCH_ARGS {
             return Err(DefinitionError::Field {
                 field: "runtime.args",
@@ -279,7 +300,7 @@ impl RuntimeDefinition {
                     args: &default_args,
                     input: InputFacts {
                         bracketed_paste: input_rules.bracketed_paste,
-                        submit_delay_ms: duration_millis(input_rules.submit_delay),
+                        submit_delay_ms,
                         text_policy: text_policy_name(input_rules.text_policy),
                         allow_while_blocked: input_rules.allows_while_blocked(),
                     },
@@ -334,8 +355,16 @@ impl RuntimeDefinition {
         if source.len() > MAX_DEFINITION_BYTES {
             return Err(DefinitionError::TooLarge);
         }
-        let raw: RawDefinition = toml::from_str(source)
-            .map_err(|error| DefinitionError::Malformed(error.message().to_owned()))?;
+        let raw: RawDefinition = toml::from_str(source).map_err(|error| {
+            let line = error.span().map(|span| {
+                source[..span.start.min(source.len())]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+                    + 1
+            });
+            DefinitionError::Malformed { line }
+        })?;
         if raw.schema != SUPPORTED_SCHEMA {
             return Err(DefinitionError::UnsupportedSchema { found: raw.schema });
         }
@@ -484,8 +513,45 @@ fn validate_token(value: &str, field: &'static str) -> Result<(), DefinitionErro
     Ok(())
 }
 
-fn duration_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+/// Returns the delay in whole milliseconds, rejecting a delay the descriptor
+/// digest could not represent exactly (sub-millisecond precision or more than
+/// `u64::MAX` milliseconds).
+fn submit_delay_millis(delay: Duration) -> Result<u64, DefinitionError> {
+    const INVALID: DefinitionError = DefinitionError::Field {
+        field: "input.submit_delay",
+        reason: "must be a whole number of milliseconds that fits in 64 bits",
+    };
+    if !delay.subsec_nanos().is_multiple_of(NANOS_PER_MILLI) {
+        return Err(INVALID);
+    }
+    u64::try_from(delay.as_millis()).map_err(|_error| INVALID)
+}
+
+/// Bounds the token count and size of the resume and fork templates.
+fn validate_native(native: &NativeSessionLaunch) -> Result<(), DefinitionError> {
+    let templates = [
+        ("resume.args", Some(native.resume_args())),
+        ("fork.args", native.fork_args()),
+    ];
+    for (field, args) in templates {
+        let Some(args) = args else { continue };
+        if args.as_slice().len() > MAX_LAUNCH_ARGS {
+            return Err(DefinitionError::Field {
+                field,
+                reason: "has too many arguments",
+            });
+        }
+        let oversized = args.as_slice().iter().any(|arg| {
+            matches!(arg, crate::agent::NativeArg::Literal(value) if value.len() > MAX_ARG_BYTES)
+        });
+        if oversized {
+            return Err(DefinitionError::Field {
+                field,
+                reason: "has a token over 1024 bytes",
+            });
+        }
+    }
+    Ok(())
 }
 
 fn text_policy_name(policy: InputTextPolicy) -> &'static str {
@@ -695,11 +761,5 @@ impl RawDefinition {
 }
 
 fn template(field: &'static str, tokens: &[String]) -> Result<NativeArgs, DefinitionError> {
-    if tokens.iter().any(|token| token.len() > MAX_ARG_BYTES) {
-        return Err(DefinitionError::Field {
-            field,
-            reason: "has a token over 1024 bytes",
-        });
-    }
     NativeArgs::from_template(tokens).map_err(|source| DefinitionError::Native { field, source })
 }
