@@ -31,11 +31,11 @@
 //! git mechanics (path computation, `git worktree add`, the non-fatal warning
 //! paths, the ownership gate) and persists through that shared store.
 
+use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,9 +64,10 @@ const SETUP_SCRIPT_INTERPRETER: &str = "sh";
 /// its own ref under this namespace, resolves it to a commit id, and deletes it.
 const FETCH_REF_NAMESPACE: &str = "refs/pohunek/fetch";
 
-/// Distinguishes the fetch refs of requests inside one daemon process; the
-/// process id (see [`fetch_ref_name`]) distinguishes daemons sharing a repository.
-static FETCH_REF_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Random bytes in a fetch ref's nonce. 128 bits make a collision between two
+/// requests (including daemons in separate PID namespaces sharing a repository)
+/// negligible.
+const FETCH_REF_NONCE_BYTES: usize = 16;
 
 /// How often [`wait_with_timeout`] polls a running setup script for completion.
 /// Small enough that a quick script returns promptly, large enough that the busy
@@ -129,12 +130,40 @@ pub struct WorktreeBound {
     pub warnings: Vec<SessionWarning>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 struct BaseRef {
     name: String,
-    /// Commit id the requested base was fetched to, when the fetch already ran
-    /// during resolution (a remote-only base branch).
-    fetched_commit: Option<String>,
+    /// The pinned fetch result, when the fetch already ran during resolution (a
+    /// remote-only base branch).
+    fetched: Option<FetchedBase>,
+}
+
+/// A base fetched from `origin` and pinned by a per-request ref.
+///
+/// The ref keeps the commit reachable (against `git gc`, concurrent maintenance
+/// or a pre-create hook) until the guard is dropped; dropping deletes the ref,
+/// but only while it still points at [`Self::commit`], so a ref this request did
+/// not create is never removed.
+#[derive(Debug)]
+struct FetchedBase {
+    commit: String,
+    repository: PathBuf,
+    ref_name: String,
+}
+
+impl Drop for FetchedBase {
+    fn drop(&mut self) {
+        if let Err(message) = git_run(
+            &self.repository,
+            &["update-ref", "-d", &self.ref_name, &self.commit],
+        ) {
+            warn!(
+                fetch_ref = %self.ref_name,
+                error = %message,
+                "could not delete the temporary fetch ref"
+            );
+        }
+    }
 }
 
 /// Outcome of [`WorktreeManager::cleanup_project`].
@@ -400,8 +429,9 @@ impl WorktreeManager {
         // successful fetch, else the (recorded) local base. The logical
         // `base_branch` name is what we persist/display; `start_point` is what
         // `git worktree add` actually branches from.
-        let start_point = match resolved_base.fetched_commit {
-            Some(commit) => commit,
+        // The pinning ref (`fetched`) lives until `git worktree add` returned.
+        let (start_point, fetched) = match resolved_base.fetched {
+            Some(fetched) => (fetched.commit.clone(), Some(fetched)),
             None => Self::fetch_start_point(&repository, &base_branch, &mut warnings),
         };
         // Pre-create hook: fires only on the fresh-create path (the reuse / recreate
@@ -436,8 +466,10 @@ impl WorktreeManager {
             .record_worktree(&binding)
             .map(StoreMutation::into_value)
             .map_err(|err| store_error("persist worktree binding", &err))?;
-        if let Err(add_error) = Self::create_worktree(&repository, &path, &req.branch, &start_point)
-        {
+        let added = Self::create_worktree(&repository, &path, &req.branch, &start_point);
+        // The new branch holds the commit from here on.
+        drop(fetched);
+        if let Err(add_error) = added {
             // Nothing was checked out, so the binding owns nothing. A binding
             // that cannot be dropped is settled by the session's compensation,
             // which drops a binding whose checkout is gone.
@@ -890,7 +922,7 @@ impl WorktreeManager {
             // No base requested: branch from the repository's current branch.
             return Self::default_branch(repository).map(|name| BaseRef {
                 name,
-                fetched_commit: None,
+                fetched: None,
             });
         };
 
@@ -898,15 +930,15 @@ impl WorktreeManager {
         match branch_exists(repository, requested) {
             Ok(true) => Ok(BaseRef {
                 name: requested.to_owned(),
-                fetched_commit: None,
+                fetched: None,
             }),
             Ok(false) => {
                 if has_origin(repository) {
                     match fetch_origin(repository, requested) {
-                        Ok(commit) => {
+                        Ok(fetched) => {
                             return Ok(BaseRef {
                                 name: requested.to_owned(),
-                                fetched_commit: Some(commit),
+                                fetched: Some(fetched),
                             });
                         }
                         Err(message) => warnings.push(SessionWarning {
@@ -938,7 +970,7 @@ impl WorktreeManager {
                 });
                 Ok(BaseRef {
                     name: default_branch,
-                    fetched_commit: None,
+                    fetched: None,
                 })
             }
             // Three-valued: a "could not tell" error is loud, not a silent
@@ -985,21 +1017,22 @@ impl WorktreeManager {
     /// non-fatal `fetch` warning on failure). A fetch is only attempted when an
     /// `origin` remote is configured.
     ///
-    /// On success the start-point is the fetched commit id, so the new branch
-    /// genuinely starts from the up-to-date remote tip, not the stale local ref.
+    /// On success the start-point is the fetched commit id (returned with the guard
+    /// that pins it), so the new branch genuinely starts from the up-to-date remote
+    /// tip, not the stale local ref.
     fn fetch_start_point(
         repository: &Path,
         base_branch: &str,
         warnings: &mut Vec<SessionWarning>,
-    ) -> String {
+    ) -> (String, Option<FetchedBase>) {
         if !has_origin(repository) {
             // No remote to fetch from — branch from the local base ref.
-            return base_branch.to_owned();
+            return (base_branch.to_owned(), None);
         }
         match fetch_origin(repository, base_branch) {
             // Branch from the pinned commit so the worktree starts up to date
             // rather than from the stale local ref.
-            Ok(commit) => commit,
+            Ok(fetched) => (fetched.commit.clone(), Some(fetched)),
             Err(message) => {
                 warnings.push(SessionWarning {
                     kind: SessionWarningKind::Fetch,
@@ -1008,7 +1041,7 @@ impl WorktreeManager {
                     ),
                     detail: Some(message),
                 });
-                base_branch.to_owned()
+                (base_branch.to_owned(), None)
             }
         }
     }
@@ -1218,17 +1251,31 @@ fn has_origin(repo: &Path) -> bool {
     git_capture(repo, &["remote", "get-url", "origin"]).is_ok()
 }
 
-/// Name of the per-request ref a fetch lands in: unique per process and call.
-fn fetch_ref_name() -> String {
-    let sequence = FETCH_REF_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{FETCH_REF_NAMESPACE}/{}-{sequence}", std::process::id())
+/// Name of the per-request ref a fetch lands in: process id plus a random nonce.
+fn fetch_ref_name() -> Result<String, String> {
+    let mut nonce = [0_u8; FETCH_REF_NONCE_BYTES];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|err| format!("could not generate a fetch ref nonce: {err}"))?;
+    let nonce = nonce.iter().fold(String::new(), |mut hex, byte| {
+        // Writing to a `String` cannot fail.
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    });
+    Ok(format!(
+        "{FETCH_REF_NAMESPACE}/{}-{nonce}",
+        std::process::id()
+    ))
 }
 
 /// Reject a base ref that git would not accept as a ref name. This keeps refspec
 /// syntax (`:`, `+`, `*`, whitespace, ...) out of the fetch refspec built from it.
 fn check_fetch_source(repo: &Path, base_branch: &str) -> Result<(), String> {
-    if base_branch.starts_with('-') {
-        return Err(format!("base ref {base_branch:?} cannot begin with '-'"));
+    // `+` is a valid ref character but a leading one would make the refspec a
+    // forced update.
+    if base_branch.starts_with(['-', '+']) {
+        return Err(format!(
+            "base ref {base_branch:?} cannot begin with '-' or '+'"
+        ));
     }
     let mut cmd = git_command(repo)?;
     cmd.args(["check-ref-format", "--allow-onelevel", base_branch]);
@@ -1242,40 +1289,58 @@ fn check_fetch_source(repo: &Path, base_branch: &str) -> Result<(), String> {
     }
 }
 
-/// Fetch a single ref from `origin` without tags and return the commit id it
-/// resolved to.
+/// Fetch a single ref from `origin` without tags into a fresh per-request ref and
+/// return the guard that pins the fetched commit.
 ///
 /// The tip lands in a per-request ref ([`fetch_ref_name`]) rather than
-/// `FETCH_HEAD`, which concurrent fetches in one repository would share. The ref
-/// is resolved to a commit id and deleted before returning, on every path after
-/// the fetch ran; a failed delete only leaks an unreferenced-by-name ref and does
-/// not affect the returned commit, so it is logged. `--end-of-options` keeps the
-/// refspec positional even if a caller forgets the leading-dash guard (defense in
-/// depth against argv flag injection).
-fn fetch_origin(repo: &Path, base_branch: &str) -> Result<String, String> {
+/// `FETCH_HEAD`, which concurrent fetches in one repository would share.
+fn fetch_origin(repo: &Path, base_branch: &str) -> Result<FetchedBase, String> {
+    fetch_into_ref(repo, base_branch, &fetch_ref_name()?)
+}
+
+/// [`fetch_origin`] into the named destination ref.
+///
+/// The refspec has no `+` and the destination must not exist beforehand, so a
+/// ref this request did not create is never overwritten, and a failed fetch
+/// never deletes anything. `--end-of-options` keeps the refspec positional even
+/// if a caller forgets the leading-dash guard (defense in depth against argv
+/// flag injection).
+fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<FetchedBase, String> {
     check_fetch_source(repo, base_branch)?;
-    let fetch_ref = fetch_ref_name();
+    let mut probe = git_command(repo)?;
+    probe.args(["rev-parse", "--verify", "--quiet", fetch_ref]);
+    let probed = run_output_bounded(probe, GIT_COMMAND_TIMEOUT)?;
+    match probed.status.code() {
+        Some(1) => {}
+        Some(0) => return Err(format!("fetch ref {fetch_ref} already exists")),
+        _ => return Err(output_failure_message(&probed)),
+    }
     let mut cmd = git_command(repo)?;
     cmd.arg("fetch")
         .arg("--no-tags")
         .arg("origin")
         .arg("--end-of-options")
-        .arg(format!("+{base_branch}:{fetch_ref}"));
-    let fetched = run_command(cmd);
-    let resolved = fetched.and_then(|_| {
-        git_capture(
-            repo,
-            &["rev-parse", "--verify", &format!("{fetch_ref}^{{commit}}")],
-        )
-    });
-    if let Err(message) = git_run(repo, &["update-ref", "-d", &fetch_ref]) {
-        warn!(
-            fetch_ref = %fetch_ref,
-            error = %message,
-            "could not delete the temporary fetch ref"
-        );
-    }
-    resolved
+        .arg(format!("{base_branch}:{fetch_ref}"));
+    run_command(cmd)?;
+    // The fetch created the ref (it was absent above), so this request owns it
+    // even when it does not resolve to a commit.
+    let commit = match git_capture(
+        repo,
+        &["rev-parse", "--verify", &format!("{fetch_ref}^{{commit}}")],
+    ) {
+        Ok(commit) => commit,
+        Err(message) => {
+            if let Err(delete) = git_run(repo, &["update-ref", "-d", fetch_ref]) {
+                warn!(fetch_ref, error = %delete, "could not delete the temporary fetch ref");
+            }
+            return Err(message);
+        }
+    };
+    Ok(FetchedBase {
+        commit,
+        repository: repo.to_path_buf(),
+        ref_name: fetch_ref.to_owned(),
+    })
 }
 
 /// `git worktree add -b <branch> <path> <start_point>` — new branch from a

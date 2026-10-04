@@ -665,7 +665,10 @@ fn daemon_fetch_under_protocol_trust_marker() {
     );
 
     let fetched = fetch_origin(&repo, "main").expect("the daemon's fetch is user-initiated");
-    assert_eq!(fetched, fixture_git(&env, &source, &["rev-parse", "HEAD"]));
+    assert_eq!(
+        fetched.commit,
+        fixture_git(&env, &source, &["rev-parse", "HEAD"])
+    );
 }
 
 /// Git sets `GIT_PROTOCOL_FROM_USER=0` for the subprocesses it runs on behalf of

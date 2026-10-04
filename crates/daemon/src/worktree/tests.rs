@@ -734,6 +734,63 @@ fn base_ref_with_refspec_syntax_is_not_fetched() {
 }
 
 #[test]
+fn fetched_commit_stays_referenced_until_the_worktree_is_created() {
+    // The pre-create hook runs after the fetch and before `git worktree add`;
+    // it records the fetch refs that still exist at that point.
+    let upstream = init_repo("pinned-upstream");
+    git_in(&upstream, &["checkout", "-q", "-b", "stacked/base"]);
+    fs::write(upstream.join("STACKED.md"), "stacked\n").expect("write stacked file");
+    git_in(&upstream, &["add", "."]);
+    git_in(&upstream, &["commit", "-q", "-m", "stacked base"]);
+    let tip = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+    git_in(&upstream, &["checkout", "-q", "main"]);
+    let downstream = clone_of(&upstream, "pinned-downstream");
+    commit_hook(
+        &downstream,
+        "pre-create",
+        "#!/bin/sh\ngit for-each-ref --format='%(objectname)' refs/pohunek/fetch/ > \"$POHUNEK_REPO/pinned.txt\"\n",
+    );
+
+    let mgr = manager("pinned");
+    let mut req = request("s-1", &downstream, "feat/x");
+    req.base_branch = Some("stacked/base".to_owned());
+    let bound = mgr.bind(&req).expect("bind");
+
+    assert_eq!(
+        fs::read_to_string(downstream.join("pinned.txt"))
+            .expect("hook ran")
+            .trim(),
+        tip,
+        "the fetch ref must pin the commit while the pre-create hook runs"
+    );
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+}
+
+#[test]
+fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
+    let upstream = init_repo("clobber-upstream");
+    let downstream = clone_of(&upstream, "clobber-downstream");
+    let main_tip = git_stdout(&downstream, &["rev-parse", "HEAD"]);
+    fs::write(downstream.join("OTHER.md"), "other\n").expect("write file");
+    git_in(&downstream, &["add", "."]);
+    git_in(&downstream, &["commit", "-q", "-m", "other"]);
+    let other_tip = git_stdout(&downstream, &["rev-parse", "HEAD"]);
+
+    // One destination holds an unrelated commit, the other the very commit the
+    // fetch would produce; neither may be touched.
+    for (dest, oid) in [
+        ("refs/pohunek/fetch/taken-other", &other_tip),
+        ("refs/pohunek/fetch/taken-same", &main_tip),
+    ] {
+        git_in(&downstream, &["update-ref", dest, oid]);
+        super::fetch_into_ref(&downstream, "main", dest)
+            .expect_err("an existing destination must fail the fetch");
+        assert_eq!(&git_stdout(&downstream, &["rev-parse", dest]), oid);
+    }
+}
+
+#[test]
 fn second_session_on_same_branch_gets_a_clear_in_use_error() {
     let mgr = manager("same-branch");
     let repo = init_repo("same-branch-repo");
