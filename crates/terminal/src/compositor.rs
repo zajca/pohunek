@@ -266,12 +266,12 @@ impl Compositor {
         let width = desired_width.max(OVERLAY_MIN_WIDTH).min(self.cols);
 
         let footer_rows = overlay.footer.as_ref().map_or(0, |_| OVERLAY_FOOTER_ROWS);
-        let desired_height = OVERLAY_VERTICAL_BORDER_ROWS
+        let fixed_height = OVERLAY_VERTICAL_BORDER_ROWS
             .saturating_add(OVERLAY_TITLE_ROWS)
-            .saturating_add(len_u16(&overlay.header))
             .saturating_add(len_u16(&overlay.lines))
             .saturating_add(footer_rows);
-        let height = desired_height.min(grid_height);
+        let header_rows = len_u16(&overlay.header).min(grid_height.saturating_sub(fixed_height));
+        let height = fixed_height.saturating_add(header_rows).min(grid_height);
 
         let row = FIRST_PHYSICAL_ROW.saturating_add((grid_height.saturating_sub(height)) / 2);
         let col = FIRST_PHYSICAL_COL.saturating_add((self.cols.saturating_sub(width)) / 2);
@@ -281,6 +281,7 @@ impl Compositor {
             col,
             width,
             height,
+            header_rows,
         })
     }
 
@@ -312,7 +313,7 @@ impl Compositor {
             return;
         };
 
-        let Some((row, col)) = overlay_cursor_position(geometry, overlay, row, col) else {
+        let Some((row, col)) = overlay_cursor_position(geometry, row, col) else {
             out.extend_from_slice(HIDE_CURSOR);
             return;
         };
@@ -328,6 +329,8 @@ struct OverlayGeometry {
     col: u16,
     width: u16,
     height: u16,
+    /// Header rows that fit; body and footer rows take priority over them.
+    header_rows: u16,
 }
 
 /// One-based grid row for the zero-based `vt100` visible-row `index`.
@@ -405,12 +408,16 @@ fn write_overlay_row(
     }
 
     let after_title = interior_offset.saturating_sub(OVERLAY_TITLE_ROWS);
-    if let Some(text) = overlay.header.get(usize::from(after_title)) {
+    if after_title < geometry.header_rows {
+        let text = overlay
+            .header
+            .get(usize::from(after_title))
+            .map_or("", String::as_str);
         write_overlay_text_row(out, geometry.width, text, None);
         return;
     }
 
-    let line_offset = after_title.saturating_sub(len_u16(&overlay.header));
+    let line_offset = after_title.saturating_sub(geometry.header_rows);
     if let Some(line) = overlay.lines.get(usize::from(line_offset)) {
         let attrs = line.highlighted.then_some(OVERLAY_HIGHLIGHT_ATTRS);
         write_overlay_text_row(out, geometry.width, &line.text, attrs);
@@ -500,12 +507,7 @@ fn write_fill(out: &mut Vec<u8>, byte: u8, width: u16) {
     out.extend(std::iter::repeat_n(byte, usize::from(width)));
 }
 
-fn overlay_cursor_position(
-    geometry: OverlayGeometry,
-    overlay: &OverlayFrame,
-    row: u16,
-    col: u16,
-) -> Option<(u16, u16)> {
+fn overlay_cursor_position(geometry: OverlayGeometry, row: u16, col: u16) -> Option<(u16, u16)> {
     let interior_height = geometry.height.saturating_sub(OVERLAY_VERTICAL_BORDER_ROWS);
     let interior_width = geometry
         .width
@@ -516,7 +518,7 @@ fn overlay_cursor_position(
 
     let row = row
         .saturating_add(OVERLAY_TITLE_ROWS)
-        .saturating_add(len_u16(&overlay.header))
+        .saturating_add(geometry.header_rows)
         .min(interior_height.saturating_sub(1));
     let col = col.min(interior_width.saturating_sub(1));
     Some((
@@ -969,5 +971,24 @@ mod tests {
 
         assert!(frame.contains("host: local"), "{frame:?}");
         assert!(!frame.contains("ignored"), "{frame:?}");
+    }
+
+    #[test]
+    fn short_terminal_drops_header_rows_before_body_and_footer() {
+        // Box needs 2 borders + title + 2 lines + footer = 6 rows of fixed
+        // content, so only one of the three header rows fits in 7 rows.
+        let mut compositor = Compositor::new(SHORT_TEST_COLS, 7);
+        let mut overlay = test_overlay();
+        overlay.header = vec!["first".to_owned(), "second".to_owned(), "third".to_owned()];
+        compositor.set_overlay(Some(overlay));
+
+        let frame = render_string(&mut compositor);
+
+        assert!(frame.contains("first"), "{frame:?}");
+        assert!(!frame.contains("second"), "{frame:?}");
+        assert!(
+            frame.contains("Kill") && frame.contains("Detach") && frame.contains("Esc closes"),
+            "body and footer must survive a short terminal: {frame:?}"
+        );
     }
 }

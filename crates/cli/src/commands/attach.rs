@@ -539,6 +539,15 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             origin_worker_id.clone(),
         )
         .await?;
+        if let AttachStreamEnd::SessionRemoved { worktrees_failed } = end {
+            if worktrees_failed > 0 {
+                eprintln!(
+                    "[pohunek] session {} removed, but {worktrees_failed} worktree checkout(s) \
+                     could not be deleted and need manual cleanup",
+                    target.session_id
+                );
+            }
+        }
         if end != AttachStreamEnd::StreamClosed {
             return Ok(());
         }
@@ -635,7 +644,10 @@ enum AttachStreamEnd {
     Detached,
     InputClosed,
     SessionStopped,
-    SessionRemoved,
+    /// The session was removed; `worktrees_failed` checkouts stay on disk.
+    SessionRemoved {
+        worktrees_failed: u32,
+    },
     StreamClosed,
 }
 
@@ -1097,6 +1109,16 @@ where
     else {
         return Ok(end);
     };
+    if let Some(MenuTaskResult {
+        action,
+        outcome: Err(message),
+        ..
+    }) = &result
+    {
+        menu.task = None;
+        terminal.take();
+        return Err(termination_failed(*action, message));
+    }
     let settled = handle_menu_task_result(
         result,
         target,
@@ -1108,6 +1130,15 @@ where
     )
     .await?;
     Ok(settled.unwrap_or(end))
+}
+
+/// The daemon closed the stream for a stop or remove that then failed, so the
+/// attach cannot continue and the failure must reach the operator.
+fn termination_failed(action: MenuTaskAction, message: &str) -> CliError {
+    CliError::Io(std::io::Error::other(format!(
+        "session {} failed after the attach stream closed: {message}",
+        action.as_str()
+    )))
 }
 
 async fn wait_for_menu_task(task: &mut Option<MenuTask>) -> Option<MenuTaskResult> {
@@ -1973,17 +2004,24 @@ where
         return Ok(None);
     };
     *menu_task = None;
-    if result.outcome.is_ok() {
-        match result.action {
-            MenuTaskAction::Kill => {
+    if let Ok(outcome) = &result.outcome {
+        match (result.action, outcome) {
+            (MenuTaskAction::Kill, _) => {
                 terminal.take();
                 return Ok(Some(AttachStreamEnd::SessionStopped));
             }
-            MenuTaskAction::Remove => {
+            (
+                MenuTaskAction::Remove,
+                MenuOutcome::Removed {
+                    worktrees_failed, ..
+                },
+            ) => {
                 terminal.take();
-                return Ok(Some(AttachStreamEnd::SessionRemoved));
+                return Ok(Some(AttachStreamEnd::SessionRemoved {
+                    worktrees_failed: *worktrees_failed,
+                }));
             }
-            MenuTaskAction::NewSession | MenuTaskAction::Fork | MenuTaskAction::Rename => {}
+            _ => {}
         }
     }
 
@@ -3351,7 +3389,7 @@ mod tests {
     fn removed_outcome() -> MenuOutcome {
         MenuOutcome::Removed {
             worktrees_removed: 1,
-            worktrees_failed: 0,
+            worktrees_failed: 2,
         }
     }
 
@@ -3380,7 +3418,12 @@ mod tests {
         .await
         .expect("handle task result");
 
-        assert_eq!(end, Some(AttachStreamEnd::SessionRemoved));
+        assert_eq!(
+            end,
+            Some(AttachStreamEnd::SessionRemoved {
+                worktrees_failed: 2
+            })
+        );
     }
 
     #[tokio::test]
@@ -3440,7 +3483,41 @@ mod tests {
         .await
         .expect("settle");
 
-        assert_eq!(end, AttachStreamEnd::SessionRemoved);
+        assert_eq!(
+            end,
+            AttachStreamEnd::SessionRemoved {
+                worktrees_failed: 2
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_close_during_a_failed_remove_reports_the_failure() {
+        let mut menu = MenuRuntime::new(true);
+        menu.task = Some(MenuTask {
+            generation: FIRST_MENU_GENERATION,
+            action: MenuTaskAction::Remove,
+            handle: tokio::spawn(async { Err("cleanup unconfirmed".to_owned()) }),
+        });
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let err = settle_stream_close(
+            AttachStreamEnd::StreamClosed,
+            &target,
+            &mut menu,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("a failed termination must not look like an ordinary close");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("remove failed") && text.contains("cleanup unconfirmed"),
+            "{text}"
+        );
+        assert!(menu.task.is_none());
     }
 
     #[tokio::test]
