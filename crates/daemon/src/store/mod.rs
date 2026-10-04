@@ -66,6 +66,8 @@ use crate::agent::{InputRules, NativeReferenceProvenance, NativeSessionLaunch, S
 use crate::project::detect::project_id;
 
 mod schema;
+#[cfg(test)]
+mod shape_guard;
 
 pub use schema::{migrate_at_startup, SchemaMigration, StoreSchemaError, STORE_SCHEMA_VERSION};
 
