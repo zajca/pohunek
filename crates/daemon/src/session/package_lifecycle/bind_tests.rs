@@ -546,7 +546,7 @@ fn capability_variant(version: &str, transform: impl FnOnce(String) -> String) -
 
 /// The fixture descriptor with a hook-reported reference instead of an
 /// assigned one.
-fn hook_strategy(document: String) -> String {
+fn hook_strategy(document: &str) -> String {
     let start = document
         .find("[native_reference]")
         .expect("the native reference table");
@@ -589,7 +589,7 @@ async fn expect_refused(fixture: &Fixture, path: &Path, target: &Package) {
 #[tokio::test]
 async fn a_resume_override_that_conflicts_with_an_assigned_target_is_refused() {
     let fixture = Fixture::new("bind-hook-to-assigned");
-    let hook = capability_variant("1.0.0", hook_strategy);
+    let hook = capability_variant("1.0.0", |document| hook_strategy(&document));
     let assigned = capability_variant("2.0.0", |document| document);
     install(&fixture, &hook).await;
     install_with(&fixture, &assigned, true, false).await;
@@ -610,7 +610,7 @@ async fn a_resume_override_that_conflicts_with_an_assigned_target_is_refused() {
 #[tokio::test]
 async fn a_fork_override_is_refused_when_the_target_cannot_fork() {
     let fixture = Fixture::new("bind-fork-removed");
-    let forking = capability_variant("1.0.0", hook_strategy);
+    let forking = capability_variant("1.0.0", |document| hook_strategy(&document));
     let plain = capability_variant("2.0.0", hook_without_fork);
     install(&fixture, &forking).await;
     install_with(&fixture, &plain, true, false).await;
@@ -626,7 +626,7 @@ async fn a_fork_override_is_refused_when_the_target_cannot_fork() {
 #[tokio::test]
 async fn a_profile_without_overrides_migrates_across_a_strategy_change() {
     let fixture = Fixture::new("bind-strategy-change");
-    let hook = capability_variant("1.0.0", hook_strategy);
+    let hook = capability_variant("1.0.0", |document| hook_strategy(&document));
     let assigned = capability_variant("2.0.0", |document| document);
     install(&fixture, &hook).await;
     install_with(&fixture, &assigned, true, false).await;
