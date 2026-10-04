@@ -2943,12 +2943,16 @@ name = "pohunek-package"
 version = "0.33.1"
 dependencies = [
  "ed25519-dalek",
+ "pohunek-platform",
  "pohunek-protocol",
+ "pohunek-test-support",
+ "rustix",
  "ruzstd",
  "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

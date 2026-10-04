@@ -2,7 +2,7 @@
 type: Concept
 id: concept/runtime-package-archive
 title: Runtime package archive
-description: The canonical deterministic tar.zst format of a runtime package, its strict reader, the size limits, and how to build and verify one.
+description: The canonical deterministic tar.zst format of a runtime package, its strict reader, the size limits, safe extraction into a verified package root and how to build and verify one.
 source_kind: manual
 intents: [debug, help, project]
 ---
@@ -12,8 +12,9 @@ intents: [debug, help, project]
 A runtime package is shipped as one canonical `tar.zst` archive. Its identity is
 the package digest: `sha256:` plus the lowercase hex SHA-256 of the archive
 bytes. Implemented by the `pohunek-package` crate (`crates/package`). The crate
-builds the archive and reads it into memory; extracting it to disk, the package
-manifest, signatures, and the registry are separate layers.
+builds the archive, reads it into memory, extracts it into an owner-private
+package root, and re-verifies that root. The runtime manifest inside the package, signatures, and the daemon
+wiring are separate layers.
 
 ## Canonical form
 
@@ -87,3 +88,45 @@ only; symlinks are rejected; any execute bit marks a file executable) and
 prints its digest. `verify` builds the directory twice and requires identical
 bytes. The release pipeline uses `verify` semantics to require byte-for-byte
 reproducibility from independent clean roots.
+
+## Install and verify a package root
+
+`package::install::install_archive` extracts a verified archive into
+`packages/<hex>/`, where `<hex>` is the lowercase hex of the archive digest
+(content-addressed, no `sha256:` prefix). Layout of one root:
+
+```text
+packages/<hex>/
+  manifest.json     per-file manifest, 0600
+  files/...         the extracted tree, directories 0700, files 0600 or 0700
+```
+
+The manifest lives beside `files/` because every ASCII path is a valid archive
+path, so no name inside the tree could be reserved for it. It lists, per file,
+the path, size, SHA-256 and executable flag, plus the archive digest, as JSON
+with unknown fields denied. File mode is `0600`, or `0700` when the canonical
+archive mode is `0755`.
+
+Extraction is descriptor-relative: after the `packages` directory is opened,
+every create, mode change, sync and rename goes through directory descriptors
+(`TrustedDir`), no symlink is followed and every file is created exclusively.
+The tree is written under `.staging-<hex>`, fsynced (files and directories),
+verified against its manifest, and only then moved with a no-replace rename to
+`packages/<hex>/`. A crash leaves either no root or a complete verified one;
+`collect_staging` removes the residue (`.staging-*`, `.collect-*`). Installs of
+one `packages` directory must be serialized by the caller (the registry holds
+its lock). Installing an archive whose digest is already present is idempotent
+when the root verifies and holds the same files; a root that fails verification
+or holds different files is never replaced.
+
+`package::verify::verify_root` re-verifies a root. The daemon calls it before it
+loads a package, launches a session from it, or mutates an integration. It
+detects added, removed, modified or truncated files, wrong modes (including a
+flipped executable bit), wrong owner, hard links, a file or directory replaced
+by a symlink, FIFO or directory, and a missing, malformed or foreign manifest,
+and returns a typed `VerifyError`. Errors identify entries by manifest position
+only and never carry paths or contents. `VerifiedRoot::read_file` returns file
+bytes that are hashed against the manifest.
+
+Extraction applies the archive limits again (file count, per-file size, total
+size, path rules) to the manifest it writes and reads back.

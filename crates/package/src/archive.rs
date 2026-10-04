@@ -298,7 +298,7 @@ fn check_type(typeflag: u8) -> Result<(), EntryRejection> {
 }
 
 /// Validates one archive path and returns it as text.
-fn validate_path<'a>(raw: &'a [u8], limits: &Limits) -> Result<&'a str, EntryRejection> {
+pub(crate) fn validate_path<'a>(raw: &'a [u8], limits: &Limits) -> Result<&'a str, EntryRejection> {
     if raw.is_empty() {
         return Err(EntryRejection::PathEmpty);
     }
@@ -334,13 +334,13 @@ fn is_path_byte(byte: u8) -> bool {
 
 /// Tracks accepted paths to catch case-fold and file/directory collisions.
 #[derive(Default)]
-struct PathIndex {
+pub(crate) struct PathIndex {
     files: HashSet<String>,
     directories: HashSet<String>,
 }
 
 impl PathIndex {
-    fn insert(&mut self, path: &str) -> Result<(), EntryRejection> {
+    pub(crate) fn insert(&mut self, path: &str) -> Result<(), EntryRejection> {
         let folded = path.to_ascii_lowercase();
         if self.files.contains(&folded) {
             return Err(EntryRejection::CaseCollision);

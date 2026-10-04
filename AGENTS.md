@@ -83,7 +83,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | Crate | Role |
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
-| `crates/package`  | Canonical runtime package archive: deterministic `tar.zst` builder, strict reader, size limits, package digest, and the signed runtime catalog verifier. |
+| `crates/package`  | Canonical runtime package archive (deterministic `tar.zst` builder, strict reader, size limits, package digest), the signed runtime catalog verifier, and descriptor-relative extraction into verified package roots with per-file re-verification. |
 | `crates/client`   | SDK client: typed errors, daemon transport, standalone configured-overlay discovery with bounded probing. |
 | `crates/assistant` | Assistant launch orchestration (agent selection, knowledge bundle, launch) and the host connection types (`HostConfig`, `ConnectionOptions`, `connect_client`) shared by the CLI and other clients. |
 | `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |

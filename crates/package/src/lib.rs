@@ -15,8 +15,14 @@
 //!   authorizes official packages by archive digest; [`LocalTrust`] is the
 //!   separate explicit-digest trust for third-party archives.
 //!
-//! Extraction to disk and package manifests are separate concerns built on
-//! top of [`VerifiedArchive`]. The formats are described in
+//! On Unix the crate also stores verified archives:
+//!
+//! - [`install`] extracts a [`VerifiedArchive`] into an owner-private,
+//!   content-addressed package root through directory descriptors.
+//! - [`verify`] re-verifies a root against its per-file [`manifest`].
+//!
+//! Signatures are covered by the signed runtime catalog; the runtime manifest
+//! inside a package is a separate concern. The formats are described in
 //! `docs/knowledge/concepts/runtime-package-archive.md` and
 //! `docs/knowledge/concepts/runtime-catalog.md`.
 
@@ -31,6 +37,19 @@ mod catalog;
 mod compression;
 mod error;
 mod limits;
+
+// Extraction and verification need descriptor-relative
+// filesystem primitives.
+#[cfg(unix)]
+mod hash;
+#[cfg(unix)]
+pub mod install;
+#[cfg(unix)]
+mod layout;
+#[cfg(unix)]
+pub mod manifest;
+#[cfg(unix)]
+pub mod verify;
 
 pub use archive::{
     build_archive, read_archive, read_archive_with_digest, ArchiveEntry, VerifiedArchive,
