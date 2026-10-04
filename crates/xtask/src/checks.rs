@@ -397,7 +397,20 @@ fn collect_pohunek_examples(content: &str) -> Vec<ExampleCommand> {
     examples
 }
 
-const REQUIRED_RELEASE_EXTRAS: [&str; 2] = ["README.md", "LICENSE"];
+/// Repository files `packaging/stage-archive` copies into every release archive.
+///
+/// The script keeps its own copy of this list in `release_files`, because it
+/// runs without the Rust toolchain; `release_extras_match_the_stage_script`
+/// fails when the two drift. A file missing here fails the release staging.
+const REQUIRED_RELEASE_EXTRAS: [&str; 7] = [
+    "README.md",
+    "LICENSE",
+    "docs/features.md",
+    "docs/install.md",
+    "docs/cli.md",
+    "docs/sdk.md",
+    "docs/development.md",
+];
 
 fn check_release_extras(repo: &Path) -> bool {
     let missing = missing_release_extras(repo);
@@ -605,6 +618,7 @@ mod tests {
     use super::{
         check_agent_skill_commands, collect_pohunek_examples, missing_release_extras,
         parse_failure_message, parse_pohunek_command, secret_hits, MIN_AGENT_SKILL_EXAMPLES,
+        REQUIRED_RELEASE_EXTRAS,
     };
 
     /// A private fixture root that is removed when the guard drops, also when
@@ -785,15 +799,31 @@ mod tests {
     fn missing_release_extras_reports_required_files() {
         let fixture = temp_root("release-extras");
         let root = fixture.path();
-        assert_eq!(missing_release_extras(root), vec!["README.md", "LICENSE"]);
+        assert_eq!(
+            missing_release_extras(root),
+            REQUIRED_RELEASE_EXTRAS.to_vec()
+        );
 
-        let readme = root.join("README.md");
-        fs::write(&readme, "readme\n").expect("write README");
+        fs::write(root.join("README.md"), "readme\n").expect("write README");
+        fs::create_dir_all(root.join("docs")).expect("create docs");
+        for page in &REQUIRED_RELEASE_EXTRAS[2..] {
+            fs::write(root.join(page), "page\n").expect("write release page");
+        }
         assert_eq!(missing_release_extras(root), vec!["LICENSE"]);
 
-        let license = root.join("LICENSE");
-        fs::write(&license, "license\n").expect("write LICENSE");
+        fs::write(root.join("LICENSE"), "license\n").expect("write LICENSE");
         assert!(missing_release_extras(root).is_empty());
+    }
+
+    #[test]
+    fn release_extras_match_the_stage_script() {
+        let script = include_str!("../../../packaging/stage-archive");
+        let line = script
+            .lines()
+            .find_map(|line| line.strip_prefix("release_files="))
+            .expect("stage-archive defines release_files");
+        let listed: Vec<&str> = line.trim_matches('\'').split_whitespace().collect();
+        assert_eq!(listed, REQUIRED_RELEASE_EXTRAS.to_vec());
     }
 
     #[test]

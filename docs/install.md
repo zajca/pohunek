@@ -11,7 +11,9 @@ covers Homebrew, Gatekeeper, upgrade, and removal on a Mac.
 
 Each release publishes `pohunek-cli-*` and `pohunek-daemon-*` archives for
 x86_64 Linux with both glibc and MUSL. Every
-archive contains its license and offline documentation under `docs/offline/`.
+archive contains its license, the README, the reference pages under `docs/`
+(features, install, CLI, SDK, development), and the offline knowledge
+documentation under `docs/offline/`.
 Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
 `packaging/install-daemon.sh` wrapper around `pohunek service install`.
 Every CLI, daemon, and relay archive is packed deterministically

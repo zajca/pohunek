@@ -8,13 +8,18 @@
 # `manifest.json`.
 # The staging directory <output-dir>/<name> is created
 # fresh and the archive name `<prefix>-<version>-<target>` is printed on
-# stdout. Run from the repository root: the installer, the smoke script, the
-# README, and the license are copied from it.
+# stdout. Run from the repository root: the installer, the smoke script, and
+# the release files below are copied from it.
 #
 # Nothing here signs or hashes. Signing, `write-manifest`, and `archive` run
 # afterwards, in that order, because the manifest covers the final bytes.
 
 set -eu
+
+# Documents every archive carries. The docs/ pages keep their repository
+# paths, so the README's links to them resolve inside an unpacked archive. Keep this
+# list equal to REQUIRED_RELEASE_EXTRAS in crates/xtask/src/checks.rs.
+release_files='README.md LICENSE docs/features.md docs/install.md docs/cli.md docs/sdk.md docs/development.md'
 
 fail() {
     printf 'stage-archive: %s\n' "$*" >&2
@@ -50,7 +55,7 @@ esac
 [ -f "$docs/manifest.json" ] || fail "missing documentation manifest: $docs/manifest.json"
 mkdir -p "$output"
 [ -d "$output" ] || fail "not a directory: $output"
-for extra in README.md LICENSE; do
+for extra in $release_files; do
     [ -f "$extra" ] || fail "required release file is missing: $extra (run from the repository root)"
 done
 [ -f packaging/verify-archive ] || fail "packaging/verify-archive is missing (run from the repository root)"
@@ -93,6 +98,8 @@ fi
 mkdir -p "$staging/docs"
 cp -R "$docs/offline" "$staging/docs/offline"
 cp "$docs/manifest.json" "$staging/docs/manifest.json"
-cp README.md LICENSE "$staging/"
+for extra in $release_files; do
+    cp "$extra" "$staging/$extra"
+done
 
 printf '%s\n' "$name"

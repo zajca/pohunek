@@ -148,8 +148,8 @@ A download-only `attest` job, the only job holding `id-token: write` and
 `attestations: write`, creates a build-provenance attestation for every
 published asset (Linux, macOS, SDK, and the `.sha256` checksum files); the publish jobs depend on it, so an
 unattested asset is never published. Developer ID signing and notarization are
-not part of the pipeline. The offline docs are
-bundled into every native component archive. CLI archives also contain
+not part of the pipeline. The offline docs, the README, and the reference
+pages under `docs/` are bundled into every native component archive. CLI archives also contain
 `packaging/smoke-hermes-plugin-release`. Release automation provisions the
 source-locked Hermes runtime without provider credentials, runs the model-free
 compatibility gate, extracts each CLI archive, and executes its packaged smoke

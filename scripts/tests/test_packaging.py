@@ -18,6 +18,14 @@ PACKAGING = ROOT / "packaging"
 EPOCH = "1700000000"
 TARGET = "x86_64-unknown-linux-gnu"
 VERSION = "1.2.3"
+# The repository documents stage-archive copies next to the README and license.
+RELEASE_PAGES = (
+    "docs/features.md",
+    "docs/install.md",
+    "docs/cli.md",
+    "docs/sdk.md",
+    "docs/development.md",
+)
 
 FAKE_POHUNEK = """#!/bin/sh
 if [ "$1" = completions ]; then
@@ -61,6 +69,9 @@ class Workspace:
         self.executable("pohunek", FAKE_POHUNEK)
         (self.root / "README.md").write_text("readme\n")
         (self.root / "LICENSE").write_text("license\n")
+        (self.root / "docs").mkdir()
+        for page in RELEASE_PAGES:
+            (self.root / page).write_text("%s\n" % page)
         (self.root / "packaging").mkdir()
         shutil.copy(PACKAGING / "install-daemon.sh", self.root / "packaging")
         shutil.copy(PACKAGING / "verify-archive", self.root / "packaging")
@@ -107,8 +118,11 @@ class StageArchiveTest(unittest.TestCase):
             "docs/manifest.json",
             "README.md",
             "LICENSE",
+            *RELEASE_PAGES,
         ):
             self.assertTrue((staging / member).is_file(), member)
+        for page in RELEASE_PAGES:
+            self.assertEqual((staging / page).read_text(), "%s\n" % page)
         self.assertEqual((staging / "completions/_pohunek").read_text(), "completion for zsh\n")
 
     def test_cli_archive_carries_the_packaged_smoke_and_no_daemon(self):
@@ -117,6 +131,25 @@ class StageArchiveTest(unittest.TestCase):
         self.assertTrue((staging / "packaging/smoke-hermes-plugin-release").is_file())
         self.assertFalse((staging / "pohunekd").exists())
         self.assertFalse((staging / "packaging/install-daemon.sh").exists())
+
+    def test_every_archive_carries_the_release_pages(self):
+        for component in ("cli", "daemon", "relay"):
+            ws = Workspace(self)
+            staging = ws.out / ws.stage(component)
+            for page in RELEASE_PAGES:
+                self.assertTrue((staging / page).is_file(), (component, page))
+
+    def test_a_missing_release_page_is_refused_before_staging(self):
+        ws = Workspace(self)
+        (ws.root / "docs" / "cli.md").unlink()
+        result = run(
+            [PACKAGING / "stage-archive", "cli", VERSION, TARGET, ws.bindir, ws.docs, ws.out],
+            cwd=ws.root,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("required release file is missing: docs/cli.md", result.stderr)
+        self.assertEqual(list(ws.out.iterdir()), [])
 
     def test_relay_archive_holds_one_binary(self):
         ws = Workspace(self)

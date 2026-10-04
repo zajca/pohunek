@@ -24,6 +24,9 @@ attestation. Everything runs as the logged-in owner: no `sudo`, no root service.
 | `pohunek-cli-<v>-aarch64-apple-darwin` | `pohunek`, completions, offline docs | copy the binary onto `PATH` |
 | `pohunek-daemon-<v>-aarch64-apple-darwin` | `pohunek`, `pohunekd`, `pohunek-sessiond`, `packaging/install-daemon.sh` | `packaging/install-daemon.sh` |
 
+Both archives also carry the README, the license, and the reference pages
+under `docs/` (`install.md`, `cli.md`, and the others the README links to).
+
 Every archive carries a `MANIFEST` (component, version, target, signing state
 `signing adhoc`, SHA-256 of each member) next to a `.sha256` of the archive
 itself. The installers verify the manifest, the host, and member permissions

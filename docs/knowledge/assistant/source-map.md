@@ -312,7 +312,9 @@ Release packaging and contributor verification:
   alphabet.
 - `packaging/stage-archive` — assembles one component's archive staging
   directory (binaries, completions, offline docs, installer or
-  smoke script, README, license) from the built binaries.
+  smoke script, README, license, and the `docs/` reference pages) from the
+  built binaries; it refuses to stage when one of those repository files is
+  missing.
 - `packaging/archive` — packs a staging directory into a byte-reproducible
   `.tar.gz` (sorted members, root ownership, `SOURCE_DATE_EPOCH` timestamps,
   normalized modes, `gzip -n`) with its `.sha256`.

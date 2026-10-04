@@ -212,8 +212,8 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("packaging"),
-        Effect::Packages(&["pohunek-cli"]),
-        "daemon packaging exercised by pohunek-cli's daemon_packaging test",
+        Effect::Packages(&["pohunek-cli", "xtask"]),
+        "daemon packaging tested by pohunek-cli; xtask embeds stage-archive's release files",
     ),
     rule(
         Pattern::File(".github/workflows/release.yml"),
@@ -974,7 +974,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 7] = [
+        let cases: [(&str, &[&str]); 8] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -988,7 +988,8 @@ mod tests {
                 "scripts/tests/smoke-hermes-plugin-release.sh",
                 &["pohunek-cli"],
             ),
-            ("packaging/install-daemon.sh", &["pohunek-cli"]),
+            ("packaging/install-daemon.sh", &["pohunek-cli", "xtask"]),
+            ("packaging/stage-archive", &["pohunek-cli", "xtask"]),
             (".github/workflows/release.yml", &["pohunek-cli"]),
             ("crates/relay/src/lib.rs", &["pohunek-relay", "xtask"]),
         ];

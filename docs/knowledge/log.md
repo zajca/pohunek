@@ -1,5 +1,13 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-04, README and reference pages)
+
+- The README is an agent-focused entry point; the human reference lives in
+  `docs/features.md`, `docs/install.md`, `docs/cli.md`, `docs/sdk.md`, and
+  `docs/development.md`, which every release archive carries next to the
+  README. The source map lists those pages, and the macOS install runbook names
+  them among the archive contents.
+
 ## Unreleased (2026-10-04, runtime catalog)
 
 - Added the runtime catalog concept: the signed catalog that authorizes official
