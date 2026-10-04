@@ -19,7 +19,7 @@ use std::sync::Arc;
 use futures::{SinkExt, StreamExt};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
 use pohunek_daemon::governance::HostGovernanceService;
-use pohunek_daemon::notifications::NotificationService;
+use pohunek_daemon::notifications::{AttentionCoordinator, NotificationService};
 use pohunek_daemon::runtime::{SubprocessWorkerEnvironment, SubprocessWorkerLauncher};
 use pohunek_daemon::session::SessionRegistry;
 use pohunek_test_support::wait::{self, wait_until};
@@ -189,13 +189,29 @@ async fn spawn_server(socket: &Path) -> (oneshot::Sender<()>, tokio::task::JoinH
     );
     let notifications = NotificationService::open(&state_root.join("notification-data"))
         .expect("notification service opens");
+    let mut policy = pohunek_daemon::notifications::default_policy();
+    policy.enabled = protocol::NotificationKindPolicy {
+        agent_blocked: true,
+        approval_required: true,
+        turn_completed: true,
+        session_finished: true,
+        error: true,
+        system: true,
+    };
+    policy.providers.clear();
+    notifications
+        .set_policy(policy)
+        .expect("enable every notification kind");
+    // Session-scoped notifications (approval, turn) are debounced by the coordinator.
+    let (attention, _attention_task) = AttentionCoordinator::spawn(notifications.clone());
     let state = DaemonState::new(
         HealthInfo::new("0.0.0"),
         registry,
         governance,
         support::overlay_registry(),
     )
-    .with_notifications(notifications);
+    .with_notifications(notifications)
+    .with_attention_coordinator(attention);
     let server = ControlServer::bind_with_state(socket, state)
         .await
         .expect("server binds");
@@ -739,4 +755,237 @@ fn assert_accepted(file: &str, label: &str, name: &str, response: &Value) {
     if MUST_SUCCEED.contains(&name) {
         assert!(response.get("ok").is_some(), "{context}");
     }
+}
+
+/// A socket the hooks dial that relays every request to the real daemon and
+/// records each (request, response) exchange.
+struct RecordingRelay {
+    path: PathBuf,
+    exchanges: Arc<std::sync::Mutex<Vec<(Value, Value)>>>,
+}
+
+impl RecordingRelay {
+    fn start(daemon: &Daemon) -> Self {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let path = daemon.socket.dir.path().join("relay.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind relay socket");
+        let upstream = daemon.socket.path.clone();
+        let exchanges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&exchanges);
+        tokio::spawn(async move {
+            while let Ok((stream, _addr)) = listener.accept().await {
+                let (upstream, recorded) = (upstream.clone(), Arc::clone(&recorded));
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut request = String::new();
+                    if BufReader::new(read).read_line(&mut request).await.is_err() {
+                        return;
+                    }
+                    let Ok(mut client) = connect_once(&upstream).await else {
+                        return;
+                    };
+                    let reply = exchange(
+                        &mut client,
+                        &serde_json::from_str(&request).expect("request JSON"),
+                    )
+                    .await;
+                    recorded.lock().expect("relay lock").push((
+                        serde_json::from_str(&request).expect("request JSON"),
+                        reply.clone(),
+                    ));
+                    let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                });
+            }
+        });
+        Self { path, exchanges }
+    }
+
+    fn exchanges(&self) -> Vec<(Value, Value)> {
+        self.exchanges.lock().expect("relay lock").clone()
+    }
+}
+
+async fn connect_once(socket: &Path) -> std::io::Result<Client> {
+    UnixStream::connect(socket)
+        .await
+        .map(|stream| Framed::new(stream, LinesCodec::new()))
+}
+
+/// Runs one real managed hook asset with the launch environment of a session
+/// that baked `version` as `POHUNEK_PROTOCOL_VERSION` and returns its exit status.
+async fn run_prebump_hook(
+    relay: &RecordingRelay,
+    live: &LiveSession,
+    version: u32,
+    agent: &str,
+    script: &str,
+    args: &[&str],
+    stdin: &Value,
+) -> std::process::ExitStatus {
+    use tokio::io::AsyncWriteExt as _;
+
+    let asset = pohunek_test_support::manifest_dir()
+        .join("src/integration/assets")
+        .join(agent)
+        .join(script);
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .arg(&asset)
+        .args(args)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").expect("test PATH"))
+        .env("TMPDIR", relay.path.parent().expect("relay dir"))
+        .env("POHUNEK_ENV", "1")
+        .env("POHUNEK_SOCKET_PATH", &relay.path)
+        .env("POHUNEK_PROTOCOL_VERSION", version.to_string())
+        .env("POHUNEK_SESSION_ID", &live.session_id)
+        .env("POHUNEK_RUNTIME_ID", &live.worker_instance_id)
+        .stdin(std::process::Stdio::piped());
+    let mut child = command.spawn().expect("spawn managed hook");
+    let mut pipe = child.stdin.take().expect("hook stdin");
+    pipe.write_all(stdin.to_string().as_bytes())
+        .await
+        .expect("write hook input");
+    drop(pipe);
+    wait::guard("the managed hook to exit", child.wait())
+        .await
+        .expect("hook exit status")
+}
+
+/// Protocol version of the current release.
+const CURRENT_VERSION: u32 = PROTOCOL_VERSION.get();
+
+/// Asserts the exchange was stamped and answered in `version` and succeeded.
+fn assert_hook_exchange(version: u32, request: &Value, reply: &Value) {
+    let context = format!("{request} => {reply}");
+    assert_eq!(
+        request["v"],
+        json!({"minimum": version, "maximum": version}),
+        "{context}"
+    );
+    assert_eq!(reply["v"], version, "{context}");
+    assert!(reply.get("ok").is_some(), "{context}");
+    assert_previous_spelling_if(version, reply);
+}
+
+fn assert_previous_spelling_if(version: u32, reply: &Value) {
+    if version == PREVIOUS_VERSION {
+        assert_previous_spelling(reply);
+    }
+}
+
+#[tokio::test]
+async fn prebump_state_hooks_report_through_the_daemon_socket() {
+    let daemon = Daemon::start("prebump-state").await;
+    let relay = RecordingRelay::start(&daemon);
+    let mut driver = daemon.connect().await;
+    let (live, _) = create_previous_session(&mut driver, &daemon).await;
+    let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
+
+    for agent in ["claude", "codex"] {
+        let mut outcomes = Vec::new();
+        for version in [PREVIOUS_VERSION, CURRENT_VERSION] {
+            let before = relay.exchanges().len();
+            // Only the Claude state hook has a release action.
+            let actions: &[&str] = if agent == "claude" {
+                &["session", "release"]
+            } else {
+                &["session"]
+            };
+            for action in actions.iter().copied() {
+                let status = run_prebump_hook(
+                    &relay,
+                    &live,
+                    version,
+                    agent,
+                    "pohunek-agent-state.sh",
+                    &[action],
+                    &input,
+                )
+                .await;
+                assert!(status.success(), "{agent} {action} v{version}");
+            }
+            let exchanges = relay.exchanges().split_off(before);
+            let methods: Vec<_> = exchanges
+                .iter()
+                .map(|(request, _)| request["method"].as_str().expect("method").to_owned())
+                .collect();
+            let mut expected = vec![
+                method::SESSION_REPORT_AGENT,
+                method::SESSION_REPORT_NATIVE_ID,
+            ];
+            if agent == "claude" {
+                expected.push(method::SESSION_RELEASE_AGENT);
+            }
+            assert_eq!(methods, expected, "{agent} v{version}");
+            for (request, reply) in &exchanges {
+                assert_hook_exchange(version, request, reply);
+            }
+            let native = &exchanges[1].0["params"];
+            let key = if version == PREVIOUS_VERSION {
+                "runtime_id"
+            } else {
+                "worker_instance_id"
+            };
+            assert_eq!(
+                native[key],
+                json!(live.worker_instance_id),
+                "{agent} v{version}"
+            );
+            outcomes.push(
+                exchanges
+                    .iter()
+                    .map(|(_, reply)| reply["ok"].clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            outcomes[0], outcomes[1],
+            "{agent}: a version 3 session is served the same outcomes as a current one"
+        );
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn prebump_notify_hooks_create_notifications_through_the_daemon_socket() {
+    let daemon = Daemon::start("prebump-notify").await;
+    let relay = RecordingRelay::start(&daemon);
+    let mut driver = daemon.connect().await;
+    let (live, _) = create_previous_session(&mut driver, &daemon).await;
+
+    let cases: [(&str, &[&str]); 4] = [
+        ("claude", &["notification", "auth_success"]),
+        ("claude", &["stop"]),
+        ("codex", &["permission_request"]),
+        ("codex", &["stop"]),
+    ];
+    for (agent, args) in cases {
+        let before = relay.exchanges().len();
+        let status = run_prebump_hook(
+            &relay,
+            &live,
+            PREVIOUS_VERSION,
+            agent,
+            "pohunek-agent-notify.sh",
+            args,
+            &json!({"hook_event_id": "evt-1"}),
+        )
+        .await;
+        assert!(status.success(), "{agent} {args:?}");
+        let exchanges = relay.exchanges().split_off(before);
+        assert_eq!(exchanges.len(), 1, "{agent} {args:?}: {exchanges:?}");
+        let (request, reply) = &exchanges[0];
+        assert_eq!(request["method"], json!(method::NOTIFICATION_CREATE));
+        assert_hook_exchange(PREVIOUS_VERSION, request, reply);
+        assert_eq!(
+            reply["ok"]["created"],
+            json!(true),
+            "{agent} {args:?}: {reply}"
+        );
+        assert_eq!(reply["ok"]["record"]["session_id"], json!(live.session_id));
+        assert_eq!(reply["ok"]["record"]["agent_kind"], json!(agent));
+    }
+    daemon.stop().await;
 }

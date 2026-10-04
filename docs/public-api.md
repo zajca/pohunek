@@ -232,7 +232,7 @@ clients; a v4 client needs a v4 daemon.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` hook request is additive to the private
-worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=10`; an asset of
+worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=11`; an asset of
 an earlier version still sends the old key, which the daemon accepts only from a
 session whose launch baked protocol 3 (and an earlier notification hook still
 sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
@@ -1281,10 +1281,14 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 
 `session.report_agent` accepts the nested agent `source`, `agent`, optional
 `activity`, optional `seq`, optional `pid`, and optional active native metadata.
-`pid` is the OS process id for the active nested agent. When present, the daemon
+`seq` is a decimal string. A session keeps the protocol version of its launch
+(`POHUNEK_PROTOCOL_VERSION`), so a session launched under protocol 3 keeps
+reporting after a daemon upgrade: its hooks send the range `3..=3` and spell the
+worker instance key `runtime_id` in `session.report_native_id`, which the
+daemon serves through the protocol 3 adapter. `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=10`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=11`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID` (falling back to
 `POHUNEK_RUNTIME_ID`), read

@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=10
+# POHUNEK_INTEGRATION_VERSION=11
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, release active-agent
@@ -50,6 +50,9 @@ SOCKET_TIMEOUT_SECS = 0.5
 RESPONSE_BYTES = 4096
 MIN_AGENT_PID = 1
 IDENTITY_TTL_SECS = 30
+# Protocol 3 spells the worker instance key `runtime_id`; protocol 4 renamed it.
+# A session keeps the protocol version of its launch, so the spelling follows it.
+WORKER_INSTANCE_KEY_RENAMED_AT = 4
 # Bounds provider JSON before decoding; oversized payloads are rejected whole.
 MAX_HOOK_INPUT_BYTES = 65536
 
@@ -270,7 +273,7 @@ if action == ACTION_RELEASE:
         "session_id": session_id,
         "source": f"pohunek:{agent}",
         "agent": agent,
-        "seq": timestamp_ms,
+        "seq": str(timestamp_ms),
     }
     send_request("session.release_agent", release_agent_params, "release")
     raise SystemExit(0)
@@ -288,7 +291,7 @@ report_agent_params = {
     "session_id": session_id,
     "source": f"pohunek:{agent}",
     "agent": agent,
-    "seq": timestamp_ms,
+    "seq": str(timestamp_ms),
     "agent_session_id": native_session_id,
 }
 if agent_pid is not None:
@@ -301,9 +304,14 @@ send_request("session.report_agent", report_agent_params, "agent")
 if worker_instance_id and agent_pid is not None:
     start_identity = process_start_identity(agent_pid)
     if start_identity is not None:
+        worker_instance_key = (
+            "worker_instance_id"
+            if protocol_version >= WORKER_INSTANCE_KEY_RENAMED_AT
+            else "runtime_id"
+        )
         native_id_params = {
             "session_id": session_id,
-            "worker_instance_id": worker_instance_id,
+            worker_instance_key: worker_instance_id,
             "agent": agent,
             "pid": agent_pid,
             "pid_start_identity": str(start_identity),
