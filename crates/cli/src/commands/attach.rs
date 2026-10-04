@@ -96,6 +96,10 @@ const FIRST_MENU_GENERATION: u64 = 0;
 const MENU_GENERATION_STEP: u64 = 1;
 /// ASCII Escape starts keyboard CSI sequences and mouse reports.
 const MENU_ESC_BYTE: u8 = 0x1b;
+/// Opens a bracketed paste (`ESC [ 200 ~`).
+const MENU_PASTE_START: &[u8] = b"\x1b[200~";
+/// Closes a bracketed paste (`ESC [ 201 ~`).
+const MENU_PASTE_END: &[u8] = b"\x1b[201~";
 /// CSI sequences handled by the attach menu use `ESC [`.
 const MENU_CSI_OPEN: u8 = b'[';
 /// SGR mouse reports use `ESC [ < ...`.
@@ -305,6 +309,8 @@ struct ModalState {
 #[derive(Debug)]
 struct MenuInputDecoder {
     pending: Vec<u8>,
+    /// Inside a bracketed paste, whose payload never counts as menu keys.
+    in_paste: bool,
 }
 
 #[derive(Debug)]
@@ -1196,7 +1202,27 @@ impl MenuInputDecoder {
     fn new() -> Self {
         Self {
             pending: Vec::new(),
+            in_paste: false,
         }
+    }
+
+    /// Skips pasted text so it can never act as menu keys. Returns whether the
+    /// whole remaining input was consumed (the paste is still open).
+    fn skip_paste(&mut self, bytes: &[u8], index: &mut usize) -> bool {
+        let rest = &bytes[*index..];
+        if let Some(end) = rest
+            .windows(MENU_PASTE_END.len())
+            .position(|window| window == MENU_PASTE_END)
+        {
+            *index += end + MENU_PASTE_END.len();
+            self.in_paste = false;
+            return false;
+        }
+        // Keep a possible split terminator for the next read.
+        let keep = rest.len().min(MENU_PASTE_END.len() - 1);
+        self.pending.extend_from_slice(&rest[rest.len() - keep..]);
+        *index = bytes.len();
+        true
     }
 
     fn push(&mut self, input: &[u8]) -> Vec<MenuEvent> {
@@ -1207,7 +1233,26 @@ impl MenuInputDecoder {
         let mut events = Vec::new();
         let mut index = 0;
         while index < bytes.len() {
-            let parsed = parse_menu_key(&bytes[index..]);
+            if self.in_paste {
+                if self.skip_paste(&bytes, &mut index) {
+                    break;
+                }
+                continue;
+            }
+            let rest = &bytes[index..];
+            if rest.starts_with(MENU_PASTE_START) {
+                self.in_paste = true;
+                index += MENU_PASTE_START.len();
+                continue;
+            }
+            if rest.len() > 2
+                && rest.len() < MENU_PASTE_START.len()
+                && MENU_PASTE_START.starts_with(rest)
+            {
+                self.pending.extend_from_slice(rest);
+                break;
+            }
+            let parsed = parse_menu_key(rest);
             if parsed.pending {
                 self.pending.extend_from_slice(&bytes[index..]);
                 break;
@@ -1313,8 +1358,14 @@ fn handle_menu_input_chunk_with_decoder(
         let before = state.clone();
         let (next, mut next_effects) = step(before.clone(), event);
         changed |= next != before;
+        let entered_confirmation = next != before && next.is_destructive_confirmation();
         *state = next;
         effects.append(&mut next_effects);
+        // A confirmation needs its own deliberate key press; bytes batched in
+        // the same read (a paste or key repeat) must not confirm it.
+        if entered_confirmation {
+            break;
+        }
     }
     MenuInputOutcome { effects, changed }
 }
@@ -3375,6 +3426,67 @@ mod tests {
 
         let effects = handle_menu_input_chunk(&mut state, b"y");
         assert_eq!(effects, vec![MenuEffect::RunRemove]);
+    }
+
+    #[test]
+    fn batched_input_cannot_confirm_a_destructive_action() {
+        for (keys, confirm) in [
+            (b"ty".as_slice(), MenuState::ConfirmRemove),
+            (b"ky", MenuState::ConfirmKill),
+        ] {
+            let mut state = MenuState::open_root();
+
+            let effects = handle_menu_input_chunk(&mut state, keys);
+
+            assert_eq!(state, confirm);
+            assert!(effects.is_empty(), "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_never_reaches_the_menu() {
+        let mut state = MenuState::open_root();
+        let mut decoder = MenuInputDecoder::new();
+
+        let outcome =
+            handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, b"\x1b[200~ty\x1b[201~");
+
+        assert_eq!(state, MenuState::open_root());
+        assert!(outcome.effects.is_empty());
+        assert!(!decoder.in_paste);
+    }
+
+    #[test]
+    fn bracketed_paste_split_across_reads_never_reaches_the_menu() {
+        let input = b"\x1b[200~ty\x1b[201~";
+        // A lone leading Escape byte is the Escape key by design, so splits
+        // start after the two-byte CSI introducer.
+        for split in 2..input.len() {
+            let mut state = MenuState::open_root();
+            let mut decoder = MenuInputDecoder::new();
+
+            let mut effects = Vec::new();
+            for chunk in [&input[..split], &input[split..]] {
+                effects.extend(
+                    handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, chunk).effects,
+                );
+            }
+
+            assert_eq!(state, MenuState::open_root(), "split={split}");
+            assert!(effects.is_empty(), "split={split}");
+            assert!(!decoder.in_paste, "split={split}");
+        }
+    }
+
+    #[test]
+    fn menu_keys_work_again_after_a_paste() {
+        let mut state = MenuState::open_root();
+        let mut decoder = MenuInputDecoder::new();
+
+        handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, b"\x1b[200~x\x1b[201~");
+        handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, b"t");
+
+        assert_eq!(state, MenuState::ConfirmRemove);
     }
 
     #[test]

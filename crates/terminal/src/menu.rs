@@ -71,6 +71,12 @@ impl MenuState {
         }
     }
 
+    /// Whether the state asks to confirm a destructive session action.
+    #[must_use]
+    pub const fn is_destructive_confirmation(&self) -> bool {
+        matches!(self, Self::ConfirmKill | Self::ConfirmRemove)
+    }
+
     /// Converts the state to a compositor overlay frame.
     #[must_use]
     pub fn to_overlay_frame(&self) -> Option<OverlayFrame> {
