@@ -56,6 +56,7 @@ fn resume_builtin_json() -> Value {
         "program": "claude",
         "args": ["--flag"],
         "input_rules": {"bracketed_paste": true, "submit_delay_ms": 5, "restricted": true},
+        "native_launch_unresolved": true,
         "native_launch": {
             "reference_kind": "id",
             "resume_args": [{"literal": "--resume"}, "reference"],
@@ -245,6 +246,7 @@ fn assert_every_field_is_reviewed(
             args: _,
             input_rules,
             native_launch: _,
+            native_launch_unresolved: _,
             launch_binding: _,
             native_reference_provenance: _,
         } = binding;

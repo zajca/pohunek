@@ -3,7 +3,7 @@
 import type { SessionWarningKind } from "./SessionWarningKind";
 
 /**
- * A non-fatal warning surfaced while setting up a session's worktree.
+ * A non-fatal warning surfaced for a session.
  *
  * Carries a machine-readable [`kind`](Self::kind), a human-readable summary,
  * and optional raw detail (e.g. trimmed git output) for debugging. Never

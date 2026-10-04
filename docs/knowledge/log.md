@@ -46,6 +46,12 @@
   sandboxed probe environment and accepts a release in `[min, below)`, so a
   package moves its supported range without a daemon release. Documented in the
   public API reference and the source map.
+## Unreleased (2026-10-04, legacy resume binding migration)
+
+- Documented that the store migration maps v0.33.0 flat recovery fields and
+  repairs v0.33.1 records that lost their native launch spec, and that an
+  unrepairable record logs a WARN, carries a `native_recovery` session warning
+  and is never resumed automatically. The public API lists the new warning kind.
 
 ## Unreleased (2026-10-04, README and reference pages)
 

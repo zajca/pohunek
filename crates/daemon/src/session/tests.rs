@@ -1311,6 +1311,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         native_launch: None,
         launch_binding,
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+        native_launch_unresolved: false,
     };
     let package_pin = LaunchPin::Pinned(Box::new(LaunchBinding {
         runtime_id: RuntimeId::parse("claude").expect("runtime id"),
@@ -11898,6 +11899,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         native_launch: None,
         launch_binding: crate::agent::host::LaunchPin::Unpinned,
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+        native_launch_unresolved: false,
     };
 
     let err = registry
@@ -12375,6 +12377,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
         launch_binding: crate::agent::host::LaunchPin::Unpinned,
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+        native_launch_unresolved: false,
     };
 
     for (program, version_output) in [
@@ -12886,6 +12889,7 @@ async fn resume_binding_restores_metadata_from_store() {
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            native_launch_unresolved: false,
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())
@@ -18318,5 +18322,173 @@ async fn the_version_probe_runs_under_the_launch_path_of_every_launch_kind() {
         .resume(&created.id)
         .await
         .expect("resume probes under the profile PATH");
+    let _ = registry.stop(&resumed.id).await;
+}
+
+/// One built-in agent of the migrated-binding tests: the v0.33.0 flat fields
+/// its binding carried, and the argv its native launch must produce.
+#[cfg(unix)]
+struct MigratedAgentCase {
+    agent: &'static str,
+    frozen_args: &'static [&'static str],
+    v0_33_0_fields: serde_json::Value,
+    resume_argv: &'static [&'static str],
+    fork_argv: Option<&'static [&'static str]>,
+}
+
+/// Records every argument vector it is launched with and stays alive; answers
+/// the Hermes version probe, which the other agents never run.
+#[cfg(unix)]
+fn write_argv_recording_agent(path: &std::path::Path, marker: &std::path::Path) {
+    write_supported_hermes_executable(
+        path,
+        &format!(
+            "printf '%s\\n' \"$@\" >> '{}'\nsleep 30\n",
+            marker.display()
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn migrated_legacy_bindings_resume_and_fork_with_the_native_argv() {
+    let cases = [
+        MigratedAgentCase {
+            agent: "claude",
+            frozen_args: &["--model", "sonnet"],
+            v0_33_0_fields: serde_json::json!({
+                "resume_mode": "flag", "ref_kind": "id", "resumable": true,
+                "fork_mode": "claude_session", "fork_resume_mode": "flag",
+                "fork_ref_kind": "id", "forkable": true,
+            }),
+            resume_argv: &["--resume", "native-legacy"],
+            fork_argv: Some(&["--resume", "native-legacy", "--fork-session"]),
+        },
+        MigratedAgentCase {
+            agent: "codex",
+            frozen_args: &[],
+            v0_33_0_fields: serde_json::json!({
+                "resume_mode": "subcommand", "ref_kind": "id", "resumable": true,
+            }),
+            resume_argv: &["resume", "native-legacy"],
+            fork_argv: None,
+        },
+        MigratedAgentCase {
+            agent: "hermes",
+            frozen_args: &["chat"],
+            v0_33_0_fields: serde_json::json!({
+                "resume_mode": "flag", "ref_kind": "id", "resumable": true,
+            }),
+            resume_argv: &["--resume", "native-legacy"],
+            fork_argv: None,
+        },
+    ];
+    // v0.33.0 froze the flat fields; v0.33.1 dropped them without a spec.
+    for generation in ["v0.33.0", "v0.33.1"] {
+        for case in &cases {
+            assert_migrated_binding_argv(generation, case).await;
+        }
+    }
+}
+
+/// Migrates one generation's store line for `case`, then resumes and forks the
+/// binding and checks the exact argv the agent is launched with.
+#[cfg(unix)]
+async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase) {
+    let tag = format!("migrated-{generation}-{}", case.agent);
+    let dir = temp_dir(&tag);
+    let marker = dir.join("argv.txt");
+    let script = dir.join("agent");
+    write_argv_recording_agent(&script, &marker);
+
+    let mut line = serde_json::json!({
+        "kind": "resume",
+        "session_id": "s-4242",
+        "agent": case.agent,
+        "agent_base": case.agent,
+        "cwd": dir,
+        "cols": 80,
+        "rows": 24,
+        "native_session_id": "native-legacy",
+        "program": script,
+        "args": case.frozen_args,
+        "input_rules": {"bracketed_paste": false, "submit_delay_ms": 150},
+    });
+    if generation == "v0.33.0" {
+        line.as_object_mut()
+            .expect("object")
+            .extend(case.v0_33_0_fields.as_object().expect("fields").clone());
+    }
+    let store_path = temp_store_path(&tag);
+    fs::write(&store_path, format!("{line}\n")).expect("write legacy store");
+    fs::set_permissions(&store_path, fs::Permissions::from_mode(0o600)).expect("private store");
+    crate::store::migrate_at_startup(&store_path).expect("migrate");
+    let binding = crate::store::Store::new(store_path.clone())
+        .load_resume()
+        .expect("load migrated binding")
+        .into_iter()
+        .next()
+        .expect("one binding");
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path),
+        ..SessionRegistryConfig::default()
+    });
+
+    let resumed = registry
+        .resume_binding(binding)
+        .await
+        .unwrap_or_else(|error| panic!("{tag}: resume failed: {error:?}"));
+
+    let expected_resume = case
+        .frozen_args
+        .iter()
+        .chain(case.resume_argv)
+        .copied()
+        .collect::<Vec<_>>();
+    let launched = wait_for_line_count(&marker, expected_resume.len()).await;
+    assert_eq!(
+        launched.lines().collect::<Vec<_>>(),
+        expected_resume,
+        "{tag}: resume argv"
+    );
+
+    let fork = registry
+        .fork(SessionForkParams {
+            session_id: resumed.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        })
+        .await;
+    match case.fork_argv {
+        Some(fork_argv) => {
+            let forked = fork.unwrap_or_else(|error| panic!("{tag}: fork failed: {error:?}"));
+            let expected_fork = case
+                .frozen_args
+                .iter()
+                .chain(fork_argv)
+                .copied()
+                .collect::<Vec<_>>();
+            let total = expected_resume.len() + expected_fork.len();
+            let launched = wait_for_line_count(&marker, total).await;
+            assert_eq!(
+                launched
+                    .lines()
+                    .skip(expected_resume.len())
+                    .collect::<Vec<_>>(),
+                expected_fork,
+                "{tag}: fork argv"
+            );
+            let _ = registry.stop(&forked.id).await;
+        }
+        None => assert_eq!(
+            fork.expect_err("the built-in spec has no fork").code,
+            "agent_fork_unsupported",
+            "{tag}"
+        ),
+    }
     let _ = registry.stop(&resumed.id).await;
 }

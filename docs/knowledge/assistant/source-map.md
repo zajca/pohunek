@@ -398,6 +398,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/protocol/src/version.rs`
 - `crates/worker-protocol/src/version.rs`
 - `scripts/release` — compatibility-constant check against the previous tag.
+- `crates/daemon/src/store/legacy_binding.rs`
 - `crates/session-worker/src/journal.rs`
 - `crates/cli/src/hermes_integration/lifecycle.rs`
 - `sdk/ts/sdk/test/runtime-path-contract.test.ts`
@@ -414,6 +415,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
 - `crates/daemon/src/session/reconcile.rs`
+- `crates/daemon/src/session/native_repair.rs`
 - `crates/daemon/src/session/target.rs`
 - `crates/daemon/src/session/procwatch.rs`
 - `crates/daemon/src/runtime/`

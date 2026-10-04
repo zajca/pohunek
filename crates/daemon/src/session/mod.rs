@@ -68,6 +68,7 @@ mod diff;
 mod hooks;
 mod input;
 mod lag;
+mod native_repair;
 mod observation;
 mod package_lifecycle;
 mod packages;

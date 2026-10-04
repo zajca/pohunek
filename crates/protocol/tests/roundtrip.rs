@@ -1723,6 +1723,7 @@ fn session_warning_json_shape_roundtrips() {
         ),
         (SessionWarningKind::SetupScript, json!("setup_script")),
         (SessionWarningKind::Hook, json!("hook")),
+        (SessionWarningKind::NativeRecovery, json!("native_recovery")),
     ];
     for (kind, expected) in cases {
         let value = serde_json::to_value(kind).expect("serialize warning kind");

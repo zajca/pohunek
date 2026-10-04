@@ -755,6 +755,7 @@ impl SessionRegistry {
                 native_launch: snapshot.native.clone(),
                 launch_binding: snapshot.launch_binding.clone(),
                 native_reference_provenance: snapshot.reference_provenance,
+                native_launch_unresolved: false,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,

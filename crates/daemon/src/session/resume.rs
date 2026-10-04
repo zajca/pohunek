@@ -543,6 +543,7 @@ impl SessionRegistry {
             native_launch: entry.snapshot.native.clone(),
             launch_binding: entry.snapshot.launch_binding.clone(),
             native_reference_provenance: entry.snapshot.reference_provenance,
+            native_launch_unresolved: false,
         }
     }
 

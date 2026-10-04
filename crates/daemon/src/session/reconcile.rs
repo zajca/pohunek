@@ -463,7 +463,9 @@ impl SessionRegistry {
         for mut record in records {
             let id = SessionId(record.session_id.clone());
             let _guard = self.lock_lifecycle(&id).await;
-            if let Some(binding) = resume_bindings.remove(&record.session_id) {
+            let mut binding = resume_bindings.remove(&record.session_id);
+            self.repair_native_recovery(&mut record, binding.as_mut());
+            if let Some(binding) = binding {
                 if let Err(reason) = merge_persisted_recovery(&mut record, binding) {
                     self.insert_unavailable_record(record, RuntimeState::Conflict, reason)
                         .await;
@@ -5372,6 +5374,7 @@ while os.getppid() == parent:
             native_launch: Some(test_native_launch(SessionRefKind::Id, true)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            native_launch_unresolved: false,
         };
         store
             .record_session(&SessionRecord {
@@ -6696,6 +6699,7 @@ while os.getppid() == parent:
                 native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
                 launch_binding: crate::agent::host::LaunchPin::Unpinned,
                 native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+                native_launch_unresolved: false,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -6979,6 +6983,135 @@ while os.getppid() == parent:
         assert_eq!(registry.list().await.len(), 1);
     }
 
+    /// Store written by the v0.33.1 daemon for a session whose native launch
+    /// spec was lost (see `store/fixtures/v0.33.1-damaged`).
+    const V0_33_1_DAMAGED_STORE: &str =
+        include_str!("../store/fixtures/v0.33.1-damaged/metadata.jsonl");
+
+    /// Migrates `store` content for agent `agent`, then rehydrates it into a
+    /// registry whose agent profiles come from `profiles` (name, TOML body).
+    async fn rehydrate_damaged_store(
+        agent: &str,
+        profiles: &[(&str, &str)],
+    ) -> (SessionRegistry, crate::test_support::ScopedDir) {
+        let root = temp_root();
+        let data = root.join("data");
+        create_private_dir(&data);
+        let store_path = data.join("metadata.jsonl");
+        std::fs::write(
+            &store_path,
+            V0_33_1_DAMAGED_STORE
+                .replace("\"agent\":\"claude\"", &format!("\"agent\":\"{agent}\"")),
+        )
+        .expect("write damaged store");
+        std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o600))
+            .expect("private store");
+        let agents = root.join("agents");
+        std::fs::create_dir_all(&agents).expect("agents dir");
+        for (name, body) in profiles {
+            std::fs::write(agents.join(format!("{name}.toml")), body).expect("write profile");
+        }
+        crate::store::migrate_at_startup(&store_path).expect("migrate the damaged store");
+
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            store_path: Some(store_path),
+            agents_dir: Some(agents),
+            worker_runtime_root: Some(root.join("runtime")),
+            ..SessionRegistryConfig::default()
+        });
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("rehydrate damaged store");
+        (registry, root)
+    }
+
+    #[tokio::test]
+    async fn a_damaged_built_in_session_is_listed_as_recoverable_and_stays_lost() {
+        let (registry, _root) = rehydrate_damaged_store("claude", &[]).await;
+
+        let sessions = registry.list().await;
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert!(
+            session.capabilities.resume && session.capabilities.fork,
+            "{session:?}"
+        );
+        assert!(session.warnings.is_empty(), "{:?}", session.warnings);
+        assert_ne!(
+            session.runtime.as_ref().map(|runtime| runtime.state),
+            Some(RuntimeState::Live),
+            "startup never resumes a lost record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_damaged_profile_session_is_repaired_through_the_registry() {
+        let (registry, _root) = rehydrate_damaged_store(
+            "work",
+            &[("work", "base = \"claude\"\nprogram = \"claude\"\n")],
+        )
+        .await;
+
+        let sessions = registry.list().await;
+        assert_eq!(sessions.len(), 1);
+        let session = &sessions[0];
+        assert!(
+            session.capabilities.resume && session.capabilities.fork,
+            "{session:?}"
+        );
+        assert!(session.warnings.is_empty(), "{:?}", session.warnings);
+        assert_ne!(
+            session.runtime.as_ref().map(|runtime| runtime.state),
+            Some(RuntimeState::Live),
+            "startup never resumes a lost record"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrepairable_damaged_session_lists_a_recovery_warning_and_is_not_resumed() {
+        let cases: [(&str, &[(&str, &str)]); 2] = [
+            ("deleted-profile", &[]),
+            (
+                "no-resume-profile",
+                &[(
+                    "no-resume-profile",
+                    "base = \"claude\"\nprogram = \"claude\"\n[resume]\nresumable = false\n",
+                )],
+            ),
+        ];
+        for (agent, profiles) in cases {
+            let (registry, _root) = rehydrate_damaged_store(agent, profiles).await;
+
+            let sessions = registry.list().await;
+            assert_eq!(sessions.len(), 1, "{agent}: the session stays listed");
+            let session = &sessions[0];
+            assert!(!session.capabilities.resume, "{agent}");
+            let warning = session
+                .warnings
+                .iter()
+                .find(|warning| warning.kind == protocol::SessionWarningKind::NativeRecovery)
+                .unwrap_or_else(|| panic!("{agent}: no native recovery warning: {session:?}"));
+            assert!(
+                warning
+                    .message
+                    .contains("Start a new session and resume the native conversation"),
+                "{agent}: {}",
+                warning.message
+            );
+            assert_eq!(
+                warning.detail.as_deref(),
+                Some("native session id: native-fixture-2"),
+                "{agent}"
+            );
+            let error = registry
+                .resume(&SessionId("s-fixture-session".to_owned()))
+                .await
+                .expect_err("an unrepairable session is never resumed");
+            assert_eq!(error.code, "agent_not_resumable", "{agent}");
+        }
+    }
+
     fn identity_snapshot(native_launch: &str) -> InspectSnapshot {
         InspectSnapshot {
             session_id: WorkerSessionId::new("s-identity").expect("session id"),
@@ -7177,6 +7310,7 @@ while os.getppid() == parent:
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            native_launch_unresolved: false,
         };
         store
             .record_resume(&recoverable_binding)
@@ -7496,6 +7630,7 @@ while os.getppid() == parent:
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            native_launch_unresolved: false,
         }
     }
 

@@ -12,7 +12,8 @@ use protocol::method::{self, Method};
 use protocol::{
     event, AgentStateEvent, AttachEvent, NotificationCreatedEvent, NotificationDeletedEvent,
     NotificationUpdatedEvent, ProtocolVersion, RuntimeInventoryEvent, SessionEvent,
-    SessionNativeRecoveredEvent, SubagentStateEvent, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    SessionNativeRecoveredEvent, SessionWarning, SessionWarningKind, SubagentStateEvent,
+    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -401,6 +402,80 @@ fn current_events_downgrade_to_the_protocol_3_golden() {
         }
     }
     assert!(renamed >= 9, "every identity-bearing event is renamed");
+}
+
+/// The session of the first `method` fixture in its current spelling, with a
+/// real `NativeRecovery` warning appended; also returns the warnings of the
+/// golden, which are what a protocol 3 client must still receive.
+fn session_with_native_recovery_warning(method: &str) -> (Value, Value) {
+    let results = fixtures(RESULTS, "results.json");
+    let golden = results
+        .entries
+        .iter()
+        .find(|entry| entry["method"] == method)
+        .unwrap_or_else(|| panic!("{method} fixture"))["result"]
+        .clone();
+    let mut current = rename_keys_everywhere(&golden);
+    let session = if current.is_array() {
+        current.get_mut(0).expect("the fixture lists a session")
+    } else {
+        &mut current
+    };
+    let warning = serde_json::to_value(SessionWarning {
+        kind: SessionWarningKind::NativeRecovery,
+        message: "native recovery is unavailable".to_owned(),
+        detail: Some("native session id: native-1".to_owned()),
+    })
+    .expect("serialize the warning");
+    session["warnings"]
+        .as_array_mut()
+        .map(|warnings| warnings.push(warning.clone()))
+        .unwrap_or_else(|| session["warnings"] = json!([warning]));
+    let golden_session = if golden.is_array() {
+        &golden[0]
+    } else {
+        &golden
+    };
+    (current, golden_session["warnings"].clone())
+}
+
+#[test]
+fn a_native_recovery_warning_is_withheld_from_protocol_3_and_kept_on_protocol_4() {
+    for method in [method::SESSION_LIST, method::SESSION_NEW] {
+        let (current, golden_warnings) = session_with_native_recovery_warning(method);
+
+        let downgraded =
+            result(v3(), method, current.clone()).expect("adapter translates the result");
+        let session = if downgraded.is_array() {
+            &downgraded[0]
+        } else {
+            &downgraded
+        };
+        let kinds: Vec<&str> = session
+            .get("warnings")
+            .and_then(Value::as_array)
+            .map(|warnings| warnings.iter().filter_map(|w| w["kind"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !kinds.contains(&"native_recovery"),
+            "{method}: protocol 3 never knew the kind: {kinds:?}"
+        );
+        assert_eq!(
+            session.get("warnings").cloned().unwrap_or(json!([])),
+            if golden_warnings.is_null() {
+                json!([])
+            } else {
+                golden_warnings
+            },
+            "{method}: the kinds protocol 3 defined are untouched"
+        );
+
+        assert_eq!(
+            result(PROTOCOL_VERSION, method, current.clone()).expect("current is served as is"),
+            current,
+            "{method}: protocol 4 keeps the warning"
+        );
+    }
 }
 
 #[test]

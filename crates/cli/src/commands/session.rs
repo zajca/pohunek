@@ -1683,6 +1683,23 @@ fn render_list_human(sessions: &[SessionInfo]) -> String {
             session.cwd.display(),
         );
     }
+    // The WARN column only counts; a lost native recovery record needs its
+    // recovery hint where the operator looks for the session.
+    for session in sessions {
+        for warning in session
+            .warnings
+            .iter()
+            .filter(|warning| warning.kind == SessionWarningKind::NativeRecovery)
+        {
+            let _ = writeln!(
+                output,
+                "warning [{}] {}: {}",
+                warning_kind_label(warning.kind),
+                session.id.0,
+                warning.message
+            );
+        }
+    }
     output
 }
 
@@ -2057,6 +2074,7 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
         SessionWarningKind::BaseBranchFallback => "base_branch_fallback",
         SessionWarningKind::SetupScript => "setup_script",
         SessionWarningKind::Hook => "hook",
+        SessionWarningKind::NativeRecovery => "native_recovery",
     }
 }
 
@@ -3178,6 +3196,27 @@ mod tests {
             "/work/codex/session.json"
         ));
         assert!(has_row(&output, "native_session_id", "<none>"));
+    }
+
+    #[test]
+    fn list_spells_out_the_recovery_hint_of_a_native_recovery_warning() {
+        let mut session = running_session("s-lost");
+        session.warnings = vec![SessionWarning {
+            kind: SessionWarningKind::NativeRecovery,
+            message: "native recovery is unavailable: start a new session".to_owned(),
+            detail: Some("native session id: native-1".to_owned()),
+        }];
+        let clean = running_session("s-clean");
+
+        let output = render_list_human(&[session, clean]);
+
+        assert!(
+            output.contains(
+                "warning [native_recovery] s-lost: native recovery is unavailable: start a new session"
+            ),
+            "list must carry the recovery hint: {output}"
+        );
+        assert!(!output.contains("s-clean:"), "{output}");
     }
 
     #[test]
