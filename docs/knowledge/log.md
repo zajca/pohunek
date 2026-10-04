@@ -1,5 +1,12 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-04, runtime package archive)
+
+- Added the runtime package archive concept: the canonical deterministic
+  `tar.zst` format, the strict reader's rejection rules, the named size limits,
+  and `cargo xtask package build|verify`. The source map lists the new
+  `crates/package` files.
+
 ## Unreleased (2026-10-03, native launch spec)
 
 - Replaced the profile `[resume] mode`/`ref_kind` keys and the `[fork]` table

@@ -459,6 +459,18 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/detect/manifests/shell.toml`
 - `crates/terminal/src/screen.rs`
 
+Runtime package archive format:
+
+- `docs/knowledge/concepts/runtime-package-archive.md`
+- `crates/package/src/lib.rs`
+- `crates/package/src/archive.rs` — strict USTAR writer and reader.
+- `crates/package/src/canonical.rs` — canonical header encoding.
+- `crates/package/src/compression.rs` — single-frame zstd encode and bounded decode.
+- `crates/package/src/limits.rs` — named size limits.
+- `crates/package/src/error.rs` — typed rejections that never echo archive content.
+- `crates/package/tests/archive.rs`
+- `crates/xtask/src/runtime_package.rs` — `cargo xtask package build|verify`.
+
 Hermes compatibility evidence:
 
 - `compat/hermes/compatibility-lock.json`

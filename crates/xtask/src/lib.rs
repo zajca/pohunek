@@ -8,6 +8,7 @@ mod generators;
 mod hermes;
 mod hermes_mock;
 mod hermes_skill;
+mod runtime_package;
 mod site;
 pub mod test_code;
 mod ts;
@@ -76,6 +77,11 @@ pub enum XtaskError {
     UnsupportedFileType(PathBuf),
     Json(serde_json::Error),
     Yaml(serde_yaml::Error),
+    Package(::package::ArchiveError),
+    /// The archive output path lies inside the package directory it packs.
+    OutputInsideInput(PathBuf),
+    /// The archive output path is a symbolic link.
+    OutputIsSymlink(PathBuf),
     InvalidPath(PathBuf),
     /// A delegated command ran and exited unsuccessfully.
     ChildExit {
@@ -120,6 +126,15 @@ impl fmt::Display for XtaskError {
             }
             Self::Json(error) => write!(f, "failed to serialize json: {error}"),
             Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
+            Self::Package(error) => write!(f, "package archive: {error}"),
+            Self::OutputIsSymlink(path) => {
+                write!(f, "archive output `{}` is a symbolic link", path.display())
+            }
+            Self::OutputInsideInput(path) => write!(
+                f,
+                "archive output `{}` is inside the package directory",
+                path.display()
+            ),
             Self::InvalidPath(path) => write!(
                 f,
                 "path `{}` cannot be represented as a deterministic relative path",
@@ -137,9 +152,12 @@ impl Error for XtaskError {
             Self::Io { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             Self::Yaml(error) => Some(error),
+            Self::Package(error) => Some(error),
             Self::Usage(_)
             | Self::UnsupportedFileType(_)
             | Self::InvalidPath(_)
+            | Self::OutputInsideInput(_)
+            | Self::OutputIsSymlink(_)
             | Self::ChildExit { .. } => None,
         }
     }
@@ -335,6 +353,7 @@ where
         },
         TopCommand::Hermes { action } => run_hermes(action, &root),
         TopCommand::Affected(options) => affected::run(&root, &options),
+        TopCommand::Package { action } => run_package(action),
         TopCommand::AgentSkill { action } => match action {
             AgentSkillAction::Generate => {
                 agent_skill::generate(&root)?;
@@ -427,6 +446,28 @@ enum TopCommand {
     /// files plus their dependents, and escalates to every test for
     /// workspace-wide or unmapped paths. Never a substitute for the full gates.
     Affected(affected::Options),
+    /// Build and check canonical runtime package archives.
+    Package {
+        #[command(subcommand)]
+        action: PackageAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PackageAction {
+    /// Build the canonical `tar.zst` archive of a package directory.
+    Build {
+        /// Package directory holding `runtime.toml` and the package files.
+        dir: PathBuf,
+        /// Archive file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Build a package directory twice and require byte-identical archives.
+    Verify {
+        /// Package directory holding `runtime.toml` and the package files.
+        dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -474,6 +515,20 @@ enum HermesAction {
 enum AgentSkillAction {
     /// Regenerate the checked agent skill from its knowledge source.
     Generate,
+}
+
+fn run_package(action: PackageAction) -> Result<(), XtaskError> {
+    match action {
+        PackageAction::Build { dir, output } => {
+            let digest = runtime_package::build(&dir, &output)?;
+            println!("package build ok: {digest}");
+        }
+        PackageAction::Verify { dir } => {
+            let digest = runtime_package::verify(&dir)?;
+            println!("package verify ok: reproducible build, {digest}");
+        }
+    }
+    Ok(())
 }
 
 fn repo_root() -> PathBuf {
