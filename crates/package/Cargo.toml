@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Canonical runtime package archive format, builder and strict reader for pohunek."
+description = "Canonical runtime package archive format, safe extraction, per-file verification and the content-addressed registry store for pohunek."
 
 [lib]
 name = "package"
@@ -20,8 +20,18 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 
+# Extraction and the registry use descriptor-relative filesystem primitives that
+# exist on Unix only.
+[target.'cfg(unix)'.dependencies]
+pohunek-platform = { workspace = true }
+
 [dev-dependencies]
 ruzstd = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+pohunek-test-support = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

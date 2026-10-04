@@ -469,7 +469,15 @@ Runtime package archive format:
 - `crates/package/src/compression.rs` — single-frame zstd encode and bounded decode.
 - `crates/package/src/limits.rs` — named size limits.
 - `crates/package/src/error.rs` — typed rejections that never echo archive content.
+- `crates/package/src/install.rs` — descriptor-relative extraction into a staging directory and atomic publication.
+- `crates/package/src/verify.rs` — per-file re-verification of a package root and manifest-checked reads.
+- `crates/package/src/manifest.rs` — per-file manifest schema and manifest digest.
+- `crates/package/src/layout.rs` — package root names, modes and bounds.
+- `crates/package/src/hash.rs` — SHA-256 helpers.
+- `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`
+- `crates/package/tests/install.rs`
+- `crates/package/tests/registry.rs`
 
 Signed runtime catalog:
 
