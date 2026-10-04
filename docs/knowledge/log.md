@@ -18,6 +18,16 @@
   client against an N-1 daemon remains #527). The source
   map lists `crates/protocol/src/compat/`.
 
+## Unreleased (2026-10-04, Pi runtime package)
+
+- Added the Pi runtime package guide: package source layout
+  (`runtime-packages/pi`, `compat/pi`), explicit-digest install, the assigned
+  `--session-id`/`--session`/`--fork` contract, the session-file existence check
+  verified against Pi 1.0.2, detection facts, limits, and how CI keeps the
+  descriptor, the supported range and the tests in sync.
+- The source map lists the package sources, the compatibility lock, the real-Pi
+  test and the `pi-package` CI job.
+
 ## Unreleased (2026-10-04, data-driven version probe)
 
 - Runtime descriptors can declare `version_probe = { parser = "semver-v1", args,

@@ -193,7 +193,8 @@ pohunek attach <session-id>                 # Ctrl-] detaches, the agent keeps r
 ```
 
 [docs/install.md](docs/install.md) covers archive verification, what the login
-service installs, upgrades, and the first worktree-isolated session.
+service installs, upgrades, the first worktree-isolated session, and installing
+the Pi coding agent as a runtime package (`runtime-packages/pi`).
 
 ## Experiments built on pohunek
 

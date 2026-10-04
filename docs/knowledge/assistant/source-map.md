@@ -500,6 +500,15 @@ Runtime package archive format:
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate`.
 - `docs/knowledge/guides/runtime-packages.md`
+- `docs/knowledge/guides/pi-package.md`
+- `runtime-packages/README.md` — layout convention of the official package sources.
+- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference, existence check, version probe).
+- `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
+- `compat/pi/compatibility-lock.json` — pinned Pi release, supported range and Node requirement.
+- `compat/pi/screens/` — screens captured from a real Pi that the manifest test classifies.
+- `crates/cli/tests/pi_package.rs` — pure package tests and the opt-in real-Pi tests.
+- `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
+- `crates/cli/tests/support/model_stub.rs` — loopback chat-completions stub used instead of a model provider.
 - `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`
 - `crates/package/tests/install.rs`

@@ -11,8 +11,8 @@ use knowledge::{
 // #81 host-governance concept, the runtime package archive and catalog concepts, source map, and system prompt) plus the reserved
 // `index.md` and `log.md` files.
 // Keep this exact assertion so changing a checked Markdown file needs an intentional update.
-const COMMITTED_KNOWLEDGE_FILES: usize = 28;
-const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 26;
+const COMMITTED_KNOWLEDGE_FILES: usize = 29;
+const COMMITTED_KNOWLEDGE_CONCEPTS: usize = 27;
 
 fn fixture(name: &str) -> PathBuf {
     manifest_dir().join("tests").join("fixtures").join(name)
