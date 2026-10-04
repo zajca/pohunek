@@ -782,6 +782,7 @@ impl Installation {
                         )
                         .expect("valid resume template"),
                     ),
+                    launch_binding: pohunek_daemon::agent::host::LaunchPin::Unpinned,
                 }),
                 native_identity_ordering: None,
                 runtime,

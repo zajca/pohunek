@@ -1,8 +1,9 @@
-//! Agent adapter trait and built-in PTY/TUI agent adapters.
+//! Agent launch primitives and the runtime host.
 //!
-//! Per `docs/plan-phase-1.md` "Agent Adapter Boundary": a small trait per agent
-//! carrying launch argv/env/cwd, input rules (Claude Ink submit-delay quirk),
-//! the state manifest, and the resume command.
+//! The runtime host ([`host`]) holds one data-driven definition per runtime;
+//! this module supplies the PTY launch command, input framing rules, native
+//! session references and the executable-resolution policy those definitions
+//! are launched with.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -12,24 +13,14 @@ use pohunek_platform::shell_env;
 use protocol::{AgentActivity, ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
-use crate::detect::Manifest;
-
-mod claude;
-mod codex;
-mod hermes;
 pub mod host;
 mod native_launch;
 mod profile;
-mod shell;
 
-pub use claude::ClaudeAdapter;
-pub use codex::CodexAdapter;
-pub use hermes::HermesAdapter;
 pub use native_launch::{
     NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
 };
-pub(crate) use profile::{default_args, default_program, ProfileRegistry, ResolvedAgent};
-pub use shell::ShellAdapter;
+pub(crate) use profile::{ProfileRegistry, ResolvedAgent};
 
 /// Shell launched when the host reports no usable login shell.
 pub(crate) const FALLBACK_LOGIN_SHELL: &str = "/bin/sh";
@@ -54,33 +45,6 @@ pub(crate) fn resolve_login_shell(raw: Option<String>) -> String {
 /// The login shell of this host's environment, resolved by [`resolve_login_shell`].
 pub(crate) fn host_login_shell() -> String {
     resolve_login_shell(std::env::var("SHELL").ok())
-}
-
-static SHELL_ADAPTER: ShellAdapter = ShellAdapter;
-static CODEX_ADAPTER: CodexAdapter = CodexAdapter;
-static CLAUDE_ADAPTER: ClaudeAdapter = ClaudeAdapter;
-static HERMES_ADAPTER: HermesAdapter = HermesAdapter;
-static UNSUPPORTED_ADAPTER: UnsupportedAdapter = UnsupportedAdapter;
-
-#[derive(Debug)]
-struct UnsupportedAdapter;
-
-impl AgentAdapter for UnsupportedAdapter {
-    fn id(&self) -> &'static str {
-        "unsupported"
-    }
-
-    fn launch(&self, _opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError> {
-        Err(ProtocolError::agent_kind_unsupported("unknown"))
-    }
-
-    fn input_rules(&self) -> InputRules {
-        InputRules::unrestricted(false, Duration::ZERO)
-    }
-
-    fn manifest(&self) -> &Manifest {
-        crate::detect::generic_shell_manifest()
-    }
 }
 
 /// Default submit delay for Claude Code's Ink TUI.
@@ -343,78 +307,42 @@ impl SessionRef {
     }
 }
 
-/// Return the compiled native-session launch spec for a built-in base agent
-/// kind, or `None` when the kind has no native recovery (a shell).
-#[must_use]
-pub(crate) fn base_native_launch(base: &protocol::AgentKind) -> Option<NativeSessionLaunch> {
-    match base {
-        protocol::AgentKind::Shell | protocol::AgentKind::Unknown(_) => None,
-        protocol::AgentKind::Codex => Some(built_in_launch(&["resume", "{reference}"], None)),
-        protocol::AgentKind::Claude => Some(built_in_launch(
-            &["--resume", "{reference}"],
-            Some(&["--resume", "{reference}", "--fork-session"]),
-        )),
-        protocol::AgentKind::Hermes => Some(built_in_launch(&["--resume", "{reference}"], None)),
+/// The native-session launch spec of a built-in runtime kind, `None` for a
+/// kind without native recovery or without an installed definition.
+#[cfg(test)]
+pub(crate) fn builtin_native_launch(kind: &protocol::AgentKind) -> Option<NativeSessionLaunch> {
+    host::builtin_host()
+        .resolve_kind(kind)
+        .ok()
+        .and_then(|definition| definition.native().cloned())
+}
+
+/// Input rules of a built-in runtime, selected by agent kind.
+///
+/// Serves `session/input.rs`, which still selects rules by [`AgentKind`]; a
+/// kind without an installed definition gets unrestricted, unframed input.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InputAdapter(InputRules);
+
+impl InputAdapter {
+    /// The rules this adapter frames input with.
+    pub(crate) const fn input_rules(self) -> InputRules {
+        self.0
     }
 }
 
-/// Build a compiled id-kind spec from templates that are valid by construction.
-fn built_in_launch(resume: &[&str], fork: Option<&[&str]>) -> NativeSessionLaunch {
-    NativeSessionLaunch::from_templates(SessionRefKind::Id, resume, fork)
-        .expect("compiled native-session templates are valid (covered by unit tests)")
-}
-
-/// Thin per-agent adapter for launch, input, and activity behavior.
-pub trait AgentAdapter: std::fmt::Debug + Send + Sync {
-    /// Stable adapter id.
-    fn id(&self) -> &str;
-    /// Build the PTY launch command, resolving the executable from `PATH`.
-    fn launch(&self, opts: &LaunchOpts) -> Result<LaunchCommand, ProtocolError>;
-    /// Programmatic input injection rules.
-    fn input_rules(&self) -> InputRules;
-    /// Agent-specific activity manifest.
-    fn manifest(&self) -> &Manifest;
-}
-
-fn launch_command(
-    program: &str,
-    args: Vec<String>,
-    opts: &LaunchOpts,
-) -> Result<LaunchCommand, ProtocolError> {
-    build_pty_command(program, args, opts)
-}
-
-/// Return the built-in adapter for an agent kind.
-#[must_use]
-pub fn adapter_for(agent: &protocol::AgentKind) -> &'static dyn AgentAdapter {
-    match agent {
-        protocol::AgentKind::Shell => &SHELL_ADAPTER,
-        protocol::AgentKind::Codex => &CODEX_ADAPTER,
-        protocol::AgentKind::Claude => &CLAUDE_ADAPTER,
-        protocol::AgentKind::Hermes => &HERMES_ADAPTER,
-        protocol::AgentKind::Unknown(_) => &UNSUPPORTED_ADAPTER,
-    }
-}
-
-/// Return the launch adapter, preserving the configured shell command seam.
-pub(crate) fn launch_adapter_for<'a>(
-    agent: &protocol::AgentKind,
-    shell_command: &'a crate::session::ShellCommand,
-) -> &'a dyn AgentAdapter {
-    match agent {
-        protocol::AgentKind::Shell => shell_command,
-        protocol::AgentKind::Codex | protocol::AgentKind::Claude | protocol::AgentKind::Hermes => {
-            adapter_for(agent)
-        }
-        protocol::AgentKind::Unknown(_) => &UNSUPPORTED_ADAPTER,
-    }
+/// Returns the input adapter for an agent kind.
+pub(crate) fn adapter_for(agent: &protocol::AgentKind) -> InputAdapter {
+    InputAdapter(host::builtin_host().resolve_kind(agent).map_or_else(
+        |_unresolved| InputRules::unrestricted(false, Duration::ZERO),
+        |definition| definition.input_rules(),
+    ))
 }
 
 /// Resolve `program` on `PATH` and build a PTY launch command in `opts`.
 ///
-/// Shared by first-launch (adapter `launch`) and resume (`resume_pty_command`):
-/// resume argv carries a runtime-built program name, so it cannot reuse the
-/// `&'static str` launch path.
+/// Shared by first launch ([`host::launch_command`]) and resume
+/// ([`resume_pty_command_from_launch`]).
 pub fn build_pty_command(
     program: &str,
     args: Vec<String>,
@@ -539,11 +467,12 @@ mod tests {
     use pohunek_test_support::process_env::ProcessEnv;
     use protocol::{AgentActivity, ErrorClass};
 
+    use super::host::{launch_command, RuntimeHost};
     use super::{
-        base_native_launch, build_pty_command, fork_pty_command_from_launch, resolve_binary,
-        resume_pty_command_from_launch, trusted_program, which_executable, AgentAdapter,
-        ClaudeAdapter, CodexAdapter, HermesAdapter, LaunchOpts, NativeArgs, NativeSessionLaunch,
-        SessionRef, SessionRefKind, ShellAdapter, ValidatedLaunchProgram,
+        build_pty_command, builtin_native_launch, fork_pty_command_from_launch, resolve_binary,
+        resume_pty_command_from_launch, trusted_program, which_executable, LaunchCommand,
+        LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef, SessionRefKind,
+        ValidatedLaunchProgram,
     };
     use crate::detect::{ManifestRegion, MatchContext};
 
@@ -589,6 +518,18 @@ mod tests {
         run()
     }
 
+    /// Launches the built-in runtime `name` the way a bare agent name does, with
+    /// `$SHELL` as the shell program.
+    fn launch_builtin(
+        name: &str,
+        opts: &LaunchOpts,
+    ) -> Result<LaunchCommand, protocol::ProtocolError> {
+        let host = RuntimeHost::from_host_environment();
+        let runtime_id = protocol::RuntimeId::parse(name).expect("runtime id");
+        let definition = host.resolve_id(&runtime_id).expect("built-in resolves");
+        launch_command(&host, definition, opts)
+    }
+
     #[test]
     fn codex_launch_resolves_binary_and_preserves_opts() {
         let bin_dir = temp_dir("codex-bin");
@@ -596,9 +537,7 @@ mod tests {
         let cwd = temp_dir("codex-cwd");
 
         let command = with_path(&bin_dir, || {
-            CodexAdapter
-                .launch(&launch_opts(cwd.clone()))
-                .expect("codex launch command")
+            launch_builtin("codex", &launch_opts(cwd.clone())).expect("codex launch command")
         });
 
         assert_eq!(command.program, codex.display().to_string());
@@ -619,9 +558,7 @@ mod tests {
         let cwd = temp_dir("claude-cwd");
 
         let command = with_path(&bin_dir, || {
-            ClaudeAdapter
-                .launch(&launch_opts(cwd.clone()))
-                .expect("claude launch command")
+            launch_builtin("claude", &launch_opts(cwd.clone())).expect("claude launch command")
         });
 
         assert_eq!(command.program, claude.display().to_string());
@@ -642,9 +579,7 @@ mod tests {
         let cwd = temp_dir("hermes-cwd");
 
         let command = with_path(&bin_dir, || {
-            HermesAdapter
-                .launch(&launch_opts(cwd.clone()))
-                .expect("Hermes launch command")
+            launch_builtin("hermes", &launch_opts(cwd.clone())).expect("Hermes launch command")
         });
 
         assert_eq!(command.program, hermes.display().to_string());
@@ -883,9 +818,7 @@ mod tests {
         let cwd = temp_dir("shell-cwd");
 
         let command = with_path_and_shell(&bin_dir, "shell", || {
-            ShellAdapter
-                .launch(&launch_opts(cwd.clone()))
-                .expect("shell launch command")
+            launch_builtin("shell", &launch_opts(cwd.clone())).expect("shell launch command")
         });
 
         assert_eq!(command.program, shell.display().to_string());
@@ -900,22 +833,28 @@ mod tests {
     }
 
     #[test]
-    fn adapters_return_expected_input_rules() {
-        let shell = ShellAdapter.input_rules();
+    fn built_in_runtimes_return_expected_input_rules() {
+        let rules = |kind: protocol::AgentKind| super::adapter_for(&kind).input_rules();
+        let shell = rules(protocol::AgentKind::Shell);
         assert!(!shell.bracketed_paste);
         assert_eq!(shell.submit_delay, Duration::ZERO);
 
-        let codex = CodexAdapter.input_rules();
+        let codex = rules(protocol::AgentKind::Codex);
         assert!(codex.bracketed_paste);
         assert_eq!(codex.submit_delay, Duration::from_millis(150));
 
-        let claude = ClaudeAdapter.input_rules();
+        let claude = rules(protocol::AgentKind::Claude);
         assert!(!claude.bracketed_paste);
         assert_eq!(claude.submit_delay, Duration::from_millis(150));
 
-        let hermes = HermesAdapter.input_rules();
+        let hermes = rules(protocol::AgentKind::Hermes);
         assert!(hermes.bracketed_paste);
         assert_eq!(hermes.submit_delay, Duration::from_millis(150));
+        assert!(!hermes.allows_while_blocked());
+
+        let unresolved = rules(protocol::AgentKind::Unknown("acme".to_owned()));
+        assert!(!unresolved.bracketed_paste);
+        assert_eq!(unresolved.submit_delay, Duration::ZERO);
     }
 
     #[test]
@@ -1014,7 +953,7 @@ mod tests {
 
     #[test]
     fn built_in_native_launch_specs_pin_exact_argv() {
-        let claude = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let claude = builtin_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
         assert_eq!(claude.reference_kind(), SessionRefKind::Id);
         assert_eq!(
             id_argv(&claude, "native-1"),
@@ -1028,23 +967,23 @@ mod tests {
             )
         );
 
-        let codex = base_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
+        let codex = builtin_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
         assert_eq!(codex.reference_kind(), SessionRefKind::Id);
         assert_eq!(
             id_argv(&codex, "native-1"),
             (vec!["resume".to_owned(), "native-1".to_owned()], None)
         );
 
-        let hermes = base_native_launch(&protocol::AgentKind::Hermes).expect("hermes recovers");
+        let hermes = builtin_native_launch(&protocol::AgentKind::Hermes).expect("hermes recovers");
         assert_eq!(hermes.reference_kind(), SessionRefKind::Id);
         assert_eq!(
             id_argv(&hermes, "native-1"),
             (vec!["--resume".to_owned(), "native-1".to_owned()], None)
         );
 
-        assert_eq!(base_native_launch(&protocol::AgentKind::Shell), None);
+        assert_eq!(builtin_native_launch(&protocol::AgentKind::Shell), None);
         assert_eq!(
-            base_native_launch(&protocol::AgentKind::Unknown("x".to_owned())),
+            builtin_native_launch(&protocol::AgentKind::Unknown("x".to_owned())),
             None
         );
     }
@@ -1053,7 +992,7 @@ mod tests {
     fn codex_and_hermes_report_fork_unsupported() {
         let reference = SessionRef::id("native-1").expect("id reference");
         for kind in [protocol::AgentKind::Codex, protocol::AgentKind::Hermes] {
-            let launch = base_native_launch(&kind).expect("recovers");
+            let launch = builtin_native_launch(&kind).expect("recovers");
             assert!(!launch.supports_fork());
             assert_eq!(
                 launch.fork_argv(&reference).expect_err("no fork").code,
@@ -1068,7 +1007,7 @@ mod tests {
         write_executable(&bin_dir, "claude-sonnet");
         let cwd = temp_dir("template-fork-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
-        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let launch = builtin_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
 
         let command = with_path(&bin_dir, || {
             fork_pty_command_from_launch(
@@ -1097,7 +1036,7 @@ mod tests {
     fn fork_pty_command_refuses_a_spec_without_fork() {
         let cwd = temp_dir("template-fork-none-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
-        let launch = base_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
+        let launch = builtin_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
 
         let error = fork_pty_command_from_launch(
             "codex",
@@ -1118,7 +1057,7 @@ mod tests {
         let session = SessionRef::id("native-123").expect("id ref");
 
         // The program is the snapshot's, NOT the base adapter's "claude".
-        let claude = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let claude = builtin_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
         let flag = with_path(&bin_dir, || {
             resume_pty_command_from_launch(
                 "claude-sonnet",
@@ -1132,7 +1071,7 @@ mod tests {
         assert!(flag.program.ends_with("claude-sonnet"));
         assert_eq!(flag.args, vec!["--resume", "native-123"]);
 
-        let codex = base_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
+        let codex = builtin_native_launch(&protocol::AgentKind::Codex).expect("codex recovers");
         let sub = with_path(&bin_dir, || {
             resume_pty_command_from_launch(
                 "claude-sonnet",
@@ -1157,7 +1096,7 @@ mod tests {
             resume_pty_command_from_launch(
                 "hermes",
                 vec!["chat".to_owned()],
-                &base_native_launch(&protocol::AgentKind::Hermes).expect("Hermes resumes"),
+                &builtin_native_launch(&protocol::AgentKind::Hermes).expect("Hermes resumes"),
                 &session,
                 &launch_opts(temp_dir("hermes-resume-cwd")),
             )
@@ -1179,7 +1118,7 @@ mod tests {
         let bin_dir = temp_dir("template-meta-bin");
         write_executable(&bin_dir, "myagent");
         let cwd = temp_dir("template-meta-cwd");
-        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let launch = builtin_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
         let hostile_id = "a b;$(touch pwned)|`x` 'q' \"z\" *";
         let hostile_path = "/work/a b/$(touch pwned);|.jsonl";
 
@@ -1237,7 +1176,7 @@ mod tests {
     #[test]
     fn resume_pty_command_from_launch_refuses_a_reference_of_the_wrong_kind() {
         let cwd = temp_dir("template-kind-cwd");
-        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let launch = builtin_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
         let path = SessionRef::path("/abs/session.jsonl").expect("path ref");
 
         let error = resume_pty_command_from_launch(
@@ -1282,7 +1221,7 @@ mod tests {
         write_executable(&bin_dir, "myagent");
         let cwd = temp_dir("template-args-cwd");
         let session = SessionRef::id("native-123").expect("id ref");
-        let launch = base_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
+        let launch = builtin_native_launch(&protocol::AgentKind::Claude).expect("claude recovers");
 
         let command = with_path(&bin_dir, || {
             resume_pty_command_from_launch(
@@ -1308,9 +1247,7 @@ mod tests {
         let cwd = temp_dir("missing-cwd");
 
         let err = with_path(&empty_path, || {
-            CodexAdapter
-                .launch(&launch_opts(&cwd))
-                .expect_err("missing codex binary")
+            launch_builtin("codex", &launch_opts(&cwd)).expect_err("missing codex binary")
         });
 
         assert_eq!(err.class, ErrorClass::Runtime);
@@ -1320,20 +1257,23 @@ mod tests {
     }
 
     #[test]
-    fn adapter_manifests_match_agent_specific_rules() {
-        // Shell inherits the generic-shell manifest verbatim — assert it returns
-        // that exact static instance (Manifest holds compiled Regex, so it is not
-        // PartialEq; pointer identity is the meaningful check).
-        assert!(
-            std::ptr::eq(
-                ShellAdapter.manifest(),
-                crate::detect::generic_shell_manifest()
-            ),
-            "shell adapter must inherit the generic-shell manifest"
+    fn built_in_manifests_match_agent_specific_rules() {
+        let manifest = |kind: protocol::AgentKind| {
+            (**super::host::builtin_host()
+                .resolve_kind(&kind)
+                .expect("built-in resolves")
+                .manifest())
+            .clone()
+        };
+        // Manifest holds compiled Regex and is not PartialEq; its Debug form is
+        // the structural comparison.
+        assert_eq!(
+            format!("{:?}", manifest(protocol::AgentKind::Shell)),
+            format!("{:?}", crate::detect::generic_shell_manifest()),
+            "shell must inherit the generic-shell manifest"
         );
 
-        let codex = CodexAdapter
-            .manifest()
+        let codex = manifest(protocol::AgentKind::Codex)
             .match_context(
                 &MatchContext::default()
                     .with_region_text(ManifestRegion::OscTitle, "Action Required"),
@@ -1342,8 +1282,7 @@ mod tests {
         assert_eq!(codex.activity, AgentActivity::Blocked);
         assert!(codex.visible_blocker);
 
-        let claude = ClaudeAdapter
-            .manifest()
+        let claude = manifest(protocol::AgentKind::Claude)
             .match_context(&MatchContext::default().with_region_text(
                 ManifestRegion::AfterLastHorizontalRule,
                 "enter to select\nesc to cancel\n↑/↓ to navigate",

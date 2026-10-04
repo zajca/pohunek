@@ -9,17 +9,17 @@ use pohunek_worker_protocol::{
 };
 
 use super::{
-    build_pty_command, debug, detect_at, event, launch_adapter_for, mpsc,
-    plan_initial_input_delivery, runtime_error, timestamp_now, warn, watch, AgentKind, Arc,
-    CancellationToken, CwdSource, DesiredState, DetectedProject, DetectorConfig,
-    DetectorConfigUpdate, DetectorInputs, DetectorScope, InputRules, LaunchCommand, LaunchOpts,
-    Manifest, Mutex, NativeSessionLaunch, Notify, Ordering, PathBuf, ProjectRecord, ProtocolError,
-    ResolvedAgent, ResumeBinding, ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState,
-    RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord,
-    SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
-    SessionWarning, ShellCommand, StateSource, TransactionKind, Worker, WorktreeRequest,
-    DEFAULT_WORKER_SUBSCRIBER_BYTES, DEFAULT_WORKER_TERMINAL_RETENTION,
-    DEFAULT_WORKER_WRITE_DEDUP_ENTRIES, SESSION_RECORD_SCHEMA_VERSION,
+    build_pty_command, debug, detect_at, event, host, mpsc, plan_initial_input_delivery,
+    runtime_error, timestamp_now, warn, watch, AgentKind, Arc, CancellationToken, CwdSource,
+    DesiredState, DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
+    DetectorScope, InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch,
+    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
+    ResumeSnapshot, RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeState, RuntimeWatchIdentity,
+    SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind,
+    SessionRegistry, SessionRuntime, SessionState, SessionTransaction, SessionWarning, StateSource,
+    TransactionKind, Worker, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
+    DEFAULT_WORKER_TERMINAL_RETENTION, DEFAULT_WORKER_WRITE_DEDUP_ENTRIES,
+    SESSION_RECORD_SCHEMA_VERSION,
 };
 use crate::procwatch::{ProcessIdentity, StartIdentity};
 use crate::runtime::lifecycle::{
@@ -749,6 +749,7 @@ impl SessionRegistry {
                 args: snapshot.args.clone(),
                 input_rules: StoredInputRules::from(input_rules),
                 native_launch: snapshot.native.clone(),
+                launch_binding: snapshot.launch_binding.clone(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,
@@ -1170,7 +1171,7 @@ pub(super) async fn open_detector_output(
 
 pub(super) fn build_launch_command(
     resolved: &ResolvedAgent,
-    shell_command: &ShellCommand,
+    runtimes: &RuntimeHost,
     opts: &LaunchOpts,
     initial_input: Option<String>,
 ) -> Result<LaunchCommandPlan, ProtocolError> {
@@ -1179,11 +1180,11 @@ pub(super) fn build_launch_command(
     // launched inside it is still caught as a self-feeding loop.
     let command = match &resolved.profile {
         // A host profile overrides the launch program/args; build via the shared
-        // PATH-resolving primitive (the same one the base adapters use). When the
+        // PATH-resolving primitive (the same one a bare runtime launches with). When the
         // options carry a validated program, that exact path bypasses resolution.
         Some(profile) => build_pty_command(&profile.program, profile.args.clone(), opts)?,
-        // A bare base kind launches exactly as the compiled adapter.
-        None => launch_adapter_for(&resolved.base, shell_command).launch(opts)?,
+        // A bare base kind launches its definition's program and arguments.
+        None => host::launch_command(runtimes, &resolved.definition, opts)?,
     };
     Ok(plan_initial_input_delivery(
         resolved,

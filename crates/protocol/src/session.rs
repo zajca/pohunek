@@ -49,6 +49,19 @@ impl AgentKind {
         }
     }
 
+    /// Classifies a wire value: the built-in kinds by name, anything else as
+    /// [`Self::Unknown`].
+    #[must_use]
+    pub fn from_wire(value: &str) -> Self {
+        match value {
+            "shell" => Self::Shell,
+            "codex" => Self::Codex,
+            "claude" => Self::Claude,
+            "hermes" => Self::Hermes,
+            other => Self::Unknown(other.to_owned()),
+        }
+    }
+
     /// Returns this kind as a runtime reference.
     ///
     /// Built-in kinds map to their [`RuntimeId`]. An unknown value is
@@ -118,13 +131,7 @@ impl<'de> Deserialize<'de> for AgentKind {
     where
         D: Deserializer<'de>,
     {
-        Ok(match String::deserialize(deserializer)?.as_str() {
-            "shell" => Self::Shell,
-            "codex" => Self::Codex,
-            "claude" => Self::Claude,
-            "hermes" => Self::Hermes,
-            other => Self::Unknown(other.to_owned()),
-        })
+        Ok(Self::from_wire(&String::deserialize(deserializer)?))
     }
 }
 
@@ -3058,6 +3065,27 @@ pub struct SessionDiffResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_kind_from_wire_names_built_ins_and_keeps_everything_else() {
+        for (wire, kind) in [
+            ("shell", AgentKind::Shell),
+            ("codex", AgentKind::Codex),
+            ("claude", AgentKind::Claude),
+            ("hermes", AgentKind::Hermes),
+        ] {
+            assert_eq!(AgentKind::from_wire(wire), kind);
+            assert_eq!(kind.as_wire(), wire);
+        }
+        for other in ["acme", "Codex", ""] {
+            assert_eq!(
+                AgentKind::from_wire(other),
+                AgentKind::Unknown(other.to_owned())
+            );
+        }
+        let decoded: AgentKind = serde_json::from_str("\"claude\"").expect("deserialize");
+        assert_eq!(decoded, AgentKind::Claude);
+    }
 
     /// A `running`, `claude`, `working` session with the given id, for filter
     /// matching tests. This is the predicate the daemon actually runs

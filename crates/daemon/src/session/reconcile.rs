@@ -26,7 +26,7 @@ use super::supervision::{
     RUNTIME_LOST_CLEANUP_UNCONFIRMED, UNREADABLE_CANDIDATES_RECOVER, UNSUPERVISED_WORKER,
 };
 use super::{
-    current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
+    adapter_for, current_time_millis, event, event_payload, identity_claim_expiry_is_valid, mpsc,
     preserve_durable_worker_metadata, preserve_newer_updated_at, runtime_error, sort_subagents,
     terminalize_running_subagents, timestamp_now, watch, ActiveAgentReport, CancellationToken,
     DesiredState, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope, Mutex,
@@ -2438,7 +2438,11 @@ impl SessionRegistry {
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
             || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
-            |binding| binding.input_rules.to_input_rules(&binding.agent_base),
+            |binding| {
+                binding
+                    .input_rules
+                    .to_input_rules(adapter_for(&binding.agent_base).input_rules())
+            },
         );
         let snapshot = recovery
             .as_ref()
@@ -2584,7 +2588,11 @@ impl SessionRegistry {
         let recovery = record.recovery.clone();
         let input_rules = recovery.as_ref().map_or_else(
             || super::input_rules_for_agent(&record.info.agent_base, &self.inner.config),
-            |binding| binding.input_rules.to_input_rules(&binding.agent_base),
+            |binding| {
+                binding
+                    .input_rules
+                    .to_input_rules(adapter_for(&binding.agent_base).input_rules())
+            },
         );
         let relaunch = recovery
             .as_ref()
@@ -5265,6 +5273,7 @@ while os.getppid() == parent:
             args: vec!["-c".to_owned(), "printf ready; sleep 30".to_owned()],
             input_rules: StoredInputRules::from(InputRules::unrestricted(false, Duration::ZERO)),
             native_launch: Some(test_native_launch(SessionRefKind::Id, true)),
+            launch_binding: crate::agent::host::LaunchPin::Unpinned,
         };
         store
             .record_session(&SessionRecord {
@@ -6578,6 +6587,7 @@ while os.getppid() == parent:
                 args: Vec::new(),
                 input_rules: StoredInputRules::default(),
                 native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+                launch_binding: crate::agent::host::LaunchPin::Unpinned,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -7057,6 +7067,7 @@ while os.getppid() == parent:
             args: Vec::new(),
             input_rules: StoredInputRules::default(),
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+            launch_binding: crate::agent::host::LaunchPin::Unpinned,
         };
         store
             .record_resume(&recoverable_binding)
@@ -7331,6 +7342,7 @@ while os.getppid() == parent:
             args: Vec::new(),
             input_rules: StoredInputRules::default(),
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+            launch_binding: crate::agent::host::LaunchPin::Unpinned,
         }
     }
 
@@ -7409,6 +7421,56 @@ while os.getppid() == parent:
             .expect("reconcile");
 
         assert!(unmigrated_entries(&registry).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_durable_session_of_an_uninstalled_runtime_stays_listed_and_keeps_its_binding() {
+        let root = temp_root();
+        let data_dir = root.join("data");
+        create_private_dir(&data_dir);
+        let store_path = data_dir.join("metadata.jsonl");
+        let store = Store::new(store_path.clone());
+        let mut record = identity_record();
+        let kind = AgentKind::Unknown("acme".to_owned());
+        record.info.agent = "acme".to_owned();
+        record.info.agent_base = kind.clone();
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.agent = "acme".to_owned();
+        recovery.agent_base = kind.clone();
+        recovery.native_session_id = Some("native-acme".to_owned());
+        store.record_session(&record).expect("persist inert record");
+        let registry = empty_registry(&root, &root.join("runtime/workers"));
+
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("reconcile");
+
+        let id = SessionId(record.session_id.clone());
+        let listed = registry
+            .inspect(&id)
+            .await
+            .expect("the session stays listed");
+        assert_eq!(listed.agent_base, kind);
+        let before = std::fs::read(&store_path).expect("read store");
+        let refused = registry
+            .resume(&id)
+            .await
+            .expect_err("an uninstalled runtime cannot be resumed");
+        assert_eq!(refused.code, "runtime_not_installed");
+        assert_eq!(
+            std::fs::read(&store_path).expect("read store"),
+            before,
+            "a refused resume leaves the stored binding untouched"
+        );
+        let kept = store.load_sessions().expect("load sessions");
+        assert_eq!(kept.len(), 1, "the inert session record is not dropped");
+        assert_eq!(
+            kept[0]
+                .recovery
+                .as_ref()
+                .and_then(|binding| binding.native_session_id.as_deref()),
+            Some("native-acme")
+        );
     }
 
     /// A plain-shell `session.new` launched in `cwd`.

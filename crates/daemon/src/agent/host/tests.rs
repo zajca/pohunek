@@ -9,24 +9,16 @@ use protocol::{
 };
 
 use super::{
-    BuiltinSource, DefinitionError, DefinitionInvariant, DefinitionOrigin, DefinitionParts,
-    LaunchProgram, RegistryError, RuntimeDefinition, RuntimeRegistry, RuntimeSource, SourceTrust,
-    RESERVED_RUNTIME_IDS,
+    check_pin, validate_launch_runtime, BuiltinSource, DefinitionError, DefinitionInvariant,
+    DefinitionOrigin, DefinitionParts, LaunchPin, LaunchProgram, RegistryError, RuntimeDefinition,
+    RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust, RESERVED_RUNTIME_IDS,
 };
-use crate::agent::{
-    adapter_for, base_native_launch, default_args, default_program, InputRules, NativeLaunchError,
-    NativeSessionLaunch, SessionRef,
+use crate::agent::{InputRules, NativeLaunchError, NativeSessionLaunch, SessionRef};
+use crate::detect::{
+    claude_manifest, codex_manifest, generic_shell_manifest, hermes_manifest, Manifest,
 };
-use crate::detect::{generic_shell_manifest, Manifest};
 
 const DIGEST: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-
-const KINDS: [AgentKind; 4] = [
-    AgentKind::Shell,
-    AgentKind::Codex,
-    AgentKind::Claude,
-    AgentKind::Hermes,
-];
 
 fn shell_manifest() -> Arc<Manifest> {
     Arc::new(generic_shell_manifest().clone())
@@ -126,23 +118,86 @@ impl RuntimeSource for FixedSource {
     }
 }
 
+/// Expected launch facts of one built-in runtime, written out literally so the
+/// descriptors are pinned to the behavior the daemon shipped with.
+struct Expected {
+    kind: AgentKind,
+    program: &'static str,
+    args: &'static [&'static str],
+    input: InputRules,
+    resume: &'static [&'static str],
+    fork: Option<&'static [&'static str]>,
+    manifest: fn() -> &'static Manifest,
+}
+
 #[test]
 fn builtin_definitions_match_the_compiled_behavior() {
-    let shell = default_program(&AgentKind::Shell);
-    let registry = builtin_registry(&shell);
-    for kind in KINDS {
-        let runtime_id = id(kind.as_wire());
-        let definition = registry.resolve(&runtime_id).expect("built-in resolves");
-        let adapter = adapter_for(&kind);
+    let delay = Duration::from_millis(150);
+    let expected = [
+        Expected {
+            kind: AgentKind::Shell,
+            program: "/bin/sh",
+            args: &[],
+            input: InputRules::unrestricted(false, Duration::ZERO),
+            resume: &[],
+            fork: None,
+            manifest: generic_shell_manifest,
+        },
+        Expected {
+            kind: AgentKind::Codex,
+            program: "codex",
+            args: &[],
+            input: InputRules::unrestricted(true, delay),
+            resume: &["resume", "{reference}"],
+            fork: None,
+            manifest: codex_manifest,
+        },
+        Expected {
+            kind: AgentKind::Claude,
+            program: "claude",
+            args: &[],
+            input: InputRules::unrestricted(false, delay),
+            resume: &["--resume", "{reference}"],
+            fork: Some(&["--resume", "{reference}", "--fork-session"]),
+            manifest: claude_manifest,
+        },
+        Expected {
+            kind: AgentKind::Hermes,
+            program: "hermes",
+            args: &["chat"],
+            input: InputRules::hermes(true, delay),
+            resume: &["--resume", "{reference}"],
+            fork: None,
+            manifest: hermes_manifest,
+        },
+    ];
+    let registry = builtin_registry("/bin/sh");
+    for case in expected {
+        let kind = &case.kind;
+        let definition = registry
+            .resolve(&id(kind.as_wire()))
+            .expect("built-in resolves");
 
-        assert_eq!(definition.runtime_id().as_str(), adapter.id(), "{kind:?}");
-        assert_eq!(definition.program().as_str(), default_program(&kind));
-        assert_eq!(definition.default_args(), default_args(&kind).as_slice());
-        assert_eq!(definition.input_rules(), adapter.input_rules(), "{kind:?}");
-        assert_eq!(definition.native(), base_native_launch(&kind).as_ref());
+        assert_eq!(definition.runtime_id().as_str(), kind.as_wire());
+        assert_eq!(definition.program().as_str(), case.program, "{kind:?}");
+        assert_eq!(definition.default_args(), case.args, "{kind:?}");
+        assert_eq!(definition.input_rules(), case.input, "{kind:?}");
+        let native = if case.resume.is_empty() {
+            None
+        } else {
+            Some(
+                NativeSessionLaunch::from_templates(
+                    crate::agent::SessionRefKind::Id,
+                    case.resume,
+                    case.fork,
+                )
+                .expect("expected templates are valid"),
+            )
+        };
+        assert_eq!(definition.native(), native.as_ref(), "{kind:?}");
         assert_eq!(
             format!("{:?}", definition.manifest()),
-            format!("{:?}", adapter.manifest()),
+            format!("{:?}", (case.manifest)()),
             "{kind:?}"
         );
     }
@@ -865,4 +920,224 @@ fn builtin_digest_differs_for_different_programs() {
     };
     assert_ne!(digest("demo"), digest("other"));
     assert_eq!(digest("demo"), digest("demo"));
+}
+
+fn builtin_definition(name: &str) -> Arc<RuntimeDefinition> {
+    Arc::clone(
+        builtin_registry("/bin/sh")
+            .resolve(&id(name))
+            .expect("built-in resolves"),
+    )
+}
+
+#[test]
+fn the_host_answers_unlaunchable_kinds_with_stable_distinct_errors() {
+    let host = RuntimeHost::from_host_environment();
+    for kind in [
+        AgentKind::Shell,
+        AgentKind::Codex,
+        AgentKind::Claude,
+        AgentKind::Hermes,
+    ] {
+        host.resolve_kind(&kind).expect("built-in kind resolves");
+    }
+    // A valid runtime id nothing backs is not installed; a value outside the
+    // grammar is presentation-only.
+    let uninstalled = host
+        .resolve_kind(&AgentKind::Unknown("acme".to_owned()))
+        .expect_err("uninstalled runtime");
+    assert_eq!(uninstalled.code, "runtime_not_installed");
+    assert!(uninstalled.msg.contains("acme"));
+    for historical in ["Acme Agent", "", "a/b"] {
+        let error = host
+            .resolve_kind(&AgentKind::Unknown(historical.to_owned()))
+            .expect_err("historical value");
+        assert_eq!(error.code, "agent_kind_unsupported", "{historical:?}");
+        assert!(!error.msg.contains(historical) || historical.is_empty());
+    }
+}
+
+#[test]
+fn only_a_host_shell_runtime_launches_with_the_host_shell_arguments() {
+    let args = vec!["-c".to_owned(), "exit 0".to_owned()];
+    let host = RuntimeHost::from_host_environment().with_shell_command("/bin/sh", args.clone());
+    let launch_args = |name: &str| host.launch_args(&builtin_definition(name));
+    assert_eq!(launch_args("shell"), args);
+    assert_eq!(launch_args("hermes"), vec!["chat".to_owned()]);
+    assert!(launch_args("codex").is_empty());
+}
+
+#[test]
+fn a_launch_pin_round_trips_and_a_missing_pin_is_unpinned() {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Holder {
+        #[serde(default, skip_serializing_if = "LaunchPin::is_unpinned")]
+        pin: LaunchPin,
+    }
+    let unpinned: Holder = serde_json::from_str("{}").expect("absent pin parses");
+    assert_eq!(unpinned.pin, LaunchPin::Unpinned);
+    assert_eq!(serde_json::to_string(&unpinned).expect("serialize"), "{}");
+
+    let pinned = Holder {
+        pin: LaunchPin::of(&builtin_definition("claude")),
+    };
+    let json = serde_json::to_string(&pinned).expect("serialize");
+    let back: Holder = serde_json::from_str(&json).expect("round trip");
+    assert_eq!(back.pin, pinned.pin);
+    assert_eq!(
+        back.pin
+            .binding()
+            .map(|binding| binding.runtime_id.as_str()),
+        Some("claude")
+    );
+}
+
+#[test]
+fn an_unpinned_snapshot_resumes_only_through_a_builtin_definition() {
+    check_pin(&LaunchPin::Unpinned, &builtin_definition("claude")).expect("built-in serves");
+    let error = check_pin(&LaunchPin::Unpinned, &package_definition("acme"))
+        .expect_err("a package definition cannot vouch for an unpinned snapshot");
+    assert_eq!(error.code, "runtime_not_installed");
+}
+
+#[test]
+fn a_pin_needs_the_same_runtime_from_the_same_origin() {
+    let claude = builtin_definition("claude");
+    let codex = builtin_definition("codex");
+    let pin = LaunchPin::of(&claude);
+    check_pin(&pin, &claude).expect("the frozen definition serves its pin");
+    assert_eq!(
+        check_pin(&pin, &codex).expect_err("another runtime").code,
+        "runtime_not_installed"
+    );
+    assert_eq!(
+        check_pin(&pin, &package_definition("claude"))
+            .expect_err("a package replacing a built-in")
+            .code,
+        "runtime_not_installed"
+    );
+
+    let package = package_definition("acme");
+    let package_pin = LaunchPin::of(&package);
+    check_pin(&package_pin, &package).expect("same package serves");
+    assert_eq!(
+        check_pin(&package_pin, &builtin_definition("claude"))
+            .expect_err("a built-in replacing a package")
+            .code,
+        "runtime_not_installed"
+    );
+    let other_digest = RuntimeDefinition::new(DefinitionParts {
+        runtime_id: id("acme"),
+        origin: DefinitionOrigin::Package {
+            package: package_pin
+                .binding()
+                .and_then(|binding| match &binding.provenance {
+                    BindingProvenance::Package { package, .. } => Some(package.clone()),
+                    BindingProvenance::Builtin { .. } => None,
+                })
+                .expect("package pin"),
+            digest: PackageDigest::parse(
+                "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            )
+            .expect("valid digest"),
+        },
+        display_name: "Acme".to_owned(),
+        program: LaunchProgram::Fixed("acme".to_owned()),
+        default_args: Vec::new(),
+        input_rules: InputRules::unrestricted(false, Duration::ZERO),
+        submit_delay_configurable: false,
+        manifest: shell_manifest(),
+        native: None,
+        prompt_arg: false,
+        version_probe_parser: None,
+        integration_handler: None,
+    })
+    .expect("valid package definition");
+    assert_eq!(
+        check_pin(&package_pin, &other_digest)
+            .expect_err("a different archive")
+            .code,
+        "runtime_not_installed"
+    );
+}
+
+#[cfg(unix)]
+mod launch_validation {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::*;
+
+    fn executable(dir: &std::path::Path, body: &str) -> String {
+        let path = dir.join("agent");
+        std::fs::write(&path, body).expect("write executable");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("set executable mode");
+        path.display().to_string()
+    }
+
+    #[test]
+    fn a_runtime_without_a_version_probe_launches_without_validation() {
+        let missing = "/nonexistent/pohunek/agent";
+        for name in ["shell", "codex", "claude"] {
+            let validated = validate_launch_runtime(&builtin_definition(name), missing)
+                .expect("no probe, no validation");
+            assert!(validated.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_hermes_probe_runs_for_a_definition_that_names_its_parser() {
+        let dir = crate::test_support::scoped_dir("pohunek-launch-validation-");
+        let hermes = builtin_definition("hermes");
+        assert_eq!(
+            hermes
+                .version_probe_parser()
+                .map(super::super::HandlerId::as_str),
+            Some("hermes-v1")
+        );
+
+        let supported = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
+        let validated = validate_launch_runtime(&hermes, &supported)
+            .expect("the pinned release passes")
+            .expect("the probed executable is pinned");
+        assert_eq!(
+            validated.as_path(),
+            std::path::Path::new(&supported)
+                .canonicalize()
+                .expect("canonical path")
+        );
+
+        let newer = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.21.0'\n");
+        let error = validate_launch_runtime(&hermes, &newer).expect_err("another release");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+        let error = validate_launch_runtime(&hermes, "/nonexistent/pohunek/hermes")
+            .expect_err("a missing executable");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+    }
+
+    #[test]
+    fn a_parser_the_daemon_does_not_provide_is_refused() {
+        let unknown = RuntimeDefinition::new(DefinitionParts {
+            runtime_id: id("acme"),
+            origin: DefinitionOrigin::Package {
+                package: package("acme.runtime"),
+                digest: PackageDigest::parse(DIGEST).expect("valid digest"),
+            },
+            display_name: "Acme".to_owned(),
+            program: LaunchProgram::Fixed("acme".to_owned()),
+            default_args: Vec::new(),
+            input_rules: InputRules::unrestricted(false, Duration::ZERO),
+            submit_delay_configurable: false,
+            manifest: shell_manifest(),
+            native: None,
+            prompt_arg: false,
+            version_probe_parser: Some(
+                super::super::HandlerId::parse("acme-v1", "test").expect("handler id"),
+            ),
+            integration_handler: None,
+        })
+        .expect("valid package definition");
+        let error = validate_launch_runtime(&unknown, "acme").expect_err("unknown parser");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+    }
 }

@@ -1200,34 +1200,43 @@ async fn session_read_identity_guard_rejects_runtime_replacement_race() {
 }
 
 #[tokio::test]
-async fn mutations_fail_closed_for_an_unsupported_persisted_agent_kind() {
+async fn mutations_fail_closed_for_a_session_whose_agent_kind_is_not_launchable() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
     let created = registry.create(params()).await.expect("create session");
-    let mut sessions = registry.inner.sessions.lock().await;
-    sessions
-        .get_mut(&created.id)
-        .expect("registered session")
-        .info
-        .agent_base = AgentKind::Unknown("future-agent".to_owned());
-    drop(sessions);
-
-    let error = registry
-        .stop(&created.id)
-        .await
-        .expect_err("unsupported agent mutation must fail closed");
-    assert_eq!(error.code, "agent_kind_unsupported");
-    assert_eq!(
+    // A valid runtime id no definition backs is `runtime_not_installed`; a
+    // value outside the runtime-id grammar stays `agent_kind_unsupported`.
+    for (kind, code) in [
+        ("future-agent", "runtime_not_installed"),
+        ("Future Agent", "agent_kind_unsupported"),
+    ] {
         registry
-            .inspect(&created.id)
+            .inner
+            .sessions
+            .lock()
             .await
-            .expect("inspect unchanged session")
-            .state,
-        SessionState::Running
-    );
+            .get_mut(&created.id)
+            .expect("registered session")
+            .info
+            .agent_base = AgentKind::Unknown(kind.to_owned());
+
+        let error = registry
+            .stop(&created.id)
+            .await
+            .expect_err("unlaunchable agent mutation must fail closed");
+        assert_eq!(error.code, code, "{kind}");
+        assert_eq!(
+            registry
+                .inspect(&created.id)
+                .await
+                .expect("inspect unchanged session")
+                .state,
+            SessionState::Running
+        );
+    }
 
     registry
         .inner
@@ -1238,6 +1247,153 @@ async fn mutations_fail_closed_for_an_unsupported_persisted_agent_kind() {
         .expect("registered session")
         .info
         .agent_base = AgentKind::Shell;
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn a_launched_session_freezes_the_launch_binding_of_its_runtime() {
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+
+    let expected = registry
+        .inner
+        .profiles
+        .runtimes()
+        .resolve_kind(&AgentKind::Shell)
+        .expect("shell resolves")
+        .binding()
+        .clone();
+    let pin = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get(&created.id).expect("registered session");
+        SessionRegistry::resume_binding_from_entry(&created.id, entry).launch_binding
+    };
+    assert_eq!(
+        pin,
+        crate::agent::host::LaunchPin::Pinned(Box::new(expected))
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match() {
+    use crate::agent::host::LaunchPin;
+    use protocol::{
+        BindingProvenance, LaunchBinding, PackageDigest, PackageId, PackageIdentity,
+        PackageVersion, RuntimeId,
+    };
+
+    let registry = SessionRegistry::default();
+    let binding = |agent_base: AgentKind, launch_binding: LaunchPin| crate::store::ResumeBinding {
+        session_id: "s-pin".to_owned(),
+        name: None,
+        agent: agent_base.as_wire().to_owned(),
+        agent_base,
+        cwd: temp_dir("pin-binding-cwd"),
+        cols: 80,
+        rows: 24,
+        native_session_id: Some("native-ignored".to_owned()),
+        native_session_path: None,
+        project_id: None,
+        is_linked_worktree: None,
+        metadata: BTreeMap::new(),
+        program: "/bin/sh".to_owned(),
+        args: Vec::new(),
+        input_rules: crate::store::StoredInputRules::default(),
+        native_launch: None,
+        launch_binding,
+    };
+    let package_pin = LaunchPin::Pinned(Box::new(LaunchBinding {
+        runtime_id: RuntimeId::parse("claude").expect("runtime id"),
+        provenance: BindingProvenance::Package {
+            package: PackageIdentity {
+                id: PackageId::parse("acme.runtime").expect("package id"),
+                version: PackageVersion::parse("1.0.0").expect("version"),
+            },
+            package_digest: PackageDigest::parse(
+                "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            )
+            .expect("digest"),
+        },
+    }));
+    let cases = [
+        // Not installed, with and without a recorded pin.
+        (
+            AgentKind::Unknown("acme".to_owned()),
+            LaunchPin::Unpinned,
+            "runtime_not_installed",
+        ),
+        (
+            AgentKind::Unknown("acme".to_owned()),
+            package_pin.clone(),
+            "runtime_not_installed",
+        ),
+        // Outside the runtime-id grammar.
+        (
+            AgentKind::Unknown("Acme Agent".to_owned()),
+            LaunchPin::Unpinned,
+            "agent_kind_unsupported",
+        ),
+        // Resolves, but a package pin cannot be served by the built-in.
+        (AgentKind::Claude, package_pin, "runtime_not_installed"),
+        // Resolves and the pin matches (unpinned lines resume through a
+        // built-in); the binding is then refused only for lacking a native
+        // launch spec, which is checked after the runtime.
+        (
+            AgentKind::Claude,
+            LaunchPin::Unpinned,
+            "agent_not_resumable",
+        ),
+    ];
+    for (kind, pin, code) in cases {
+        let label = format!("{kind:?}");
+        let err = registry
+            .resume_binding(binding(kind, pin))
+            .await
+            .expect_err("binding must be refused");
+        assert_eq!(err.code, code, "{label}");
+    }
+}
+
+#[tokio::test]
+async fn the_shell_command_text_never_breaks_the_registry_or_the_snapshot_program() {
+    // A shell command is host input: control characters and over-long text are
+    // launch argv, not descriptor data, so the registry still builds and the
+    // shell runtime's snapshot program stays the host login shell.
+    let long_script = "x".repeat(crate::agent::host::MAX_ARG_BYTES * 2);
+    let command = ShellCommand::new(
+        "/bin/sh",
+        vec![
+            "-c".to_owned(),
+            format!("printf 'a\nb'; sleep 30 # {long_script}"),
+        ],
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: command,
+        stop_grace: Duration::from_millis(50),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    let (snapshot_program, snapshot_args) = {
+        let sessions = registry.inner.sessions.lock().await;
+        let entry = sessions.get(&created.id).expect("registered session");
+        (entry.snapshot.program.clone(), entry.snapshot.args.clone())
+    };
+    assert_eq!(snapshot_program, crate::agent::host_login_shell());
+    assert!(snapshot_args.is_empty());
+
+    // A shell-base profile without `program` launches the login shell, not
+    // the configured shell command.
+    let resolved = registry
+        .inner
+        .profiles
+        .resolve_agent("shell")
+        .expect("shell resolves");
+    assert_eq!(resolved.program(), crate::agent::host_login_shell());
     let _ = registry.stop(&created.id).await;
 }
 
@@ -11730,6 +11886,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         args: Vec::new(),
         input_rules: crate::store::StoredInputRules::default(),
         native_launch: None,
+        launch_binding: crate::agent::host::LaunchPin::Unpinned,
     };
 
     let err = registry
@@ -12205,6 +12362,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         args: vec!["chat".to_owned()],
         input_rules: crate::store::StoredInputRules::default(),
         native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+        launch_binding: crate::agent::host::LaunchPin::Unpinned,
     };
 
     for (program, version_output) in [
@@ -12711,6 +12869,7 @@ async fn resume_binding_restores_metadata_from_store() {
             args: vec!["-c".to_owned(), "sleep 30".to_owned()],
             input_rules: crate::store::StoredInputRules::default(),
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
+            launch_binding: crate::agent::host::LaunchPin::Unpinned,
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())
