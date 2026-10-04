@@ -459,7 +459,6 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/mod.rs`
 - `crates/daemon/src/agent/native_launch.rs`
 - `crates/daemon/src/agent/native_reference.rs`
-- `crates/daemon/src/agent/profile.rs`
 - `crates/daemon/src/agent/host/`
 - `crates/xtask/tests/no_special_dispatch.rs`
 - `crates/daemon/src/agent/builtin/`
@@ -489,10 +488,19 @@ Runtime package archive format:
 - `crates/daemon/src/agent/host/handle.rs` — runtime host snapshot, reload and launch verification.
 - `crates/daemon/src/session/packages.rs` — reload and retention-checked uninstall.
 - `crates/package/src/hash.rs` — SHA-256 helpers.
+- `crates/package/src/directory.rs` — directory-to-archive builder behind `plugin link` and `cargo xtask package build`.
+- `crates/package/src/catalog_state.rs` — persisted catalog high-water mark and revoked key ids.
+- `crates/daemon/src/session/package_lifecycle/` — the `package.*` operations: validate from the verified archive, claim rules, catalog trust, record, reload.
+- `crates/daemon/src/agent/host/claim.rs` — which package may serve which runtime id.
+- `crates/daemon/src/api/handler/package.rs` — `package.*` handlers and the local-only gate.
+- `crates/protocol/src/package.rs` — `package.*` payloads and stable error codes.
+- `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
+- `docs/knowledge/guides/runtime-packages.md`
 - `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`
 - `crates/package/tests/install.rs`
 - `crates/package/tests/registry.rs`
+- `crates/package/tests/catalog_state.rs`
 
 Signed runtime catalog:
 
