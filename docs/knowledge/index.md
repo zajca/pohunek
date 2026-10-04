@@ -19,6 +19,8 @@ Start here:
   [agent profiles](concepts/agent-profiles.md) describe the operating model.
   The [runtime package archive](concepts/runtime-package-archive.md) defines the
   canonical deterministic `tar.zst` format, its strict reader, and its limits.
+  The [runtime catalog](concepts/runtime-catalog.md) defines how the signed
+  catalog authorizes official packages and how local digest trust differs.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   and [remote hosts](guides/remote-hosts.md)
   cover common configuration paths.

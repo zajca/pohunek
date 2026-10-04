@@ -43,6 +43,8 @@ base64 = "0.22"
 # explicitly opts into the minimal `std` and zeroization support it needs.
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std", "zeroize"] }
 getrandom = "0.2"
+# Runtime catalog entries state the core versions they support as a semver range.
+semver = "1"
 # xtask is the only crate that depends on the CLI library, and it must build
 # without the embedded skill artifact so the artifact generator stays runnable
 # while the artifact is missing or damaged; building pohunek-cli itself keeps

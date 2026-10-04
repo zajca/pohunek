@@ -2941,8 +2941,12 @@ dependencies = [
 name = "pohunek-package"
 version = "0.33.1"
 dependencies = [
+ "ed25519-dalek",
  "pohunek-protocol",
  "ruzstd",
+ "semver",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
