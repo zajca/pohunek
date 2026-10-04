@@ -612,6 +612,26 @@ it is rejected with `runtime/agent_kind_unsupported` by agent-targeted mutation
 and persistence paths. Unknown values never silently become a supported launch,
 resume, or fork adapter.
 
+Agent runtime identities use three Rust types over the same string namespace.
+`RuntimeId` is always valid: lowercase ASCII alphanumerics plus `.`, `_` and
+`-`, 1 to 64 bytes, no leading `.` or `-`, no `..`; deserialization rejects
+anything else. `RuntimeRef` is lenient: any string deserializes, a
+grammar-valid value is an `Id` and every other value is a historical label,
+displayable but rejected with `runtime/agent_kind_unsupported` (a fixed message
+that never echoes the label). The wire form is a bare string, so a reference
+round-trips to the same kind. `Id` does not mean launchable: installation is
+decided by the daemon registry at resolve time, and a valid `RuntimeId` that no
+enabled runtime resolves is rejected with `runtime/runtime_not_installed`.
+`PackageId`, `PackageVersion`, `PackageDigest` and `DescriptorDigest`
+(`sha256:` plus 64 lowercase hex characters) identify where a runtime
+definition came from. `PackageIdentity` pairs a package id with its version.
+`LaunchBinding` pairs a `RuntimeId` with a `provenance`: `builtin` carries an
+optional `package` identity (id and version together or not at all) and a
+descriptor digest that covers only structural launch fields and is not a
+package digest, `package` carries a `package` identity and a package digest.
+All are TypeScript strings except `PackageIdentity`, `LaunchBinding` and
+`BindingProvenance`.
+
 ### Session Observation
 
 Observation is available only for Pohunek-managed terminals. It does not attach,
@@ -1376,7 +1396,9 @@ observation behavior: `agent_kind_unsupported`,
 `session_input_rejected`, `session_input_blocked`, `session_agent_blocked`,
 `session_input_invalid_wait`, `session_input_wait_unsupported`,
 `session_input_timeout`, and the CLI-local `session_input_interrupted`. Daemon startup may additionally return
-`observation_limits_invalid`. Observation request errors intentionally carry no terminal
+`observation_limits_invalid`. `runtime_not_installed` is reserved and not yet emitted: the daemon returns it
+once session creation resolves runtimes through the registry.
+Observation request errors intentionally carry no terminal
 payload or current-runtime payload; refresh `session.inspect` or restart
 observation from a fresh screen/tail when recovery requires new coordinates.
 

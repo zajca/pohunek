@@ -515,6 +515,7 @@ Protocol contracts and transport:
 - `crates/protocol/src/lib.rs`
 - `crates/protocol/src/method.rs`
 - `crates/protocol/src/notification.rs`
+- `crates/protocol/src/runtime_id.rs`
 - `crates/protocol/src/session.rs`
 - `crates/protocol/src/project.rs`
 - `crates/protocol/src/capabilities.rs`

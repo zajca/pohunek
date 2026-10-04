@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::version::ProtocolVersionRange;
+use crate::{runtime_id::RuntimeId, version::ProtocolVersionRange};
 
 /// Broad error category for a control-protocol error.
 ///
@@ -121,6 +121,19 @@ impl ProtocolError {
                 "upgrade the daemon to a version that explicitly supports this agent kind"
                     .to_owned(),
             ),
+        )
+    }
+
+    /// The canonical `runtime/runtime_not_installed` error.
+    ///
+    /// The identity is a validated [`RuntimeId`], so echoing it is safe.
+    #[must_use]
+    pub fn runtime_not_installed(runtime: &RuntimeId) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "runtime_not_installed",
+            format!("runtime `{runtime}` is not installed or not enabled on this host"),
+            Some("install and enable the runtime, or choose an installed runtime".to_owned()),
         )
     }
 
