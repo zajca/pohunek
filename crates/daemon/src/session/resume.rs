@@ -12,6 +12,10 @@ use std::io;
 use std::sync::Arc;
 
 use crate::agent::host::RuntimeDefinition;
+use crate::agent::NativeReferenceProvenance;
+use crate::detect::Manifest;
+use crate::runtime::environment::{base_environment, effective_variable};
+use pohunek_worker_protocol::BaseEnv;
 
 /// Frozen structural relaunch snapshot for a session (Part C, C.4).
 ///
@@ -31,6 +35,9 @@ pub(super) struct ResumeSnapshot {
     pub(super) native: Option<NativeSessionLaunch>,
     /// The runtime identity this launch shape was frozen with.
     pub(super) launch_binding: host::LaunchPin,
+    /// Where the native reference the session currently holds came from. It
+    /// changes with the reference, unlike the launch shape above.
+    pub(super) reference_provenance: NativeReferenceProvenance,
 }
 
 impl ResumeSnapshot {
@@ -41,6 +48,7 @@ impl ResumeSnapshot {
             args: Vec::new(),
             native: None,
             launch_binding: host::LaunchPin::Unpinned,
+            reference_provenance: NativeReferenceProvenance::Reported,
         }
     }
 
@@ -51,6 +59,7 @@ impl ResumeSnapshot {
             args: binding.args.clone(),
             native: binding.native_launch.clone(),
             launch_binding: binding.launch_binding.clone(),
+            reference_provenance: binding.native_reference_provenance,
         }
     }
 
@@ -287,24 +296,17 @@ impl SessionRegistry {
             input_rules_for_definition(&definition, &self.inner.config)
         };
 
-        let (profile_env, manifest_override) = match self
-            .inner
-            .profiles
-            .resolve_agent(&binding.agent)
-        {
-            Ok(resolved) => resolved.profile.map_or((Vec::new(), None), |profile| {
-                (profile.env, profile.manifest)
-            }),
-            Err(err) => {
-                warn!(
-                    session_id = %binding.session_id,
-                    agent = %binding.agent,
-                    error = %err,
-                    "agent profile no longer resolves at fork; launching from the structural snapshot without profile env"
-                );
-                (Vec::new(), None)
-            }
-        };
+        let (profile_env, manifest_override) = self.recovery_profile(&binding, "fork");
+        // Fork is fail-closed on a reference that no longer names a conversation.
+        let base_environment = self.launch_base_environment()?;
+        verify_assigned_reference(
+            &launch,
+            &binding,
+            &session_ref,
+            &base_environment,
+            &profile_env,
+        )
+        .await?;
         let mut env_extra = profile_env;
         env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
         let opts = LaunchOpts {
@@ -321,11 +323,20 @@ impl SessionRegistry {
             &session_ref,
             &opts,
         )?;
+        // The conversation a fork starts is new and core never learns its
+        // reference without an integration report, so a fork of an assigned
+        // reference starts without one instead of inheriting the source's.
+        let inherits_reference = launch.assigned().is_none();
         let snapshot = ResumeSnapshot {
             program,
             args: binding.args.clone(),
             native: Some(launch),
             launch_binding: binding.launch_binding.clone(),
+            reference_provenance: if inherits_reference {
+                binding.native_reference_provenance
+            } else {
+                NativeReferenceProvenance::Reported
+            },
         };
         let guard = self.lock_lifecycle(&id).await;
         let info = self
@@ -343,8 +354,12 @@ impl SessionRegistry {
                     cols: params.cols,
                     rows: params.rows,
                     command,
-                    native_session_id: binding.native_session_id,
-                    native_session_path: binding.native_session_path,
+                    native_session_id: binding
+                        .native_session_id
+                        .filter(|_inherited| inherits_reference),
+                    native_session_path: binding
+                        .native_session_path
+                        .filter(|_inherited| inherits_reference),
                     project_id: binding.project_id,
                     is_linked_worktree: binding.is_linked_worktree,
                     repo,
@@ -359,6 +374,45 @@ impl SessionRegistry {
             .await?;
         self.persist_resume_binding(&info.id).await;
         Ok(info)
+    }
+
+    /// The base environment a launch of this registry hands to the agent.
+    fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
+        let lifecycle = self.lifecycle()?;
+        base_environment(
+            &lifecycle.config.environment_allowlist,
+            &lifecycle.config.environment_source,
+        )
+        .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))
+    }
+
+    /// The environment and detection-manifest override of the profile
+    /// `binding` was launched from, re-resolved by name because neither is
+    /// persisted.
+    ///
+    /// A profile that no longer resolves yields no environment and no override
+    /// and a warning: the operation proceeds from the frozen structural
+    /// snapshot.
+    fn recovery_profile(
+        &self,
+        binding: &ResumeBinding,
+        operation: &'static str,
+    ) -> (Vec<(String, String)>, Option<Manifest>) {
+        match self.inner.profiles.resolve_agent(&binding.agent) {
+            Ok(resolved) => resolved.profile.map_or((Vec::new(), None), |profile| {
+                (profile.env, profile.manifest)
+            }),
+            Err(err) => {
+                warn!(
+                    session_id = %binding.session_id,
+                    agent = %binding.agent,
+                    error = %err,
+                    operation,
+                    "agent profile no longer resolves; launching from the structural snapshot without profile env"
+                );
+                (Vec::new(), None)
+            }
+        }
     }
 
     /// The resume binding and git context a fork of `id` launches from.
@@ -413,6 +467,7 @@ impl SessionRegistry {
             input_rules: entry.input_rules.into(),
             native_launch: entry.snapshot.native.clone(),
             launch_binding: entry.snapshot.launch_binding.clone(),
+            native_reference_provenance: entry.snapshot.reference_provenance,
         }
     }
 
@@ -488,24 +543,19 @@ impl SessionRegistry {
         // detection-manifest override — neither is ever persisted (C.4 no-secrets).
         // A deleted/renamed profile resumes from the frozen structural snapshot with
         // no profile env and a warning, never a failure.
-        let (profile_env, manifest_override) = match self
-            .inner
-            .profiles
-            .resolve_agent(&binding.agent)
-        {
-            Ok(resolved) => resolved.profile.map_or((Vec::new(), None), |profile| {
-                (profile.env, profile.manifest)
-            }),
-            Err(err) => {
-                warn!(
-                    session_id = %binding.session_id,
-                    agent = %binding.agent,
-                    error = %err,
-                    "agent profile no longer resolves at resume; relaunching from the structural snapshot without profile env"
-                );
-                (Vec::new(), None)
-            }
-        };
+        let (profile_env, manifest_override) = self.recovery_profile(&binding, "resume");
+        // A reference core assigned is only as good as the conversation behind
+        // it: relaunching into a conversation the agent never wrote, or one it
+        // left, would silently start an empty session.
+        let base_environment = self.launch_base_environment()?;
+        verify_assigned_reference(
+            &launch,
+            &binding,
+            &session_ref,
+            &base_environment,
+            &profile_env,
+        )
+        .await?;
         // Profile env first, daemon handshake env appended last (POHUNEK_* wins).
         let mut env_extra = profile_env;
         env_extra.extend(self.session_pty_env(binding.agent_base.clone(), &id));
@@ -530,6 +580,7 @@ impl SessionRegistry {
             args: binding.args.clone(),
             native: Some(launch),
             launch_binding: binding.launch_binding.clone(),
+            reference_provenance: binding.native_reference_provenance,
         };
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
@@ -611,6 +662,51 @@ impl SessionRegistry {
             }
         }
     }
+}
+
+/// Confirms that an assigned native reference still names an existing
+/// conversation, through the check the runtime declared at launch.
+///
+/// A reference that arrived through an integration report is not checked here.
+/// The check reads its config-home variable and `HOME` from the environment the
+/// agent is launched with (the filtered base environment, then the profile
+/// environment), and runs off the async runtime because it lists directories.
+///
+/// # Errors
+///
+/// Returns `agent_native_reference_missing` when the conversation is not found
+/// or cannot be verified; the caller must not launch anything.
+async fn verify_assigned_reference(
+    launch: &NativeSessionLaunch,
+    binding: &ResumeBinding,
+    session_ref: &SessionRef,
+    base_environment: &BaseEnv,
+    profile_env: &[(String, String)],
+) -> Result<(), ProtocolError> {
+    if binding.native_reference_provenance != NativeReferenceProvenance::Assigned {
+        return Ok(());
+    }
+    let Some(assigned) = launch.assigned() else {
+        return Ok(());
+    };
+    let existence = assigned.existence().clone();
+    let session_ref = session_ref.clone();
+    let profile_env = profile_env.to_vec();
+    let base_environment = base_environment.clone();
+    let verdict = tokio::task::spawn_blocking(move || {
+        let lookup = |name: &str| effective_variable(&base_environment, &profile_env, name);
+        existence.verify(&session_ref, &lookup)
+    })
+    .await
+    .map_err(|error| runtime_error("agent_native_reference_missing", error.to_string()))?;
+    verdict.map_err(|failure| {
+        warn!(
+            session_id = %binding.session_id,
+            failure = %failure,
+            "assigned native reference is not recoverable"
+        );
+        ProtocolError::from(failure)
+    })
 }
 
 fn binding_program(binding: &ResumeBinding, definition: &RuntimeDefinition) -> String {

@@ -34,8 +34,9 @@ use ulid::Ulid;
 use crate::agent::host::{self, RuntimeHost};
 use crate::agent::{
     agent_fork_unsupported, agent_not_resumable, build_pty_command, fork_pty_command_from_launch,
-    resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchOpts, NativeSessionLaunch,
-    ProfileRegistry, ResolvedAgent, SessionRef, SessionRefKind, ValidatedLaunchProgram,
+    resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchOpts,
+    NativeReferenceProvenance, NativeSessionLaunch, ProfileRegistry, ResolvedAgent, SessionRef,
+    SessionRefKind, ValidatedLaunchProgram,
 };
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
 use crate::external::{
@@ -1235,29 +1236,76 @@ impl SessionRegistry {
     ) -> Self {
         #[cfg(test)]
         {
-            let mut config = config;
-            let (runtime_root, state_root, test_dirs) = owned_test_worker_roots(&config);
-            config.worker_runtime_root = Some(runtime_root.clone());
-            config.worker_state_root = Some(state_root.clone());
-            if config.supervision.is_none() {
-                config.supervision = Some(test_supervision(&runtime_root, &state_root));
-            }
-            let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
-                runtime_root,
-                state_root,
-            ));
-            let registry = Self::new_with_launcher_and_inspector(config, launcher, inspector);
-            *registry
-                .inner
-                .test_dirs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = test_dirs;
-            registry
+            Self::new_for_test(config, inspector, None, None)
         }
         #[cfg(not(test))]
         {
-            Self::build(config, None, inspector)
+            Self::build(config, None, inspector, None)
         }
+    }
+
+    /// Creates a unit-test registry over in-process workers, optionally
+    /// serving `runtimes` instead of the built-in runtime set.
+    #[cfg(test)]
+    fn new_for_test(
+        config: SessionRegistryConfig,
+        inspector: Arc<dyn ProcessInspector>,
+        runtimes: Option<RuntimeHost>,
+        environment: Option<(crate::runtime::EnvironmentSource, Vec<String>)>,
+    ) -> Self {
+        let mut config = config;
+        let (runtime_root, state_root, test_dirs) = owned_test_worker_roots(&config);
+        config.worker_runtime_root = Some(runtime_root.clone());
+        config.worker_state_root = Some(state_root.clone());
+        if config.supervision.is_none() {
+            config.supervision = Some(test_supervision(&runtime_root, &state_root));
+        }
+        if let (Some((source, allowlist)), Some(supervision)) =
+            (environment, config.supervision.as_mut())
+        {
+            supervision.environment_source = source;
+            supervision.environment_allowlist = allowlist;
+        }
+        let launcher = Arc::new(crate::runtime::InProcessWorkerLauncher::new(
+            runtime_root,
+            state_root,
+        ));
+        let registry = Self::build(config, Some(launcher), inspector, runtimes);
+        *registry
+            .inner
+            .test_dirs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = test_dirs;
+        registry
+    }
+
+    /// Creates a unit-test registry that serves `runtimes` (for example a
+    /// non-built-in definition) next to or instead of the built-in set.
+    #[cfg(test)]
+    pub(crate) fn new_with_runtimes(config: SessionRegistryConfig, runtimes: RuntimeHost) -> Self {
+        Self::new_for_test(
+            config,
+            Arc::new(crate::procwatch::readable_host::ReadableHost::new()),
+            Some(runtimes),
+            None,
+        )
+    }
+
+    /// [`Self::new_with_runtimes`] with the base-environment source and
+    /// allowlist workers launch their agents with.
+    #[cfg(test)]
+    pub(crate) fn new_with_runtimes_and_environment(
+        config: SessionRegistryConfig,
+        runtimes: RuntimeHost,
+        source: crate::runtime::EnvironmentSource,
+        allowlist: Vec<String>,
+    ) -> Self {
+        Self::new_for_test(
+            config,
+            Arc::new(crate::procwatch::readable_host::ReadableHost::new()),
+            Some(runtimes),
+            Some((source, allowlist)),
+        )
     }
 
     /// Creates a registry with explicit worker and process-observer backends.
@@ -1270,13 +1318,14 @@ impl SessionRegistry {
         launcher: Arc<dyn WorkerLauncher>,
         inspector: Arc<dyn ProcessInspector>,
     ) -> Self {
-        Self::build(config, Some(launcher), inspector)
+        Self::build(config, Some(launcher), inspector, None)
     }
 
     fn build(
         config: SessionRegistryConfig,
         launcher: Option<Arc<dyn WorkerLauncher>>,
         inspector: Arc<dyn ProcessInspector>,
+        runtimes: Option<RuntimeHost>,
     ) -> Self {
         let external = ExternalSessions::new();
         let external_observer = config
@@ -1309,10 +1358,12 @@ impl SessionRegistry {
         // Host agent profiles resolve the free-string `agent` name; built from the
         // configured agents dir (a bare base kind still resolves when it is unset).
         // The configured shell command decides what a bare shell session launches.
-        let runtimes = RuntimeHost::from_host_environment().with_shell_command(
-            config.shell_command.program(),
-            config.shell_command.args().to_vec(),
-        );
+        let runtimes = runtimes
+            .unwrap_or_else(RuntimeHost::from_host_environment)
+            .with_shell_command(
+                config.shell_command.program(),
+                config.shell_command.args().to_vec(),
+            );
         let profiles = ProfileRegistry::with_runtimes(config.agents_dir.clone(), runtimes)
             .with_revision_state_dir(config.host_state_dir.clone());
         let retention = retention::RetentionState::new(config.retention_policy_path.clone());
@@ -1842,6 +1893,10 @@ impl SessionRegistry {
         info: SessionInfo,
         pending_initial_input: Option<String>,
     ) -> Result<SessionInfo, ProtocolError> {
+        // A reference assigned at launch makes the session resumable at once.
+        if info.native_session_id.is_some() {
+            self.persist_resume_binding(&info.id).await;
+        }
         self.spawn_session_hook(SessionHookRequest {
             event: HookEvent::SessionStart,
             cwd: info.cwd.clone(),
@@ -2051,11 +2106,26 @@ impl SessionRegistry {
         // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
         // the launch program/args plus the native-session launch spec (a profile's
         // override, else the base kind's).
+        // An assigned runtime gets its reference generated here, before launch,
+        // so the durable record written ahead of the spawn already holds it.
+        let assigned = match native.as_ref().and_then(NativeSessionLaunch::assigned) {
+            Some(assigned) => {
+                let reference = crate::agent::generate_assigned_reference()?;
+                let argv = assigned.launch_argv(&reference);
+                Some((reference, argv))
+            }
+            None => None,
+        };
         let snapshot = ResumeSnapshot {
             program: resolved.program().to_owned(),
             args: resolved.snapshot_args(),
             native,
             launch_binding: host::LaunchPin::of(&resolved.definition),
+            reference_provenance: if assigned.is_some() {
+                NativeReferenceProvenance::Assigned
+            } else {
+                NativeReferenceProvenance::Reported
+            },
         };
         // The detection-manifest override is consumed only by the detector, on
         // both the launch and resume paths; never persisted (re-resolved by name).
@@ -2083,6 +2153,9 @@ impl SessionRegistry {
             resolved,
             self.inner.profiles.runtimes(),
             &opts,
+            assigned
+                .as_ref()
+                .map_or(&[][..], |(_, argv)| argv.as_slice()),
             params.input.clone(),
         )?;
         let spec = PtySessionSpec {
@@ -2098,7 +2171,9 @@ impl SessionRegistry {
             cols: params.cols,
             rows: params.rows,
             command: plan.command,
-            native_session_id: None,
+            native_session_id: assigned
+                .as_ref()
+                .map(|(reference, _)| reference.value().to_owned()),
             native_session_path: None,
             project_id,
             is_linked_worktree,
@@ -2270,7 +2345,14 @@ impl SessionRegistry {
             }
         };
 
-        let (info, record, previous_ordering, previous_native_id, previous_native_path) = {
+        let (
+            info,
+            record,
+            previous_ordering,
+            previous_native_id,
+            previous_native_path,
+            previous_provenance,
+        ) = {
             let mut sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get_mut(&session_id) else {
                 return not_recorded;
@@ -2296,6 +2378,8 @@ impl SessionRegistry {
             let previous_ordering = entry.last_native_report.clone();
             let previous_native_id = entry.info.native_session_id.clone();
             let previous_native_path = entry.info.native_session_path.clone();
+            let previous_provenance = entry.snapshot.reference_provenance;
+            entry.snapshot.reference_provenance = NativeReferenceProvenance::Reported;
             entry.last_native_report = Some(NativeIdentityReport {
                 worker_instance_id: params.worker_instance_id().to_owned(),
                 pid: params.pid(),
@@ -2321,6 +2405,7 @@ impl SessionRegistry {
                 previous_ordering,
                 previous_native_id,
                 previous_native_path,
+                previous_provenance,
             )
         };
         if let Err(error) = self.write_session_record(record).await {
@@ -2337,6 +2422,7 @@ impl SessionRegistry {
                     entry.last_native_report = previous_ordering;
                     entry.info.native_session_id = previous_native_id;
                     entry.info.native_session_path = previous_native_path;
+                    entry.snapshot.reference_provenance = previous_provenance;
                 }
             }
             return not_recorded;
@@ -3786,6 +3872,9 @@ impl SessionRegistry {
             .info
             .native_session_path
             .clone_from(&record.info.native_session_path);
+        if let Some(recovery) = &record.recovery {
+            candidate.snapshot.reference_provenance = recovery.native_reference_provenance;
+        }
         candidate
             .last_native_report
             .clone_from(&record.native_identity_ordering);
@@ -5155,6 +5244,7 @@ fn preserve_durable_worker_metadata(existing: &SessionRecord, replacement: &mut 
                 replacement
                     .native_session_path
                     .clone_from(&existing.native_session_path);
+                replacement.native_reference_provenance = existing.native_reference_provenance;
             }
             (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
             _ => {}

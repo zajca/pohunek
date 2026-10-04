@@ -28,5 +28,8 @@ args = ["resume", "{reference}"]
 [fork]
 supported = false
 
+[native_reference]
+strategy = "hook"
+
 [integration]
 handler = "codex-hook-v1"

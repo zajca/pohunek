@@ -1310,6 +1310,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         input_rules: crate::store::StoredInputRules::default(),
         native_launch: None,
         launch_binding,
+        native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
     };
     let package_pin = LaunchPin::Pinned(Box::new(LaunchBinding {
         runtime_id: RuntimeId::parse("claude").expect("runtime id"),
@@ -11896,6 +11897,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         input_rules: crate::store::StoredInputRules::default(),
         native_launch: None,
         launch_binding: crate::agent::host::LaunchPin::Unpinned,
+        native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
     };
 
     let err = registry
@@ -12372,6 +12374,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         input_rules: crate::store::StoredInputRules::default(),
         native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
         launch_binding: crate::agent::host::LaunchPin::Unpinned,
+        native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
     };
 
     for (program, version_output) in [
@@ -12882,6 +12885,7 @@ async fn resume_binding_restores_metadata_from_store() {
             input_rules: crate::store::StoredInputRules::default(),
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
+            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())
@@ -16833,4 +16837,546 @@ async fn recoveries_of_different_sessions_are_not_serialized() {
         .expect("held recovery completes once released");
     registry.stop(&held.id).await.expect("stop held session");
     registry.stop(&free.id).await.expect("stop free session");
+}
+
+/// A Pi-shaped agent that appends `launch` and its arguments to `marker` on
+/// every start. A start with `--session-id` stays alive until the returned gate
+/// is written; every other start (resume, fork) stays alive for the whole test.
+#[cfg(unix)]
+fn assigned_agent_script(dir: &std::path::Path, marker: &std::path::Path) -> (PathBuf, fs::File) {
+    let script = dir.join("pi-like");
+    let gate_path = dir.join("exit.gate");
+    let gate = hook_gate(&gate_path);
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nprintf 'launch\\n' >> '{marker}'\nprintf '%s\\n' \"$@\" >> '{marker}'\ncase \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
+            marker = marker.display(),
+            gate = gate_path.display(),
+        ),
+    );
+    (script, gate)
+}
+
+/// Lines of the launch `index` (zero-based) recorded in `marker`.
+#[cfg(unix)]
+fn recorded_launch(marker: &std::path::Path, index: usize) -> Vec<String> {
+    fs::read_to_string(marker)
+        .expect("read argv marker")
+        .split("launch\n")
+        .nth(index + 1)
+        .map(|launch| launch.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(unix)]
+fn assigned_registry(
+    script: &std::path::Path,
+    existence: &str,
+    store_path: &std::path::Path,
+    agents_dir: Option<PathBuf>,
+) -> SessionRegistry {
+    SessionRegistry::new_with_runtimes(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.to_path_buf()),
+            agents_dir,
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_host(script, existence),
+    )
+}
+
+/// Asserts that the durable record and the resume store of `id` hold
+/// `reference` with provenance `assigned`, frozen assignment and no
+/// process-bound ordering key.
+#[cfg(unix)]
+fn assert_assigned_binding_persisted(store: &crate::store::Store, id: &SessionId, reference: &str) {
+    let record = store
+        .load_sessions()
+        .expect("durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .expect("durable record");
+    let recovery = record.recovery.expect("durable recovery binding");
+    assert_eq!(recovery.native_session_id.as_deref(), Some(reference));
+    assert_eq!(
+        recovery.native_reference_provenance,
+        crate::agent::NativeReferenceProvenance::Assigned
+    );
+    assert!(
+        record.native_identity_ordering.is_none(),
+        "an assigned reference is no identity evidence"
+    );
+    let legacy = store.load_resume().expect("resume store");
+    let legacy = legacy
+        .iter()
+        .find(|binding| binding.session_id == id.0)
+        .expect("resume binding is persisted at create");
+    assert_eq!(
+        legacy.native_reference_provenance,
+        crate::agent::NativeReferenceProvenance::Assigned
+    );
+    let launch_argv = legacy
+        .native_launch
+        .as_ref()
+        .and_then(NativeSessionLaunch::assigned)
+        .map(|assigned| {
+            assigned.launch_argv(&crate::agent::SessionRef::id(reference).expect("id reference"))
+        });
+    assert_eq!(
+        launch_argv,
+        Some(vec!["--session-id".to_owned(), reference.to_owned()]),
+        "the assignment is frozen into the binding"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_from_it() {
+    let dir = temp_dir("assigned-e2e");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let store_path = temp_store_path("assigned-e2e");
+    let registry = assigned_registry(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        &store_path,
+        None,
+    );
+
+    let created = registry
+        .create(SessionNewParams {
+            agent: "pi".to_owned(),
+            cwd: Some(dir.clone()),
+            input: Some("hello".to_owned()),
+            ..params()
+        })
+        .await
+        .expect("create a hook-less package session");
+
+    // Launch: fixed args, the assigned template, then the prompt.
+    let first = wait_for_file_contains(&marker, "hello").await;
+    assert!(first.starts_with("launch\n"));
+    let launch = recorded_launch(&marker, 0);
+    let reference = created
+        .native_session_id
+        .clone()
+        .expect("the session holds the assigned reference at once");
+    assert_eq!(
+        launch,
+        [
+            "--model",
+            "fast",
+            "--session-id",
+            reference.as_str(),
+            "hello"
+        ]
+    );
+    assert!(
+        uuid::Uuid::parse_str(&reference).is_ok(),
+        "core generates a UUID"
+    );
+    assert!(created.capabilities.resume && created.capabilities.fork);
+
+    // Persistence: both the durable record and the resume store carry the
+    // reference with its provenance, and no process-bound ordering exists.
+    let store = crate::store::Store::new(store_path.clone());
+    assert_assigned_binding_persisted(&store, &created.id, &reference);
+
+    // Resume: the frozen args and the resume template, never the start flag.
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    registry.resume(&created.id).await.expect("native recovery");
+    wait_for_file_contains(&marker, "--session\n").await;
+    assert_eq!(
+        recorded_launch(&marker, 1),
+        ["--model", "fast", "--session", reference.as_str()]
+    );
+
+    // Fork: the fork template with the source's reference; the child holds no
+    // reference of its own because core cannot learn the forked conversation.
+    let forked = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect("native fork");
+    wait_for_file_contains(&marker, "--fork\n").await;
+    assert_eq!(
+        recorded_launch(&marker, 2),
+        ["--model", "fast", "--fork", reference.as_str()]
+    );
+    assert_eq!(forked.native_session_id, None);
+    assert!(store
+        .load_resume()
+        .expect("resume store")
+        .iter()
+        .all(|binding| binding.session_id != forked.id.0));
+
+    let _ = registry.stop(&forked.id).await;
+    let _ = registry.stop(&created.id).await;
+}
+
+/// The durable recovery binding of `id`, as a restarted daemon reads it.
+#[cfg(unix)]
+fn durable_recovery(store_path: &std::path::Path, id: &SessionId) -> crate::store::ResumeBinding {
+    crate::store::Store::new(store_path.to_path_buf())
+        .load_sessions()
+        .expect("durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == id.0)
+        .and_then(|record| record.recovery)
+        .expect("durable recovery binding")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_refuses_an_assigned_reference_whose_conversation_is_missing() {
+    let dir = temp_dir("assigned-existence");
+    let home = temp_dir("assigned-existence-home");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let store_path = temp_store_path("assigned-existence");
+    // The profile points the runtime's config home at a test directory, so the
+    // check never reads the host's environment.
+    let agents_dir = temp_agents_dir_with(
+        "assigned-existence",
+        "pi-home",
+        &format!(
+            "base = \"pi\"\nprogram = \"{}\"\n[env]\n{} = \"{}\"\n",
+            script.display(),
+            crate::agent::host::fixture::PI_SHAPED_HOME_ENV,
+            home.display()
+        ),
+    );
+    let registry = assigned_registry(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
+        &store_path,
+        Some(agents_dir),
+    );
+
+    let created = registry
+        .create(SessionNewParams {
+            agent: "pi-home".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create a hook-less package session");
+    let reference = created
+        .native_session_id
+        .clone()
+        .expect("assigned reference");
+    wait_for_file_contains(&marker, "--session-id").await;
+    assert_eq!(
+        recorded_launch(&marker, 0),
+        ["--session-id", reference.as_str()],
+        "a profile launches with its own args and the assigned template"
+    );
+
+    // The agent never wrote the conversation: a live fork is refused.
+    let fork = SessionForkParams {
+        session_id: created.id.clone(),
+        name: None,
+        cwd_mode: ForkCwdMode::Same,
+        cols: 80,
+        rows: 24,
+    };
+    let refused = registry
+        .fork(fork.clone())
+        .await
+        .expect_err("fork needs the conversation");
+    assert_eq!(refused.code, "agent_native_reference_missing");
+
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    let refused = registry
+        .resume(&created.id)
+        .await
+        .expect_err("recovery needs the conversation");
+    assert_eq!(refused.code, "agent_native_reference_missing");
+    assert_eq!(
+        fs::read_to_string(&marker)
+            .expect("marker")
+            .matches("launch\n")
+            .count(),
+        1,
+        "no agent is launched into an empty conversation"
+    );
+    let terminal = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(terminal.state, SessionState::Done);
+
+    // The persisted binding a restarted daemon recovers from carries the
+    // provenance, so the check also guards that path.
+    let persisted = durable_recovery(&store_path, &created.id);
+    assert_eq!(
+        persisted.native_reference_provenance,
+        crate::agent::NativeReferenceProvenance::Assigned
+    );
+    let refused = registry
+        .resume_binding(persisted)
+        .await
+        .expect_err("a persisted binding is checked too");
+    assert_eq!(refused.code, "agent_native_reference_missing");
+
+    // Once the conversation exists, the same recovery goes through.
+    let project = home.join("sessions").join("proj");
+    fs::create_dir_all(&project).expect("session store dir");
+    fs::write(
+        project.join(format!("2026-10-04T10-00-00Z_{reference}.jsonl")),
+        "{}",
+    )
+    .expect("conversation file");
+    registry.resume(&created.id).await.expect("native recovery");
+    wait_for_file_contains(&marker, "--session\n").await;
+    assert_eq!(
+        recorded_launch(&marker, 1),
+        ["--session", reference.as_str()]
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_report_labels_the_reference_it_writes_reported() {
+    let dir = temp_dir("assigned-reported");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let store_path = temp_store_path("assigned-reported");
+    let registry = assigned_registry(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        &store_path,
+        None,
+    );
+    let created = registry
+        .create(SessionNewParams {
+            agent: "pi".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    assert!(
+        registry
+            .report_native_id(native_report!(&registry;
+                session_id: created.id.clone(),
+                agent: "pi".to_owned(),
+                native_session_id: "reported-conversation".to_owned(),
+                transcript_path: None,
+            ))
+            .await
+            .recorded
+    );
+
+    let record = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("durable sessions")
+        .into_iter()
+        .find(|record| record.session_id == created.id.0)
+        .expect("durable record");
+    let recovery = record.recovery.expect("recovery");
+    assert_eq!(
+        recovery.native_session_id.as_deref(),
+        Some("reported-conversation")
+    );
+    assert_eq!(
+        recovery.native_reference_provenance,
+        crate::agent::NativeReferenceProvenance::Reported,
+        "a reference written by a report is never labelled assigned"
+    );
+    assert!(record.native_identity_ordering.is_some());
+
+    let _ = registry.stop(&created.id).await;
+}
+
+/// A fixed base-environment source: the thread fixture's variables plus
+/// `extra`, with `HOME` set to `home`.
+#[cfg(unix)]
+fn assigned_environment(
+    home: &std::path::Path,
+    extra: &[(&str, &std::path::Path)],
+) -> crate::runtime::EnvironmentSource {
+    let crate::runtime::EnvironmentSource::Fixed(mut variables) =
+        crate::test_support::thread_environment_source()
+    else {
+        panic!("a test fixture supplies an explicit environment");
+    };
+    variables.remove(std::ffi::OsStr::new("XDG_CONFIG_HOME"));
+    variables.insert("HOME".into(), home.into());
+    for (name, value) in extra {
+        variables.insert((*name).into(), (*value).into());
+    }
+    crate::runtime::EnvironmentSource::Fixed(variables)
+}
+
+/// Writes `<root>/sessions/proj/<stamp>_<reference>.jsonl`.
+#[cfg(unix)]
+fn write_conversation(root: &std::path::Path, reference: &str) {
+    let project = root.join("sessions").join("proj");
+    fs::create_dir_all(&project).expect("session store dir");
+    fs::write(
+        project.join(format!("2026-10-04T10-00-00Z_{reference}.jsonl")),
+        "{}",
+    )
+    .expect("conversation file");
+}
+
+/// Creates an assigned session of agent `agent`, lets it exit and returns its
+/// reference with the recovery outcome. The registry's base environment is
+/// `source` filtered by `allowlist`.
+#[cfg(unix)]
+async fn recover_assigned(
+    tag: &str,
+    agents_dir: Option<PathBuf>,
+    source: crate::runtime::EnvironmentSource,
+    allowlist: &[&str],
+    prepare: impl FnOnce(&str),
+) -> Result<(), String> {
+    let dir = temp_dir(tag);
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    if let Some(template) = &agents_dir {
+        let body = fs::read_to_string(template.join("pi-env.toml"))
+            .expect("profile template")
+            .replace("SCRIPT", &script.display().to_string());
+        fs::write(template.join("pi-env.toml"), body).expect("profile");
+    }
+    let registry = SessionRegistry::new_with_runtimes_and_environment(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            agents_dir,
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_host(
+            &script,
+            crate::agent::host::fixture::PI_SHAPED_XDG_CHECK,
+        ),
+        source,
+        allowlist.iter().map(|name| (*name).to_owned()).collect(),
+    );
+    let agent = if registry.inner.profiles.resolve_agent("pi-env").is_ok() {
+        "pi-env"
+    } else {
+        "pi"
+    };
+    let created = registry
+        .create(SessionNewParams {
+            agent: agent.to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    let reference = created
+        .native_session_id
+        .clone()
+        .expect("assigned reference");
+    prepare(&reference);
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    let outcome = registry.resume(&created.id).await.map(|_| ());
+    let _ = registry.stop(&created.id).await;
+    outcome.map_err(|error| error.code)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_reads_a_config_home_forwarded_through_the_base_environment() {
+    let home = temp_dir("assigned-env-home");
+    let xdg = temp_dir("assigned-env-xdg");
+    let source = assigned_environment(&home, &[("XDG_CONFIG_HOME", &xdg)]);
+    let outcome = recover_assigned(
+        "assigned-env-forwarded",
+        None,
+        source,
+        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+        |reference| write_conversation(&xdg, reference),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        Ok(()),
+        "the forwarded XDG_CONFIG_HOME is the store"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_profile_variable_wins_over_the_base_environment_for_recovery() {
+    let home = temp_dir("assigned-env-profile-home");
+    let base_xdg = temp_dir("assigned-env-profile-base");
+    let profile_xdg = temp_dir("assigned-env-profile-own");
+    let agents_dir = temp_agents_dir_with(
+        "assigned-env-profile",
+        "pi-env",
+        &format!(
+            "base = \"pi\"\nprogram = \"SCRIPT\"\n[env]\nXDG_CONFIG_HOME = \"{}\"\n",
+            profile_xdg.display()
+        ),
+    );
+    let source = assigned_environment(&home, &[("XDG_CONFIG_HOME", &base_xdg)]);
+    let outcome = recover_assigned(
+        "assigned-env-profile-run",
+        Some(agents_dir),
+        source,
+        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+        |reference| write_conversation(&profile_xdg, reference),
+    )
+    .await;
+    assert_eq!(outcome, Ok(()), "the profile's XDG_CONFIG_HOME wins");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_falls_back_to_the_declared_home_relative_store() {
+    let home = temp_dir("assigned-env-fallback-home");
+    let source = assigned_environment(&home, &[]);
+    let outcome = recover_assigned(
+        "assigned-env-fallback",
+        None,
+        source,
+        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+        |reference| write_conversation(&home.join(".config").join("pi"), reference),
+    )
+    .await;
+    assert_eq!(outcome, Ok(()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_home_the_allowlist_does_not_forward_is_not_used_for_recovery() {
+    let spoofed_home = temp_dir("assigned-env-spoofed-home");
+    let source = assigned_environment(&spoofed_home, &[]);
+    let outcome = recover_assigned(
+        "assigned-env-spoofed",
+        None,
+        source,
+        &["PATH"],
+        |reference| write_conversation(&spoofed_home.join(".config").join("pi"), reference),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        Err("agent_native_reference_missing".to_owned()),
+        "the agent would not see this HOME, so it is not the store"
+    );
 }

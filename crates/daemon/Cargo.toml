@@ -48,6 +48,7 @@ nix = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 time = { workspace = true }
 ulid = { workspace = true }
+uuid = { workspace = true }
 zeroize = { workspace = true }
 
 # FSEvents backend for live transcript watching on macOS. Default features are

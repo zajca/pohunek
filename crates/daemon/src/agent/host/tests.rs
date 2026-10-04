@@ -13,7 +13,10 @@ use super::{
     DefinitionOrigin, DefinitionParts, LaunchPin, LaunchProgram, RegistryError, RuntimeDefinition,
     RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust, RESERVED_RUNTIME_IDS,
 };
-use crate::agent::{InputRules, NativeLaunchError, NativeSessionLaunch, SessionRef};
+use crate::agent::{
+    InputRules, NativeLaunchError, NativeReferenceError, NativeReferenceStrategy,
+    NativeSessionLaunch, SessionRef,
+};
 use crate::detect::{
     claude_manifest, codex_manifest, generic_shell_manifest, hermes_manifest, Manifest,
 };
@@ -40,8 +43,20 @@ fn package(id_value: &str) -> PackageIdentity {
 }
 
 /// A well-formed runtime document with the given `[resume]` and `[fork]`
-/// tables.
+/// tables and the `[native_reference]` strategy they imply: `none` next to an
+/// unsupported resume, `hook` otherwise.
 fn document(resume: &str, fork: &str) -> String {
+    let strategy = if resume.starts_with("supported = false") {
+        "strategy = \"none\""
+    } else {
+        "strategy = \"hook\""
+    };
+    document_with(resume, fork, strategy)
+}
+
+/// A well-formed runtime document with explicit `[resume]`, `[fork]` and
+/// `[native_reference]` table bodies.
+fn document_with(resume: &str, fork: &str, native_reference: &str) -> String {
     format!(
         r#"
 schema = 1
@@ -66,6 +81,9 @@ text_policy = "unrestricted"
 
 [fork]
 {fork}
+
+[native_reference]
+{native_reference}
 "#
     )
 }
@@ -1140,4 +1158,269 @@ mod launch_validation {
         let error = validate_launch_runtime(&unknown, "acme").expect_err("unknown parser");
         assert_eq!(error.code, "agent_runtime_unsupported");
     }
+}
+
+const ID_RESUME: &str =
+    "supported = true\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]";
+const ASSIGNED_NONE_CHECK: &str = "strategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{reference}\"]\n\n[native_reference.existence]\ncheck = \"none\"";
+
+fn native_reference_error(
+    resume: &str,
+    fork: &str,
+    native_reference: &str,
+) -> NativeReferenceError {
+    match parse(&document_with(resume, fork, native_reference)) {
+        Err(DefinitionError::NativeReference(error)) => error,
+        other => panic!("expected a native_reference error, got {other:?}"),
+    }
+}
+
+#[test]
+fn builtin_runtimes_declare_their_native_reference_strategy() {
+    let registry = builtin_registry("/bin/sh");
+    for (runtime, strategy) in [
+        ("shell", NativeReferenceStrategy::None),
+        ("codex", NativeReferenceStrategy::Hook),
+        ("claude", NativeReferenceStrategy::Hook),
+        ("hermes", NativeReferenceStrategy::Hook),
+    ] {
+        let definition = registry.resolve(&id(runtime)).expect("built in");
+        assert_eq!(
+            definition.native_reference_strategy(),
+            strategy,
+            "{runtime}"
+        );
+        assert!(
+            definition
+                .native()
+                .is_none_or(|native| native.assigned().is_none()),
+            "{runtime} does not assign a reference"
+        );
+    }
+}
+
+#[test]
+fn the_three_strategies_resolve_to_their_launch_shape() {
+    let none = parse(&document_with(
+        "supported = false",
+        "supported = false",
+        "strategy = \"none\"",
+    ))
+    .expect("none");
+    assert_eq!(
+        none.native_reference_strategy(),
+        NativeReferenceStrategy::None
+    );
+    assert!(none.native().is_none());
+
+    let hook = parse(&document_with(
+        ID_RESUME,
+        "supported = false",
+        "strategy = \"hook\"",
+    ))
+    .expect("hook");
+    assert_eq!(
+        hook.native_reference_strategy(),
+        NativeReferenceStrategy::Hook
+    );
+
+    let assigned = parse(&document_with(
+        ID_RESUME,
+        "supported = false",
+        ASSIGNED_NONE_CHECK,
+    ))
+    .expect("assigned");
+    assert_eq!(
+        assigned.native_reference_strategy(),
+        NativeReferenceStrategy::Assigned
+    );
+    let reference = SessionRef::id("abc").expect("id");
+    let native = assigned.native().expect("resumable");
+    assert_eq!(
+        native.assigned().expect("assigned").launch_argv(&reference),
+        ["--session-id", "abc"]
+    );
+    assert_eq!(
+        native.resume_argv(&reference).expect("renders"),
+        ["--session", "abc"]
+    );
+}
+
+#[test]
+fn the_strategy_is_mandatory_and_strict() {
+    let base = document(ID_RESUME, "supported = false");
+    parse(&base).expect("baseline is valid");
+    let without = base.replace("\n[native_reference]\nstrategy = \"hook\"\n", "\n");
+    assert!(matches!(
+        parse(&without),
+        Err(DefinitionError::Malformed { .. })
+    ));
+    for bad in ["strategy = \"guess\"", "strategy = \"hook\"\nextra = 1", ""] {
+        assert!(
+            matches!(
+                parse(&document_with(ID_RESUME, "supported = false", bad)),
+                Err(DefinitionError::Malformed { .. })
+            ),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn a_strategy_must_agree_with_the_resume_table() {
+    assert_eq!(
+        native_reference_error(ID_RESUME, "supported = false", "strategy = \"none\""),
+        NativeReferenceError::NoneRequiresNoResume
+    );
+    assert_eq!(
+        native_reference_error(
+            "supported = false",
+            "supported = false",
+            "strategy = \"hook\""
+        ),
+        NativeReferenceError::HookRequiresResume
+    );
+    assert_eq!(
+        native_reference_error(
+            "supported = false",
+            "supported = false",
+            ASSIGNED_NONE_CHECK
+        ),
+        NativeReferenceError::AssignedRequiresResume
+    );
+}
+
+#[test]
+fn an_assigned_reference_must_be_an_id_with_a_template_and_an_explicit_check() {
+    assert_eq!(
+        native_reference_error(
+            "supported = true\nreference_kind = \"path\"\nargs = [\"--session\", \"{reference}\"]",
+            "supported = false",
+            ASSIGNED_NONE_CHECK
+        ),
+        NativeReferenceError::AssignedRequiresIdReference
+    );
+    assert_eq!(
+        native_reference_error(
+            ID_RESUME,
+            "supported = false",
+            "strategy = \"assigned\"\n\n[native_reference.existence]\ncheck = \"none\""
+        ),
+        NativeReferenceError::AssignedRequiresLaunchArgs
+    );
+    assert_eq!(
+        native_reference_error(
+            ID_RESUME,
+            "supported = false",
+            "strategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{reference}\"]"
+        ),
+        NativeReferenceError::AssignedRequiresExistence
+    );
+    for (tokens, expected) in [
+        ("[\"--session-id\"]", NativeLaunchError::MissingReference),
+        (
+            "[\"--session-id={reference}\"]",
+            NativeLaunchError::BracesInLiteral { index: 0 },
+        ),
+        (
+            "[\"{reference}\", \"{reference}\"]",
+            NativeLaunchError::DuplicateReference,
+        ),
+        ("[]", NativeLaunchError::EmptyTemplate),
+    ] {
+        let body = format!(
+            "strategy = \"assigned\"\nlaunch_args = {tokens}\n\n[native_reference.existence]\ncheck = \"none\""
+        );
+        assert_eq!(
+            native_reference_error(ID_RESUME, "supported = false", &body),
+            NativeReferenceError::LaunchArgs(expected),
+            "{tokens}"
+        );
+    }
+    let bad_check = "strategy = \"assigned\"\nlaunch_args = [\"--session-id\", \"{reference}\"]\n\n[native_reference.existence]\ncheck = \"file\"\nroot_home = \"..\"\nfile_name = \"{reference}\"\nname_match = \"exact\"\nmax_depth = 0";
+    assert!(matches!(
+        native_reference_error(ID_RESUME, "supported = false", bad_check),
+        NativeReferenceError::Existence(error) if error.field() == "root_home"
+    ));
+}
+
+#[test]
+fn only_an_assigned_strategy_accepts_a_template_or_a_check() {
+    for strategy in ["none", "hook"] {
+        let resume = if strategy == "none" {
+            "supported = false"
+        } else {
+            ID_RESUME
+        };
+        assert_eq!(
+            native_reference_error(
+                resume,
+                "supported = false",
+                &format!("strategy = \"{strategy}\"\nlaunch_args = [\"{{reference}}\"]")
+            ),
+            NativeReferenceError::UnexpectedField {
+                field: "launch_args"
+            }
+        );
+        assert_eq!(
+            native_reference_error(
+                resume,
+                "supported = false",
+                &format!(
+                    "strategy = \"{strategy}\"\n\n[native_reference.existence]\ncheck = \"none\""
+                )
+            ),
+            NativeReferenceError::UnexpectedField { field: "existence" }
+        );
+    }
+}
+
+#[test]
+fn an_assigned_launch_template_is_bounded_like_the_other_templates() {
+    let many = vec!["\"--x\""; super::MAX_LAUNCH_ARGS].join(", ");
+    let body = format!(
+        "strategy = \"assigned\"\nlaunch_args = [{many}, \"{{reference}}\"]\n\n[native_reference.existence]\ncheck = \"none\""
+    );
+    assert_eq!(
+        parse(&document_with(ID_RESUME, "supported = false", &body)).expect_err("too many"),
+        DefinitionError::Field {
+            field: "native_reference.launch_args",
+            reason: "has too many arguments"
+        }
+    );
+    let long = "x".repeat(super::MAX_ARG_BYTES + 1);
+    let body = format!(
+        "strategy = \"assigned\"\nlaunch_args = [\"{long}\", \"{{reference}}\"]\n\n[native_reference.existence]\ncheck = \"none\""
+    );
+    assert_eq!(
+        parse(&document_with(ID_RESUME, "supported = false", &body)).expect_err("oversized"),
+        DefinitionError::Field {
+            field: "native_reference.launch_args",
+            reason: "has a token over 1024 bytes"
+        }
+    );
+}
+
+#[test]
+fn the_descriptor_digest_covers_the_assignment_and_ignores_hook_runtimes() {
+    let build = |resume: &str, native_reference: &str| {
+        RuntimeDefinition::from_toml(
+            &document_with(resume, "supported = false", native_reference),
+            |package| DefinitionOrigin::Builtin {
+                package: Some(package),
+            },
+            |_name| Ok(shell_manifest()),
+        )
+        .expect("valid")
+        .binding()
+        .clone()
+    };
+    let hook = build(ID_RESUME, "strategy = \"hook\"");
+    let assigned = build(ID_RESUME, ASSIGNED_NONE_CHECK);
+    let other_template = build(
+        ID_RESUME,
+        &ASSIGNED_NONE_CHECK.replace("--session-id", "--id"),
+    );
+    assert_ne!(hook, assigned);
+    assert_ne!(assigned, other_template);
 }

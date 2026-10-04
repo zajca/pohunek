@@ -750,6 +750,7 @@ impl SessionRegistry {
                 input_rules: StoredInputRules::from(input_rules),
                 native_launch: snapshot.native.clone(),
                 launch_binding: snapshot.launch_binding.clone(),
+                native_reference_provenance: snapshot.reference_provenance,
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,
@@ -1173,16 +1174,22 @@ pub(super) async fn open_detector_output(
     Ok(receiver)
 }
 
+/// Builds the launch command of a new session.
+///
+/// `native_args` is the argv fragment that hands an assigned native reference
+/// to the agent; it follows the runtime's fixed arguments and precedes the
+/// initial prompt argument.
 pub(super) fn build_launch_command(
     resolved: &ResolvedAgent,
     runtimes: &RuntimeHost,
     opts: &LaunchOpts,
+    native_args: &[String],
     initial_input: Option<String>,
 ) -> Result<LaunchCommandPlan, ProtocolError> {
     // Shell carries no agent-hook handshake, but it does carry the universal
     // `POHUNEK_SESSION_ID` marker (see `session_pty_env`) so a `pohunek attach`
     // launched inside it is still caught as a self-feeding loop.
-    let command = match &resolved.profile {
+    let mut command = match &resolved.profile {
         // A host profile overrides the launch program/args; build via the shared
         // PATH-resolving primitive (the same one a bare runtime launches with). When the
         // options carry a validated program, that exact path bypasses resolution.
@@ -1190,6 +1197,7 @@ pub(super) fn build_launch_command(
         // A bare base kind launches its definition's program and arguments.
         None => host::launch_command(runtimes, &resolved.definition, opts)?,
     };
+    command.args.extend_from_slice(native_args);
     Ok(plan_initial_input_delivery(
         resolved,
         command,

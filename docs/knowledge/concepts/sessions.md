@@ -590,11 +590,34 @@ and rejects before any child/worktree side effect. See
 [Hermes operator](../guides/hermes-operator.md) for the typed tool and hook
 boundaries.
 
+Where the native reference comes from is a per-runtime strategy declared in the
+runtime definition's `[native_reference]` table: `hook` (a validated integration
+report, the built-in `codex`, `claude` and `hermes` behavior), `assigned` (core
+generates the reference and passes it at launch) or `none` (no native recovery,
+the `shell` runtime). A runtime package without an integration handler is
+resumable only with `assigned`, which needs an agent CLI that accepts a
+caller-chosen session id; with `hook` or `none` it gets launch and detection
+only, because `session.report_native_id` accepts a report only from the launch
+process itself. An assigned reference is recorded with provenance `assigned`,
+is never identity evidence for ancestry, sequence or pid validation, and is
+persisted before the agent starts, so the session is resumable at once. It goes
+stale when the user switches conversation inside the agent (`/clear`, in-session
+resume) or when the agent never wrote the conversation, so `session.resume` and
+`session.fork` first run the existence check the runtime declared (a bounded,
+shell-free, symlink-free file listing below a declared config home) and fail
+closed with `agent_native_reference_missing` instead of launching an agent into
+an empty conversation; a runtime that declares `check = "none"` is relaunched
+unchecked. Recovery never falls back to another runtime, the shell or
+"continue latest". A fork of an assigned reference holds no reference of its
+own and is not resumable. That a later validated report supersedes an assigned
+reference, with `/clear` switching covered by tests, ships with the
+integration-report work; the public API reference has the field-level contract.
+
 `session.fork` creates a new pohunek session id and PTY from the source session's
 native agent conversation. The source may still be live; fork does not require a
 terminal state. With `cwd_mode: "same"`, the new session starts in the source
 cwd/worktree and carries the same launch-agent native metadata, so the fork is
-resumable too. The fork argv comes from the session's frozen native-session
+resumable too (except a fork of an assigned reference, which holds none). The fork argv comes from the session's frozen native-session
 launch spec: Claude forks as `claude --resume <native_session_id>
 --fork-session`, and a host profile that declares `fork_args` forks with exactly
 those arguments. Codex fork is intentionally not enabled in this daemon contract;

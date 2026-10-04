@@ -29,5 +29,8 @@ args = ["--resume", "{reference}"]
 [fork]
 supported = false
 
+[native_reference]
+strategy = "hook"
+
 [integration]
 handler = "hermes-hook-v1"

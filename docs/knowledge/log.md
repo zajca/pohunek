@@ -14,6 +14,18 @@
   and `cargo xtask package build|verify`. The source map lists the new
   `crates/package` files.
 
+## Unreleased (2026-10-04, assigned native references)
+
+- Runtime definitions declare how core obtains the native session reference in
+  a required `[native_reference]` table: `hook`, `assigned` or `none`. The
+  public API reference and the sessions page state the corrected rule for
+  runtime packages without an integration handler (resume and fork only through
+  an assigned reference), the assigned launch template and existence check, the
+  `assigned`/`reported` provenance, and the `agent_native_reference_missing`
+  error. The agent-profiles page notes that a profile inherits an assigned
+  base's assignment. The rule that a later reported reference supersedes an
+  assigned one is not part of this change.
+
 ## Unreleased (2026-10-03, native launch spec)
 
 - Replaced the profile `[resume] mode`/`ref_kind` keys and the `[fork]` table
