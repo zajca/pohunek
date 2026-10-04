@@ -203,8 +203,13 @@ agent-runtime meaning. A v3 client that sends its range `3..=3` to a v4 daemon
 (or the reverse) receives `daemon/version_mismatch` before any method runs, so
 it never sees a renamed field; there is no `runtime_id` alias on the public wire.
 Every daemon, CLI, SDK, managed hook and Hermes plugin must be upgraded
-together. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=9`; an asset of
-an earlier version still sends the old key, so `integration.status` reports it
+together. Notification hooks deliver through the worker socket when
+`POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
+the worker's `notification_create` hook request is additive to the private
+worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=10`; an asset of
+an earlier version still sends the old key (and an earlier notification hook still
+sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
+rejects its notifications), so `integration.status` reports it
 `outdated` and `integration.doctor` as an asset finding until it is reinstalled.
 
 Clients should call `daemon.health` after opening a control connection to learn
@@ -1140,7 +1145,7 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=9`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=10`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID` (falling back to
 `POHUNEK_RUNTIME_ID`), read

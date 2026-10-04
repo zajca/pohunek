@@ -92,6 +92,8 @@ pub enum RejectReason {
     SequenceStale,
     /// The subagent claim carries identifiers outside the accepted shape.
     SubagentClaimInvalid,
+    /// The notification claim is not a bounded JSON object.
+    NotificationInvalid,
 }
 
 impl RejectReason {
@@ -113,6 +115,7 @@ impl RejectReason {
             Self::ClaimExpired => "claim_expired",
             Self::SequenceStale => "sequence_stale",
             Self::SubagentClaimInvalid => "subagent_claim_invalid",
+            Self::NotificationInvalid => "notification_invalid",
         }
     }
 }

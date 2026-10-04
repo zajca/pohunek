@@ -28,10 +28,12 @@ Protocol v4 spells the worker instance identifier `worker_instance_id` where
 v3 spelled it `runtime_id`. There is no compatibility shim. Do not downgrade one
 peer independently: it will be isolated from v4 peers. Restore the coordinated
 v4 component set instead. Managed Codex and Claude hook assets carry
-`POHUNEK_INTEGRATION_VERSION=9`; after the upgrade run
+`POHUNEK_INTEGRATION_VERSION=10`; after the upgrade run
 `pohunek integration doctor` and reinstall every asset it reports as outdated,
 because an older hook still sends the old key and its native-identity reports
-are rejected. Earlier protocol transitions (integer-v1 to range negotiation,
+are rejected. Notification hooks older than version 10 send a bare integer `v`
+instead of the `{minimum, maximum}` range, so the daemon drops their
+notifications until they are reinstalled. Earlier protocol transitions (integer-v1 to range negotiation,
 the v3 overlay-routing change) do not widen the supported range.
 
 1. Download the component archive for the binary being updated: CLI (`pohunek`),

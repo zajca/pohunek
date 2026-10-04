@@ -47,6 +47,7 @@ use crate::journal::{
     SubagentPhase as JournalSubagentPhase, SubagentRecord, WorkerOrigin,
 };
 use crate::launch::{self, LaunchClaimStatus};
+use crate::notification;
 use crate::output::OutputCompletion;
 use crate::{
     Command, ControllerLease, EnvBase, Exit, InputFragment, InputPlan, Journal, LeaseError,
@@ -523,6 +524,8 @@ struct State {
     pty: Option<PtyOwner>,
     initialize_transaction: Option<TransactionId>,
     launch_agent_base: Option<String>,
+    /// Public protocol version the daemon selected for this runtime's hooks.
+    public_protocol_version: Option<u32>,
     stop_grace: Duration,
     terminal_retention: Duration,
     exit: Option<ExitStatus>,
@@ -538,6 +541,7 @@ impl State {
             pty: None,
             initialize_transaction: None,
             launch_agent_base: None,
+            public_protocol_version: None,
             stop_grace: crate::config::DEFAULT_STOP_GRACE,
             terminal_retention: Duration::from_hours(24),
             exit: None,
@@ -1141,6 +1145,7 @@ async fn initialize_request(
         command,
         &effective_config,
         initialize.launch.agent_base,
+        initialize.public_protocol_version,
         &initialize.dimensions,
     )
     .await?;
@@ -1166,6 +1171,7 @@ async fn spawn_running(
     command: Command,
     config: &WorkerConfig,
     agent_base: String,
+    public_protocol_version: u32,
     dimensions: &Dimensions,
 ) -> Result<(PtyOwner, WireProcessIdentity), ControlError> {
     let (pty, child_process, committed) = {
@@ -1176,6 +1182,7 @@ async fn spawn_running(
         state.stop_grace = config.stop_grace;
         state.terminal_retention = config.terminal_retention;
         state.launch_agent_base = Some(agent_base);
+        state.public_protocol_version = Some(public_protocol_version);
         state.journal.phase = JournalPhase::Live;
         state.journal.child = Some(journal_identity(pty.identity()));
         state.journal.pty_created_at = Some(timestamp());
@@ -2986,6 +2993,15 @@ enum HookRequest {
         subagent_id: String,
         outcome: Option<JournalSubagentPhase>,
     },
+    NotificationCreate {
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: String,
+        provider: String,
+        pid: u32,
+        start_identity: u64,
+        sequence: u64,
+        params: serde_json::Value,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -3318,6 +3334,77 @@ where
                 }
                 (accepted, false, current_runtime, accepted)
             }
+        }
+        HookRequest::NotificationCreate {
+            worker_instance_id,
+            provider,
+            pid,
+            start_identity,
+            sequence,
+            params,
+        } => {
+            let line = {
+                let state = shared.state.lock().await;
+                let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+                let inadmissible = hook_claim_admissible(
+                    known_identity_provider(&provider),
+                    current_runtime.as_deref() == Some(worker_instance_id.as_str()),
+                    state.phase == WireRuntimePhase::Running,
+                );
+                if let Some(reason) = inadmissible {
+                    reject_identity(&shared, "notification_create", reason, peer);
+                    None
+                } else if !state.pty.as_ref().is_some_and(|pty| {
+                    hook_claim_valid(
+                        &shared,
+                        "notification_create",
+                        peer,
+                        pid,
+                        start_identity,
+                        pty.identity().pid,
+                    )
+                }) {
+                    None
+                } else {
+                    let line = state.public_protocol_version.and_then(|version| {
+                        notification::build_request_line(
+                            shared.session_id.as_str(),
+                            version,
+                            sequence,
+                            params,
+                            shared.config.max_notification_params_bytes,
+                        )
+                    });
+                    if line.is_none() {
+                        reject_identity(
+                            &shared,
+                            "notification_create",
+                            RejectReason::NotificationInvalid,
+                            peer,
+                        );
+                    }
+                    line
+                }
+            };
+            let delivered = match line {
+                Some(line) => {
+                    notification::deliver(
+                        &shared.daemon_socket_path,
+                        &line,
+                        shared.config.notification_forward_timeout,
+                    )
+                    .await
+                }
+                None => false,
+            };
+            return writer
+                .write(&HookResponse {
+                    ok: delivered,
+                    launch_identity_accepted: false,
+                    launch_identity_status: LaunchClaimStatus::NotApplicable,
+                })
+                .await
+                .map_err(|error| WorkerError::Protocol(error.to_string()));
         }
     };
     if accepted {

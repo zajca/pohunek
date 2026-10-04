@@ -629,7 +629,10 @@ Hooks have two separate roles:
   validates process ancestry and accepts this binding only for the designated
   immutable launch agent; it journals the accepted value before forwarding it
   to the daemon. This keeps recovery tied to the original launch identity and
-  retains the claim across daemon outage. Every private report is additionally
+  retains the claim across daemon outage. A notification hook uses the same
+  endpoint: the worker attests the caller, binds the notification to its own
+  session, and forwards it to the daemon's public socket; when the worker
+  refuses or lacks the request type the hook dials the daemon directly. Every private report is additionally
   bound to its reporter: the worker accepts it only from the process it names or
   from a descendant of that process, using kernel peer identity the caller
   cannot supply. That is the shape the shipped hooks already have, and it stops

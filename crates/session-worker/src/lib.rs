@@ -22,6 +22,7 @@ mod input;
 mod journal;
 mod launch;
 mod lease;
+mod notification;
 mod output;
 mod pty;
 mod server;

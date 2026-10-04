@@ -48,6 +48,8 @@ pub use uninstall::{uninstall, uninstall_claude, uninstall_codex};
 mod lifecycle_tests;
 #[cfg(all(test, unix))]
 mod removal_tests;
+#[cfg(all(test, unix))]
+mod worker_hook_tests;
 #[cfg(unix)]
 use commit::{Action, Expected, Step, StepGate};
 
@@ -3012,7 +3014,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after bounded in-memory state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=9";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=10";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -3501,6 +3503,11 @@ mod tests {
         }
     }
 
+    /// Protocol version a session launched by this build carries in its env.
+    fn current_protocol_version() -> String {
+        protocol::PROTOCOL_VERSION.get().to_string()
+    }
+
     fn run_notification_asset_custom(
         agent: &str,
         args: &[&str],
@@ -3574,7 +3581,7 @@ mod tests {
             .env("TMPDIR", tmpdir)
             .env(ENV_FLAG, "1")
             .env(ENV_SOCKET_PATH, &socket_path)
-            .env(ENV_PROTOCOL_VERSION, "1")
+            .env(ENV_PROTOCOL_VERSION, current_protocol_version())
             .env("POHUNEK_SECRET_SENTINEL", "DROP_ME_ENV")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -3623,6 +3630,99 @@ mod tests {
         assert_eq!(stderr, "", "hook must not print stderr");
         assert_eq!(requests.len(), 1, "expected one request: {requests:?}");
         (stdout, stderr, requests.into_iter().next().unwrap())
+    }
+
+    /// Builds a daemon state backed by a real notification service in `dir`.
+    fn notification_test_state(dir: &Path) -> crate::api::DaemonState {
+        let notifications =
+            crate::notifications::NotificationService::open(dir).expect("notification service");
+        let mut policy = crate::notifications::default_policy();
+        policy.enabled = protocol::NotificationKindPolicy {
+            agent_blocked: true,
+            approval_required: true,
+            turn_completed: true,
+            session_finished: true,
+            error: true,
+            system: true,
+        };
+        policy.providers.clear();
+        notifications.set_policy(policy).expect("enable all kinds");
+        // Session-scoped notifications are debounced by the coordinator task,
+        // which is detached and ends with the test runtime.
+        let (attention, _task) =
+            crate::notifications::AttentionCoordinator::spawn(notifications.clone());
+        crate::api::DaemonState::new(
+            crate::api::HealthInfo::new("test"),
+            crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default()),
+            std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
+            crate::test_support::overlay_registry(),
+        )
+        .with_notifications(notifications)
+        .with_attention_coordinator(attention)
+    }
+
+    /// Feeds one captured hook request line to the daemon's real request parser
+    /// and returns the daemon's one-shot reply.
+    async fn dispatch_hook_request(state: &crate::api::DaemonState, request: &Value) -> Value {
+        let line = serde_json::to_string(request).expect("hook request serializes");
+        let crate::api::Dispatch::Reply(reply) = crate::api::dispatch_line(&line, state).await
+        else {
+            panic!("notification.create returns a one-shot reply");
+        };
+        serde_json::from_str(&reply).expect("daemon reply is JSON")
+    }
+
+    #[tokio::test]
+    async fn notify_hook_envelopes_are_accepted_by_the_daemon_request_parser() {
+        let cases: [(&str, &[&str]); 2] = [
+            ("claude", &["notification", "auth_success"]),
+            ("codex", &["permission_request"]),
+        ];
+        for (agent, args) in cases {
+            let (status, _stdout, stderr, requests) =
+                run_notification_asset(agent, args, &json!({}), true);
+            assert!(
+                status.success(),
+                "{agent} hook exited with {status}: {stderr}"
+            );
+            assert_eq!(requests.len(), 1, "{agent}: expected one request");
+            let request = &requests[0];
+
+            let line = serde_json::to_string(request).expect("hook request serializes");
+            serde_json::from_str::<protocol::Request>(&line).unwrap_or_else(|err| {
+                panic!("{agent} hook envelope does not parse as a control request: {err}")
+            });
+
+            let dir = scoped_dir(&format!("{agent}-notify-daemon"));
+            let state = notification_test_state(&dir);
+            let reply = dispatch_hook_request(&state, request).await;
+            assert!(
+                reply.get("err").is_none(),
+                "{agent} hook notification was rejected: {reply}"
+            );
+            assert_eq!(
+                reply["ok"]["created"],
+                json!(true),
+                "{agent} hook must create a notification: {reply}"
+            );
+            assert_eq!(reply["ok"]["record"]["agent_kind"], json!(agent));
+        }
+    }
+
+    #[test]
+    fn notify_hooks_send_the_protocol_range_derived_from_the_launch_env() {
+        for (agent, args) in [("claude", &["stop"][..]), ("codex", &["stop"][..])] {
+            let (_stdout, _stderr, request) =
+                captured_notification_request(agent, args, &json!({}));
+            assert_eq!(
+                request["v"],
+                json!({
+                    "minimum": protocol::PROTOCOL_VERSION.get(),
+                    "maximum": protocol::PROTOCOL_VERSION.get(),
+                }),
+                "{agent} hook must stamp a range, not a bare integer"
+            );
+        }
     }
 
     fn large_json_input() -> Vec<u8> {
