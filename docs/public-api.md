@@ -892,6 +892,21 @@ reveals nothing about profile `[env]` values. A malformed revision is
 `runtime/agent_profile_revision_invalid`; an unreadable host key is
 `runtime/agent_profile_revision_unavailable` (no unkeyed fallback).
 
+A host profile over a package-served base carries the top-level keys
+`package` (package id) and `digest` (`sha256:` plus 64 hex characters), both or
+neither; a profile over a built-in base carries neither. The profile resolves
+from exactly that digest, so `package.select` and an update of the package do
+not change what it launches and do not change its revision, while a migration
+that changes the digest does. A package-served base without the keys is
+`runtime/invalid_profile` with the migration command
+`pohunek plugin profile migrate <name>` in its message. A fresh launch through
+a pinned profile still requires its package to be enabled and verified
+(`runtime/runtime_not_installed` or `runtime/runtime_incompatible`); a session
+already pinned to the digest resumes. A digest pinned by a host profile counts
+as referenced for `package.uninstall`, `package.list` and `package.doctor`, and
+`host.inspect` reports a pinned profile `available: false` while its package is
+disabled, uninstalled or fails verification.
+
 Agent runtime identities use two Rust types over the same string namespace.
 The fields listed above (`agent_base`, `active_agent_base`, the subagent
 `provider`, the inventory `agent_base`, the integration `agent` and the

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use package::registry::{IncompatibleReason, RegistryError, RetainedDigests, RetainedState};
 use package::verify::{VerifiedRoot, VerifyError};
 use package::{ArchiveEntry, Limits, PackageDigest};
-use protocol::{BindingProvenance, PackageIdentity, ProtocolError, RuntimeId};
+use protocol::{BindingProvenance, PackageId, PackageIdentity, ProtocolError, RuntimeId};
 use thiserror::Error;
 
 use super::claim::is_reserved;
@@ -255,6 +255,37 @@ impl PackageStore {
         } else {
             Err(PackageRejection::IdentityMismatch)
         }
+    }
+
+    /// Loads the definition of exactly the package `digest` for a host
+    /// profile that binds it by package id and digest.
+    ///
+    /// The record found by `digest` must belong to the package `package`;
+    /// the version is whatever the record holds, because a profile pins the
+    /// archive digest and not a version label. The rest is
+    /// [`Self::load_pinned`]: enablement and selection are not consulted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageRejection::NotRegistered`] for an unknown digest,
+    /// [`PackageRejection::IdentityMismatch`] when the digest belongs to
+    /// another package or runtime, and the other rejections of
+    /// [`Self::load_pinned`].
+    pub fn load_bound(
+        &self,
+        runtime_id: &RuntimeId,
+        digest: &PackageDigest,
+        package: &PackageId,
+    ) -> Result<RuntimeDefinition, PackageRejection> {
+        let state = self.registry.state().map_err(PackageRejection::Registry)?;
+        let record = state
+            .package(digest)
+            .ok_or(PackageRejection::NotRegistered)?;
+        if record.identity().id != *package {
+            return Err(PackageRejection::IdentityMismatch);
+        }
+        let identity = record.identity().clone();
+        self.load_pinned(runtime_id, digest, &identity)
     }
 
     /// Verifies the root of `digest` and builds its definition, whatever

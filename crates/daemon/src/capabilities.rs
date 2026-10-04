@@ -82,6 +82,7 @@ impl VersionProbe {
 }
 
 /// Resolves the definition a base runtime launches, when one is registered.
+#[cfg(test)]
 fn definition_for_base<'a>(
     registry: &'a RuntimeRegistry,
     base: &RuntimeId,
@@ -152,32 +153,31 @@ fn host_capabilities_for(
     // Host profiles: each resolvable profile is a launchable agent name; probe its
     // resolved program exactly as its base runtime, so availability is consistent.
     for agent in profiles.enumerate() {
-        let definition = definition_for_base(registry, &agent.base);
-        let runtime = match (definition, agent.profile.as_ref()) {
-            (Some(definition), Some(profile)) => probe_definition(
+        // A pinned profile is described by the definition it launches from,
+        // and is unavailable once that package cannot launch a fresh session.
+        let launchable = profiles.runtimes().verify_launchable(&agent.definition);
+        let base = RuntimeRef::from(agent.base.clone());
+        let runtime = match (&launchable, agent.profile.as_ref()) {
+            (Err(_), _) => unavailable_runtime(&agent.name, base),
+            (Ok(()), Some(profile)) => {
+                probe_definition(&agent.name, base, &agent.definition, &profile.program)
+            }
+            (Ok(()), None) => probe_definition(
                 &agent.name,
-                RuntimeRef::from(agent.base.clone()),
-                definition,
-                &profile.program,
+                base,
+                &agent.definition,
+                agent.definition.program().as_str(),
             ),
-            (Some(definition), None) => probe_definition(
-                &agent.name,
-                RuntimeRef::from(agent.base.clone()),
-                definition,
-                definition.program().as_str(),
-            ),
-            // A base without a registered runtime has nothing to launch.
-            (None, _) => AgentRuntime {
-                agent: agent.name.clone(),
-                agent_base: Some(RuntimeRef::from(agent.base.clone())),
-                available: false,
-                path: None,
-                version: None,
-                supported: None,
-            },
         };
         runtimes.push(runtime);
         supported_agents.push(agent.name);
+    }
+    for profile in profiles.unavailable_pinned() {
+        runtimes.push(unavailable_runtime(
+            &profile.name,
+            RuntimeRef::from(profile.base),
+        ));
+        supported_agents.push(profile.name);
     }
 
     let git_available = which_on_path("git").is_some();
@@ -194,6 +194,18 @@ fn host_capabilities_for(
         terminal_read_supported: true,
         output_read_supported: true,
         session_wait_supported: true,
+    }
+}
+
+/// The entry of an agent name that has nothing to launch right now.
+fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
+    AgentRuntime {
+        agent: agent.to_owned(),
+        agent_base: Some(agent_base),
+        available: false,
+        path: None,
+        version: None,
+        supported: None,
     }
 }
 

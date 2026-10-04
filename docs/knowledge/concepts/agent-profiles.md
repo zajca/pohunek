@@ -149,3 +149,46 @@ package pins its archive digest; resume resolves exactly that digest, verified
 again, never the currently selected version, a built-in or another package. A
 pinned package whose root is modified or damaged refuses resume with
 `runtime_incompatible` and keeps its binding.
+
+## Package-bound profiles
+
+A profile whose `base` is served by an installed runtime package binds that
+package explicitly with two more top-level keys, set together or not at all:
+
+```toml
+base = "acme"                                   # the runtime id the package serves
+package = "acme.runtime"                        # the package id
+digest = "sha256:<64 lowercase hex digits>"     # the archive digest to launch from
+```
+
+- A profile over a built-in base (`shell`, `codex`, `claude`, `hermes`) has
+  neither key; supplying them is `invalid_profile`, as is supplying only one.
+- A profile over a package-served base without the keys is `invalid_profile`.
+  Its message names the migration command
+  `pohunek plugin profile migrate <name>`, which writes the keys for the
+  package version selected now.
+- With both keys the profile resolves from exactly that digest, never from the
+  registry's current selection. `plugin update`, `plugin select` and a newer
+  installed version do not change what the profile launches, while a bare
+  runtime name keeps following the selection.
+- A digest that is not installed is `runtime_not_installed`; a digest that
+  belongs to another package or runtime, or whose root fails verification, is
+  `runtime_incompatible`.
+- A profile pin keeps its digest installed: `plugin uninstall` and the removal
+  of a modified root are refused (`package_referenced`) while a host profile
+  pins the digest, and `package.list`/`package.inspect` report it as
+  `referenced`. A profile file that fails the owner-security checks, escapes the
+  agents directory or does not parse pins nothing.
+
+The profile revision covers the file text and the resolved launch binding, so a
+migration (a changed `digest`) changes the revision and a relay-approved
+revision fails with `agent_profile_revision_stale`, while an update of the
+package does not touch the digest and leaves the approved revision valid.
+
+Disabling a package stops fresh launches only. `session.new` through a pinned
+profile, owner-local or relay-approved, fails with `runtime_not_installed`
+because every fresh launch verifies that its package is enabled and its root
+intact; a session already pinned to that digest still resumes and forks.
+`host.inspect.runtimes` describes a pinned profile from its pinned definition
+and reports `available: false` while its package is disabled, uninstalled or
+fails verification.

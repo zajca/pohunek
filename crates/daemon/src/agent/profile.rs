@@ -10,17 +10,23 @@
 //!
 //! Resolution ([`ProfileRegistry::resolve_agent`]) is the 4-step chain: A.2.1
 //! charset guard → profile file → bare base kind → `agent_profile_not_found`.
+//!
+//! A profile whose base runtime is served by an installed package binds that
+//! package explicitly with the `package` and `digest` keys and resolves from
+//! exactly that digest; a profile over a built-in base carries neither key.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{ErrorClass, ProtocolError, RuntimeId};
+use package::registry::RetainedDigests;
+use package::PackageDigest;
+use protocol::{ErrorClass, PackageId, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost};
+use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy};
 use super::{InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::Manifest;
 use crate::project::config::validate_name;
@@ -32,6 +38,14 @@ use crate::project::config::validate_name;
 struct RawProfile {
     /// Base kind to extend: `shell` | `codex` | `claude` | `hermes`.
     base: String,
+    /// Package serving `base`; set together with `digest` exactly when a
+    /// package, not a built-in, serves the base runtime.
+    #[serde(default)]
+    package: Option<String>,
+    /// Archive digest (`sha256:<hex>`) of the package version the profile
+    /// launches from, whatever the registry selects now.
+    #[serde(default)]
+    digest: Option<String>,
     /// Launch program (PATH name or absolute path); defaults to the base program.
     #[serde(default)]
     program: Option<String>,
@@ -376,19 +390,9 @@ impl ProfileRegistry {
         let Some(dir) = &self.dir else {
             return Vec::new();
         };
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
         let mut resolved = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            match self.resolve_agent(stem) {
+        for (stem, _path) in profile_files(dir) {
+            match self.resolve_agent(&stem) {
                 Ok(agent) if agent.profile.is_some() => resolved.push(agent),
                 Ok(_) => {}
                 Err(err) => {
@@ -399,6 +403,129 @@ impl ProfileRegistry {
         resolved.sort_by(|a, b| a.name.cmp(&b.name));
         resolved
     }
+
+    /// The profiles that bind a package version the host cannot serve now:
+    /// the digest is not installed, or its root fails verification. They are
+    /// listed so `host.inspect` reports them unavailable instead of hiding
+    /// them. Sorted by name.
+    pub(crate) fn unavailable_pinned(&self) -> Vec<UnavailableProfile> {
+        let Some(dir) = &self.dir else {
+            return Vec::new();
+        };
+        let mut unavailable = Vec::new();
+        for (stem, path) in profile_files(dir) {
+            let Ok(Some(binding)) = read_binding(dir, &stem, &path) else {
+                continue;
+            };
+            let Some(base) = binding.base else {
+                continue;
+            };
+            let refused = matches!(
+                self.resolve_agent(&stem),
+                Err(ProtocolError { ref code, .. })
+                    if code == "runtime_not_installed" || code == "runtime_incompatible"
+            );
+            if refused {
+                unavailable.push(UnavailableProfile { name: stem, base });
+            }
+        }
+        unavailable.sort_by(|a, b| a.name.cmp(&b.name));
+        unavailable
+    }
+
+    /// The package digests that host profiles pin.
+    ///
+    /// Every `*.toml` of the agents directory is read through the same
+    /// containment and owner-security checks as a profile load, and only its
+    /// `package`/`digest` keys are parsed. A file that fails a check or does
+    /// not parse pins nothing and logs a warning, so one broken profile never
+    /// blocks the lifecycle of another package.
+    pub(crate) fn pinned_digests(&self) -> RetainedDigests {
+        let mut pinned = RetainedDigests::new();
+        let Some(dir) = &self.dir else {
+            return pinned;
+        };
+        for (stem, path) in profile_files(dir) {
+            match read_binding(dir, &stem, &path) {
+                Ok(Some(binding)) => pinned.insert(binding.digest),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(profile = %stem, error = %err, "agent profile pins no package digest");
+                }
+            }
+        }
+        pinned
+    }
+}
+
+/// A host profile whose pinned package version cannot be served right now.
+#[derive(Debug, Clone)]
+pub(crate) struct UnavailableProfile {
+    /// The profile name.
+    pub name: String,
+    /// The base runtime the profile extends.
+    pub base: RuntimeId,
+}
+
+/// The profile files of `dir`: `(stem, path)` of every regular `*.toml` file.
+fn profile_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
+                return None;
+            }
+            let stem = path.file_stem().and_then(|stem| stem.to_str())?.to_owned();
+            Some((stem, path))
+        })
+        .collect()
+}
+
+/// The package binding keys of one profile file, parsed without the rest of
+/// the profile.
+#[derive(Debug, Deserialize)]
+struct RawBinding {
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// A parsed package binding of a profile file.
+struct FileBinding {
+    base: Option<RuntimeId>,
+    digest: PackageDigest,
+}
+
+/// Read the package binding of `path`, under the containment and
+/// owner-security checks of a profile load. `Ok(None)` is a profile that
+/// pins nothing.
+fn read_binding(dir: &Path, name: &str, path: &Path) -> Result<Option<FileBinding>, ProtocolError> {
+    validate_name("agent", name)?;
+    assert_contained(dir, path, name)?;
+    if !file_is_owner_secure(path) {
+        return Err(invalid_profile(
+            name,
+            "profile file is not owner-secure (wrong owner or group/world-writable)",
+        ));
+    }
+    let content =
+        std::fs::read_to_string(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
+    let raw: RawBinding = toml::from_str(&content)
+        .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+    let Some(digest) = raw.digest else {
+        return Ok(None);
+    };
+    let digest = PackageDigest::parse(&digest)
+        .map_err(|_error| invalid_profile(name, "digest is not a valid package digest"))?;
+    Ok(Some(FileBinding {
+        base: raw.base.and_then(|base| RuntimeId::parse(&base).ok()),
+        digest,
+    }))
 }
 
 /// Whether `dir` is safe to load host config from: owned by the daemon's effective
@@ -490,9 +617,12 @@ fn load_profile(
         .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
+    let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
+    // A session recovering from a pinned definition keeps it: the profile's own
+    // binding applies to fresh launches.
     let definition = match pinned {
         Some(definition) if *definition.runtime_id() == base_id => Arc::clone(definition),
-        _ => runtimes.resolve_id(&base_id)?,
+        _ => resolve_base(name, runtimes, &base_id, pin.as_ref())?,
     };
     // A runtime without native resume (the shell) cannot have a profile claim one.
     if definition.native().is_none()
@@ -553,6 +683,68 @@ fn load_profile(
             inputs,
         }),
     })
+}
+
+/// The package binding of a profile: the package id and archive digest its
+/// base runtime is launched from.
+#[derive(Debug, Clone)]
+struct PackagePin {
+    package: PackageId,
+    digest: PackageDigest,
+}
+
+/// Parse the `package`/`digest` keys: both or neither.
+fn parse_package_pin(
+    name: &str,
+    package: Option<&str>,
+    digest: Option<&str>,
+) -> Result<Option<PackagePin>, ProtocolError> {
+    let (package, digest) = match (package, digest) {
+        (None, None) => return Ok(None),
+        (Some(package), Some(digest)) => (package, digest),
+        _ => {
+            return Err(invalid_profile(
+                name,
+                "package and digest must be set together",
+            ))
+        }
+    };
+    let package = PackageId::parse(package)
+        .map_err(|_error| invalid_profile(name, "package is not a valid package id"))?;
+    let digest = PackageDigest::parse(digest).map_err(|_error| {
+        invalid_profile(
+            name,
+            "digest must be sha256: followed by 64 lowercase hex digits",
+        )
+    })?;
+    Ok(Some(PackagePin { package, digest }))
+}
+
+/// Resolve the base runtime of a profile under its package binding.
+///
+/// A built-in base takes no binding. A package-served base requires one and is
+/// then resolved from exactly the bound digest; an unbound profile naming a
+/// package-served base is refused with the migration command.
+fn resolve_base(
+    name: &str,
+    runtimes: &RuntimeHost,
+    base: &RuntimeId,
+    pin: Option<&PackagePin>,
+) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+    match (pin, runtimes.served_by(base)) {
+        (Some(_), Some(ServedBy::Builtin)) => Err(invalid_profile(
+            name,
+            &format!("package and digest apply only to a package-served base, and '{base}' is built in"),
+        )),
+        (Some(pin), _) => runtimes.resolve_profile_pin(base, &pin.package, &pin.digest),
+        (None, Some(ServedBy::Package(package))) => Err(invalid_profile(
+            name,
+            &format!(
+                "base '{base}' is served by the installed package '{package}' and the profile does not pin it; run `pohunek plugin profile migrate {name}`"
+            ),
+        )),
+        (None, _) => runtimes.resolve_id(base),
+    }
 }
 
 /// Resolve a profile's effective native-session launch spec.
@@ -719,6 +911,9 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
         None,
     )
 }
+
+#[cfg(test)]
+mod pin_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1403,10 +1598,18 @@ mod tests {
         )
     }
 
+    /// A profile body on the Pi-shaped package base: its package binding, then `rest`.
+    fn pinned_pi(rest: &str) -> String {
+        format!(
+            "base = \"pi\"\n{}{rest}",
+            crate::agent::host::fixture::pi_shaped_profile_pin()
+        )
+    }
+
     #[test]
     fn a_profile_inherits_the_assignment_of_its_base_runtime() {
         let dir = tmp_agents_dir("assigned-inherit");
-        write_profile(&dir, "mine", "base = \"pi\"\nargs = [\"--x\"]\n");
+        write_profile(&dir, "mine", &pinned_pi("args = [\"--x\"]\n"));
         let agent = assigned_registry(&dir)
             .resolve_agent("mine")
             .expect("resolves");
@@ -1421,7 +1624,9 @@ mod tests {
         write_profile(
             &dir,
             "restated",
-            "base = \"pi\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n",
+            &pinned_pi(
+                "[resume]\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n",
+            ),
         );
         let error = assigned_registry(&dir)
             .resolve_agent("restated")
@@ -1432,7 +1637,7 @@ mod tests {
     #[test]
     fn a_profile_may_switch_recovery_off_on_an_assigned_base() {
         let dir = tmp_agents_dir("assigned-off");
-        write_profile(&dir, "off", "base = \"pi\"\n[resume]\nresumable = false\n");
+        write_profile(&dir, "off", &pinned_pi("[resume]\nresumable = false\n"));
         let agent = assigned_registry(&dir)
             .resolve_agent("off")
             .expect("resolves");

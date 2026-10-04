@@ -57,13 +57,14 @@ impl SessionRegistry {
     }
 
     /// Package digests that a live, lost or resumable session was launched
-    /// from.
+    /// from, or that a host profile pins.
     ///
-    /// The set is the union of the durable records (logical sessions and
-    /// resume bindings) and the sessions held in memory, so a registry without
-    /// persistence still protects its live sessions. The durable scan is
-    /// strict: a record that cannot be interpreted may pin a package, so it is
-    /// an error rather than an omission.
+    /// The set is the union of the digests host profiles pin, the durable
+    /// records (logical sessions and resume bindings) and the sessions held in
+    /// memory, so a registry without persistence still protects its live
+    /// sessions. The durable scan is strict: a record that cannot be
+    /// interpreted may pin a package, so it is an error rather than an
+    /// omission.
     ///
     /// # Errors
     ///
@@ -71,6 +72,14 @@ impl SessionRegistry {
     /// record that cannot be interpreted.
     pub async fn retained_package_digests(&self) -> io::Result<RetainedDigests> {
         let mut retained = RetainedDigests::new();
+        let profiles = self.inner.profiles.clone();
+        retained.extend(
+            tokio::task::spawn_blocking(move || profiles.pinned_digests())
+                .await
+                .map_err(|join_error| io::Error::other(join_error.to_string()))?
+                .iter()
+                .cloned(),
+        );
         if let Some(store) = self.inner.store.clone() {
             let pinned = tokio::task::spawn_blocking(move || store.pinned_package_digests())
                 .await
