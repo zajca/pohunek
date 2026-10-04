@@ -5,7 +5,8 @@
   "upstream": {
     "npm": "@earendil-works/pi-coding-agent",
     "release": "1.0.2",
-    "binary": "pi"
+    "binary": "pi",
+    "node_min": "22.19.0"
   },
   "supported": {
     "min": "1.0.0",
