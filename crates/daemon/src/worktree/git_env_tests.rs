@@ -392,7 +392,7 @@ fn daemon_fetch_under_exec_path() {
     assert!(marker.is_file(), "the inherited exec path runs the helper");
     std::fs::remove_file(&marker).expect("remove marker");
 
-    assert!(fetch_origin(&repo, "main").is_err());
+    fetch_origin(&repo, "main").expect_err("the fetch from an unreachable remote fails");
     assert!(
         !marker.exists(),
         "the daemon's fetch ran a helper from the inherited GIT_EXEC_PATH"
@@ -551,7 +551,7 @@ fn daemon_git_subprocesses_under_user_variables() {
 
     // The daemon's fetch reaches the same transport with the persistent
     // variables only.
-    assert!(fetch_origin(&repo, "main").is_err());
+    fetch_origin(&repo, "main").expect_err("the fetch from an unreachable remote fails");
     let fetch_names = recorded_names(&fetch_record);
     for (name, _) in KEPT_USER_VARS {
         assert!(
@@ -664,9 +664,9 @@ fn daemon_fetch_under_protocol_trust_marker() {
         "the inherited trust marker must refuse the user-allowed protocol"
     );
 
-    fetch_origin(&repo, "main").expect("the daemon's fetch is user-initiated");
+    let fetched = fetch_origin(&repo, "main").expect("the daemon's fetch is user-initiated");
     assert_eq!(
-        fixture_git(&env, &repo, &["rev-parse", "--verify", "FETCH_HEAD"]),
+        fetched.commit,
         fixture_git(&env, &source, &["rev-parse", "HEAD"])
     );
 }

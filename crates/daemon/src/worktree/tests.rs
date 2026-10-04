@@ -569,6 +569,250 @@ fn remote_only_base_branch_is_fetched_before_default_branch_fallback() {
     assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), stacked_tip);
 }
 
+/// Number of concurrent creates in the shared-repository race test.
+const CONCURRENT_CREATES: usize = 8;
+
+/// Clone `upstream` into a fresh directory configured for committing.
+fn clone_of(upstream: &Path, tag: &str) -> PathBuf {
+    let downstream = unique_dir(tag).join("clone");
+    let clone = pohunek_test_support::process_env::command("git")
+        .args(["clone", "-q"])
+        .arg(upstream)
+        .arg(&downstream)
+        .output()
+        .expect("git clone");
+    assert!(
+        clone.status.success(),
+        "git clone failed: {}",
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    git_in(&downstream, &["config", "user.email", "test@example.com"]);
+    git_in(&downstream, &["config", "user.name", "Test"]);
+    git_in(&downstream, &["config", "commit.gpgsign", "false"]);
+    downstream
+}
+
+/// Refs under the per-request fetch namespace, one per line.
+fn leftover_fetch_refs(repo: &Path) -> String {
+    git_stdout(repo, &["for-each-ref", "refs/pohunek/fetch/"])
+}
+
+#[test]
+fn concurrent_creates_in_one_repository_each_start_from_their_own_base() {
+    // Upstream carries distinct commits behind distinct refs: remote-only
+    // branches and `refs/pull/<n>/head`-style refs. The downstream clone has
+    // none of them locally, so every create fetches its own base.
+    let upstream = init_repo("race-upstream");
+    let mut bases = Vec::new();
+    for index in 0..CONCURRENT_CREATES {
+        git_in(
+            &upstream,
+            &["checkout", "-q", "-b", &format!("tmp/{index}"), "main"],
+        );
+        fs::write(
+            upstream.join(format!("BASE-{index}.md")),
+            format!("{index}\n"),
+        )
+        .expect("write base file");
+        git_in(&upstream, &["add", "."]);
+        git_in(&upstream, &["commit", "-q", "-m", &format!("base {index}")]);
+        let tip = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+        let name = if index % 2 == 0 {
+            format!("stacked/base-{index}")
+        } else {
+            format!("refs/pull/{index}/head")
+        };
+        let refname = if name.starts_with("refs/") {
+            name.clone()
+        } else {
+            format!("refs/heads/{name}")
+        };
+        git_in(&upstream, &["update-ref", &refname, &tip]);
+        git_in(&upstream, &["checkout", "-q", "main"]);
+        git_in(&upstream, &["branch", "-q", "-D", &format!("tmp/{index}")]);
+        bases.push((name, tip));
+    }
+    let downstream = clone_of(&upstream, "race-downstream");
+
+    let mgr = manager("race");
+    let barrier = std::sync::Barrier::new(CONCURRENT_CREATES);
+    let results: Vec<_> = std::thread::scope(|scope| {
+        let handles: Vec<_> = bases
+            .iter()
+            .enumerate()
+            .map(|(index, (base, _))| {
+                let (mgr, barrier, downstream) = (&mgr, &barrier, &downstream);
+                scope.spawn(move || {
+                    let mut req =
+                        request(&format!("s-{index}"), downstream, &format!("feat/{index}"));
+                    req.base_branch = Some(base.clone());
+                    barrier.wait();
+                    mgr.bind(&req)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("create thread"))
+            .collect()
+    });
+
+    for ((base, tip), result) in bases.iter().zip(results) {
+        let bound = result.expect("concurrent bind succeeds");
+        assert_eq!(&bound.base_branch, base, "the logical base name is kept");
+        assert!(
+            bound.warnings.is_empty(),
+            "no warnings expected: {:?}",
+            bound.warnings
+        );
+        assert_eq!(
+            &git_stdout(&bound.path, &["rev-parse", "HEAD"]),
+            tip,
+            "worktree for base {base} must start from that base's commit"
+        );
+    }
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+}
+
+#[test]
+fn successful_fetch_leaves_no_temporary_ref_and_keeps_the_logical_base_name() {
+    let upstream = init_repo("pin-upstream");
+    let downstream = clone_of(&upstream, "pin-downstream");
+    fs::write(upstream.join("NEW.md"), "v2\n").expect("write upstream file");
+    git_in(&upstream, &["add", "."]);
+    git_in(&upstream, &["commit", "-q", "-m", "v2"]);
+
+    let mgr = manager("pin");
+    let mut req = request("s-1", &downstream, "feat/x");
+    req.base_branch = Some("main".to_owned());
+    let bound = mgr.bind(&req).expect("bind");
+
+    assert_eq!(bound.base_branch, "main");
+    let stored = mgr
+        .store()
+        .find_worktree_for_session("s-1")
+        .expect("read binding")
+        .expect("binding persisted");
+    assert_eq!(stored.base_branch, "main");
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+}
+
+#[test]
+fn failed_fetch_leaves_no_temporary_ref() {
+    let repo = init_repo("fetch-clean-repo");
+    let bogus = unique_dir("fetch-clean-bogus").join("missing.git");
+    git_in(
+        &repo,
+        &["remote", "add", "origin", &bogus.to_string_lossy()],
+    );
+
+    let mgr = manager("fetch-clean");
+    let bound = mgr
+        .bind(&request("s-1", &repo, "feat/x"))
+        .expect("bind falls back when fetch fails");
+
+    assert!(bound
+        .warnings
+        .iter()
+        .any(|w| w.kind == SessionWarningKind::Fetch));
+    assert_eq!(leftover_fetch_refs(&repo), "");
+}
+
+#[test]
+fn base_ref_with_refspec_syntax_is_not_fetched() {
+    let upstream = init_repo("refspec-upstream");
+    let downstream = clone_of(&upstream, "refspec-downstream");
+    let before = git_stdout(&downstream, &["for-each-ref"]);
+
+    for hostile in ["main:refs/heads/injected", "+main", "ma*in"] {
+        assert!(
+            super::fetch_origin(&downstream, hostile).is_err(),
+            "{hostile:?} must be rejected before any fetch"
+        );
+    }
+    assert_eq!(git_stdout(&downstream, &["for-each-ref"]), before);
+}
+
+#[test]
+fn fetched_commit_stays_referenced_until_the_worktree_is_created() {
+    // The pre-create hook runs after the fetch and before `git worktree add`;
+    // it records the fetch refs that still exist at that point.
+    let upstream = init_repo("pinned-upstream");
+    git_in(&upstream, &["checkout", "-q", "-b", "stacked/base"]);
+    fs::write(upstream.join("STACKED.md"), "stacked\n").expect("write stacked file");
+    git_in(&upstream, &["add", "."]);
+    git_in(&upstream, &["commit", "-q", "-m", "stacked base"]);
+    let tip = git_stdout(&upstream, &["rev-parse", "HEAD"]);
+    git_in(&upstream, &["checkout", "-q", "main"]);
+    let downstream = clone_of(&upstream, "pinned-downstream");
+    commit_hook(
+        &downstream,
+        "pre-create",
+        "#!/bin/sh\ngit for-each-ref --format='%(objectname)' refs/pohunek/fetch/ > \"$POHUNEK_REPO/pinned.txt\"\n",
+    );
+
+    let mgr = manager("pinned");
+    let mut req = request("s-1", &downstream, "feat/x");
+    req.base_branch = Some("stacked/base".to_owned());
+    let bound = mgr.bind(&req).expect("bind");
+
+    assert_eq!(
+        fs::read_to_string(downstream.join("pinned.txt"))
+            .expect("hook ran")
+            .trim(),
+        tip,
+        "the fetch ref must pin the commit while the pre-create hook runs"
+    );
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+}
+
+#[test]
+fn annotated_tag_base_is_pinned_by_its_commit_and_its_ref_is_deleted() {
+    let upstream = init_repo("tag-upstream");
+    git_in(&upstream, &["tag", "-a", "v1.0.0", "-m", "release"]);
+    let commit = git_stdout(&upstream, &["rev-parse", "v1.0.0^{commit}"]);
+    let tag_object = git_stdout(&upstream, &["rev-parse", "v1.0.0"]);
+    assert_ne!(commit, tag_object, "an annotated tag has its own object");
+    let downstream = clone_of(&upstream, "tag-downstream");
+    git_in(&downstream, &["tag", "-d", "v1.0.0"]);
+
+    let fetched = super::fetch_origin(&downstream, "v1.0.0").expect("fetch the tag");
+    assert_eq!(fetched.commit, commit);
+    drop(fetched);
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+
+    let mgr = manager("tag");
+    let mut req = request("s-1", &downstream, "feat/x");
+    req.base_branch = Some("v1.0.0".to_owned());
+    let bound = mgr.bind(&req).expect("bind from a tag base");
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+}
+
+#[test]
+fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
+    let upstream = init_repo("clobber-upstream");
+    let downstream = clone_of(&upstream, "clobber-downstream");
+    let main_tip = git_stdout(&downstream, &["rev-parse", "HEAD"]);
+    fs::write(downstream.join("OTHER.md"), "other\n").expect("write file");
+    git_in(&downstream, &["add", "."]);
+    git_in(&downstream, &["commit", "-q", "-m", "other"]);
+    let other_tip = git_stdout(&downstream, &["rev-parse", "HEAD"]);
+
+    // One destination holds an unrelated commit, the other the very commit the
+    // fetch would produce; neither may be touched.
+    for (dest, oid) in [
+        ("refs/pohunek/fetch/taken-other", &other_tip),
+        ("refs/pohunek/fetch/taken-same", &main_tip),
+    ] {
+        git_in(&downstream, &["update-ref", dest, oid]);
+        super::fetch_into_ref(&downstream, "main", dest)
+            .expect_err("an existing destination must fail the fetch");
+        assert_eq!(&git_stdout(&downstream, &["rev-parse", dest]), oid);
+    }
+}
+
 #[test]
 fn second_session_on_same_branch_gets_a_clear_in_use_error() {
     let mgr = manager("same-branch");
