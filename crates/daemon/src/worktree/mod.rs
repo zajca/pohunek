@@ -1462,85 +1462,22 @@ fn run_admin_command(repo: &Path, cmd: Command) -> Result<(), String> {
 }
 
 /// [`run_admin_command`] with an explicit bound on the lock wait.
+///
+/// The lock is held from before git is spawned until git has exited: the admin
+/// entry is complete once the process is gone (hooks run inside it), so reading
+/// its output afterwards needs no lock.
 fn run_admin_command_within(
     repo: &Path,
     cmd: Command,
     lock_timeout: Duration,
 ) -> Result<(), String> {
     let lock = admin_lock(repo)?;
-    let _guard = lock_within(&lock, lock_timeout)?;
-    let output = run_output_via_files(cmd, GIT_COMMAND_TIMEOUT)?;
+    let guard = lock_within(&lock, lock_timeout)?;
+    let output = run_output_bounded_then(cmd, GIT_COMMAND_TIMEOUT, move || drop(guard))?;
     if output.status.success() {
         return Ok(());
     }
     Err(output_failure_message(&output))
-}
-
-/// Largest stdout or stderr a command run by [`run_output_via_files`] returns;
-/// anything beyond is dropped. Git's own diagnostics are a few lines, so this
-/// only limits what a hook writes into the same streams.
-const ADMIN_OUTPUT_CAP_BYTES: u64 = 64 * 1024;
-
-/// Run a command like [`run_output_bounded`], but with stdout and stderr going
-/// to anonymous owner-only temporary files instead of pipes.
-///
-/// A hook may leave a background process that inherits the output descriptors.
-/// With pipes that process holds end-of-stream open and stalls the reader; with
-/// unlinked files it only writes into a file nobody waits on, so the call
-/// returns as soon as git exits, with no reader threads and no signal to any
-/// process. The files are read back once git has exited, truncated to
-/// [`ADMIN_OUTPUT_CAP_BYTES`]. A timeout kills the still-unreaped process
-/// group exactly as [`run_output_bounded`] does.
-///
-/// A surviving descendant can keep appending to its unlinked file, so disk use
-/// is bounded only by that process's own lifetime and the filesystem holding
-/// the temporary directory: the space is released when the last descriptor
-/// closes, and is never read by the daemon.
-fn run_output_via_files(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
-    let stdout = tempfile::tempfile()
-        .map_err(|err| format!("failed to create a temporary file for git output: {err}"))?;
-    let stderr = tempfile::tempfile()
-        .map_err(|err| format!("failed to create a temporary file for git output: {err}"))?;
-    let stdout_reader = stdout
-        .try_clone()
-        .map_err(|err| format!("failed to duplicate the git output file: {err}"))?;
-    let stderr_reader = stderr
-        .try_clone()
-        .map_err(|err| format!("failed to duplicate the git output file: {err}"))?;
-    configure_process_group(&mut cmd);
-    cmd.stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
-    let mut child = cmd
-        .spawn()
-        .map_err(|err| format!("failed to run git: {err}"))?;
-    // Release the parent's copies of the child's descriptors held by `cmd`.
-    drop(cmd);
-
-    let status = match wait_child_with_timeout(&mut child, timeout) {
-        GitOutcome::Exited(status) => status,
-        GitOutcome::TimedOut => {
-            return Err(format!("git command timed out after {timeout:?}"));
-        }
-        GitOutcome::WaitError(err) => {
-            return Err(format!("failed to wait for git: {err}"));
-        }
-    };
-    Ok(Output {
-        status,
-        stdout: read_capped(stdout_reader, "stdout")?,
-        stderr: read_capped(stderr_reader, "stderr")?,
-    })
-}
-
-/// Read at most [`ADMIN_OUTPUT_CAP_BYTES`] from the start of `file`.
-fn read_capped(mut file: fs::File, stream_name: &str) -> Result<Vec<u8>, String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    file.seek(SeekFrom::Start(0))
-        .map_err(|err| format!("failed to rewind git {stream_name}: {err}"))?;
-    let mut buf = Vec::new();
-    file.take(ADMIN_OUTPUT_CAP_BYTES)
-        .read_to_end(&mut buf)
-        .map_err(|err| format!("failed to read git {stream_name}: {err}"))?;
-    Ok(buf)
 }
 
 /// Whether the checkout of `binding` is gone: its directory is absent, and
@@ -2048,7 +1985,20 @@ fn run_command(cmd: Command) -> Result<String, String> {
 /// timeout is `Err`. Callers branch on `Output::status` for command-specific
 /// success/failure semantics (e.g. `session::diff`'s `git diff --no-index`,
 /// which uses exit code 1 to mean "files differ", not "failed").
-pub(crate) fn run_output_bounded(mut cmd: Command, timeout: Duration) -> Result<Output, String> {
+pub(crate) fn run_output_bounded(cmd: Command, timeout: Duration) -> Result<Output, String> {
+    run_output_bounded_then(cmd, timeout, || {})
+}
+
+/// [`run_output_bounded`] that calls `after_exit` as soon as the process has
+/// exited (or been killed on timeout, or its wait failed), before the output
+/// streams are joined. `after_exit` is dropped uncalled when spawning fails.
+///
+// TODO: unbounded output join, see #556
+fn run_output_bounded_then(
+    mut cmd: Command,
+    timeout: Duration,
+    after_exit: impl FnOnce(),
+) -> Result<Output, String> {
     configure_process_group(&mut cmd);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd
@@ -2059,7 +2009,9 @@ pub(crate) fn run_output_bounded(mut cmd: Command, timeout: Duration) -> Result<
     let stdout_reader = thread::spawn(move || read_pipe(stdout));
     let stderr_reader = thread::spawn(move || read_pipe(stderr));
 
-    let status = match wait_child_with_timeout(&mut child, timeout) {
+    let outcome = wait_child_with_timeout(&mut child, timeout);
+    after_exit();
+    let status = match outcome {
         GitOutcome::Exited(status) => status,
         GitOutcome::TimedOut => {
             return Err(format!("git command timed out after {timeout:?}"));
