@@ -557,8 +557,8 @@ fn hook_strategy(document: &str) -> String {
 }
 
 /// A hook runtime that cannot fork.
-fn hook_without_fork(document: String) -> String {
-    hook_strategy(&document).replace(
+fn hook_without_fork(document: &str) -> String {
+    hook_strategy(document).replace(
         "[fork]\nsupported = true\nargs = [\"--fork\", \"{reference}\"]",
         "[fork]\nsupported = false",
     )
@@ -611,7 +611,7 @@ async fn a_resume_override_that_conflicts_with_an_assigned_target_is_refused() {
 async fn a_fork_override_is_refused_when_the_target_cannot_fork() {
     let fixture = Fixture::new("bind-fork-removed");
     let forking = capability_variant("1.0.0", |document| hook_strategy(&document));
-    let plain = capability_variant("2.0.0", hook_without_fork);
+    let plain = capability_variant("2.0.0", |document| hook_without_fork(&document));
     install(&fixture, &forking).await;
     install_with(&fixture, &plain, true, false).await;
     let override_with_fork = format!(
