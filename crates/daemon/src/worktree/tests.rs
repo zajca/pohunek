@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use protocol::{SessionRetentionHold, SessionWarningKind};
 
 use super::{
-    admin_lock, git_command, lock_within, run_admin_command_within, worktree_add_new,
-    worktree_prune,
+    admin_lock, git_command, lock_within, run_admin_command_within, run_output_bounded_with_drain,
+    worktree_add_new, worktree_prune,
 };
 use super::{
     branch_slug, hook_env, is_valid_worktree, run_output_bounded, HookContext, HookEvent,
@@ -795,7 +795,7 @@ fn admin_commands_wait_for_the_repository_lock_before_running_git() {
     cmd.args(["worktree", "add", "-b", "feat/locked", "--end-of-options"])
         .arg(&checkout)
         .arg("main");
-    let message = run_admin_command_within(&repo, cmd, Duration::ZERO)
+    let message = run_admin_command_within(&repo, cmd, Duration::ZERO, TEST_DRAIN_TIMEOUT)
         .expect_err("the held lock keeps the command from running");
 
     assert!(
@@ -807,6 +807,55 @@ fn admin_commands_wait_for_the_repository_lock_before_running_git() {
         "git must not have run while the lock was held"
     );
     drop(held);
+}
+
+/// Drain bound for the lingering-descendant tests: long enough for output to
+/// flush on a loaded host, short enough to keep the tests quick.
+const TEST_DRAIN_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[test]
+fn output_draining_is_bounded_when_a_descendant_keeps_the_pipes_open() {
+    let marker = unique_dir("drain-marker").join("started");
+    let mut cmd = pohunek_test_support::process_env::command("sh");
+    // The background job inherits stdout/stderr and outlives the shell.
+    cmd.arg("-c").arg(format!(
+        "echo partial; (touch '{}'; exec sleep 300) & exit 0",
+        marker.display()
+    ));
+
+    let output = run_output_bounded_with_drain(cmd, TEST_GIT_TIMEOUT, TEST_DRAIN_TIMEOUT)
+        .expect("the command completes despite the lingering descendant");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "partial");
+    assert!(marker.exists(), "the descendant was started");
+}
+
+/// Generous bound on the command itself in the drain tests.
+const TEST_GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[test]
+fn worktree_add_with_a_lingering_hook_descendant_releases_the_repository_lock() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = init_repo("lock-hook");
+    let hooks = repo.join(".git").join("hooks");
+    fs::create_dir_all(&hooks).expect("hooks dir");
+    let hook = hooks.join("post-checkout");
+    fs::write(&hook, "#!/bin/sh\n(exec sleep 300) &\nexit 0\n").expect("write hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+    let checkout = unique_dir("lock-hook-checkout").join("wt");
+    let mut cmd = git_command(&repo).expect("git command");
+    cmd.args(["worktree", "add", "-b", "feat/hook", "--end-of-options"])
+        .arg(&checkout)
+        .arg("main");
+
+    run_admin_command_within(&repo, cmd, TEST_GIT_TIMEOUT, TEST_DRAIN_TIMEOUT)
+        .expect("add succeeds although the hook left a background job");
+
+    assert!(is_valid_worktree(&checkout));
+    let lock = admin_lock(&repo).expect("lock");
+    drop(lock_within(&lock, Duration::ZERO).expect("the lock was released after the add"));
 }
 
 #[test]
