@@ -4,6 +4,7 @@
 // Rust guideline compliant 2026-10-04
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use package::{build_archive, read_archive, ArchiveEntry, Limits, PackageDigest};
@@ -123,6 +124,8 @@ pub(super) fn explicit(
 pub(super) struct Fixture {
     pub(super) dir: PathBuf,
     pub(super) plugins: PathBuf,
+    /// The agents directory the registry loads host profiles from.
+    pub(super) agents: PathBuf,
     pub(super) host: RuntimeHost,
     pub(super) registry: SessionRegistry,
 }
@@ -146,6 +149,13 @@ impl Fixture {
     fn build(tag: &str, anchor: Option<HostTrustAnchor>, store_path: Option<PathBuf>) -> Self {
         let dir = temp_dir(tag);
         let plugins = dir.join("plugins");
+        let agents = dir.join("agents");
+        let state = dir.join("state");
+        for private in [&agents, &state] {
+            fs::create_dir_all(private).expect("create a private fixture directory");
+            fs::set_permissions(private, fs::Permissions::from_mode(0o700))
+                .expect("secure a fixture directory");
+        }
         let host = RuntimeHost::with_packages(
             BuiltinSource::new("/bin/sh"),
             PackageSource::new(PackageStore::open(&plugins).expect("the store opens")),
@@ -157,6 +167,8 @@ impl Fixture {
                 stop_grace: std::time::Duration::from_millis(50),
                 store_path,
                 catalog_trust_anchor: anchor,
+                agents_dir: Some(agents.clone()),
+                host_state_dir: Some(state),
                 ..SessionRegistryConfig::default()
             },
             host.clone(),
@@ -164,6 +176,7 @@ impl Fixture {
         Self {
             dir,
             plugins,
+            agents,
             host,
             registry,
         }
@@ -175,6 +188,14 @@ impl Fixture {
         let path = self.dir.join(name);
         fs::write(&path, bytes).expect("write the fixture file");
         path.to_str().expect("utf-8 path").to_owned()
+    }
+
+    /// Writes the host profile `name` with `text`, owner-private.
+    pub(super) fn write_profile(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.agents.join(format!("{name}.toml"));
+        fs::write(&path, text).expect("write the profile");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("secure the profile");
+        path
     }
 
     /// Writes the archive of `package` and returns its path.

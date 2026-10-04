@@ -128,26 +128,39 @@ one state:
   `package`, or `digest`.
 
 `pohunek plugin profile migrate <name> [--digest <d>] [--yes] [--json]` pins
-the profile. The target is the installed package with the given digest (the full
+the profile through the daemon's `package.bind_profile` method; the command
+never writes the file. The daemon applies the pin under the same exclusive
+package lifecycle authority as install, select and uninstall, so a concurrent
+uninstall of the target either runs first (the bind then fails with
+`package_profile_target_invalid`) or is refused with `package_referenced`.
+The target is the installed package with the given digest (the full
 `sha256:<64 hex>` or a unique prefix of at least 12 hex characters), which must
-serve the profile's base. Without `--digest` it is the one selected, enabled
-package serving the base; none or several is an error, never a guess, and a
-faulted package is refused. The command prints the profile, base, package
-version, digest, and current pin and changes nothing until repeated with
-`--yes` (`consent_required` otherwise). It refuses a profile whose base no
-installed package serves (`profile_base_builtin`) and reports `unchanged` with
-exit status 0 when the profile already pins the target.
+serve the profile's base and load without a fault. Without `--digest` it is the
+one selected, enabled package serving the base; none or several is an error,
+never a guess. The command first asks the daemon for a dry run, prints the
+profile, base, package version, digest, and current pin, and changes nothing
+until repeated with `--yes` (`consent_required` otherwise); the consented call
+names the digest the preview showed. A base served by a built-in is refused
+(`package_profile_base_builtin`), as are a missing profile
+(`package_profile_not_found`), one the daemon cannot accept as a profile file
+(`package_profile_unusable`: symlink, hard link, wrong owner, group- or
+world-writable, too large, not valid TOML) and one edited while the bind ran
+(`package_profile_changed`). A profile that already pins the target is reported
+as `unchanged` with exit status 0 and is not written.
 
 Only the `package` and `digest` keys are rewritten: existing ones are updated in
 place, missing ones are inserted directly after `base`, and every other byte of
-the file (comments, `[env]` values, ordering) is kept. The write is atomic: the
-new file is created exclusively in the same directory, synchronized, and renamed
-over the original, which is displaced aside first so a profile edited since it
-was read is detected instead of overwritten, and is removed only after the
-rewritten file re-reads and verifies. The new file keeps the original mode
-narrowed to at most `0600`. Profiles can hold secret `[env]` values, so no
-command prints file content or values; a parse failure is reported as a line
-number and message only.
+the file (comments, `[env]` values, ordering) is kept. The daemon reads the
+profile with the same loader that serves launches and the retention scan, writes
+the new text to a temporary file in the agents directory (mode narrowed to at
+most `0600`), and renames it over `<name>.toml`: the name resolves to either the
+old or the new complete file at every instant, with no interval in which the
+profile is missing. Immediately before the rename the file is compared with what
+was read and a changed profile is left as found. A temporary left by an
+interrupted run never ends in `.toml`, is never loaded, and is removed by the
+next bind. Profiles can hold secret `[env]` values, so nothing prints file
+content or values; a parse failure is reported as a line number and message
+only.
 
 The commands work on this machine only (`--host` is rejected) and need the
 agents directory to be owned by you and not group- or world-writable. A

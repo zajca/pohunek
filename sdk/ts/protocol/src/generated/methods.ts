@@ -30,6 +30,8 @@ import type {
   NotificationRetentionResult,
   NotificationUpdateParams,
   NotificationUpdateResult,
+  PackageBindProfileParams,
+  PackageBindProfileResult,
   PackageChangeResult,
   PackageDoctorParams,
   PackageDoctorResult,
@@ -124,6 +126,7 @@ export interface Methods {
   "notification.policy.set": { params: NotificationPolicyParams; output: NotificationPolicyResult };
   "notification.retention.prune": { params: NotificationRetentionParams; output: NotificationRetentionResult };
   "notification.update": { params: NotificationUpdateParams; output: NotificationUpdateResult };
+  "package.bind_profile": { params: PackageBindProfileParams; output: PackageBindProfileResult };
   "package.doctor": { params: PackageDoctorParams; output: PackageDoctorResult };
   "package.inspect": { params: PackageInspectParams; output: PackageInspectResult };
   "package.install": { params: PackageInstallParams; output: PackageInstallResult };

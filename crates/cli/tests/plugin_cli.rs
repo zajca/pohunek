@@ -720,15 +720,49 @@ fn pinned_text(digest: &str) -> String {
     )
 }
 
-/// A daemon serving `acme-pi` through one selected package.
-fn daemon_serving_pi(method: &str, _params: &Value) -> Value {
+/// A daemon serving `acme-pi` through one selected package; `package.bind_profile`
+/// previews on a dry run and binds otherwise.
+fn daemon_serving_pi(method: &str, params: &Value) -> Value {
     match method {
         "package.list" => json!({
             "generation": 2,
             "packages": [package("acme.pi", "1.0.0", DIGEST_NEW, true)]
         }),
+        "package.bind_profile" => bind_result(
+            if params["dry_run"] == true {
+                "preview"
+            } else {
+                "bound"
+            },
+            params,
+        ),
         other => panic!("unexpected method {other}"),
     }
+}
+
+/// A daemon whose profile already pins the selected package.
+fn daemon_with_pinned_profile(method: &str, params: &Value) -> Value {
+    match method {
+        "package.bind_profile" => {
+            let mut result = bind_result("unchanged", params);
+            result["previous"] = json!(DIGEST_NEW);
+            result["reloaded"] = json!(false);
+            result
+        }
+        other => panic!("unexpected method {other}"),
+    }
+}
+
+/// The `package.bind_profile` result for the profile named in `params`.
+fn bind_result(status: &str, params: &Value) -> Value {
+    json!({
+        "status": status,
+        "profile": params["profile"],
+        "base": "acme-pi",
+        "package": package("acme.pi", "1.0.0", DIGEST_NEW, true),
+        "runtime": runtime(),
+        "reloaded": status == "bound"
+    })
 }
 
 fn assert_no_secret(output: &Output) {
@@ -813,7 +847,7 @@ fn profile_list_without_an_agents_directory_is_empty() {
 }
 
 #[test]
-fn profile_migrate_without_yes_previews_and_changes_nothing() {
+fn profile_migrate_without_yes_asks_the_daemon_for_a_preview_only() {
     let fixture = Fixture::new();
     let path = fixture.profile("work", &profile_text(), 0o600);
     let daemon = fixture.serve(daemon_serving_pi);
@@ -839,11 +873,20 @@ fn profile_migrate_without_yes_previews_and_changes_nothing() {
     assert_eq!(stdout_json(&output)["err"]["code"], "consent_required");
 
     assert_eq!(fs::read_to_string(&path).expect("read"), profile_text());
-    assert_eq!(methods(&daemon.finish()), ["package.list", "package.list"]);
+    let recorded = daemon.finish();
+    assert_eq!(
+        methods(&recorded),
+        ["package.bind_profile", "package.bind_profile"]
+    );
+    for (_, params) in &recorded {
+        assert_eq!(params["profile"], "work");
+        assert_eq!(params["dry_run"], true);
+        assert!(params.get("digest").is_none(), "{params}");
+    }
 }
 
 #[test]
-fn profile_migrate_rewrites_only_the_pin_and_is_idempotent() {
+fn profile_migrate_with_yes_binds_through_the_daemon_and_never_writes_the_file() {
     let fixture = Fixture::new();
     let path = fixture.profile("work", &profile_text(), 0o600);
     let daemon = fixture.serve(daemon_serving_pi);
@@ -852,48 +895,67 @@ fn profile_migrate_rewrites_only_the_pin_and_is_idempotent() {
     assert!(output.status.success(), "{}", stderr_text(&output));
     assert_no_secret(&output);
     let document = stdout_json(&output);
-    assert_eq!(document["ok"]["status"], "migrated");
-    assert_eq!(document["ok"]["digest"], DIGEST_NEW);
-    assert_eq!(document["ok"]["package"], "acme.pi");
+    assert_eq!(document["ok"]["status"], "bound");
+    assert_eq!(document["ok"]["package"]["digest"], DIGEST_NEW);
+    assert_eq!(document["ok"]["profile"], "work");
     assert_eq!(document["ok"]["base"], "acme-pi");
-    assert_eq!(
-        fs::read_to_string(&path).expect("read"),
-        pinned_text(DIGEST_NEW)
-    );
-    assert_eq!(
-        fs::metadata(&path).expect("metadata").permissions().mode() & 0o7777,
-        0o600
-    );
 
     let output = fixture.run(&["plugin", "profile", "migrate", "work", "--yes"]);
     assert!(output.status.success(), "{}", stderr_text(&output));
-    assert_no_secret(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Pinned profile work to acme.pi"));
+
+    // The daemon owns the rewrite: the command leaves the file alone.
+    assert_eq!(fs::read_to_string(&path).expect("read"), profile_text());
+    let recorded = daemon.finish();
+    assert_eq!(
+        methods(&recorded),
+        [
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.bind_profile"
+        ]
+    );
+    // The consented call names the digest the preview announced.
+    for pair in recorded.chunks(2) {
+        assert_eq!(pair[0].1["dry_run"], true);
+        assert_eq!(pair[1].1["dry_run"], false);
+        assert_eq!(pair[1].1["digest"], DIGEST_NEW);
+        assert_eq!(pair[1].1["profile"], "work");
+    }
+}
+
+#[test]
+fn profile_migrate_reports_an_already_pinned_profile_without_consent() {
+    let fixture = Fixture::new();
+    fixture.profile("work", &pinned_text(DIGEST_NEW), 0o600);
+    let daemon = fixture.serve(daemon_with_pinned_profile);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
     assert!(String::from_utf8_lossy(&output.stdout).contains("nothing changed"));
     let output = fixture.run(&["plugin", "profile", "migrate", "work", "--json"]);
     assert!(output.status.success(), "{}", stderr_text(&output));
     assert_eq!(stdout_json(&output)["ok"]["status"], "unchanged");
+
+    let recorded = daemon.finish();
     assert_eq!(
-        fs::read_to_string(&path).expect("read"),
-        pinned_text(DIGEST_NEW)
+        methods(&recorded),
+        ["package.bind_profile", "package.bind_profile"]
     );
-    let names: Vec<_> = fs::read_dir(fixture.agents_dir())
-        .expect("read directory")
-        .map(|entry| entry.expect("entry").file_name())
-        .collect();
-    assert_eq!(names, ["work.toml"], "no staging file remains");
-    // Migration talks to the daemon only to list packages.
-    assert!(methods(&daemon.finish())
-        .iter()
-        .all(|m| *m == "package.list"));
+    assert!(recorded.iter().all(|(_, params)| params["dry_run"] == true));
 }
 
 #[test]
-fn profile_migrate_moves_an_old_pin_only_when_asked() {
+fn profile_migrate_passes_a_full_digest_and_resolves_a_prefix_through_the_package_list() {
     let fixture = Fixture::new();
-    let old = pinned_text(DIGEST_OLD);
-    let path = fixture.profile("work", &old, 0o600);
+    fixture.profile("work", &profile_text(), 0o600);
     let daemon = fixture.serve(daemon_serving_pi);
 
+    let output = fixture.run(&[
+        "plugin", "profile", "migrate", "work", "--digest", DIGEST_NEW, "--yes",
+    ]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
     let output = fixture.run(&[
         "plugin",
         "profile",
@@ -904,13 +966,9 @@ fn profile_migrate_moves_an_old_pin_only_when_asked() {
         "--yes",
     ]);
     assert!(output.status.success(), "{}", stderr_text(&output));
-    assert_no_secret(&output);
-    assert_eq!(
-        fs::read_to_string(&path).expect("read"),
-        old.replace(DIGEST_OLD, DIGEST_NEW)
-    );
 
-    // A digest that is not installed never resolves.
+    // A prefix of a digest that is not installed never reaches the daemon's
+    // bind.
     let output = fixture.run(&[
         "plugin",
         "profile",
@@ -926,41 +984,21 @@ fn profile_migrate_moves_an_old_pin_only_when_asked() {
         stdout_json(&output)["err"]["code"],
         "profile_target_invalid"
     );
-    drop(daemon.finish());
-}
 
-#[test]
-fn profile_migrate_refuses_unusable_profiles_and_targets() {
-    let fixture = Fixture::new();
-    let real = fixture.profile("real", &profile_text(), 0o600);
-    std::os::unix::fs::symlink(&real, fixture.agents_dir().join("link.toml")).expect("symlink");
-    fixture.profile("loose", &profile_text(), 0o660);
-    fixture.profile("shell", "base = \"shell\"\n", 0o600);
-    fixture.profile(
-        "broken",
-        &format!("base = \"acme-pi\"\n[env]\nTOKEN = {SENTINEL}\n"),
-        0o600,
-    );
-    let daemon = fixture.serve(daemon_serving_pi);
-    let cases = [
-        ("link", "profile_unusable"),
-        ("loose", "profile_unusable"),
-        ("broken", "profile_unusable"),
-        ("shell", "profile_base_builtin"),
-        ("absent", "profile_not_found"),
-    ];
-    for (name, code) in cases {
-        let output = fixture.run(&["plugin", "profile", "migrate", name, "--yes", "--json"]);
-        assert_eq!(output.status.code(), Some(1), "{name}");
-        assert_no_secret(&output);
-        assert_eq!(stdout_json(&output)["err"]["code"], code, "{name}");
-    }
-    assert_eq!(fs::read_to_string(&real).expect("read"), profile_text());
+    let recorded = daemon.finish();
     assert_eq!(
-        fs::read_to_string(fixture.agents_dir().join("loose.toml")).expect("read"),
-        profile_text()
+        methods(&recorded),
+        [
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.list",
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.list",
+        ]
     );
-    drop(daemon.finish());
+    assert_eq!(recorded[0].1["digest"], DIGEST_NEW);
+    assert_eq!(recorded[3].1["digest"], DIGEST_NEW);
 }
 
 #[test]
@@ -974,25 +1012,19 @@ fn profile_migrate_rejects_invalid_names_before_any_io() {
 }
 
 #[test]
-fn profile_commands_refuse_an_unsafe_agents_directory() {
+fn profile_list_refuses_an_unsafe_agents_directory() {
     let fixture = Fixture::new();
     fixture.profile("work", &profile_text(), 0o600);
     fs::set_permissions(fixture.agents_dir(), fs::Permissions::from_mode(0o770))
         .expect("loosen directory");
     let daemon = fixture.serve(daemon_serving_pi);
-    for arguments in [
-        vec!["plugin", "profile", "list", "--json"],
-        vec!["plugin", "profile", "migrate", "work", "--yes", "--json"],
-    ] {
-        let output = fixture.run(&arguments);
-        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
-        assert_no_secret(&output);
-        assert_eq!(
-            stdout_json(&output)["err"]["code"],
-            "profile_directory_unusable",
-            "{arguments:?}"
-        );
-    }
+    let output = fixture.run(&["plugin", "profile", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_no_secret(&output);
+    assert_eq!(
+        stdout_json(&output)["err"]["code"],
+        "profile_directory_unusable"
+    );
     drop(daemon.finish());
     fs::set_permissions(
         fixture.agents_dir(),

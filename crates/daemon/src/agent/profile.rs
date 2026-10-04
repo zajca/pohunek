@@ -991,6 +991,9 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
     )
 }
 
+mod bind;
+pub(crate) use bind::{apply_pin, check_structure, parse_head, BindError, Pin};
+
 #[cfg(test)]
 mod pin_tests;
 

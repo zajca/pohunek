@@ -1279,16 +1279,41 @@ impl TrustedDir {
     ///
     /// Returns [`AtomicReplaceError::BeforeCommit`] before rename, or
     /// [`AtomicReplaceError::CommittedDurabilityUncertain`] after rename.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the write, identity revalidation, commit boundary, and inode-safe cleanup form one auditable transaction"
-    )]
     pub fn replace_file(
         &self,
         destination: impl AsRef<OsStr>,
         temporary: impl AsRef<OsStr>,
         contents: &[u8],
         mode: u32,
+    ) -> Result<(), AtomicReplaceError> {
+        self.replace_file_checked(destination, temporary, contents, mode, || Ok(()))
+    }
+
+    /// Atomically replaces one owner-private regular file after a last check.
+    ///
+    /// Behaves as [`Self::replace_file`], and runs `precommit` once the
+    /// temporary file is written and synchronized, immediately before the
+    /// destination is revalidated and the rename activates the replacement. An
+    /// error from `precommit` is a [`AtomicReplaceError::BeforeCommit`]: the
+    /// destination is untouched and the temporary file is removed. The
+    /// destination name resolves to either the old or the new complete file at
+    /// every instant; there is no interval in which it is missing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AtomicReplaceError::BeforeCommit`] before rename, or
+    /// [`AtomicReplaceError::CommittedDurabilityUncertain`] after rename.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the write, identity revalidation, commit boundary, and inode-safe cleanup form one auditable transaction"
+    )]
+    pub fn replace_file_checked(
+        &self,
+        destination: impl AsRef<OsStr>,
+        temporary: impl AsRef<OsStr>,
+        contents: &[u8],
+        mode: u32,
+        precommit: impl FnOnce() -> FsResult<()>,
     ) -> Result<(), AtomicReplaceError> {
         validate_mode(mode).map_err(AtomicReplaceError::BeforeCommit)?;
         let destination =
@@ -1373,7 +1398,9 @@ impl TrustedDir {
                 return Err(AtomicReplaceError::BeforeCommit(error));
             }
         };
-        let activation = if let Some(expected) = destination_identity {
+        let activation = if let Err(error) = precommit() {
+            Err(error)
+        } else if let Some(expected) = destination_identity {
             match inspect_entry(
                 &self.file,
                 &destination_path,
@@ -4393,6 +4420,46 @@ mod tests {
             b"new"
         );
         assert!(!temporary.path().join(".record.next").exists());
+    }
+
+    #[test]
+    fn a_refusing_precommit_check_leaves_the_destination_and_removes_the_temporary() {
+        let (temporary, trusted) = trusted_root();
+        trusted
+            .replace_file("record", ".record.initial", b"old", FILE_MODE)
+            .expect("install initial record");
+
+        let refused =
+            trusted.replace_file_checked("record", ".record.next", b"new", FILE_MODE, || {
+                Err(FsError::IdentityChanged {
+                    path: PathBuf::from("record"),
+                })
+            });
+
+        assert!(matches!(
+            refused,
+            Err(AtomicReplaceError::BeforeCommit(
+                FsError::IdentityChanged { .. }
+            ))
+        ));
+        assert_eq!(
+            fs::read(temporary.path().join("record")).expect("read record"),
+            b"old"
+        );
+        assert!(!temporary.path().join(".record.next").exists());
+
+        let ran = std::cell::Cell::new(false);
+        trusted
+            .replace_file_checked("record", ".record.next", b"new", FILE_MODE, || {
+                ran.set(true);
+                Ok(())
+            })
+            .expect("an accepting check lets the replacement commit");
+        assert!(ran.get());
+        assert_eq!(
+            fs::read(temporary.path().join("record")).expect("read record"),
+            b"new"
+        );
     }
 
     #[test]

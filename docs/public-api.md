@@ -471,6 +471,7 @@ All params and result type names below refer to structs exported by
 | `package.set_enabled` | `PackageSetEnabledParams` | `PackageChangeResult` | Local-only. Enables or disables an installed package for fresh launches. |
 | `package.select` | `PackageSelectParams` | `PackageChangeResult` | Local-only. Selects the installed version bare requests of its package id resolve to. |
 | `package.uninstall` | `PackageUninstallParams` | `PackageUninstallResult` | Local-only. Removes an installed package that no session or host profile pins. |
+| `package.bind_profile` | `PackageBindProfileParams` | `PackageBindProfileResult` | Local-only. Pins a host agent profile to an installed package under the package lifecycle authority, or previews the change with `dry_run`. |
 
 `status` exists as a method constant in `crates/protocol` but is not a supported
 daemon method in this API version. It returns `daemon/method_not_found`.
@@ -548,6 +549,7 @@ Shared payloads:
 | `package.set_enabled` | `{digest, enabled}` | `{package, reloaded}` | Disabling blocks fresh launches only; a session already pinned to the digest still resumes. Enabling first proves the package root verifies and the package may serve its runtime id, so it cannot create a runtime id conflict. |
 | `package.select` | `{digest}` | `{package, reloaded}` | Bare requests of the package id resolve to this version afterwards. The same root and runtime id checks as enabling apply. |
 | `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest. `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
+| `package.bind_profile` | `{profile, digest?, dry_run}` | `{status, profile, base, previous?, package, runtime, reloaded}` | `profile` is the file name under the agents directory without `.toml`. With `digest` the installed package of that digest must serve the profile's base runtime and load without a fault; without it the target is the one selected, enabled package serving the base. Only the `package` and `digest` keys are rewritten, every other byte is kept, and the new file replaces the old with one `rename(2)` so the profile name never stops resolving; a profile edited after it was read is left as found. `status` is `preview` (dry run, the pin would change), `bound` or `unchanged` (already pinned; nothing written). `previous` is the digest pinned before. `reloaded` is `true` only for `bound`: profile files are read at every resolution, so the pin is live at once. Runs under the same exclusive authority as `package.uninstall`, so an uninstall of the target either precedes the bind (`package_profile_target_invalid`) or is refused with `package_referenced`. |
 
 Install and link validate the package in memory before anything is extracted:
 `runtime.toml` is parsed from the verified archive, and the package identity
@@ -601,6 +603,11 @@ Errors use the error contract below. Every code has fixed message and
 | `package_registry_failed` | `runtime` | The package registry or its storage failed. |
 | `package_limit_reached` | `runtime` | The registry holds the maximum number of packages. |
 | `package_reload_failed` | `daemon` | The change was committed but the runtime registry was not rebuilt. |
+| `package_profile_not_found` | `runtime` | The host has no agent profile of that name. |
+| `package_profile_unusable` | `runtime` | The profile fails the daemon's profile acceptance rule, is a symbolic or hard link, or is not valid TOML. |
+| `package_profile_base_builtin` | `runtime` | The profile's base runtime is served by a built-in, so there is no package to pin. |
+| `package_profile_target_invalid` | `runtime` | The package is not installed, is faulted, does not serve the base runtime, or is not the unique selected package. |
+| `package_profile_changed` | `runtime` | The profile changed while it was being rewritten and was left as found. |
 
 ### Daemon Runtime Configuration
 

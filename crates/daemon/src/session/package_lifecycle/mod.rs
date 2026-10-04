@@ -15,6 +15,7 @@
 
 // Rust guideline compliant 2026-10-04
 
+mod bind;
 mod error;
 mod fault;
 mod source;
@@ -807,6 +808,8 @@ fn commit_install(
     })
 }
 
+#[cfg(test)]
+mod bind_tests;
 #[cfg(test)]
 mod catalog_tests;
 #[cfg(test)]

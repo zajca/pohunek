@@ -294,6 +294,65 @@ pub struct PackageUninstallResult {
     pub reloaded: bool,
 }
 
+/// Parameters for `package.bind_profile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PackageBindProfileParams.ts"))]
+pub struct PackageBindProfileParams {
+    /// Name of the host agent profile: its file name under the agents
+    /// directory without `.toml`.
+    pub profile: String,
+    /// The installed package to pin; it must serve the profile's base runtime
+    /// and load without a fault. Absent means the selected, enabled package
+    /// that serves the base runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub digest: Option<PackageDigest>,
+    /// Validate and report without changing the profile.
+    pub dry_run: bool,
+}
+
+/// What a profile bind did to the profile file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PackageBindStatus.ts"))]
+pub enum PackageBindStatus {
+    /// A dry run: the pin would change and nothing was written.
+    Preview,
+    /// The profile now pins the package.
+    Bound,
+    /// The profile already pinned the package; nothing was written.
+    Unchanged,
+}
+
+/// Result of `package.bind_profile`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PackageBindProfileResult.ts"))]
+pub struct PackageBindProfileResult {
+    /// What the call did.
+    pub status: PackageBindStatus,
+    /// The profile name.
+    pub profile: String,
+    /// The base runtime the profile extends.
+    pub base: RuntimeId,
+    /// The digest the profile pinned before the call; absent when it pinned
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub previous: Option<PackageDigest>,
+    /// The package the profile pins afterwards (or would pin, for a preview).
+    pub package: PackageInfo,
+    /// What the package's runtime descriptor declares.
+    pub runtime: PackageRuntimeInfo,
+    /// Whether the new pin is live. The daemon reads profile files at every
+    /// resolution, so a bound profile takes effect at once; a preview and an
+    /// unchanged profile report `false`.
+    pub reloaded: bool,
+}
+
 /// Result of `package.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -440,6 +499,20 @@ pub enum PackageErrorKind {
     LimitReached,
     /// The change was committed but the runtime registry was not rebuilt.
     ReloadFailed,
+    /// The host has no agent profile of the requested name.
+    ProfileNotFound,
+    /// The profile cannot be rewritten: it fails the daemon's profile
+    /// acceptance rule, is a symbolic or hard link, or is not valid TOML.
+    ProfileUnusable,
+    /// The profile's base runtime is served by a built-in, so there is no
+    /// package to pin.
+    ProfileBaseBuiltin,
+    /// The requested package cannot be pinned by the profile: it is not
+    /// installed, is faulted, does not serve the base runtime, or no unique
+    /// selected package serves it.
+    ProfileTargetInvalid,
+    /// The profile changed while it was being rewritten and was left as found.
+    ProfileChanged,
 }
 
 impl PackageErrorKind {
@@ -466,6 +539,11 @@ impl PackageErrorKind {
             Self::RegistryFailed => "package_registry_failed",
             Self::LimitReached => "package_limit_reached",
             Self::ReloadFailed => "package_reload_failed",
+            Self::ProfileNotFound => "package_profile_not_found",
+            Self::ProfileUnusable => "package_profile_unusable",
+            Self::ProfileBaseBuiltin => "package_profile_base_builtin",
+            Self::ProfileTargetInvalid => "package_profile_target_invalid",
+            Self::ProfileChanged => "package_profile_changed",
         }
     }
 
@@ -500,6 +578,19 @@ impl PackageErrorKind {
             Self::ReloadFailed => {
                 "the change was committed but the runtime registry was not rebuilt"
             }
+            Self::ProfileNotFound => "the host has no agent profile of that name",
+            Self::ProfileUnusable => {
+                "the agent profile cannot be rewritten: it fails the profile acceptance rule or is not valid TOML"
+            }
+            Self::ProfileBaseBuiltin => {
+                "the profile's base runtime is served by a built-in, so there is no package to pin"
+            }
+            Self::ProfileTargetInvalid => {
+                "the package cannot be pinned by the profile: it is not installed, is faulted, does not serve the base runtime, or is not the unique selected package"
+            }
+            Self::ProfileChanged => {
+                "the agent profile changed while it was being rewritten and was left as found"
+            }
         }
     }
 
@@ -526,6 +617,15 @@ impl PackageErrorKind {
             Self::RegistryFailed => "run the package doctor and check the state directory",
             Self::LimitReached => "uninstall packages that are no longer needed",
             Self::ReloadFailed => "run the package doctor, then retry or restart the daemon",
+            Self::ProfileNotFound => "list the profiles with `pohunek plugin profile list`",
+            Self::ProfileUnusable => {
+                "make the profile a regular owner-private TOML file with a valid base, then retry"
+            }
+            Self::ProfileBaseBuiltin => "a profile on a built-in base needs no package pin",
+            Self::ProfileTargetInvalid => {
+                "install, enable and select a package that serves the base runtime, or pass the digest of one"
+            }
+            Self::ProfileChanged => "run the command again to review the profile as it is now",
         }
     }
 
@@ -595,6 +695,33 @@ mod tests {
     }
 
     #[test]
+    fn bind_profile_params_reject_unknown_fields_and_missing_flags() {
+        let ok = serde_json::json!({ "profile": "work", "dry_run": true });
+        let parsed =
+            serde_json::from_value::<PackageBindProfileParams>(ok.clone()).expect("no digest");
+        assert_eq!(parsed.digest, None);
+        let mut with_digest = ok.clone();
+        with_digest["digest"] = serde_json::json!(digest());
+        let parsed = serde_json::from_value::<PackageBindProfileParams>(with_digest.clone())
+            .expect("with digest");
+        assert_eq!(parsed.digest, Some(digest()));
+        assert_eq!(
+            serde_json::to_value(&parsed).expect("serialize"),
+            with_digest
+        );
+        let mut extra = ok.clone();
+        extra["path"] = serde_json::json!("/x");
+        serde_json::from_value::<PackageBindProfileParams>(extra).expect_err("rejected");
+        let mut missing = ok;
+        missing.as_object_mut().expect("object").remove("dry_run");
+        serde_json::from_value::<PackageBindProfileParams>(missing).expect_err("rejected");
+        assert_eq!(
+            serde_json::to_value(PackageBindStatus::Unchanged).expect("serialize"),
+            "unchanged"
+        );
+    }
+
+    #[test]
     fn error_codes_are_unique_and_convert_with_recovery() {
         use std::collections::BTreeSet;
         let kinds = [
@@ -617,6 +744,11 @@ mod tests {
             PackageErrorKind::RegistryFailed,
             PackageErrorKind::LimitReached,
             PackageErrorKind::ReloadFailed,
+            PackageErrorKind::ProfileNotFound,
+            PackageErrorKind::ProfileUnusable,
+            PackageErrorKind::ProfileBaseBuiltin,
+            PackageErrorKind::ProfileTargetInvalid,
+            PackageErrorKind::ProfileChanged,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());

@@ -766,12 +766,58 @@ async fn an_unpinned_profile_migrates_to_the_installed_package() {
         .json(&["plugin", "profile", "migrate", "work", "--yes"])
         .await;
     assert_eq!(code, 0, "{migrated}");
-    assert_eq!(migrated["ok"]["status"], "migrated");
+    assert_eq!(migrated["ok"]["status"], "bound");
     let text = fs::read_to_string(&path).expect("read the profile");
     assert!(text.contains(built.digest.as_str()), "{text}");
     let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
     assert_eq!(code, 0, "{listed}");
     assert_eq!(listed["ok"]["profiles"][0]["state"], "pinned");
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn profile_migrate_maps_the_daemon_refusals_and_leaves_profiles_untouched() {
+    let harness = Harness::start().await;
+    let built = harness.archive("1.0.0");
+    install_enabled(&harness, &built).await;
+    let real = harness.profile("real", &format!("base = \"{RUNTIME}\"\n"));
+    std::os::unix::fs::symlink(&real, harness.agents.join("link.toml")).expect("symlink");
+    let loose = harness.profile("loose", &format!("base = \"{RUNTIME}\"\n"));
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o660)).expect("loosen");
+    harness.profile("broken", "base = \"pi\"\n[env]\nTOKEN = oops\n");
+    harness.profile("shell", "base = \"shell\"\n");
+    let cases = [
+        ("link", "package_profile_unusable"),
+        ("loose", "package_profile_unusable"),
+        ("broken", "package_profile_unusable"),
+        ("shell", "package_profile_base_builtin"),
+        ("absent", "package_profile_not_found"),
+    ];
+    for (name, code) in cases {
+        let (exit, document) = harness
+            .json(&["plugin", "profile", "migrate", name, "--yes"])
+            .await;
+        assert_eq!(exit, 1, "{name}: {document}");
+        assert_eq!(document["err"]["code"], code, "{name}");
+    }
+    let (exit, document) = harness
+        .json(&[
+            "plugin",
+            "profile",
+            "migrate",
+            "real",
+            "--digest",
+            &format!("sha256:{}", "0".repeat(64)),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(exit, 1, "{document}");
+    assert_eq!(document["err"]["code"], "package_profile_target_invalid");
+    assert_eq!(
+        fs::read_to_string(&real).expect("read"),
+        format!("base = \"{RUNTIME}\"\n")
+    );
 
     harness.stop().await;
 }

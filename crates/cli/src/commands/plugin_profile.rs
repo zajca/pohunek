@@ -3,27 +3,29 @@
 //! A host agent profile (`<config_dir>/agents/<name>.toml`) extends a base
 //! runtime. When an installed package serves that runtime, the profile must
 //! carry an explicit `package` and `digest` pin. A profile moves to another
-//! digest only through `migrate`, which rewrites exactly those two keys and
-//! leaves every other byte of the file alone.
+//! digest only through `migrate`, which asks the daemon to rewrite exactly
+//! those two keys under its package lifecycle authority; this command never
+//! writes the file itself. `list` is informational: it reads the files with its
+//! own reader, and the daemon decides what a profile resolves to.
 //!
 //! Profile files can hold secret `[env]` values. Nothing here deserializes
 //! `[env]`, prints file content, or echoes a parse error's source line: a
 //! diagnostic names a key or a line number only.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use clap::{Args, Subcommand};
-use pohunek_platform::filesystem::{
-    DestinationExpectation, DisplacingReplaceError, EntryIdentity, EntryKind, FsError, StagedEntry,
-    TrustedDir,
+use pohunek_platform::filesystem::{EntryKind, FsError, TrustedDir};
+use protocol::{
+    method, PackageBindProfileParams, PackageBindProfileResult, PackageBindStatus, PackageDigest,
+    PackageId, PackageInfo, RuntimeId,
 };
-use protocol::{PackageDigest, PackageId, PackageInfo, PackageVersion, RuntimeId};
 use serde::Serialize;
-use toml_edit::{DocumentMut, Item, TomlError, Value};
+use toml_edit::{DocumentMut, TomlError};
 
 use super::plugin::{
     list, print_output, render_table, sanitize, short_digest, state_label, summary, DigestSelector,
@@ -59,26 +61,11 @@ pub(crate) const MAX_PROFILE_ENTRIES: usize = 1024;
 /// file from exhausting memory before it is parsed.
 const MAX_PROFILE_BYTES: usize = 1 << 20;
 
-/// Permission bits a rewritten profile may keep.
-///
-/// A profile can hold secret `[env]` values, so the rewrite never leaves it
-/// readable or writable by anyone but its owner, even if the original was.
-const REWRITE_MODE_CEILING: u32 = 0o600;
-
 /// Permission bits that let another account modify a file.
 const OTHERS_WRITE_BITS: u32 = 0o022;
 
 /// Permission bits of a file mode.
 const MODE_BITS: u32 = 0o7777;
-
-/// Prefix of the temporary file a rewrite stages.
-///
-/// It has no `.toml` extension and starts with a dot, so neither the daemon's
-/// profile enumeration nor `profile list` can mistake it for a profile.
-const TEMPORARY_PREFIX: &str = ".pohunek-profile-migrate-";
-
-/// Random bytes in a temporary file name.
-const TEMPORARY_RANDOM_BYTES: usize = 16;
 
 /// `pohunek plugin profile` subcommands.
 #[derive(Debug, Subcommand)]
@@ -96,8 +83,8 @@ pub(crate) enum ProfileAction {
         json: bool,
     },
 
-    /// Pin a profile to an installed package, rewriting only its `package`
-    /// and `digest` keys.
+    /// Pin a profile to an installed package; the daemon rewrites only its
+    /// `package` and `digest` keys.
     ///
     /// Without `--digest` the profile moves to the selected, enabled package
     /// that serves its base runtime. Nothing is rewritten until you repeat the
@@ -183,28 +170,12 @@ pub(crate) fn profile_names(agents_dir: &Path) -> Vec<String> {
     names
 }
 
-/// The explicit pin a profile carries for a package-served base runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Pin {
-    package: PackageId,
-    digest: PackageDigest,
-}
-
 /// The keys of a profile the commands read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProfileHead {
     base: RuntimeId,
     package: Option<PackageId>,
     digest: Option<PackageDigest>,
-}
-
-impl ProfileHead {
-    fn pin(&self) -> Option<Pin> {
-        Some(Pin {
-            package: self.package.clone()?,
-            digest: self.digest.clone()?,
-        })
-    }
 }
 
 /// Describe a TOML parse failure by message and line only.
@@ -256,75 +227,6 @@ fn string_key<'a>(document: &'a DocumentMut, key: &str) -> Result<Option<&'a str
             .map(Some)
             .ok_or_else(|| format!("`{key}` must be a string")),
     }
-}
-
-/// The text of `original` with the two pin keys removed.
-fn without_pin(original: &str) -> Result<String, String> {
-    let mut document: DocumentMut = original
-        .parse()
-        .map_err(|error: TomlError| toml_diagnostic(original, &error))?;
-    document.remove("package");
-    document.remove("digest");
-    Ok(document.to_string())
-}
-
-/// Set the `package` and `digest` keys of `text` and return the new text.
-///
-/// Existing pin keys keep their position and decoration. Missing ones are
-/// inserted directly after `base`. Refuses to return text whose content other
-/// than the two keys differs from `text`.
-fn apply_pin(text: &str, pin: &Pin) -> Result<String, String> {
-    let mut document: DocumentMut = text
-        .parse()
-        .map_err(|error: TomlError| toml_diagnostic(text, &error))?;
-    let root = document.as_table_mut();
-    let wanted = [
-        ("package", pin.package.as_str()),
-        ("digest", pin.digest.as_str()),
-    ];
-    let mut missing = Vec::new();
-    for (key, value) in wanted {
-        match root.get_mut(key) {
-            Some(Item::Value(existing)) if existing.is_str() => {
-                let mut replacement = Value::from(value);
-                *replacement.decor_mut() = existing.decor().clone();
-                *existing = replacement;
-            }
-            Some(_) => return Err(format!("`{key}` must be a string")),
-            None => missing.push((key, value)),
-        }
-    }
-    if !missing.is_empty() {
-        // Plain tables are emitted by position, but values and dotted tables
-        // are emitted in map order, so everything after `base` is lifted out,
-        // the new keys go in, and the lifted entries return in their order.
-        let after_base: Vec<String> = root
-            .iter()
-            .skip_while(|(key, _)| *key != "base")
-            .skip(1)
-            .filter(|(_, item)| match item {
-                Item::Value(_) => true,
-                Item::Table(table) => table.is_dotted(),
-                Item::None | Item::ArrayOfTables(_) => false,
-            })
-            .map(|(key, _)| key.to_owned())
-            .collect();
-        let lifted: Vec<_> = after_base
-            .iter()
-            .filter_map(|key| root.remove_entry(key))
-            .collect();
-        for (key, value) in missing {
-            root.insert(key, Item::Value(Value::from(value)));
-        }
-        for (key, item) in lifted {
-            root.insert_formatted(&key, item);
-        }
-    }
-    let rewritten = document.to_string();
-    if without_pin(&rewritten)? != without_pin(text)? {
-        return Err("the rewrite would change content other than the pin".to_owned());
-    }
-    Ok(rewritten)
 }
 
 /// State of a profile relative to the installed packages.
@@ -463,8 +365,6 @@ fn check_file_policy(
 /// A profile file read through the trusted directory descriptor.
 struct LoadedProfile {
     text: String,
-    mode: u32,
-    identity: EntryIdentity,
 }
 
 fn profile_file_name(name: &str) -> String {
@@ -510,8 +410,7 @@ fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault
     .map_err(LoadFault::Unsafe)?;
     // The descriptor-level checks below revalidate type, owner, mode and link
     // count on the opened file, so a swap after the inspection fails closed.
-    let identity = dir
-        .entry_identity_with_mode(&file, EntryKind::RegularFile, mode)
+    dir.entry_identity_with_mode(&file, EntryKind::RegularFile, mode)
         .map_err(|_error| LoadFault::Unreadable("the file failed the safety checks"))?
         .ok_or(LoadFault::Missing)?;
     let bytes = dir
@@ -522,11 +421,7 @@ fn load_profile(dir: &TrustedDir, name: &str) -> Result<LoadedProfile, LoadFault
         })?;
     let text = String::from_utf8(bytes)
         .map_err(|_error| LoadFault::Unreadable("the file is not valid UTF-8"))?;
-    Ok(LoadedProfile {
-        text,
-        mode,
-        identity,
-    })
+    Ok(LoadedProfile { text })
 }
 
 fn directory_error(error: &FsError) -> Error {
@@ -639,145 +534,46 @@ fn render_listing(listing: &ProfileListing) -> String {
     output
 }
 
-/// Pick the package a profile migrates to.
-///
-/// With a selector, the installed package that matches it and serves `base`.
-/// Without one, the one selected and enabled package that serves `base`.
-fn resolve_target<'a>(
-    name: &str,
-    base: &RuntimeId,
-    packages: &'a [PackageInfo],
-    selector: Option<&DigestSelector>,
-) -> Result<&'a PackageInfo, Error> {
-    let target = |detail: String| Error::ProfileTarget {
-        name: name.to_owned(),
-        detail,
-    };
-    let serving: Vec<&PackageInfo> = packages
-        .iter()
-        .filter(|info| info.runtime_id.as_ref() == Some(base))
-        .collect();
-    if serving.is_empty() {
-        return Err(Error::ProfileBaseBuiltin {
-            name: name.to_owned(),
-            base: base.to_string(),
-        });
-    }
-    let candidates: Vec<&PackageInfo> = match selector {
-        Some(selector) => serving
-            .into_iter()
-            .filter(|info| selector.matches(&info.digest))
-            .collect(),
-        None => serving
-            .into_iter()
-            .filter(|info| info.selected && info.enabled)
-            .collect(),
-    };
-    let chosen = match candidates.as_slice() {
-        [] if selector.is_some() => {
-            return Err(target(format!(
-                "no installed package with that digest serves base runtime {base}"
-            )))
-        }
-        [] => {
-            return Err(target(format!(
-                "no selected, enabled package serves base runtime {base}; select one with `pohunek plugin select` or pass --digest"
-            )))
-        }
-        [only] => *only,
-        several => {
-            let listed: Vec<String> = several
-                .iter()
-                .map(|info| summary(&info.package.id, &info.package.version, &info.digest))
-                .collect();
-            return Err(target(format!(
-                "several packages match for base runtime {base}: {}; pass a longer --digest",
-                listed.join(", ")
-            )));
-        }
-    };
-    if chosen.fault.is_some() {
-        return Err(target(format!(
-            "{} is faulted; run `pohunek plugin doctor` first",
-            summary(&chosen.package.id, &chosen.package.version, &chosen.digest)
-        )));
-    }
-    Ok(chosen)
-}
-
-/// Whether the profile already carries exactly the target pin.
-fn already_pinned(head: &ProfileHead, target: &PackageInfo) -> bool {
-    head.package.as_ref() == Some(&target.package.id)
-        && head.digest.as_ref() == Some(&target.digest)
-}
-
-/// How a `migrate` ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum MigrationStatus {
-    Migrated,
-    Unchanged,
-}
-
-/// Result of `profile migrate`.
-#[derive(Debug, Serialize)]
-struct MigrationResult {
-    name: String,
-    base: RuntimeId,
-    package: PackageId,
-    version: PackageVersion,
-    digest: PackageDigest,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_package: Option<PackageId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_digest: Option<PackageDigest>,
-    status: MigrationStatus,
-}
-
-fn render_review(name: &str, head: &ProfileHead, target: &PackageInfo) -> String {
+/// Review of the change a preview announced.
+fn render_review(result: &PackageBindProfileResult) -> String {
     let mut output = String::from("The profile would change:\n");
-    let _ = writeln!(output, "Profile:     {name}");
-    let _ = writeln!(output, "Base:        {}", head.base);
+    let _ = writeln!(output, "Profile:     {}", result.profile);
+    let _ = writeln!(output, "Base:        {}", result.base);
     let _ = writeln!(
         output,
         "Package:     {} {}",
-        target.package.id, target.package.version
+        result.package.package.id, result.package.package.version
     );
-    let _ = writeln!(output, "Digest:      {}", target.digest);
-    let _ = writeln!(output, "State:       {}", state_label(target));
-    match (&head.package, &head.digest) {
-        (None, None) => {
+    let _ = writeln!(output, "Digest:      {}", result.package.digest);
+    let _ = writeln!(output, "State:       {}", state_label(&result.package));
+    match &result.previous {
+        None => {
             let _ = writeln!(output, "Current pin: none");
         }
-        (package, digest) => {
-            let _ = writeln!(
-                output,
-                "Current pin: {} {}",
-                package
-                    .as_ref()
-                    .map_or_else(|| "-".to_owned(), ToString::to_string),
-                digest
-                    .as_ref()
-                    .map_or_else(|| "-".to_owned(), ToString::to_string),
-            );
+        Some(digest) => {
+            let _ = writeln!(output, "Current pin: {digest}");
         }
     }
     output
 }
 
-fn render_migration(result: &MigrationResult) -> String {
-    let what = summary(&result.package, &result.version, &result.digest);
+fn render_migration(result: &PackageBindProfileResult) -> String {
+    let what = summary(
+        &result.package.package.id,
+        &result.package.package.version,
+        &result.package.digest,
+    );
     match result.status {
-        MigrationStatus::Migrated => format!(
-            "Pinned profile {} to {what}.\nThe daemon reads the profile at the next launch.\n",
-            result.name
-        ),
-        MigrationStatus::Unchanged => {
+        PackageBindStatus::Unchanged => {
             format!(
                 "Profile {} already pins {what}; nothing changed.\n",
-                result.name
+                result.profile
             )
         }
+        PackageBindStatus::Bound | PackageBindStatus::Preview => format!(
+            "Pinned profile {} to {what}.\nThe daemon reads the profile at the next launch.\n",
+            result.profile
+        ),
     }
 }
 
@@ -785,9 +581,9 @@ fn render_migration(result: &MigrationResult) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`CliError`] when the agents directory or
-/// profile is unusable, the target does not resolve, consent is missing, the
-/// rewrite fails, or the daemon fails.
+/// Returns [`CliError`] when the agents directory is unusable (`list`), a
+/// `--digest` prefix does not name one package, consent is missing, or the
+/// daemon refuses or fails the request.
 pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
     match action {
         ProfileAction::List { json } => {
@@ -806,146 +602,82 @@ pub(crate) async fn run(action: ProfileAction) -> Result<(), CliError> {
 async fn run_migrate(args: &MigrateArgs) -> Result<(), CliError> {
     let paths = Paths::resolve()?;
     let mut client = Client::connect(LOCAL_HOST, &paths).await?;
-    let packages = list(&mut client).await?.packages;
     let name = args.name.as_str();
-    let dir = open_agents_dir(&paths.config_dir.join(AGENTS_DIR))
-        .map_err(|error| directory_error(&error))?
-        .ok_or_else(|| Error::ProfileNotFound {
-            name: name.to_owned(),
-        })?;
-    let loaded = load_profile(&dir, name).map_err(|fault| match fault {
-        LoadFault::Missing => Error::ProfileNotFound {
-            name: name.to_owned(),
-        },
-        other => Error::ProfileUnusable {
-            name: name.to_owned(),
-            detail: other.detail().to_owned(),
-        },
-    })?;
-    let head = parse_head(&loaded.text).map_err(|detail| Error::ProfileUnusable {
-        name: name.to_owned(),
-        detail,
-    })?;
-    let target = resolve_target(name, &head.base, &packages, args.digest.as_ref())?;
-    let result = |status| MigrationResult {
-        name: name.to_owned(),
-        base: head.base.clone(),
-        package: target.package.id.clone(),
-        version: target.package.version.clone(),
-        digest: target.digest.clone(),
-        previous_package: head.package.clone(),
-        previous_digest: head.digest.clone(),
-        status,
+    let requested = match &args.digest {
+        None => None,
+        Some(DigestSelector::Full(digest)) => Some(digest.clone()),
+        Some(selector @ DigestSelector::Prefix(_)) => {
+            let packages = list(&mut client).await?.packages;
+            Some(resolve_prefix(name, selector, &packages)?)
+        }
     };
-    if already_pinned(&head, target) {
-        let result = result(MigrationStatus::Unchanged);
-        return print_output(args.json, &result, || render_migration(&result));
+    let preview = client
+        .call::<method::PackageBindProfile>(PackageBindProfileParams {
+            profile: name.to_owned(),
+            digest: requested,
+            dry_run: true,
+        })
+        .await?;
+    if preview.status == PackageBindStatus::Unchanged {
+        return print_output(args.json, &preview, || render_migration(&preview));
     }
     if !args.yes {
         if !args.json {
-            print!("{}", render_review(name, &head, target));
+            print!("{}", render_review(&preview));
         }
         return Err(Error::ConsentRequired {
             verb: "migrating",
             summary: format!(
                 "profile {name} to {}",
-                summary(&target.package.id, &target.package.version, &target.digest)
+                summary(
+                    &preview.package.package.id,
+                    &preview.package.package.version,
+                    &preview.package.digest
+                )
             ),
         }
         .into());
     }
-    let pin = Pin {
-        package: target.package.id.clone(),
-        digest: target.digest.clone(),
-    };
-    write_pin(&dir, name, &loaded, &pin).map_err(|detail| Error::ProfileWrite {
+    // The call names the package the owner consented to, so a package
+    // selected between the preview and this call cannot change the target.
+    let bound = client
+        .call::<method::PackageBindProfile>(PackageBindProfileParams {
+            profile: name.to_owned(),
+            digest: Some(preview.package.digest.clone()),
+            dry_run: false,
+        })
+        .await?;
+    print_output(args.json, &bound, || render_migration(&bound))
+}
+
+/// The one installed digest a hex prefix names.
+fn resolve_prefix(
+    name: &str,
+    selector: &DigestSelector,
+    packages: &[PackageInfo],
+) -> Result<PackageDigest, Error> {
+    let target = |detail: String| Error::ProfileTarget {
         name: name.to_owned(),
         detail,
-    })?;
-    let result = result(MigrationStatus::Migrated);
-    print_output(args.json, &result, || render_migration(&result))
-}
-
-fn temporary_name() -> Result<String, String> {
-    let mut bytes = [0_u8; TEMPORARY_RANDOM_BYTES];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|_error| "the system random source failed".to_owned())?;
-    let mut name = String::from(TEMPORARY_PREFIX);
-    for byte in bytes {
-        let _ = write!(name, "{byte:02x}");
+    };
+    let matching: Vec<&PackageInfo> = packages
+        .iter()
+        .filter(|info| selector.matches(&info.digest))
+        .collect();
+    match matching.as_slice() {
+        [] => Err(target("no installed package has that digest".to_owned())),
+        [only] => Ok(only.digest.clone()),
+        several => {
+            let listed: Vec<String> = several
+                .iter()
+                .map(|info| summary(&info.package.id, &info.package.version, &info.digest))
+                .collect();
+            Err(target(format!(
+                "several packages match: {}; pass a longer --digest",
+                listed.join(", ")
+            )))
+        }
     }
-    Ok(name)
-}
-
-/// Rewrite the profile atomically and verify the result.
-///
-/// The original is displaced under a private quarantine name and stays there
-/// until the new file is verified, so a profile changed by anyone else since
-/// it was read is detected rather than overwritten, and a failed verification
-/// leaves the original recoverable.
-fn write_pin(
-    dir: &TrustedDir,
-    name: &str,
-    loaded: &LoadedProfile,
-    pin: &Pin,
-) -> Result<(), String> {
-    let file = profile_file_name(name);
-    let rewritten = apply_pin(&loaded.text, pin)?;
-    let mode = loaded.mode & REWRITE_MODE_CEILING;
-    let replaced = dir
-        .replace_file_displacing(
-            &file,
-            temporary_name()?,
-            rewritten.as_bytes(),
-            mode,
-            DestinationExpectation::Exact {
-                identity: loaded.identity,
-                mode: loaded.mode,
-                content: loaded.text.as_bytes(),
-            },
-        )
-        .map_err(|error| match error {
-            DisplacingReplaceError::BeforeCommit(FsError::IdentityChanged { .. }) => {
-                "the profile changed while it was being rewritten; nothing was changed, run the command again"
-                    .to_owned()
-            }
-            DisplacingReplaceError::BeforeCommit(_) => {
-                "the profile could not be replaced; it is unchanged".to_owned()
-            }
-            DisplacingReplaceError::CommittedDurabilityUncertain { .. } => {
-                "the profile was rewritten but the directory could not be synchronized; run the command again to confirm"
-                    .to_owned()
-            }
-            DisplacingReplaceError::RecoveryRequired { quarantine, .. } => format!(
-                "the replacement failed and the original remains at {}",
-                quarantine.display()
-            ),
-            _ => "the profile could not be replaced".to_owned(),
-        })?;
-    let quarantine = replaced.displaced.as_ref().map(StagedEntry::path);
-    let verified = dir
-        .read_file(&file, mode, MAX_PROFILE_BYTES)
-        .ok()
-        .filter(|bytes| bytes == rewritten.as_bytes())
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| parse_head(&text).ok())
-        .is_some_and(|head| head.pin().as_ref() == Some(pin));
-    if !verified {
-        let kept = quarantine.map_or_else(String::new, |path| {
-            format!("; the original is kept at {}", path.display())
-        });
-        return Err(format!("the rewritten profile failed verification{kept}"));
-    }
-    if let Some(original) = replaced.displaced {
-        let at = original.path();
-        original.remove().map_err(|_error| {
-            format!(
-                "the profile was rewritten but the previous copy remains at {}",
-                at.display()
-            )
-        })?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

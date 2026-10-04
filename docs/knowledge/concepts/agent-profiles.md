@@ -165,8 +165,9 @@ digest = "sha256:<64 lowercase hex digits>"     # the archive digest to launch f
   neither key; supplying them is `invalid_profile`, as is supplying only one.
 - A profile over a package-served base without the keys is `invalid_profile`.
   Its message names the migration command
-  `pohunek plugin profile migrate <name>`, which writes the keys for the
-  package version selected now.
+  `pohunek plugin profile migrate <name>`, which the daemon applies under the
+  package lifecycle authority (`package.bind_profile`), writing the keys for the
+  package version selected now with an atomic replace.
 - With both keys the profile resolves from exactly that digest, never from the
   registry's current selection. `plugin update`, `plugin select` and a newer
   installed version do not change what the profile launches, while a bare

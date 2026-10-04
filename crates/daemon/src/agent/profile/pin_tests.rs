@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use package::registry::{Registry, RetainedDigests};
 use package::{Limits, PackageDigest};
@@ -30,7 +30,7 @@ const PROGRAM_SCRIPT: &str = "#!/bin/sh\nexit 0\n";
 /// A plugin root with the fixture package installed, an agents directory and
 /// a host state directory, over one runtime host.
 struct Fixture {
-    _root: tempfile::TempDir,
+    root: tempfile::TempDir,
     plugins: PathBuf,
     agents: PathBuf,
     state: PathBuf,
@@ -55,7 +55,7 @@ impl Fixture {
         let first = root.path().join(FIRST_PROGRAM);
         let (host, digest) = installed_pi_host(&plugins, &first);
         Self {
-            _root: root,
+            root,
             plugins,
             agents,
             state,
@@ -92,7 +92,7 @@ impl Fixture {
     fn update_to_second_version(&self) -> PackageDigest {
         let digest = install_pi_package(
             &self.plugins,
-            &self._root.path().join(SECOND_PROGRAM),
+            &self.root.path().join(SECOND_PROGRAM),
             "2.0.0",
             true,
         );
@@ -276,7 +276,7 @@ fn an_unknown_digest_is_not_installed() {
 }
 
 #[test]
-fn a_modified_package_root_is_incompatible() {
+fn a_modified_packageroot_is_incompatible() {
     let fixture = Fixture::new();
     fixture.write_pinned("pinned", &fixture.digest);
     fixture.tamper();
@@ -524,7 +524,7 @@ fn host_inspect_reports_a_pinned_profile_unavailable_when_its_package_is_disable
 }
 
 #[test]
-fn host_inspect_reports_a_pinned_profile_unavailable_when_its_root_fails_verification() {
+fn host_inspect_reports_a_pinned_profile_unavailable_when_itsroot_fails_verification() {
     let fixture = Fixture::new();
     fixture.write_pinned("pinned", &fixture.digest);
     fixture.tamper();

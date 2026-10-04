@@ -17,25 +17,26 @@ use crate::{
     NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult,
     NotificationListParams, NotificationListResult, NotificationPolicyParams,
     NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
-    NotificationUpdateParams, NotificationUpdateResult, PackageChangeResult, PackageDoctorParams,
-    PackageDoctorResult, PackageInspectParams, PackageInspectResult, PackageInstallParams,
-    PackageInstallResult, PackageLinkParams, PackageListResult, PackageSelectParams,
-    PackageSetEnabledParams, PackageUninstallParams, PackageUninstallResult, ProjectActionParams,
-    ProjectActionResult, ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo,
-    ProjectListParams, ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams,
-    ProjectRemoveResult, ProjectRenameParams, ProjectShowParams, ProjectShowResult,
-    RuntimeInventoryResult, SessionAttachParams, SessionAttachResult, SessionDetachParams,
-    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionDiffParams,
-    SessionDiffResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult,
-    SessionOutputParams, SessionOutputResult, SessionPolicyParams, SessionPolicyResult,
-    SessionReadParams, SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionRenameParams, SessionRenameResult, SessionReportAgentParams,
-    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
-    SessionResizeParams, SessionResizeResult, SessionResumeResult, SessionRetentionParams,
-    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
-    WorktreeRemoveParams, WorktreeRemoveResult,
+    NotificationUpdateParams, NotificationUpdateResult, PackageBindProfileParams,
+    PackageBindProfileResult, PackageChangeResult, PackageDoctorParams, PackageDoctorResult,
+    PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,
+    PackageLinkParams, PackageListResult, PackageSelectParams, PackageSetEnabledParams,
+    PackageUninstallParams, PackageUninstallResult, ProjectActionParams, ProjectActionResult,
+    ProjectActionsParams, ProjectActionsResult, ProjectAddParams, ProjectInfo, ProjectListParams,
+    ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
+    ProjectRenameParams, ProjectShowParams, ProjectShowResult, RuntimeInventoryResult,
+    SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult,
+    SessionDetectionParams, SessionDetectionResult, SessionDiffParams, SessionDiffResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
+    SessionOutputResult, SessionPolicyParams, SessionPolicyResult, SessionReadParams,
+    SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionResumeResult, SessionRetentionParams, SessionRetentionResult,
+    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
+    SessionStopResult, SessionWaitParams, SessionWaitResult, WorktreeRemoveParams,
+    WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -691,6 +692,16 @@ method_table!(
     PackageUninstallResult,
     "PackageUninstallParams",
     "PackageUninstallResult";
+
+    /// Pin a host agent profile to an installed runtime package under the
+    /// package lifecycle authority (local-only).
+    PackageBindProfile,
+    PACKAGE_BIND_PROFILE,
+    "package.bind_profile",
+    PackageBindProfileParams,
+    PackageBindProfileResult,
+    "PackageBindProfileParams",
+    "PackageBindProfileResult";
 );
 
 #[cfg(test)]

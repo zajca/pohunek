@@ -399,48 +399,12 @@ pub(crate) enum Error {
         detail: String,
     },
 
-    /// No profile file has the requested name.
-    #[error("no agent profile named {name} exists on this host")]
-    ProfileNotFound {
-        /// The requested profile name.
-        name: String,
-    },
-
-    /// The profile file fails the safety policy, cannot be read, or does not parse.
-    #[error("profile {name} cannot be used: {detail}")]
-    ProfileUnusable {
-        /// The profile name.
-        name: String,
-        /// The reason, naming a key or line but never a value.
-        detail: String,
-    },
-
-    /// No installed package serves the profile's base runtime.
-    #[error(
-        "profile {name} extends base runtime {base}, which no installed package serves; there is nothing to migrate"
-    )]
-    ProfileBaseBuiltin {
-        /// The profile name.
-        name: String,
-        /// The profile's base runtime id.
-        base: String,
-    },
-
     /// The migration target does not resolve to one usable package.
     #[error("profile {name}: {detail}")]
     ProfileTarget {
         /// The profile name.
         name: String,
         /// Why no single target resolves.
-        detail: String,
-    },
-
-    /// Rewriting the profile failed.
-    #[error("profile {name} was not rewritten: {detail}")]
-    ProfileWrite {
-        /// The profile name.
-        name: String,
-        /// What failed.
         detail: String,
     },
 }
@@ -456,11 +420,7 @@ impl Error {
             Self::Ambiguous { .. } => "plugin_selector_ambiguous",
             Self::UpdateIdMismatch { .. } => "plugin_update_id_mismatch",
             Self::ProfileDirectory { .. } => "profile_directory_unusable",
-            Self::ProfileNotFound { .. } => "profile_not_found",
-            Self::ProfileUnusable { .. } => "profile_unusable",
-            Self::ProfileBaseBuiltin { .. } => "profile_base_builtin",
             Self::ProfileTarget { .. } => "profile_target_invalid",
-            Self::ProfileWrite { .. } => "profile_write_failed",
         }
     }
 
@@ -485,18 +445,8 @@ impl Error {
             Self::ProfileDirectory { .. } => {
                 "the agents directory must be owned by you and not group- or world-writable"
             }
-            Self::ProfileNotFound { .. } => "list profiles with `pohunek plugin profile list`",
-            Self::ProfileUnusable { .. } => {
-                "fix the profile file: it must be a regular file you own, not writable by others, with valid TOML"
-            }
-            Self::ProfileBaseBuiltin { .. } => {
-                "install a package that serves the base runtime with `pohunek plugin install`"
-            }
             Self::ProfileTarget { .. } => {
                 "list installed packages with `pohunek plugin list` and pass --digest"
-            }
-            Self::ProfileWrite { .. } => {
-                "check the agents directory and run `pohunek plugin profile list`"
             }
         }
     }
@@ -1713,20 +1663,7 @@ mod tests {
                 found: "b".into(),
             },
             Error::ProfileDirectory { detail: "d".into() },
-            Error::ProfileNotFound { name: "n".into() },
-            Error::ProfileUnusable {
-                name: "n".into(),
-                detail: "d".into(),
-            },
-            Error::ProfileBaseBuiltin {
-                name: "n".into(),
-                base: "b".into(),
-            },
             Error::ProfileTarget {
-                name: "n".into(),
-                detail: "d".into(),
-            },
-            Error::ProfileWrite {
                 name: "n".into(),
                 detail: "d".into(),
             },
