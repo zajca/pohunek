@@ -133,3 +133,73 @@ pub(crate) fn pi_shaped_host(program: &Path, existence: &str) -> RuntimeHost {
         RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
     RuntimeHost::new(registry)
 }
+
+/// Detection manifest shipped by [`installed_pi_host`] packages.
+const PACKAGED_DETECT_MANIFEST: &str = r#"[[rules]]
+id = "idle_prompt"
+state = "idle"
+priority = 100
+region = "whole_recent"
+any = [{ contains = "ready" }]
+"#;
+
+/// Installs the Pi-shaped fixture as an enabled, selected package into the
+/// plugin root `plugins_dir` and returns a host that serves it with its
+/// archive digest.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot be installed or loaded, which would be a
+/// defect of the fixture.
+pub(crate) fn installed_pi_host(
+    plugins_dir: &Path,
+    program: &Path,
+) -> (RuntimeHost, PackageDigest) {
+    use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
+    use package::{build_archive, read_archive, ArchiveEntry, Limits};
+
+    use super::package::{PackageSource, PackageStore};
+
+    let document = pi_shaped_document(program, PI_SHAPED_NO_CHECK).replace(
+        "detect_manifest = \"any\"",
+        "detect_manifest = \"detect.toml\"",
+    );
+    let entries = [
+        ArchiveEntry {
+            path: "runtime.toml".to_owned(),
+            contents: document.into_bytes(),
+            executable: false,
+        },
+        ArchiveEntry {
+            path: "detect.toml".to_owned(),
+            contents: PACKAGED_DETECT_MANIFEST.as_bytes().to_vec(),
+            executable: false,
+        },
+    ];
+    let bytes = build_archive(&entries, &Limits::DEFAULT).expect("the fixture archive builds");
+    let digest = read_archive(&bytes, &Limits::DEFAULT)
+        .expect("the fixture archive reads")
+        .digest()
+        .clone();
+    Registry::open_at(plugins_dir, Limits::DEFAULT)
+        .expect("the plugin root opens")
+        .install(&InstallRequest {
+            archive: &bytes,
+            expected: &digest,
+            identity: protocol::PackageIdentity {
+                id: protocol::PackageId::parse("acme.runtime.pi").expect("package id"),
+                version: protocol::PackageVersion::parse("1.0.0").expect("package version"),
+            },
+            source: InstallSource::ExplicitDigest,
+            enabled: true,
+            select: true,
+            installed_at_unix_seconds: 1_700_000_000,
+        })
+        .expect("the fixture package installs");
+    let host = RuntimeHost::with_packages(
+        BuiltinSource::new("/bin/sh"),
+        PackageSource::new(PackageStore::open(plugins_dir).expect("the store opens")),
+    )
+    .expect("the host builds");
+    (host, digest)
+}

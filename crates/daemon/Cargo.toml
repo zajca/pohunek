@@ -21,6 +21,7 @@ pohunek-protocol = { workspace = true }
 pohunek-netbird = { workspace = true }
 pohunek-platform = { workspace = true }
 overlay = { workspace = true }
+pohunek-package = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-service-config = { workspace = true }
 pohunek-terminal = { workspace = true }
