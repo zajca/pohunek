@@ -1339,6 +1339,29 @@ fn seed_durable_metadata(paths: &BasePaths) {
     }
 }
 
+/// Backups a schema migration leaves next to the store, plus lookalikes the
+/// purge must keep.
+fn seed_schema_backups(paths: &BasePaths) -> Vec<PathBuf> {
+    let store = std::ffi::OsStr::new(pohunek_paths::METADATA_STORE_NAME);
+    let backups = vec![
+        paths
+            .data_dir
+            .join(pohunek_paths::schema_backup_name(store, 1)),
+        paths
+            .data_dir
+            .join(pohunek_paths::schema_backup_temp_name(store, 4242, 7)),
+    ];
+    for backup in &backups {
+        std::fs::write(backup, "{\"kind\":\"resume\"}\n").expect("schema backup");
+    }
+    std::fs::write(
+        paths.data_dir.join("metadata.jsonl.pre-schema-1.bak"),
+        "keep",
+    )
+    .expect("lookalike");
+    backups
+}
+
 fn assert_purged(paths: &BasePaths) {
     assert!(!paths.data_dir.join("metadata.jsonl").exists());
     assert!(!paths.data_dir.join("events").exists());
@@ -1375,6 +1398,58 @@ async fn purge_follows_the_rollback_of_an_unregistered_install() {
     assert!(report.purged, "the report says the metadata is purged");
     assert_purged(&paths);
     harness.assert_clean();
+}
+
+#[tokio::test]
+async fn purge_removes_the_schema_migration_backups_with_the_store() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let backups = seed_schema_backups(&paths);
+    let _record = pending_install_at_config(&harness).await;
+
+    let report = harness.engine().uninstall(PURGE).await.expect("uninstall");
+
+    assert!(report.purged);
+    assert_purged(&paths);
+    for backup in &backups {
+        assert!(!backup.exists(), "{} survives the purge", backup.display());
+        assert!(
+            report.removed.contains(backup),
+            "{} is reported as removed",
+            backup.display()
+        );
+    }
+    assert!(
+        paths
+            .data_dir
+            .join("metadata.jsonl.pre-schema-1.bak")
+            .exists(),
+        "a file outside the backup grammar is kept"
+    );
+}
+
+#[tokio::test]
+async fn purge_refuses_a_symlinked_schema_backup_without_following_it() {
+    let harness = Harness::new();
+    let paths = harness.context.paths().clone();
+    seed_durable_metadata(&paths);
+    let referent = paths.data_dir.join("worktrees/repo/keep");
+    std::fs::write(&referent, "owner work").expect("referent");
+    let link = paths.data_dir.join("metadata.jsonl.pre-schema-1");
+    std::os::unix::fs::symlink(&referent, &link).expect("symlink");
+    let _record = pending_install_at_config(&harness).await;
+
+    harness
+        .engine()
+        .uninstall(PURGE)
+        .await
+        .expect_err("a symlinked backup fails the purge closed");
+
+    assert_eq!(
+        std::fs::read_to_string(&referent).expect("referent"),
+        "owner work"
+    );
 }
 
 #[tokio::test]

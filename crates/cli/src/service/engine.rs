@@ -154,8 +154,10 @@ use super::verify::UnitVerifier;
 ///
 /// Names match the daemon's store (`metadata.jsonl`) and event log
 /// directory (`events`). Worktrees, notifications, and configuration are
-/// never purged: they may hold the owner's work.
-const PURGED_DATA_FILES: [&str; 1] = ["metadata.jsonl"];
+/// never purged: they may hold the owner's work. The store's pre-migration
+/// backups (`pohunek_paths::is_schema_backup_artifact`) are full copies of it
+/// and are purged with it.
+const PURGED_DATA_FILES: [&str; 1] = [pohunek_paths::METADATA_STORE_NAME];
 
 /// Durable metadata directories `--purge` removes from the data directory.
 const PURGED_DATA_DIRS: [&str; 1] = ["events"];
@@ -1271,6 +1273,10 @@ impl<'a> Engine<'a> {
                     record::remove_file(&data, name)?;
                     report.removed.push(paths.data_dir.join(name));
                 }
+                for backup in schema_backups(&data, name)? {
+                    record::remove_file(&data, &backup)?;
+                    report.removed.push(paths.data_dir.join(backup));
+                }
             }
             for name in PURGED_DATA_DIRS {
                 if layout::remove_tree(&data, name)? {
@@ -1680,6 +1686,27 @@ fn file_exists(path: &Path) -> Result<bool, Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(super::error::io_error("inspect", path)(error)),
     }
+}
+
+/// Names of the schema-migration backups of `store` in `data`.
+///
+/// Only names matching the daemon's backup grammar exactly are returned; the
+/// caller removes them through descriptor-relative, no-follow operations.
+fn schema_backups(
+    data: &pohunek_platform::filesystem::TrustedDir,
+    store: &str,
+) -> Result<Vec<String>, Error> {
+    let names = data
+        .entry_names()
+        .map_err(|source| super::error::fs_error("list data directory", source))?;
+    let mut backups: Vec<String> = names
+        .iter()
+        .filter_map(|name| name.to_str())
+        .filter(|name| pohunek_paths::is_schema_backup_artifact(store, name))
+        .map(str::to_owned)
+        .collect();
+    backups.sort();
+    Ok(backups)
 }
 
 /// Removes `service.toml`; returns whether it existed.

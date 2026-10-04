@@ -44,9 +44,6 @@ pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
 /// JSON key holding a line's schema version.
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
-/// Suffix of the pre-migration backup, followed by the schema version found.
-const BACKUP_SUFFIX: &str = ".pre-schema-";
-
 /// One schema step: rewrites a record from schema `from` to schema `from + 1`.
 pub(super) struct Migration {
     /// Schema the step upgrades from.
@@ -417,8 +414,7 @@ impl Store {
             TrustedDir::open_absolute(parent_directory(&self.path), OWNER_PRIVATE_DIRECTORY_MODE)
                 .map_err(fs_error_to_io)?;
         for schema in 1..STORE_SCHEMA_VERSION {
-            let mut backup_name = store_name.to_os_string();
-            backup_name.push(format!("{BACKUP_SUFFIX}{schema}"));
+            let backup_name = pohunek_paths::schema_backup_name(store_name, schema);
             let bytes = match directory.read_file(
                 &backup_name,
                 OWNER_PRIVATE_FILE_MODE,
@@ -459,8 +455,7 @@ impl Store {
                 "metadata store has no filename",
             )
         })?;
-        let mut backup_name = store_name.to_os_string();
-        backup_name.push(format!("{BACKUP_SUFFIX}{schema}"));
+        let backup_name = pohunek_paths::schema_backup_name(store_name, schema);
         let backup_path = parent_directory(&self.path).join(&backup_name);
 
         let directory =
@@ -478,12 +473,11 @@ impl Store {
             return Ok(backup_path);
         }
 
-        let mut temporary = store_name.to_os_string();
-        temporary.push(format!(
-            ".backup.{}.{}",
+        let temporary = pohunek_paths::schema_backup_temp_name(
+            store_name,
             std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        );
         let identity = directory
             .create_file(&temporary, bytes, OWNER_PRIVATE_FILE_MODE)
             .map_err(fs_error_to_io)?;
@@ -973,6 +967,29 @@ mod tests {
     }
 
     #[test]
+    fn every_file_a_migration_adds_is_a_backup_artifact_the_purge_recognises() {
+        let (store, path) = store_with("artifacts", V0_33_0_STORE);
+        let dir = path.parent().expect("store dir").to_path_buf();
+        let before: Vec<_> = fs::read_dir(&dir)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+
+        store.migrate_to_current().expect("migrate");
+
+        let added: Vec<_> = fs::read_dir(&dir)
+            .expect("list")
+            .map(|entry| entry.expect("entry").file_name())
+            .filter(|name| !before.contains(name))
+            .collect();
+        assert_eq!(added.len(), 1, "{added:?}");
+        assert!(pohunek_paths::is_schema_backup_artifact(
+            pohunek_paths::METADATA_STORE_NAME,
+            added[0].to_str().expect("utf-8")
+        ));
+    }
+
+    #[test]
     fn migration_leaves_no_temporary_backup_file_behind() {
         let (store, path) = store_with("no-temp", V0_33_0_STORE);
         write_private(&backup_path(&path, 1), "earlier backup\n");
@@ -982,7 +999,7 @@ mod tests {
         let leftovers: Vec<_> = fs::read_dir(path.parent().expect("store dir"))
             .expect("list store dir")
             .map(|entry| entry.expect("entry").file_name())
-            .filter(|name| name.to_string_lossy().contains(".backup."))
+            .filter(|name| name.to_string_lossy().contains("pre-schema-tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }

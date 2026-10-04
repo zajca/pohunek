@@ -58,7 +58,7 @@ use pohunek_platform::supervisor::{self, Namespace};
 use pohunek_service_config::ServiceConfig;
 
 /// File name of the unified logical-session metadata store under the data dir.
-const STORE_NAME: &str = "metadata.jsonl";
+const STORE_NAME: &str = pohunek_paths::METADATA_STORE_NAME;
 
 /// Subdirectory under the data dir holding per-session git worktrees.
 const WORKTREES_SUBDIR: &str = "worktrees";
