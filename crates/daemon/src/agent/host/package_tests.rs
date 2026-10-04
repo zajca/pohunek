@@ -292,7 +292,8 @@ fn a_disabled_package_still_serves_the_sessions_pinned_to_it() {
 fn reload_picks_up_installs_and_uninstalls_and_keeps_the_builtins() {
     let plugins = Plugins::new();
     let host = plugins.host();
-    assert!(host.resolve_id(&runtime("acme")).is_err());
+    host.resolve_id(&runtime("acme"))
+        .expect_err("the runtime is not served");
 
     let built = acme("1.0.0");
     install(&plugins.registry(), &built, true, true);
@@ -308,7 +309,8 @@ fn reload_picks_up_installs_and_uninstalls_and_keeps_the_builtins() {
         .uninstall(&built.digest, &package::registry::RetainedDigests::new())
         .expect("uninstall");
     host.reload().expect("reload");
-    assert!(host.resolve_id(&runtime("acme")).is_err());
+    host.resolve_id(&runtime("acme"))
+        .expect_err("the runtime is not served");
     host.resolve_id(&runtime("codex")).expect("built-in stays");
 }
 
@@ -470,7 +472,7 @@ fn tamper(plugins: &Plugins, digest: &PackageDigest, how: &Tamper) {
         Tamper::AddFile => fs::write(root.join("files").join("extra"), b"x").expect("write"),
         Tamper::RemoveFile => fs::remove_file(root.join("files").join("notes.txt")).expect("rm"),
         Tamper::Chmod => {
-            fs::set_permissions(&descriptor, fs::Permissions::from_mode(0o644)).expect("chmod")
+            fs::set_permissions(&descriptor, fs::Permissions::from_mode(0o644)).expect("chmod");
         }
         Tamper::RemoveRoot => fs::remove_dir_all(&root).expect("remove root"),
     }
@@ -512,7 +514,8 @@ fn a_package_modified_after_install_never_launches_pins_or_loads() {
             report.rejected[0].reason,
             PackageRejection::Root(_)
         ));
-        assert!(host.resolve_id(&runtime("acme")).is_err());
+        host.resolve_id(&runtime("acme"))
+            .expect_err("the runtime is not served");
         host.resolve_id(&runtime("codex")).expect("built-in stays");
     }
 }
@@ -609,7 +612,8 @@ fn packages_claiming_the_same_runtime_are_both_refused() {
 
     let host = plugins.host();
 
-    assert!(host.resolve_id(&runtime("shared")).is_err());
+    host.resolve_id(&runtime("shared"))
+        .expect_err("the runtime is not served");
     let report = host.package_report();
     assert_eq!(report.rejected.len(), 2);
     assert!(report
@@ -677,7 +681,8 @@ fn a_descriptor_that_disagrees_with_the_recorded_identity_is_refused() {
         host.package_report().rejected[0].reason,
         PackageRejection::IdentityMismatch
     );
-    assert!(host.resolve_id(&runtime("acme")).is_err());
+    host.resolve_id(&runtime("acme"))
+        .expect_err("the runtime is not served");
 }
 
 #[test]
@@ -750,7 +755,9 @@ fn an_unreadable_registry_record_degrades_to_the_builtins_and_blocks_reload() {
         restarted.package_report().fault,
         Some(RegistryError::Corrupt)
     );
-    assert!(restarted.resolve_id(&runtime("acme")).is_err());
+    restarted
+        .resolve_id(&runtime("acme"))
+        .expect_err("the runtime is not served");
     restarted.resolve_id(&runtime("codex")).expect("built-in");
     let pinned = restarted
         .resolve_pinned(&RuntimeRef::from_wire("acme"), &pin_of(&built, "acme"))
