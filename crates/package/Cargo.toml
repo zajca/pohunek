@@ -24,6 +24,7 @@ thiserror = { workspace = true }
 # exist on Unix only.
 [target.'cfg(unix)'.dependencies]
 pohunek-platform = { workspace = true }
+rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 ruzstd = { workspace = true }

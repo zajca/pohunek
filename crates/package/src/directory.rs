@@ -3,22 +3,40 @@
 //! [`build_directory_archive`] walks a developer directory and returns the same
 //! deterministic bytes [`crate::build_archive`] produces for that file set. The
 //! walk accepts regular files and directories only, charges every file against
-//! the archive limits from the bytes actually read, and never follows a symlink
-//! that replaces a file between the directory listing and the read.
+//! the archive limits from the bytes actually read. The walk holds a descriptor
+//! per directory and opens every entry relative to it without following
+//! symlinks and without blocking, then checks type and identity on the opened
+//! descriptor, so an entry swapped for a symlink or a fifo after it was listed
+//! is reported as changed and never followed or waited on.
 
 // Rust guideline compliant 2026-10-04
 
-use std::fs;
+use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::fd::OwnedFd;
 use std::path::Path;
 
+use rustix::fs::{fstat, openat, statat, AtFlags, Dir, FileType, Mode, OFlags, Stat};
+use rustix::io::Errno;
 use thiserror::Error;
 
 use crate::{build_archive, ArchiveEntry, ArchiveError, EntryRejection, Limits, MAX_PATH_BYTES};
 
 /// Any execute bit marks the file executable in the canonical archive.
-const EXECUTE_BITS: u32 = 0o111;
+const EXECUTE_BITS: rustix::fs::RawMode = 0o111;
+
+/// Flags that open a directory without following a symlink at its name.
+const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+/// Flags that open a regular file without following a symlink at its name and
+/// without blocking on a fifo or device swapped in after the listing.
+const FILE_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::NONBLOCK)
+    .union(OFlags::CLOEXEC);
 
 /// Bytes of a tar block; every file costs one header block plus data padded to
 /// a block boundary in the canonical stream.
@@ -79,7 +97,8 @@ pub fn build_directory_archive(dir: &Path, limits: &Limits) -> Result<Vec<u8>, D
         files: 0,
         expanded: 0,
     };
-    collect(dir, dir, &mut budget, &mut entries)?;
+    let root = rustix::fs::open(dir, DIRECTORY_FLAGS, Mode::empty()).map_err(open_error)?;
+    collect(&root, "", &mut budget, &mut entries)?;
     build_archive(&entries, limits).map_err(DirectoryError::Archive)
 }
 
@@ -154,69 +173,125 @@ impl Budget<'_> {
     }
 }
 
-/// Collects regular files below `dir`; symlinks and special files are errors.
+/// What the listing saw at one name: its type and identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Listed {
+    kind: FileType,
+    device: rustix::fs::Dev,
+    inode: u64,
+}
+
+/// Maps an open failure to the typed error; a name that stopped being the
+/// listed type (a symlink where `O_NOFOLLOW` forbids one, a non-directory
+/// where one was listed) means the tree changed while it was read.
+fn open_error(errno: Errno) -> DirectoryError {
+    if matches!(errno, Errno::LOOP | Errno::NOTDIR | Errno::NXIO) {
+        DirectoryError::Changed
+    } else {
+        DirectoryError::Io {
+            kind: io::Error::from(errno).kind(),
+        }
+    }
+}
+
+fn identity(stat: &Stat) -> Listed {
+    Listed {
+        kind: FileType::from_raw_mode(stat.st_mode),
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    }
+}
+
+/// Inspects `name` below `dir` without following it.
+fn list_entry(dir: &OwnedFd, name: &str) -> Result<Listed, DirectoryError> {
+    statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|stat| identity(&stat))
+        .map_err(open_error)
+}
+
+/// Opens the directory `name` listed below `dir`, provided it is still that
+/// directory.
+fn open_listed_dir(dir: &OwnedFd, name: &str, listed: Listed) -> Result<OwnedFd, DirectoryError> {
+    let child = openat(dir, name, DIRECTORY_FLAGS, Mode::empty()).map_err(open_error)?;
+    let opened = identity(&fstat(&child).map_err(open_error)?);
+    if opened == listed {
+        Ok(child)
+    } else {
+        Err(DirectoryError::Changed)
+    }
+}
+
+/// Opens the regular file `name` listed below `dir` and reads it, provided it
+/// is still that file.
+///
+/// The open neither follows a symlink nor blocks, and type and identity are
+/// checked on the opened descriptor before a byte is read.
+fn read_listed_file(
+    dir: &OwnedFd,
+    name: &str,
+    listed: Listed,
+    budget: &mut Budget<'_>,
+) -> Result<(Vec<u8>, bool), DirectoryError> {
+    let fd = openat(dir, name, FILE_FLAGS, Mode::empty()).map_err(open_error)?;
+    let stat = fstat(&fd).map_err(open_error)?;
+    if identity(&stat) != listed {
+        return Err(DirectoryError::Changed);
+    }
+    let contents = budget.read_charged(File::from(fd))?;
+    let executable = stat.st_mode & EXECUTE_BITS != 0;
+    Ok((contents, executable))
+}
+
+/// Collects regular files below the directory `dir`, whose path relative to
+/// the package root is `prefix`; symlinks and special files are errors.
 fn collect(
-    root: &Path,
-    dir: &Path,
+    dir: &OwnedFd,
+    prefix: &str,
     budget: &mut Budget<'_>,
     entries: &mut Vec<ArchiveEntry>,
 ) -> Result<(), DirectoryError> {
-    for item in fs::read_dir(dir)? {
-        let path = item?.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.is_dir() {
-            collect(root, &path, budget, entries)?;
-        } else if metadata.is_file() {
-            let relative = path
-                .strip_prefix(root)
-                .map_err(|_cause| DirectoryError::InvalidPath)?;
-            let name = relative
-                .components()
-                .map(|component| component.as_os_str().to_str())
-                .collect::<Option<Vec<&str>>>()
-                .ok_or(DirectoryError::InvalidPath)?
-                .join("/");
-            budget.admit(name.len())?;
-            let (contents, executable) = read_listed_file(&path, &metadata, budget)?;
-            entries.push(ArchiveEntry {
-                path: name,
-                contents,
-                executable,
-            });
+    let listing = Dir::read_from(dir).map_err(open_error)?;
+    let mut names = Vec::new();
+    for item in listing {
+        let item = item.map_err(open_error)?;
+        let bytes = item.file_name().to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name = std::str::from_utf8(bytes).map_err(|_cause| DirectoryError::InvalidPath)?;
+        names.push(name.to_owned());
+    }
+    for name in names {
+        let listed = list_entry(dir, &name)?;
+        let relative = if prefix.is_empty() {
+            name.clone()
         } else {
-            return Err(DirectoryError::UnsupportedFileType);
+            format!("{prefix}/{name}")
+        };
+        match listed.kind {
+            FileType::Directory => {
+                let child = open_listed_dir(dir, &name, listed)?;
+                collect(&child, &relative, budget, entries)?;
+            }
+            FileType::RegularFile => {
+                budget.admit(relative.len())?;
+                let (contents, executable) = read_listed_file(dir, &name, listed, budget)?;
+                entries.push(ArchiveEntry {
+                    path: relative,
+                    contents,
+                    executable,
+                });
+            }
+            _ => return Err(DirectoryError::UnsupportedFileType),
         }
     }
     Ok(())
 }
 
-/// Opens `path` and reads it, provided it is still the file `listed` described.
-///
-/// The open follows symlinks, so identity is checked on the opened descriptor
-/// before a byte is read; a file replaced by a symlink after the listing is
-/// reported as [`DirectoryError::Changed`] instead of being followed.
-fn read_listed_file(
-    path: &Path,
-    listed: &fs::Metadata,
-    budget: &mut Budget<'_>,
-) -> Result<(Vec<u8>, bool), DirectoryError> {
-    let file = fs::File::open(path)?;
-    let opened = file.metadata()?;
-    if !is_same_regular_file(listed, &opened) {
-        return Err(DirectoryError::Changed);
-    }
-    let contents = budget.read_charged(file)?;
-    Ok((contents, opened.permissions().mode() & EXECUTE_BITS != 0))
-}
-
-/// Whether `opened` is a regular file with the device and inode of `listed`.
-fn is_same_regular_file(listed: &fs::Metadata, opened: &fs::Metadata) -> bool {
-    opened.is_file() && listed.dev() == opened.dev() && listed.ino() == opened.ino()
-}
-
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     use super::*;
     use crate::read_archive;
@@ -433,28 +508,124 @@ mod tests {
         ));
     }
 
+    fn open_root(path: &Path) -> OwnedFd {
+        rustix::fs::open(path, DIRECTORY_FLAGS, Mode::empty()).expect("open the root")
+    }
+
     #[test]
     fn a_file_swapped_for_a_symlink_after_the_listing_is_reported_as_changed() {
         let dir = pohunek_test_support::tempdir().expect("tempdir");
-        let victim = dir.path().join("victim");
         let secret = dir.path().join("secret");
-        fs::write(&victim, b"listed\n").expect("write");
+        fs::write(dir.path().join("victim"), b"listed\n").expect("write");
         fs::write(&secret, b"followed\n").expect("write");
-        let listed = fs::symlink_metadata(&victim).expect("metadata");
-        fs::remove_file(&victim).expect("remove");
-        symlink(&secret, &victim).expect("symlink");
+        let root = open_root(dir.path());
+        let listed = list_entry(&root, "victim").expect("list");
+        fs::remove_file(dir.path().join("victim")).expect("remove");
+        symlink(&secret, dir.path().join("victim")).expect("symlink");
 
         let limits = Limits::DEFAULT;
-        let mut budget = Budget {
-            limits: &limits,
-            files: 1,
-            expanded: 0,
-        };
+        let mut budget = budget(&limits);
         assert_eq!(
-            read_listed_file(&victim, &listed, &mut budget),
+            read_listed_file(&root, "victim", listed, &mut budget),
             Err(DirectoryError::Changed)
         );
         assert_eq!(budget.expanded, 0, "nothing was read from the target");
+    }
+
+    #[test]
+    fn a_file_swapped_for_a_fifo_after_the_listing_is_reported_without_blocking() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        fs::write(dir.path().join("victim"), b"listed\n").expect("write");
+        let root = open_root(dir.path());
+        let listed = list_entry(&root, "victim").expect("list");
+        fs::remove_file(dir.path().join("victim")).expect("remove");
+        rustix::fs::mknodat(&root, "victim", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
+            .expect("mkfifo");
+
+        let limits = Limits::DEFAULT;
+        let mut budget = budget(&limits);
+        // The open must return at once: a blocking open would hang this test.
+        assert_eq!(
+            read_listed_file(&root, "victim", listed, &mut budget),
+            Err(DirectoryError::Changed)
+        );
+    }
+
+    #[test]
+    fn a_file_swapped_for_a_symlink_to_a_fifo_is_reported_without_blocking() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        fs::write(dir.path().join("victim"), b"listed\n").expect("write");
+        let root = open_root(dir.path());
+        let listed = list_entry(&root, "victim").expect("list");
+        fs::remove_file(dir.path().join("victim")).expect("remove");
+        rustix::fs::mknodat(&root, "pipe", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
+            .expect("mkfifo");
+        symlink(dir.path().join("pipe"), dir.path().join("victim")).expect("symlink");
+
+        let limits = Limits::DEFAULT;
+        let mut budget = budget(&limits);
+        assert_eq!(
+            read_listed_file(&root, "victim", listed, &mut budget),
+            Err(DirectoryError::Changed)
+        );
+    }
+
+    #[test]
+    fn a_fifo_in_the_tree_is_an_unsupported_file_type() {
+        let dir = package_dir();
+        let root = open_root(dir.path());
+        rustix::fs::mknodat(&root, "pipe", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)
+            .expect("mkfifo");
+        assert_eq!(
+            build_directory_archive(dir.path(), &Limits::DEFAULT),
+            Err(DirectoryError::UnsupportedFileType)
+        );
+    }
+
+    #[test]
+    fn a_directory_swapped_for_a_symlink_after_the_listing_is_not_followed() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        let outside = pohunek_test_support::tempdir().expect("tempdir");
+        fs::write(outside.path().join("secret"), b"external\n").expect("write");
+        fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        fs::write(dir.path().join("sub/inner"), b"listed\n").expect("write");
+        let root = open_root(dir.path());
+        let listed = list_entry(&root, "sub").expect("list");
+        fs::remove_dir_all(dir.path().join("sub")).expect("remove");
+        symlink(outside.path(), dir.path().join("sub")).expect("symlink");
+
+        assert_eq!(
+            open_listed_dir(&root, "sub", listed).err(),
+            Some(DirectoryError::Changed)
+        );
+    }
+
+    #[test]
+    fn a_directory_replaced_by_another_directory_after_the_listing_is_changed() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        let root = open_root(dir.path());
+        let listed = list_entry(&root, "sub").expect("list");
+        fs::remove_dir(dir.path().join("sub")).expect("remove");
+        // A different directory (new inode) at the same name.
+        fs::create_dir(dir.path().join("other")).expect("mkdir");
+        fs::rename(dir.path().join("other"), dir.path().join("sub")).expect("rename");
+        assert_eq!(
+            open_listed_dir(&root, "sub", listed).err(),
+            Some(DirectoryError::Changed)
+        );
+    }
+
+    #[test]
+    fn a_symlinked_root_is_refused() {
+        let dir = package_dir();
+        let holder = pohunek_test_support::tempdir().expect("tempdir");
+        let link = holder.path().join("link");
+        symlink(dir.path(), &link).expect("symlink");
+        assert_eq!(
+            build_directory_archive(&link, &Limits::DEFAULT),
+            Err(DirectoryError::Changed)
+        );
     }
 
     #[test]
@@ -463,27 +634,13 @@ mod tests {
         let path = dir.path().join("hook");
         fs::write(&path, b"#!/bin/sh\n").expect("write");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod");
-        let listed = fs::symlink_metadata(&path).expect("metadata");
+        let root = open_root(dir.path());
+        let listed = list_entry(&root, "hook").expect("list");
         let limits = Limits::DEFAULT;
         let mut budget = budget(&limits);
         assert_eq!(
-            read_listed_file(&path, &listed, &mut budget),
+            read_listed_file(&root, "hook", listed, &mut budget),
             Ok((b"#!/bin/sh\n".to_vec(), true))
         );
-    }
-
-    #[test]
-    fn identity_requires_the_same_regular_file() {
-        let dir = pohunek_test_support::tempdir().expect("tempdir");
-        let first = dir.path().join("first");
-        let second = dir.path().join("second");
-        fs::write(&first, b"a").expect("write");
-        fs::write(&second, b"a").expect("write");
-        let first_meta = fs::metadata(&first).expect("metadata");
-        let second_meta = fs::metadata(&second).expect("metadata");
-        assert!(is_same_regular_file(&first_meta, &first_meta));
-        assert!(!is_same_regular_file(&first_meta, &second_meta));
-        let dir_meta = fs::metadata(dir.path()).expect("metadata");
-        assert!(!is_same_regular_file(&dir_meta, &dir_meta));
     }
 }
