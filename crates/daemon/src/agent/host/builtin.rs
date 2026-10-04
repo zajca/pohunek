@@ -7,13 +7,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{AgentKind, RuntimeId};
+use protocol::RuntimeId;
 
 use super::definition::{
     DefinitionError, DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition,
+    MAX_ARG_BYTES,
 };
 use super::registry::{RuntimeSource, SourceTrust};
-use crate::agent::{default_program, InputRules};
+use crate::agent::InputRules;
 use crate::detect::{self, Manifest};
 
 /// Embedded descriptors of the built-in agent runtimes.
@@ -25,6 +26,14 @@ const EMBEDDED_DESCRIPTORS: [&str; 3] = [
 
 /// Display name of the shell runtime.
 const SHELL_DISPLAY_NAME: &str = "Shell";
+
+/// Shell launched when the host reports no usable login shell.
+const FALLBACK_SHELL: &str = "/bin/sh";
+
+/// Whether `shell` passes the same program rules a definition enforces.
+fn is_valid_shell_program(shell: &str) -> bool {
+    !shell.is_empty() && shell.len() <= MAX_ARG_BYTES && !shell.chars().any(char::is_control)
+}
 
 /// Supplies the shell, Codex, Claude and Hermes definitions.
 #[derive(Debug, Clone)]
@@ -42,9 +51,24 @@ impl BuiltinSource {
     }
 
     /// Creates a source whose shell runtime launches the host's login shell.
+    ///
+    /// `$SHELL` is host input, so it is used only when it satisfies the
+    /// definition's program rules; otherwise the shell falls back to
+    /// [`FALLBACK_SHELL`], the same value the daemon uses when `$SHELL` is unset.
+    /// Building the registry therefore cannot fail because of the environment.
     #[must_use]
     pub fn from_host_environment() -> Self {
-        Self::new(default_program(&AgentKind::Shell))
+        Self::from_login_shell(std::env::var("SHELL").ok())
+    }
+
+    /// [`from_host_environment`](Self::from_host_environment) with the login
+    /// shell value passed in.
+    #[must_use]
+    pub fn from_login_shell(login_shell: Option<String>) -> Self {
+        let shell_program = login_shell
+            .filter(|shell| is_valid_shell_program(shell))
+            .unwrap_or_else(|| FALLBACK_SHELL.to_owned());
+        Self::new(shell_program)
     }
 
     fn shell_definition(&self) -> Result<RuntimeDefinition, DefinitionError> {

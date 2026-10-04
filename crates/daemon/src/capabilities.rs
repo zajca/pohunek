@@ -826,6 +826,36 @@ mod tests {
     }
 
     #[test]
+    fn invalid_login_shell_never_breaks_the_registry_or_non_shell_runtimes() {
+        let oversized = "s".repeat(crate::agent::host::MAX_ARG_BYTES + 1);
+        for shell in [
+            Some(String::new()),
+            Some(oversized),
+            Some("/bin/s\nh".to_owned()),
+            Some("/bin/s\u{7f}h".to_owned()),
+            None,
+        ] {
+            let registry =
+                RuntimeRegistry::from_sources(&[&BuiltinSource::from_login_shell(shell)])
+                    .expect("an invalid login shell must not fail the registry");
+            let caps = host_capabilities_for("0.0.0", &no_profiles(), &registry);
+            let names: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
+            assert_eq!(names, RESERVED_RUNTIME_IDS);
+            let shell_def = registry
+                .resolve(&RuntimeId::parse("shell").expect("id"))
+                .expect("shell registered");
+            assert_eq!(shell_def.program().as_str(), "/bin/sh");
+            assert!(definition_for_base(&registry, &AgentKind::Hermes).is_some());
+        }
+        let valid = BuiltinSource::from_login_shell(Some("/usr/bin/zsh".to_owned()));
+        let registry = RuntimeRegistry::from_sources(&[&valid]).expect("registry");
+        let shell_def = registry
+            .resolve(&RuntimeId::parse("shell").expect("id"))
+            .expect("shell registered");
+        assert_eq!(shell_def.program().as_str(), "/usr/bin/zsh");
+    }
+
+    #[test]
     fn inventory_lists_builtins_in_reserved_order_with_their_wire_shape() {
         let caps = host_capabilities_for("0.0.0", &no_profiles(), &test_registry());
         let order: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
