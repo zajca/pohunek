@@ -7788,9 +7788,14 @@ while os.getppid() == parent:
 
         impl Marked {
             fn spawn(worker_instance_id: &str) -> Self {
+                Self::spawn_with(&[("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id)])
+            }
+
+            /// Like [`Self::spawn`] with exactly the given environment markers.
+            fn spawn_with(markers: &[(&str, &str)]) -> Self {
                 let output = std::process::Command::new("/bin/sh")
                     .args(["-c", "trap '' HUP; sleep 60 >/dev/null 2>&1 & echo $!"])
-                    .env("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id)
+                    .envs(markers.iter().copied())
                     .output()
                     .expect("spawn marked process");
                 let pid = String::from_utf8(output.stdout)
@@ -7900,6 +7905,72 @@ while os.getppid() == parent:
             lost.wait_gone().await;
             assert!(bystander.alive(), "another runtime is never swept");
             assert_eq!(fixture.supervisor.retired(), vec![id]);
+        }
+
+        /// A daemon upgraded while a worker kept running sees descendants that
+        /// carry only `POHUNEK_RUNTIME_ID`; after a crash the sweep reaps them
+        /// and the runtime is lost with a confirmed cleanup.
+        #[tokio::test]
+        async fn crash_sweeps_a_descendant_that_carries_only_the_runtime_id_marker() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let lost = Marked::spawn_with(&[("POHUNEK_RUNTIME_ID", "runtime-s-310")]);
+            persist_record(&fixture.root, "s-310", Some("runtime-s-310"));
+            write_live_journal(
+                &fixture.root,
+                "s-310",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-310"),
+            );
+            let id = service_id("s-310", TEST_GENERATION);
+            fixture
+                .supervisor
+                .script_job(id.clone(), present(ServiceState::Failed, None));
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-310").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
+            lost.wait_gone().await;
+        }
+
+        /// A process claiming two worker instances is neither signalled nor
+        /// allowed to make the cleanup look complete.
+        #[tokio::test]
+        async fn crash_next_to_a_process_with_conflicting_markers_keeps_the_cleanup_unconfirmed() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let conflicting = Marked::spawn_with(&[
+                ("POHUNEK_WORKER_INSTANCE_ID", "runtime-s-311"),
+                ("POHUNEK_RUNTIME_ID", "runtime-s-311-other"),
+            ]);
+            persist_record(&fixture.root, "s-311", Some("runtime-s-311"));
+            write_live_journal(
+                &fixture.root,
+                "s-311",
+                dead_worker_with_realistic_start(),
+                Some("runtime-s-311"),
+            );
+            fixture.supervisor.script_job(
+                service_id("s-311", TEST_GENERATION),
+                present(ServiceState::Failed, None),
+            );
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+
+            let runtime = runtime_of(&fixture.registry, "s-311").await;
+            assert_eq!(runtime.state, RuntimeState::Lost);
+            assert_eq!(
+                runtime.loss_reason.as_deref(),
+                Some(RUNTIME_LOST_CLEANUP_UNCONFIRMED)
+            );
+            assert!(
+                conflicting.alive(),
+                "an ambiguous process is never signalled"
+            );
         }
 
         #[tokio::test]

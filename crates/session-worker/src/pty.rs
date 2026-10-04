@@ -2414,6 +2414,62 @@ mod tests {
         assert_eq!(listing, expected);
     }
 
+    /// A worker started inside an older session still holds that session's
+    /// `POHUNEK_RUNTIME_ID`; its PTY child must not carry it, or the child
+    /// would claim two worker instances.
+    #[tokio::test]
+    async fn inherited_base_child_does_not_carry_the_ambient_runtime_id_marker() {
+        let mut ambient = pohunek_test_support::process_env::ProcessEnv::lock();
+        ambient.set("POHUNEK_RUNTIME_ID", "ambient-instance");
+        ambient.set("POHUNEK_WORKER_INSTANCE_ID", "ambient-new-instance");
+        let cwd = pohunek_test_support::tempdir().expect("child working directory");
+        let pty = spawn(Command {
+            program: std::env::current_exe()
+                .expect("test executable")
+                .into_os_string()
+                .into_string()
+                .expect("test executable path is UTF-8"),
+            args: [
+                "--ignored",
+                "--exact",
+                ENV_LISTING_CHILD_TEST,
+                "--nocapture",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            base: EnvBase::Inherited,
+            env: Vec::new(),
+            cwd: cwd.path().to_path_buf(),
+            cols: 4000,
+            rows: 24,
+        });
+        let mut output = pty.subscribe_output(None).expect("subscribe");
+        let exit = pty.wait_exit().await.expect("exit");
+        assert_eq!(exit.exit_code, Some(0));
+
+        let mut observed = Vec::new();
+        while let Some(event) = output.recv().await {
+            match event {
+                OutputEvent::Replay(chunk) | OutputEvent::Output(chunk) => {
+                    observed.extend_from_slice(&chunk.bytes);
+                }
+                OutputEvent::Exit { .. } => break,
+                OutputEvent::Gap { .. } => panic!("environment listing must fit the history"),
+                OutputEvent::TerminalSnapshot(_) => {}
+            }
+        }
+        let observed = String::from_utf8(observed).expect("environment listing is UTF-8");
+        assert!(
+            observed.contains(ENV_LISTING_PREFIX),
+            "the listing child printed nothing: {observed}"
+        );
+        assert!(
+            !observed.contains("POHUNEK_RUNTIME_ID")
+                && !observed.contains("POHUNEK_WORKER_INSTANCE_ID"),
+            "ambient worker instance markers reached the child"
+        );
+    }
+
     #[tokio::test]
     async fn real_pty_accepts_deduplicated_input_and_stops_group() {
         let cwd = crate::test_support::child_cwd();

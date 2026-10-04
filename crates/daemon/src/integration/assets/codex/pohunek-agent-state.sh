@@ -55,7 +55,8 @@ action = os.environ.get("POHUNEK_HOOK_ACTION")
 socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
 worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
-worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID")
+# Workers that set only POHUNEK_RUNTIME_ID name the same worker instance.
+worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID") or os.environ.get("POHUNEK_RUNTIME_ID")
 agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
 
 if not session_id or (not worker_socket_path and (not socket_path or not protocol_raw)):

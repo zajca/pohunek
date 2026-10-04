@@ -915,6 +915,30 @@ class HookTests(unittest.TestCase):
         self.assertEqual(response, {"ok": True})
         self.assertEqual(client.recv.call_count, 2)
 
+    def test_worker_instance_environment_names_resolve_to_one_instance(self) -> None:
+        base = {
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1",
+            "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_PROTOCOL_VERSION": "1",
+        }
+        cases = [
+            ("current name", {"POHUNEK_WORKER_INSTANCE_ID": "r-1"}, "r-1"),
+            ("runtime id name only", {"POHUNEK_RUNTIME_ID": "r-2"}, "r-2"),
+            ("both names prefer the current one", {"POHUNEK_WORKER_INSTANCE_ID": "r-1", "POHUNEK_RUNTIME_ID": "r-2"}, "r-1"),
+        ]
+        for name, extra, expected in cases:
+            with self.subTest(name):
+                reporter = HookReporter({**base, **extra})
+                reporter._start_identity = 1
+                captured: list[dict[str, object]] = []
+                with mock.patch.object(reporter, "_send_worker", side_effect=lambda payload: captured.append(payload) or True):
+                    reporter.on_session_start({"session_id": "launch"})
+                self.assertEqual([item["runtime_id"] for item in captured], [expected])
+
+    def test_no_worker_instance_environment_name_means_inactive(self) -> None:
+        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker"})
+        reporter._start_identity = 1
+        self.assertFalse(reporter.active)
+
     def test_continuation_identity_uses_monotonic_sequences(self) -> None:
         reporter = HookReporter({
             "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",

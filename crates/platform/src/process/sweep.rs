@@ -16,7 +16,7 @@ use std::time::Duration;
 use rustix::process::{Pid as NativePid, Signal};
 use tokio::time::Instant;
 
-use super::{Error, ProcessIdentity, ProcessInspector, StartIdentity};
+use super::{Error, ProcessIdentity, ProcessInspector, StartIdentity, WorkerInstanceMarker};
 
 /// Largest accepted worker instance ID, in bytes.
 ///
@@ -152,6 +152,9 @@ pub enum SkipReason {
     /// process was between images), so it cannot be proven to belong to the
     /// runtime.
     MarkersUnreadable,
+    /// `POHUNEK_WORKER_INSTANCE_ID` and `POHUNEK_RUNTIME_ID` carry different
+    /// values, so the process cannot be proven to belong to the runtime or not.
+    MarkersConflicting,
     /// The sweep aborted before signalling the selected process.
     Aborted,
 }
@@ -441,8 +444,16 @@ fn classify(
         }
         Err(error) => return Err(error),
     };
-    if markers.worker_instance_id.as_deref() != Some(request.worker_instance_id()) {
-        return Ok(Selection::Foreign);
+    match markers.worker_instance() {
+        WorkerInstanceMarker::Instance(id) if id == request.worker_instance_id() => {}
+        // A process claiming two instances is attributed to neither, so it is
+        // never signalled, and the skip keeps the caller's cleanup unconfirmed.
+        WorkerInstanceMarker::Conflicting => {
+            return Ok(Selection::Skip(SkipReason::MarkersConflicting));
+        }
+        WorkerInstanceMarker::Absent | WorkerInstanceMarker::Instance(_) => {
+            return Ok(Selection::Foreign);
+        }
     }
     Ok(match verify(inspector, identity)? {
         None => Selection::Target,

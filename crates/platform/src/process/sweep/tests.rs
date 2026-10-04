@@ -258,6 +258,84 @@ fn marked(worker_instance_id: &str) -> MarkerAnswer {
     })
 }
 
+fn marked_runtime_id(runtime_id: &str) -> MarkerAnswer {
+    MarkerAnswer::Markers(OwnershipMarkers {
+        runtime_id: Some(runtime_id.to_owned()),
+        ..OwnershipMarkers::default()
+    })
+}
+
+fn marked_both(worker_instance_id: &str, runtime_id: &str) -> MarkerAnswer {
+    MarkerAnswer::Markers(OwnershipMarkers {
+        worker_instance_id: Some(worker_instance_id.to_owned()),
+        runtime_id: Some(runtime_id.to_owned()),
+        ..OwnershipMarkers::default()
+    })
+}
+
+/// A descendant of a worker that predates `POHUNEK_WORKER_INSTANCE_ID` carries
+/// only `POHUNEK_RUNTIME_ID`; the sweep reaps it so a crashed or removed
+/// session never reports a clean cleanup while it survives.
+#[tokio::test]
+async fn a_process_carrying_only_the_runtime_id_marker_is_swept() {
+    let current = identity(10, 100);
+    let alternate = identity(11, 110);
+    let agreeing = identity(12, 120);
+    let other_instance = identity(13, 130);
+    let inspector = ScriptedInspector::default()
+        .with_process(current, marked(RUNTIME))
+        .with_process(alternate, marked_runtime_id(RUNTIME))
+        .with_process(agreeing, marked_both(RUNTIME, RUNTIME))
+        .with_process(other_instance, marked_runtime_id("runtime-b"));
+    let sender = RecordingSender::fatal_on(&[Signal::TERM]);
+
+    let report = scripted_sweep(&inspector, &sender).await.expect("sweep");
+
+    assert_eq!(
+        sender.sent(),
+        vec![
+            (current, Signal::TERM),
+            (alternate, Signal::TERM),
+            (agreeing, Signal::TERM),
+        ]
+    );
+    let mut terminated = report.terminated.clone();
+    terminated.sort_by_key(|identity| identity.pid);
+    assert_eq!(terminated, vec![current, alternate, agreeing]);
+    assert!(report.skipped.is_empty());
+    assert!(report.is_complete());
+}
+
+/// A process whose two markers name different instances is attributed to
+/// neither: nothing is signalled and the skip is visible to the caller, which
+/// treats the cleanup as unconfirmed.
+#[tokio::test]
+async fn a_process_with_conflicting_instance_markers_is_skipped_and_never_signalled() {
+    let conflicting = identity(10, 100);
+    let reversed = identity(11, 110);
+    let inspector = ScriptedInspector::default()
+        .with_process(conflicting, marked_both(RUNTIME, "runtime-b"))
+        .with_process(reversed, marked_both("runtime-b", RUNTIME));
+    let sender = RecordingSender::fatal_on(&[Signal::TERM, Signal::KILL]);
+
+    let report = scripted_sweep(&inspector, &sender).await.expect("sweep");
+
+    assert!(sender.sent().is_empty());
+    assert_eq!(
+        report.skipped,
+        vec![
+            Skipped {
+                identity: conflicting,
+                reason: SkipReason::MarkersConflicting,
+            },
+            Skipped {
+                identity: reversed,
+                reason: SkipReason::MarkersConflicting,
+            },
+        ]
+    );
+}
+
 #[test]
 fn unreadable_marker_processes_are_classified_by_their_start_time() {
     use super::{classify, Selection, START_IDENTITY_ORDERS_PROCESS_STARTS};
@@ -548,6 +626,7 @@ async fn selection_matches_the_runtime_marker_exactly() {
                 session_id: Some(RUNTIME.to_owned()),
                 daemon_id: Some(RUNTIME.to_owned()),
                 worker_instance_id: None,
+                runtime_id: None,
             }),
         );
     let sender = RecordingSender::fatal_on(&[Signal::TERM]);
@@ -689,19 +768,12 @@ mod host {
     }
 
     fn spawn(inspector: HostInspector, script: &str, worker_instance_id: Option<&str>) -> Fixture {
-        spawn_marked(
-            inspector,
-            script,
-            worker_instance_id.map(|value| ("POHUNEK_WORKER_INSTANCE_ID", value)),
-        )
+        let marker = worker_instance_id.map(|value| ("POHUNEK_WORKER_INSTANCE_ID", value));
+        spawn_marked(inspector, script, marker.as_slice())
     }
 
-    /// Spawns the fixture with one `(name, value)` environment marker, if any.
-    fn spawn_marked(
-        inspector: HostInspector,
-        script: &str,
-        marker: Option<(&str, &str)>,
-    ) -> Fixture {
+    /// Spawns the fixture with the given `(name, value)` environment markers.
+    fn spawn_marked(inspector: HostInspector, script: &str, markers: &[(&str, &str)]) -> Fixture {
         let env = pohunek_test_support::env::TestEnv::new().expect("test environment");
         let mut command = env.command("/bin/sh");
         command
@@ -709,7 +781,7 @@ mod host {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some((name, value)) = marker {
+        for (name, value) in markers {
             command.env(name, value);
         }
         let child = command.spawn().expect("spawn fixture");
@@ -829,26 +901,66 @@ mod host {
         assert_untouched(inspector, &report, &longer);
     }
 
-    /// The sweep matches the one `POHUNEK_WORKER_INSTANCE_ID` marker name; a
-    /// process carrying the same value only under `POHUNEK_RUNTIME_ID` is not
-    /// selected, so an unknown marker fails closed.
+    /// A descendant of a worker that predates `POHUNEK_WORKER_INSTANCE_ID`
+    /// carries only `POHUNEK_RUNTIME_ID`; the sweep of its instance reaps it
+    /// and leaves a process of another instance alone.
     #[tokio::test]
-    async fn a_process_with_only_a_runtime_id_marker_is_not_swept() {
+    async fn a_descendant_with_only_the_runtime_id_marker_is_swept() {
         let inspector = HostInspector::new();
-        let runtime = unique_runtime("old-marker");
-        let marked = spawn(inspector, COMPLIANT, Some(&runtime));
-        let old_marker = spawn_marked(
+        let runtime = unique_runtime("alternate-marker");
+        let other = unique_runtime("alternate-other");
+        let descendant = spawn_marked(
             inspector,
             COMPLIANT,
-            Some(("POHUNEK_RUNTIME_ID", runtime.as_str())),
+            &[("POHUNEK_RUNTIME_ID", runtime.as_str())],
+        );
+        let other_instance = spawn_marked(
+            inspector,
+            COMPLIANT,
+            &[("POHUNEK_RUNTIME_ID", other.as_str())],
         );
 
         let report = sweep_runtime(&inspector, &request(&runtime))
             .await
             .expect("sweep worker instance");
 
-        assert_eq!(report.terminated, vec![marked.identity]);
+        assert_eq!(report.terminated, vec![descendant.identity]);
         assert!(report.is_complete());
-        assert_untouched(inspector, &report, &old_marker);
+        assert_untouched(inspector, &report, &other_instance);
+    }
+
+    /// Two markers naming different instances leave the process alone and
+    /// visible in the report.
+    #[tokio::test]
+    async fn a_process_with_conflicting_markers_survives_and_is_reported() {
+        let inspector = HostInspector::new();
+        let runtime = unique_runtime("conflict");
+        let other = unique_runtime("conflict-other");
+        let conflicting = spawn_marked(
+            inspector,
+            COMPLIANT,
+            &[
+                ("POHUNEK_WORKER_INSTANCE_ID", runtime.as_str()),
+                ("POHUNEK_RUNTIME_ID", other.as_str()),
+            ],
+        );
+
+        let report = sweep_runtime(&inspector, &request(&runtime))
+            .await
+            .expect("sweep worker instance");
+
+        assert!(report.terminated.is_empty() && report.killed.is_empty());
+        // Unrelated same-user processes with unreadable environments may also
+        // be listed; only the conflicting fixture's entry is asserted.
+        let reasons = report
+            .skipped
+            .iter()
+            .filter(|skipped| skipped.identity == conflicting.identity)
+            .map(|skipped| skipped.reason)
+            .collect::<Vec<_>>();
+        assert_eq!(reasons, vec![super::super::SkipReason::MarkersConflicting]);
+        assert!(inspector
+            .is_running(conflicting.identity)
+            .expect("inspect survivor"));
     }
 }

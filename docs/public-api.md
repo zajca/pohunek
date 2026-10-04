@@ -1001,14 +1001,18 @@ binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
 `POHUNEK_INTEGRATION_VERSION=8`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
-worker instance from `POHUNEK_WORKER_INSTANCE_ID`, read
+worker instance from `POHUNEK_WORKER_INSTANCE_ID` (falling back to
+`POHUNEK_RUNTIME_ID`), read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
-`SessionStart`. An installed hook from an earlier asset version reads no
-worker instance and cannot report identity; `integration.status` reports it as
+`SessionStart`. An installed hook from an earlier asset version reads only
+`POHUNEK_RUNTIME_ID`, which current workers do not set, so it cannot report identity; `integration.status` reports it as
 `outdated` with `reinstall` recovery, and `integration.doctor` as an asset
-finding, until it is reinstalled. The process sweep matches only the
-`POHUNEK_WORKER_INSTANCE_ID` marker, so a process that carries no such marker
-is never selected.
+finding, until it is reinstalled. A worker sets only
+`POHUNEK_WORKER_INSTANCE_ID` and strips an inherited `POHUNEK_RUNTIME_ID` from its
+children. The hooks and the process sweep also read `POHUNEK_RUNTIME_ID` as the
+same worker instance marker, so descendants of a worker that set only that name
+are still reaped and still report identity; a process whose two markers name
+different instances is never signalled and leaves the cleanup unconfirmed.
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an
 optional `seq`. A release clears only the current matching active-agent claim;
