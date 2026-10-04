@@ -496,8 +496,8 @@ fn explicit_agent_selection_and_unsupported_agents() {
         let error = super::uninstall(&agent).expect_err("unsupported agent");
         assert_eq!(error.code, "agent_not_installable");
     }
-    let unknown = super::uninstall(&RuntimeRef::from_wire("pi")).expect_err("unknown agent");
-    assert_eq!(unknown.code, "agent_kind_unsupported");
+    let no_handler = super::uninstall(&RuntimeRef::from_wire("pi")).expect_err("no handler");
+    assert_eq!(no_handler.code, "agent_not_installable");
 }
 
 fn assert_no_sentinel(label: &str, text: &str) {
@@ -1053,9 +1053,9 @@ fn doctor_selects_agents_and_rejects_unsupported_ones() {
             &[],
             &[],
         )
-        .expect_err("unknown")
+        .expect_err("no handler")
         .code,
-        "agent_kind_unsupported"
+        "agent_not_installable"
     );
 }
 

@@ -1267,6 +1267,12 @@ agent type. The hook validates its action and Pohunek handshake before reading,
 rejects oversized JSON, and never stages the payload on disk; provider prompts,
 results, messages, and transcript paths are discarded.
 
+The four integration methods classify an explicit `agent` before acting: a
+value outside the runtime-id grammar is `runtime/agent_kind_unsupported`, a
+valid id no enabled runtime backs is `runtime/runtime_not_installed`, and an
+installed runtime with no daemon-managed hook integration (the shell, Hermes,
+or any other registered runtime) is `runtime/agent_not_installable`.
+
 `integration.status` is the corresponding read-only drift report. Bare status
 reports both daemon-managed agents; `--agent codex` and `--agent claude` select
 one. Every managed script is checked independently against its embedded asset

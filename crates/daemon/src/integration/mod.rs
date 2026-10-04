@@ -242,7 +242,7 @@ fn install_one(agent: &RuntimeRef) -> Result<Vec<IntegrationInstallReport>, Prot
             "Hermes integration is not available in this milestone",
             None,
         )),
-        other => Err(ProtocolError::agent_kind_unsupported(other)),
+        other => Err(status_unsupported(other)),
     }
 }
 
@@ -265,7 +265,7 @@ pub fn status(params: IntegrationStatusParams) -> Result<IntegrationStatusResult
             return Err(status_unsupported(unsupported));
         }
         Some(other) => {
-            return Err(ProtocolError::agent_kind_unsupported(other));
+            return Err(status_unsupported(other));
         }
         None => vec![
             reported_agent_status(StatusAgent::Claude),
@@ -312,6 +312,9 @@ impl StatusAgent {
     }
 }
 
+/// `agent_not_installable` for an agent whose runtime is installed but has no
+/// daemon-managed hook integration. Callers validate the runtime against the
+/// registry first, so a non-installed or historical value never reaches it.
 fn status_unsupported(agent: &str) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
@@ -2919,7 +2922,7 @@ fn config_dir_missing(agent: &RuntimeRef, dir: &Path) -> ProtocolError {
             "Hermes integration is not available in this milestone",
         ),
         other => {
-            return ProtocolError::agent_kind_unsupported(other);
+            return status_unsupported(other);
         }
     };
     ProtocolError::new(
@@ -5750,17 +5753,15 @@ mod tests {
     }
 
     #[test]
-    fn install_and_status_reject_any_agent_without_a_hook_integration() {
-        for wire in ["pi", "Not An Id"] {
-            let status = super::status(protocol::IntegrationStatusParams {
-                agent: Some(RuntimeRef::from_wire(wire)),
-            })
-            .expect_err("status must reject the agent");
-            assert_eq!(status.code, "agent_kind_unsupported", "{wire}");
-            let install = super::install(Some(RuntimeRef::from_wire(wire)))
-                .expect_err("install must reject the agent");
-            assert_eq!(install.code, "agent_kind_unsupported", "{wire}");
-        }
+    fn install_and_status_report_an_installed_runtime_without_a_hook_integration() {
+        let status = super::status(protocol::IntegrationStatusParams {
+            agent: Some(RuntimeRef::from_wire("pi")),
+        })
+        .expect_err("status must reject the agent");
+        assert_eq!(status.code, "agent_not_installable");
+        let install = super::install(Some(RuntimeRef::from_wire("pi")))
+            .expect_err("install must reject the agent");
+        assert_eq!(install.code, "agent_not_installable");
     }
 
     /// The `PATH` a hook child inherits, read under the process-environment lock

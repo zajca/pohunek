@@ -543,7 +543,8 @@ fn unsafe_installer_lock(dir: &std::path::Path) -> IntegrationFinding {
 /// # Errors
 ///
 /// `agent_not_installable` for the shell runtime and Hermes (Hermes has its
-/// own local doctor) and a typed error for an unknown agent kind.
+/// own local doctor), and for any other installed runtime; the handler
+/// rejects historical and uninstalled runtimes before this runs.
 pub fn doctor(params: IntegrationDoctorParams) -> Result<IntegrationDoctorResult, ProtocolError> {
     doctor_with(
         params,
@@ -566,7 +567,7 @@ pub(super) fn doctor_with(
             return Err(status_unsupported(unsupported));
         }
         Some(other) => {
-            return Err(ProtocolError::agent_kind_unsupported(other));
+            return Err(status_unsupported(other));
         }
         None => vec![StatusAgent::Claude, StatusAgent::Codex],
     };

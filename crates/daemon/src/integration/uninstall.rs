@@ -54,7 +54,7 @@ pub fn uninstall(agent: &RuntimeRef) -> Result<IntegrationUninstallResult, Proto
             return Err(super::status_unsupported(unsupported));
         }
         other => {
-            return Err(ProtocolError::agent_kind_unsupported(other));
+            return Err(super::status_unsupported(other));
         }
     };
     Ok(IntegrationUninstallResult {

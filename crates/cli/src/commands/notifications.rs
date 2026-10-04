@@ -221,15 +221,12 @@ pub(crate) fn parse_notification_severity(value: &str) -> Result<NotificationSev
     }
 }
 
-/// Parse an agent kind wire value.
+/// Parse an agent kind: any grammar-valid runtime id, installed or not, since
+/// the filter only compares against the kinds notification records carry.
 pub(crate) fn parse_agent_kind(value: &str) -> Result<protocol::RuntimeRef, String> {
-    match value {
-        protocol::RuntimeId::SHELL
-        | protocol::RuntimeId::CODEX
-        | protocol::RuntimeId::CLAUDE
-        | protocol::RuntimeId::HERMES => Ok(protocol::RuntimeRef::from_wire(value)),
-        other => Err(format!("invalid agent kind '{other}'")),
-    }
+    protocol::RuntimeId::parse(value)
+        .map(protocol::RuntimeRef::from)
+        .map_err(|_error| format!("invalid agent kind '{value}'"))
 }
 
 /// Parse a policy provider selector.
@@ -1380,6 +1377,38 @@ mod tests {
 
         let filtered = filter_rows_by_agent(&rows, Some(&protocol::RuntimeRef::codex()));
 
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].record.id, NotificationId("n-1".to_owned()));
+    }
+
+    #[test]
+    fn agent_filter_accepts_any_valid_runtime_id_and_rejects_the_rest() {
+        let custom = parse_agent_kind("acme").expect("a valid runtime id parses");
+        assert_eq!(custom, protocol::RuntimeRef::from_wire("acme"));
+        for invalid in ["Not An Id", "", "a/b"] {
+            assert_eq!(
+                parse_agent_kind(invalid),
+                Err(format!("invalid agent kind '{invalid}'"))
+            );
+        }
+
+        let rows = vec![
+            HostedNotification {
+                host_id: "host-b".to_owned(),
+                record: protocol::NotificationRecord {
+                    agent_kind: Some(custom.clone()),
+                    ..record("n-1", NotificationStatus::Unread)
+                },
+            },
+            HostedNotification {
+                host_id: "host-b".to_owned(),
+                record: protocol::NotificationRecord {
+                    agent_kind: Some(protocol::RuntimeRef::codex()),
+                    ..record("n-2", NotificationStatus::Unread)
+                },
+            },
+        ];
+        let filtered = filter_rows_by_agent(&rows, Some(&custom));
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].record.id, NotificationId("n-1".to_owned()));
     }

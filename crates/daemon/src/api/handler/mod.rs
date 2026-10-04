@@ -284,10 +284,22 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
             daemon::handle_daemon_doctor(request, &state.governance, &state.sessions).await
         }
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
-        method::INTEGRATION_INSTALL => integration::handle_integration_install(request).await,
-        method::INTEGRATION_STATUS => integration::handle_integration_status(request).await,
-        method::INTEGRATION_UNINSTALL => integration::handle_integration_uninstall(request).await,
-        method::INTEGRATION_DOCTOR => integration::handle_integration_doctor(request).await,
+        method::INTEGRATION_INSTALL => {
+            integration::handle_integration_install(request, state.sessions.profiles().runtimes())
+                .await
+        }
+        method::INTEGRATION_STATUS => {
+            integration::handle_integration_status(request, state.sessions.profiles().runtimes())
+                .await
+        }
+        method::INTEGRATION_UNINSTALL => {
+            integration::handle_integration_uninstall(request, state.sessions.profiles().runtimes())
+                .await
+        }
+        method::INTEGRATION_DOCTOR => {
+            integration::handle_integration_doctor(request, state.sessions.profiles().runtimes())
+                .await
+        }
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_GOVERNANCE_INSPECT => {
             governance::handle_host_governance_inspect(request, &state.governance).await
