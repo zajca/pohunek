@@ -130,7 +130,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 # Single source of truth for the released version. Every crate opts in via
 # `version.workspace = true`, so `scripts/release` only bumps it here.
 [workspace.package]
-version = "0.33.0"
+version = "0.33.1"
 edition = "2021"
 license = "MIT"
 rust-version = "1.96"
