@@ -146,7 +146,7 @@ runtime lifecycle from launch.
 - **Logical session**: the durable Pohunek session record identified by
   `session_id`.
 - **Runtime**: one process generation within a logical session, identified by
-  `runtime_id` and `runtime_generation`.
+  `worker_instance_id` and `runtime_generation`.
 - **Native session reference**: a Hermes session ID or title accepted by
   `hermes chat --resume`.
 - **Hermes profile**: an isolated Hermes home containing its own configuration,
@@ -483,7 +483,7 @@ reference. It also reports:
 - process start identity;
 - a monotonic report sequence;
 - a bounded expiry;
-- the current Pohunek `runtime_id`, when inherited in the environment.
+- the current worker instance id (`POHUNEK_WORKER_INSTANCE_ID`), when inherited in the environment.
 
 The worker-private report path remains the preferred native-identity path. The
 public `session.report_native_id` method is the necessary local fallback,
@@ -572,7 +572,7 @@ Result:
 {
   "session_id": "sess_...",
   "worker_id": "worker_...",
-  "runtime_id": "runtime_...",
+  "worker_instance_id": "runtime_...",
   "runtime_generation": "2",
   "watermark": "1842",
   "dimensions": {
@@ -628,7 +628,7 @@ Request:
   "params": {
     "session_id": "sess_...",
     "runtime": {
-      "runtime_id": "runtime_...",
+      "worker_instance_id": "runtime_...",
       "runtime_generation": "2"
     },
     "after_offset": "8192",
@@ -643,7 +643,7 @@ Result:
 ```json
 {
   "session_id": "sess_...",
-  "runtime_id": "runtime_...",
+  "worker_instance_id": "runtime_...",
   "runtime_generation": "2",
   "history_start_offset": "4096",
   "start_offset": "8192",
@@ -688,7 +688,7 @@ Request:
   "params": {
     "session_id": "sess_...",
     "runtime": {
-      "runtime_id": "runtime_...",
+      "worker_instance_id": "runtime_...",
       "runtime_generation": "2"
     },
     "after_updated_at": "2026-07-27T12:00:00Z",

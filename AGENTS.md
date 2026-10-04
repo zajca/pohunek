@@ -69,7 +69,7 @@ Hard constraints, decided on purpose — respect them in every change:
   serve a UI.
 - **Issue/PR providers (Linear, GitHub) live only in `zajca/pohunek-work`,
   never in core** (neither the daemon, the CLI, nor this repository's scripts).
-- **Protocol today:** public protocol v3 is owner-only newline-delimited JSON
+- **Protocol today:** public protocol v4 is owner-only newline-delimited JSON
   over a Unix socket (local) and TCP on configured overlays (remote); attach
   uses a separate raw-byte connection per PTY. [#70](https://github.com/zajca/pohunek/issues/70)
   owns the coordinated v4 host-link cutover; do not describe relay protocol as
