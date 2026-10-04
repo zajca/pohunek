@@ -1,0 +1,33 @@
+# Built-in runtime descriptor for Hermes Agent, in the runtime.toml shape.
+#
+# `detect_manifest` names an activity manifest embedded in the daemon.
+# `version_probe.parser` names a compiled parser for the `--version` output.
+
+schema = 1
+id = "pohunek.runtime.hermes"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "hermes"
+name = "Hermes Agent"
+program = "hermes"
+args = ["chat"]
+detect_manifest = "hermes"
+version_probe = { parser = "hermes-v1" }
+
+[input]
+bracketed_paste = true
+submit_delay_ms = 150
+text_policy = "hermes_safe_text"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--resume", "{reference}"]
+
+[fork]
+supported = false
+
+[integration]
+handler = "hermes-hook-v1"

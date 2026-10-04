@@ -451,6 +451,8 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/claude.rs`
 - `crates/daemon/src/agent/hermes.rs`
 - `crates/daemon/src/agent/shell.rs`
+- `crates/daemon/src/agent/host/`
+- `crates/daemon/src/agent/builtin/`
 - `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/osc.rs`
 - `crates/daemon/src/detect/manifest/mod.rs`
