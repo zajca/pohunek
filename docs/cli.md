@@ -33,7 +33,7 @@ port is retained.
 | `pohunek session list` | List sessions, including a `running/recent` subagent count; `--filter state=running --filter agent=codex` (ANDed), `-q` for ids only. |
 | `pohunek session inspect <target>` | Full logical session record: agent state, current/recent subagents, runtime state and generation, cwd, project, branch, worktree, recovery binding. |
 | `pohunek attach <target>` | Attach the current terminal; `Ctrl-]` detaches. |
-| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
+| `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. `--until <activity>` (repeatable) and `--timeout <ms>` wait for the agent's reaction in the same call, for zero-delay profiles only. |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
 | `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
 | `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `worker_instance_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
@@ -114,6 +114,30 @@ printf '%s' 'Review the failing test and propose a fix.' \
 printf '%s' 'Run the focused tests.' \
   | pohunek session input s-01J00000000000000000000000 --stdin --json
 ```
+
+`session input` can also wait for the agent's reaction in the same call:
+`--until` names the activities that end the wait (repeatable, default `idle`
+and `blocked`) and `--timeout` bounds it to `1..8000` ms (default 8000). The
+whole wait contract is validated before any text is delivered. The waited form
+works only for agent profiles whose submit framing has no delay, such as
+`shell`: Codex, Claude Code, and Hermes submit with a delay and fail with
+`session_input_wait_unsupported` before any bytes are written. For them, send
+the input and then wait with `session wait`:
+
+```bash
+pohunek session input s-01J00000000000000000000000 'make test' \
+  --until idle --timeout 5000 --json          # a zero-delay shell profile
+
+pohunek session input s-01J00000000000000000000000 'Continue.' --json
+pohunek session wait s-01J00000000000000000000000 \
+  --activity idle --activity blocked --timeout-ms 8000 --json
+```
+
+A waited input refuses a blocked agent with `session_agent_blocked`: an approval
+is pending and belongs to the operator. `session_input_timeout` means delivery
+or the target activity did not arrive before the deadline; the text may already
+have been delivered, so inspect the session instead of resending it. See
+[sessions](knowledge/concepts/sessions.md) for the full wait contract.
 
 Every `--json` success is one document shaped as
 `{cli_version, protocol: {minimum, maximum}, ok}`; failures use the same prefix
