@@ -1,0 +1,64 @@
+name: Notify the Homebrew tap
+
+# Tells the tap zajca/homebrew-pohunek to bump the `pohunek` formula after a
+# stable `vX.Y.Z` release has been published. It is a separate workflow so that
+# `release.yml` keeps no secret: the only credential here is the dispatch token,
+# which can only start a workflow in the tap. The job checks out nothing, runs
+# no code from this repository or from a release asset, and reads the tag name
+# only through `env`, after the shell has matched it against a strict pattern.
+# A pre-release is skipped: the formula follows stable releases only.
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Dispatch the tap bump
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ github.event.workflow_run.head_branch }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check the release and build the payload
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          if [ "$version" = "$TAG" ] || ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::the tag must look like vX.Y.Z, got: $TAG"
+            exit 1
+          fi
+          # The release must exist and be published, not only a green run.
+          state="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease --jq '"\(.isDraft) \(.isPrerelease)"')"
+          case "$state" in
+            "false false") ;;
+            "false true")
+              echo "release $TAG is a pre-release; the formula follows stable releases only"
+              exit 0
+              ;;
+            *)
+              echo "::error::release $TAG is not published"
+              exit 1
+              ;;
+          esac
+          {
+            echo "formula=pohunek"
+            echo "payload=$(jq -cn --arg formula pohunek --arg tag "$TAG" '{formula: $formula, tag: $tag}')"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch the bump to the tap
+        if: ${{ steps.select.outputs.formula != '' }}
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ secrets.TAP_DISPATCH_PAT }}
+          repository: zajca/homebrew-pohunek
+          event-type: pohunek-work-release
+          client-payload: ${{ steps.select.outputs.payload }}
