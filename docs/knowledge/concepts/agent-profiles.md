@@ -57,10 +57,58 @@ operator plugin provides lifecycle hooks, typed tools, and a generated skill in
 an isolated profile or custom absolute home; it never reads the profile's
 `state.db`. See [Hermes operator](../guides/hermes-operator.md).
 
-Resume and fork are independent capabilities frozen into each session at
-creation. A profile may disable a capability supported by its base adapter, but
-it cannot invent support the adapter does not have. Clients read
-`SessionInfo.capabilities` rather than branching on profile or base-kind names.
+Resume and fork come from one native-session launch spec frozen into each
+session at creation (see below). Clients read `SessionInfo.capabilities` rather
+than branching on profile or base-kind names.
 An unknown future base-kind string is presentation-only: it can be displayed
 neutrally but cannot be launched, mutated, recovered, or persisted until the
 daemon explicitly supports it.
+
+## Native recovery spec
+
+A native-session launch spec states how an agent CLI resumes and optionally
+forks one of its own conversations: the kind of native reference it consumes
+(`id` or `path`), the resume argv, and an optional fork argv. Each argv has
+exactly one reference slot. The daemon runs the argv directly and never invokes
+a shell, so a reference containing spaces or shell metacharacters stays one
+argument. A `path` reference must still be an absolute path and an `id`
+reference must not begin with `-`; both checks run where the reference is
+recorded and again when it is used.
+
+Built-in specs (all `id` references):
+
+| Base | Resume | Fork |
+|------|--------|------|
+| `claude` | `--resume <reference>` | `--resume <reference> --fork-session` |
+| `codex` | `resume <reference>` | unsupported |
+| `hermes` | `--resume <reference>` | unsupported |
+| `shell` | none | none |
+
+A profile without a `[resume]` table inherits its base spec. A `[resume]` table
+is either `resumable = false` (no native recovery and therefore no fork) or a
+complete spec; nothing is merged with the base:
+
+```toml
+base = "claude"
+[resume]
+reference_kind = "path"                 # "id" or "path"
+args = ["--session", "{reference}"]     # resume argv, required
+fork_args = ["--fork", "{reference}"]   # optional; absent means no fork
+```
+
+`fork_args` is accepted only on a base with compiled fork support (`claude`);
+a `codex`, `hermes`, or `shell` profile that sets it is rejected, so those
+bases keep returning `agent_fork_unsupported`. Runtime packages will declare
+their own fork support later.
+
+`{reference}` must be a whole argv token, appear exactly once per list, and is
+never part of a larger string. The daemon rejects, with `invalid_profile` naming
+the profile and the field, an unknown `reference_kind`, a missing `reference_kind`
+or `args`, an empty list, a list without or with more than one `{reference}`, an
+embedded form such as `--session={reference}`, any other brace in a token, an
+empty or control-character token, `fork_args` without `args` or on a base without compiled fork support, and any
+`[resume]` table on a `shell` base. A malformed profile fails before any worker,
+session record, or worktree exists. Parse errors report the message and line
+only, never profile environment values. The resolved spec is stored in the
+session's recovery binding as `native_launch`; recovery and fork use that frozen
+copy even after the profile changes.

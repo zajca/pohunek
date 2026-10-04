@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pohunek_client::{Client, ClientError, ClientOptions};
-use pohunek_daemon::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
+use pohunek_daemon::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
 use pohunek_daemon::store::{
     DesiredState, ResumeBinding, RuntimeRecord, SessionRecord, Store, StoredInputRules,
 };
@@ -774,13 +774,14 @@ impl Installation {
                         false,
                         Duration::ZERO,
                     )),
-                    resume_mode: Some(ResumeMode::Flag),
-                    ref_kind: Some(SessionRefKind::Id),
-                    resumable: true,
-                    fork_mode: Some(ForkMode::ClaudeSession),
-                    fork_resume_mode: Some(ResumeMode::Flag),
-                    fork_ref_kind: Some(SessionRefKind::Id),
-                    forkable: false,
+                    native_launch: Some(
+                        NativeSessionLaunch::from_templates(
+                            SessionRefKind::Id,
+                            &["--resume", "{reference}"],
+                            None,
+                        )
+                        .expect("valid resume template"),
+                    ),
                 }),
                 native_identity_ordering: None,
                 runtime,

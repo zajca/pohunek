@@ -20,8 +20,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::{
-    adapter_for, base_capabilities, base_fork_template, base_resume_template, AgentCapabilities,
-    ForkTemplate, InputRules, ResumeMode, ResumeTemplate, SessionRefKind,
+    adapter_for, base_native_launch, InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind,
 };
 use crate::detect::Manifest;
 use crate::project::config::validate_name;
@@ -41,21 +40,80 @@ struct RawProfile {
     args: Option<Vec<String>>,
     /// Extra PTY env (every `POHUNEK_`-prefixed key is stripped on load — reserved).
     #[serde(default)]
-    env: HashMap<String, String>,
+    env: HashMap<String, EnvValue>,
     /// Input-framing override; absent ⇒ the base kind's defaults.
     #[serde(default)]
     input_rules: Option<RawInputRules>,
-    /// Resume override (`mode/ref_kind/resumable`); absent ⇒ inherit the base kind's
-    /// resume template (or non-resumable for a shell).
+    /// Native recovery override; absent ⇒ inherit the base kind's native-session
+    /// launch spec (or non-resumable for a shell).
     #[serde(default)]
     resume: Option<RawResume>,
-    /// Fork override. Profiles may only disable a compiled base capability.
-    #[serde(default)]
-    fork: Option<RawFork>,
     /// Detection-manifest override name, resolved from `agents/manifests/<name>.toml`
     /// under the same charset + containment guard as a profile file.
     #[serde(default)]
     manifest: Option<String>,
+}
+
+/// A profile env value. Deserializing a non-string fails with a fixed message
+/// instead of serde's default, which echoes the offending value.
+#[derive(Clone)]
+struct EnvValue(String);
+
+impl std::fmt::Debug for EnvValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EnvValue(<redacted>)")
+    }
+}
+
+impl<'de> Deserialize<'de> for EnvValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StringOnly;
+
+        impl<'de> serde::de::Visitor<'de> for StringOnly {
+            type Value = EnvValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<EnvValue, E> {
+                Ok(EnvValue(v.to_owned()))
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<EnvValue, E> {
+                Err(E::custom("environment values must be strings"))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<EnvValue, E> {
+                Err(E::custom("environment values must be strings"))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<EnvValue, E> {
+                Err(E::custom("environment values must be strings"))
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<EnvValue, E> {
+                Err(E::custom("environment values must be strings"))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _: A) -> Result<EnvValue, A::Error> {
+                Err(serde::de::Error::custom(
+                    "environment values must be strings",
+                ))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, _: A) -> Result<EnvValue, A::Error> {
+                Err(serde::de::Error::custom(
+                    "environment values must be strings",
+                ))
+            }
+        }
+
+        deserializer.deserialize_any(StringOnly)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,28 +125,26 @@ struct RawInputRules {
     submit_delay_ms: Option<u64>,
 }
 
+/// A `[resume]` table: either `resumable = false` (no native recovery) or a
+/// complete native-session launch spec. A spec is never merged with the base
+/// kind's argv, so a fork shape can never be combined with a different resume
+/// shape.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawResume {
-    /// `flag` (`--resume <ref>`) | `subcommand` (`resume <ref>`); absent ⇒ the base
-    /// kind's mode.
-    #[serde(default)]
-    mode: Option<String>,
-    /// `id` | `path`; absent ⇒ the base kind's ref kind.
-    #[serde(default)]
-    ref_kind: Option<String>,
-    /// Whether this profile resumes at all; absent ⇒ inherit the base kind (a shell
-    /// never resumes, claude/codex do).
+    /// `false` disables native recovery; absent or `true` requires a spec.
     #[serde(default)]
     resumable: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawFork {
-    /// Whether this profile retains its base kind's native fork capability.
+    /// `id` | `path`: the kind of native reference both operations consume.
     #[serde(default)]
-    supported: Option<bool>,
+    reference_kind: Option<String>,
+    /// Resume argv template with exactly one whole-token `{reference}`.
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    /// Fork argv template with exactly one whole-token `{reference}`; absent ⇒
+    /// the profile cannot fork natively.
+    #[serde(default)]
+    fork_args: Option<Vec<String>>,
 }
 
 /// Host-profile launch overrides. Present on a [`ResolvedAgent`] only when a
@@ -107,13 +163,10 @@ pub(crate) struct ResolvedProfile {
     pub env: Vec<(String, String)>,
     /// Input-rules override; `None` ⇒ inherit the base kind's rules.
     pub input_rules: Option<InputRules>,
-    /// Resolved resume template; `Some` ⇒ resumable with this argv mode + ref kind,
-    /// `None` ⇒ not resumable. Authoritative for a profile (does NOT fall back to
-    /// the base kind when `None`).
-    pub resume: Option<ResumeTemplate>,
-    /// Effective fork template. `None` means this profile cannot fork, either
-    /// because its base has no compiled fork capability or the profile disabled it.
-    pub fork: Option<ForkTemplate>,
+    /// Resolved native-session launch spec; `None` ⇒ not resumable and not
+    /// forkable. Authoritative for a profile (does NOT fall back to the base kind
+    /// when `None`).
+    pub native: Option<NativeSessionLaunch>,
     /// Parsed detection-manifest override; `None` ⇒ inherit the base kind's manifest.
     pub manifest: Option<Manifest>,
 }
@@ -131,15 +184,12 @@ pub(crate) struct ResolvedAgent {
 }
 
 impl ResolvedAgent {
-    /// Return the effective native recovery capabilities for this resolved agent.
+    /// Return the effective native-session launch spec for this resolved agent.
     #[must_use]
-    pub(crate) fn capabilities(&self) -> AgentCapabilities {
+    pub(crate) fn native_launch(&self) -> Option<NativeSessionLaunch> {
         self.profile.as_ref().map_or_else(
-            || base_capabilities(&self.base),
-            |profile| AgentCapabilities {
-                resume: profile.resume,
-                fork: profile.fork,
-            },
+            || base_native_launch(&self.base),
+            |profile| profile.native.clone(),
         )
     }
 }
@@ -348,15 +398,20 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
     }
     let content =
         std::fs::read_to_string(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
-    let raw: RawProfile =
-        toml::from_str(&content).map_err(|err| invalid_profile(name, &err.to_string()))?;
+    let raw: RawProfile = toml::from_str(&content)
+        .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
     let base = base_kind_from_name(&raw.base)
         .ok_or_else(|| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
     // A shell has no native resume; a `base = "shell"` profile may never claim one.
-    if base == AgentKind::Shell && raw.resume.as_ref().and_then(|r| r.resumable) == Some(true) {
+    if base == AgentKind::Shell
+        && raw
+            .resume
+            .as_ref()
+            .is_some_and(|resume| resume.resumable != Some(false))
+    {
         return Err(invalid_profile(
             name,
-            "base = \"shell\" cannot set resume.resumable = true (a shell has no native resume)",
+            "base = \"shell\" cannot declare a [resume] spec (a shell has no native resume)",
         ));
     }
     let program = raw.program.unwrap_or_else(|| default_program(&base));
@@ -368,6 +423,7 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
         .env
         .into_iter()
         .filter(|(key, _)| !key.starts_with("POHUNEK_"))
+        .map(|(key, value)| (key, value.0))
         .collect();
     let input_rules = raw.input_rules.map(|rules| {
         adapter_for(&base).input_rules().with_framing(
@@ -375,8 +431,7 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
             Duration::from_millis(rules.submit_delay_ms.unwrap_or(0)),
         )
     });
-    let resume = resolve_resume(name, &base, raw.resume.as_ref())?;
-    let fork = resolve_fork(name, &base, raw.resume.as_ref(), raw.fork.as_ref())?;
+    let native = resolve_native(name, &base, raw.resume.as_ref())?;
     let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
     Ok(ResolvedAgent {
         name: name.to_owned(),
@@ -386,113 +441,98 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
             args,
             env,
             input_rules,
-            resume,
-            fork,
+            native,
             manifest,
         }),
     })
 }
 
-/// Resolve a profile's effective resume template (C.3). Absent `[resume]` inherits
-/// the base kind's template; an explicit block overrides `mode/ref_kind/resumable`,
-/// defaulting any omitted field from the base kind. `None` ⇒ not resumable
-/// (authoritative — never falls back to the base kind).
-fn resolve_resume(
+/// Resolve a profile's effective native-session launch spec.
+///
+/// An absent `[resume]` inherits the base kind's compiled spec. `resumable =
+/// false` yields no native recovery. Otherwise `[resume]` must carry a complete
+/// spec (`reference_kind` and `args`, optionally `fork_args` on a base with
+/// compiled fork support); nothing is merged
+/// with the base kind, and every template is validated here so a malformed
+/// profile fails before any session is created.
+fn resolve_native(
     name: &str,
     base: &AgentKind,
     raw: Option<&RawResume>,
-) -> Result<Option<ResumeTemplate>, ProtocolError> {
-    let base_template = base_resume_template(base);
+) -> Result<Option<NativeSessionLaunch>, ProtocolError> {
     let Some(raw) = raw else {
-        return Ok(base_template);
+        return Ok(base_native_launch(base));
     };
-    // Default resumability to whether the base kind resumes at all.
-    if !raw.resumable.unwrap_or(base_template.is_some()) {
-        return Ok(None);
-    }
-    resolve_resume_operation(name, base_template, raw).map(Some)
-}
-
-/// Resolve the argv and reference shape independently of resume availability.
-fn resolve_resume_operation(
-    name: &str,
-    base_template: Option<ResumeTemplate>,
-    raw: &RawResume,
-) -> Result<ResumeTemplate, ProtocolError> {
-    let mode = match raw.mode.as_deref() {
-        Some(value) => parse_resume_mode(name, value)?,
-        None => base_template.map(|template| template.mode).ok_or_else(|| {
-            invalid_profile(
+    if raw.resumable == Some(false) {
+        if raw.reference_kind.is_some() || raw.args.is_some() || raw.fork_args.is_some() {
+            return Err(invalid_profile(
                 name,
-                "resume.mode is required for a profile with no resumable base",
-            )
-        })?,
-    };
-    let ref_kind = match raw.ref_kind.as_deref() {
-        Some(value) => parse_ref_kind(name, value)?,
-        None => base_template.map_or(SessionRefKind::Id, |template| template.ref_kind),
-    };
-    Ok(ResumeTemplate { mode, ref_kind })
-}
-
-/// Resolve a profile's effective native fork capability.
-///
-/// Profiles inherit the compiled base capability unless they explicitly set
-/// `fork.supported = false`. Any base may state that explicit disable; enabling
-/// is rejected unless the compiled base owns native fork semantics.
-fn resolve_fork(
-    name: &str,
-    base: &AgentKind,
-    raw_resume: Option<&RawResume>,
-    raw_fork: Option<&RawFork>,
-) -> Result<Option<ForkTemplate>, ProtocolError> {
-    let base_template = base_fork_template(base);
-    if raw_fork.and_then(|raw| raw.supported) == Some(false) {
+                "resume.resumable = false cannot be combined with resume.reference_kind, resume.args, or resume.fork_args",
+            ));
+        }
         return Ok(None);
     }
-    let Some(base_template) = base_template else {
-        if raw_fork.and_then(|raw| raw.supported) != Some(true) {
-            return Ok(None);
-        }
+    let reference_kind = raw
+        .reference_kind
+        .as_deref()
+        .ok_or_else(|| invalid_profile(name, "resume.reference_kind is required"))
+        .and_then(|value| parse_reference_kind(name, value))?;
+    let resume_args = raw
+        .args
+        .as_deref()
+        .ok_or_else(|| invalid_profile(name, "resume.args is required"))
+        .and_then(|tokens| parse_template(name, "resume.args", tokens))?;
+    // Fork semantics are owned by the compiled base: a profile may restate or
+    // omit its base's fork, but cannot grant fork to a base that has none.
+    if raw.fork_args.is_some()
+        && !base_native_launch(base).is_some_and(|compiled| compiled.supports_fork())
+    {
         return Err(invalid_profile(
             name,
-            "fork.supported = true requires a base kind with native fork support",
-        ));
-    };
-    let resume = raw_resume.map_or(Ok(base_template.resume), |raw| {
-        resolve_resume_operation(name, Some(base_template.resume), raw)
-    })?;
-    if resume.mode == ResumeMode::Subcommand {
-        return Err(invalid_profile(
-            name,
-            "resume.mode = \"subcommand\" requires fork.supported = false for this base kind",
+            "resume.fork_args requires a base kind with native fork support",
         ));
     }
-    Ok(Some(ForkTemplate {
-        resume,
-        mode: base_template.mode,
-    }))
+    let fork_args = raw
+        .fork_args
+        .as_deref()
+        .map(|tokens| parse_template(name, "resume.fork_args", tokens))
+        .transpose()?;
+    Ok(Some(NativeSessionLaunch::new(
+        reference_kind,
+        resume_args,
+        fork_args,
+    )))
 }
 
-fn parse_resume_mode(name: &str, value: &str) -> Result<ResumeMode, ProtocolError> {
-    match value {
-        "flag" => Ok(ResumeMode::Flag),
-        "subcommand" => Ok(ResumeMode::Subcommand),
-        other => Err(invalid_profile(
-            name,
-            &format!("unknown resume.mode '{other}' (expected 'flag' or 'subcommand')"),
-        )),
-    }
+fn parse_template(name: &str, field: &str, tokens: &[String]) -> Result<NativeArgs, ProtocolError> {
+    NativeArgs::from_template(tokens)
+        .map_err(|err| invalid_profile(name, &format!("{field}: {err}")))
 }
 
-fn parse_ref_kind(name: &str, value: &str) -> Result<SessionRefKind, ProtocolError> {
+fn parse_reference_kind(name: &str, value: &str) -> Result<SessionRefKind, ProtocolError> {
     match value {
         "id" => Ok(SessionRefKind::Id),
         "path" => Ok(SessionRefKind::Path),
         other => Err(invalid_profile(
             name,
-            &format!("unknown resume.ref_kind '{other}' (expected 'id' or 'path')"),
+            &format!("unknown resume.reference_kind '{other}' (expected 'id' or 'path')"),
         )),
+    }
+}
+
+/// Describe a TOML parse failure by message and line only.
+///
+/// The error's own `Display` quotes the offending source line, which can be an
+/// `[env]` entry carrying a secret; the message and line number never do.
+fn toml_diagnostic(content: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => {
+            let line = content
+                .get(..span.start)
+                .map_or(1, |head| head.matches('\n').count() + 1);
+            format!("line {line}: {}", error.message())
+        }
+        None => error.message().to_owned(),
     }
 }
 
@@ -553,6 +593,7 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{NativeArg, SessionRef};
 
     fn tmp_agents_dir(tag: &str) -> crate::test_support::ScopedDir {
         crate::test_support::scoped_dir(&format!("pohunek-agents-{tag}-"))
@@ -669,29 +710,8 @@ mod tests {
         assert_eq!(input_rules.submit_delay, Duration::from_millis(25));
         assert!(input_rules.validate_text("unsafe\u{1b}[201~").is_err());
         assert!(!input_rules.allows_while_blocked());
-        assert_eq!(
-            profile.resume,
-            Some(ResumeTemplate {
-                mode: ResumeMode::Flag,
-                ref_kind: SessionRefKind::Id,
-            })
-        );
-        assert_eq!(profile.fork, None);
-    }
-
-    #[test]
-    fn hermes_profile_cannot_enable_unsupported_fork() {
-        let dir = tmp_agents_dir("hermes-fork");
-        write_profile(
-            &dir,
-            "hermes-fork",
-            "base = \"hermes\"\n[fork]\nsupported = true\n",
-        );
-
-        let error = ProfileRegistry::new(Some(dir.clone()))
-            .resolve_agent("hermes-fork")
-            .expect_err("Hermes has no compiled fork semantics");
-        assert_eq!(error.code, "invalid_profile");
+        assert_eq!(profile.native, base_native_launch(&AgentKind::Hermes));
+        assert!(!profile.native.expect("Hermes recovers").supports_fork());
     }
 
     #[test]
@@ -757,198 +777,299 @@ mod tests {
         std::fs::write(manifests.join(format!("{name}.toml")), body).expect("write manifest");
     }
 
+    fn resolve(dir: &Path, name: &str) -> Result<ResolvedProfile, ProtocolError> {
+        ProfileRegistry::new(Some(dir.to_path_buf()))
+            .resolve_agent(name)
+            .map(|agent| agent.profile.expect("profile overrides"))
+    }
+
+    fn invalid_message(dir: &Path, name: &str) -> String {
+        let error = resolve(dir, name).expect_err("profile must be rejected");
+        assert_eq!(error.code, "invalid_profile");
+        error.msg
+    }
+
     #[test]
-    fn resume_template_inherits_base_kind_without_a_resume_block() {
+    fn native_launch_inherits_base_kind_without_a_resume_block() {
         let dir = tmp_agents_dir("resume-inherit");
         write_profile(&dir, "c", "base = \"claude\"\n");
         write_profile(&dir, "x", "base = \"codex\"\n");
-        let reg = ProfileRegistry::new(Some(dir.clone()));
+        write_profile(&dir, "h", "base = \"hermes\"\n");
 
-        let claude = reg.resolve_agent("c").expect("resolves").profile.unwrap();
-        assert_eq!(
-            claude.resume,
-            Some(ResumeTemplate {
-                mode: ResumeMode::Flag,
-                ref_kind: SessionRefKind::Id,
-            })
-        );
-        let codex = reg.resolve_agent("x").expect("resolves").profile.unwrap();
-        assert_eq!(
-            codex.resume,
-            Some(ResumeTemplate {
-                mode: ResumeMode::Subcommand,
-                ref_kind: SessionRefKind::Id,
-            })
-        );
+        for (name, base) in [
+            ("c", AgentKind::Claude),
+            ("x", AgentKind::Codex),
+            ("h", AgentKind::Hermes),
+        ] {
+            let agent = ProfileRegistry::new(Some(dir.clone()))
+                .resolve_agent(name)
+                .expect("resolves");
+            assert_eq!(agent.native_launch(), base_native_launch(&base), "{name}");
+            assert_eq!(
+                agent.profile.expect("profile").native,
+                base_native_launch(&base)
+            );
+        }
     }
 
     #[test]
-    fn resume_block_overrides_mode_and_ref_kind() {
-        let dir = tmp_agents_dir("resume-override");
-        // A claude-based profile that drives a `resume` subcommand against a path.
+    fn resume_only_spec_resolves_without_fork() {
+        let dir = tmp_agents_dir("resume-only");
         write_profile(
             &dir,
             "weird",
-            "base = \"claude\"\n[resume]\nmode = \"subcommand\"\nref_kind = \"path\"\n[fork]\nsupported = false\n",
+            "base = \"claude\"\n[resume]\nreference_kind = \"path\"\nargs = [\"resume\", \"{reference}\"]\n",
         );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-        let resume = reg
-            .resolve_agent("weird")
+        let native = resolve(&dir, "weird")
             .expect("resolves")
-            .profile
-            .unwrap()
-            .resume;
+            .native
+            .expect("spec");
+        assert_eq!(native.reference_kind(), SessionRefKind::Path);
         assert_eq!(
-            resume,
-            Some(ResumeTemplate {
-                mode: ResumeMode::Subcommand,
-                ref_kind: SessionRefKind::Path,
-            })
+            native.resume_args().as_slice(),
+            [
+                NativeArg::Literal("resume".to_owned()),
+                NativeArg::Reference
+            ]
+        );
+        assert!(!native.supports_fork(), "fork is explicit, never inherited");
+    }
+
+    #[test]
+    fn pi_shaped_spec_resolves_resume_and_fork() {
+        let dir = tmp_agents_dir("pi-shaped");
+        write_profile(
+            &dir,
+            "pi-like",
+            "base = \"claude\"\nprogram = \"pi\"\n[resume]\nreference_kind = \"path\"\nargs = [\"--session\", \"{reference}\"]\nfork_args = [\"--fork\", \"{reference}\"]\n",
+        );
+        let native = resolve(&dir, "pi-like")
+            .expect("resolves")
+            .native
+            .expect("spec");
+        let path = SessionRef::path("/work/a b/$(x);.jsonl").expect("path reference");
+        assert_eq!(native.reference_kind(), SessionRefKind::Path);
+        assert_eq!(
+            native.resume_argv(&path).expect("resume"),
+            vec!["--session", "/work/a b/$(x);.jsonl"]
+        );
+        assert_eq!(
+            native.fork_argv(&path).expect("fork"),
+            vec!["--fork", "/work/a b/$(x);.jsonl"]
         );
     }
 
     #[test]
-    fn resumable_false_yields_no_resume_template() {
+    fn spec_may_restate_the_claude_shapes_with_or_without_fork() {
+        let dir = tmp_agents_dir("claude-restated");
+        write_profile(
+            &dir,
+            "with-fork",
+            "base = \"claude\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = [\"--resume\", \"{reference}\", \"--fork-session\"]\n",
+        );
+        write_profile(
+            &dir,
+            "no-fork",
+            "base = \"claude\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\n",
+        );
+        assert_eq!(
+            resolve(&dir, "with-fork").expect("resolves").native,
+            base_native_launch(&AgentKind::Claude)
+        );
+        let no_fork = resolve(&dir, "no-fork")
+            .expect("resolves")
+            .native
+            .expect("spec");
+        assert!(!no_fork.supports_fork());
+    }
+
+    #[test]
+    fn resumable_false_yields_no_native_launch() {
         let dir = tmp_agents_dir("resume-off");
         write_profile(
             &dir,
             "noresume",
-            "base = \"codex\"\n[resume]\nresumable = false\n",
+            "base = \"claude\"\n[resume]\nresumable = false\n",
         );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-        let resume = reg
+        let agent = ProfileRegistry::new(Some(dir.clone()))
             .resolve_agent("noresume")
-            .expect("resolves")
-            .profile
-            .unwrap()
-            .resume;
+            .expect("resolves");
+        assert_eq!(agent.native_launch(), None);
         assert_eq!(
-            resume, None,
+            agent.profile.expect("profile").native,
+            None,
             "resumable=false is authoritative, not base-fallback"
         );
     }
 
     #[test]
-    fn fork_capability_inherits_or_can_be_explicitly_disabled() {
-        let dir = tmp_agents_dir("fork-capability");
-        write_profile(&dir, "inherits", "base = \"claude\"\n");
+    fn malformed_resume_specs_are_rejected_with_profile_and_field() {
+        let dir = tmp_agents_dir("resume-bad-specs");
+        let cases: [(&str, &str, &str); 14] = [
+            (
+                "unknown-kind",
+                "reference_kind = \"socket\"\nargs = [\"--resume\", \"{reference}\"]\n",
+                "unknown resume.reference_kind",
+            ),
+            (
+                "missing-kind",
+                "args = [\"--resume\", \"{reference}\"]\n",
+                "resume.reference_kind is required",
+            ),
+            (
+                "missing-args",
+                "reference_kind = \"id\"\n",
+                "resume.args is required",
+            ),
+            (
+                "empty-table",
+                "",
+                "resume.reference_kind is required",
+            ),
+            (
+                "empty-args",
+                "reference_kind = \"id\"\nargs = []\n",
+                "resume.args: the argument list is empty",
+            ),
+            (
+                "no-sentinel",
+                "reference_kind = \"id\"\nargs = [\"--resume\"]\n",
+                "resume.args: the argument list has no `{reference}` placeholder",
+            ),
+            (
+                "duplicate-sentinel",
+                "reference_kind = \"id\"\nargs = [\"{reference}\", \"{reference}\"]\n",
+                "resume.args: the argument list has more than one",
+            ),
+            (
+                "embedded",
+                "reference_kind = \"id\"\nargs = [\"--session={reference}\"]\n",
+                "resume.args: argument 0 contains braces",
+            ),
+            (
+                "unknown-placeholder",
+                "reference_kind = \"id\"\nargs = [\"--resume\", \"{ref}\", \"{reference}\"]\n",
+                "resume.args: argument 1 contains braces",
+            ),
+            (
+                "empty-literal",
+                "reference_kind = \"id\"\nargs = [\"\", \"{reference}\"]\n",
+                "resume.args: argument 0 is an empty literal",
+            ),
+            (
+                "bad-fork",
+                "reference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = [\"--fork\"]\n",
+                "resume.fork_args: the argument list has no `{reference}` placeholder",
+            ),
+            (
+                "empty-fork",
+                "reference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = []\n",
+                "resume.fork_args: the argument list is empty",
+            ),
+            (
+                "fork-without-resume",
+                "reference_kind = \"id\"\nfork_args = [\"--fork\", \"{reference}\"]\n",
+                "resume.args is required",
+            ),
+            (
+                "off-with-spec",
+                "resumable = false\nreference_kind = \"id\"\n",
+                "cannot be combined",
+            ),
+        ];
+        for (name, body, expected) in cases {
+            write_profile(&dir, name, &format!("base = \"claude\"\n[resume]\n{body}"));
+            let message = invalid_message(&dir, name);
+            assert!(message.contains(&format!("'{name}'")), "{name}: {message}");
+            assert!(message.contains(expected), "{name}: {message}");
+        }
+    }
+
+    #[test]
+    fn removed_mode_and_fork_table_keys_are_rejected() {
+        let dir = tmp_agents_dir("resume-removed-keys");
         write_profile(
             &dir,
-            "disabled",
+            "mode",
+            "base = \"claude\"\n[resume]\nmode = \"flag\"\n",
+        );
+        write_profile(
+            &dir,
+            "ref-kind",
+            "base = \"claude\"\n[resume]\nref_kind = \"id\"\n",
+        );
+        write_profile(
+            &dir,
+            "fork-table",
             "base = \"claude\"\n[fork]\nsupported = false\n",
         );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-
-        assert_eq!(
-            reg.resolve_agent("inherits")
-                .expect("inherits profile")
-                .profile
-                .expect("profile")
-                .fork,
-            base_fork_template(&AgentKind::Claude)
-        );
-        assert_eq!(
-            reg.resolve_agent("disabled")
-                .expect("disabled profile")
-                .profile
-                .expect("profile")
-                .fork,
-            None
-        );
+        for name in ["mode", "ref-kind", "fork-table"] {
+            assert!(
+                invalid_message(&dir, name).contains("unknown field"),
+                "{name}"
+            );
+        }
     }
 
     #[test]
-    fn profile_cannot_enable_fork_for_an_unsupported_base() {
-        let dir = tmp_agents_dir("fork-enable-invalid");
-        write_profile(
-            &dir,
-            "invalid",
-            "base = \"codex\"\n[fork]\nsupported = true\n",
-        );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-
-        let err = reg
-            .resolve_agent("invalid")
-            .expect_err("codex cannot invent fork support");
-        assert_eq!(err.code, "invalid_profile");
-        assert!(err.msg.contains("native fork support"));
+    fn fork_args_require_a_base_with_compiled_fork_support() {
+        let dir = tmp_agents_dir("fork-args-base");
+        let spec = "[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = [\"--fork\", \"{reference}\"]\n";
+        for base in ["codex", "hermes"] {
+            let name = format!("{base}-fork");
+            write_profile(&dir, &name, &format!("base = \"{base}\"\n{spec}"));
+            let message = invalid_message(&dir, &name);
+            assert!(message.contains(&format!("'{name}'")), "{message}");
+            assert!(
+                message.contains("resume.fork_args requires a base kind with native fork support"),
+                "{message}"
+            );
+        }
+        write_profile(&dir, "claude-fork", &format!("base = \"claude\"\n{spec}"));
+        let native = resolve(&dir, "claude-fork")
+            .expect("claude owns fork")
+            .native;
+        assert!(native.expect("spec").supports_fork());
     }
 
     #[test]
-    fn unsupported_base_may_explicitly_keep_fork_disabled() {
-        let dir = tmp_agents_dir("fork-disable-codex");
+    fn shell_base_cannot_declare_a_resume_spec() {
+        let dir = tmp_agents_dir("shell-spec");
         write_profile(
             &dir,
-            "codex-no-fork",
-            "base = \"codex\"\n[fork]\nsupported = false\n",
+            "sh-spec",
+            "base = \"shell\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\n",
         );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-
-        let profile = reg
-            .resolve_agent("codex-no-fork")
-            .expect("explicit disable is valid")
-            .profile
-            .expect("profile");
-        assert_eq!(profile.fork, None);
+        assert!(invalid_message(&dir, "sh-spec").contains("shell"));
     }
 
     #[test]
-    fn claude_may_disable_resume_while_inheriting_fork() {
-        let dir = tmp_agents_dir("fork-without-resume");
+    fn diagnostics_never_echo_profile_env_values() {
+        let dir = tmp_agents_dir("env-leak");
+        let secret = "s3cr3t-sentinel-value";
         write_profile(
             &dir,
-            "fork-only",
-            "base = \"claude\"\n[resume]\nresumable = false\n",
-        );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-
-        let capabilities = reg
-            .resolve_agent("fork-only")
-            .expect("fork-only profile")
-            .capabilities();
-        assert_eq!(capabilities.resume, None);
-        assert_eq!(capabilities.fork, base_fork_template(&AgentKind::Claude));
-    }
-
-    #[test]
-    fn inherited_claude_fork_rejects_subcommand_resume_override() {
-        let dir = tmp_agents_dir("fork-subcommand-invalid");
-        write_profile(
-            &dir,
-            "invalid-fork-shape",
-            "base = \"claude\"\n[resume]\nmode = \"subcommand\"\n",
-        );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-
-        let err = reg
-            .resolve_agent("invalid-fork-shape")
-            .expect_err("subcommand fork shape must be rejected explicitly");
-        assert_eq!(err.code, "invalid_profile");
-        assert!(err.msg.contains("fork.supported = false"));
-    }
-
-    #[test]
-    fn unknown_resume_mode_or_ref_kind_is_invalid_profile() {
-        let dir = tmp_agents_dir("resume-bad");
-        write_profile(
-            &dir,
-            "badmode",
-            "base = \"claude\"\n[resume]\nmode = \"telepathy\"\n",
+            "dup-env",
+            &format!("base = \"claude\"\n[env]\nTOKEN = \"{secret}\"\nTOKEN = \"{secret}-2\"\n"),
         );
         write_profile(
             &dir,
-            "badkind",
-            "base = \"claude\"\n[resume]\nref_kind = \"socket\"\n",
+            "typed-env",
+            "base = \"claude\"\n[env]\nPIN = 123456\n",
         );
-        let reg = ProfileRegistry::new(Some(dir.clone()));
-        assert_eq!(
-            reg.resolve_agent("badmode").expect_err("bad mode").code,
-            "invalid_profile"
+        write_profile(
+            &dir,
+            "bad-template",
+            &format!(
+                "base = \"claude\"\n[env]\nTOKEN = \"{secret}\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume\"]\n"
+            ),
         );
-        assert_eq!(
-            reg.resolve_agent("badkind").expect_err("bad ref_kind").code,
-            "invalid_profile"
-        );
+        for name in ["dup-env", "typed-env", "bad-template"] {
+            let message = invalid_message(&dir, name);
+            assert!(!message.contains(secret), "{name}: {message}");
+            assert!(!message.contains("123456"), "{name}: {message}");
+        }
+        assert!(invalid_message(&dir, "typed-env").contains("environment values must be strings"));
     }
 
     #[test]

@@ -24,7 +24,7 @@ use protocol::{
 };
 
 use crate::agent::LaunchCommand;
-use crate::agent::{InputRules, ResumeMode, SessionRefKind};
+use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
 use crate::api::{dispatch_line, DaemonState, HealthInfo};
 use crate::detect::{ActivityTransition, DetectorConfig, ManifestRegion, MatchContext};
 use crate::external::{external_session_id, TranscriptIndex};
@@ -1257,6 +1257,15 @@ fn test_worker_roots(config: &SessionRegistryConfig) -> (PathBuf, PathBuf) {
     let (runtime_root, state_root, owned) = super::owned_test_worker_roots(config);
     WORKER_ROOT_DIRS.with(|dirs| dirs.borrow_mut().extend(owned));
     (runtime_root, state_root)
+}
+
+fn test_native_launch(kind: SessionRefKind, fork: bool) -> NativeSessionLaunch {
+    NativeSessionLaunch::from_templates(
+        kind,
+        &["--resume", "{reference}"],
+        fork.then_some(&["--resume", "{reference}", "--fork-session"][..]),
+    )
+    .expect("valid test templates")
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -11386,14 +11395,14 @@ async fn fork_hermes_session_is_rejected_before_child_side_effects() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn fork_only_claude_profile_records_its_required_native_reference() {
-    let dir = temp_dir("fork-only-native-reference");
+async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
+    let dir = temp_dir("non-resumable-claude");
     let script = dir.join("claude-agent");
     write_executable(&script, "#!/bin/sh\nsleep 30\n");
-    let store_path = temp_store_path("fork-only-native-reference");
+    let store_path = temp_store_path("non-resumable-claude");
     let agents_dir = temp_agents_dir_with(
-        "fork-only-native-reference",
-        "fork-only",
+        "non-resumable-claude",
+        "no-recovery",
         &format!(
             "base = \"claude\"\nprogram = \"{}\"\n[resume]\nresumable = false\n",
             script.display()
@@ -11408,12 +11417,14 @@ async fn fork_only_claude_profile_records_its_required_native_reference() {
     });
     let created = registry
         .create(SessionNewParams {
-            agent: "fork-only".to_owned(),
+            agent: "no-recovery".to_owned(),
             cwd: Some(dir),
             ..params()
         })
         .await
-        .expect("create fork-only Claude session");
+        .expect("create non-resumable Claude session");
+    assert!(!created.capabilities.resume);
+    assert!(!created.capabilities.fork);
     let runtime_id = created
         .runtime
         .as_ref()
@@ -11429,22 +11440,18 @@ async fn fork_only_claude_profile_records_its_required_native_reference() {
             pid_start_identity: 1,
             sequence: 1,
             expires_at: native_report_expiry(),
-            native_session_id: "fork-native".to_owned(),
+            native_session_id: "ignored-native".to_owned(),
             transcript_path: None,
         ))
         .await;
-    assert!(result.recorded);
-
-    let persisted = crate::store::Store::new(store_path)
-        .load_resume()
-        .expect("load fork-only binding");
-    assert_eq!(persisted.len(), 1);
-    assert!(!persisted[0].resumable);
-    assert!(persisted[0].forkable);
-    assert_eq!(
-        persisted[0].native_session_id.as_deref(),
-        Some("fork-native")
+    assert!(
+        !result.recorded,
+        "no native recovery means no native id is recorded"
     );
+    assert!(crate::store::Store::new(store_path)
+        .load_resume()
+        .expect("load resume bindings")
+        .is_empty());
     let _ = registry.stop(&created.id).await;
 }
 
@@ -11458,7 +11465,7 @@ async fn fork_disable_is_frozen_across_profile_removal() {
         "fork-disable-frozen",
         "no-fork",
         &format!(
-            "base = \"claude\"\nprogram = \"{}\"\n[fork]\nsupported = false\n",
+            "base = \"claude\"\nprogram = \"{}\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{{reference}}\"]\n",
             script.display()
         ),
     );
@@ -11496,7 +11503,7 @@ async fn fork_disable_is_frozen_across_profile_removal() {
 
 #[tokio::test]
 async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
-    // The load-bearing C.3 fix: a `ref_kind = "path"` profile must store the
+    // The load-bearing C.3 fix: a `reference_kind = "path"` profile must store the
     // native reference into `native_session_path` (clearing `native_session_id`),
     // chosen by the FROZEN snapshot — never by the wire `agent` literal, which
     // the SessionStart hook bakes to a base-kind name carrying no profile id.
@@ -11504,7 +11511,7 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
     let agents_dir = temp_agents_dir_with(
             "path-profile",
             "pathy",
-            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[resume]\nref_kind = \"path\"\n",
+            "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[resume]\nreference_kind = \"path\"\nargs = [\"--resume\", \"{reference}\"]\n",
         );
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: hermetic_shell(),
@@ -11555,10 +11562,11 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
         Some("/home/u/.claude/t.jsonl")
     );
     assert_eq!(persisted[0].native_session_id, None);
-    assert_eq!(persisted[0].ref_kind, Some(SessionRefKind::Path));
-    assert_eq!(persisted[0].resume_mode, Some(ResumeMode::Flag));
+    assert_eq!(persisted[0].reference_kind(), Some(SessionRefKind::Path));
+    assert!(persisted[0].resumable());
+    assert!(!persisted[0].forkable());
     assert_eq!(persisted[0].program, "/bin/sh");
-    assert!(persisted[0].resumable);
+    assert!(persisted[0].resumable());
 
     registry
         .resize(&created.id, 120, 40)
@@ -11643,13 +11651,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         program: "/bin/sh".to_owned(),
         args: Vec::new(),
         input_rules: crate::store::StoredInputRules::default(),
-        resume_mode: Some(ResumeMode::Flag),
-        ref_kind: Some(SessionRefKind::Id),
-        resumable: false,
-        fork_mode: None,
-        fork_resume_mode: None,
-        fork_ref_kind: None,
-        forkable: false,
+        native_launch: None,
     };
 
     let err = registry
@@ -12124,13 +12126,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         program: script.display().to_string(),
         args: vec!["chat".to_owned()],
         input_rules: crate::store::StoredInputRules::default(),
-        resume_mode: Some(ResumeMode::Flag),
-        ref_kind: Some(SessionRefKind::Id),
-        resumable: true,
-        fork_mode: None,
-        fork_resume_mode: None,
-        fork_ref_kind: None,
-        forkable: false,
+        native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
     };
 
     for (program, version_output) in [
@@ -12251,6 +12247,183 @@ async fn explicit_native_recovery_accepts_terminal_runtime() {
         .contains("--resume"));
 
     let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_keeps_a_hostile_native_id_as_one_argv_element() {
+    let marker = temp_dir("hostile-id-marker").join("argv.txt");
+    let (agents_dir, mut gate) = temp_agent_that_exits_then_resumes("hostile-id", &marker);
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    let hostile = "native id;$(touch pwned)|`x` 'q' \"z\" *";
+    assert!(
+        registry
+            .report_native_id(native_report!(&registry;
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: hostile.to_owned(),
+                transcript_path: None,
+            ))
+            .await
+            .recorded
+    );
+    gate.write_all(b"go\n")
+        .expect("release the agent exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+
+    registry.resume(&created.id).await.expect("native recovery");
+    let argv = wait_for_file_contains(&marker, "--resume").await;
+    assert_eq!(
+        argv.lines().collect::<Vec<_>>(),
+        ["--model", "sonnet", "--model", "sonnet", "--resume", hostile],
+        "the launch args stay frozen and the reference is one argv element"
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
+    let dir = temp_dir("pi-shaped-session");
+    let marker = dir.join("argv.txt");
+    let script = dir.join("pi-like");
+    let gate_path = dir.join("exit.gate");
+    let mut gate = hook_gate(&gate_path);
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$1\" in --session|--fork) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            marker.display(),
+            gate_path.display(),
+        ),
+    );
+    let agents_dir = temp_agents_dir_with(
+        "pi-shaped-session",
+        "pi-like",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\n[resume]\nreference_kind = \"path\"\nargs = [\"--session\", \"{{reference}}\"]\nfork_args = [\"--fork\", \"{{reference}}\"]\n",
+            script.display()
+        ),
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        stop_grace: Duration::from_millis(50),
+        agents_dir: Some(agents_dir),
+        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry
+        .create(SessionNewParams {
+            agent: "pi-like".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create Pi-shaped session");
+    assert!(created.capabilities.resume && created.capabilities.fork);
+    let reference = "/work/with space/$(touch pwned);|.jsonl";
+    assert!(
+        registry
+            .report_native_id(native_report!(&registry;
+                session_id: created.id.clone(),
+                agent: "claude".to_owned(),
+                native_session_id: "ignored-for-path-kind".to_owned(),
+                transcript_path: Some(reference.to_owned()),
+            ))
+            .await
+            .recorded
+    );
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+
+    registry.resume(&created.id).await.expect("native recovery");
+    let argv = wait_for_file_contains(&marker, "--session").await;
+    // The first launch passes no arguments and prints one empty line.
+    assert_eq!(
+        argv.lines().skip(1).collect::<Vec<_>>(),
+        ["--session", reference]
+    );
+
+    let forked = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect("native fork");
+    let argv = wait_for_file_contains(&marker, "--fork").await;
+    assert_eq!(
+        argv.lines().skip(1).collect::<Vec<_>>(),
+        ["--session", reference, "--fork", reference]
+    );
+
+    let _ = registry.stop(&forked.id).await;
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn malformed_resume_template_fails_before_any_worker_or_record_exists() {
+    let dir = temp_dir("malformed-template-session");
+    let store_path = temp_store_path("malformed-template-session");
+    let runtime_root = temp_dir("malformed-template-runtime");
+    let agents_dir = temp_agents_dir_with(
+        "malformed-template-session",
+        "broken",
+        "base = \"claude\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--resume={reference}\"]\n",
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: hermetic_shell(),
+        agents_dir: Some(agents_dir),
+        store_path: Some(store_path.clone()),
+        worker_runtime_root: Some(runtime_root.clone()),
+        ..SessionRegistryConfig::default()
+    });
+
+    let error = registry
+        .create(SessionNewParams {
+            agent: "broken".to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect_err("a malformed template must reject the launch");
+
+    assert_eq!(error.code, "invalid_profile");
+    assert!(error.msg.contains("'broken'") && error.msg.contains("resume.args"));
+    assert!(registry.list().await.is_empty());
+    assert!(
+        !store_path.exists()
+            || crate::store::Store::new(store_path)
+                .load_resume()
+                .expect("load resume bindings")
+                .is_empty()
+    );
+    assert_eq!(
+        fs::read_dir(&runtime_root).expect("runtime root").count(),
+        0,
+        "no worker socket or runtime state may exist"
+    );
 }
 
 #[cfg(unix)]
@@ -12459,13 +12632,7 @@ async fn resume_binding_restores_metadata_from_store() {
             program: "/bin/sh".to_owned(),
             args: vec!["-c".to_owned(), "sleep 30".to_owned()],
             input_rules: crate::store::StoredInputRules::default(),
-            resume_mode: Some(ResumeMode::Flag),
-            ref_kind: Some(SessionRefKind::Id),
-            resumable: true,
-            fork_mode: None,
-            fork_resume_mode: None,
-            fork_ref_kind: None,
-            forkable: false,
+            native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
         })
         .expect("seed resume binding");
     let binding = crate::store::Store::new(store_path.clone())

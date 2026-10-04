@@ -445,6 +445,7 @@ Agent runtime and profile resolution:
 - `crates/session-worker/`
 - `crates/worker-protocol/`
 - `crates/daemon/src/agent/mod.rs`
+- `crates/daemon/src/agent/native_launch.rs`
 - `crates/daemon/src/agent/profile.rs`
 - `crates/daemon/src/agent/codex.rs`
 - `crates/daemon/src/agent/claude.rs`

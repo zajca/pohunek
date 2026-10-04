@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pohunek_client::{Client, ClientOptions};
-use pohunek_daemon::agent::{ForkMode, InputRules};
+use pohunek_daemon::agent::{InputRules, NativeSessionLaunch};
 use pohunek_daemon::runtime::Worker;
 use pohunek_daemon::store::{
     DesiredState, ResumeBinding, RuntimeRecord, SessionRecord, Store, StoredInputRules,
@@ -753,13 +753,14 @@ impl Fixture {
                         false,
                         Duration::from_millis(150),
                     )),
-                    resume_mode: Some(pohunek_daemon::agent::ResumeMode::Flag),
-                    ref_kind: Some(pohunek_daemon::agent::SessionRefKind::Id),
-                    resumable: true,
-                    fork_mode: Some(ForkMode::ClaudeSession),
-                    fork_resume_mode: Some(pohunek_daemon::agent::ResumeMode::Flag),
-                    fork_ref_kind: Some(pohunek_daemon::agent::SessionRefKind::Id),
-                    forkable: true,
+                    native_launch: Some(
+                        NativeSessionLaunch::from_templates(
+                            pohunek_daemon::agent::SessionRefKind::Id,
+                            &["--resume", "{reference}"],
+                            Some(&["--resume", "{reference}", "--fork-session"]),
+                        )
+                        .expect("valid launch templates"),
+                    ),
                 }),
                 native_identity_ordering: None,
                 runtime: RuntimeRecord {

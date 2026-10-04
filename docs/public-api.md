@@ -527,10 +527,15 @@ Important fields:
   `true` means an opt-in observed external agent. External sessions are
   read-only: attach, input, resize, stop, remove, rename, metadata updates, and
   resume return `runtime/session_external_read_only`.
-- `capabilities`: required `SessionCapabilities` object with independent
-  `resume` and `fork` booleans frozen for the logical session. Clients must use
-  these flags instead of inferring provider behavior from `agent` or
-  `agent_base`. Records that predate the field load both flags as `false`.
+- `capabilities`: required `SessionCapabilities` object with `resume` and
+  `fork` booleans frozen for the logical session. Both derive from one frozen
+  native-session launch spec (reference kind, resume argv, optional fork argv),
+  so `fork` is `true` only when `resume` is `true`. Clients must use these flags
+  instead of inferring provider behavior from `agent` or `agent_base`. Records
+  that predate the field load both flags as `false`. Host profiles declare the
+  spec in `[resume]` (`reference_kind`, `args`, optional `fork_args`, accepted only on
+  bases with compiled fork support, currently `claude`); see the
+  agent-profiles concept page.
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.

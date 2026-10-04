@@ -13,8 +13,8 @@ use super::{
     plan_initial_input_delivery, runtime_error, timestamp_now, warn, watch, AgentKind, Arc,
     CancellationToken, CwdSource, DesiredState, DetectedProject, DetectorConfig,
     DetectorConfigUpdate, DetectorInputs, DetectorScope, InputRules, LaunchCommand, LaunchOpts,
-    Manifest, Mutex, Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent,
-    ResumeBinding, ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState,
+    Manifest, Mutex, NativeSessionLaunch, Notify, Ordering, PathBuf, ProjectRecord, ProtocolError,
+    ResolvedAgent, ResumeBinding, ResumeSnapshot, RuntimeHandle, RuntimeRecord, RuntimeState,
     RuntimeWatchIdentity, SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord,
     SessionRefKind, SessionRegistry, SessionRuntime, SessionState, SessionTransaction,
     SessionWarning, ShellCommand, StateSource, TransactionKind, Worker, WorktreeRequest,
@@ -625,8 +625,11 @@ impl SessionRegistry {
             PtyRegistration::Recover { created_at, .. } => created_at.clone(),
         };
         let capabilities = protocol::SessionCapabilities {
-            resume: snapshot.resume.is_some(),
-            fork: snapshot.fork.is_some(),
+            resume: snapshot.native.is_some(),
+            fork: snapshot
+                .native
+                .as_ref()
+                .is_some_and(NativeSessionLaunch::supports_fork),
         };
         let runtime_generation =
             next_runtime_generation(&registration).map_err(LaunchFailure::Cleaned)?;
@@ -745,13 +748,7 @@ impl SessionRegistry {
                 program: snapshot.program.clone(),
                 args: snapshot.args.clone(),
                 input_rules: StoredInputRules::from(input_rules),
-                resume_mode: snapshot.resume.map(|template| template.mode),
-                ref_kind: snapshot.resume.map(|template| template.ref_kind),
-                resumable: snapshot.resume.is_some(),
-                fork_mode: snapshot.fork.map(|template| template.mode),
-                fork_resume_mode: snapshot.fork.map(|template| template.resume.mode),
-                fork_ref_kind: snapshot.fork.map(|template| template.resume.ref_kind),
-                forkable: snapshot.fork.is_some(),
+                native_launch: snapshot.native.clone(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,
