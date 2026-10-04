@@ -606,10 +606,10 @@ mod tests {
         fs::create_dir(dir.path().join("sub")).expect("mkdir");
         let root = open_root(dir.path());
         let listed = list_entry(&root, "sub").expect("list");
-        fs::remove_dir(dir.path().join("sub")).expect("remove");
-        // A different directory (new inode) at the same name.
-        fs::create_dir(dir.path().join("other")).expect("mkdir");
-        fs::rename(dir.path().join("other"), dir.path().join("sub")).expect("rename");
+        // The listed directory stays alive under another name, so the
+        // replacement cannot be handed its inode.
+        fs::rename(dir.path().join("sub"), dir.path().join("kept")).expect("rename");
+        fs::create_dir(dir.path().join("sub")).expect("mkdir");
         assert_eq!(
             open_listed_dir(&root, "sub", listed).err(),
             Some(DirectoryError::Changed)
