@@ -1,12 +1,12 @@
 //! Native recovery metadata and explicit provider-native relaunch.
 
 use super::{
-    agent_fork_unsupported, agent_not_resumable, base_resume_template, default_program,
-    fork_pty_command_from_template, input_rules_for_agent, is_terminal,
-    resume_pty_command_from_template, runtime_error, session_not_found, validate_session_name,
-    warn, ForkTemplate, LaunchOpts, Ordering, PathBuf, ProtocolError, PtySessionSpec,
-    ResumeBinding, ResumeTemplate, SessionEntry, SessionForkParams, SessionId, SessionInfo,
-    SessionRef, SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
+    agent_fork_unsupported, agent_not_resumable, base_native_launch, default_program,
+    fork_pty_command_from_launch, input_rules_for_agent, is_terminal,
+    resume_pty_command_from_launch, runtime_error, session_not_found, validate_session_name, warn,
+    LaunchOpts, NativeSessionLaunch, Ordering, PathBuf, ProtocolError, PtySessionSpec,
+    ResumeBinding, SessionEntry, SessionForkParams, SessionId, SessionInfo, SessionRef,
+    SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
 };
 
 use std::io;
@@ -25,18 +25,35 @@ pub(super) struct ResumeSnapshot {
     pub(super) program: String,
     /// Launch args (the profile's `args`; empty for a bare base kind).
     pub(super) args: Vec<String>,
-    /// Resolved resume template; `None` ⇒ this session does not resume.
-    pub(super) resume: Option<ResumeTemplate>,
-    /// Resolved fork template; `None` ⇒ this session cannot fork natively.
-    pub(super) fork: Option<ForkTemplate>,
+    /// Resolved native-session launch spec; `None` ⇒ this session neither resumes
+    /// nor forks natively.
+    pub(super) native: Option<NativeSessionLaunch>,
 }
 
 impl ResumeSnapshot {
+    /// The snapshot of a session with no recorded launch shape.
+    pub(super) fn empty() -> Self {
+        Self {
+            program: String::new(),
+            args: Vec::new(),
+            native: None,
+        }
+    }
+
+    /// Rebuild the snapshot frozen into a persisted binding.
+    pub(super) fn from_binding(binding: &ResumeBinding) -> Self {
+        Self {
+            program: binding.program.clone(),
+            args: binding.args.clone(),
+            native: binding.native_launch.clone(),
+        }
+    }
+
     /// Return the native reference kind required by resume or fork.
     pub(super) fn native_ref_kind(&self) -> Option<SessionRefKind> {
-        self.resume
-            .map(|template| template.ref_kind)
-            .or_else(|| self.fork.map(|template| template.resume.ref_kind))
+        self.native
+            .as_ref()
+            .map(NativeSessionLaunch::reference_kind)
     }
 }
 
@@ -217,9 +234,14 @@ impl SessionRegistry {
         self.ensure_not_external(&params.session_id).await?;
         let (binding, repo, branch, worktree_path) = self.fork_source(&params.session_id).await?;
 
-        let fork_template = binding_fork_template(&binding).ok_or_else(agent_fork_unsupported)?;
-        let session_ref = session_ref_from_binding(fork_template.resume, &binding)?;
-        let resume_template = binding_resume_template(&binding);
+        // Fork is fail-closed: only a spec frozen into the binding can fork, never
+        // the base kind's compiled spec.
+        let launch = binding
+            .native_launch
+            .clone()
+            .filter(NativeSessionLaunch::supports_fork)
+            .ok_or_else(agent_fork_unsupported)?;
+        let session_ref = session_ref_from_binding(launch.reference_kind(), &binding)?;
 
         let id = Self::allocate_session_id();
         self.ensure_worker_socket(&id)?;
@@ -258,18 +280,17 @@ impl SessionRegistry {
             env_extra,
             validated_program: None,
         };
-        let command = fork_pty_command_from_template(
+        let command = fork_pty_command_from_launch(
             &program,
             binding.args.clone(),
-            fork_template,
+            &launch,
             &session_ref,
             &opts,
         )?;
         let snapshot = ResumeSnapshot {
             program,
             args: binding.args.clone(),
-            resume: resume_template,
-            fork: Some(fork_template),
+            native: Some(launch),
         };
         let guard = self.lock_lifecycle(&id).await;
         let info = self
@@ -355,13 +376,7 @@ impl SessionRegistry {
             program: entry.snapshot.program.clone(),
             args: entry.snapshot.args.clone(),
             input_rules: entry.input_rules.into(),
-            resume_mode: entry.snapshot.resume.map(|template| template.mode),
-            ref_kind: entry.snapshot.resume.map(|template| template.ref_kind),
-            resumable: entry.snapshot.resume.is_some(),
-            fork_mode: entry.snapshot.fork.map(|template| template.mode),
-            fork_resume_mode: entry.snapshot.fork.map(|template| template.resume.mode),
-            fork_ref_kind: entry.snapshot.fork.map(|template| template.resume.ref_kind),
-            forkable: entry.snapshot.fork.is_some(),
+            native_launch: entry.snapshot.native.clone(),
         }
     }
 
@@ -409,15 +424,15 @@ impl SessionRegistry {
         validated_program: Option<ValidatedLaunchProgram>,
         guard: super::LifecycleGuard,
     ) -> Result<SessionInfo, ProtocolError> {
-        // The resume mechanics come from the frozen structural snapshot (C.4). An
-        // explicit `(resume_mode, ref_kind)` pair drives the argv; a legacy binding
-        // (pre-C2, no snapshot) falls back to the base kind's native template.
-        let template =
-            binding_resume_template(&binding).ok_or_else(|| agent_not_resumable(&binding.agent))?;
-        // Build the native reference from the field the frozen `ref_kind` names, so
-        // a `path`-kind profile inherits the absolute-path guard and an `id`-kind the
-        // leading-dash guard (the documented asymmetry).
-        let session_ref = session_ref_from_binding(template, &binding)?;
+        // The resume mechanics come from the frozen structural snapshot (C.4). A
+        // binding without a snapshot program falls back to the base kind's
+        // compiled spec.
+        let launch =
+            binding_native_launch(&binding).ok_or_else(|| agent_not_resumable(&binding.agent))?;
+        // Build the native reference from the field the frozen reference kind
+        // names, so a `path`-kind spec applies the absolute-path guard and an
+        // `id`-kind spec the leading-dash guard (the documented asymmetry).
+        let session_ref = session_ref_from_binding(launch.reference_kind(), &binding)?;
 
         let id = SessionId(binding.session_id.clone());
 
@@ -464,10 +479,10 @@ impl SessionRegistry {
             env_extra,
             validated_program,
         };
-        let command = resume_pty_command_from_template(
+        let command = resume_pty_command_from_launch(
             &program,
             binding.args.clone(),
-            template,
+            &launch,
             &session_ref,
             &opts,
         )?;
@@ -476,8 +491,7 @@ impl SessionRegistry {
         let snapshot = ResumeSnapshot {
             program,
             args: binding.args.clone(),
-            resume: Some(template),
-            fork: binding_fork_template(&binding),
+            native: Some(launch),
         };
         // A resumed session relaunches in its recorded cwd, which already is the
         // worktree path for worktree sessions (the worktree persists on disk
@@ -569,50 +583,27 @@ fn binding_program(binding: &ResumeBinding) -> String {
     }
 }
 
-/// Return the resume capability frozen into a persisted binding.
-fn binding_resume_template(binding: &ResumeBinding) -> Option<ResumeTemplate> {
-    if !binding.resumable && !binding.program.is_empty() {
-        return None;
-    }
-    binding
-        .resume_mode
-        .zip(binding.ref_kind)
-        .map(|(mode, ref_kind)| ResumeTemplate { mode, ref_kind })
-        .or_else(|| {
-            binding
-                .program
-                .is_empty()
-                .then(|| base_resume_template(&binding.agent_base))
-                .flatten()
-        })
-}
-
-/// Return the fork capability frozen into a persisted binding.
+/// Return the native-session launch spec frozen into a persisted binding.
 ///
-/// Bindings without an explicit fork snapshot are fail-closed. This includes
-/// persisted pre-1.0 bindings written before the fork fields existed.
-fn binding_fork_template(binding: &ResumeBinding) -> Option<ForkTemplate> {
-    if binding.forkable {
-        return binding
-            .fork_mode
-            .zip(binding.fork_resume_mode)
-            .zip(binding.fork_ref_kind)
-            .map(|((mode, resume_mode), ref_kind)| ForkTemplate {
-                resume: ResumeTemplate {
-                    mode: resume_mode,
-                    ref_kind,
-                },
-                mode,
-            });
+/// A binding written without a snapshot program carries no frozen spec and
+/// resolves to its base kind's compiled spec; a binding with a snapshot is
+/// authoritative, so an absent spec means the session does not recover natively.
+fn binding_native_launch(binding: &ResumeBinding) -> Option<NativeSessionLaunch> {
+    if binding.program.is_empty() {
+        binding
+            .native_launch
+            .clone()
+            .or_else(|| base_native_launch(&binding.agent_base))
+    } else {
+        binding.native_launch.clone()
     }
-    None
 }
 
 fn session_ref_from_binding(
-    template: ResumeTemplate,
+    reference_kind: SessionRefKind,
     binding: &ResumeBinding,
 ) -> Result<SessionRef, ProtocolError> {
-    match template.ref_kind {
+    match reference_kind {
         SessionRefKind::Id => match &binding.native_session_id {
             Some(value) => SessionRef::id(value),
             None => Err(runtime_error(

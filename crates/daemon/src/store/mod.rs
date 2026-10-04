@@ -30,16 +30,16 @@
 //! not contain secrets.
 //!
 //! The resume binding additionally carries the **structural relaunch snapshot**
-//! (Part C, C.4): `program`, `args`, `input_rules`, `resume_mode`, `ref_kind`,
-//! `resumable`, `fork_mode`, `fork_resume_mode`, `fork_ref_kind`, `forkable`, and
-//! `agent_base`. These
-//! are the non-secret fields needed to
-//! relaunch-and-resume a host-profile session with exactly its launch-time shape
-//! after a daemon restart. The profile's **`env` is deliberately NOT among them** —
+//! (Part C, C.4): `program`, `args`, `input_rules`, `native_launch` (the typed
+//! native-session launch spec: reference kind plus resume and optional fork argv
+//! with one reference slot each), and `agent_base`. These are the non-secret
+//! fields needed to relaunch-and-resume a host-profile session with exactly its
+//! launch-time shape after a daemon restart. The profile's **`env` is deliberately NOT among them** —
 //! it may hold secrets, so it is re-resolved by agent name at resume, never
 //! persisted (a deleted profile resumes from the structural snapshot with no env).
-//! Fork fields deliberately default to disabled when absent. Persisted bindings
-//! from earlier pre-1.0 builds do not infer capabilities from current code.
+//! An absent `native_launch` means the session has no native recovery. Persisted
+//! bindings from earlier pre-1.0 builds do not infer capabilities from current
+//! code.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -56,7 +56,7 @@ use protocol::{AgentKind, ProjectSource, RuntimeState, SessionInfo};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::agent::{ForkMode, InputRules, ResumeMode, SessionRefKind};
+use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
 use crate::project::detect::project_id;
 
 #[cfg(unix)]
@@ -125,33 +125,36 @@ pub struct ResumeBinding {
     /// at creation so a profile's `[input_rules]` override survives a restart.
     #[serde(default)]
     pub input_rules: StoredInputRules,
-    /// Structural relaunch snapshot (C.4): the resume argv mode, frozen at creation
-    /// so a profile's `[resume] mode` override drives the relaunch argv. `None` for
-    /// a non-resumable session or a legacy line.
+    /// Structural relaunch snapshot (C.4): the native-session launch spec, frozen
+    /// at creation so a profile's `[resume]` override drives the relaunch and fork
+    /// argv and decides which validation guard the captured reference passes.
+    /// `None` for a session without native recovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_mode: Option<ResumeMode>,
-    /// Structural relaunch snapshot (C.4): the native-reference kind, frozen at
-    /// creation. Decides whether the captured reference resumes via the id (dash)
-    /// guard or the path (absolute) guard. `None` for non-resumable / legacy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ref_kind: Option<SessionRefKind>,
-    /// Structural relaunch snapshot (C.4): whether this session resumes at all,
-    /// frozen at creation. Serde default (`false`) for a legacy line.
-    #[serde(default)]
-    pub resumable: bool,
-    /// Structural relaunch snapshot: the provider-native fork argv shape. `None`
-    /// when the session cannot fork or a legacy binding predates this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fork_mode: Option<ForkMode>,
-    /// Structural relaunch snapshot: the resume argv operation used by fork.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fork_resume_mode: Option<ResumeMode>,
-    /// Structural relaunch snapshot: the native-reference kind used by fork.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fork_ref_kind: Option<SessionRefKind>,
-    /// Whether the session retained a native fork capability at creation.
-    #[serde(default)]
-    pub forkable: bool,
+    pub native_launch: Option<NativeSessionLaunch>,
+}
+
+impl ResumeBinding {
+    /// The native reference kind this binding recovers with, when it recovers.
+    #[must_use]
+    pub fn reference_kind(&self) -> Option<SessionRefKind> {
+        self.native_launch
+            .as_ref()
+            .map(NativeSessionLaunch::reference_kind)
+    }
+
+    /// Whether the binding can resume natively.
+    #[must_use]
+    pub fn resumable(&self) -> bool {
+        self.native_launch.is_some()
+    }
+
+    /// Whether the binding can fork natively.
+    #[must_use]
+    pub fn forkable(&self) -> bool {
+        self.native_launch
+            .as_ref()
+            .is_some_and(NativeSessionLaunch::supports_fork)
+    }
 }
 
 impl<'de> Deserialize<'de> for ResumeBinding {
@@ -187,19 +190,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             #[serde(default)]
             input_rules: StoredInputRules,
             #[serde(default)]
-            resume_mode: Option<ResumeMode>,
-            #[serde(default)]
-            ref_kind: Option<SessionRefKind>,
-            #[serde(default)]
-            resumable: bool,
-            #[serde(default)]
-            fork_mode: Option<ForkMode>,
-            #[serde(default)]
-            fork_resume_mode: Option<ResumeMode>,
-            #[serde(default)]
-            fork_ref_kind: Option<SessionRefKind>,
-            #[serde(default)]
-            forkable: bool,
+            native_launch: Option<NativeSessionLaunch>,
         }
 
         let raw = RawResumeBinding::deserialize(deserializer)?;
@@ -227,13 +218,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             program: raw.program,
             args: raw.args,
             input_rules: raw.input_rules,
-            resume_mode: raw.resume_mode,
-            ref_kind: raw.ref_kind,
-            resumable: raw.resumable,
-            fork_mode: raw.fork_mode,
-            fork_resume_mode: raw.fork_resume_mode,
-            fork_ref_kind: raw.fork_ref_kind,
-            forkable: raw.forkable,
+            native_launch: raw.native_launch,
         })
     }
 }
@@ -1524,9 +1509,18 @@ mod tests {
     use protocol::{AgentActivity, AgentKind, ProjectSource};
 
     use super::{
-        ForkMode, ProjectRecord, ProjectResolution, ResumeBinding, ResumeMode, SessionRefKind,
-        Store, StoreMutation, StoredInputRules, WorktreeBinding, WorktreeStatus,
+        ProjectRecord, ProjectResolution, ResumeBinding, SessionRefKind, Store, StoreMutation,
+        StoredInputRules, WorktreeBinding, WorktreeStatus,
     };
+    use crate::agent::{NativeArgs, NativeSessionLaunch};
+
+    fn launch(kind: SessionRefKind, resume: &[&str], fork: Option<&[&str]>) -> NativeSessionLaunch {
+        NativeSessionLaunch::new(
+            kind,
+            NativeArgs::from_template(resume).expect("resume template"),
+            fork.map(|tokens| NativeArgs::from_template(tokens).expect("fork template")),
+        )
+    }
 
     fn temp_store_path(tag: &str) -> PathBuf {
         // The directory lives until the test's thread ends.
@@ -1563,13 +1557,11 @@ mod tests {
                 bracketed_paste: false,
                 submit_delay_ms: 150,
             },
-            resume_mode: Some(ResumeMode::Flag),
-            ref_kind: Some(SessionRefKind::Id),
-            resumable: true,
-            fork_mode: Some(ForkMode::ClaudeSession),
-            fork_resume_mode: Some(ResumeMode::Flag),
-            fork_ref_kind: Some(SessionRefKind::Id),
-            forkable: true,
+            native_launch: Some(launch(
+                SessionRefKind::Id,
+                &["--resume", "{reference}"],
+                Some(&["--resume", "{reference}", "--fork-session"]),
+            )),
         }
     }
 
@@ -1657,17 +1649,73 @@ mod tests {
                 bracketed_paste: true,
                 submit_delay_ms: 42,
             },
-            resume_mode: Some(ResumeMode::Subcommand),
-            ref_kind: Some(SessionRefKind::Path),
-            resumable: true,
-            fork_mode: None,
-            fork_resume_mode: None,
-            fork_ref_kind: None,
-            forkable: false,
+            native_launch: Some(launch(
+                SessionRefKind::Path,
+                &["--session", "{reference}"],
+                Some(&["--fork", "{reference}"]),
+            )),
         };
         store.record_resume(&binding).expect("record");
         let loaded = store.load_resume().expect("load");
         assert_eq!(loaded, vec![binding], "the structural snapshot round-trips");
+    }
+
+    #[test]
+    fn resume_binding_roundtrips_resume_only_and_fork_specs() {
+        let store = Store::new(temp_store_path("resume-native-launch"));
+        let mut resume_only = resume("s-resume-only", "native-1");
+        resume_only.native_launch =
+            Some(launch(SessionRefKind::Id, &["resume", "{reference}"], None));
+        let with_fork = resume("s-fork", "native-2");
+        store
+            .record_resume(&resume_only)
+            .expect("record resume-only");
+        store.record_resume(&with_fork).expect("record fork");
+
+        let loaded = store.load_resume().expect("load");
+        assert_eq!(loaded.len(), 2);
+        for binding in &loaded {
+            let expected = if binding.session_id == "s-fork" {
+                &with_fork
+            } else {
+                &resume_only
+            };
+            assert_eq!(binding, expected);
+        }
+        assert!(resume_only.resumable() && !resume_only.forkable());
+        assert!(with_fork.resumable() && with_fork.forkable());
+        assert_eq!(with_fork.reference_kind(), Some(SessionRefKind::Id));
+    }
+
+    #[test]
+    fn resume_line_with_an_invalid_launch_spec_is_dropped() {
+        let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
+        let corrupt = concat!(
+            r#"{"kind":"resume","session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
+            r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
+            "\n"
+        );
+        write_private(store.path(), corrupt);
+        assert!(
+            store.load_resume().expect("load").is_empty(),
+            "a spec without a reference slot must not load as a binding"
+        );
+    }
+
+    #[test]
+    fn resume_line_with_removed_mode_fields_loads_as_non_recoverable() {
+        let store = Store::new(temp_store_path("resume-removed-fields"));
+        let old = concat!(
+            r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","program":"claude","#,
+            r#""resume_mode":"flag","ref_kind":"id","resumable":true}"#,
+            "\n"
+        );
+        write_private(store.path(), old);
+        let loaded = store.load_resume().expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].native_launch, None);
     }
 
     #[test]
@@ -1717,13 +1765,10 @@ mod tests {
         assert_eq!(b.program, "");
         assert!(b.args.is_empty());
         assert_eq!(b.input_rules, StoredInputRules::default());
-        assert_eq!(b.resume_mode, None);
-        assert_eq!(b.ref_kind, None);
-        assert!(!b.resumable);
-        assert_eq!(b.fork_mode, None);
-        assert_eq!(b.fork_resume_mode, None);
-        assert_eq!(b.fork_ref_kind, None);
-        assert!(!b.forkable);
+        assert_eq!(b.native_launch, None);
+        assert!(!b.resumable());
+        assert!(!b.forkable());
+        assert_eq!(b.reference_kind(), None);
         assert!(b.metadata.is_empty());
     }
 

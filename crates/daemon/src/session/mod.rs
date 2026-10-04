@@ -32,11 +32,11 @@ use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use crate::agent::{
-    adapter_for, agent_fork_unsupported, agent_not_resumable, base_resume_template,
-    build_pty_command, default_args, default_program, fork_pty_command_from_template,
-    launch_adapter_for, resume_pty_command_from_template, AgentAdapter, ForkTemplate, InputRules,
-    LaunchCommand, LaunchOpts, ProfileRegistry, ResolvedAgent, ResumeTemplate, SessionRef,
-    SessionRefKind, ValidatedLaunchProgram,
+    adapter_for, agent_fork_unsupported, agent_not_resumable, base_native_launch,
+    build_pty_command, default_args, default_program, fork_pty_command_from_launch,
+    launch_adapter_for, resume_pty_command_from_launch, AgentAdapter, InputRules, LaunchCommand,
+    LaunchOpts, NativeSessionLaunch, ProfileRegistry, ResolvedAgent, SessionRef, SessionRefKind,
+    ValidatedLaunchProgram,
 };
 use crate::detect::{identify_agent, ActivityTransition, Detector, DetectorConfig, Manifest};
 use crate::external::{
@@ -2024,15 +2024,15 @@ impl SessionRegistry {
             ..
         } = target;
         let base = resolved.base.clone();
-        let capabilities = resolved.capabilities();
+        let native = resolved.native_launch();
         let input_rules = resolved
             .profile
             .as_ref()
             .and_then(|profile| profile.input_rules)
             .unwrap_or_else(|| input_rules_for_agent(&base, &self.inner.config));
         // Freeze the structural relaunch snapshot (C.4) from the resolved agent:
-        // the launch program/args plus the resume template (a profile's override,
-        // else the base kind's).
+        // the launch program/args plus the native-session launch spec (a profile's
+        // override, else the base kind's).
         let snapshot = ResumeSnapshot {
             program: resolved
                 .profile
@@ -2042,8 +2042,7 @@ impl SessionRegistry {
                 .profile
                 .as_ref()
                 .map_or_else(|| default_args(&base), |profile| profile.args.clone()),
-            resume: capabilities.resume,
-            fork: capabilities.fork,
+            native,
         };
         // The detection-manifest override is consumed only by the detector, on
         // both the launch and resume paths; never persisted (re-resolved by name).
@@ -4601,14 +4600,16 @@ fn create_intent_record(
     resolved: &ResolvedAgent,
     cwd: &Path,
 ) -> Result<SessionRecord, ProtocolError> {
-    let capabilities = resolved.capabilities();
+    let native = resolved.native_launch();
     let created_at = timestamp_now();
     let info = SessionInfo {
         id: id.clone(),
         external: Some(false),
         capabilities: protocol::SessionCapabilities {
-            resume: capabilities.resume.is_some(),
-            fork: capabilities.fork.is_some(),
+            resume: native.is_some(),
+            fork: native
+                .as_ref()
+                .is_some_and(NativeSessionLaunch::supports_fork),
         },
         name: validate_session_name(params.name.as_deref())?,
         agent: resolved.name.clone(),
