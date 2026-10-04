@@ -602,8 +602,10 @@ max_depth = 1                                    # directory levels below dir
   environment, so a variable or `HOME` the agent would not see is not used), descends at most `max_depth` levels below `dir`
   (at most 4) visiting at most 50 000 entries, and matches regular files whose
   name equals (`exact`) or ends with (`ends_with`) `file_name` with the
-  reference substituted. It runs no shell, expands no glob, never follows a
-  symlink, and checks that `dir` stays inside the root. `root_env`, `root_home`,
+  reference substituted. It runs no shell and expands no glob. It opens the
+  root once and reads every directory through descriptors opened relative to
+  their parent without following symlinks, so a symlink, or a directory swapped
+  for one during the scan, is never entered and fails closed. `root_env`, `root_home`,
   `dir` and `file_name` accept only plain components (ASCII letters, digits,
   `.`, `_`, `-`), so no path, `..`, glob or `POHUNEK_*` variable is
   expressible. A missing conversation, an unset or relative root, an

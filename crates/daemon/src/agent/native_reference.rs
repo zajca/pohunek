@@ -20,9 +20,13 @@
 //! reference whose conversation no longer exists instead of launching the agent
 //! into an empty one.
 
-use std::ffi::OsString;
-use std::fs;
+use std::ffi::{OsStr, OsString};
+use std::fs as std_fs;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+
+use rustix::fs;
 
 use protocol::{ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
@@ -459,6 +463,10 @@ pub enum ReferenceCheckFailure {
     /// The scan hit its entry bound before it found the conversation.
     #[error("the declared session store is too large to verify")]
     ScanLimit,
+    /// A directory of the store was replaced, or is a symlink, while it was
+    /// being searched.
+    #[error("the declared session store changed during verification")]
+    StoreChanged,
 }
 
 impl From<ReferenceCheckFailure> for ProtocolError {
@@ -503,18 +511,93 @@ impl FileExistence {
         if reference.len() > MAX_CHECKED_REFERENCE_BYTES || !is_plain_component(reference) {
             return Err(ReferenceCheckFailure::InvalidReference);
         }
-        let root = self.resolve_root(env)?;
-        let base = match &self.dir {
-            Some(dir) => root.join(dir),
-            None => root.clone(),
-        };
-        let canonical_root = canonicalize(&root)?;
-        let canonical_base = canonicalize(&base)?;
-        if !canonical_base.starts_with(&canonical_root) {
-            return Err(ReferenceCheckFailure::RootUnavailable);
-        }
+        let root = canonicalize(&self.resolve_root(env)?)?;
         let wanted = self.file_name.replace(NAME_PLACEHOLDER, reference);
-        self.scan(&canonical_base, &wanted)
+        self.scan_store(&root, &wanted, &mut |_directory| {})
+    }
+
+    /// Opens the declared root once and searches it through directory
+    /// descriptors only.
+    ///
+    /// `before_open` runs after a subdirectory is discovered and before it is
+    /// opened; it receives the directory's diagnostic path.
+    fn scan_store(
+        &self,
+        root: &Path,
+        wanted: &str,
+        before_open: &mut dyn FnMut(&Path),
+    ) -> Result<(), ReferenceCheckFailure> {
+        let mut path = root.to_path_buf();
+        let mut directory = open_root(root)?;
+        for component in self.dir.iter().flat_map(|dir| dir.split('/')) {
+            directory =
+                open_child_directory(&directory, OsStr::new(component)).map_err(|errno| {
+                    classify_open_error(errno, ReferenceCheckFailure::RootUnavailable)
+                })?;
+            path.push(component);
+        }
+        let mut visited = 0_usize;
+        self.scan_directory(&directory, &path, 0, wanted, &mut visited, before_open)
+    }
+
+    /// Depth-first search of `directory`. A directory is read through its
+    /// descriptor; each entry is typed with a no-follow `statat` and each
+    /// subdirectory is opened relative to its parent with `O_NOFOLLOW`, so a
+    /// path string is never resolved a second time and a symlink or a swapped
+    /// directory is refused instead of entered.
+    fn scan_directory(
+        &self,
+        directory: &OwnedFd,
+        path: &Path,
+        depth: u8,
+        wanted: &str,
+        visited: &mut usize,
+        before_open: &mut dyn FnMut(&Path),
+    ) -> Result<(), ReferenceCheckFailure> {
+        let entries =
+            fs::Dir::read_from(directory).map_err(|_errno| ReferenceCheckFailure::Missing)?;
+        let mut subdirectories = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_errno| ReferenceCheckFailure::Missing)?;
+            let name_bytes = entry.file_name().to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            *visited += 1;
+            if *visited > MAX_EXISTENCE_ENTRIES {
+                return Err(ReferenceCheckFailure::ScanLimit);
+            }
+            let name = OsStr::from_bytes(name_bytes);
+            let Ok(stat) = fs::statat(directory, name, fs::AtFlags::SYMLINK_NOFOLLOW) else {
+                continue;
+            };
+            match fs::FileType::from_raw_mode(stat.st_mode) {
+                fs::FileType::RegularFile => {
+                    if name
+                        .to_str()
+                        .is_some_and(|name| self.name_matches(name, wanted))
+                    {
+                        return Ok(());
+                    }
+                }
+                fs::FileType::Directory if depth < self.max_depth => {
+                    subdirectories.push(name.to_os_string());
+                }
+                _ => {}
+            }
+        }
+        for name in subdirectories {
+            let child_path = path.join(&name);
+            before_open(&child_path);
+            let child = open_child_directory(directory, &name)
+                .map_err(|errno| classify_open_error(errno, ReferenceCheckFailure::StoreChanged))?;
+            match self.scan_directory(&child, &child_path, depth + 1, wanted, visited, before_open)
+            {
+                Err(ReferenceCheckFailure::Missing) => {}
+                outcome => return outcome,
+            }
+        }
+        Err(ReferenceCheckFailure::Missing)
     }
 
     /// The config home: the declared variable when it is set to an absolute
@@ -548,44 +631,6 @@ impl FileExistence {
         Ok(home.join(relative))
     }
 
-    /// Breadth-first listing of `base` down to `max_depth`. Only regular files
-    /// match and only real directories are entered, so a symlink can never
-    /// lead the scan outside the base.
-    fn scan(&self, base: &Path, wanted: &str) -> Result<(), ReferenceCheckFailure> {
-        let mut level = vec![base.to_path_buf()];
-        let mut visited = 0_usize;
-        for depth in 0..=self.max_depth {
-            let mut next = Vec::new();
-            for directory in &level {
-                let Ok(entries) = fs::read_dir(directory) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    visited += 1;
-                    if visited > MAX_EXISTENCE_ENTRIES {
-                        return Err(ReferenceCheckFailure::ScanLimit);
-                    }
-                    let Ok(kind) = entry.file_type() else {
-                        continue;
-                    };
-                    if kind.is_file() {
-                        let name = entry.file_name();
-                        if name
-                            .to_str()
-                            .is_some_and(|name| self.name_matches(name, wanted))
-                        {
-                            return Ok(());
-                        }
-                    } else if kind.is_dir() && depth < self.max_depth {
-                        next.push(entry.path());
-                    }
-                }
-            }
-            level = next;
-        }
-        Err(ReferenceCheckFailure::Missing)
-    }
-
     fn name_matches(&self, name: &str, wanted: &str) -> bool {
         match self.name_match {
             NameMatch::Exact => name == wanted,
@@ -594,9 +639,42 @@ impl FileExistence {
     }
 }
 
+/// Opens the canonical store root as a directory descriptor.
+fn open_root(root: &Path) -> Result<OwnedFd, ReferenceCheckFailure> {
+    fs::open(
+        root,
+        fs::OFlags::RDONLY | fs::OFlags::DIRECTORY | fs::OFlags::CLOEXEC,
+        fs::Mode::empty(),
+    )
+    .map_err(|errno| classify_open_error(errno, ReferenceCheckFailure::RootUnavailable))
+}
+
+/// Opens the child directory `name` of `parent` without following a symlink.
+fn open_child_directory(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, rustix::io::Errno> {
+    fs::openat(
+        parent,
+        name,
+        fs::OFlags::RDONLY | fs::OFlags::DIRECTORY | fs::OFlags::NOFOLLOW | fs::OFlags::CLOEXEC,
+        fs::Mode::empty(),
+    )
+}
+
+/// An absent directory is a missing conversation; any other open failure
+/// (including the refusal to follow a symlink) is `otherwise`.
+fn classify_open_error(
+    errno: rustix::io::Errno,
+    otherwise: ReferenceCheckFailure,
+) -> ReferenceCheckFailure {
+    if errno == rustix::io::Errno::NOENT {
+        ReferenceCheckFailure::Missing
+    } else {
+        otherwise
+    }
+}
+
 /// Canonicalizes `path`, mapping an absent path to [`ReferenceCheckFailure::Missing`].
 fn canonicalize(path: &Path) -> Result<PathBuf, ReferenceCheckFailure> {
-    fs::canonicalize(path).map_err(|error| {
+    std_fs::canonicalize(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ReferenceCheckFailure::Missing
         } else {
@@ -607,6 +685,8 @@ fn canonicalize(path: &Path) -> Result<PathBuf, ReferenceCheckFailure> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     use pohunek_test_support::tempdir;
@@ -963,6 +1043,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_directory_swapped_for_a_symlink_after_discovery_is_not_entered() {
+        let outside = tempdir().expect("outside dir");
+        fs::write(outside.path().join("t_abc.jsonl"), "{}").expect("outside file");
+        let store = store_with("proj", "t_other.jsonl");
+        let ReferenceExistence::File(check) = existence(pi_spec()) else {
+            panic!("a file check");
+        };
+        let root = fs::canonicalize(&store.root).expect("canonical root");
+        let target = outside.path().to_path_buf();
+        let mut swapped = false;
+        let outcome = check.scan_store(&root, "_abc.jsonl", &mut |directory| {
+            // The scan has typed `proj` as a directory and is about to open
+            // it: replace it with a link to a directory that holds a match.
+            fs::remove_dir_all(directory).expect("remove discovered directory");
+            std::os::unix::fs::symlink(&target, directory).expect("swap in a symlink");
+            swapped = true;
+        });
+        assert!(swapped, "the hook ran between discovery and traversal");
+        assert_eq!(
+            outcome,
+            Err(ReferenceCheckFailure::StoreChanged),
+            "a match behind the swapped-in link must not be found"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_declared_directory_that_links_outside_the_root_is_refused() {
         let outside = tempdir().expect("outside dir");
         fs::write(outside.path().join("t_abc.jsonl"), "{}").expect("outside file");
@@ -985,6 +1092,7 @@ mod tests {
             ReferenceCheckFailure::RootUnavailable,
             ReferenceCheckFailure::InvalidReference,
             ReferenceCheckFailure::ScanLimit,
+            ReferenceCheckFailure::StoreChanged,
         ] {
             let error = ProtocolError::from(failure);
             assert_eq!(error.code, "agent_native_reference_missing");
