@@ -20,7 +20,7 @@ use protocol::{AgentKind, ErrorClass, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::host::{ProfileRevision, RuntimeDefinition, RuntimeHost};
+use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost};
 use super::{InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::Manifest;
 use crate::project::config::validate_name;
@@ -169,8 +169,8 @@ pub(crate) struct ResolvedProfile {
     pub native: Option<NativeSessionLaunch>,
     /// Parsed detection-manifest override; `None` ⇒ inherit the base kind's manifest.
     pub manifest: Option<Manifest>,
-    /// Revision of the profile's launch inputs, as approved by the owner.
-    pub revision: ProfileRevision,
+    /// Digest of the profile's launch inputs; the source of its revision.
+    pub inputs: ProfileInputs,
 }
 
 /// The resolution of an agent NAME on this host: its base kind plus optional
@@ -197,11 +197,11 @@ impl ResolvedAgent {
         )
     }
 
-    /// The revision of the host profile this agent resolved from; `None` for a
-    /// bare runtime.
+    /// The launch inputs of the host profile this agent resolved from; `None`
+    /// for a bare runtime.
     #[must_use]
-    pub(crate) fn profile_revision(&self) -> Option<&ProfileRevision> {
-        self.profile.as_ref().map(|profile| &profile.revision)
+    pub(crate) fn profile_inputs(&self) -> Option<&ProfileInputs> {
+        self.profile.as_ref().map(|profile| &profile.inputs)
     }
 
     /// The program the agent launches: the profile's, else the base runtime's.
@@ -240,6 +240,8 @@ pub(crate) struct ProfileRegistry {
     dir: Option<PathBuf>,
     /// Resolves the base runtime a name or profile extends.
     runtimes: RuntimeHost,
+    /// Host-local key that turns profile launch inputs into revisions.
+    revision_keys: Arc<RevisionKeys>,
 }
 
 impl ProfileRegistry {
@@ -271,7 +273,46 @@ impl ProfileRegistry {
             }
             secure
         });
-        Self { dir, runtimes }
+        Self {
+            dir,
+            runtimes,
+            revision_keys: Arc::default(),
+        }
+    }
+
+    /// Keys profile revisions with a secret kept in the host-state directory
+    /// `state_dir`. Without one, revisions are unavailable (typed error).
+    #[must_use]
+    pub(crate) fn with_revision_state_dir(mut self, state_dir: Option<PathBuf>) -> Self {
+        self.revision_keys = Arc::new(RevisionKeys::new(state_dir));
+        self
+    }
+
+    /// The revision keys of this host.
+    pub(crate) fn revision_keys(&self) -> &RevisionKeys {
+        &self.revision_keys
+    }
+
+    /// The revision of the host profile `agent` resolved from, or `None` for a
+    /// bare runtime. This is the owner's approval step; its caller arrives
+    /// with the locally approved `HostShare` (#82).
+    ///
+    /// # Errors
+    ///
+    /// Returns `agent_profile_revision_unavailable` when the host's revision
+    /// key cannot be read or created.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the approval caller arrives with #82")
+    )]
+    pub(crate) fn revision_of(
+        &self,
+        agent: &ResolvedAgent,
+    ) -> Result<Option<super::host::ProfileRevision>, ProtocolError> {
+        agent
+            .profile_inputs()
+            .map(|inputs| self.revision_keys.revision(inputs))
+            .transpose()
     }
 
     /// Resolve an agent name (4-step chain, fail-closed):
@@ -462,11 +503,13 @@ fn load_profile(
     let manifest_source = resolve_manifest(name, dir, raw.manifest.as_deref())?;
     let binding_json = serde_json::to_vec(definition.binding())
         .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
-    let revision = ProfileRevision::of_inputs(
+    let inputs = ProfileInputs::of(
         &content,
         manifest_source.as_ref().map(|source| source.text.as_str()),
         &binding_json,
-    );
+        &program,
+        &args,
+    )?;
     Ok(ResolvedAgent {
         name: name.to_owned(),
         base,
@@ -478,7 +521,7 @@ fn load_profile(
             input_rules,
             native,
             manifest: manifest_source.map(|source| source.manifest),
-            revision,
+            inputs,
         }),
     })
 }

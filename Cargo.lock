@@ -2843,6 +2843,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "getrandom 0.2.17",
+ "hmac 0.12.1",
  "libc",
  "nix 0.29.0",
  "notify",

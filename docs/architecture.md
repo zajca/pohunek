@@ -569,10 +569,16 @@ today. `RelayProfile` carries only the name of a locally approved owner
 profile and the profile revision that was approved. It can never name a
 runtime id, package, program or argv: a bare runtime id is answered with
 `agent_profile_not_found`, and a profile edited after approval (its file, the
-detection manifest it names, or the launch binding of its base runtime) is
-refused with `agent_profile_revision_stale`. The resolved agent keeps the
-revision of its profile. Connecting a relay-origin `session.new` to
-`RelayProfile` depends on the locally approved `HostShare` of
+detection manifest it names, the launch binding of its base runtime, or its
+effective program and arguments) is refused with
+`agent_profile_revision_stale`. A profile revision is an HMAC-SHA256 under a
+host-local secret (`profile-revision.key` in the owner-private host-state
+directory, created on first use) over those inputs, so a different login shell
+changes it, a revision never lets a holder confirm a guessed `[env]` value, and
+it is stable across daemon restarts. A missing or unreadable key fails closed
+with `agent_profile_revision_unavailable`; there is no unkeyed fallback, and
+owner-local launches never need the key. Connecting a relay-origin
+`session.new` to `RelayProfile` depends on the locally approved `HostShare` of
 [#82](https://github.com/zajca/pohunek/issues/82); until then the relay
 variant is covered at the resolution seam only.
 
@@ -581,8 +587,9 @@ owned by other issues. A source-scan test
 (`crates/xtask/tests/no_special_dispatch.rs`) pins every production line under
 `crates/daemon/src` that still names `codex`, `claude` or `hermes`, per file,
 with the issue that removes it (#144 integration handlers, #145-#147 built-in
-packages, #487 transcript parsing) or `data`; a new occurrence or a stale entry
-fails the test.
+packages, #487 transcript parsing) or `data`. The pin is the exact trimmed text
+of each naming line (a SHA-256 over them for the large integration files), so a
+new, replaced or edited line and a stale entry all fail the test.
 
 ### Agent state detection
 

@@ -72,7 +72,11 @@ host resolves an owner-local name: a host profile, else an installed runtime
 id. A relay-selected launch resolves only a locally approved host profile by
 name and approved revision; it can never name a runtime id, package, program or
 argv. A bare runtime id fails with `agent_profile_not_found`, and a profile
-edited after approval fails with `agent_profile_revision_stale`. No relay
+edited after approval fails with `agent_profile_revision_stale`. The
+revision is a keyed MAC under a host-local secret and covers the profile, its
+manifest, its base runtime binding and the effective program and arguments; it
+reveals no environment value, and an unreadable key fails closed with
+`agent_profile_revision_unavailable`. No relay
 caller exists yet; it depends on the locally approved host share of
 [#82](https://github.com/zajca/pohunek/issues/82).
 

@@ -26,6 +26,7 @@ pub use registry::{
     RESERVED_RUNTIME_IDS,
 };
 pub use source::{LaunchSource, ProfileRevision};
+pub(crate) use source::{ProfileInputs, RevisionKeys};
 
 #[cfg(test)]
 mod tests;
