@@ -28,7 +28,7 @@ use tracing::warn;
 
 use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy};
 use super::{InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind};
-use crate::detect::Manifest;
+use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
 use crate::project::config::validate_name;
 
 /// A parsed `agents/<name>.toml`. `deny_unknown_fields` keeps the surface tight so
@@ -566,9 +566,6 @@ pub(crate) const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 /// The resolved file is opened without following a further link and without
 /// blocking on a fifo or device swapped in after the check.
 fn read_profile_text(dir: &Path, name: &str, path: &Path) -> Result<String, ProtocolError> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
     // Containment first: a symlinked `<name>.toml` that escapes the tree must be
     // rejected before its contents are read or exec'd (C.5).
     assert_contained(dir, path, name)?;
@@ -578,26 +575,53 @@ fn read_profile_text(dir: &Path, name: &str, path: &Path) -> Result<String, Prot
             "profile file is not owner-secure (wrong owner or group/world-writable)",
         ));
     }
-    let unreadable = |error: &std::io::Error| invalid_profile(name, &error.to_string());
-    let resolved = std::fs::canonicalize(path).map_err(|error| unreadable(&error))?;
+    let resolved =
+        std::fs::canonicalize(path).map_err(|error| invalid_profile(name, &error.to_string()))?;
+    read_bounded_text(&resolved, MAX_PROFILE_BYTES).map_err(|failure| match failure {
+        BoundedRead::Io(error) => invalid_profile(name, &error.to_string()),
+        BoundedRead::NotRegular => invalid_profile(name, "profile file is not a regular file"),
+        BoundedRead::TooLarge => invalid_profile(name, "profile file is too large"),
+    })
+}
+
+/// Why a bounded read of a config file failed.
+#[derive(Debug)]
+enum BoundedRead {
+    /// The open or the read failed.
+    Io(std::io::Error),
+    /// The path is not a regular file.
+    NotRegular,
+    /// The file holds more than the bound.
+    TooLarge,
+}
+
+/// Reads the UTF-8 text of the file at `resolved`, at most `max_bytes`.
+///
+/// The one bounded reader of the profile layer, used for profile files and for
+/// the detection-manifest overrides they name; both are read under the package
+/// lifecycle authority when a rewrite is validated. The file is opened without
+/// following a final link and without blocking on a fifo or device, checked to
+/// be a regular file on the descriptor, and read through `take(max + 1)`, so
+/// an oversized or growing file is refused after at most `max + 1` bytes are
+/// buffered.
+fn read_bounded_text(resolved: &Path, max_bytes: u64) -> Result<String, BoundedRead> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(&resolved)
-        .map_err(|error| unreadable(&error))?;
-    if !file
-        .metadata()
-        .map_err(|error| unreadable(&error))?
-        .is_file()
-    {
-        return Err(invalid_profile(name, "profile file is not a regular file"));
+        .open(resolved)
+        .map_err(BoundedRead::Io)?;
+    if !file.metadata().map_err(BoundedRead::Io)?.is_file() {
+        return Err(BoundedRead::NotRegular);
     }
     let mut text = String::new();
-    file.take(MAX_PROFILE_BYTES + 1)
+    file.take(max_bytes.saturating_add(1))
         .read_to_string(&mut text)
-        .map_err(|error| unreadable(&error))?;
-    if u64::try_from(text.len()).map_or(true, |read| read > MAX_PROFILE_BYTES) {
-        return Err(invalid_profile(name, "profile file is too large"));
+        .map_err(BoundedRead::Io)?;
+    if u64::try_from(text.len()).map_or(true, |read| read > max_bytes) {
+        return Err(BoundedRead::TooLarge);
     }
     Ok(text)
 }
@@ -989,8 +1013,17 @@ fn resolve_manifest(
         ));
     }
     assert_contained(dir, &path, name)?;
-    let content = std::fs::read_to_string(&path)
+    let resolved = std::fs::canonicalize(&path)
         .map_err(|err| invalid_profile(name, &format!("manifest '{manifest_name}': {err}")))?;
+    let limit = u64::try_from(MAX_MANIFEST_SOURCE_BYTES).unwrap_or(u64::MAX);
+    let content = read_bounded_text(&resolved, limit).map_err(|failure| {
+        let reason = match failure {
+            BoundedRead::Io(err) => err.to_string(),
+            BoundedRead::NotRegular => "is not a regular file".to_owned(),
+            BoundedRead::TooLarge => "is too large".to_owned(),
+        };
+        invalid_profile(name, &format!("manifest '{manifest_name}': {reason}"))
+    })?;
     let manifest = Manifest::parse_str(&content)
         .map_err(|err| invalid_profile(name, &format!("manifest '{manifest_name}': {err}")))?;
     Ok(Some(ManifestSource {

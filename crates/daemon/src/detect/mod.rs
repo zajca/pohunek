@@ -18,6 +18,7 @@ mod manifest;
 mod osc;
 
 pub use machine::{ActivityEvidence, ActivityTransition, DetectionConfig, StateMachine};
+pub(crate) use manifest::MAX_MANIFEST_SOURCE_BYTES;
 pub use manifest::{
     Manifest, ManifestError, ManifestMatch, ManifestRegion, MatchContext, MatcherKind,
     ProcessMatchers,

@@ -632,3 +632,35 @@ fn the_retention_scan_refuses_a_directory_with_too_many_entries() {
         .pinned_digests()
         .expect_err("an oversized directory is not assumed to pin nothing");
 }
+
+#[test]
+fn the_bounded_reader_refuses_a_fifo_and_an_oversized_file_without_blocking() {
+    let fixture = Fixture::new();
+    let fifo = fixture.agents.join("pipe.txt");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("create a fifo");
+    assert!(matches!(
+        super::read_bounded_text(&fifo, 1024),
+        Err(super::BoundedRead::NotRegular)
+    ));
+
+    let big = fixture.agents.join("big.txt");
+    fs::File::create(&big)
+        .expect("create")
+        .set_len(1025)
+        .expect("sparse file");
+    assert!(matches!(
+        super::read_bounded_text(&big, 1024),
+        Err(super::BoundedRead::TooLarge)
+    ));
+    fs::write(&big, "x".repeat(1024)).expect("write");
+    assert_eq!(
+        super::read_bounded_text(&big, 1024)
+            .expect("at the bound")
+            .len(),
+        1024
+    );
+}

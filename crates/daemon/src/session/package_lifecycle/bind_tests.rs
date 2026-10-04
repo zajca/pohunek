@@ -681,3 +681,76 @@ async fn the_rewritten_profile_must_fit_the_size_limit_the_loader_applies() {
     let written = fs::read(&path).expect("read").len();
     assert!(written <= limit, "{written} bytes");
 }
+
+// ----- manifest overrides are read under the lock with a bound --------------
+
+/// A profile that names the detection-manifest override `manifest`.
+fn with_manifest(manifest: &str) -> String {
+    format!("{}manifest = \"{manifest}\"\n", unpinned_head())
+}
+
+fn unpinned_head() -> String {
+    format!("base = \"{RUNTIME}\"\nprogram = \"{INERT_PROGRAM}\"\n")
+}
+
+fn manifests_dir(fixture: &Fixture) -> std::path::PathBuf {
+    let dir = fixture.agents.join("manifests");
+    fs::create_dir_all(&dir).expect("manifests directory");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("private manifests");
+    dir
+}
+
+#[tokio::test]
+async fn an_oversized_manifest_override_is_refused_in_preview_and_commit() {
+    let fixture = Fixture::new("bind-manifest-oversized");
+    install(&fixture, &Package::pi()).await;
+    let big = manifests_dir(&fixture).join("big.toml");
+    let file = fs::File::create(&big).expect("create");
+    file.set_len(u64::try_from(crate::detect::MAX_MANIFEST_SOURCE_BYTES).expect("fits") + 1)
+        .expect("sparse file");
+    fs::set_permissions(&big, fs::Permissions::from_mode(0o600)).expect("secure");
+    let path = fixture.write_profile(PROFILE, &with_manifest("big"));
+    let before = state_of(&path);
+
+    for dry_run in [true, false] {
+        let refused = fixture
+            .registry
+            .package_bind_profile(bind(PROFILE, None, dry_run))
+            .await
+            .expect_err("the manifest is over the parser's limit");
+        assert_eq!(
+            refused,
+            PackageErrorKind::ProfileUnusable,
+            "dry_run {dry_run}"
+        );
+        assert_eq!(state_of(&path), before, "the profile is untouched");
+    }
+}
+
+#[tokio::test]
+async fn a_non_regular_manifest_override_is_refused_without_blocking() {
+    let fixture = Fixture::new("bind-manifest-fifo");
+    install(&fixture, &Package::pi()).await;
+    let pipe = manifests_dir(&fixture).join("pipe.toml");
+    nix::unistd::mkfifo(
+        &pipe,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("create a fifo");
+    let path = fixture.write_profile(PROFILE, &with_manifest("pipe"));
+    let before = state_of(&path);
+
+    for dry_run in [true, false] {
+        let refused = fixture
+            .registry
+            .package_bind_profile(bind(PROFILE, None, dry_run))
+            .await
+            .expect_err("a fifo is not a manifest");
+        assert_eq!(
+            refused,
+            PackageErrorKind::ProfileUnusable,
+            "dry_run {dry_run}"
+        );
+        assert_eq!(state_of(&path), before, "the profile is untouched");
+    }
+}
