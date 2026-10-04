@@ -96,12 +96,17 @@ args = ["--session", "{reference}"]     # resume argv, required
 fork_args = ["--fork", "{reference}"]   # optional; absent means no fork
 ```
 
+`fork_args` is accepted only on a base with compiled fork support (`claude`);
+a `codex`, `hermes`, or `shell` profile that sets it is rejected, so those
+bases keep returning `agent_fork_unsupported`. Runtime packages will declare
+their own fork support later.
+
 `{reference}` must be a whole argv token, appear exactly once per list, and is
 never part of a larger string. The daemon rejects, with `invalid_profile` naming
 the profile and the field, an unknown `reference_kind`, a missing `reference_kind`
 or `args`, an empty list, a list without or with more than one `{reference}`, an
 embedded form such as `--session={reference}`, any other brace in a token, an
-empty or control-character token, `fork_args` without `args`, and any
+empty or control-character token, `fork_args` without `args` or on a base without compiled fork support, and any
 `[resume]` table on a `shell` base. A malformed profile fails before any worker,
 session record, or worktree exists. Parse errors report the message and line
 only, never profile environment values. The resolved spec is stored in the

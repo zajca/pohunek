@@ -451,7 +451,8 @@ fn load_profile(name: &str, path: &Path, dir: &Path) -> Result<ResolvedAgent, Pr
 ///
 /// An absent `[resume]` inherits the base kind's compiled spec. `resumable =
 /// false` yields no native recovery. Otherwise `[resume]` must carry a complete
-/// spec (`reference_kind` and `args`, optionally `fork_args`); nothing is merged
+/// spec (`reference_kind` and `args`, optionally `fork_args` on a base with
+/// compiled fork support); nothing is merged
 /// with the base kind, and every template is validated here so a malformed
 /// profile fails before any session is created.
 fn resolve_native(
@@ -481,6 +482,16 @@ fn resolve_native(
         .as_deref()
         .ok_or_else(|| invalid_profile(name, "resume.args is required"))
         .and_then(|tokens| parse_template(name, "resume.args", tokens))?;
+    // Fork semantics are owned by the compiled base: a profile may restate or
+    // omit its base's fork, but cannot grant fork to a base that has none.
+    if raw.fork_args.is_some()
+        && !base_native_launch(base).is_some_and(|compiled| compiled.supports_fork())
+    {
+        return Err(invalid_profile(
+            name,
+            "resume.fork_args requires a base kind with native fork support",
+        ));
+    }
     let fork_args = raw
         .fork_args
         .as_deref()
@@ -830,7 +841,7 @@ mod tests {
         write_profile(
             &dir,
             "pi-like",
-            "base = \"hermes\"\nprogram = \"pi\"\n[resume]\nreference_kind = \"path\"\nargs = [\"--session\", \"{reference}\"]\nfork_args = [\"--fork\", \"{reference}\"]\n",
+            "base = \"claude\"\nprogram = \"pi\"\n[resume]\nreference_kind = \"path\"\nargs = [\"--session\", \"{reference}\"]\nfork_args = [\"--fork\", \"{reference}\"]\n",
         );
         let native = resolve(&dir, "pi-like")
             .expect("resolves")
@@ -998,6 +1009,27 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn fork_args_require_a_base_with_compiled_fork_support() {
+        let dir = tmp_agents_dir("fork-args-base");
+        let spec = "[resume]\nreference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]\nfork_args = [\"--fork\", \"{reference}\"]\n";
+        for base in ["codex", "hermes"] {
+            let name = format!("{base}-fork");
+            write_profile(&dir, &name, &format!("base = \"{base}\"\n{spec}"));
+            let message = invalid_message(&dir, &name);
+            assert!(message.contains(&format!("'{name}'")), "{message}");
+            assert!(
+                message.contains("resume.fork_args requires a base kind with native fork support"),
+                "{message}"
+            );
+        }
+        write_profile(&dir, "claude-fork", &format!("base = \"claude\"\n{spec}"));
+        let native = resolve(&dir, "claude-fork")
+            .expect("claude owns fork")
+            .native;
+        assert!(native.expect("spec").supports_fork());
     }
 
     #[test]
