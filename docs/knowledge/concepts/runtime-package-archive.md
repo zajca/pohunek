@@ -90,6 +90,14 @@ prints its digest. `verify` builds the directory twice and requires identical
 bytes. The release pipeline uses `verify` semantics to require byte-for-byte
 reproducibility from independent clean roots.
 
+Both commands call `package::directory::build_directory_archive(dir, limits)`
+(Unix), which the CLI's `plugin link` also uses. It walks regular files only
+(a symlink or special file is `UnsupportedFileType`, a non-UTF-8 name is
+`InvalidPath`), charges every file against the limits from the bytes actually
+read, and compares the opened file's device, inode and type with the listing so
+a file swapped for a symlink during the walk is `Changed` instead of followed.
+`DirectoryError` carries no path or content.
+
 ## Install and verify a package root
 
 `package::install::install_archive` extracts a verified archive into
@@ -167,6 +175,14 @@ the clock or parse the runtime manifest; the caller supplies both.
   live or lost sessions and durable resume bindings, supplied by the daemon) and
   refuses while the digest is in it. A modified root is refused; a missing root
   is simply unrecorded. The record is replaced before the root is deleted.
+- `remove_modified` is the separate removal for a package whose root fails
+  verification (changed, added, retyped or missing-entry content, a changed
+  mode or manifest), which `uninstall` refuses. It applies the same
+  retained-digest refusal, acts only on a failing root (a verifying or missing
+  root is `RootIntact`; use `uninstall`), un-records the package and any
+  selection of it in one commit, then deletes the root through the same
+  quarantine. A root the platform cannot delete (for example a hard-linked
+  file) yields `RemovalIncomplete` after the package is already unrecorded.
 - `retained_roots` verifies each referenced digest and returns `Ready` or
   `Incompatible` with a typed reason: not registered, root missing, or root
   invalid (including a manifest that differs from the recorded one). The
@@ -177,6 +193,18 @@ the clock or parse the runtime manifest; the caller supplies both.
 
 Install publishes the root before it records it, and uninstall un-records
 before it deletes, so the record never names a root that was never published.
+
+### Catalog state
+
+The registry also persists what the catalog verifier needs from its caller, in
+`catalog-state.json` (schema 1, unknown fields denied, `0600`, at most 16 KiB)
+beside the record and under the same lock. `catalog_state()` reads it without
+the lock (a missing file is the empty state) and `record_catalog(&verified)`
+merges a verified catalog: the high-water mark becomes the maximum of the
+stored mark and the catalog sequence and revoked key ids are united (at most
+`MAX_REVOKED_KEYS`, else `TooManyRevokedKeys`). A sequence below the stored mark
+changes nothing and a merge that changes nothing writes nothing. A corrupt or
+unknown-schema file is a typed error and is never replaced.
 
 ## Daemon host
 
