@@ -914,10 +914,10 @@ async fn the_reported_runtime_accounts_for_every_argument_of_a_fresh_launch() {
         "{actual:?} against {predicted:?}"
     );
     for (actual, predicted) in actual.iter().zip(&predicted) {
-        if predicted != "{reference}" {
-            assert_eq!(actual, predicted);
-        } else {
+        if predicted == "{reference}" {
             assert!(!actual.is_empty(), "the reference slot is filled");
+        } else {
+            assert_eq!(actual, predicted);
         }
     }
 
