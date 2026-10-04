@@ -10,11 +10,8 @@
 </p>
 
 **pohunek** is a headless, multihost backbone for coding agents. One small Rust
-daemon runs on every machine you own. Each Codex, Claude Code, or Hermes Agent
-session gets its own durable terminal that survives detach, terminal and daemon
-crashes, and daemon upgrades. The daemon exposes sessions, live agent state, worktrees, and
-notifications through one versioned protocol, a JSON CLI, and Rust and
-TypeScript SDKs.
+daemon per machine. One durable terminal per Codex, Claude Code, or Hermes
+Agent session. One versioned JSON contract for everything you build on top.
 
 > A *pohunek* is the farmhand boy who drives the draft animals. He does not
 > plow himself — he keeps the team moving.
@@ -24,29 +21,86 @@ the right worktree, and tells you or your tooling when one of them needs
 attention.
 
 > **Status: pre-1.0, experimental.** Wire shapes, config files, and on-disk
-> metadata may change freely between releases. Linux-first.
+> metadata may change freely between releases. Linux-first; macOS on Apple
+> Silicon is in progress.
 
-## What pohunek is for
+## Two machines, one minute
+
+```bash
+# Which of your NetBird peers already run a daemon? No tokens, no server.
+pohunek host discover
+
+# Start Codex on the build box, in a fresh worktree, with its first prompt.
+# The project name resolves on buildbox; no filesystem path crosses the wire.
+pohunek session new --host buildbox --project myapp --agent codex \
+  --branch feat/parser --input "Fix the parser fuzz failures." --yes
+
+# Go do something else. When the agent waits for an approval or is blocked,
+# the record lands here, from every host at once.
+pohunek notifications watch --all-hosts
+
+# Take over the terminal across the mesh; Ctrl-] leaves the agent running.
+pohunek attach buildbox/s-01J00000000000000000000000
+
+# What did it change? Diff of the remote worktree, untracked files included.
+pohunek session diff buildbox/s-01J00000000000000000000000
+```
+
+Close the terminal, restart or upgrade the daemon: the session keeps the same
+PTY and child PID. Logout, a host reboot, or a worker failure ends that runtime
+generation; the session then shows `runtime.state=lost`, is never restarted
+behind your back, and `pohunek session resume` recovers it on purpose when the
+agent's native session id was captured.
+
+## Why not a multiplexer and ssh
+
+A multiplexer keeps a shell alive. It does not know that the process inside is
+an agent, so every agent-aware need lands on whoever writes the tool. pohunek
+handles it once, for every agent CLI:
+
+| You need to | pohunek gives you |
+|---|---|
+| Know whether the agent is working, blocked on an approval, or idle | Live `working` / `blocked` / `idle` detection from OSC titles, screen patterns, and PTY activity. Detection rules are TOML manifests, so a new agent needs no recompile. |
+| Submit a multi-line prompt into an Ink TUI without it being half-swallowed | `session input` with per-agent framing (bracketed paste, delayed submit). Prompts can come from stdin so they never appear in argv or logs. |
+| Hear about it when something needs you, on any machine | Durable notification records (`unread → read → acknowledged → archived`), fed by agent hooks and daemon-side detection, deduped and debounced, fanned out with `--all-hosts`. |
+| Keep two agents out of one working tree | `--branch` creates a worktree per session off the base branch; ownership is recorded and checked before any reuse or cleanup. |
+| Get a conversation back, or branch it | Hooks capture the agent's own session id for explicit `session resume`; `session fork` branches a Claude Code conversation into a new session and PTY. |
+| Watch without stealing the terminal | `session screen`, paged `session output` with exact runtime cursors, and `session wait` for bounded change polling. |
+| Drive it from a script or another agent | One versioned `--json` envelope, typed errors with recovery hints, `subscribe` event streams, Rust and TypeScript SDKs. |
+
+## What pohunek is built for
 
 - **Headless by design.** This repository ships no user interface. The daemon,
   its protocol, the CLI with `--json`, and the SDKs are the product. Every GUI,
-  launcher, or dashboard is a client of the same public contract.
+  launcher, or dashboard is a client of the same public contract: the Rust
+  crate `pohunek-client` and the TypeScript packages `@pohunek/protocol`,
+  `@pohunek/sdk` (with a node-free browser entry), and `@pohunek/testkit`
+  speak one newline-delimited JSON protocol, with the TypeScript types
+  generated from the Rust source of truth. A shell script around `--json` is a
+  legitimate client too. [docs/sdk.md](docs/sdk.md) has the examples.
 - **A stable base for tooling you build yourself.** Each agent CLI has its own
   TUI quirks, prompt framing, hooks, session ids, and resume and fork rules.
-  pohunek handles those differences once: durable PTYs, per-agent input
-  framing, live `working` / `blocked` / `idle` detection, native session
-  recovery, and hook-fed notifications. Your scripts, launchers, review bots,
-  and manager agents then talk to one contract and never integrate each agent
-  CLI and harness themselves.
+  pohunek absorbs those differences once, so your scripts, launchers, review
+  bots, and manager agents talk to one contract instead of every harness.
 - **Multihost from the start.** Every host is authoritative for its own
-  sessions. The CLI and SDKs talk directly to each host's daemon, locally over
-  an owner-only Unix socket and remotely over a NetBird/WireGuard overlay. There
-  is no central server, no SaaS, and no state sync. `--host buildbox` or a
-  `buildbox/<session-id>` target is all it takes to work on another machine.
-- **Driven by agents, not only by people.** Every automation command returns one
-  versioned JSON envelope with typed errors. `pohunek agent-skill` prints the
-  complete operating skill an agent needs, and `pohunek assistant` starts an
-  agent session that already knows pohunek and your hosts.
+  sessions. The CLI and SDKs talk directly to each host's daemon: an owner-only
+  Unix socket locally, a NetBird/WireGuard overlay remotely, bound only to the
+  overlay address. No central server, no SaaS, no state sync. `--host buildbox`
+  or a `buildbox/<session-id>` target is all it takes.
+- **Driven by agents, not only by people.** Every automation command returns
+  one versioned JSON envelope with typed errors. `pohunek agent-skill` prints
+  the complete operating skill an agent needs, and `pohunek assistant` starts
+  an agent session that already knows pohunek and your hosts.
+
+```bash
+# An agent, or your script, working a session on another host:
+printf '%s' 'Run the focused tests.' \
+  | pohunek session input buildbox/s-01J00000000000000000000000 --stdin --json
+pohunek session wait buildbox/s-01J00000000000000000000000 \
+  --activity idle --timeout-ms 8000 --json     # wakes on idle, or reports a timeout
+pohunek agent-skill --json                     # the full skill text plus its sha256
+pohunek assistant "why does attach fail on my laptop?"
+```
 
 ```text
         your tooling: agents, scripts, launchers, GUIs, dashboards
@@ -60,8 +114,11 @@ attention.
   claude · codex           codex · hermes           claude · shell
 ```
 
-[Features and architecture overview](docs/features.md) lists everything the
-core does, explains the daemon/worker split, and describes the single-owner
+Each daemon hands every session to its own `pohunek-sessiond` worker (a
+systemd transient unit on Linux, a launchd job on macOS), which owns the PTY.
+pohunek is built for one operator on machines they own: owner-only permissions
+locally, your overlay's policies remotely, no multi-user auth, no hosted control
+plane. [Features and architecture](docs/features.md) has the full list and the
 trust boundary.
 
 ## Install with an agent
@@ -135,34 +192,26 @@ pohunek session new --agent claude --name "fix-login-bug"
 pohunek attach <session-id>                 # Ctrl-] detaches, the agent keeps running
 ```
 
-[docs/install.md](docs/install.md) has the full procedure: archive
-verification, what the login service installs, upgrades from older releases,
-and the first worktree-isolated session.
+[docs/install.md](docs/install.md) covers archive verification, what the login
+service installs, upgrades, and the first worktree-isolated session.
 
 ## Experiments built on pohunek
 
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work) holds the author's
-own tooling on top of the core. It is also the test that the core works as a
-backbone. Every surface there uses only public contracts: the CLI with
-`--json` and the public protocol through the SDKs, pinned to one core release
-and moving in lockstep with the protocol version. These surfaces are
-experiments. They show one way to build on pohunek, not the way.
+own tooling on top of the core, and is the test that the core works as a
+backbone: every surface there uses only the CLI with `--json` and the public
+protocol through the SDKs, pinned to one core release. They show one way to
+build on pohunek, not the way.
 
-- **`pohunek-work` workflow plugin.** It answers one question for every open
-  work item: who acts next, me, an agent, or a reviewer? It joins Linear or
-  GitHub Issues, GitHub pull request state, and pohunek sessions into one table
-  with a derived `on_turn` column. Named actions (`implement`, `babysit`,
-  `fix-ci`, `rebase`, `review`, `ready`, `attach`) launch linked agent sessions
-  in fresh worktrees. Merging stays manual. The plugin is also the first step
-  toward a managing agent that runs these actions under an explicit owner
-  policy.
-- **Native GUI** (`pohunek-gui`, Iced). A session-first desktop control plane
-  for Linux (Wayland) and macOS. It embeds no terminal: opening a session
-  launches your own terminal.
-- **Web control center.** A Bun backend with transparent protocol tunnels, plus
-  a Svelte SPA with an in-browser terminal. It works from a phone over the mesh.
-- **Launchers.** rofi and sway scripts, plus Linear and GitHub issue pickers
-  that start or switch to a session in two keystrokes.
+- **Workflow plugin.** Joins Linear or GitHub Issues, pull request state, and
+  pohunek sessions into one table with a derived `on_turn` column (me, an
+  agent, or a reviewer); named actions such as `implement`, `babysit`, `fix-ci`,
+  and `review` launch linked sessions in fresh worktrees. Merging stays manual.
+- **Native GUI** (`pohunek-gui`, Iced) for Linux (Wayland) and macOS; opening a
+  session launches your own terminal.
+- **Web control center**: Bun backend, Svelte SPA with an in-browser terminal,
+  usable from a phone over the mesh.
+- **Launchers**: rofi and sway scripts plus Linear and GitHub issue pickers.
 
 The core never learns about Linear, GitHub, or work items. It knows sessions,
 worktrees, projects, events, notifications, and opaque metadata, and leaves
