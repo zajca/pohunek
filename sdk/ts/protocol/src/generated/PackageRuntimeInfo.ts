@@ -6,8 +6,11 @@ import type { RuntimeId } from "./RuntimeId";
  * What a package's runtime descriptor declares, for review before and after
  * installation.
  *
- * The program and fixed arguments are exactly what the daemon will launch as
- * the owner, so the owner can review them before consenting to an install.
+ * The program, the fixed arguments and every argument template the daemon can
+ * add to a launch (reference passing, resume, fork, the first prompt) are
+ * exactly what it will run as the owner, so the owner can review all of them
+ * before consenting to an install. The descriptor carries no environment
+ * values, setup commands or hooks.
  */
 export type PackageRuntimeInfo = {
   /**
@@ -26,6 +29,32 @@ export type PackageRuntimeInfo = {
    * Fixed launch arguments.
    */
   args: Array<string>;
+  /**
+   * Arguments core appends at a fresh launch to pass the generated native
+   * reference; `{reference}` marks where the reference goes. Absent when
+   * the runtime does not assign its reference.
+   */
+  launch_args?: Array<string>;
+  /**
+   * Arguments of a native resume, with `{reference}` for the reference.
+   * Absent when the runtime cannot resume.
+   */
+  resume_args?: Array<string>;
+  /**
+   * Arguments of a native fork, with `{reference}` for the reference.
+   * Absent when the runtime cannot fork.
+   */
+  fork_args?: Array<string>;
+  /**
+   * Whether the first prompt of a session is appended to the launch
+   * arguments instead of being typed into the terminal.
+   */
+  prompt_argument: boolean;
+  /**
+   * The core-owned version probe the runtime names, if any. The probe runs
+   * the resolved program with arguments core fixes, never package data.
+   */
+  version_probe?: string;
   /**
    * Whether the runtime supports native resume.
    */

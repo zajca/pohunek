@@ -59,8 +59,10 @@ they need `--yes`.
 - Without `--yes`, the CLI asks the daemon to validate the package in a dry run
   (nothing is installed), prints what the package declares (package id,
   version, digest, trust origin, runtime id, display name, the program and fixed
-  arguments the daemon will launch as the owner, resume and fork support, the
-  integration handler), and fails with code `consent_required`. Nothing changed.
+  arguments the daemon will launch as the owner, the arguments it appends at
+  launch to pass the session reference, the resume and fork argument templates
+  (`{reference}` marks the reference slot), whether the first prompt is
+  appended to the arguments, the version probe and the integration handler), and fails with code `consent_required`. Nothing changed.
 - With `--yes`, the CLI repeats the dry run and then performs the change.
 - Under `--json` without `--yes` only the error envelope is printed; its
   message names the package, so omit `--json` to see the full review.

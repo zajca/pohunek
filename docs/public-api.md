@@ -498,9 +498,14 @@ Shared payloads:
   `identity_mismatch`, `runtime_not_claimable`, `runtime_conflict`. `fault` is
   absent when the root verified and the descriptor loaded.
 - `PackageRuntimeInfo`: `runtime_id`, `display_name`, `program`, `args`,
-  `resumable`, `forkable` and optional `integration_handler`. The program and
-  fixed arguments are exactly what the daemon launches as the owner, so they
-  can be reviewed before an install.
+  `resumable`, `forkable`, `prompt_argument` and the optional `launch_args`
+  (the arguments appended at a fresh launch to pass the generated reference),
+  `resume_args`, `fork_args` (templates in which `{reference}` marks the
+  reference slot), `version_probe` and `integration_handler`. The program, the
+  fixed arguments and every template are exactly what the daemon can put in
+  the argv of a process it launches as the owner (the first prompt is appended
+  when `prompt_argument` is true), so all of it can be reviewed before an
+  install. A descriptor carries no environment values, setup commands or hooks.
 - `PackageTrust`, a tagged object: `{"kind":"explicit_digest","digest":...}`
   requires the archive digest to equal `digest` and never authorizes an
   official runtime alias; `{"kind":"catalog","catalog_path":...}` names a

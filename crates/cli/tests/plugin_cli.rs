@@ -157,7 +157,8 @@ fn runtime() -> Value {
         "program": "bin/pi",
         "args": ["--mode", "rpc"],
         "resumable": true,
-        "forkable": false
+        "forkable": false,
+        "prompt_argument": false
     })
 }
 

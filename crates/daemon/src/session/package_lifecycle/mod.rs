@@ -50,6 +50,7 @@ use crate::agent::host::{
     decide_claim, definition_from_archive, is_reserved, Authority, ClaimRefusal, PackageRejection,
     PackageReport, PackageStore, RuntimeDefinition, RuntimeHost,
 };
+use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
 
 /// What a package method needs from the session registry.
 struct Context {
@@ -442,12 +443,39 @@ fn authority_of(source: RecordSource) -> Authority {
     }
 }
 
+/// The tokens of an argument template, with the reference slot spelled as the
+/// placeholder the owner reads.
+fn template_tokens(args: &NativeArgs) -> Vec<String> {
+    args.as_slice()
+        .iter()
+        .map(|arg| match arg {
+            NativeArg::Literal(value) => value.clone(),
+            NativeArg::Reference => REFERENCE_PLACEHOLDER.to_owned(),
+        })
+        .collect()
+}
+
 fn runtime_info(definition: &RuntimeDefinition) -> PackageRuntimeInfo {
     PackageRuntimeInfo {
         runtime_id: definition.runtime_id().clone(),
         display_name: definition.display_name().to_owned(),
         program: definition.program().as_str().to_owned(),
         args: definition.default_args().to_vec(),
+        launch_args: definition
+            .native()
+            .and_then(NativeSessionLaunch::assigned)
+            .map(|assigned| template_tokens(assigned.launch_args())),
+        resume_args: definition
+            .native()
+            .map(|native| template_tokens(native.resume_args())),
+        fork_args: definition
+            .native()
+            .and_then(NativeSessionLaunch::fork_args)
+            .map(template_tokens),
+        prompt_argument: definition.prompt_arg(),
+        version_probe: definition
+            .version_probe_parser()
+            .map(|parser| parser.as_str().to_owned()),
         resumable: definition.native().is_some(),
         forkable: definition
             .native()

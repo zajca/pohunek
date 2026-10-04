@@ -95,6 +95,7 @@ pub fn build_directory_archive(dir: &Path, limits: &Limits) -> Result<Vec<u8>, D
     let mut budget = Budget {
         limits,
         files: 0,
+        directories: 0,
         expanded: 0,
     };
     let root = rustix::fs::open(dir, DIRECTORY_FLAGS, Mode::empty()).map_err(open_error)?;
@@ -111,6 +112,10 @@ pub fn build_directory_archive(dir: &Path, limits: &Limits) -> Result<Vec<u8>, D
 struct Budget<'a> {
     limits: &'a Limits,
     files: usize,
+    /// Directory entries seen across the whole tree. Directories hold no file
+    /// by themselves, so without this count a tree of empty directories would
+    /// cost unbounded filesystem work while passing every other limit.
+    directories: usize,
     expanded: u64,
 }
 
@@ -277,8 +282,7 @@ fn collect(
     // against the remaining file budget; subdirectories hold no file by
     // themselves and are bounded by the whole-archive file limit.
     let file_room = budget.limits.max_files.saturating_sub(budget.files);
-    let directory_room = budget.limits.max_files;
-    let (mut files_seen, mut directories_seen) = (0_usize, 0_usize);
+    let mut files_seen = 0_usize;
     for item in listing {
         let item = item.map_err(open_error)?;
         let bytes = item.file_name().to_bytes();
@@ -286,13 +290,14 @@ fn collect(
             continue;
         }
         let kind = entry_kind(dir, item.file_name(), item.file_type())?;
-        let (seen, room) = if kind == FileType::Directory {
-            (&mut directories_seen, directory_room)
+        let too_many = if kind == FileType::Directory {
+            budget.directories += 1;
+            budget.directories > budget.limits.max_files
         } else {
-            (&mut files_seen, file_room)
+            files_seen += 1;
+            files_seen > file_room
         };
-        *seen += 1;
-        if *seen > room {
+        if too_many {
             return Err(DirectoryError::Archive(ArchiveError::TooManyFiles {
                 limit: budget.limits.max_files,
             }));
@@ -355,6 +360,7 @@ mod tests {
         Budget {
             limits,
             files: 1,
+            directories: 0,
             expanded: 0,
         }
     }
@@ -757,6 +763,33 @@ mod tests {
                 kind: io::ErrorKind::NotFound
             })
         );
+    }
+
+    #[test]
+    fn a_multilevel_tree_of_empty_directories_shares_one_directory_budget() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        // Two directories per level are within a budget of four on their own;
+        // the tree as a whole holds six.
+        for top in ["a", "b"] {
+            for inner in ["x", "y"] {
+                fs::create_dir_all(dir.path().join(top).join(inner)).expect("mkdir");
+            }
+        }
+        let limits = Limits {
+            max_files: 4,
+            ..Limits::DEFAULT
+        };
+        assert_eq!(
+            build_directory_archive(dir.path(), &limits),
+            Err(DirectoryError::Archive(ArchiveError::TooManyFiles {
+                limit: 4
+            }))
+        );
+        let roomy = Limits {
+            max_files: 6,
+            ..Limits::DEFAULT
+        };
+        build_directory_archive(dir.path(), &roomy).expect("six directories fit a budget of six");
     }
 
     #[test]

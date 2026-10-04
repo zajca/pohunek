@@ -16,7 +16,7 @@ use protocol::{
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
 use crate::agent::host::RESERVED_RUNTIME_IDS;
 use crate::session::tests::{
-    assigned_agent_script, durable_recovery, params, temp_dir, temp_store_path,
+    assigned_agent_script, durable_recovery, params, recorded_launch, temp_dir, temp_store_path,
 };
 
 fn enable(digest: &package::PackageDigest, enabled: bool) -> PackageSetEnabledParams {
@@ -859,4 +859,90 @@ async fn doctor_reports_a_pinned_digest_the_registry_does_not_record() {
     );
     assert_eq!(doctor.findings[0].digest, package.digest);
     assert!(doctor.findings[0].referenced);
+}
+
+#[tokio::test]
+async fn the_reported_runtime_accounts_for_every_argument_of_a_fresh_launch() {
+    let (fixture, package, dir, mut gate, _store) = session_fixture("package-argv-preview").await;
+    let runtime = fixture
+        .registry
+        .package_inspect(package.digest.clone())
+        .await
+        .expect("inspect")
+        .runtime
+        .expect("the descriptor loads");
+    let launch_template = runtime
+        .launch_args
+        .clone()
+        .expect("the runtime passes its reference at launch");
+    assert_eq!(launch_template, ["--session-id", "{reference}"]);
+    assert_eq!(
+        runtime.resume_args.as_deref(),
+        Some(&["--session".to_owned(), "{reference}".to_owned()][..])
+    );
+    assert_eq!(
+        runtime.fork_args.as_deref(),
+        Some(&["--fork".to_owned(), "{reference}".to_owned()][..])
+    );
+    assert!(runtime.prompt_argument);
+
+    let prompt = "first prompt";
+    let created = fixture
+        .registry
+        .create(protocol::SessionNewParams {
+            input: Some(prompt.to_owned()),
+            ..new_params(&dir)
+        })
+        .await
+        .expect("fresh launch");
+    gate.write_all(b"go\n").expect("release the exit gate");
+    fixture
+        .registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("the session exits");
+
+    // Everything the process received after its program, as the preview
+    // predicts it: the fixed arguments, the reference template, the prompt.
+    let actual = recorded_launch(&dir.join("argv.txt"), 0);
+    let mut predicted = runtime.args.clone();
+    predicted.extend(launch_template.iter().cloned());
+    predicted.push(prompt.to_owned());
+    assert_eq!(
+        actual.len(),
+        predicted.len(),
+        "{actual:?} against {predicted:?}"
+    );
+    for (actual, predicted) in actual.iter().zip(&predicted) {
+        if predicted != "{reference}" {
+            assert_eq!(actual, predicted);
+        } else {
+            assert!(!actual.is_empty(), "the reference slot is filled");
+        }
+    }
+
+    // A resume launches the fixed arguments and the resume template only.
+    fixture.registry.resume(&created.id).await.expect("resume");
+    let resumed = wait_for_launch(&dir.join("argv.txt"), 1).await;
+    let mut predicted = runtime.args.clone();
+    predicted.extend(runtime.resume_args.clone().expect("resumable"));
+    assert_eq!(
+        resumed.len(),
+        predicted.len(),
+        "{resumed:?} against {predicted:?}"
+    );
+    assert_eq!(
+        resumed[..predicted.len() - 1],
+        predicted[..predicted.len() - 1]
+    );
+    let _ = fixture.registry.stop(&created.id).await;
+}
+
+/// The recorded argv of launch `index`, once the launch has written it.
+async fn wait_for_launch(marker: &std::path::Path, index: usize) -> Vec<String> {
+    pohunek_test_support::wait::wait_until("the launch recorded its arguments", || async {
+        let launch = recorded_launch(marker, index);
+        (!launch.is_empty()).then_some(launch)
+    })
+    .await
 }

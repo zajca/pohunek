@@ -16863,7 +16863,7 @@ pub(super) fn assigned_agent_script(
 
 /// Lines of the launch `index` (zero-based) recorded in `marker`.
 #[cfg(unix)]
-fn recorded_launch(marker: &std::path::Path, index: usize) -> Vec<String> {
+pub(super) fn recorded_launch(marker: &std::path::Path, index: usize) -> Vec<String> {
     fs::read_to_string(marker)
         .expect("read argv marker")
         .split("launch\n")

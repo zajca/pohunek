@@ -1023,13 +1023,51 @@ fn render_package_details(output: &mut String, info: &PackageInfo) {
     let _ = writeln!(output, "Trust:       {}", origin_label(info.origin));
 }
 
+/// An argument template as the owner reads it; `{reference}` marks the slot
+/// core fills with the native session reference.
+fn template_text(tokens: Option<&[String]>) -> String {
+    tokens.map_or_else(|| "none".to_owned(), |tokens| format!("{tokens:?}"))
+}
+
 fn render_runtime_details(output: &mut String, runtime: &PackageRuntimeInfo) {
     let _ = writeln!(output, "Runtime:     {}", runtime.runtime_id);
     let _ = writeln!(output, "Name:        {}", sanitize(&runtime.display_name));
     let _ = writeln!(output, "Program:     {:?}", runtime.program);
     let _ = writeln!(output, "Arguments:   {:?}", runtime.args);
+    let _ = writeln!(
+        output,
+        "Launch adds: {}",
+        template_text(runtime.launch_args.as_deref())
+    );
     let _ = writeln!(output, "Resume:      {}", yes_no(runtime.resumable));
+    let _ = writeln!(
+        output,
+        "  arguments: {}",
+        template_text(runtime.resume_args.as_deref())
+    );
     let _ = writeln!(output, "Fork:        {}", yes_no(runtime.forkable));
+    let _ = writeln!(
+        output,
+        "  arguments: {}",
+        template_text(runtime.fork_args.as_deref())
+    );
+    let _ = writeln!(
+        output,
+        "First prompt: {}",
+        if runtime.prompt_argument {
+            "appended to the arguments"
+        } else {
+            "typed into the terminal"
+        }
+    );
+    let _ = writeln!(
+        output,
+        "Version probe: {}",
+        runtime
+            .version_probe
+            .as_deref()
+            .map_or_else(|| "none".to_owned(), sanitize)
+    );
     let _ = writeln!(
         output,
         "Integration: {}",
@@ -1628,6 +1666,15 @@ mod tests {
             display_name: name.to_owned(),
             program: "bin/pi".to_owned(),
             args: vec!["--mode".to_owned(), "rpc".to_owned()],
+            launch_args: Some(vec![
+                "-c".to_owned(),
+                "run \u{1b}[31m".to_owned(),
+                "{reference}".to_owned(),
+            ]),
+            resume_args: Some(vec!["--session".to_owned(), "{reference}".to_owned()]),
+            fork_args: None,
+            prompt_argument: true,
+            version_probe: Some("probe".to_owned()),
             resumable: true,
             forkable: false,
             integration_handler: None,
@@ -1644,6 +1691,10 @@ mod tests {
         };
         let text = render_install_review(&preview, true, false);
         for needle in [
+            "Launch adds: [\"-c\", \"run \\u{1b}[31m\", \"{reference}\"]",
+            "arguments: [\"--session\", \"{reference}\"]",
+            "First prompt: appended to the arguments",
+            "Version probe: probe",
             "acme.pi 1.0.0",
             DIGEST_A,
             "explicit digest",
