@@ -122,7 +122,7 @@ pub struct DaemonHealthResult {
     pub status: String,
     /// Daemon build version.
     pub daemon_version: String,
-    /// Protocol version spoken by the daemon.
+    /// Protocol version negotiated for the connection that asked.
     pub protocol_version: ProtocolVersion,
 }
 

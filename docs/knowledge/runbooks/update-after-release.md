@@ -15,23 +15,28 @@ release archive or rebuilding it from source.
 
 ## Current public protocol v4 boundary
 
-The current release supports only protocol `4..=4` and cannot communicate with
-protocol-v3 or older peers: a mismatched range returns `daemon/version_mismatch`
-before any method runs. Before replacing any component, inventory every CLI,
-SDK, custom client, managed hook and local or NetBird-reachable daemon that must
-talk to another peer. Drain cross-host automation, upgrade that complete set in
-one maintenance window, and then verify every host with `pohunek health --json`
-and `pohunek host inspect <host> --json`. The response must advertise protocol
-range `4..=4` for this release.
+A daemon of the current release accepts public protocol `3..=4`: clients of the
+previous release (protocol 3) keep working against it, and a range outside that
+returns `daemon/version_mismatch` before any method runs. Clients of the current
+release speak only protocol `4..=4`, so upgrade every daemon before the clients
+that talk to it: a v4 client against a daemon that only speaks v3 is refused.
+Before replacing any component, inventory every CLI, SDK, custom client, managed
+hook and local or NetBird-reachable daemon that must talk to another peer. Drain
+cross-host automation, upgrade the daemons first, and then verify every host with
+`pohunek health --json` and `pohunek host inspect <host> --json`. The reported
+`protocol_version` is the version negotiated for that connection (`4` for a
+current CLI).
 
 Protocol v4 spells the worker instance identifier `worker_instance_id` where
-v3 spelled it `runtime_id`. There is no compatibility shim. Do not downgrade one
-peer independently: it will be isolated from v4 peers. Restore the coordinated
-v4 component set instead. Managed Codex and Claude hook assets carry
+v3 spelled it `runtime_id`. The daemon translates that spelling for protocol 3
+clients only; a v4 client or hook never sends it. Do not downgrade one peer
+independently: a v3 client is served by a v4 daemon, but a v4 client is refused by
+a v3 daemon. Managed Codex and Claude hook assets carry
 `POHUNEK_INTEGRATION_VERSION=10`; after the upgrade run
 `pohunek integration doctor` and reinstall every asset it reports as outdated,
-because an older hook still sends the old key and its native-identity reports
-are rejected. Notification hooks older than version 10 send a bare integer `v`
+because an older hook still sends the old key, which the daemon accepts only
+inside a session whose launch baked protocol 3; in any other session its
+native-identity reports are rejected. Notification hooks older than version 10 send a bare integer `v`
 instead of the `{minimum, maximum}` range, so the daemon drops their
 notifications until they are reinstalled. Earlier protocol transitions (integer-v1 to range negotiation,
 the v3 overlay-routing change) do not widen the supported range.
@@ -43,10 +48,12 @@ workers (private worker protocol versions `PREVIOUS_VERSION` and
 `CURRENT_VERSION`), for the worker journal, and for public-protocol clients;
 nothing else is shimmed. The current state differs for the last two. The worker
 journal reader accepts an explicit list of schemas, which today holds only the
-current one. The public protocol window is currently `4..=4` because the
-daemon-side N-1 adapters are not delivered yet
-([#526](https://github.com/zajca/pohunek/issues/526)), so upgrade every host
-and client in one pass, as the protocol v4 boundary above describes. The
+current one. The public protocol window is `3..=4`: protocol 3 clients and tooling keep
+working against a daemon of this release. The remaining gap is a new client
+against an old daemon
+([#527](https://github.com/zajca/pohunek/issues/527)), so upgrade the daemon on
+every host before the clients that talk to it, as the protocol v4 boundary above
+describes. The
 daemon's persisted state, `<data_dir>/metadata.jsonl`, does migrate from any
 older kept schema, so skipping releases is safe for it. Each release's notes name every schema or
 protocol constant that changed (`STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`,

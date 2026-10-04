@@ -1,20 +1,20 @@
 //! Daemon-scoped methods: `daemon.health` and `daemon.doctor`.
 
-use protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
+use protocol::{ProtocolError, Request, Response};
 
-use super::util::{error_value, ok_value};
+use super::util::{error_value, ok_value, selected_version};
 use super::HealthInfo;
 use crate::governance::HostGovernanceService;
 use crate::session::SessionRegistry;
 
-/// `daemon.health`: report daemon version + protocol version.
+/// `daemon.health`: report daemon version + the protocol version of this connection.
 pub(super) fn handle_health(request: &Request, health: &HealthInfo) -> Response {
     ok_value(
         request,
         &protocol::DaemonHealthResult {
             status: "ok".to_owned(),
             daemon_version: health.daemon_version.clone(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: selected_version(request),
         },
     )
 }

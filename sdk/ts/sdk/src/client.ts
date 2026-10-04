@@ -2,7 +2,7 @@ import {
   MAX_SESSION_WAIT_MS,
   MAX_WORKER_INSTANCE_ID_BYTES,
   PROTOCOL_VERSION,
-  SUPPORTED_PROTOCOL_VERSIONS,
+  CLIENT_PROTOCOL_VERSIONS,
   type Methods,
   type ProtocolError,
   type ProtocolVersion,
@@ -100,7 +100,7 @@ export class Client {
     params: Methods[K]["params"],
   ): Promise<Methods[K]["output"]> {
     const request: Request = {
-      v: SUPPORTED_PROTOCOL_VERSIONS,
+      v: CLIENT_PROTOCOL_VERSIONS,
       id: nextRequestId(String(method)),
       method: String(method),
       params,

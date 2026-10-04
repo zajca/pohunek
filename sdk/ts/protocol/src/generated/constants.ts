@@ -3,8 +3,11 @@
 import type { AttachHeader } from "./index";
 
 export const PROTOCOL_VERSION = 4 as const;
-export const MIN_PROTOCOL_VERSION = 4 as const;
-export const SUPPORTED_PROTOCOL_VERSIONS = { minimum: 4, maximum: 4 } as const;
+export const MIN_PROTOCOL_VERSION = 3 as const;
+/** Range a daemon of this release accepts; a client does not advertise it. */
+export const SUPPORTED_PROTOCOL_VERSIONS = { minimum: 3, maximum: 4 } as const;
+/** Range a client of this release advertises in every request. */
+export const CLIENT_PROTOCOL_VERSIONS = { minimum: 4, maximum: 4 } as const;
 export const MAX_CONTROL_LINE_BYTES = 1048576 as const;
 export const MAX_WORKER_INSTANCE_ID_BYTES = 128 as const;
 export const MAX_SESSION_INPUT_BYTES = 262144 as const;

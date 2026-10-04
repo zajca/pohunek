@@ -3,7 +3,7 @@ import {
   MAX_CONTROL_LINE_BYTES,
   MAX_SESSION_WAIT_MS,
   PROTOCOL_VERSION,
-  SUPPORTED_PROTOCOL_VERSIONS,
+  CLIENT_PROTOCOL_VERSIONS,
   type HostGovernanceStatus,
   type ProtocolError,
   type SessionInfo,
@@ -31,7 +31,7 @@ import {
 describe("Client request/response", () => {
   test("request decoder accepts ordered ranges and rejects legacy exact versions", () => {
     expect(isRequest({
-      v: SUPPORTED_PROTOCOL_VERSIONS,
+      v: CLIENT_PROTOCOL_VERSIONS,
       id: "range-request",
       method: "daemon.health",
       params: null,
@@ -49,7 +49,7 @@ describe("Client request/response", () => {
       params: null,
     })).toBe(false);
     expect(isRequest({
-      v: SUPPORTED_PROTOCOL_VERSIONS,
+      v: CLIENT_PROTOCOL_VERSIONS,
       id: "origin-request",
       method: "daemon.health",
       params: null,
@@ -57,14 +57,14 @@ describe("Client request/response", () => {
       origin_daemon_id: "daemon-origin",
     })).toBe(true);
     expect(isRequest({
-      v: SUPPORTED_PROTOCOL_VERSIONS,
+      v: CLIENT_PROTOCOL_VERSIONS,
       id: "partial-origin",
       method: "daemon.health",
       params: null,
       origin_session_id: "s-origin",
     })).toBe(false);
     expect(isRequest({
-      v: SUPPORTED_PROTOCOL_VERSIONS,
+      v: CLIENT_PROTOCOL_VERSIONS,
       id: "unsafe-origin",
       method: "daemon.health",
       params: null,
@@ -72,7 +72,7 @@ describe("Client request/response", () => {
       origin_daemon_id: "daemon origin",
     })).toBe(false);
     expect(isRequest({
-      v: SUPPORTED_PROTOCOL_VERSIONS,
+      v: CLIENT_PROTOCOL_VERSIONS,
       id: "oversized-origin",
       method: "daemon.health",
       params: null,
@@ -95,7 +95,7 @@ describe("Client request/response", () => {
 
       expect(result).toEqual([session] satisfies SessionInfo[]);
       const sent = parseRequestLine(await daemon.nextRequest());
-      expect(sent["v"]).toEqual(SUPPORTED_PROTOCOL_VERSIONS);
+      expect(sent["v"]).toEqual(CLIENT_PROTOCOL_VERSIONS);
       expect(sent["method"]).toBe("session.list");
       expect(sent["params"]).toEqual({ filters: [{ key: "state", value: "running" }] });
       expect(sent["origin_session_id"]).toBeUndefined();
@@ -406,7 +406,7 @@ describe("Client request/response", () => {
     try {
       const client = await connectClient(daemon);
       const request: Request = {
-        v: SUPPORTED_PROTOCOL_VERSIONS,
+        v: CLIENT_PROTOCOL_VERSIONS,
         id: "req-too-large",
         method: "daemon.health",
         params: { payload: "x".repeat(MAX_CONTROL_LINE_BYTES + 1) },
@@ -465,6 +465,31 @@ describe("Client request/response", () => {
       expect(error.toProtocolError().code).toBe("version_mismatch");
       const poisoned = await expectClientError(client.call("daemon.health", null));
       expect(poisoned.toProtocolError().code).toBe("framing");
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("a client offers only the current version and refuses a daemon that answers in an older one", async () => {
+    expect(CLIENT_PROTOCOL_VERSIONS).toEqual({ minimum: PROTOCOL_VERSION, maximum: PROTOCOL_VERSION });
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (requestLine) => JSON.stringify({
+          v: PROTOCOL_VERSION - 1,
+          id: requestIdFromLine(requestLine),
+          ok: { status: "ok", daemon_version: "0.0.0", protocol_version: PROTOCOL_VERSION - 1 },
+        }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+
+      const error = await expectClientError(client.handshake());
+
+      expect(error.toProtocolError().code).toBe("version_mismatch");
+      const sent = parseRequestLine(await daemon.nextRequest());
+      expect(sent["v"]).toEqual({ minimum: PROTOCOL_VERSION, maximum: PROTOCOL_VERSION });
     } finally {
       await daemon.close();
     }
@@ -904,7 +929,7 @@ describe("Client request/response", () => {
     try {
       const client = await connectClient(daemon);
       const request: Request = {
-        v: SUPPORTED_PROTOCOL_VERSIONS,
+        v: CLIENT_PROTOCOL_VERSIONS,
         id: "partial-origin",
         method: "daemon.health",
         params: null,
@@ -927,7 +952,7 @@ describe("Client request/response", () => {
         origin: { sessionId: "s-origin", daemonId: "daemon-origin" },
       });
       const request: Request = {
-        v: SUPPORTED_PROTOCOL_VERSIONS,
+        v: CLIENT_PROTOCOL_VERSIONS,
         id: "conflicting-origin",
         method: "daemon.health",
         params: null,

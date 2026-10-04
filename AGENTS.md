@@ -40,11 +40,12 @@ rule. The current state of each place is stated separately.
 - **Public-protocol clients.** Contract: a protocol change keeps the previous
   version served through daemon-side adapters. An adapter translates shape
   only. A semantic change raises `MIN_PROTOCOL_VERSION` too and is an announced
-  break; the oldest adapter is deleted on the next bump. State: no adapters
-  exist yet and `MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`, so the
-  supported public window is `4..=4` and all peers upgrade in one pass. The
-  adapters are delivered by
-  [#526](https://github.com/zajca/pohunek/issues/526).
+  break; the oldest adapter is deleted on the next bump. State: the daemon
+  accepts `3..=4` (`MIN_PROTOCOL_VERSION` is `PROTOCOL_VERSION - 1`, adapter in
+  `crates/protocol/src/compat/v3.rs`) while clients advertise only `4..=4`
+  (`CLIENT_PROTOCOL_VERSIONS`). The remaining gap is a new client against an
+  N-1 daemon, so hosts still upgrade in one pass for that direction
+  ([#527](https://github.com/zajca/pohunek/issues/527)).
 - **Persisted daemon state.** Contract and state: `metadata.jsonl` migrates
   from any older kept schema, because skipping releases is normal with
   `update-pohunek`. A persisted shape change requires a schema bump and a
@@ -122,16 +123,21 @@ Hard constraints, decided on purpose — respect them in every change:
   `assistant`) are a pinned API, not a stable one: they stay pre-1.0 with no
   back-compat shims, and a client absorbs breaking changes when it bumps its
   pinned tag.
-- **UIs move in lockstep with `PROTOCOL_VERSION`.** The TypeScript SDK
-  handshake requires the daemon's protocol version, so a client pins the core
-  release it was built against. A protocol surface that only UI clients call
-  (`host.discover`, `worktree.remove`, and the UI use of `subscribe`) is still a
-  public obligation: core keeps server-side contract tests for it, listed in
-  `docs/public-api.md` ("External clients"). Core adds no CLI command only to
-  serve a UI.
+- **UIs pin the core release they were built against.** A client advertises
+  exactly `CLIENT_PROTOCOL_VERSIONS` (the current `PROTOCOL_VERSION`) and the
+  TypeScript SDK handshake requires the daemon to report that version, so a
+  client newer than its daemon is refused (`daemon/version_mismatch`). A daemon
+  of release N additionally serves the clients of release N-1 through the
+  protocol window (`docs/architecture.md` "Protocol versioning"), which bounds
+  how long a UI release trails a core update. A protocol surface that only UI
+  clients call (`host.discover`, `worktree.remove`, and the UI use of
+  `subscribe`) is still a public obligation: core keeps server-side contract
+  tests for it, listed in `docs/public-api.md` ("External clients"). Core adds
+  no CLI command only to serve a UI.
 - **Issue/PR providers (Linear, GitHub) live only in `zajca/pohunek-work`,
   never in core** (neither the daemon, the CLI, nor this repository's scripts).
-- **Protocol today:** public protocol v4 is owner-only newline-delimited JSON
+- **Protocol today:** public protocol v4 (the daemon also accepts v3 through the
+  protocol window) is owner-only newline-delimited JSON
   over a Unix socket (local) and TCP on configured overlays (remote); attach
   uses a separate raw-byte connection per PTY. [#70](https://github.com/zajca/pohunek/issues/70)
   owns the coordinated v4 host-link cutover; do not describe relay protocol as
@@ -680,7 +686,13 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
   a `Co-Authored-By` trailer or any "generated with" footer.
 - Keep changes scoped. If you touch the wire protocol (`crates/protocol`), expect
   ripples in `client`, `daemon`, and `cli`, and into `docs/public-api.md` and the
-  `docs/knowledge/` bundle — update and test all.
+  `docs/knowledge/` bundle — update and test all. A non-additive wire change
+  (rename, moved field) bumps `PROTOCOL_VERSION`, adds the edge adapter for the
+  version it leaves behind in `crates/protocol/src/compat/` with golden fixtures
+  and consumer recordings produced by that release's own code, and deletes the
+  oldest adapter in the same change. A semantic change (new required parameter,
+  removed method or event, changed error code or meaning) cannot be adapted: it
+  also raises `MIN_PROTOCOL_VERSION` and is announced as a break.
 - Run the full gate set above before declaring done. Report failures honestly
   with output; never claim green without running it.
 - When a task spans 3+ steps, plan first and verify after each major step.

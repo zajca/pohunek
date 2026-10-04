@@ -1,6 +1,7 @@
 export type * from "./generated/index";
 export {
   ATTACH_PRELUDE_FIELDS,
+  CLIENT_PROTOCOL_VERSIONS,
   EVENT_AGENT_STATE,
   EVENT_ATTACH_CLOSED,
   EVENT_ATTACH_OPENED,

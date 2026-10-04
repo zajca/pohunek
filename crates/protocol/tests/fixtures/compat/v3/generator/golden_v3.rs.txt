@@ -1,0 +1,1003 @@
+// Regeneration instructions for the protocol-3 golden fixtures.
+//
+// This file is stored with a .txt extension so that cargo does not compile it
+// as a test of the current crate. To regenerate the fixtures from the release
+// that defined protocol 3:
+//   1. Check out the release tag in a separate worktree
+//      (git worktree add --detach <dir> v0.33.0).
+//   2. Copy this file to <dir>/crates/protocol/tests/golden_v3.rs.
+//   3. From <dir>, with every POHUNEK_* variable unset, run
+//        GOLDEN_V3_OUT=<repo>/crates/protocol/tests/fixtures/compat/v3 \
+//          cargo test -p pohunek-protocol --test golden_v3 -- --nocapture
+//      GOLDEN_V3_OUT names the directory that receives requests.json,
+//      results.json and events.json; the test fails when it is unset.
+// The test asserts that every method in METHOD_SPECS and every event in
+// EVENT_SPECS of the checked-out release has at least one entry, and that each
+// JSON literal equals its own typed re-serialization. Object keys are written in
+// sorted order because serde_json maps are sorted without preserve_order.
+
+//! Generator for the protocol-3 golden fixtures.
+//!
+//! Every value starts as a JSON literal that is parsed through this release's
+//! strict typed structs and serialized back, so the recorded JSON is exactly
+//! what this release emits. A literal that differs from its own re-serialized
+//! form fails the run, which keeps the literals canonical and free of typos.
+
+use std::{collections::BTreeSet, fs, path::PathBuf};
+
+use protocol::{
+    method::{self, Method},
+    ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision, EnrollmentStatus,
+    HostGovernanceStatus, HostId, HostOwner, OwnerRevision, PrincipalId, QuarantineReason, RelayId,
+    PROTOCOL_VERSION,
+};
+use serde::{de::DeserializeOwned, Serialize};
+use serde_json::{json, Value};
+
+const RELEASE: &str = "v0.33.0";
+const COMMIT: &str = "e6fcf2377ba14a51d8e7de971c13e1e86a864134";
+const OUT_DIR_ENV: &str = "GOLDEN_V3_OUT";
+
+/// Parses `literal` into `T`, serializes it back, and requires the two JSON
+/// values to be identical.
+fn canonical<T: Serialize + DeserializeOwned>(literal: Value) -> Value {
+    let typed: T = serde_json::from_value(literal.clone())
+        .unwrap_or_else(|error| panic!("literal rejected by {}: {error}\n{literal:#}", std::any::type_name::<T>()));
+    let value = serde_json::to_value(&typed).expect("serialize typed value");
+    assert_eq!(
+        value,
+        literal,
+        "literal is not the canonical serialization of {}",
+        std::any::type_name::<T>()
+    );
+    value
+}
+
+#[derive(Default)]
+struct Recorder {
+    requests: Vec<Value>,
+    results: Vec<Value>,
+    events: Vec<Value>,
+}
+
+impl Recorder {
+    fn request<M: Method>(&mut self, params: Value) {
+        let params = canonical::<M::Params>(params);
+        self.requests.push(json!({"method": M::NAME, "params": params}));
+    }
+
+    fn result<M, T>(&mut self, result: Value)
+    where
+        M: Method<Output = T>,
+        T: Serialize + DeserializeOwned,
+    {
+        let result = canonical::<T>(result);
+        self.results.push(json!({"method": M::NAME, "result": result}));
+    }
+
+    fn event<T: Serialize + DeserializeOwned>(&mut self, name: &str, payload: Value) {
+        let payload = canonical::<T>(payload);
+        self.events.push(json!({"event": name, "payload": payload}));
+    }
+}
+
+fn governance_id(prefix: &str) -> String {
+    format!("{prefix}{}", "A".repeat(protocol::GOVERNANCE_ID_PAYLOAD_BYTES))
+}
+
+fn governance_status(status: EnrollmentStatus, quarantine: Option<QuarantineReason>) -> Value {
+    let status = HostGovernanceStatus::new(
+        HostId::parse(&governance_id("host_")).expect("host id"),
+        Some(EnrollmentInfo::new(
+            RelayId::parse(&governance_id("relay_")).expect("relay id"),
+            status,
+            EnrollmentRevision::new(4).expect("enrollment revision"),
+        )),
+        Some(HostOwner::Principal(
+            PrincipalId::parse(&governance_id("principal_")).expect("principal id"),
+        )),
+        Some(OwnerRevision::new(8).expect("owner revision")),
+        quarantine,
+        ApprovalKeyReference::from_ed25519_verifying_key_bytes([7; 32]),
+    )
+    .expect("consistent governance status");
+    serde_json::to_value(&status).expect("serialize governance status")
+}
+
+fn protocol_version() -> Value {
+    serde_json::to_value(PROTOCOL_VERSION).expect("serialize protocol version")
+}
+
+fn subagent() -> Value {
+    json!({
+        "id": "sub-1",
+        "parent_id": "sub-0",
+        "provider": "claude",
+        "agent_type": "code-reviewer",
+        "lifecycle": "running",
+        "activity": "working",
+        "revision": "4",
+        "started_at_ms": 1_781_690_400_000_u64,
+        "updated_at_ms": 1_781_690_460_000_u64,
+        "finished_at_ms": 1_781_690_520_000_u64
+    })
+}
+
+fn warnings() -> Value {
+    json!([
+        {"kind": "fetch", "message": "git fetch failed", "detail": "could not resolve host: github.com"},
+        {"kind": "base_branch_fallback", "message": "base branch main not found, using master"},
+        {"kind": "setup_script", "message": "setup script exited with status 1", "detail": "exit status: 1"},
+        {"kind": "hook", "message": "post-create hook timed out", "detail": "timed out after 30s"}
+    ])
+}
+
+fn runtime_full() -> Value {
+    json!({
+        "state": "live",
+        "runtime_generation": "3",
+        "worker_id": "worker-1",
+        "runtime_id": "runtime-42",
+        "started_at": "2026-06-17T10:00:00Z",
+        "last_connected_at": "2026-06-17T10:05:00Z",
+        "loss_reason": "worker control socket closed"
+    })
+}
+
+fn runtime_identity() -> Value {
+    json!({"runtime_id": "runtime-42", "runtime_generation": "3"})
+}
+
+/// A session with every optional field populated.
+fn session_full() -> Value {
+    json!({
+        "id": "s-42",
+        "external": false,
+        "capabilities": {"resume": true, "fork": true},
+        "name": "review auth flow",
+        "agent": "claude",
+        "agent_base": "claude",
+        "cwd": "/workspace/project/.worktrees/feature-auth",
+        "cwd_source": "osc7",
+        "pid": 4242,
+        "runtime": runtime_full(),
+        "cols": 120,
+        "rows": 40,
+        "state": "running",
+        "state_source": "report",
+        "activity": "working",
+        "subagents": [subagent()],
+        "active_agent": "claude",
+        "active_agent_base": "claude",
+        "active_agent_pid": 4300,
+        "active_agent_session_id": "claude-active-abc",
+        "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "native_session_id": "claude-native-abc",
+        "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "project_id": "p-7",
+        "project_label": "project",
+        "is_linked_worktree": true,
+        "repo": "/workspace/project",
+        "branch": "feature/auth",
+        "worktree_path": "/workspace/project/.worktrees/feature-auth",
+        "warnings": warnings(),
+        "metadata": {"owner": "cli", "ticket": "DMD-1356"},
+        "created_at": "2026-06-17T10:00:00Z",
+        "updated_at": "2026-06-17T10:01:00Z",
+        "exit_code": 0
+    })
+}
+
+/// A stopped shell session with the optional fields absent and a runtime that
+/// carries only its required fields.
+fn session_stopped() -> Value {
+    json!({
+        "id": "s-43",
+        "capabilities": {"resume": false, "fork": false},
+        "agent": "shell",
+        "agent_base": "shell",
+        "cwd": "/workspace/other",
+        "pid": 5151,
+        "runtime": {"state": "terminal", "runtime_generation": "1"},
+        "cols": 80,
+        "rows": 24,
+        "state": "stopped",
+        "state_source": "process",
+        "created_at": "2026-06-17T09:00:00Z",
+        "updated_at": "2026-06-17T09:30:00Z",
+        "exit_code": 130
+    })
+}
+
+fn with_extra(base: Value, extra: Value) -> Value {
+    let mut merged = base;
+    merged
+        .as_object_mut()
+        .expect("object base")
+        .extend(extra.as_object().expect("object extra").clone());
+    merged
+}
+
+fn notification_record() -> Value {
+    json!({
+        "id": "n-42",
+        "source": {
+            "provider": "codex",
+            "provider_event": "PermissionRequest",
+            "host_local_source_id": "hook-42"
+        },
+        "kind": "approval_required",
+        "severity": "action_required",
+        "status": "acknowledged",
+        "title": "Approval required",
+        "body": "Codex is waiting for a tool approval.",
+        "metadata": {"tool": "bash"},
+        "created_at": "2026-07-03T09:00:00Z",
+        "session_id": "s-42",
+        "agent_kind": "codex",
+        "source_id": "src-1",
+        "dedupe_key": "approval:s-42",
+        "project_id": "p-7",
+        "read_at": "2026-07-03T09:01:00Z",
+        "acked_at": "2026-07-03T09:02:00Z",
+        "archived_at": "2026-07-03T09:03:00Z",
+        "deleted_at": "2026-07-03T09:04:00Z",
+        "superseded_by": "n-43"
+    })
+}
+
+fn notification_policy() -> Value {
+    let kinds = |agent_blocked: bool, turn_completed: bool, system: bool| {
+        json!({
+            "agent_blocked": agent_blocked,
+            "approval_required": true,
+            "turn_completed": turn_completed,
+            "session_finished": false,
+            "error": true,
+            "system": system
+        })
+    };
+    json!({
+        "attention_dedupe_window_secs": 90,
+        "attention_debounce_secs": 7,
+        "enabled": kinds(true, false, false),
+        "providers": {
+            "claude": kinds(true, true, false),
+            "codex": kinds(true, false, true)
+        },
+        "retention": {
+            "sweep_interval_secs": 3600,
+            "info_ttl_secs": 86_400,
+            "warning_ttl_secs": 172_800,
+            "resolved_attention_ttl_secs": 604_800,
+            "resolved_error_ttl_secs": 1_209_600,
+            "archived_ttl_secs": 2_592_000,
+            "compaction_min_actions": 100
+        }
+    })
+}
+
+fn project_info() -> Value {
+    json!({
+        "id": "p-7",
+        "label": "project",
+        "repo_root": "/workspace/project",
+        "git_common_dir": "/workspace/project/.git",
+        "origin_url": "git@github.com:example/project.git",
+        "default_base_branch": "main",
+        "source": "manual",
+        "is_bare": false,
+        "added_at": "2026-06-01T08:00:00Z",
+        "last_used_at": "2026-06-17T10:00:00Z"
+    })
+}
+
+fn integration_status() -> Value {
+    json!({
+        "agent": "codex",
+        "available": true,
+        "expected_asset_paths": ["/home/user/.codex/pohunek-agent-state.sh"],
+        "present_asset_paths": [],
+        "registration_paths": ["/home/user/.codex/hooks.json"],
+        "installed_version": null,
+        "expected_version": protocol::EXPECTED_INTEGRATION_VERSION,
+        "state": "outdated",
+        "recovery": "reinstall",
+        "warnings": ["managed state hook is missing"]
+    })
+}
+
+fn output_result() -> Value {
+    json!({
+        "session_id": "s-42",
+        "runtime_id": "runtime-42",
+        "runtime_generation": "3",
+        "history_start_offset": "20",
+        "start_offset": "20",
+        "next_offset": "24",
+        "runtime_end_offset": "30",
+        "data_base64": "dGVzdA==",
+        "gap": {"start_offset": "10", "end_offset": "20"},
+        "has_more": true,
+        "timed_out": false
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn record_methods(rec: &mut Recorder) {
+    use protocol::*;
+
+    // Requests.
+    rec.request::<method::DaemonHealth>(Value::Null);
+    rec.request::<method::HostGovernanceInspect>(Value::Null);
+    rec.request::<method::SessionNew>(json!({
+        "agent": "claude",
+        "name": "review auth flow",
+        "cwd": "/workspace/project",
+        "cols": 120,
+        "rows": 40,
+        "project": "p-7",
+        "repo": "/workspace/project",
+        "branch": "feature/auth",
+        "base_branch": "main",
+        "input": "start the review",
+        "metadata": {"owner": "cli", "ticket": "DMD-1356"}
+    }));
+    rec.request::<method::SessionList>(json!({"filters": [
+        {"key": "state", "value": "running"},
+        {"key": "activity", "value": "blocked"},
+        {"key": "agent", "value": "codex"},
+        {"key": "id", "value": "s-42"},
+        {"key": "project", "value": "p-7"}
+    ]}));
+    rec.request::<method::SessionRuntimeInventory>(Value::Null);
+    rec.request::<method::SessionInspect>(json!("s-42"));
+    rec.request::<method::SessionStop>(json!("s-42"));
+    rec.request::<method::SessionResume>(json!("s-42"));
+    rec.request::<method::SessionFork>(json!({
+        "session_id": "s-42",
+        "name": "forked review",
+        "cwd_mode": "same",
+        "cols": 100,
+        "rows": 30
+    }));
+    rec.request::<method::SessionRemove>(json!("s-42"));
+    rec.request::<method::SessionRemoveAcceptingUnconfirmed>(json!("s-42"));
+    rec.request::<method::SessionAttach>(json!({
+        "session_id": "s-42",
+        "initial_dimensions": {"cols": 120, "rows": 40},
+        "origin_session_id": "s-1",
+        "origin_daemon_id": "daemon-1",
+        "origin_worker_id": "worker-9"
+    }));
+    rec.request::<method::SessionDetach>(json!({"stream_id": "stream-1"}));
+    rec.request::<method::SessionResize>(json!({"session_id": "s-42", "cols": 132, "rows": 43}));
+    rec.request::<method::SessionInput>(json!({
+        "session_id": "s-42",
+        "text": "continue\n",
+        "wait": {"until": ["idle", "blocked"], "timeout_ms": 5000}
+    }));
+    rec.request::<method::SessionScreen>(json!({"session_id": "s-42"}));
+    rec.request::<method::SessionDetection>(json!({"session_id": "s-42"}));
+    rec.request::<method::SessionOutput>(json!({"session_id": "s-42", "max_bytes": 4096}));
+    rec.request::<method::SessionOutput>(json!({
+        "session_id": "s-42",
+        "runtime": runtime_identity(),
+        "after_offset": "24",
+        "max_bytes": 1024,
+        "wait_ms": 250
+    }));
+    rec.request::<method::SessionRead>(json!({
+        "session_id": "s-42",
+        "source": "recent_unwrapped",
+        "lines": 20,
+        "format": "ansi"
+    }));
+    rec.request::<method::SessionWait>(json!({
+        "session_id": "s-42",
+        "runtime": runtime_identity(),
+        "after_updated_at": "2026-06-17T10:00:00Z",
+        "after_terminal_watermark": "7",
+        "after_output_offset": "8",
+        "states": ["stopped", "failed"],
+        "activities": ["blocked"],
+        "timeout_ms": 5000
+    }));
+    rec.request::<method::Subscribe>(Value::Null);
+    rec.request::<method::SessionReportNativeId>(json!({
+        "session_id": "s-42",
+        "runtime_id": "runtime-42",
+        "agent": "claude",
+        "pid": 4242,
+        "pid_start_identity": "777",
+        "sequence": "3",
+        "expires_at": "2026-07-27T12:00:10Z",
+        "native_session_id": "claude-native-abc",
+        "transcript_path": "/home/user/.claude/transcripts/abc.jsonl"
+    }));
+    rec.request::<method::SessionReportAgent>(json!({
+        "session_id": "s-42",
+        "source": "hook",
+        "agent": "claude",
+        "activity": "working",
+        "seq": "5",
+        "pid": 4300,
+        "agent_session_id": "claude-active-abc",
+        "agent_session_path": "/home/user/.claude/projects/project/abc.jsonl"
+    }));
+    rec.request::<method::SessionReleaseAgent>(json!({
+        "session_id": "s-42",
+        "source": "hook",
+        "agent": "claude",
+        "seq": "6"
+    }));
+    rec.request::<method::SessionSetMetadata>(json!({
+        "session_id": "s-42",
+        "metadata": {"owner": "gui", "obsolete": null}
+    }));
+    rec.request::<method::SessionRename>(json!({"session_id": "s-42", "name": "renamed review"}));
+    rec.request::<method::SessionDiff>(json!({"session_id": "s-42", "base": "main"}));
+    rec.request::<method::SessionPolicyGet>(Value::Null);
+    rec.request::<method::SessionPolicySet>(json!({"retention": {
+        "enabled": true,
+        "sweep_interval_secs": 600,
+        "terminal_ttl_secs": 86_400,
+        "lost_ttl_secs": 3600,
+        "max_removals_per_sweep": 25
+    }}));
+    rec.request::<method::SessionRetentionSweep>(json!({"dry_run": true, "limit": 10}));
+    rec.request::<method::IntegrationInstall>(json!({"agent": "claude"}));
+    rec.request::<method::IntegrationStatus>(json!({"agent": "codex"}));
+    rec.request::<method::IntegrationUninstall>(json!({"agent": "codex"}));
+    rec.request::<method::IntegrationDoctor>(json!({"agent": "claude"}));
+    rec.request::<method::HostInspect>(Value::Null);
+    rec.request::<method::AssistantMaterialize>(json!({"snapshot": "{\"sessions\":[],\"projects\":[]}"}));
+    rec.request::<method::DaemonDoctor>(Value::Null);
+    rec.request::<method::HostDiscover>(json!({"force": true}));
+    rec.request::<method::NotificationCreate>(json!({
+        "source": {
+            "provider": "codex",
+            "provider_event": "PermissionRequest",
+            "host_local_source_id": "hook-42"
+        },
+        "kind": "approval_required",
+        "severity": "action_required",
+        "title": "Approval required",
+        "body": "Codex is waiting for a tool approval.",
+        "metadata": {"tool": "bash"},
+        "session_id": "s-42",
+        "agent_kind": "codex",
+        "source_id": "src-1",
+        "dedupe_key": "approval:s-42",
+        "project_id": "p-7"
+    }));
+    rec.request::<method::NotificationList>(json!({
+        "status": "unread",
+        "kind": "approval_required",
+        "severity": "action_required",
+        "provider": "codex",
+        "session_id": "s-42",
+        "created_after": "2026-07-03T08:00:00Z",
+        "created_before": "2026-07-03T10:00:00Z",
+        "limit": 50,
+        "cursor": "page-2"
+    }));
+    rec.request::<method::NotificationUpdate>(json!({"id": "n-42", "status": "read"}));
+    rec.request::<method::NotificationDelete>(json!({"id": "n-42"}));
+    rec.request::<method::NotificationPolicyGet>(Value::Null);
+    rec.request::<method::NotificationPolicySet>(json!({"policy": notification_policy()}));
+    rec.request::<method::NotificationRetentionPrune>(json!({
+        "dry_run": true,
+        "status": "archived",
+        "before": "2026-06-01T00:00:00Z",
+        "limit": 100
+    }));
+    rec.request::<method::ProjectList>(json!({"filters": [
+        {"key": "source", "value": "manual"},
+        {"key": "label", "value": "project"},
+        {"key": "id", "value": "p-7"}
+    ]}));
+    rec.request::<method::ProjectAdd>(json!({
+        "path": "/workspace/project",
+        "name": "project",
+        "base_branch": "main"
+    }));
+    rec.request::<method::ProjectShow>(json!({"reference": "project"}));
+    rec.request::<method::ProjectRename>(json!({"reference": "project", "name": "renamed"}));
+    rec.request::<method::ProjectRemove>(json!({"reference": "project", "prune_worktrees": true}));
+    rec.request::<method::ProjectPrompt>(json!({"reference": "project", "name": "issue"}));
+    rec.request::<method::ProjectAction>(json!({"reference": "project", "name": "review-pr"}));
+    rec.request::<method::ProjectActions>(json!({"reference": "project"}));
+    rec.request::<method::WorktreeRemove>(json!({"path": "/workspace/project/.worktrees/feature-auth"}));
+
+    // Results.
+    rec.result::<method::DaemonHealth, DaemonHealthResult>(json!({
+        "status": "ok",
+        "daemon_version": "0.33.0",
+        "protocol_version": protocol_version()
+    }));
+    rec.result::<method::HostGovernanceInspect, HostGovernanceStatus>(governance_status(
+        EnrollmentStatus::Quarantined,
+        Some(QuarantineReason::ProjectionConflict),
+    ));
+    rec.result::<method::SessionNew, SessionNewResult>(with_extra(
+        session_full(),
+        json!({"applied_input": true}),
+    ));
+    rec.result::<method::SessionList, Vec<SessionInfo>>(json!([session_full(), session_stopped()]));
+    rec.result::<method::SessionRuntimeInventory, RuntimeInventoryResult>(json!({"entries": [
+        {
+            "runtime_slot": "slot-1",
+            "claimed_session_id": "s-42",
+            "worker_id": "worker-1",
+            "runtime_id": "runtime-42",
+            "status": "managed",
+            "reason": "authenticated"
+        },
+        {
+            "runtime_slot": "slot-2",
+            "claimed_session_id": "s-77",
+            "worker_id": "worker-2",
+            "runtime_id": "runtime-77",
+            "status": "orphaned",
+            "reason": "no durable session record"
+        },
+        {"runtime_slot": "slot-3", "status": "incompatible"}
+    ]}));
+    rec.result::<method::SessionInspect, SessionInfo>(session_full());
+    rec.result::<method::SessionStop, SessionStopResult>(json!({"stopped": true}));
+    rec.result::<method::SessionResume, SessionResumeResult>(json!({"session": session_full()}));
+    rec.result::<method::SessionFork, SessionForkResult>(with_extra(
+        session_full(),
+        json!({"applied_input": false}),
+    ));
+    rec.result::<method::SessionRemove, SessionRemoveResult>(json!({
+        "removed": true,
+        "stopped": false,
+        "worktrees_removed": 1,
+        "worktrees_failed": 0
+    }));
+    rec.result::<method::SessionRemoveAcceptingUnconfirmed, SessionRemoveResult>(json!({
+        "removed": true,
+        "stopped": true,
+        "worktrees_removed": 1,
+        "worktrees_failed": 1,
+        "accepted_unconfirmed_processes": [
+            {"pid": 4242, "start_identity": "9007199254740993", "command": "ssh-agent"},
+            {"pid": 7, "start_identity": "1"}
+        ]
+    }));
+    rec.result::<method::SessionAttach, SessionAttachResult>(json!({"stream_id": "stream-1"}));
+    rec.result::<method::SessionDetach, SessionDetachResult>(json!({
+        "detached": false,
+        "error": {
+            "class": "runtime",
+            "code": "worker_attach_stream_failed",
+            "msg": "worker attach stream failed"
+        }
+    }));
+    rec.result::<method::SessionResize, SessionResizeResult>(json!({"session": session_full()}));
+    rec.result::<method::SessionInput, SessionInputResult>(json!({
+        "accepted": true,
+        "activity": "idle",
+        "activity_source": "report",
+        "runtime": runtime_identity(),
+        "activity_epoch": "d-epoch-1",
+        "activity_revision": "7"
+    }));
+    rec.result::<method::SessionScreen, SessionScreenResult>(json!({
+        "session_id": "s-42",
+        "worker_id": "worker-1",
+        "runtime_id": "runtime-42",
+        "runtime_generation": "3",
+        "watermark": "9007199254740993",
+        "dimensions": {"cols": 120, "rows": 40},
+        "cursor": {"row": 3, "col": 7, "visible": true},
+        "alternate_screen": false,
+        "title": "Build",
+        "progress": "40%",
+        "visible_lines": ["one", "two"]
+    }));
+    rec.result::<method::SessionDetection, SessionDetectionResult>(json!({
+        "session_id": "s-42",
+        "supported_regions": [
+            "osc_title",
+            "osc_progress",
+            "whole_recent",
+            "bottom_lines",
+            "bottom_non_empty_lines",
+            "top_non_empty_lines",
+            "last_non_empty_above_prompt_box",
+            "after_last_prompt_marker",
+            "prompt_box_body",
+            "after_last_horizontal_rule"
+        ],
+        "previews": [{
+            "kind": "top_non_empty_lines",
+            "region": "top_non_empty_lines(8)",
+            "text": "Do you trust the contents of this directory?"
+        }]
+    }));
+    rec.result::<method::SessionOutput, SessionOutputResult>(output_result());
+    rec.result::<method::SessionRead, SessionReadResult>(json!({
+        "text": "one\ntwo",
+        "source_used": "visible",
+        "runtime_id": "runtime-42",
+        "runtime_generation": "3",
+        "revision": "9007199254740994",
+        "alternate_screen": false,
+        "lines_requested": 20,
+        "truncated": true
+    }));
+    rec.result::<method::SessionWait, SessionWaitResult>(json!({
+        "reason": "runtime_changed",
+        "session": session_full(),
+        "terminal_watermark": "7",
+        "output_offset": "8"
+    }));
+    rec.result::<method::Subscribe, Value>(json!({"subscribed": true}));
+    rec.result::<method::SessionReportNativeId, SessionReportNativeIdResult>(json!({"recorded": true}));
+    rec.result::<method::SessionReportAgent, SessionReportAgentResult>(json!({"recorded": true}));
+    rec.result::<method::SessionReleaseAgent, SessionReleaseAgentResult>(json!({"released": true}));
+    rec.result::<method::SessionSetMetadata, SessionSetMetadataResult>(json!({"session": session_full()}));
+    rec.result::<method::SessionRename, SessionRenameResult>(json!({"session": session_full()}));
+    rec.result::<method::SessionDiff, SessionDiffResult>(json!({
+        "diff": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        "base": "main",
+        "truncated": false
+    }));
+    let retention = json!({
+        "enabled": true,
+        "sweep_interval_secs": 600,
+        "terminal_ttl_secs": 86_400,
+        "lost_ttl_secs": 3600,
+        "max_removals_per_sweep": 25
+    });
+    rec.result::<method::SessionPolicyGet, SessionPolicyResult>(json!({"retention": retention}));
+    rec.result::<method::SessionPolicySet, SessionPolicyResult>(json!({"retention": retention}));
+    rec.result::<method::SessionRetentionSweep, SessionRetentionResult>(json!({
+        "dry_run": true,
+        "examined": 5,
+        "eligible": 3,
+        "held": 1,
+        "removed": 0,
+        "worktrees_cleaned": 0,
+        "worktrees_failed": 0,
+        "failed": 0,
+        "sessions": [
+            {
+                "session_id": "s-43",
+                "reason": "terminal",
+                "age_secs": 90_000,
+                "worktree_path": "/workspace/other/.worktrees/old",
+                "hold": "worktree_uncommitted",
+                "removed": false
+            },
+            {"session_id": "s-44", "reason": "lost", "age_secs": 4000, "removed": false}
+        ]
+    }));
+    rec.result::<method::IntegrationInstall, IntegrationInstallResult>(json!({"installed": [
+        {
+            "agent": "claude",
+            "hook_path": "/home/user/.claude/hooks/pohunek-agent-state.sh",
+            "config_paths": ["/home/user/.claude/settings.json"],
+            "cleanup_incomplete": ["/home/user/.claude/hooks/old.sh"]
+        },
+        {
+            "agent": "codex",
+            "hook_path": "/home/user/.codex/pohunek-agent-state.sh",
+            "config_paths": ["/home/user/.codex/hooks.json", "/home/user/.codex/config.toml"],
+            "cleanup_incomplete": []
+        }
+    ]}));
+    rec.result::<method::IntegrationStatus, IntegrationStatusResult>(json!({"agents": [integration_status()]}));
+    rec.result::<method::IntegrationUninstall, IntegrationUninstallResult>(json!({"uninstalled": [{
+        "agent": "claude",
+        "state": "removed",
+        "removed_paths": ["/home/user/.claude/hooks/pohunek-agent-state.sh"],
+        "updated_paths": ["/home/user/.claude/settings.json"],
+        "preserved_paths": [],
+        "cleanup_incomplete": []
+    }]}));
+    rec.result::<method::IntegrationDoctor, IntegrationDoctorResult>(json!({
+        "ok": false,
+        "agents": [{
+            "agent": "codex",
+            "ok": false,
+            "status": integration_status(),
+            "findings": [
+                {
+                    "code": "asset_missing",
+                    "severity": "error",
+                    "summary": "managed state hook is missing",
+                    "remediation": "run `pohunek integration install --agent codex`"
+                },
+                {"code": "agent_not_installed", "severity": "info", "summary": "agent not installed"}
+            ]
+        }]
+    }));
+    rec.result::<method::HostInspect, HostCapabilities>(json!({
+        "daemon_version": "0.33.0",
+        "protocol_version": protocol_version(),
+        "supported_agents": ["shell", "codex", "claude", "hermes"],
+        "runtimes": [
+            {"agent": "shell", "agent_base": "shell", "available": true},
+            {"agent": "codex", "agent_base": "codex", "available": true, "path": "/usr/local/bin/codex"},
+            {"agent": "claude", "agent_base": "claude", "available": false},
+            {
+                "agent": "hermes",
+                "agent_base": "hermes",
+                "available": true,
+                "path": "/usr/local/bin/hermes",
+                "version": "0.20.0",
+                "supported": true
+            }
+        ],
+        "git_available": true,
+        "worktree_supported": true,
+        "terminal_read_supported": true,
+        "output_read_supported": true,
+        "session_wait_supported": true
+    }));
+    rec.result::<method::AssistantMaterialize, AssistantMaterializeResult>(json!({
+        "bundle_path": "/cache/pohunek/knowledge/v1",
+        "snapshot_path": "/run/pohunek/assistant/launch-42/snapshot.json",
+        "version": "0.33.0",
+        "content_hash": "sha256:abc123",
+        "concepts": [
+            {
+                "type": "Guide",
+                "id": "launcher",
+                "title": "Assistant launcher",
+                "description": "How the assistant launch flow uses materialized knowledge.",
+                "intents": ["project", "help"],
+                "since": "0.1.0",
+                "changed_in": ["0.2.0"],
+                "deprecated": {"version": "0.3.0", "successor": "launcher-v2"}
+            },
+            {
+                "type": "Concept",
+                "id": "architecture",
+                "title": "Architecture",
+                "description": "Assistant architecture overview."
+            }
+        ]
+    }));
+    rec.result::<method::DaemonDoctor, DaemonDoctorResult>(json!({"report": {
+        "checks": [
+            {"name": "bin:git", "status": "ok", "detail": "found at /usr/bin/git"},
+            {"name": "bin:codex", "status": "warn", "detail": "'codex' not found on PATH"}
+        ],
+        "overall": "warn"
+    }}));
+    rec.result::<method::HostDiscover, Vec<HostRecord>>(json!([
+        {
+            "name": "host-b",
+            "fqdn": "host-b.netbird.cloud",
+            "address": "100.92.30.40",
+            "port": 18722,
+            "overlay": "netbird",
+            "peer_id": "100.92.30.40",
+            "classification": "reachable_daemon",
+            "daemon_version": "0.33.0"
+        },
+        {
+            "name": "host-c",
+            "fqdn": null,
+            "address": "100.92.30.41",
+            "port": 18722,
+            "overlay": "netbird",
+            "peer_id": null,
+            "classification": "version_mismatch",
+            "daemon_protocol_version": 2
+        },
+        {
+            "name": null,
+            "fqdn": null,
+            "address": null,
+            "port": 18722,
+            "overlay": "netbird",
+            "peer_id": "100.92.30.42",
+            "classification": "unreachable"
+        },
+        {
+            "name": "host-e",
+            "fqdn": "host-e.netbird.cloud",
+            "address": "100.92.30.43",
+            "port": 18722,
+            "overlay": "netbird",
+            "peer_id": "100.92.30.43",
+            "classification": "candidate"
+        }
+    ]));
+    rec.result::<method::NotificationCreate, NotificationCreateResult>(json!({
+        "created": true,
+        "record": notification_record()
+    }));
+    rec.result::<method::NotificationList, NotificationListResult>(json!({
+        "notifications": [notification_record()],
+        "next_cursor": "page-3"
+    }));
+    rec.result::<method::NotificationUpdate, NotificationUpdateResult>(json!({"record": notification_record()}));
+    rec.result::<method::NotificationDelete, NotificationDeleteResult>(json!({"id": "n-42", "deleted": true}));
+    rec.result::<method::NotificationPolicyGet, NotificationPolicyResult>(json!({"policy": notification_policy()}));
+    rec.result::<method::NotificationPolicySet, NotificationPolicyResult>(json!({"policy": notification_policy()}));
+    rec.result::<method::NotificationRetentionPrune, NotificationRetentionResult>(json!({
+        "dry_run": true,
+        "pruned": ["n-1", "n-2"]
+    }));
+    rec.result::<method::ProjectList, Vec<ProjectInfo>>(json!([project_info()]));
+    rec.result::<method::ProjectAdd, ProjectInfo>(project_info());
+    rec.result::<method::ProjectShow, ProjectShowResult>(json!({
+        "project": project_info(),
+        "worktrees": [
+            {
+                "path": "/workspace/project/.worktrees/feature-auth",
+                "branch": "feature/auth",
+                "head": "0123456789abcdef0123456789abcdef01234567",
+                "bare": false,
+                "locked": false,
+                "owned": true,
+                "session_id": "s-42"
+            },
+            {"path": "/workspace/project", "bare": false, "locked": true, "owned": false}
+        ]
+    }));
+    rec.result::<method::ProjectRename, ProjectInfo>(project_info());
+    rec.result::<method::ProjectRemove, ProjectRemoveResult>(json!({
+        "removed": true,
+        "pruned_worktrees": 2,
+        "skipped_worktrees": ["/workspace/project/.worktrees/dirty"]
+    }));
+    rec.result::<method::ProjectPrompt, ProjectPromptResult>(json!({
+        "name": "issue",
+        "content": "Process ${title}\n\n${body}",
+        "layer": "in_repo"
+    }));
+    rec.result::<method::ProjectAction, ProjectActionResult>(json!({
+        "provider": "github_pr",
+        "agent": "codex",
+        "base_branch": "main",
+        "branch": "feature/static",
+        "prompt_name": "pr-review",
+        "prompt_content": "Review ${title}\n\n${body}"
+    }));
+    rec.result::<method::ProjectActions, ProjectActionsResult>(json!({"actions": [
+        {"name": "issue", "provider": "linear_issue", "template": "linear", "layer": "host"},
+        {"name": "review-pr", "provider": "github_pr", "template": "github", "layer": "in_repo"},
+        {"name": "task", "provider": "none", "template": "plain", "layer": "host"}
+    ]}));
+    rec.result::<method::WorktreeRemove, WorktreeRemoveResult>(json!({"removed": true}));
+}
+
+fn record_events(rec: &mut Recorder) {
+    use protocol::*;
+
+    rec.event::<AgentStateEvent>(
+        event::AGENT_STATE,
+        json!({
+            "session_id": "s-42",
+            "activity": "blocked",
+            "source": "osc_title",
+            "runtime": runtime_identity(),
+            "activity_epoch": "d-epoch-1",
+            "revision": "7"
+        }),
+    );
+    rec.event::<SubagentStateEvent>(
+        event::SUBAGENT_STATE,
+        json!({"session_id": "s-42", "subagent": subagent(), "runtime": runtime_identity()}),
+    );
+    rec.event::<AttachEvent>(
+        event::ATTACH_OPENED,
+        json!({"session_id": "s-42", "stream_id": "stream-1"}),
+    );
+    rec.event::<AttachEvent>(
+        event::ATTACH_CLOSED,
+        json!({"session_id": "s-42", "stream_id": "stream-1"}),
+    );
+    rec.event::<NotificationCreatedEvent>(
+        event::NOTIFICATION_CREATED,
+        json!({"record": notification_record()}),
+    );
+    rec.event::<NotificationUpdatedEvent>(
+        event::NOTIFICATION_UPDATED,
+        json!({"record": notification_record()}),
+    );
+    rec.event::<NotificationDeletedEvent>(
+        event::NOTIFICATION_DELETED,
+        json!({"notification_id": "n-42"}),
+    );
+    for name in [
+        event::SESSION_CREATED,
+        event::SESSION_UPDATED,
+        event::SESSION_STOPPED,
+        event::SESSION_REMOVED,
+        event::SESSION_RUNTIME_RECONNECTED,
+        event::SESSION_RUNTIME_LOST,
+        event::SESSION_RUNTIME_CONFLICT,
+    ] {
+        rec.event::<SessionEvent>(name, json!({"session": session_full()}));
+    }
+    rec.event::<RuntimeInventoryEvent>(
+        event::SESSION_RUNTIME_DISCOVERED,
+        json!({"entry": {
+            "runtime_slot": "slot-2",
+            "claimed_session_id": "s-77",
+            "worker_id": "worker-2",
+            "runtime_id": "runtime-77",
+            "status": "conflict",
+            "reason": "two workers claim the same slot"
+        }}),
+    );
+    rec.event::<SessionNativeRecoveredEvent>(
+        event::SESSION_NATIVE_RECOVERED,
+        json!({
+            "session": session_full(),
+            "previous_runtime_id": "runtime-41",
+            "runtime_id": "runtime-42"
+        }),
+    );
+}
+
+fn render(kind_key: &str, entries: &[Value]) -> String {
+    let document = json!({
+        "release": RELEASE,
+        "commit": COMMIT,
+        "protocol_version": 3,
+        "entries": entries,
+    });
+    assert_eq!(
+        PROTOCOL_VERSION,
+        protocol::ProtocolVersion::new(3).expect("protocol version 3"),
+        "{kind_key}: generator must run against protocol version 3"
+    );
+    let mut text = serde_json::to_string_pretty(&document).expect("render fixture");
+    text.push('\n');
+    text
+}
+
+#[test]
+fn golden_v3_fixtures_cover_every_method_and_event() {
+    let mut rec = Recorder::default();
+    record_methods(&mut rec);
+    record_events(&mut rec);
+
+    let request_names: BTreeSet<&str> = rec
+        .requests
+        .iter()
+        .map(|entry| entry["method"].as_str().expect("method name"))
+        .collect();
+    let result_names: BTreeSet<&str> = rec
+        .results
+        .iter()
+        .map(|entry| entry["method"].as_str().expect("method name"))
+        .collect();
+    let event_names: BTreeSet<&str> = rec
+        .events
+        .iter()
+        .map(|entry| entry["event"].as_str().expect("event name"))
+        .collect();
+    for spec in method::METHOD_SPECS {
+        assert!(request_names.contains(spec.name), "no request entry for {}", spec.name);
+        assert!(result_names.contains(spec.name), "no result entry for {}", spec.name);
+    }
+    for spec in protocol::event::EVENT_SPECS {
+        assert!(event_names.contains(spec.name), "no event entry for {}", spec.name);
+    }
+    assert_eq!(request_names.len(), method::METHOD_SPECS.len());
+    assert_eq!(result_names.len(), method::METHOD_SPECS.len());
+    assert_eq!(event_names.len(), protocol::event::EVENT_SPECS.len());
+
+    let out_dir = PathBuf::from(
+        std::env::var_os(OUT_DIR_ENV).unwrap_or_else(|| panic!("{OUT_DIR_ENV} must name the output directory")),
+    );
+    fs::create_dir_all(&out_dir).expect("create output directory");
+    for (file, entries) in [
+        ("requests.json", &rec.requests),
+        ("results.json", &rec.results),
+        ("events.json", &rec.events),
+    ] {
+        fs::write(out_dir.join(file), render(file, entries)).expect("write fixture");
+    }
+}

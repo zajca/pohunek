@@ -8,7 +8,7 @@ import {
   MAX_SESSION_OUTPUT_BYTES,
   MAX_SESSION_WAIT_MS,
   PROTOCOL_VERSION,
-  SUPPORTED_PROTOCOL_VERSIONS,
+  CLIENT_PROTOCOL_VERSIONS,
   type HostRecord,
   type ProtocolEvent,
   type SessionOutputParams,
@@ -621,7 +621,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       const client = await connectLocal(requireUnixSocket(daemon));
       const error = await expectClientError(
         client.request({
-          v: SUPPORTED_PROTOCOL_VERSIONS,
+          v: CLIENT_PROTOCOL_VERSIONS,
           id: "unknown-method",
           method: "session.unknown",
           params: null,
@@ -1012,7 +1012,7 @@ function testSocketPath(label: string): string {
 
 function subscribeRequest(id: string): Request {
   return {
-    v: SUPPORTED_PROTOCOL_VERSIONS,
+    v: CLIENT_PROTOCOL_VERSIONS,
     id,
     method: "subscribe",
     params: null,

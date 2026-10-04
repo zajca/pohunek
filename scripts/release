@@ -122,7 +122,7 @@ EXPECTED_INTEGRATION_VERSION|crates/protocol/src/integration.rs
 
 # Prints the value of `const NAME` under pathspec at git ref, or nothing when
 # the constant does not exist there. An initializer that names another constant
-# (`= OTHER`, `= OTHER - 1`, `= OTHER + 1`, looked up in the same crate) is
+# (`= OTHER`, `= OTHER - 1`, `= OTHER + 1`, `= Wrapper(OTHER.0 - 1)`, looked up in the same crate) is
 # resolved to its final value, so an alias changes when its target does. An
 # initializer it cannot evaluate is an error, never a silent "unchanged".
 # Arguments: ref name pathspec [depth].
@@ -135,6 +135,10 @@ pohunek_const_value() {
   pcv_rhs="$(git -C "$repo_root" grep -h -E "^[[:space:]]*(pub(\([a-z]+\))? )?const $2:" "$1" -- "$3" 2>/dev/null |
     head -n 1 | sed -E 's/^[^=]*=[[:space:]]*//; s/;[[:space:]]*$//')"
   [ -n "$pcv_rhs" ] || return 0
+  # `Wrapper(OTHER.0 - N)`, how a newtype constant derives from another, is the
+  # offset alias `OTHER - N` applied to the same wrapped value.
+  pcv_rhs="$(printf '%s' "$pcv_rhs" |
+    sed -E 's/^[A-Za-z_]+\(([A-Z][A-Z0-9_]+)\.0[[:space:]]*([-+][[:space:]]*[0-9]+)\)$/\1 \2/')"
   if ! printf '%s' "$pcv_rhs" | grep -qE '[A-Z][A-Z0-9_]{2,}'; then
     printf '%s\n' "$pcv_rhs"
     return 0

@@ -1,0 +1,203 @@
+{
+  "release": "v0.33.0",
+  "commit": "e6fcf2377ba14a51d8e7de971c13e1e86a864134",
+  "consumer": "TypeScript SDK @pohunek/sdk (sdk/ts/sdk)",
+  "capture": "In the v0.33.0 worktree: `bun install --frozen-lockfile`, then `bun test/capture-requests.ts <socket> <labels.json>` from sdk/ts/sdk, a throwaway script (not checked in) that calls connectLocal(socket) and runs client.handshake(), client.call('session.list'|'session.new'|'session.inspect'|'session.stop'|'session.read'|'session.runtime_inventory'), client.sessionScreen/sessionOutput(runtime)/sessionWait(runtime)/sessionInput (plain and with wait) and client.subscribe({method:'subscribe'}) against a throwaway python3 capture server (unix socket, one NDJSON request per line, logs the raw line, replies with a canned protocol-3 envelope {\"v\":3,\"id\":<echo>,\"ok\":...} so the consumer proceeds; not checked in) listening on $XDG_RUNTIME_DIR/pohunek/daemon.sock. The SDK built every line itself; replies that do not satisfy SDK result validation are irrelevant. Only the request ids were normalized: the SDK id embeds a per-process random run token, replaced by forty zeros (shape sdk-<method>-<token>-<counter> unchanged); the subscribe id was chosen by the script.",
+  "requests": [
+    {
+      "label": "handshake daemon.health",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-daemon.health-0000000000000000000000000000000000000000-0",
+        "method": "daemon.health",
+        "params": null
+      }
+    },
+    {
+      "label": "session.list",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.list-0000000000000000000000000000000000000000-1",
+        "method": "session.list",
+        "params": {}
+      }
+    },
+    {
+      "label": "session.new shell",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.new-0000000000000000000000000000000000000000-2",
+        "method": "session.new",
+        "params": {
+          "agent": "shell",
+          "cols": 80,
+          "rows": 24
+        }
+      }
+    },
+    {
+      "label": "session.inspect",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.inspect-0000000000000000000000000000000000000000-3",
+        "method": "session.inspect",
+        "params": "ses_0123456789abcdef"
+      }
+    },
+    {
+      "label": "session.stop",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.stop-0000000000000000000000000000000000000000-4",
+        "method": "session.stop",
+        "params": "ses_0123456789abcdef"
+      }
+    },
+    {
+      "label": "session.screen",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.screen-0000000000000000000000000000000000000000-5",
+        "method": "session.screen",
+        "params": {
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.output runtime",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.output-0000000000000000000000000000000000000000-6",
+        "method": "session.output",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "runtime": {
+            "runtime_id": "rt-0123456789abcdef",
+            "runtime_generation": "1"
+          },
+          "after_offset": "0",
+          "max_bytes": 16384
+        }
+      }
+    },
+    {
+      "label": "session.wait runtime",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.wait-0000000000000000000000000000000000000000-7",
+        "method": "session.wait",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "runtime": {
+            "runtime_id": "rt-0123456789abcdef",
+            "runtime_generation": "1"
+          },
+          "after_output_offset": "0",
+          "states": [
+            "running"
+          ],
+          "timeout_ms": 1000
+        }
+      }
+    },
+    {
+      "label": "session.read",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.read-0000000000000000000000000000000000000000-8",
+        "method": "session.read",
+        "params": {
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.input",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.input-0000000000000000000000000000000000000000-9",
+        "method": "session.input",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "text": "echo hi"
+        }
+      }
+    },
+    {
+      "label": "session.input wait",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.input-0000000000000000000000000000000000000000-10",
+        "method": "session.input",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "text": "echo hi",
+          "wait": {
+            "until": [
+              "idle"
+            ],
+            "timeout_ms": 1000
+          }
+        }
+      }
+    },
+    {
+      "label": "session.runtime_inventory",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.runtime_inventory-0000000000000000000000000000000000000000-11",
+        "method": "session.runtime_inventory",
+        "params": null
+      }
+    },
+    {
+      "label": "subscribe",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-subscribe-0",
+        "method": "subscribe",
+        "params": null
+      }
+    }
+  ]
+}

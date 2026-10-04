@@ -505,7 +505,7 @@ fn print_json_error(err: &ProtocolError) {
             "{}",
             serde_json::json!({
                 "cli_version": env!("CARGO_PKG_VERSION"),
-                "protocol": protocol::SUPPORTED_PROTOCOL_VERSIONS,
+                "protocol": protocol::CLIENT_PROTOCOL_VERSIONS,
                 "err": {
                     "class": "daemon",
                     "code": "serialize_failed",

@@ -1,0 +1,1708 @@
+{
+  "commit": "e6fcf2377ba14a51d8e7de971c13e1e86a864134",
+  "entries": [
+    {
+      "method": "daemon.health",
+      "result": {
+        "daemon_version": "0.33.0",
+        "protocol_version": 3,
+        "status": "ok"
+      }
+    },
+    {
+      "method": "host.governance.inspect",
+      "result": {
+        "approval_key_reference": "approval_key_BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+        "enrollment": {
+          "relay_id": "relay_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "revision": "4",
+          "status": "quarantined"
+        },
+        "host_id": "host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "owner": {
+          "id": "principal_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "kind": "principal"
+        },
+        "owner_revision": "8",
+        "quarantine": "projection_conflict"
+      }
+    },
+    {
+      "method": "session.new",
+      "result": {
+        "active_agent": "claude",
+        "active_agent_base": "claude",
+        "active_agent_pid": 4300,
+        "active_agent_session_id": "claude-active-abc",
+        "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "activity": "working",
+        "agent": "claude",
+        "agent_base": "claude",
+        "applied_input": true,
+        "branch": "feature/auth",
+        "capabilities": {
+          "fork": true,
+          "resume": true
+        },
+        "cols": 120,
+        "created_at": "2026-06-17T10:00:00Z",
+        "cwd": "/workspace/project/.worktrees/feature-auth",
+        "cwd_source": "osc7",
+        "exit_code": 0,
+        "external": false,
+        "id": "s-42",
+        "is_linked_worktree": true,
+        "metadata": {
+          "owner": "cli",
+          "ticket": "DMD-1356"
+        },
+        "name": "review auth flow",
+        "native_session_id": "claude-native-abc",
+        "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "pid": 4242,
+        "project_id": "p-7",
+        "project_label": "project",
+        "repo": "/workspace/project",
+        "rows": 40,
+        "runtime": {
+          "last_connected_at": "2026-06-17T10:05:00Z",
+          "loss_reason": "worker control socket closed",
+          "runtime_generation": "3",
+          "runtime_id": "runtime-42",
+          "started_at": "2026-06-17T10:00:00Z",
+          "state": "live",
+          "worker_id": "worker-1"
+        },
+        "state": "running",
+        "state_source": "report",
+        "subagents": [
+          {
+            "activity": "working",
+            "agent_type": "code-reviewer",
+            "finished_at_ms": 1781690520000,
+            "id": "sub-1",
+            "lifecycle": "running",
+            "parent_id": "sub-0",
+            "provider": "claude",
+            "revision": "4",
+            "started_at_ms": 1781690400000,
+            "updated_at_ms": 1781690460000
+          }
+        ],
+        "updated_at": "2026-06-17T10:01:00Z",
+        "warnings": [
+          {
+            "detail": "could not resolve host: github.com",
+            "kind": "fetch",
+            "message": "git fetch failed"
+          },
+          {
+            "kind": "base_branch_fallback",
+            "message": "base branch main not found, using master"
+          },
+          {
+            "detail": "exit status: 1",
+            "kind": "setup_script",
+            "message": "setup script exited with status 1"
+          },
+          {
+            "detail": "timed out after 30s",
+            "kind": "hook",
+            "message": "post-create hook timed out"
+          }
+        ],
+        "worktree_path": "/workspace/project/.worktrees/feature-auth"
+      }
+    },
+    {
+      "method": "session.list",
+      "result": [
+        {
+          "active_agent": "claude",
+          "active_agent_base": "claude",
+          "active_agent_pid": 4300,
+          "active_agent_session_id": "claude-active-abc",
+          "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "activity": "working",
+          "agent": "claude",
+          "agent_base": "claude",
+          "branch": "feature/auth",
+          "capabilities": {
+            "fork": true,
+            "resume": true
+          },
+          "cols": 120,
+          "created_at": "2026-06-17T10:00:00Z",
+          "cwd": "/workspace/project/.worktrees/feature-auth",
+          "cwd_source": "osc7",
+          "exit_code": 0,
+          "external": false,
+          "id": "s-42",
+          "is_linked_worktree": true,
+          "metadata": {
+            "owner": "cli",
+            "ticket": "DMD-1356"
+          },
+          "name": "review auth flow",
+          "native_session_id": "claude-native-abc",
+          "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "pid": 4242,
+          "project_id": "p-7",
+          "project_label": "project",
+          "repo": "/workspace/project",
+          "rows": 40,
+          "runtime": {
+            "last_connected_at": "2026-06-17T10:05:00Z",
+            "loss_reason": "worker control socket closed",
+            "runtime_generation": "3",
+            "runtime_id": "runtime-42",
+            "started_at": "2026-06-17T10:00:00Z",
+            "state": "live",
+            "worker_id": "worker-1"
+          },
+          "state": "running",
+          "state_source": "report",
+          "subagents": [
+            {
+              "activity": "working",
+              "agent_type": "code-reviewer",
+              "finished_at_ms": 1781690520000,
+              "id": "sub-1",
+              "lifecycle": "running",
+              "parent_id": "sub-0",
+              "provider": "claude",
+              "revision": "4",
+              "started_at_ms": 1781690400000,
+              "updated_at_ms": 1781690460000
+            }
+          ],
+          "updated_at": "2026-06-17T10:01:00Z",
+          "warnings": [
+            {
+              "detail": "could not resolve host: github.com",
+              "kind": "fetch",
+              "message": "git fetch failed"
+            },
+            {
+              "kind": "base_branch_fallback",
+              "message": "base branch main not found, using master"
+            },
+            {
+              "detail": "exit status: 1",
+              "kind": "setup_script",
+              "message": "setup script exited with status 1"
+            },
+            {
+              "detail": "timed out after 30s",
+              "kind": "hook",
+              "message": "post-create hook timed out"
+            }
+          ],
+          "worktree_path": "/workspace/project/.worktrees/feature-auth"
+        },
+        {
+          "agent": "shell",
+          "agent_base": "shell",
+          "capabilities": {
+            "fork": false,
+            "resume": false
+          },
+          "cols": 80,
+          "created_at": "2026-06-17T09:00:00Z",
+          "cwd": "/workspace/other",
+          "exit_code": 130,
+          "id": "s-43",
+          "pid": 5151,
+          "rows": 24,
+          "runtime": {
+            "runtime_generation": "1",
+            "state": "terminal"
+          },
+          "state": "stopped",
+          "state_source": "process",
+          "updated_at": "2026-06-17T09:30:00Z"
+        }
+      ]
+    },
+    {
+      "method": "session.runtime_inventory",
+      "result": {
+        "entries": [
+          {
+            "claimed_session_id": "s-42",
+            "reason": "authenticated",
+            "runtime_id": "runtime-42",
+            "runtime_slot": "slot-1",
+            "status": "managed",
+            "worker_id": "worker-1"
+          },
+          {
+            "claimed_session_id": "s-77",
+            "reason": "no durable session record",
+            "runtime_id": "runtime-77",
+            "runtime_slot": "slot-2",
+            "status": "orphaned",
+            "worker_id": "worker-2"
+          },
+          {
+            "runtime_slot": "slot-3",
+            "status": "incompatible"
+          }
+        ]
+      }
+    },
+    {
+      "method": "session.inspect",
+      "result": {
+        "active_agent": "claude",
+        "active_agent_base": "claude",
+        "active_agent_pid": 4300,
+        "active_agent_session_id": "claude-active-abc",
+        "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "activity": "working",
+        "agent": "claude",
+        "agent_base": "claude",
+        "branch": "feature/auth",
+        "capabilities": {
+          "fork": true,
+          "resume": true
+        },
+        "cols": 120,
+        "created_at": "2026-06-17T10:00:00Z",
+        "cwd": "/workspace/project/.worktrees/feature-auth",
+        "cwd_source": "osc7",
+        "exit_code": 0,
+        "external": false,
+        "id": "s-42",
+        "is_linked_worktree": true,
+        "metadata": {
+          "owner": "cli",
+          "ticket": "DMD-1356"
+        },
+        "name": "review auth flow",
+        "native_session_id": "claude-native-abc",
+        "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "pid": 4242,
+        "project_id": "p-7",
+        "project_label": "project",
+        "repo": "/workspace/project",
+        "rows": 40,
+        "runtime": {
+          "last_connected_at": "2026-06-17T10:05:00Z",
+          "loss_reason": "worker control socket closed",
+          "runtime_generation": "3",
+          "runtime_id": "runtime-42",
+          "started_at": "2026-06-17T10:00:00Z",
+          "state": "live",
+          "worker_id": "worker-1"
+        },
+        "state": "running",
+        "state_source": "report",
+        "subagents": [
+          {
+            "activity": "working",
+            "agent_type": "code-reviewer",
+            "finished_at_ms": 1781690520000,
+            "id": "sub-1",
+            "lifecycle": "running",
+            "parent_id": "sub-0",
+            "provider": "claude",
+            "revision": "4",
+            "started_at_ms": 1781690400000,
+            "updated_at_ms": 1781690460000
+          }
+        ],
+        "updated_at": "2026-06-17T10:01:00Z",
+        "warnings": [
+          {
+            "detail": "could not resolve host: github.com",
+            "kind": "fetch",
+            "message": "git fetch failed"
+          },
+          {
+            "kind": "base_branch_fallback",
+            "message": "base branch main not found, using master"
+          },
+          {
+            "detail": "exit status: 1",
+            "kind": "setup_script",
+            "message": "setup script exited with status 1"
+          },
+          {
+            "detail": "timed out after 30s",
+            "kind": "hook",
+            "message": "post-create hook timed out"
+          }
+        ],
+        "worktree_path": "/workspace/project/.worktrees/feature-auth"
+      }
+    },
+    {
+      "method": "session.stop",
+      "result": {
+        "stopped": true
+      }
+    },
+    {
+      "method": "session.resume",
+      "result": {
+        "session": {
+          "active_agent": "claude",
+          "active_agent_base": "claude",
+          "active_agent_pid": 4300,
+          "active_agent_session_id": "claude-active-abc",
+          "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "activity": "working",
+          "agent": "claude",
+          "agent_base": "claude",
+          "branch": "feature/auth",
+          "capabilities": {
+            "fork": true,
+            "resume": true
+          },
+          "cols": 120,
+          "created_at": "2026-06-17T10:00:00Z",
+          "cwd": "/workspace/project/.worktrees/feature-auth",
+          "cwd_source": "osc7",
+          "exit_code": 0,
+          "external": false,
+          "id": "s-42",
+          "is_linked_worktree": true,
+          "metadata": {
+            "owner": "cli",
+            "ticket": "DMD-1356"
+          },
+          "name": "review auth flow",
+          "native_session_id": "claude-native-abc",
+          "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "pid": 4242,
+          "project_id": "p-7",
+          "project_label": "project",
+          "repo": "/workspace/project",
+          "rows": 40,
+          "runtime": {
+            "last_connected_at": "2026-06-17T10:05:00Z",
+            "loss_reason": "worker control socket closed",
+            "runtime_generation": "3",
+            "runtime_id": "runtime-42",
+            "started_at": "2026-06-17T10:00:00Z",
+            "state": "live",
+            "worker_id": "worker-1"
+          },
+          "state": "running",
+          "state_source": "report",
+          "subagents": [
+            {
+              "activity": "working",
+              "agent_type": "code-reviewer",
+              "finished_at_ms": 1781690520000,
+              "id": "sub-1",
+              "lifecycle": "running",
+              "parent_id": "sub-0",
+              "provider": "claude",
+              "revision": "4",
+              "started_at_ms": 1781690400000,
+              "updated_at_ms": 1781690460000
+            }
+          ],
+          "updated_at": "2026-06-17T10:01:00Z",
+          "warnings": [
+            {
+              "detail": "could not resolve host: github.com",
+              "kind": "fetch",
+              "message": "git fetch failed"
+            },
+            {
+              "kind": "base_branch_fallback",
+              "message": "base branch main not found, using master"
+            },
+            {
+              "detail": "exit status: 1",
+              "kind": "setup_script",
+              "message": "setup script exited with status 1"
+            },
+            {
+              "detail": "timed out after 30s",
+              "kind": "hook",
+              "message": "post-create hook timed out"
+            }
+          ],
+          "worktree_path": "/workspace/project/.worktrees/feature-auth"
+        }
+      }
+    },
+    {
+      "method": "session.fork",
+      "result": {
+        "active_agent": "claude",
+        "active_agent_base": "claude",
+        "active_agent_pid": 4300,
+        "active_agent_session_id": "claude-active-abc",
+        "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "activity": "working",
+        "agent": "claude",
+        "agent_base": "claude",
+        "applied_input": false,
+        "branch": "feature/auth",
+        "capabilities": {
+          "fork": true,
+          "resume": true
+        },
+        "cols": 120,
+        "created_at": "2026-06-17T10:00:00Z",
+        "cwd": "/workspace/project/.worktrees/feature-auth",
+        "cwd_source": "osc7",
+        "exit_code": 0,
+        "external": false,
+        "id": "s-42",
+        "is_linked_worktree": true,
+        "metadata": {
+          "owner": "cli",
+          "ticket": "DMD-1356"
+        },
+        "name": "review auth flow",
+        "native_session_id": "claude-native-abc",
+        "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "pid": 4242,
+        "project_id": "p-7",
+        "project_label": "project",
+        "repo": "/workspace/project",
+        "rows": 40,
+        "runtime": {
+          "last_connected_at": "2026-06-17T10:05:00Z",
+          "loss_reason": "worker control socket closed",
+          "runtime_generation": "3",
+          "runtime_id": "runtime-42",
+          "started_at": "2026-06-17T10:00:00Z",
+          "state": "live",
+          "worker_id": "worker-1"
+        },
+        "state": "running",
+        "state_source": "report",
+        "subagents": [
+          {
+            "activity": "working",
+            "agent_type": "code-reviewer",
+            "finished_at_ms": 1781690520000,
+            "id": "sub-1",
+            "lifecycle": "running",
+            "parent_id": "sub-0",
+            "provider": "claude",
+            "revision": "4",
+            "started_at_ms": 1781690400000,
+            "updated_at_ms": 1781690460000
+          }
+        ],
+        "updated_at": "2026-06-17T10:01:00Z",
+        "warnings": [
+          {
+            "detail": "could not resolve host: github.com",
+            "kind": "fetch",
+            "message": "git fetch failed"
+          },
+          {
+            "kind": "base_branch_fallback",
+            "message": "base branch main not found, using master"
+          },
+          {
+            "detail": "exit status: 1",
+            "kind": "setup_script",
+            "message": "setup script exited with status 1"
+          },
+          {
+            "detail": "timed out after 30s",
+            "kind": "hook",
+            "message": "post-create hook timed out"
+          }
+        ],
+        "worktree_path": "/workspace/project/.worktrees/feature-auth"
+      }
+    },
+    {
+      "method": "session.remove",
+      "result": {
+        "removed": true,
+        "stopped": false,
+        "worktrees_failed": 0,
+        "worktrees_removed": 1
+      }
+    },
+    {
+      "method": "session.remove_accepting_unconfirmed",
+      "result": {
+        "accepted_unconfirmed_processes": [
+          {
+            "command": "ssh-agent",
+            "pid": 4242,
+            "start_identity": "9007199254740993"
+          },
+          {
+            "pid": 7,
+            "start_identity": "1"
+          }
+        ],
+        "removed": true,
+        "stopped": true,
+        "worktrees_failed": 1,
+        "worktrees_removed": 1
+      }
+    },
+    {
+      "method": "session.attach",
+      "result": {
+        "stream_id": "stream-1"
+      }
+    },
+    {
+      "method": "session.detach",
+      "result": {
+        "detached": false,
+        "error": {
+          "class": "runtime",
+          "code": "worker_attach_stream_failed",
+          "msg": "worker attach stream failed"
+        }
+      }
+    },
+    {
+      "method": "session.resize",
+      "result": {
+        "session": {
+          "active_agent": "claude",
+          "active_agent_base": "claude",
+          "active_agent_pid": 4300,
+          "active_agent_session_id": "claude-active-abc",
+          "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "activity": "working",
+          "agent": "claude",
+          "agent_base": "claude",
+          "branch": "feature/auth",
+          "capabilities": {
+            "fork": true,
+            "resume": true
+          },
+          "cols": 120,
+          "created_at": "2026-06-17T10:00:00Z",
+          "cwd": "/workspace/project/.worktrees/feature-auth",
+          "cwd_source": "osc7",
+          "exit_code": 0,
+          "external": false,
+          "id": "s-42",
+          "is_linked_worktree": true,
+          "metadata": {
+            "owner": "cli",
+            "ticket": "DMD-1356"
+          },
+          "name": "review auth flow",
+          "native_session_id": "claude-native-abc",
+          "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "pid": 4242,
+          "project_id": "p-7",
+          "project_label": "project",
+          "repo": "/workspace/project",
+          "rows": 40,
+          "runtime": {
+            "last_connected_at": "2026-06-17T10:05:00Z",
+            "loss_reason": "worker control socket closed",
+            "runtime_generation": "3",
+            "runtime_id": "runtime-42",
+            "started_at": "2026-06-17T10:00:00Z",
+            "state": "live",
+            "worker_id": "worker-1"
+          },
+          "state": "running",
+          "state_source": "report",
+          "subagents": [
+            {
+              "activity": "working",
+              "agent_type": "code-reviewer",
+              "finished_at_ms": 1781690520000,
+              "id": "sub-1",
+              "lifecycle": "running",
+              "parent_id": "sub-0",
+              "provider": "claude",
+              "revision": "4",
+              "started_at_ms": 1781690400000,
+              "updated_at_ms": 1781690460000
+            }
+          ],
+          "updated_at": "2026-06-17T10:01:00Z",
+          "warnings": [
+            {
+              "detail": "could not resolve host: github.com",
+              "kind": "fetch",
+              "message": "git fetch failed"
+            },
+            {
+              "kind": "base_branch_fallback",
+              "message": "base branch main not found, using master"
+            },
+            {
+              "detail": "exit status: 1",
+              "kind": "setup_script",
+              "message": "setup script exited with status 1"
+            },
+            {
+              "detail": "timed out after 30s",
+              "kind": "hook",
+              "message": "post-create hook timed out"
+            }
+          ],
+          "worktree_path": "/workspace/project/.worktrees/feature-auth"
+        }
+      }
+    },
+    {
+      "method": "session.input",
+      "result": {
+        "accepted": true,
+        "activity": "idle",
+        "activity_epoch": "d-epoch-1",
+        "activity_revision": "7",
+        "activity_source": "report",
+        "runtime": {
+          "runtime_generation": "3",
+          "runtime_id": "runtime-42"
+        }
+      }
+    },
+    {
+      "method": "session.screen",
+      "result": {
+        "alternate_screen": false,
+        "cursor": {
+          "col": 7,
+          "row": 3,
+          "visible": true
+        },
+        "dimensions": {
+          "cols": 120,
+          "rows": 40
+        },
+        "progress": "40%",
+        "runtime_generation": "3",
+        "runtime_id": "runtime-42",
+        "session_id": "s-42",
+        "title": "Build",
+        "visible_lines": [
+          "one",
+          "two"
+        ],
+        "watermark": "9007199254740993",
+        "worker_id": "worker-1"
+      }
+    },
+    {
+      "method": "session.detection",
+      "result": {
+        "previews": [
+          {
+            "kind": "top_non_empty_lines",
+            "region": "top_non_empty_lines(8)",
+            "text": "Do you trust the contents of this directory?"
+          }
+        ],
+        "session_id": "s-42",
+        "supported_regions": [
+          "osc_title",
+          "osc_progress",
+          "whole_recent",
+          "bottom_lines",
+          "bottom_non_empty_lines",
+          "top_non_empty_lines",
+          "last_non_empty_above_prompt_box",
+          "after_last_prompt_marker",
+          "prompt_box_body",
+          "after_last_horizontal_rule"
+        ]
+      }
+    },
+    {
+      "method": "session.output",
+      "result": {
+        "data_base64": "dGVzdA==",
+        "gap": {
+          "end_offset": "20",
+          "start_offset": "10"
+        },
+        "has_more": true,
+        "history_start_offset": "20",
+        "next_offset": "24",
+        "runtime_end_offset": "30",
+        "runtime_generation": "3",
+        "runtime_id": "runtime-42",
+        "session_id": "s-42",
+        "start_offset": "20",
+        "timed_out": false
+      }
+    },
+    {
+      "method": "session.read",
+      "result": {
+        "alternate_screen": false,
+        "lines_requested": 20,
+        "revision": "9007199254740994",
+        "runtime_generation": "3",
+        "runtime_id": "runtime-42",
+        "source_used": "visible",
+        "text": "one\ntwo",
+        "truncated": true
+      }
+    },
+    {
+      "method": "session.wait",
+      "result": {
+        "output_offset": "8",
+        "reason": "runtime_changed",
+        "session": {
+          "active_agent": "claude",
+          "active_agent_base": "claude",
+          "active_agent_pid": 4300,
+          "active_agent_session_id": "claude-active-abc",
+          "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "activity": "working",
+          "agent": "claude",
+          "agent_base": "claude",
+          "branch": "feature/auth",
+          "capabilities": {
+            "fork": true,
+            "resume": true
+          },
+          "cols": 120,
+          "created_at": "2026-06-17T10:00:00Z",
+          "cwd": "/workspace/project/.worktrees/feature-auth",
+          "cwd_source": "osc7",
+          "exit_code": 0,
+          "external": false,
+          "id": "s-42",
+          "is_linked_worktree": true,
+          "metadata": {
+            "owner": "cli",
+            "ticket": "DMD-1356"
+          },
+          "name": "review auth flow",
+          "native_session_id": "claude-native-abc",
+          "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "pid": 4242,
+          "project_id": "p-7",
+          "project_label": "project",
+          "repo": "/workspace/project",
+          "rows": 40,
+          "runtime": {
+            "last_connected_at": "2026-06-17T10:05:00Z",
+            "loss_reason": "worker control socket closed",
+            "runtime_generation": "3",
+            "runtime_id": "runtime-42",
+            "started_at": "2026-06-17T10:00:00Z",
+            "state": "live",
+            "worker_id": "worker-1"
+          },
+          "state": "running",
+          "state_source": "report",
+          "subagents": [
+            {
+              "activity": "working",
+              "agent_type": "code-reviewer",
+              "finished_at_ms": 1781690520000,
+              "id": "sub-1",
+              "lifecycle": "running",
+              "parent_id": "sub-0",
+              "provider": "claude",
+              "revision": "4",
+              "started_at_ms": 1781690400000,
+              "updated_at_ms": 1781690460000
+            }
+          ],
+          "updated_at": "2026-06-17T10:01:00Z",
+          "warnings": [
+            {
+              "detail": "could not resolve host: github.com",
+              "kind": "fetch",
+              "message": "git fetch failed"
+            },
+            {
+              "kind": "base_branch_fallback",
+              "message": "base branch main not found, using master"
+            },
+            {
+              "detail": "exit status: 1",
+              "kind": "setup_script",
+              "message": "setup script exited with status 1"
+            },
+            {
+              "detail": "timed out after 30s",
+              "kind": "hook",
+              "message": "post-create hook timed out"
+            }
+          ],
+          "worktree_path": "/workspace/project/.worktrees/feature-auth"
+        },
+        "terminal_watermark": "7"
+      }
+    },
+    {
+      "method": "subscribe",
+      "result": {
+        "subscribed": true
+      }
+    },
+    {
+      "method": "session.report_native_id",
+      "result": {
+        "recorded": true
+      }
+    },
+    {
+      "method": "session.report_agent",
+      "result": {
+        "recorded": true
+      }
+    },
+    {
+      "method": "session.release_agent",
+      "result": {
+        "released": true
+      }
+    },
+    {
+      "method": "session.set_metadata",
+      "result": {
+        "session": {
+          "active_agent": "claude",
+          "active_agent_base": "claude",
+          "active_agent_pid": 4300,
+          "active_agent_session_id": "claude-active-abc",
+          "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "activity": "working",
+          "agent": "claude",
+          "agent_base": "claude",
+          "branch": "feature/auth",
+          "capabilities": {
+            "fork": true,
+            "resume": true
+          },
+          "cols": 120,
+          "created_at": "2026-06-17T10:00:00Z",
+          "cwd": "/workspace/project/.worktrees/feature-auth",
+          "cwd_source": "osc7",
+          "exit_code": 0,
+          "external": false,
+          "id": "s-42",
+          "is_linked_worktree": true,
+          "metadata": {
+            "owner": "cli",
+            "ticket": "DMD-1356"
+          },
+          "name": "review auth flow",
+          "native_session_id": "claude-native-abc",
+          "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "pid": 4242,
+          "project_id": "p-7",
+          "project_label": "project",
+          "repo": "/workspace/project",
+          "rows": 40,
+          "runtime": {
+            "last_connected_at": "2026-06-17T10:05:00Z",
+            "loss_reason": "worker control socket closed",
+            "runtime_generation": "3",
+            "runtime_id": "runtime-42",
+            "started_at": "2026-06-17T10:00:00Z",
+            "state": "live",
+            "worker_id": "worker-1"
+          },
+          "state": "running",
+          "state_source": "report",
+          "subagents": [
+            {
+              "activity": "working",
+              "agent_type": "code-reviewer",
+              "finished_at_ms": 1781690520000,
+              "id": "sub-1",
+              "lifecycle": "running",
+              "parent_id": "sub-0",
+              "provider": "claude",
+              "revision": "4",
+              "started_at_ms": 1781690400000,
+              "updated_at_ms": 1781690460000
+            }
+          ],
+          "updated_at": "2026-06-17T10:01:00Z",
+          "warnings": [
+            {
+              "detail": "could not resolve host: github.com",
+              "kind": "fetch",
+              "message": "git fetch failed"
+            },
+            {
+              "kind": "base_branch_fallback",
+              "message": "base branch main not found, using master"
+            },
+            {
+              "detail": "exit status: 1",
+              "kind": "setup_script",
+              "message": "setup script exited with status 1"
+            },
+            {
+              "detail": "timed out after 30s",
+              "kind": "hook",
+              "message": "post-create hook timed out"
+            }
+          ],
+          "worktree_path": "/workspace/project/.worktrees/feature-auth"
+        }
+      }
+    },
+    {
+      "method": "session.rename",
+      "result": {
+        "session": {
+          "active_agent": "claude",
+          "active_agent_base": "claude",
+          "active_agent_pid": 4300,
+          "active_agent_session_id": "claude-active-abc",
+          "active_agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "activity": "working",
+          "agent": "claude",
+          "agent_base": "claude",
+          "branch": "feature/auth",
+          "capabilities": {
+            "fork": true,
+            "resume": true
+          },
+          "cols": 120,
+          "created_at": "2026-06-17T10:00:00Z",
+          "cwd": "/workspace/project/.worktrees/feature-auth",
+          "cwd_source": "osc7",
+          "exit_code": 0,
+          "external": false,
+          "id": "s-42",
+          "is_linked_worktree": true,
+          "metadata": {
+            "owner": "cli",
+            "ticket": "DMD-1356"
+          },
+          "name": "review auth flow",
+          "native_session_id": "claude-native-abc",
+          "native_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+          "pid": 4242,
+          "project_id": "p-7",
+          "project_label": "project",
+          "repo": "/workspace/project",
+          "rows": 40,
+          "runtime": {
+            "last_connected_at": "2026-06-17T10:05:00Z",
+            "loss_reason": "worker control socket closed",
+            "runtime_generation": "3",
+            "runtime_id": "runtime-42",
+            "started_at": "2026-06-17T10:00:00Z",
+            "state": "live",
+            "worker_id": "worker-1"
+          },
+          "state": "running",
+          "state_source": "report",
+          "subagents": [
+            {
+              "activity": "working",
+              "agent_type": "code-reviewer",
+              "finished_at_ms": 1781690520000,
+              "id": "sub-1",
+              "lifecycle": "running",
+              "parent_id": "sub-0",
+              "provider": "claude",
+              "revision": "4",
+              "started_at_ms": 1781690400000,
+              "updated_at_ms": 1781690460000
+            }
+          ],
+          "updated_at": "2026-06-17T10:01:00Z",
+          "warnings": [
+            {
+              "detail": "could not resolve host: github.com",
+              "kind": "fetch",
+              "message": "git fetch failed"
+            },
+            {
+              "kind": "base_branch_fallback",
+              "message": "base branch main not found, using master"
+            },
+            {
+              "detail": "exit status: 1",
+              "kind": "setup_script",
+              "message": "setup script exited with status 1"
+            },
+            {
+              "detail": "timed out after 30s",
+              "kind": "hook",
+              "message": "post-create hook timed out"
+            }
+          ],
+          "worktree_path": "/workspace/project/.worktrees/feature-auth"
+        }
+      }
+    },
+    {
+      "method": "session.diff",
+      "result": {
+        "base": "main",
+        "diff": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        "truncated": false
+      }
+    },
+    {
+      "method": "session.policy.get",
+      "result": {
+        "retention": {
+          "enabled": true,
+          "lost_ttl_secs": 3600,
+          "max_removals_per_sweep": 25,
+          "sweep_interval_secs": 600,
+          "terminal_ttl_secs": 86400
+        }
+      }
+    },
+    {
+      "method": "session.policy.set",
+      "result": {
+        "retention": {
+          "enabled": true,
+          "lost_ttl_secs": 3600,
+          "max_removals_per_sweep": 25,
+          "sweep_interval_secs": 600,
+          "terminal_ttl_secs": 86400
+        }
+      }
+    },
+    {
+      "method": "session.retention.sweep",
+      "result": {
+        "dry_run": true,
+        "eligible": 3,
+        "examined": 5,
+        "failed": 0,
+        "held": 1,
+        "removed": 0,
+        "sessions": [
+          {
+            "age_secs": 90000,
+            "hold": "worktree_uncommitted",
+            "reason": "terminal",
+            "removed": false,
+            "session_id": "s-43",
+            "worktree_path": "/workspace/other/.worktrees/old"
+          },
+          {
+            "age_secs": 4000,
+            "reason": "lost",
+            "removed": false,
+            "session_id": "s-44"
+          }
+        ],
+        "worktrees_cleaned": 0,
+        "worktrees_failed": 0
+      }
+    },
+    {
+      "method": "integration.install",
+      "result": {
+        "installed": [
+          {
+            "agent": "claude",
+            "cleanup_incomplete": [
+              "/home/user/.claude/hooks/old.sh"
+            ],
+            "config_paths": [
+              "/home/user/.claude/settings.json"
+            ],
+            "hook_path": "/home/user/.claude/hooks/pohunek-agent-state.sh"
+          },
+          {
+            "agent": "codex",
+            "cleanup_incomplete": [],
+            "config_paths": [
+              "/home/user/.codex/hooks.json",
+              "/home/user/.codex/config.toml"
+            ],
+            "hook_path": "/home/user/.codex/pohunek-agent-state.sh"
+          }
+        ]
+      }
+    },
+    {
+      "method": "integration.status",
+      "result": {
+        "agents": [
+          {
+            "agent": "codex",
+            "available": true,
+            "expected_asset_paths": [
+              "/home/user/.codex/pohunek-agent-state.sh"
+            ],
+            "expected_version": 7,
+            "installed_version": null,
+            "present_asset_paths": [],
+            "recovery": "reinstall",
+            "registration_paths": [
+              "/home/user/.codex/hooks.json"
+            ],
+            "state": "outdated",
+            "warnings": [
+              "managed state hook is missing"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "method": "integration.uninstall",
+      "result": {
+        "uninstalled": [
+          {
+            "agent": "claude",
+            "cleanup_incomplete": [],
+            "preserved_paths": [],
+            "removed_paths": [
+              "/home/user/.claude/hooks/pohunek-agent-state.sh"
+            ],
+            "state": "removed",
+            "updated_paths": [
+              "/home/user/.claude/settings.json"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "method": "integration.doctor",
+      "result": {
+        "agents": [
+          {
+            "agent": "codex",
+            "findings": [
+              {
+                "code": "asset_missing",
+                "remediation": "run `pohunek integration install --agent codex`",
+                "severity": "error",
+                "summary": "managed state hook is missing"
+              },
+              {
+                "code": "agent_not_installed",
+                "severity": "info",
+                "summary": "agent not installed"
+              }
+            ],
+            "ok": false,
+            "status": {
+              "agent": "codex",
+              "available": true,
+              "expected_asset_paths": [
+                "/home/user/.codex/pohunek-agent-state.sh"
+              ],
+              "expected_version": 7,
+              "installed_version": null,
+              "present_asset_paths": [],
+              "recovery": "reinstall",
+              "registration_paths": [
+                "/home/user/.codex/hooks.json"
+              ],
+              "state": "outdated",
+              "warnings": [
+                "managed state hook is missing"
+              ]
+            }
+          }
+        ],
+        "ok": false
+      }
+    },
+    {
+      "method": "host.inspect",
+      "result": {
+        "daemon_version": "0.33.0",
+        "git_available": true,
+        "output_read_supported": true,
+        "protocol_version": 3,
+        "runtimes": [
+          {
+            "agent": "shell",
+            "agent_base": "shell",
+            "available": true
+          },
+          {
+            "agent": "codex",
+            "agent_base": "codex",
+            "available": true,
+            "path": "/usr/local/bin/codex"
+          },
+          {
+            "agent": "claude",
+            "agent_base": "claude",
+            "available": false
+          },
+          {
+            "agent": "hermes",
+            "agent_base": "hermes",
+            "available": true,
+            "path": "/usr/local/bin/hermes",
+            "supported": true,
+            "version": "0.20.0"
+          }
+        ],
+        "session_wait_supported": true,
+        "supported_agents": [
+          "shell",
+          "codex",
+          "claude",
+          "hermes"
+        ],
+        "terminal_read_supported": true,
+        "worktree_supported": true
+      }
+    },
+    {
+      "method": "assistant.materialize",
+      "result": {
+        "bundle_path": "/cache/pohunek/knowledge/v1",
+        "concepts": [
+          {
+            "changed_in": [
+              "0.2.0"
+            ],
+            "deprecated": {
+              "successor": "launcher-v2",
+              "version": "0.3.0"
+            },
+            "description": "How the assistant launch flow uses materialized knowledge.",
+            "id": "launcher",
+            "intents": [
+              "project",
+              "help"
+            ],
+            "since": "0.1.0",
+            "title": "Assistant launcher",
+            "type": "Guide"
+          },
+          {
+            "description": "Assistant architecture overview.",
+            "id": "architecture",
+            "title": "Architecture",
+            "type": "Concept"
+          }
+        ],
+        "content_hash": "sha256:abc123",
+        "snapshot_path": "/run/pohunek/assistant/launch-42/snapshot.json",
+        "version": "0.33.0"
+      }
+    },
+    {
+      "method": "daemon.doctor",
+      "result": {
+        "report": {
+          "checks": [
+            {
+              "detail": "found at /usr/bin/git",
+              "name": "bin:git",
+              "status": "ok"
+            },
+            {
+              "detail": "'codex' not found on PATH",
+              "name": "bin:codex",
+              "status": "warn"
+            }
+          ],
+          "overall": "warn"
+        }
+      }
+    },
+    {
+      "method": "host.discover",
+      "result": [
+        {
+          "address": "100.92.30.40",
+          "classification": "reachable_daemon",
+          "daemon_version": "0.33.0",
+          "fqdn": "host-b.netbird.cloud",
+          "name": "host-b",
+          "overlay": "netbird",
+          "peer_id": "100.92.30.40",
+          "port": 18722
+        },
+        {
+          "address": "100.92.30.41",
+          "classification": "version_mismatch",
+          "daemon_protocol_version": 2,
+          "fqdn": null,
+          "name": "host-c",
+          "overlay": "netbird",
+          "peer_id": null,
+          "port": 18722
+        },
+        {
+          "address": null,
+          "classification": "unreachable",
+          "fqdn": null,
+          "name": null,
+          "overlay": "netbird",
+          "peer_id": "100.92.30.42",
+          "port": 18722
+        },
+        {
+          "address": "100.92.30.43",
+          "classification": "candidate",
+          "fqdn": "host-e.netbird.cloud",
+          "name": "host-e",
+          "overlay": "netbird",
+          "peer_id": "100.92.30.43",
+          "port": 18722
+        }
+      ]
+    },
+    {
+      "method": "notification.create",
+      "result": {
+        "created": true,
+        "record": {
+          "acked_at": "2026-07-03T09:02:00Z",
+          "agent_kind": "codex",
+          "archived_at": "2026-07-03T09:03:00Z",
+          "body": "Codex is waiting for a tool approval.",
+          "created_at": "2026-07-03T09:00:00Z",
+          "dedupe_key": "approval:s-42",
+          "deleted_at": "2026-07-03T09:04:00Z",
+          "id": "n-42",
+          "kind": "approval_required",
+          "metadata": {
+            "tool": "bash"
+          },
+          "project_id": "p-7",
+          "read_at": "2026-07-03T09:01:00Z",
+          "session_id": "s-42",
+          "severity": "action_required",
+          "source": {
+            "host_local_source_id": "hook-42",
+            "provider": "codex",
+            "provider_event": "PermissionRequest"
+          },
+          "source_id": "src-1",
+          "status": "acknowledged",
+          "superseded_by": "n-43",
+          "title": "Approval required"
+        }
+      }
+    },
+    {
+      "method": "notification.list",
+      "result": {
+        "next_cursor": "page-3",
+        "notifications": [
+          {
+            "acked_at": "2026-07-03T09:02:00Z",
+            "agent_kind": "codex",
+            "archived_at": "2026-07-03T09:03:00Z",
+            "body": "Codex is waiting for a tool approval.",
+            "created_at": "2026-07-03T09:00:00Z",
+            "dedupe_key": "approval:s-42",
+            "deleted_at": "2026-07-03T09:04:00Z",
+            "id": "n-42",
+            "kind": "approval_required",
+            "metadata": {
+              "tool": "bash"
+            },
+            "project_id": "p-7",
+            "read_at": "2026-07-03T09:01:00Z",
+            "session_id": "s-42",
+            "severity": "action_required",
+            "source": {
+              "host_local_source_id": "hook-42",
+              "provider": "codex",
+              "provider_event": "PermissionRequest"
+            },
+            "source_id": "src-1",
+            "status": "acknowledged",
+            "superseded_by": "n-43",
+            "title": "Approval required"
+          }
+        ]
+      }
+    },
+    {
+      "method": "notification.update",
+      "result": {
+        "record": {
+          "acked_at": "2026-07-03T09:02:00Z",
+          "agent_kind": "codex",
+          "archived_at": "2026-07-03T09:03:00Z",
+          "body": "Codex is waiting for a tool approval.",
+          "created_at": "2026-07-03T09:00:00Z",
+          "dedupe_key": "approval:s-42",
+          "deleted_at": "2026-07-03T09:04:00Z",
+          "id": "n-42",
+          "kind": "approval_required",
+          "metadata": {
+            "tool": "bash"
+          },
+          "project_id": "p-7",
+          "read_at": "2026-07-03T09:01:00Z",
+          "session_id": "s-42",
+          "severity": "action_required",
+          "source": {
+            "host_local_source_id": "hook-42",
+            "provider": "codex",
+            "provider_event": "PermissionRequest"
+          },
+          "source_id": "src-1",
+          "status": "acknowledged",
+          "superseded_by": "n-43",
+          "title": "Approval required"
+        }
+      }
+    },
+    {
+      "method": "notification.delete",
+      "result": {
+        "deleted": true,
+        "id": "n-42"
+      }
+    },
+    {
+      "method": "notification.policy.get",
+      "result": {
+        "policy": {
+          "attention_debounce_secs": 7,
+          "attention_dedupe_window_secs": 90,
+          "enabled": {
+            "agent_blocked": true,
+            "approval_required": true,
+            "error": true,
+            "session_finished": false,
+            "system": false,
+            "turn_completed": false
+          },
+          "providers": {
+            "claude": {
+              "agent_blocked": true,
+              "approval_required": true,
+              "error": true,
+              "session_finished": false,
+              "system": false,
+              "turn_completed": true
+            },
+            "codex": {
+              "agent_blocked": true,
+              "approval_required": true,
+              "error": true,
+              "session_finished": false,
+              "system": true,
+              "turn_completed": false
+            }
+          },
+          "retention": {
+            "archived_ttl_secs": 2592000,
+            "compaction_min_actions": 100,
+            "info_ttl_secs": 86400,
+            "resolved_attention_ttl_secs": 604800,
+            "resolved_error_ttl_secs": 1209600,
+            "sweep_interval_secs": 3600,
+            "warning_ttl_secs": 172800
+          }
+        }
+      }
+    },
+    {
+      "method": "notification.policy.set",
+      "result": {
+        "policy": {
+          "attention_debounce_secs": 7,
+          "attention_dedupe_window_secs": 90,
+          "enabled": {
+            "agent_blocked": true,
+            "approval_required": true,
+            "error": true,
+            "session_finished": false,
+            "system": false,
+            "turn_completed": false
+          },
+          "providers": {
+            "claude": {
+              "agent_blocked": true,
+              "approval_required": true,
+              "error": true,
+              "session_finished": false,
+              "system": false,
+              "turn_completed": true
+            },
+            "codex": {
+              "agent_blocked": true,
+              "approval_required": true,
+              "error": true,
+              "session_finished": false,
+              "system": true,
+              "turn_completed": false
+            }
+          },
+          "retention": {
+            "archived_ttl_secs": 2592000,
+            "compaction_min_actions": 100,
+            "info_ttl_secs": 86400,
+            "resolved_attention_ttl_secs": 604800,
+            "resolved_error_ttl_secs": 1209600,
+            "sweep_interval_secs": 3600,
+            "warning_ttl_secs": 172800
+          }
+        }
+      }
+    },
+    {
+      "method": "notification.retention.prune",
+      "result": {
+        "dry_run": true,
+        "pruned": [
+          "n-1",
+          "n-2"
+        ]
+      }
+    },
+    {
+      "method": "project.list",
+      "result": [
+        {
+          "added_at": "2026-06-01T08:00:00Z",
+          "default_base_branch": "main",
+          "git_common_dir": "/workspace/project/.git",
+          "id": "p-7",
+          "is_bare": false,
+          "label": "project",
+          "last_used_at": "2026-06-17T10:00:00Z",
+          "origin_url": "git@github.com:example/project.git",
+          "repo_root": "/workspace/project",
+          "source": "manual"
+        }
+      ]
+    },
+    {
+      "method": "project.add",
+      "result": {
+        "added_at": "2026-06-01T08:00:00Z",
+        "default_base_branch": "main",
+        "git_common_dir": "/workspace/project/.git",
+        "id": "p-7",
+        "is_bare": false,
+        "label": "project",
+        "last_used_at": "2026-06-17T10:00:00Z",
+        "origin_url": "git@github.com:example/project.git",
+        "repo_root": "/workspace/project",
+        "source": "manual"
+      }
+    },
+    {
+      "method": "project.show",
+      "result": {
+        "project": {
+          "added_at": "2026-06-01T08:00:00Z",
+          "default_base_branch": "main",
+          "git_common_dir": "/workspace/project/.git",
+          "id": "p-7",
+          "is_bare": false,
+          "label": "project",
+          "last_used_at": "2026-06-17T10:00:00Z",
+          "origin_url": "git@github.com:example/project.git",
+          "repo_root": "/workspace/project",
+          "source": "manual"
+        },
+        "worktrees": [
+          {
+            "bare": false,
+            "branch": "feature/auth",
+            "head": "0123456789abcdef0123456789abcdef01234567",
+            "locked": false,
+            "owned": true,
+            "path": "/workspace/project/.worktrees/feature-auth",
+            "session_id": "s-42"
+          },
+          {
+            "bare": false,
+            "locked": true,
+            "owned": false,
+            "path": "/workspace/project"
+          }
+        ]
+      }
+    },
+    {
+      "method": "project.rename",
+      "result": {
+        "added_at": "2026-06-01T08:00:00Z",
+        "default_base_branch": "main",
+        "git_common_dir": "/workspace/project/.git",
+        "id": "p-7",
+        "is_bare": false,
+        "label": "project",
+        "last_used_at": "2026-06-17T10:00:00Z",
+        "origin_url": "git@github.com:example/project.git",
+        "repo_root": "/workspace/project",
+        "source": "manual"
+      }
+    },
+    {
+      "method": "project.remove",
+      "result": {
+        "pruned_worktrees": 2,
+        "removed": true,
+        "skipped_worktrees": [
+          "/workspace/project/.worktrees/dirty"
+        ]
+      }
+    },
+    {
+      "method": "project.prompt",
+      "result": {
+        "content": "Process ${title}\n\n${body}",
+        "layer": "in_repo",
+        "name": "issue"
+      }
+    },
+    {
+      "method": "project.action",
+      "result": {
+        "agent": "codex",
+        "base_branch": "main",
+        "branch": "feature/static",
+        "prompt_content": "Review ${title}\n\n${body}",
+        "prompt_name": "pr-review",
+        "provider": "github_pr"
+      }
+    },
+    {
+      "method": "project.actions",
+      "result": {
+        "actions": [
+          {
+            "layer": "host",
+            "name": "issue",
+            "provider": "linear_issue",
+            "template": "linear"
+          },
+          {
+            "layer": "in_repo",
+            "name": "review-pr",
+            "provider": "github_pr",
+            "template": "github"
+          },
+          {
+            "layer": "host",
+            "name": "task",
+            "provider": "none",
+            "template": "plain"
+          }
+        ]
+      }
+    },
+    {
+      "method": "worktree.remove",
+      "result": {
+        "removed": true
+      }
+    }
+  ],
+  "protocol_version": 3,
+  "release": "v0.33.0"
+}

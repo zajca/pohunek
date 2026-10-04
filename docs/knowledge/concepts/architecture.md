@@ -33,8 +33,9 @@ knowledge bundle materialized on the host that runs the agent.
 
 All shipped clients use the same public protocol v4. Each request advertises an
 inclusive `minimum`/`maximum` version range; the first response selects the
-highest overlap for that connection. The old integer-v1 request envelope is not
-accepted. Waiting observation calls open dedicated connections so they do not
+highest overlap for that connection. A daemon accepts its own version and the
+previous one (`3..=4` today) through shape-only adapters, while clients advertise
+only their own version. The old integer-v1 request envelope is not accepted. Waiting observation calls open dedicated connections so they do not
 block the caller's ordinary control connection.
 
 The shipped platform foundation centralizes target-neutral process identity,
@@ -114,7 +115,8 @@ Pohunek core ships no user interface. GUIs, the web control center, and desktop
 launchers are external clients developed in `zajca/pohunek-work`. They use public
 contracts only: the CLI with `--json`, or the public protocol through the Rust
 crates (pinned by git tag) and the TypeScript SDK (release tarballs pinned by URL
-and integrity). They move in lockstep with the protocol version, and the core
+and integrity). They pin the protocol version they were built against (a daemon also serves the
+previous version), and the core
 crates they link are a pinned, not a stable, API. Issue and PR providers live
 only in `zajca/pohunek-work`.
 

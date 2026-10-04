@@ -155,8 +155,10 @@ versioned SDKs. The Rust crates are pinned by git tag; the TypeScript SDK is
 pinned by release-tarball URL and integrity. The core crates a Rust client links
 (`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`, `assistant`)
 are a pinned, not a stable, API: they stay pre-1.0 with no back-compat shims.
-External UIs move in lockstep with `PROTOCOL_VERSION`, because the TypeScript SDK
-handshake requires the daemon's exact protocol version. Methods only UI clients
+External UIs pin the `PROTOCOL_VERSION` they were built against, because the
+TypeScript SDK handshake requires the version negotiated for its connection to
+equal its own; a daemon one release newer still serves them through the protocol
+window (see "Protocol versioning"). Methods only UI clients
 call (`host.discover`, `worktree.remove`) are still public obligations with
 server-side contract tests in core (`docs/public-api.md`, "External clients").
 Issue and PR providers (Linear, GitHub) are client concerns and never enter
@@ -505,6 +507,56 @@ common version instead of requiring exact maximum-version equality.
 The bounded N-1 rule that governs those later overlaps is the
 [upgrade window](#upgrade-window) below.
 
+#### Protocol window and edge adapters
+
+A daemon of release N negotiates `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION`
+(`SUPPORTED_PROTOCOL_VERSIONS`) with the minimum one below the maximum, so it
+serves release N-1's public protocol next to its own (today `3..=4`). Clients
+advertise only `CLIENT_PROTOCOL_VERSIONS`, exactly `PROTOCOL_VERSION`, because
+they carry no adapters: a current client against a daemon that only speaks the
+older version gets `daemon/version_mismatch` instead of a payload it would
+decode wrongly (new clients against an N-1 daemon on another host are
+[#527](https://github.com/zajca/pohunek/issues/527)).
+
+Core types describe only the current wire shape. `crates/protocol/src/compat/`
+holds one adapter module per older version in the window (`v3`). An adapter
+translates by shape only: renames and moved fields at typed locations (free-form
+values such as session metadata are never walked), plus withholding what the
+older version cannot decode (events it never defined, enum values such as
+warning kinds it never knew). The daemon applies it at two choke points:
+`handle_request` upgrades the request parameters and downgrades the response,
+and the subscription writer downgrades every event for its own connection,
+because the negotiated version is fixed for the connection's life. Handlers and
+the event bus only ever see the current shape. `daemon.health` and
+`host.inspect` report the version negotiated for the asking connection, which is
+what an N-1 SDK handshake compares with its own version.
+
+Two rules keep the window bounded:
+
+- **Semantic change rule.** An adapter cannot paper over a change of meaning: a
+  new required parameter, a removed method or event, a changed error code or
+  changed behavior behind an unchanged name. Such a change raises
+  `MIN_PROTOCOL_VERSION` to `PROTOCOL_VERSION` in the same bump, no adapter is
+  written for the version it strands, and the release notes announce the break.
+  Additive changes (optional fields, new methods, new error codes) need no
+  bump; an event or enum value new to the daemon is withheld from an older
+  subscriber by the adapter's known-event and known-value lists.
+- **Adapter deletion rule.** A `PROTOCOL_VERSION` bump deletes the oldest
+  adapter and its fixtures in the same change and adds the adapter for the
+  version being left behind.
+
+Golden fixtures for every method and event family live under
+`crates/protocol/tests/fixtures/compat/v<N-1>/`; consumer recordings (CLI,
+TypeScript SDK, Hermes plugin, managed hooks) live under
+`crates/daemon/tests/fixtures/compat/v<N-1>/consumers/`. They are serialized or
+recorded by the previous release's own code, never written by hand;
+`generator/golden_v3.rs.txt` shows how to regenerate them from a checkout of the
+previous tag. `crates/protocol/tests/compat_v3.rs` fails when a method or event
+has no fixture, when a current type stops decoding a renamed fixture, or when the
+adapter and an independent blind rename of the fixture disagree. The real-daemon
+test `crates/daemon/tests/protocol_window.rs` replays the recordings and checks
+the per-connection shapes.
+
 The accepted relay path is a coordinated public protocol v4 cutover owned by
 [#70](https://github.com/zajca/pohunek/issues/70). Inside userspace WireGuard,
 the host opens a TCP control link and serves typed NDJSON requests from the
@@ -536,10 +588,12 @@ states the contract and then the current state.
   is `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the
   maximum. An adapter translates shape only. A semantic change raises
   `MIN_PROTOCOL_VERSION` as well and is an announced break. The oldest adapter
-  is deleted on the next bump. The current state: no adapters exist and
-  `MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`, so the supported public
-  window is `4..=4` and every peer must upgrade in one pass. The adapters are
-  delivered by [#526](https://github.com/zajca/pohunek/issues/526).
+  is deleted on the next bump. The current state: the
+  daemon accepts `3..=4` through the `v3` adapter while clients advertise only
+  `4..=4`; a new client against an N-1 daemon is refused, so hosts still
+  upgrade in one pass for that direction
+  ([#527](https://github.com/zajca/pohunek/issues/527)). Mechanics, rules and
+  fixtures are under "Protocol window and edge adapters" above.
 - **Persisted daemon state.** Migrates from any older kept schema (see below).
 
 Everything else stays unshimmed. A record that cannot be migrated or adopted is

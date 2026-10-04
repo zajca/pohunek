@@ -24,7 +24,7 @@ use protocol::{
     method, AttachHeader, HostCapabilities, Request as ProtocolRequest, Response,
     SessionAttachParams, SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId,
     SessionInfo, SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionState, SessionStopResult, PROTOCOL_VERSION,
+    SessionNewParams, SessionState, SessionStopResult, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -751,29 +751,57 @@ async fn version_mismatch_over_tcp_is_rejected_with_the_daemon_version() {
 }
 
 #[tokio::test]
-async fn a_protocol_three_client_is_rejected_with_the_typed_version_error() {
-    // A client still speaking the previous public protocol (`runtime_id`
-    // spelling) gets the typed mismatch error and the daemon's own version
-    // before any method runs, never a payload it could misread.
+async fn a_client_of_the_previous_protocol_is_served_in_its_own_version_over_tcp() {
+    // The overlay listener shares the daemon's dispatch, so a client of the
+    // previous public protocol is answered at its own version, not rejected.
     let (addr, _socket, shutdown, handle) =
-        spawn_dual_servers("remote-protocol-three-client", "0.0.0", shell_config()).await;
+        spawn_dual_servers("remote-previous-protocol-client", "0.0.0", shell_config()).await;
 
     let mut client = connect_tcp(addr).await;
-    let previous = PROTOCOL_VERSION.get() - 1;
-    assert_eq!(previous, 3);
+    let previous = MIN_PROTOCOL_VERSION.get();
+    assert_eq!(previous + 1, PROTOCOL_VERSION.get());
     let request: ProtocolRequest = serde_json::from_value(serde_json::json!({
         "v": {"minimum": previous, "maximum": previous},
-        "id": "old-client",
+        "id": "previous-client",
         "method": method::SESSION_LIST,
         "params": {}
     }))
     .expect("valid previous-version request range");
 
     let response = exchange(&mut client, &request).await;
+    assert_eq!(response.version().get(), previous);
+    let listed = response
+        .into_result()
+        .expect("a client of the previous protocol is accepted");
+    assert!(listed.is_array(), "{listed}");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
+async fn a_client_older_than_the_window_is_rejected_with_the_typed_version_error() {
+    // A client two public versions back gets the typed mismatch error and the
+    // daemon's own version before any method runs, never a payload it could
+    // misread.
+    let (addr, _socket, shutdown, handle) =
+        spawn_dual_servers("remote-protocol-below-window", "0.0.0", shell_config()).await;
+
+    let mut client = connect_tcp(addr).await;
+    let below = MIN_PROTOCOL_VERSION.get() - 1;
+    let request: ProtocolRequest = serde_json::from_value(serde_json::json!({
+        "v": {"minimum": below, "maximum": below},
+        "id": "old-client",
+        "method": method::SESSION_LIST,
+        "params": {}
+    }))
+    .expect("valid below-window request range");
+
+    let response = exchange(&mut client, &request).await;
     assert_eq!(response.version(), PROTOCOL_VERSION);
     let err = response
         .into_result()
-        .expect_err("a protocol 3 client must be rejected");
+        .expect_err("a client below the window must be rejected");
     assert_eq!(err.code, "version_mismatch");
     assert!(err.recover.is_some(), "the error carries a recovery hint");
 

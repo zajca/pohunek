@@ -4,7 +4,7 @@
 //! command supports `--json` where the plan calls for machine-readable output
 //! (see `docs/plan-phase-1.md` "CLI Grammar").
 
-use protocol::{ProtocolError, Request, SUPPORTED_PROTOCOL_VERSIONS};
+use protocol::{ProtocolError, Request, CLIENT_PROTOCOL_VERSIONS};
 use serde::Serialize;
 
 use crate::error::CliError;
@@ -37,7 +37,7 @@ pub(crate) mod setup;
 pub(crate) fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, CliError> {
     render_json_document(&JsonEnvelope {
         cli_version: env!("CARGO_PKG_VERSION"),
-        protocol: SUPPORTED_PROTOCOL_VERSIONS,
+        protocol: CLIENT_PROTOCOL_VERSIONS,
         ok: Some(value),
         err: None,
     })
@@ -47,7 +47,7 @@ pub(crate) fn render_json<T: Serialize + ?Sized>(value: &T) -> Result<String, Cl
 pub(crate) fn render_json_error(error: &ProtocolError) -> Result<String, CliError> {
     render_json_document(&JsonEnvelope::<()> {
         cli_version: env!("CARGO_PKG_VERSION"),
-        protocol: SUPPORTED_PROTOCOL_VERSIONS,
+        protocol: CLIENT_PROTOCOL_VERSIONS,
         ok: None,
         err: Some(error),
     })

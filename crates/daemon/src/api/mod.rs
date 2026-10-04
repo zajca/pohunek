@@ -949,18 +949,14 @@ where
                 Some(Ok(_)) => {}
             },
             evt = session_events.recv() => match evt {
-                Ok(event) => {
-                    send_event_line(framed, &event.with_version(version)).await?;
-                }
+                Ok(event) => forward_event(framed, event, version).await?,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             evt = notification_events.recv() => match evt {
-                Ok(event) => {
-                    send_event_line(framed, &event.with_version(version)).await?;
-                }
+                Ok(event) => forward_event(framed, event, version).await?,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "event subscriber lagged; some events were dropped");
                 }
@@ -969,6 +965,38 @@ where
         }
     }
     Ok(())
+}
+
+/// Writes `event` in the shape of the connection's negotiated `version`.
+///
+/// An event the version never defined is not sent. An event that cannot be
+/// expressed in the version is logged and skipped so one bad event does not end
+/// the subscription.
+async fn forward_event<S>(
+    framed: &mut Framed<S, LinesCodec>,
+    event: Event,
+    version: protocol::ProtocolVersion,
+) -> Result<(), io::Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if version == protocol::PROTOCOL_VERSION {
+        return send_event_line(framed, &event.with_version(version)).await;
+    }
+    let name = event.event().to_owned();
+    match protocol::compat::downgrade_event(event, version) {
+        Ok(Some(adapted)) => send_event_line(framed, &adapted).await,
+        Ok(None) => Ok(()),
+        Err(error) => {
+            error!(
+                event = %name,
+                protocol_version = version.get(),
+                %error,
+                "event cannot be expressed in the negotiated protocol version; skipped"
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn send_event_line<S>(

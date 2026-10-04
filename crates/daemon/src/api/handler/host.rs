@@ -4,7 +4,7 @@ use protocol::{HostDiscoverParams, Request, Response};
 
 use super::util::error_value;
 
-use super::util::{ok_value, parse_optional_params};
+use super::util::{ok_value, parse_optional_params, selected_version};
 use super::HealthInfo;
 use crate::discovery::DiscoveryCache;
 use crate::session::SessionRegistry;
@@ -14,16 +14,17 @@ use crate::session::SessionRegistry;
 /// The snapshot is built fresh on each request (agent runtimes are probed
 /// against `PATH`), so it always reflects the host as it is now. Transport
 /// agnostic: the same handler answers over the local Unix socket and over a
-/// `NetBird` TCP connection.
+/// `NetBird` TCP connection. The reported protocol version is the one this
+/// connection negotiated.
 pub(super) fn handle_host_inspect(
     request: &Request,
     health: &HealthInfo,
     sessions: &SessionRegistry,
 ) -> Response {
-    ok_value(
-        request,
-        &crate::capabilities::host_capabilities(&health.daemon_version, sessions.profiles()),
-    )
+    let mut capabilities =
+        crate::capabilities::host_capabilities(&health.daemon_version, sessions.profiles());
+    capabilities.protocol_version = selected_version(request);
+    ok_value(request, &capabilities)
 }
 
 /// `host.discover`: enumerate `NetBird` peers and classify each daemon.

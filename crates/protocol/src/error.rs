@@ -13,7 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{runtime_id::RuntimeId, version::ProtocolVersionRange};
+use crate::{
+    runtime_id::RuntimeId,
+    version::{ProtocolVersion, ProtocolVersionRange},
+};
 
 /// Broad error category for a control-protocol error.
 ///
@@ -107,6 +110,24 @@ impl ProtocolError {
                 client.minimum(), client.maximum(), daemon.minimum(), daemon.maximum()
             ),
             Some("upgrade the older side so the client and daemon support an overlapping protocol version".to_owned()),
+        )
+    }
+
+    /// The canonical `daemon/version_adapter_failed` error.
+    ///
+    /// The daemon could not express a payload in the older protocol version the
+    /// connection negotiated. The message names only the version, never the
+    /// payload. Code is stable: `version_adapter_failed`.
+    #[must_use]
+    pub fn version_adapter_failed(version: ProtocolVersion) -> Self {
+        Self::new(
+            ErrorClass::Daemon,
+            "version_adapter_failed",
+            format!("the daemon cannot express this payload in protocol version {version}"),
+            Some(
+                "upgrade the client to a build that speaks the daemon's current protocol version"
+                    .to_owned(),
+            ),
         )
     }
 

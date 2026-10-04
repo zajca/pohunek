@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, type ProtocolEvent } from "@pohunek/protocol";
+import { PROTOCOL_VERSION, CLIENT_PROTOCOL_VERSIONS, type ProtocolEvent } from "@pohunek/protocol";
 import {
   Client,
   ClientError,
@@ -180,7 +180,7 @@ describe("Subscription", () => {
 
 function subscribeRequest(id: string): Request {
   return {
-    v: SUPPORTED_PROTOCOL_VERSIONS,
+    v: CLIENT_PROTOCOL_VERSIONS,
     id,
     method: "subscribe",
     params: null,

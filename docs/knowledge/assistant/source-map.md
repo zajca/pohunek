@@ -551,6 +551,8 @@ Protocol contracts and transport:
 - `crates/client/src/transport.rs`
 - `crates/paths/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
+- `crates/protocol/src/compat/mod.rs`
+- `crates/protocol/src/compat/v3.rs`
 - `crates/protocol/src/envelope.rs`
 - `crates/protocol/src/decimal.rs`
 - `crates/protocol/src/limits.rs`
@@ -564,6 +566,7 @@ Protocol contracts and transport:
 - `crates/protocol/src/integration.rs`
 - `crates/protocol/src/error.rs`
 - `crates/protocol/src/version.rs`
+- `crates/protocol/tests/compat_v3.rs`
 - `crates/protocol/tests/roundtrip.rs`
 - `crates/netbird/src/lib.rs`
 - `crates/netbird/src/status.rs`

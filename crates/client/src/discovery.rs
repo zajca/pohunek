@@ -12,8 +12,8 @@ use std::time::Duration;
 use futures::{stream, StreamExt as _};
 use overlay::{OverlayFailure, OverlayRegistry, RoutedPeer};
 use protocol::{
-    method, HostClass, HostRecord, Request, Response, MAX_CONTROL_LINE_BYTES,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    method, HostClass, HostRecord, Request, Response, CLIENT_PROTOCOL_VERSIONS,
+    MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -374,7 +374,7 @@ async fn read_line(
 
 fn classify_response(response: &Response) -> HostClass {
     let daemon_protocol_version = response.version().get();
-    if !SUPPORTED_PROTOCOL_VERSIONS.contains(response.version()) {
+    if !CLIENT_PROTOCOL_VERSIONS.contains(response.version()) {
         return HostClass::VersionMismatch {
             daemon_protocol_version,
         };

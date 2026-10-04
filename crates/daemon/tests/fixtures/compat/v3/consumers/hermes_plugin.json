@@ -1,0 +1,365 @@
+{
+  "release": "v0.33.0",
+  "commit": "e6fcf2377ba14a51d8e7de971c13e1e86a864134",
+  "consumer": "Hermes plugin (crates/cli/src/hermes_integration/assets/pohunek)",
+  "capture": "A throwaway python3 driver (not checked in) loads the v0.33.0 plugin package like tests/test_plugin_runtime.py does, builds HookReporter(env) with env {POHUNEK_ENV=1, POHUNEK_SESSION_ID=ses_0123456789abcdef, POHUNEK_RUNTIME_ID=rt-0123456789abcdef, POHUNEK_SOCKET_PATH=<capture socket>, POHUNEK_PROTOCOL_VERSION=3, POHUNEK_DAEMON_ID=daemon-0123456789ab} (no POHUNEK_WORKER_SOCKET_PATH, so the public fallback is used) and calls callbacks(reporter): on_session_start({session_id}), pre_llm_call, pre_approval_request, post_approval_response, post_llm_call, on_session_end({interrupted:true}), on_session_finalize against a throwaway python3 capture server (unix socket, one NDJSON request per line, logs the raw line, replies with a canned protocol-3 envelope {\"v\":3,\"id\":<echo>,\"ok\":...} so the consumer proceeds; not checked in) listening on $XDG_RUNTIME_DIR/pohunek/daemon.sock. `cli_invocations` come from Tools(policy, session).handlers() (policy mode full, pohunek_cli = a recorder script that appends sys.argv to a file) for pohunek_session_output/wait/get/screen; `args` is the tool input, `argv` the exact CLI argv the plugin built. Normalized values: the process pid (4242), its process start identity (1234567) and expires_at (2026-01-01T00:00:30Z) vary per run; request ids and sequences are deterministic and untouched.",
+  "requests": [
+    {
+      "label": "hermes on_session_start",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:1:report_native_id",
+        "method": "session.report_native_id",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "runtime_id": "rt-0123456789abcdef",
+          "agent": "hermes",
+          "pid": 4242,
+          "pid_start_identity": "1234567",
+          "sequence": "1",
+          "expires_at": "2026-01-01T00:00:30Z",
+          "native_session_id": "native-0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "hermes pre_llm_call",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:2:report_native_id",
+        "method": "session.report_native_id",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "runtime_id": "rt-0123456789abcdef",
+          "agent": "hermes",
+          "pid": 4242,
+          "pid_start_identity": "1234567",
+          "sequence": "2",
+          "expires_at": "2026-01-01T00:00:30Z",
+          "native_session_id": "native-0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "hermes pre_llm_call",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:3:report_agent",
+        "method": "session.report_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:hermes",
+          "agent": "hermes",
+          "activity": "working",
+          "seq": 3,
+          "pid": 4242
+        }
+      }
+    },
+    {
+      "label": "hermes pre_approval_request",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:4:report_agent",
+        "method": "session.report_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:hermes",
+          "agent": "hermes",
+          "activity": "blocked",
+          "seq": 4,
+          "pid": 4242
+        }
+      }
+    },
+    {
+      "label": "hermes pre_approval_request",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:4:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "hermes",
+            "provider_event": "approval_required",
+            "host_local_source_id": "daemon-0123456789ab"
+          },
+          "kind": "approval_required",
+          "severity": "action_required",
+          "title": "Hermes session update",
+          "body": "Hermes session activity changed.",
+          "metadata": {},
+          "session_id": "ses_0123456789abcdef",
+          "agent_kind": "hermes",
+          "dedupe_key": "attention:ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "hermes post_approval_response",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:5:report_agent",
+        "method": "session.report_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:hermes",
+          "agent": "hermes",
+          "activity": "working",
+          "seq": 5,
+          "pid": 4242
+        }
+      }
+    },
+    {
+      "label": "hermes post_llm_call",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:6:report_agent",
+        "method": "session.report_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:hermes",
+          "agent": "hermes",
+          "activity": "idle",
+          "seq": 6,
+          "pid": 4242
+        }
+      }
+    },
+    {
+      "label": "hermes post_llm_call",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:6:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "hermes",
+            "provider_event": "turn_completed",
+            "host_local_source_id": "daemon-0123456789ab"
+          },
+          "kind": "turn_completed",
+          "severity": "success",
+          "title": "Hermes session update",
+          "body": "Hermes session activity changed.",
+          "metadata": {},
+          "session_id": "ses_0123456789abcdef",
+          "agent_kind": "hermes",
+          "dedupe_key": "attention:ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "hermes on_session_end interrupted",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:7:report_agent",
+        "method": "session.report_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:hermes",
+          "agent": "hermes",
+          "activity": "idle",
+          "seq": 7,
+          "pid": 4242
+        }
+      }
+    },
+    {
+      "label": "hermes on_session_end interrupted",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:7:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "hermes",
+            "provider_event": "agent_blocked",
+            "host_local_source_id": "daemon-0123456789ab"
+          },
+          "kind": "agent_blocked",
+          "severity": "warning",
+          "title": "Hermes session update",
+          "body": "Hermes session activity changed.",
+          "metadata": {},
+          "session_id": "ses_0123456789abcdef",
+          "agent_kind": "hermes",
+          "dedupe_key": "attention:ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "hermes on_session_finalize",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hermes-hook:8:release_agent",
+        "method": "session.release_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:hermes",
+          "agent": "hermes",
+          "seq": 8
+        }
+      }
+    }
+  ],
+  "cli_invocations": [
+    {
+      "label": "pohunek_session_output runtime",
+      "tool": "pohunek_session_output",
+      "args": {
+        "session": "ses_0123456789abcdef",
+        "runtime_id": "rt-0123456789abcdef",
+        "runtime_generation": "1",
+        "after_offset": "0",
+        "max_bytes": 4096
+      },
+      "argv": [
+        "--host",
+        "local",
+        "session",
+        "output",
+        "--max-bytes",
+        "4096",
+        "--json",
+        "--runtime-id",
+        "rt-0123456789abcdef",
+        "--runtime-generation",
+        "1",
+        "--after-offset",
+        "0",
+        "--",
+        "ses_0123456789abcdef"
+      ]
+    },
+    {
+      "label": "pohunek_session_output runtime wait",
+      "tool": "pohunek_session_output",
+      "args": {
+        "session": "ses_0123456789abcdef",
+        "runtime_id": "rt-0123456789abcdef",
+        "runtime_generation": "1",
+        "after_offset": "0",
+        "wait_ms": 500
+      },
+      "argv": [
+        "--host",
+        "local",
+        "session",
+        "output",
+        "--max-bytes",
+        "16384",
+        "--json",
+        "--runtime-id",
+        "rt-0123456789abcdef",
+        "--runtime-generation",
+        "1",
+        "--after-offset",
+        "0",
+        "--wait-ms",
+        "500",
+        "--",
+        "ses_0123456789abcdef"
+      ]
+    },
+    {
+      "label": "pohunek_session_wait runtime",
+      "tool": "pohunek_session_wait",
+      "args": {
+        "session": "ses_0123456789abcdef",
+        "runtime_id": "rt-0123456789abcdef",
+        "runtime_generation": "1",
+        "after_output_offset": "0",
+        "states": [
+          "running"
+        ],
+        "timeout_ms": 1000
+      },
+      "argv": [
+        "--host",
+        "local",
+        "session",
+        "wait",
+        "--timeout-ms",
+        "1000",
+        "--json",
+        "--runtime-id",
+        "rt-0123456789abcdef",
+        "--runtime-generation",
+        "1",
+        "--after-output-offset",
+        "0",
+        "--state",
+        "running",
+        "--",
+        "ses_0123456789abcdef"
+      ]
+    },
+    {
+      "label": "pohunek_session_get",
+      "tool": "pohunek_session_get",
+      "args": {
+        "session": "ses_0123456789abcdef"
+      },
+      "argv": [
+        "--host",
+        "local",
+        "session",
+        "inspect",
+        "--json",
+        "--",
+        "ses_0123456789abcdef"
+      ]
+    },
+    {
+      "label": "pohunek_session_screen",
+      "tool": "pohunek_session_screen",
+      "args": {
+        "session": "ses_0123456789abcdef"
+      },
+      "argv": [
+        "--host",
+        "local",
+        "session",
+        "screen",
+        "--json",
+        "--",
+        "ses_0123456789abcdef"
+      ]
+    }
+  ]
+}
