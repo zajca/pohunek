@@ -9,8 +9,8 @@ use protocol::{
 };
 
 use super::{
-    BuiltinSource, DefinitionError, DefinitionOrigin, DefinitionParts, LaunchProgram,
-    RegistryError, RuntimeDefinition, RuntimeRegistry, RuntimeSource, SourceTrust,
+    BuiltinSource, DefinitionError, DefinitionInvariant, DefinitionOrigin, DefinitionParts,
+    LaunchProgram, RegistryError, RuntimeDefinition, RuntimeRegistry, RuntimeSource, SourceTrust,
     RESERVED_RUNTIME_IDS,
 };
 use crate::agent::{
@@ -489,6 +489,10 @@ fn inventory_is_ordered_and_complete() {
 #[test]
 fn reserved_ids_cannot_be_claimed_by_other_sources() {
     for reserved in RESERVED_RUNTIME_IDS {
+        if reserved == RuntimeId::SHELL {
+            // The shell cannot even be constructed from a package.
+            continue;
+        }
         let source = FixedSource {
             trust: SourceTrust::External,
             definitions: vec![package_definition(reserved)],
@@ -562,7 +566,9 @@ fn definitions_reject_unsafe_launch_text() {
     let build = |name: &str, args: Vec<String>| {
         RuntimeDefinition::new(DefinitionParts {
             runtime_id: id("demo"),
-            origin: DefinitionOrigin::Builtin { package: None },
+            origin: DefinitionOrigin::Builtin {
+                package: Some(package("pohunek.runtime.demo")),
+            },
             display_name: name.to_owned(),
             program: LaunchProgram::Fixed("demo".to_owned()),
             default_args: args,
@@ -609,7 +615,9 @@ fn definitions_reject_unsafe_launch_text() {
 fn builtin_parts() -> DefinitionParts {
     DefinitionParts {
         runtime_id: id("demo"),
-        origin: DefinitionOrigin::Builtin { package: None },
+        origin: DefinitionOrigin::Builtin {
+            package: Some(package("pohunek.runtime.demo")),
+        },
         display_name: "Demo".to_owned(),
         program: LaunchProgram::Fixed("demo".to_owned()),
         default_args: Vec::new(),
@@ -776,4 +784,85 @@ fn native_templates_are_bounded_on_every_path() {
         field_of(toml_args(super::MAX_LAUNCH_ARGS + 1)).0,
         "resume.args"
     );
+}
+
+#[test]
+fn shell_and_package_identity_invariants_are_enforced() {
+    let invariant = |parts: DefinitionParts| match RuntimeDefinition::new(parts) {
+        Err(DefinitionError::Invariant(invariant)) => invariant,
+        other => panic!("expected an invariant error, got {other:?}"),
+    };
+    let host_shell = || LaunchProgram::HostShell("/bin/sh".to_owned());
+    let shell = |program: LaunchProgram, origin: DefinitionOrigin| DefinitionParts {
+        runtime_id: id("shell"),
+        origin,
+        program,
+        ..builtin_parts()
+    };
+    let packageless = || DefinitionOrigin::Builtin { package: None };
+
+    // The valid shell shape is accepted.
+    RuntimeDefinition::new(shell(host_shell(), packageless())).expect("valid shell");
+
+    assert_eq!(
+        invariant(DefinitionParts {
+            program: host_shell(),
+            ..builtin_parts()
+        }),
+        DefinitionInvariant::HostShellOnlyForShell
+    );
+    assert_eq!(
+        invariant(DefinitionParts {
+            program: host_shell(),
+            origin: package_origin(),
+            ..builtin_parts()
+        }),
+        DefinitionInvariant::HostShellOnlyForShell
+    );
+    assert_eq!(
+        invariant(DefinitionParts {
+            origin: packageless(),
+            ..builtin_parts()
+        }),
+        DefinitionInvariant::BuiltinRequiresPackage
+    );
+    assert_eq!(
+        invariant(shell(LaunchProgram::Fixed("sh".to_owned()), packageless())),
+        DefinitionInvariant::ShellRequiresHostShell
+    );
+    assert_eq!(
+        invariant(shell(host_shell(), package_origin())),
+        DefinitionInvariant::ShellIsPackageless
+    );
+    assert_eq!(
+        invariant(shell(
+            host_shell(),
+            DefinitionOrigin::Builtin {
+                package: Some(package("pohunek.runtime.shell"))
+            }
+        )),
+        DefinitionInvariant::ShellIsPackageless
+    );
+}
+
+fn package_origin() -> DefinitionOrigin {
+    DefinitionOrigin::Package {
+        package: package("acme.runtime"),
+        digest: PackageDigest::parse(DIGEST).expect("valid digest"),
+    }
+}
+
+#[test]
+fn builtin_digest_differs_for_different_programs() {
+    let digest = |program: &str| {
+        RuntimeDefinition::new(DefinitionParts {
+            program: LaunchProgram::Fixed(program.to_owned()),
+            ..builtin_parts()
+        })
+        .expect("valid")
+        .binding()
+        .clone()
+    };
+    assert_ne!(digest("demo"), digest("other"));
+    assert_eq!(digest("demo"), digest("demo"));
 }

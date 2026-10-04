@@ -100,6 +100,9 @@ pub enum DefinitionError {
         /// Underlying rule violation.
         source: BindingFieldError,
     },
+    /// Runtime id, program kind and origin contradict each other.
+    #[error("{0}")]
+    Invariant(DefinitionInvariant),
     /// A resume or fork template is invalid.
     #[error("{field}: {source}")]
     Native {
@@ -119,6 +122,23 @@ pub enum DefinitionError {
     /// `detect_manifest` names a manifest the source cannot provide.
     #[error("detect_manifest does not name an available detection manifest")]
     UnknownManifest,
+}
+
+/// A cross-field rule a runtime definition violates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DefinitionInvariant {
+    /// The host login shell is only valid for the shell runtime.
+    #[error("only the shell runtime may launch the host login shell")]
+    HostShellOnlyForShell,
+    /// The shell runtime must launch the host login shell.
+    #[error("the shell runtime must launch the host login shell")]
+    ShellRequiresHostShell,
+    /// The shell runtime has no package identity and is built in.
+    #[error("the shell runtime must be built in and carry no package identity")]
+    ShellIsPackageless,
+    /// A non-shell built-in runtime must name the package it stands for.
+    #[error("a built-in runtime other than the shell requires a package identity")]
+    BuiltinRequiresPackage,
 }
 
 /// The program a definition launches.
@@ -265,6 +285,7 @@ impl RuntimeDefinition {
             version_probe_parser,
             integration_handler,
         } = parts;
+        validate_identity_invariants(&runtime_id, &origin, &program)?;
         validate_label(&display_name, "runtime.name")?;
         validate_token(program.as_str(), "runtime.program")?;
         if let LaunchProgram::Fixed(program) = &program {
@@ -511,6 +532,32 @@ fn validate_token(value: &str, field: &'static str) -> Result<(), DefinitionErro
         });
     }
     Ok(())
+}
+
+/// Enforces the shell/non-shell cross-field rules.
+///
+/// The descriptor digest omits the host login shell, so the shell is the only
+/// definition allowed to use it; every other built-in launches a fixed program
+/// that the digest covers and names a package identity.
+fn validate_identity_invariants(
+    runtime_id: &RuntimeId,
+    origin: &DefinitionOrigin,
+    program: &LaunchProgram,
+) -> Result<(), DefinitionError> {
+    let is_shell = runtime_id.as_str() == RuntimeId::SHELL;
+    let host_shell = matches!(program, LaunchProgram::HostShell(_));
+    let invariant = if host_shell && !is_shell {
+        DefinitionInvariant::HostShellOnlyForShell
+    } else if is_shell && !host_shell {
+        DefinitionInvariant::ShellRequiresHostShell
+    } else if is_shell && !matches!(origin, DefinitionOrigin::Builtin { package: None }) {
+        DefinitionInvariant::ShellIsPackageless
+    } else if matches!(origin, DefinitionOrigin::Builtin { package: None }) && !is_shell {
+        DefinitionInvariant::BuiltinRequiresPackage
+    } else {
+        return Ok(());
+    };
+    Err(DefinitionError::Invariant(invariant))
 }
 
 /// Returns the delay in whole milliseconds, rejecting a delay the descriptor

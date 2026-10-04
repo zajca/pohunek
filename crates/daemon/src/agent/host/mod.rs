@@ -11,9 +11,9 @@ mod registry;
 
 pub use builtin::BuiltinSource;
 pub use definition::{
-    DefinitionError, DefinitionOrigin, DefinitionParts, HandlerId, LaunchProgram,
-    RuntimeDefinition, MAX_ARG_BYTES, MAX_DEFINITION_BYTES, MAX_LABEL_BYTES, MAX_LAUNCH_ARGS,
-    SUPPORTED_RUNTIME_API, SUPPORTED_SCHEMA,
+    DefinitionError, DefinitionInvariant, DefinitionOrigin, DefinitionParts, HandlerId,
+    LaunchProgram, RuntimeDefinition, MAX_ARG_BYTES, MAX_DEFINITION_BYTES, MAX_LABEL_BYTES,
+    MAX_LAUNCH_ARGS, SUPPORTED_RUNTIME_API, SUPPORTED_SCHEMA,
 };
 pub use registry::{
     InventoryEntry, RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust,
