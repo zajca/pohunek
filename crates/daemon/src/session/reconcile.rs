@@ -123,7 +123,8 @@ pub(super) struct JournalEvidence {
     worker_pid: u32,
     worker_start_identity: String,
     boot_identity: String,
-    runtime_id: Option<String>,
+    #[serde(rename = "runtime_id")]
+    worker_instance_id: Option<String>,
     child: Option<JournalChild>,
     cols: Option<u16>,
     rows: Option<u16>,
@@ -139,7 +140,7 @@ impl JournalEvidence {
         JournalWorker {
             pid: self.worker_pid,
             start_identity: &self.worker_start_identity,
-            runtime_id: self.runtime_id.as_deref(),
+            worker_instance_id: self.worker_instance_id.as_deref(),
         }
     }
 }
@@ -195,7 +196,10 @@ impl SessionRegistry {
         snapshot: &InspectSnapshot,
     ) -> WorkerMetadataApplyOutcome {
         let expected_worker_id = snapshot.worker_id.to_string();
-        let expected_runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
+        let expected_worker_instance_id = snapshot
+            .worker_instance_id
+            .as_ref()
+            .map(ToString::to_string);
         let mut memory_base = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(id) else {
@@ -205,7 +209,7 @@ impl SessionRegistry {
             if !worker_metadata_record_is_current(
                 &record,
                 &expected_worker_id,
-                expected_runtime_id.as_deref(),
+                expected_worker_instance_id.as_deref(),
             ) {
                 return WorkerMetadataApplyOutcome::Discarded;
             }
@@ -254,7 +258,7 @@ impl SessionRegistry {
         if !worker_metadata_record_is_current(
             &durable_base,
             &expected_worker_id,
-            expected_runtime_id.as_deref(),
+            expected_worker_instance_id.as_deref(),
         ) {
             return WorkerMetadataApplyOutcome::Discarded;
         }
@@ -297,7 +301,7 @@ impl SessionRegistry {
             if !worker_metadata_record_is_current(
                 &current,
                 &expected_worker_id,
-                expected_runtime_id.as_deref(),
+                expected_worker_instance_id.as_deref(),
             ) {
                 return WorkerMetadataApplyOutcome::Discarded;
             }
@@ -360,8 +364,12 @@ impl SessionRegistry {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
             let runtime = updated.1.runtime.as_ref().and_then(|runtime| {
-                runtime.runtime_id.as_ref().and_then(|runtime_id| {
-                    SessionRuntimeIdentity::new(runtime_id.clone(), runtime.runtime_generation).ok()
+                runtime.runtime_id.as_ref().and_then(|worker_instance_id| {
+                    SessionRuntimeIdentity::new(
+                        worker_instance_id.clone(),
+                        runtime.runtime_generation,
+                    )
+                    .ok()
                 })
             });
             for subagent in updated.2 {
@@ -861,7 +869,7 @@ impl SessionRegistry {
             }
             Unreachable::Ended {
                 journaled,
-                runtime_id,
+                worker_instance_id,
                 worker_start_identity,
             } => {
                 // The removal finalizer sweeps every runtime of the
@@ -871,12 +879,12 @@ impl SessionRegistry {
                         .finish_removal_intent(record, Some(&generation), lifecycle, retry)
                         .await;
                 }
-                // `runtime_id` is set only for a journaled worker proven gone;
+                // `worker_instance_id` is set only for a journaled worker proven gone;
                 // a generation that never journaled has nothing proven to
                 // sweep, so only its job is retired.
-                let cleanup = match runtime_id.as_deref() {
-                    Some(runtime_id) => {
-                        self.sweep_lost_runtime(&id.0, runtime_id, worker_start_identity)
+                let cleanup = match worker_instance_id.as_deref() {
+                    Some(worker_instance_id) => {
+                        self.sweep_lost_runtime(&id.0, worker_instance_id, worker_start_identity)
                             .await
                     }
                     None => Cleanup::Complete,
@@ -977,7 +985,7 @@ impl SessionRegistry {
             kind: crate::store::TransactionKind::Remove,
             phase: "requested".to_owned(),
             previous_worker_id: None,
-            previous_runtime_id: None,
+            previous_worker_instance_id: None,
             daemon_instance_id: None,
         });
         match self
@@ -1124,7 +1132,10 @@ impl SessionRegistry {
                     runtime_slot: session_id.to_owned(),
                     claimed_session_id: Some(session_id.to_owned()),
                     worker_id: Some(snapshot.worker_id.to_string()),
-                    runtime_id: snapshot.runtime_id.as_ref().map(ToString::to_string),
+                    runtime_id: snapshot
+                        .worker_instance_id
+                        .as_ref()
+                        .map(ToString::to_string),
                     status: RuntimeInventoryStatus::Managed,
                     reason: None,
                 });
@@ -1205,15 +1216,16 @@ impl SessionRegistry {
             }
             Unreachable::Ended {
                 journaled,
-                runtime_id,
+                worker_instance_id,
                 worker_start_identity,
             } => {
                 // Only a journaled worker whose process is proven gone proves
                 // which runtime died. Without a journal nothing proves what
                 // ran, so no process is swept; the ended job is still retired.
                 let cleanup = if journaled {
-                    let runtime_id = runtime_id.unwrap_or_else(|| expected.runtime_id.clone());
-                    self.sweep_lost_runtime(&id.0, &runtime_id, worker_start_identity)
+                    let worker_instance_id =
+                        worker_instance_id.unwrap_or_else(|| expected.worker_instance_id.clone());
+                    self.sweep_lost_runtime(&id.0, &worker_instance_id, worker_start_identity)
                         .await
                 } else {
                     Cleanup::Complete
@@ -1558,7 +1570,7 @@ impl SessionRegistry {
     /// Removal deletes the only record of the session's runtimes, and a
     /// descendant that left the worker's process group (launchd kills only
     /// the group) is reaped by nothing but the marker sweep. Every runtime
-    /// the record names (`runtime_id`) or a journal of `generation` records,
+    /// the record names (`worker_instance_id`) or a journal of `generation` records,
     /// terminal journals included, is swept ([`Self::sweep_lost_runtime`])
     /// with the start identity of the worker that journaled it; a runtime no
     /// journal records is swept without one, which counts every
@@ -1582,7 +1594,7 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         generation: Option<&super::Generation>,
-        runtime_id: Option<&str>,
+        worker_instance_id: Option<&str>,
         cleanup: UnconfirmedCleanup,
     ) -> Result<Vec<(UnconfirmedProcess, String)>, ProtocolError> {
         let ambiguous = |detail: String| {
@@ -1612,7 +1624,7 @@ impl SessionRegistry {
                 .filter(|journal| journal.generation == generation.generation())
             {
                 let worker = journal.worker();
-                let Some(journaled) = worker.runtime_id else {
+                let Some(journaled) = worker.worker_instance_id else {
                     continue;
                 };
                 // A malformed start identity proves no bystander foreign, so
@@ -1631,17 +1643,20 @@ impl SessionRegistry {
                 }
             }
         }
-        if let Some(runtime_id) = runtime_id {
-            if !runtimes.iter().any(|(known, _)| known == runtime_id) {
-                runtimes.push((runtime_id.to_owned(), None));
+        if let Some(worker_instance_id) = worker_instance_id {
+            if !runtimes
+                .iter()
+                .any(|(known, _)| known == worker_instance_id)
+            {
+                runtimes.push((worker_instance_id.to_owned(), None));
             }
         }
         // Each accepted process with the runtime that first listed it. The
         // caller logs them once the removal has completed.
         let mut accepted: Vec<(UnconfirmedProcess, String)> = Vec::new();
-        for (runtime_id, start) in runtimes {
+        for (worker_instance_id, start) in runtimes {
             let outcome = self
-                .sweep_lost_runtime_detailed(&id.0, &runtime_id, start)
+                .sweep_lost_runtime_detailed(&id.0, &worker_instance_id, start)
                 .await;
             if outcome.cleanup != Cleanup::Unconfirmed {
                 continue;
@@ -1649,7 +1664,7 @@ impl SessionRegistry {
             if cleanup == UnconfirmedCleanup::Accept && outcome.only_unreadable_candidates_blocked()
             {
                 for candidate in &outcome.unreadable {
-                    record_accepted_process(&mut accepted, candidate, &runtime_id);
+                    record_accepted_process(&mut accepted, candidate, &worker_instance_id);
                     // Stops at the first excess process so the work stays
                     // bounded however many candidates a host has.
                     if accepted.len() > MAX_ACCEPTED_UNCONFIRMED_PROCESSES {
@@ -1663,7 +1678,7 @@ impl SessionRegistry {
                 continue;
             }
             let mut error = ambiguous(format!(
-                "processes of runtime {runtime_id} are not proven gone"
+                "processes of runtime {worker_instance_id} are not proven gone"
             ));
             if outcome.only_unreadable_candidates_blocked() {
                 error.msg = format!(
@@ -1733,12 +1748,12 @@ impl SessionRegistry {
                 return true;
             }
         }
-        let runtime_id = record.runtime.runtime_id.clone();
+        let worker_instance_id = record.runtime.worker_instance_id.clone();
         match self
             .release_removed_session(
                 &id,
                 generation,
-                runtime_id.as_deref(),
+                worker_instance_id.as_deref(),
                 UnconfirmedCleanup::Refuse,
             )
             .await
@@ -1915,13 +1930,16 @@ impl SessionRegistry {
         record.info.state_source = StateSource::Process;
         record.runtime.state = RuntimeState::Terminal;
         record.runtime.worker_id = Some(evidence.worker_id.clone());
-        record.runtime.runtime_id.clone_from(&evidence.runtime_id);
+        record
+            .runtime
+            .worker_instance_id
+            .clone_from(&evidence.worker_instance_id);
         record.runtime.reason = None;
         record.info.runtime = Some(SessionRuntime {
             state: RuntimeState::Terminal,
             runtime_generation,
             worker_id: Some(evidence.worker_id),
-            runtime_id: evidence.runtime_id,
+            runtime_id: evidence.worker_instance_id,
             started_at: record
                 .info
                 .runtime
@@ -1990,9 +2008,9 @@ impl SessionRegistry {
             .is_some_and(|expected| expected != snapshot.worker_id.as_str())
             || record
                 .runtime
-                .runtime_id
+                .worker_instance_id
                 .as_deref()
-                .zip(snapshot.runtime_id.as_ref())
+                .zip(snapshot.worker_instance_id.as_ref())
                 .is_some_and(|(expected, actual)| expected != actual.as_str());
         if identity_conflict {
             self.insert_unavailable_record(
@@ -2185,7 +2203,7 @@ impl SessionRegistry {
                 worker_id: Some(candidate.snapshot.worker_id.to_string()),
                 runtime_id: candidate
                     .snapshot
-                    .runtime_id
+                    .worker_instance_id
                     .as_ref()
                     .map(ToString::to_string),
                 status,
@@ -2298,7 +2316,7 @@ impl SessionRegistry {
     ) {
         let native_recovery = record.transaction.as_ref().and_then(|transaction| {
             (transaction.kind == crate::store::TransactionKind::Recover)
-                .then(|| transaction.previous_runtime_id.clone())
+                .then(|| transaction.previous_worker_instance_id.clone())
         });
         let Some(child) = snapshot.child_process else {
             self.insert_unavailable_record(record, RuntimeState::Lost, "worker_child_missing")
@@ -2378,7 +2396,10 @@ impl SessionRegistry {
             }
         };
         let now = timestamp_now();
-        let runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
+        let worker_instance_id = snapshot
+            .worker_instance_id
+            .as_ref()
+            .map(ToString::to_string);
         let runtime_generation = record
             .info
             .runtime
@@ -2397,7 +2418,7 @@ impl SessionRegistry {
             state: RuntimeState::Live,
             runtime_generation,
             worker_id: Some(snapshot.worker_id.to_string()),
-            runtime_id: runtime_id.clone(),
+            runtime_id: worker_instance_id.clone(),
             started_at: record
                 .info
                 .runtime
@@ -2411,7 +2432,7 @@ impl SessionRegistry {
         record.transaction = None;
         record.runtime.state = RuntimeState::Live;
         record.runtime.worker_id = Some(snapshot.worker_id.to_string());
-        record.runtime.runtime_id = runtime_id;
+        record.runtime.worker_instance_id = worker_instance_id;
         record.runtime.reason = None;
 
         let recovery = record.recovery.clone();
@@ -2502,8 +2523,8 @@ impl SessionRegistry {
             );
         }
         self.spawn_worker_exit_watcher(id, worker, expected, runtime_watch_cancel);
-        if let Some(previous_runtime_id) = native_recovery {
-            self.emit_native_recovered(&info, previous_runtime_id);
+        if let Some(previous_worker_instance_id) = native_recovery {
+            self.emit_native_recovered(&info, previous_worker_instance_id);
         } else {
             self.emit(event::SESSION_RUNTIME_RECONNECTED, &info);
         }
@@ -2547,7 +2568,7 @@ impl SessionRegistry {
             state,
             runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: record.runtime.worker_id.clone(),
-            runtime_id: record.runtime.runtime_id.clone(),
+            runtime_id: record.runtime.worker_instance_id.clone(),
             started_at: None,
             last_connected_at: None,
             loss_reason: Some(reason.to_owned()),
@@ -2656,7 +2677,7 @@ impl SessionRegistry {
                         state: RuntimeState::Terminal,
                         runtime_generation: protocol::RuntimeGeneration::new(1),
                         worker_id: terminal.runtime.worker_id.clone(),
-                        runtime_id: terminal.runtime.runtime_id.clone(),
+                        runtime_id: terminal.runtime.worker_instance_id.clone(),
                         started_at: None,
                         last_connected_at: None,
                         loss_reason: None,
@@ -3001,7 +3022,7 @@ fn apply_identity_projection(
 pub(super) fn worker_metadata_record_is_current(
     record: &SessionRecord,
     worker_id: &str,
-    runtime_id: Option<&str>,
+    worker_instance_id: Option<&str>,
 ) -> bool {
     let Some(runtime) = record.info.runtime.as_ref() else {
         return false;
@@ -3011,10 +3032,10 @@ pub(super) fn worker_metadata_record_is_current(
         && record.info.state == SessionState::Running
         && runtime.state == RuntimeState::Live
         && runtime.worker_id.as_deref() == Some(worker_id)
-        && runtime.runtime_id.as_deref() == runtime_id
+        && runtime.runtime_id.as_deref() == worker_instance_id
         && record.runtime.state == RuntimeState::Live
         && record.runtime.worker_id.as_deref() == Some(worker_id)
-        && record.runtime.runtime_id.as_deref() == runtime_id
+        && record.runtime.worker_instance_id.as_deref() == worker_instance_id
 }
 
 fn metadata_write_failure_outcome(error: &ProtocolError) -> WorkerMetadataApplyOutcome {
@@ -3555,7 +3576,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
                 runtime: crate::store::RuntimeRecord {
                     state: runtime_state,
                     worker_id: None,
-                    runtime_id: None,
+                    worker_instance_id: None,
                     service_id: None,
                     generation: None,
                     executable: None,
@@ -3702,9 +3723,9 @@ fn classify_terminal_journals(
                 .is_none_or(|expected| expected == journal.worker_id)
             && record
                 .runtime
-                .runtime_id
+                .worker_instance_id
                 .as_deref()
-                .is_none_or(|expected| journal.runtime_id.as_deref() == Some(expected))
+                .is_none_or(|expected| journal.worker_instance_id.as_deref() == Some(expected))
     });
     match terminal.as_slice() {
         [journal] => TerminalJournalClassification::Exact(Box::new((*journal).clone())),
@@ -3860,9 +3881,9 @@ fn persisted_identity_mismatch(record: &SessionRecord, snapshot: &InspectSnapsho
         .is_some_and(|expected| expected != snapshot.worker_id.as_str())
         || record
             .runtime
-            .runtime_id
+            .worker_instance_id
             .as_deref()
-            .zip(snapshot.runtime_id.as_ref())
+            .zip(snapshot.worker_instance_id.as_ref())
             .is_some_and(|(expected, actual)| expected != actual.as_str())
 }
 
@@ -3935,9 +3956,9 @@ mod tests {
         ActiveIdentityClaim, ControlCode, ControlError, ControlMessage, ControlReader,
         ControlResponse, ControlWriter, Dimensions, Initialize, InitializeLimits, InspectSnapshot,
         LaunchIdentity, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
-        ResponseKind, RuntimeId, RuntimePhase as WorkerRuntimePhase, SecretEnv,
-        SessionId as WorkerSessionId, StopPolicy, SubagentPhase, SubagentSnapshot, TransactionId,
-        Version, WorkerId,
+        ResponseKind, RuntimePhase as WorkerRuntimePhase, SecretEnv, SessionId as WorkerSessionId,
+        StopPolicy, SubagentPhase, SubagentSnapshot, TransactionId, Version, WorkerId,
+        WorkerInstanceId,
     };
     use protocol::{
         AgentActivity, AgentKind, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
@@ -4461,7 +4482,7 @@ while os.getppid() == parent:
             worker_pid: 41,
             worker_start_identity: "410".to_owned(),
             boot_identity: "boot-test".to_owned(),
-            runtime_id: record.runtime.runtime_id.clone(),
+            worker_instance_id: record.runtime.worker_instance_id.clone(),
             child: Some(super::JournalChild { pid: 50 }),
             cols: Some(80),
             rows: Some(24),
@@ -4645,7 +4666,7 @@ while os.getppid() == parent:
         let runtime_root = root.join("runtime/workers");
         let session_id = "s-209";
         let worker_id = "worker-startup-identity-retry";
-        let (controller, runtime_id, child_pid, server_task, reporter) =
+        let (controller, worker_instance_id, child_pid, server_task, reporter) =
             spawn_initialized_worker_with_reporter(&root, &runtime_root, session_id, worker_id)
                 .await;
         let child = controller
@@ -4662,7 +4683,7 @@ while os.getppid() == parent:
                 &reporter,
                 serde_json::json!({
                     "type": "identity_report",
-                    "runtime_id": runtime_id.as_str(),
+                    "runtime_id": worker_instance_id.as_str(),
                     "provider": "codex",
                     "pid": child.pid,
                     "start_identity": child.start_identity,
@@ -4694,9 +4715,9 @@ while os.getppid() == parent:
         record.info.pid = child_pid;
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
         info_runtime.worker_id = Some(worker_id.to_owned());
-        info_runtime.runtime_id = Some(runtime_id.to_string());
+        info_runtime.runtime_id = Some(worker_instance_id.to_string());
         record.runtime.worker_id = Some(worker_id.to_owned());
-        record.runtime.runtime_id = Some(runtime_id.to_string());
+        record.runtime.worker_instance_id = Some(worker_instance_id.to_string());
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
         recovery.agent = "shell".to_owned();
@@ -4792,7 +4813,7 @@ while os.getppid() == parent:
         let runtime_root = root.join("runtime/workers");
         let session_id = "s-211";
         let worker_id = "worker-identity-subject-binding";
-        let (controller, runtime_id, _child_pid, server_task, reporters) =
+        let (controller, worker_instance_id, _child_pid, server_task, reporters) =
             spawn_initialized_worker_with_reporters(
                 &root,
                 &runtime_root,
@@ -4819,7 +4840,7 @@ while os.getppid() == parent:
                 .expect("format identity expiry");
             serde_json::json!({
                 "type": "identity_report",
-                "runtime_id": runtime_id.as_str(),
+                "runtime_id": worker_instance_id.as_str(),
                 "provider": "claude",
                 "pid": pid,
                 "start_identity": start_identity,
@@ -4897,7 +4918,7 @@ while os.getppid() == parent:
             descendant_release.display(),
             root_release.display(),
         );
-        let (controller, runtime_id, child_pid, server_task) =
+        let (controller, worker_instance_id, child_pid, server_task) =
             spawn_initialized_worker_with_command(
                 &root,
                 &runtime_root,
@@ -4921,7 +4942,7 @@ while os.getppid() == parent:
                 &reporter,
                 serde_json::json!({
                     "type": "identity_report",
-                    "runtime_id": runtime_id.as_str(),
+                    "runtime_id": worker_instance_id.as_str(),
                     "provider": "codex",
                     "pid": child.pid,
                     "start_identity": child.start_identity,
@@ -4949,11 +4970,11 @@ while os.getppid() == parent:
         record.info.native_session_id = Some("native-before-drain".to_owned());
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
         info_runtime.worker_id = Some(worker_id.to_owned());
-        info_runtime.runtime_id = Some(runtime_id.to_string());
+        info_runtime.runtime_id = Some(worker_instance_id.to_string());
         record.runtime.worker_id = Some(worker_id.to_owned());
-        record.runtime.runtime_id = Some(runtime_id.to_string());
+        record.runtime.worker_instance_id = Some(worker_instance_id.to_string());
         record.native_identity_ordering = Some(NativeIdentityOrdering {
-            runtime_id: runtime_id.to_string(),
+            worker_instance_id: worker_instance_id.to_string(),
             pid: child.pid,
             pid_start_identity: child.start_identity,
             sequence: 1,
@@ -5009,7 +5030,7 @@ while os.getppid() == parent:
             SessionId(session_id.to_owned()),
             Some(
                 protocol::SessionRuntimeIdentity::new(
-                    runtime_id.as_str(),
+                    worker_instance_id.as_str(),
                     protocol::RuntimeGeneration::new(1),
                 )
                 .expect("runtime identity"),
@@ -5101,7 +5122,7 @@ while os.getppid() == parent:
         );
         let released_pid_path = released.pid_path.clone();
         let reassert_pid_path = reassert.pid_path.clone();
-        let runtime_id = first_controller
+        let worker_instance_id = first_controller
             .initialize(Initialize {
                 session_id: wire_session_id,
                 transaction_id: TransactionId::new("create-restart-test").expect("transaction id"),
@@ -5145,7 +5166,7 @@ while os.getppid() == parent:
                 &released,
                 serde_json::json!({
                     "type": "identity_report",
-                    "runtime_id": runtime_id.as_str(),
+                    "runtime_id": worker_instance_id.as_str(),
                     "provider": "claude",
                     "pid": released_pid,
                     "start_identity": released_start,
@@ -5162,7 +5183,7 @@ while os.getppid() == parent:
                 &released,
                 serde_json::json!({
                     "type": "identity_release",
-                    "runtime_id": runtime_id.as_str(),
+                    "runtime_id": worker_instance_id.as_str(),
                     "provider": "claude",
                     "pid": released_pid,
                     "start_identity": released_start,
@@ -5191,7 +5212,7 @@ while os.getppid() == parent:
                 state: RuntimeState::Live,
                 runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: Some(worker_id.to_owned()),
-                runtime_id: Some(runtime_id.to_string()),
+                runtime_id: Some(worker_instance_id.to_string()),
                 started_at: Some(created_at.clone()),
                 last_connected_at: Some(created_at.clone()),
                 loss_reason: None,
@@ -5255,11 +5276,11 @@ while os.getppid() == parent:
                     kind: crate::store::TransactionKind::Create,
                     phase: "preparing".to_owned(),
                     previous_worker_id: None,
-                    previous_runtime_id: None,
+                    previous_worker_instance_id: None,
                     daemon_instance_id: None,
                 }),
                 native_identity_ordering: Some(NativeIdentityOrdering {
-                    runtime_id: runtime_id.to_string(),
+                    worker_instance_id: worker_instance_id.to_string(),
                     pid: child.pid,
                     pid_start_identity: child.start_identity,
                     sequence: 100,
@@ -5282,7 +5303,7 @@ while os.getppid() == parent:
                 runtime: RuntimeRecord {
                     state: RuntimeState::Starting,
                     worker_id: None,
-                    runtime_id: None,
+                    worker_instance_id: None,
                     service_id: Some(format!("{session_id}.{TEST_GENERATION}")),
                     generation: Some(TEST_GENERATION.to_owned()),
                     executable: Some(PathBuf::from(TEST_WORKER_EXECUTABLE)),
@@ -5322,7 +5343,7 @@ while os.getppid() == parent:
                 .runtime
                 .as_ref()
                 .and_then(|runtime| runtime.runtime_id.as_deref()),
-            Some(runtime_id.as_str())
+            Some(worker_instance_id.as_str())
         );
         assert_eq!(
             adopted.native_session_id.as_deref(),
@@ -5335,7 +5356,7 @@ while os.getppid() == parent:
         let reassert_request = |sequence: u64| {
             serde_json::json!({
                 "type": "identity_report",
-                "runtime_id": runtime_id.as_str(),
+                "runtime_id": worker_instance_id.as_str(),
                 "provider": "claude",
                 "pid": reassert_pid,
                 "start_identity": reassert_start,
@@ -5355,7 +5376,7 @@ while os.getppid() == parent:
         );
         let stale_native_report = SessionReportNativeIdParams::new(
             SessionId(session_id.to_owned()),
-            runtime_id.as_str(),
+            worker_instance_id.as_str(),
             "claude",
             child.pid,
             ProcessStartIdentity::new(child.start_identity),
@@ -5486,7 +5507,7 @@ while os.getppid() == parent:
             .await
             .expect("first controller");
         let wire_worker_id = first_controller.worker_id().await;
-        let runtime_id = first_controller
+        let worker_instance_id = first_controller
             .initialize(Initialize {
                 session_id: WorkerSessionId::new(session_id).expect("session id"),
                 transaction_id: TransactionId::new("create-hermes-restart")
@@ -5540,7 +5561,7 @@ while os.getppid() == parent:
         };
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
         info_runtime.worker_id = Some(worker_id.to_owned());
-        info_runtime.runtime_id = Some(runtime_id.to_string());
+        info_runtime.runtime_id = Some(worker_instance_id.to_string());
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
         recovery.agent = "hermes".to_owned();
@@ -5552,7 +5573,7 @@ while os.getppid() == parent:
             StoredInputRules::from(InputRules::hermes(true, Duration::from_millis(150)));
         recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
         record.runtime.worker_id = Some(worker_id.to_owned());
-        record.runtime.runtime_id = Some(runtime_id.to_string());
+        record.runtime.worker_instance_id = Some(worker_instance_id.to_string());
 
         let store_path = root.join("data/metadata.jsonl");
         bind_test_generation(&mut record);
@@ -5585,7 +5606,7 @@ while os.getppid() == parent:
                 .runtime
                 .as_ref()
                 .and_then(|runtime| runtime.runtime_id.as_deref()),
-            Some(runtime_id.as_str())
+            Some(worker_instance_id.as_str())
         );
         assert_eq!(
             adopted.capabilities,
@@ -5674,13 +5695,13 @@ while os.getppid() == parent:
         record.info.pid = 0;
         record.runtime.state = RuntimeState::Starting;
         record.runtime.worker_id = None;
-        record.runtime.runtime_id = None;
+        record.runtime.worker_instance_id = None;
         record.transaction = Some(crate::store::SessionTransaction {
             id: "create-s-204".to_owned(),
             kind: crate::store::TransactionKind::Create,
             phase: "preparing".to_owned(),
             previous_worker_id: None,
-            previous_runtime_id: None,
+            previous_worker_instance_id: None,
             daemon_instance_id: None,
         });
         record.recovery.as_mut().expect("recovery").session_id = "s-204".to_owned();
@@ -5773,7 +5794,7 @@ while os.getppid() == parent:
         logical.session_id = "s-205".to_owned();
         logical.info.id = SessionId("s-205".to_owned());
         logical.runtime.worker_id = Some("worker-terminal".to_owned());
-        logical.runtime.runtime_id = Some("runtime-terminal".to_owned());
+        logical.runtime.worker_instance_id = Some("runtime-terminal".to_owned());
         logical.recovery.as_mut().expect("recovery").session_id = "s-205".to_owned();
         Store::new(store_path.clone())
             .record_session(&logical)
@@ -5801,7 +5822,7 @@ while os.getppid() == parent:
             (1, 2),
             "2026-07-23T00:00:00Z".to_owned(),
         );
-        journal.runtime_id = Some("runtime-terminal".to_owned());
+        journal.worker_instance_id = Some("runtime-terminal".to_owned());
         journal.child = Some(JournalChildIdentity {
             pid: 51,
             process_group: 51,
@@ -6007,13 +6028,13 @@ while os.getppid() == parent:
     async fn reconciliation_replays_durable_stop_intent() {
         let root = temp_root();
         let runtime_root = root.join("runtime/workers");
-        let (controller, runtime_id, child_pid, server_task) =
+        let (controller, worker_instance_id, child_pid, server_task) =
             spawn_initialized_worker(&root, &runtime_root, "s-206", "worker-stop-replay").await;
         persist_live_record(
             &root,
             "s-206",
             "worker-stop-replay",
-            runtime_id.as_str(),
+            worker_instance_id.as_str(),
             child_pid,
             DesiredState::Stopped,
             crate::store::TransactionKind::Stop,
@@ -6047,13 +6068,13 @@ while os.getppid() == parent:
     async fn reconciliation_finishes_durable_remove_intent() {
         let root = temp_root();
         let runtime_root = root.join("runtime/workers");
-        let (controller, runtime_id, child_pid, server_task) =
+        let (controller, worker_instance_id, child_pid, server_task) =
             spawn_initialized_worker(&root, &runtime_root, "s-207", "worker-remove-replay").await;
         persist_live_record(
             &root,
             "s-207",
             "worker-remove-replay",
-            runtime_id.as_str(),
+            worker_instance_id.as_str(),
             child_pid,
             DesiredState::Removed,
             crate::store::TransactionKind::Remove,
@@ -6080,7 +6101,7 @@ while os.getppid() == parent:
     async fn worker_protocol_upgrade_and_rollback_preserve_runtime_generation() {
         let root = temp_root();
         let runtime_root = root.join("runtime/workers");
-        let (initial, runtime_id, child_pid, server_task) =
+        let (initial, worker_instance_id, child_pid, server_task) =
             spawn_initialized_worker(&root, &runtime_root, "s-208", "worker-version-fixture").await;
         let socket = initial.socket_path().to_path_buf();
         drop(initial);
@@ -6108,7 +6129,10 @@ while os.getppid() == parent:
             .await
             .expect("negotiate release fixture");
             let snapshot = controller.inspect().await.expect("inspect release fixture");
-            assert_eq!(snapshot.runtime_id.as_ref(), Some(&runtime_id));
+            assert_eq!(
+                snapshot.worker_instance_id.as_ref(),
+                Some(&worker_instance_id)
+            );
             assert_eq!(
                 snapshot.child_process.expect("child process").pid,
                 child_pid
@@ -6217,7 +6241,7 @@ while os.getppid() == parent:
         worker_id: &str,
     ) -> (
         crate::runtime::Worker,
-        RuntimeId,
+        WorkerInstanceId,
         u32,
         tokio::task::JoinHandle<()>,
     ) {
@@ -6244,12 +6268,12 @@ while os.getppid() == parent:
         worker_id: &str,
     ) -> (
         crate::runtime::Worker,
-        RuntimeId,
+        WorkerInstanceId,
         u32,
         tokio::task::JoinHandle<()>,
         Reporter,
     ) {
-        let (controller, runtime_id, child_pid, task, mut reporters) =
+        let (controller, worker_instance_id, child_pid, task, mut reporters) =
             spawn_initialized_worker_with_reporters(
                 root,
                 runtime_root,
@@ -6259,7 +6283,7 @@ while os.getppid() == parent:
             )
             .await;
         let reporter = reporters.pop().expect("one reporter");
-        (controller, runtime_id, child_pid, task, reporter)
+        (controller, worker_instance_id, child_pid, task, reporter)
     }
 
     /// Starts a worker whose PTY runs one in-tree reporter per requested name.
@@ -6271,7 +6295,7 @@ while os.getppid() == parent:
         names: &[&str],
     ) -> (
         crate::runtime::Worker,
-        RuntimeId,
+        WorkerInstanceId,
         u32,
         tokio::task::JoinHandle<()>,
         Vec<Reporter>,
@@ -6283,18 +6307,19 @@ while os.getppid() == parent:
             command.push(' ');
         }
         command.push_str("printf ready; while :; do sleep 1; done");
-        let (controller, runtime_id, child_pid, task) = spawn_initialized_worker_with_command(
-            root,
-            runtime_root,
-            session_id,
-            worker_id,
-            command,
-        )
-        .await;
+        let (controller, worker_instance_id, child_pid, task) =
+            spawn_initialized_worker_with_command(
+                root,
+                runtime_root,
+                session_id,
+                worker_id,
+                command,
+            )
+            .await;
         for reporter in &reporters {
             wait_for_directory(&reporter.inbox).await;
         }
-        (controller, runtime_id, child_pid, task, reporters)
+        (controller, worker_instance_id, child_pid, task, reporters)
     }
 
     async fn spawn_initialized_worker_with_command(
@@ -6305,7 +6330,7 @@ while os.getppid() == parent:
         command: String,
     ) -> (
         crate::runtime::Worker,
-        RuntimeId,
+        WorkerInstanceId,
         u32,
         tokio::task::JoinHandle<()>,
     ) {
@@ -6314,7 +6339,7 @@ while os.getppid() == parent:
         let controller = crate::runtime::Worker::connect(&socket, session_id, "crash-replay-setup")
             .await
             .expect("connect setup controller");
-        let runtime_id = controller
+        let worker_instance_id = controller
             .initialize(Initialize {
                 session_id: WorkerSessionId::new(session_id).expect("session id"),
                 transaction_id: TransactionId::new(format!("create-{session_id}"))
@@ -6351,7 +6376,7 @@ while os.getppid() == parent:
             .child_process
             .expect("child process")
             .pid;
-        (controller, runtime_id, child_pid, task)
+        (controller, worker_instance_id, child_pid, task)
     }
 
     fn spawn_incompatible_worker(
@@ -6402,7 +6427,7 @@ while os.getppid() == parent:
         record.session_id = id.to_owned();
         record.info.id = SessionId(id.to_owned());
         record.runtime.worker_id = Some(worker_id.to_owned());
-        record.runtime.runtime_id = None;
+        record.runtime.worker_instance_id = None;
         record.info.runtime.as_mut().expect("runtime").worker_id = Some(worker_id.to_owned());
         record.info.runtime.as_mut().expect("runtime").runtime_id = None;
         record.recovery.as_mut().expect("recovery").session_id = id.to_owned();
@@ -6416,7 +6441,7 @@ while os.getppid() == parent:
         root: &std::path::Path,
         id: &str,
         worker_id: &str,
-        runtime_id: &str,
+        worker_instance_id: &str,
         child_pid: u32,
         desired_state: DesiredState,
         transaction_kind: crate::store::TransactionKind,
@@ -6428,9 +6453,10 @@ while os.getppid() == parent:
         record.info.agent = "shell".to_owned();
         record.info.agent_base = AgentKind::Shell;
         record.info.runtime.as_mut().expect("runtime").worker_id = Some(worker_id.to_owned());
-        record.info.runtime.as_mut().expect("runtime").runtime_id = Some(runtime_id.to_owned());
+        record.info.runtime.as_mut().expect("runtime").runtime_id =
+            Some(worker_instance_id.to_owned());
         record.runtime.worker_id = Some(worker_id.to_owned());
-        record.runtime.runtime_id = Some(runtime_id.to_owned());
+        record.runtime.worker_instance_id = Some(worker_instance_id.to_owned());
         record.desired_state = desired_state;
         let transaction_label = match transaction_kind {
             crate::store::TransactionKind::Create => "create",
@@ -6443,7 +6469,7 @@ while os.getppid() == parent:
             kind: transaction_kind,
             phase: "requested".to_owned(),
             previous_worker_id: None,
-            previous_runtime_id: None,
+            previous_worker_instance_id: None,
             daemon_instance_id: None,
         });
         let recovery = record.recovery.as_mut().expect("recovery");
@@ -6556,7 +6582,7 @@ while os.getppid() == parent:
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
                 worker_id: Some("worker-identity".to_owned()),
-                runtime_id: Some("runtime-identity".to_owned()),
+                worker_instance_id: Some("runtime-identity".to_owned()),
                 service_id: None,
                 generation: None,
                 executable: None,
@@ -6569,7 +6595,7 @@ while os.getppid() == parent:
     fn sequenced_session_identity_wins_over_stale_resume_projection() {
         let mut record = identity_record();
         record.native_identity_ordering = Some(NativeIdentityOrdering {
-            runtime_id: "runtime-identity".to_owned(),
+            worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
             sequence: 2,
@@ -6601,7 +6627,7 @@ while os.getppid() == parent:
         let store = Store::new(root.join("metadata.jsonl"));
         let mut existing = identity_record();
         existing.native_identity_ordering = Some(NativeIdentityOrdering {
-            runtime_id: "runtime-identity".to_owned(),
+            worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
             sequence: 7,
@@ -6647,7 +6673,7 @@ while os.getppid() == parent:
         let store = Store::new(root.join("metadata.jsonl"));
         let mut existing = identity_record();
         existing.native_identity_ordering = Some(NativeIdentityOrdering {
-            runtime_id: "runtime-identity".to_owned(),
+            worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
             sequence: 7,
@@ -6692,7 +6718,7 @@ while os.getppid() == parent:
         let root = temp_root();
         let store = Store::new(root.join("metadata.jsonl"));
         let mut inconsistent = identity_record();
-        inconsistent.runtime.runtime_id = Some("runtime-journal".to_owned());
+        inconsistent.runtime.worker_instance_id = Some("runtime-journal".to_owned());
         store
             .record_session(&inconsistent)
             .expect("seed denormalized runtime mismatch");
@@ -6839,7 +6865,9 @@ while os.getppid() == parent:
         InspectSnapshot {
             session_id: WorkerSessionId::new("s-identity").expect("session id"),
             worker_id: WorkerId::new("worker-identity").expect("worker id"),
-            runtime_id: Some(RuntimeId::new("runtime-identity").expect("runtime id")),
+            worker_instance_id: Some(
+                WorkerInstanceId::new("runtime-identity").expect("runtime id"),
+            ),
             phase: WorkerRuntimePhase::Running,
             worker_process: ProcessIdentity {
                 pid: 40,
@@ -7589,17 +7617,17 @@ while os.getppid() == parent:
         fn persist_record(
             root: &Path,
             session_id: &str,
-            runtime_id: Option<&str>,
+            worker_instance_id: Option<&str>,
         ) -> SessionRecord {
             let mut record = identity_record();
             record.session_id = session_id.to_owned();
             record.info.id = SessionId(session_id.to_owned());
             let worker_id = format!("worker-{session_id}");
             record.runtime.worker_id = Some(worker_id.clone());
-            record.runtime.runtime_id = runtime_id.map(ToOwned::to_owned);
+            record.runtime.worker_instance_id = worker_instance_id.map(ToOwned::to_owned);
             let runtime = record.info.runtime.as_mut().expect("runtime");
             runtime.worker_id = Some(worker_id);
-            runtime.runtime_id = runtime_id.map(ToOwned::to_owned);
+            runtime.runtime_id = worker_instance_id.map(ToOwned::to_owned);
             record.recovery.as_mut().expect("recovery").session_id = session_id.to_owned();
             bind_test_generation(&mut record);
             Store::new(root.join("data/metadata.jsonl"))
@@ -7613,9 +7641,15 @@ while os.getppid() == parent:
             root: &Path,
             session_id: &str,
             worker: (u32, u64),
-            runtime_id: Option<&str>,
+            worker_instance_id: Option<&str>,
         ) {
-            write_generation_journal(root, session_id, TEST_GENERATION, worker, runtime_id);
+            write_generation_journal(
+                root,
+                session_id,
+                TEST_GENERATION,
+                worker,
+                worker_instance_id,
+            );
         }
 
         /// Writes the live journal of `session_id`'s worker naming `generation`.
@@ -7624,10 +7658,17 @@ while os.getppid() == parent:
             session_id: &str,
             generation: &str,
             worker: (u32, u64),
-            runtime_id: Option<&str>,
+            worker_instance_id: Option<&str>,
         ) {
             let worker_id = format!("worker-{session_id}");
-            write_worker_journal(root, session_id, &worker_id, generation, worker, runtime_id);
+            write_worker_journal(
+                root,
+                session_id,
+                &worker_id,
+                generation,
+                worker,
+                worker_instance_id,
+            );
         }
 
         /// Writes the live journal of `session_id`'s worker `worker_id`
@@ -7638,7 +7679,7 @@ while os.getppid() == parent:
             worker_id: &str,
             generation: &str,
             worker: (u32, u64),
-            runtime_id: Option<&str>,
+            worker_instance_id: Option<&str>,
         ) {
             write_journal_record(
                 root,
@@ -7646,21 +7687,21 @@ while os.getppid() == parent:
                 worker_id,
                 generation,
                 worker,
-                runtime_id,
+                worker_instance_id,
                 |_| {},
             );
         }
 
         /// Writes the terminal journal of `session_id`'s [`TEST_GENERATION`]
         /// worker after its child exited successfully.
-        fn write_terminal_journal(root: &Path, session_id: &str, runtime_id: &str) {
+        fn write_terminal_journal(root: &Path, session_id: &str, worker_instance_id: &str) {
             write_journal_record(
                 root,
                 session_id,
                 &format!("worker-{session_id}"),
                 TEST_GENERATION,
                 dead_worker(),
-                Some(runtime_id),
+                Some(worker_instance_id),
                 |journal| {
                     journal.phase = JournalRuntimePhase::Terminal;
                     journal.outcome = Some(pohunek_session_worker::RuntimeOutcome {
@@ -7682,7 +7723,7 @@ while os.getppid() == parent:
             worker_id: &str,
             generation: &str,
             worker: (u32, u64),
-            runtime_id: Option<&str>,
+            worker_instance_id: Option<&str>,
             finish: impl FnOnce(&mut JournalRecord),
         ) {
             let mut journal = JournalRecord::bootstrap(
@@ -7699,7 +7740,7 @@ while os.getppid() == parent:
                 (1, 2),
                 "2026-09-24T00:00:00Z".to_owned(),
             );
-            journal.runtime_id = runtime_id.map(ToOwned::to_owned);
+            journal.worker_instance_id = worker_instance_id.map(ToOwned::to_owned);
             journal.phase = JournalRuntimePhase::Live;
             finish(&mut journal);
             let session_dir = root.join("state/workers").join(session_id);
@@ -7741,15 +7782,15 @@ while os.getppid() == parent:
             (identity.pid, identity.start_identity.get())
         }
 
-        /// A hangup-ignoring process marked with `runtime_id`, reparented away
+        /// A hangup-ignoring process marked with `worker_instance_id`, reparented away
         /// from the test process so its exit is observable without reaping.
         struct Marked(u32);
 
         impl Marked {
-            fn spawn(runtime_id: &str) -> Self {
+            fn spawn(worker_instance_id: &str) -> Self {
                 let output = std::process::Command::new("/bin/sh")
                     .args(["-c", "trap '' HUP; sleep 60 >/dev/null 2>&1 & echo $!"])
-                    .env("POHUNEK_RUNTIME_ID", runtime_id)
+                    .env("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id)
                     .output()
                     .expect("spawn marked process");
                 let pid = String::from_utf8(output.stdout)
@@ -7947,10 +7988,10 @@ while os.getppid() == parent:
         async fn live_worker_behind_a_foreign_job_definition_is_not_adopted() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-305", "worker-s-305")
                     .await;
-            persist_record(&fixture.root, "s-305", Some(runtime_id.as_str()));
+            persist_record(&fixture.root, "s-305", Some(worker_instance_id.as_str()));
             drop(controller);
             fixture.supervisor.script_job(
                 service_id("s-305", TEST_GENERATION),
@@ -7991,10 +8032,10 @@ while os.getppid() == parent:
         async fn live_worker_of_the_record_generation_is_adopted_without_supervisor_evidence() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-306", "worker-s-306")
                     .await;
-            persist_record(&fixture.root, "s-306", Some(runtime_id.as_str()));
+            persist_record(&fixture.root, "s-306", Some(worker_instance_id.as_str()));
             drop(controller);
             fixture
                 .supervisor
@@ -8020,10 +8061,10 @@ while os.getppid() == parent:
         async fn live_worker_with_an_absent_job_is_adopted_and_flagged() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-315", "worker-s-315")
                     .await;
-            persist_record(&fixture.root, "s-315", Some(runtime_id.as_str()));
+            persist_record(&fixture.root, "s-315", Some(worker_instance_id.as_str()));
             drop(controller);
             let mut events = fixture.registry.subscribe();
 
@@ -8316,7 +8357,7 @@ while os.getppid() == parent:
                 kind: crate::store::TransactionKind::Create,
                 phase: "preparing".to_owned(),
                 previous_worker_id: None,
-                previous_runtime_id: None,
+                previous_worker_instance_id: None,
                 daemon_instance_id: None,
             });
             Store::new(fixture.root.join("data/metadata.jsonl"))
@@ -8348,7 +8389,7 @@ while os.getppid() == parent:
                 kind: crate::store::TransactionKind::Create,
                 phase: "preparing".to_owned(),
                 previous_worker_id: None,
-                previous_runtime_id: None,
+                previous_worker_instance_id: None,
                 daemon_instance_id: None,
             });
             Store::new(fixture.root.join("data/metadata.jsonl"))
@@ -8410,7 +8451,7 @@ while os.getppid() == parent:
                 kind: crate::store::TransactionKind::Create,
                 phase: "preparing".to_owned(),
                 previous_worker_id: None,
-                previous_runtime_id: None,
+                previous_worker_instance_id: None,
                 daemon_instance_id: None,
             });
             Store::new(root.join("data/metadata.jsonl"))
@@ -8553,10 +8594,10 @@ while os.getppid() == parent:
         async fn ambiguous_generation_is_adopted_once_its_worker_is_reachable_again() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-319", "worker-s-319")
                     .await;
-            persist_record(&fixture.root, "s-319", Some(runtime_id.as_str()));
+            persist_record(&fixture.root, "s-319", Some(worker_instance_id.as_str()));
             drop(controller);
             let socket = runtime_root
                 .join("s-319")
@@ -8577,7 +8618,10 @@ while os.getppid() == parent:
 
             std::fs::rename(&hidden, &socket).expect("restore the worker socket");
             let runtime = wait_state(&fixture.registry, "s-319", RuntimeState::Live).await;
-            assert_eq!(runtime.runtime_id.as_deref(), Some(runtime_id.as_str()));
+            assert_eq!(
+                runtime.runtime_id.as_deref(),
+                Some(worker_instance_id.as_str())
+            );
             assert!(
                 fixture.supervisor.retired().is_empty(),
                 "nothing was retired"
@@ -8618,10 +8662,10 @@ while os.getppid() == parent:
         async fn readopted_worker_is_watched_only_by_its_new_watchers() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-350", "worker-s-350")
                     .await;
-            persist_record(&fixture.root, "s-350", Some(runtime_id.as_str()));
+            persist_record(&fixture.root, "s-350", Some(worker_instance_id.as_str()));
             drop(controller);
             fixture.supervisor.script_job(
                 service_id("s-350", TEST_GENERATION),
@@ -8691,10 +8735,10 @@ while os.getppid() == parent:
         async fn reclassified_entry_cancels_the_watchers_it_replaces() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-351", "worker-s-351")
                     .await;
-            let record = persist_record(&fixture.root, "s-351", Some(runtime_id.as_str()));
+            let record = persist_record(&fixture.root, "s-351", Some(worker_instance_id.as_str()));
             drop(controller);
             Box::pin(fixture.registry.reconcile_workers())
                 .await
@@ -8897,10 +8941,11 @@ while os.getppid() == parent:
         async fn reconciled_removal_intent_evicts_the_listed_session() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-359", "worker-s-359")
                     .await;
-            let mut record = persist_record(&fixture.root, "s-359", Some(runtime_id.as_str()));
+            let mut record =
+                persist_record(&fixture.root, "s-359", Some(worker_instance_id.as_str()));
             drop(controller);
             Box::pin(fixture.registry.reconcile_workers())
                 .await
@@ -8967,16 +9012,16 @@ while os.getppid() == parent:
         fn persist_removal_intent(
             root: &Path,
             session_id: &str,
-            runtime_id: Option<&str>,
+            worker_instance_id: Option<&str>,
         ) -> SessionRecord {
-            let mut record = persist_record(root, session_id, runtime_id);
+            let mut record = persist_record(root, session_id, worker_instance_id);
             record.desired_state = DesiredState::Removed;
             record.transaction = Some(crate::store::SessionTransaction {
                 id: format!("remove-{session_id}"),
                 kind: crate::store::TransactionKind::Remove,
                 phase: "requested".to_owned(),
                 previous_worker_id: None,
-                previous_runtime_id: None,
+                previous_worker_instance_id: None,
                 daemon_instance_id: None,
             });
             Store::new(root.join("data/metadata.jsonl"))
@@ -9146,10 +9191,11 @@ while os.getppid() == parent:
         async fn replayed_removal_retires_the_generation_and_cleans_up() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-374", "worker-s-374")
                     .await;
-            let record = persist_removal_intent(&fixture.root, "s-374", Some(runtime_id.as_str()));
+            let record =
+                persist_removal_intent(&fixture.root, "s-374", Some(worker_instance_id.as_str()));
             seed_removal_leftovers(&fixture.root, &record);
             drop(controller);
             let id = service_id("s-374", TEST_GENERATION);
@@ -9170,10 +9216,11 @@ while os.getppid() == parent:
         async fn replayed_removal_keeps_its_intent_until_the_generation_is_retired() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-375", "worker-s-375")
                     .await;
-            let record = persist_removal_intent(&fixture.root, "s-375", Some(runtime_id.as_str()));
+            let record =
+                persist_removal_intent(&fixture.root, "s-375", Some(worker_instance_id.as_str()));
             seed_removal_leftovers(&fixture.root, &record);
             drop(controller);
             let id = service_id("s-375", TEST_GENERATION);
@@ -9216,10 +9263,11 @@ while os.getppid() == parent:
             let fixture =
                 fixture(Arc::<RetryInspector>::clone(&inspector) as Arc<dyn ProcessInspector>);
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-382", "worker-s-382")
                     .await;
-            let record = persist_removal_intent(&fixture.root, "s-382", Some(runtime_id.as_str()));
+            let record =
+                persist_removal_intent(&fixture.root, "s-382", Some(worker_instance_id.as_str()));
             seed_removal_leftovers(&fixture.root, &record);
             drop(controller);
             fixture.supervisor.script_job(
@@ -9253,16 +9301,16 @@ while os.getppid() == parent:
         fn persist_stop_intent(
             root: &Path,
             session_id: &str,
-            runtime_id: Option<&str>,
+            worker_instance_id: Option<&str>,
         ) -> SessionRecord {
-            let mut record = persist_record(root, session_id, runtime_id);
+            let mut record = persist_record(root, session_id, worker_instance_id);
             record.desired_state = DesiredState::Stopped;
             record.transaction = Some(crate::store::SessionTransaction {
                 id: format!("stop-{session_id}"),
                 kind: crate::store::TransactionKind::Stop,
                 phase: "requested".to_owned(),
                 previous_worker_id: None,
-                previous_runtime_id: None,
+                previous_worker_instance_id: None,
                 daemon_instance_id: None,
             });
             Store::new(root.join("data/metadata.jsonl"))
@@ -9288,10 +9336,11 @@ while os.getppid() == parent:
         async fn failed_stop_replay_keeps_the_intent_and_the_retry_replays_it() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, child_pid, server_task) =
+            let (controller, worker_instance_id, child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-390", "worker-s-390")
                     .await;
-            let record = persist_stop_intent(&fixture.root, "s-390", Some(runtime_id.as_str()));
+            let record =
+                persist_stop_intent(&fixture.root, "s-390", Some(worker_instance_id.as_str()));
             fixture.supervisor.script_job(
                 service_id("s-390", TEST_GENERATION),
                 present(ServiceState::Running, None),
@@ -9359,10 +9408,11 @@ while os.getppid() == parent:
         async fn stop_intent_of_a_stopping_worker_is_replayed() {
             let fixture = fixture(Arc::new(RetryInspector::default()));
             let runtime_root = fixture.root.join("runtime/workers");
-            let (controller, runtime_id, _child_pid, server_task) =
+            let (controller, worker_instance_id, _child_pid, server_task) =
                 spawn_initialized_worker(&fixture.root, &runtime_root, "s-391", "worker-s-391")
                     .await;
-            let record = persist_stop_intent(&fixture.root, "s-391", Some(runtime_id.as_str()));
+            let record =
+                persist_stop_intent(&fixture.root, "s-391", Some(worker_instance_id.as_str()));
             let mut snapshot = controller.inspect().await.expect("inspect live worker");
             // A worker whose earlier stop still waits for its terminal commit
             // reports `Stopping`; its stop intent is replayed, not imported.
@@ -10871,13 +10921,13 @@ while os.getppid() == parent:
 
             /// Reaps the hangup-ignoring PTY tree of a session left alone.
             async fn reap(&self, created: &SessionInfo, descendant: u32) {
-                let runtime_id = created
+                let worker_instance_id = created
                     .runtime
                     .as_ref()
                     .and_then(|runtime| runtime.runtime_id.clone())
                     .expect("created runtime id");
                 self.registry
-                    .sweep_lost_runtime(&created.id.0, &runtime_id, None)
+                    .sweep_lost_runtime(&created.id.0, &worker_instance_id, None)
                     .await;
                 wait_gone(descendant).await;
             }
@@ -10956,13 +11006,13 @@ while os.getppid() == parent:
             );
             assert!(alive(descendant), "nothing is swept");
             // The fixture's PTY tree ignores hangup; reap it explicitly.
-            let runtime_id = created
+            let worker_instance_id = created
                 .runtime
                 .and_then(|runtime| runtime.runtime_id)
                 .expect("created runtime id");
             fixture
                 .registry
-                .sweep_lost_runtime(&created.id.0, &runtime_id, None)
+                .sweep_lost_runtime(&created.id.0, &worker_instance_id, None)
                 .await;
             wait_gone(descendant).await;
         }

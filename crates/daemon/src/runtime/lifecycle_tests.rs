@@ -665,7 +665,7 @@ fn records_round_trip_and_reject_foreign_or_partial_generations() {
     let mut record = RuntimeRecord {
         state: protocol::RuntimeState::Starting,
         worker_id: None,
-        runtime_id: None,
+        worker_instance_id: None,
         service_id: None,
         generation: None,
         executable: None,
@@ -1634,7 +1634,7 @@ fn serve_fake_version_five_worker(
                             .expect("range"),
                         session_id: session_id.clone(),
                         worker_id: worker_id.clone(),
-                        runtime_id: None,
+                        worker_instance_id: None,
                         worker_process: WireProcess {
                             pid: std::process::id(),
                             start_identity: 1,

@@ -6,8 +6,8 @@ use std::task::{Context, Poll};
 
 use pohunek_worker_protocol::{
     CloseReason, ControlCodecError, ControlMessage, ControlReader, ControlWriter, DataFrame,
-    FrameError, FrameHeader, FrameKind, RuntimeId, StreamId, Version, WriteId, CURRENT_VERSION,
-    MAX_DATA_HEADER_BYTES, MAX_DATA_PAYLOAD_BYTES,
+    FrameError, FrameHeader, FrameKind, StreamId, Version, WorkerInstanceId, WriteId,
+    CURRENT_VERSION, MAX_DATA_HEADER_BYTES, MAX_DATA_PAYLOAD_BYTES,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -91,7 +91,7 @@ fn output_frame(payload: Vec<u8>) -> DataFrame {
         FrameHeader {
             version: CURRENT_VERSION,
             stream_id: StreamId::new("stream-1").expect("valid stream"),
-            runtime_id: RuntimeId::new("runtime-1").expect("valid runtime"),
+            worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
             kind: FrameKind::Output { offset: 42 },
         },
         payload,
@@ -192,7 +192,7 @@ async fn malformed_unknown_and_mismatched_frames_are_rejected() {
     let close_header = serde_json::to_vec(&FrameHeader {
         version: CURRENT_VERSION,
         stream_id: StreamId::new("stream-1").expect("valid stream"),
-        runtime_id: RuntimeId::new("runtime-1").expect("valid runtime"),
+        worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
         kind: FrameKind::Close {
             reason: CloseReason::Requested,
         },
@@ -217,7 +217,7 @@ async fn oversized_lengths_are_rejected_before_payload_reads() {
     let header = serde_json::to_vec(&FrameHeader {
         version: CURRENT_VERSION,
         stream_id: StreamId::new("stream-1").expect("valid stream"),
-        runtime_id: RuntimeId::new("runtime-1").expect("valid runtime"),
+        worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
         kind: FrameKind::Input {
             write_id: WriteId::new("write-1").expect("valid write"),
         },

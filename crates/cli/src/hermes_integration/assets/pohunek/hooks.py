@@ -41,7 +41,7 @@ class HookReporter:
     def __init__(self, environ: dict[str, str] | None = None) -> None:
         env = os.environ if environ is None else environ
         self._session_id = env.get("POHUNEK_SESSION_ID", "") if env.get("POHUNEK_ENV") == "1" else ""
-        self._runtime_id = env.get("POHUNEK_RUNTIME_ID", "")
+        self._worker_instance_id = env.get("POHUNEK_WORKER_INSTANCE_ID", "")
         self._worker_socket = _local_socket(env.get("POHUNEK_WORKER_SOCKET_PATH", ""))
         self._daemon_socket = _local_socket(env.get("POHUNEK_SOCKET_PATH", ""))
         self._protocol = _positive_int(env.get("POHUNEK_PROTOCOL_VERSION"))
@@ -54,7 +54,7 @@ class HookReporter:
 
     @property
     def active(self) -> bool:
-        return bool(self._session_id and self._runtime_id and self._start_identity is not None)
+        return bool(self._session_id and self._worker_instance_id and self._start_identity is not None)
 
     def on_session_start(self, args: dict[str, Any] | None = None, **kwargs: Any) -> None:
         self._safe(self._identity, args, kwargs)
@@ -93,7 +93,7 @@ class HookReporter:
             return
         sequence = self._next_sequence()
         private = {
-            "type": "identity_release", "runtime_id": self._runtime_id, "provider": "hermes",
+            "type": "identity_release", "runtime_id": self._worker_instance_id, "provider": "hermes",
             "pid": self._pid, "start_identity": self._start_identity, "sequence": sequence,
         }
         if self._safe_worker(private):
@@ -112,14 +112,14 @@ class HookReporter:
         sequence = self._next_sequence()
         expires = (datetime.now(timezone.utc) + timedelta(seconds=_IDENTITY_TTL_SECONDS)).isoformat().replace("+00:00", "Z")
         private = {
-            "type": "identity_report", "runtime_id": self._runtime_id, "provider": "hermes",
+            "type": "identity_report", "runtime_id": self._worker_instance_id, "provider": "hermes",
             "pid": self._pid, "start_identity": self._start_identity, "sequence": sequence,
             "expires_at": expires, "reference_kind": "id", "native_reference": native_id,
         }
         if self._safe_worker(private):
             return
         self._safe(self._send_public, "session.report_native_id", {
-            "session_id": self._session_id, "runtime_id": self._runtime_id, "agent": "hermes",
+            "session_id": self._session_id, "runtime_id": self._worker_instance_id, "agent": "hermes",
             "pid": self._pid, "pid_start_identity": str(self._start_identity), "sequence": str(sequence),
             "expires_at": expires, "native_session_id": native_id,
         })

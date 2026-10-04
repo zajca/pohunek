@@ -83,7 +83,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     fixture.start_worker(&fixture.isolation_worker_key).await;
     let worker = fixture.connect_worker("fixture-controller").await;
     let worker_id = worker.worker_id().await;
-    let runtime_id = worker
+    let worker_instance_id = worker
         .initialize(fixture.initialize(worker_id.clone()))
         .await
         .expect("initialize systemd worker");
@@ -95,7 +95,11 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         .expect("child process")
         .pid;
     let pty_device = child_tty(child_pid);
-    fixture.persist_record(&worker_id.to_string(), &runtime_id.to_string(), child_pid);
+    fixture.persist_record(
+        &worker_id.to_string(),
+        &worker_instance_id.to_string(),
+        child_pid,
+    );
     let isolation_worker = fixture
         .connect_worker_for(
             &fixture.isolation_session_id,
@@ -103,7 +107,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         )
         .await;
     let isolation_worker_id = isolation_worker.worker_id().await;
-    let isolation_runtime_id = isolation_worker
+    let isolation_worker_instance_id = isolation_worker
         .initialize(
             fixture.initialize_for(&fixture.isolation_session_id, isolation_worker_id.clone()),
         )
@@ -120,7 +124,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         &fixture.isolation_session_id,
         &fixture.isolation_worker_key,
         &isolation_worker_id.to_string(),
-        &isolation_runtime_id.to_string(),
+        &isolation_worker_instance_id.to_string(),
         isolation_child_pid,
     );
     worker
@@ -147,7 +151,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         &first,
         child_pid,
         &worker_id.to_string(),
-        &runtime_id.to_string(),
+        &worker_instance_id.to_string(),
     );
     assert_eq!(child_tty(child_pid), pty_device);
     let rehydrated_activity = fixture
@@ -158,7 +162,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         &fixture.inspect_for(&fixture.isolation_session_id).await,
         isolation_child_pid,
         isolation_worker_id.as_str(),
-        isolation_runtime_id.as_str(),
+        isolation_worker_instance_id.as_str(),
     );
 
     Fixture::systemctl(["restart", fixture.daemon_unit.as_str()]);
@@ -170,7 +174,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         &restarted,
         child_pid,
         &worker_id.to_string(),
-        &runtime_id.to_string(),
+        &worker_instance_id.to_string(),
     );
     assert_eq!(child_tty(child_pid), pty_device);
     let mut before_outage_attach = fixture.open_attach(&fixture.session_id).await;
@@ -196,7 +200,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         &after_sigkill,
         child_pid,
         &worker_id.to_string(),
-        &runtime_id.to_string(),
+        &worker_instance_id.to_string(),
     );
     assert_eq!(child_tty(child_pid), pty_device);
     let mut after_outage_attach = fixture.open_attach(&fixture.session_id).await;
@@ -287,7 +291,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         .worker_id
         .as_deref()
         .expect("recovered worker id");
-    let recovered_runtime_id = recovered_runtime
+    let recovered_worker_instance_id = recovered_runtime
         .runtime_id
         .as_deref()
         .expect("recovered runtime id");
@@ -300,7 +304,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         "recovery must retire the superseded generation"
     );
     assert_ne!(recovered_worker_id, worker_id.as_str());
-    assert_ne!(recovered_runtime_id, runtime_id.as_str());
+    assert_ne!(recovered_worker_instance_id, worker_instance_id.as_str());
     let persisted = Store::new(fixture.data_home.join("pohunek/metadata.jsonl"))
         .load_sessions()
         .expect("load recovered logical record")
@@ -314,8 +318,8 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         Some(recovered_worker_id)
     );
     assert_eq!(
-        persisted.runtime.runtime_id.as_deref(),
-        Some(recovered_runtime_id)
+        persisted.runtime.worker_instance_id.as_deref(),
+        Some(recovered_worker_instance_id)
     );
     let recovered_generation = persisted
         .runtime
@@ -353,7 +357,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         &after_repeated,
         recovered.pid,
         recovered_worker_id,
-        recovered_runtime_id,
+        recovered_worker_instance_id,
     );
 
     Fixture::systemctl([
@@ -378,7 +382,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         &fixture.inspect().await,
         recovered.pid,
         recovered_worker_id,
-        recovered_runtime_id,
+        recovered_worker_instance_id,
     );
 
     client
@@ -389,7 +393,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     eprintln!(
         "systemd lifecycle passed: worker_pid={worker_unit_pid} child_pid={child_pid} \
          pty_device={} \
-         runtime_id={runtime_id} recovered_runtime_id={recovered_runtime_id} \
+         worker_instance_id={worker_instance_id} recovered_worker_instance_id={recovered_worker_instance_id} \
          daemon_pids={daemon_pid},{restarted_daemon_pid},{killed_daemon_pid}",
         pty_device.display()
     );
@@ -660,12 +664,12 @@ impl Fixture {
         }
     }
 
-    fn persist_record(&self, worker_id: &str, runtime_id: &str, child_pid: u32) {
+    fn persist_record(&self, worker_id: &str, worker_instance_id: &str, child_pid: u32) {
         self.persist_record_for(
             &self.session_id,
             &self.worker_key,
             worker_id,
-            runtime_id,
+            worker_instance_id,
             child_pid,
         );
     }
@@ -675,7 +679,7 @@ impl Fixture {
         session_id: &str,
         worker_key: &WorkerKey,
         worker_id: &str,
-        runtime_id: &str,
+        worker_instance_id: &str,
         child_pid: u32,
     ) {
         let now = "2026-07-23T00:00:00Z".to_owned();
@@ -696,7 +700,7 @@ impl Fixture {
                 state: RuntimeState::Live,
                 runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: Some(worker_id.to_owned()),
-                runtime_id: Some(runtime_id.to_owned()),
+                runtime_id: Some(worker_instance_id.to_owned()),
                 started_at: Some(now.clone()),
                 last_connected_at: Some(now.clone()),
                 loss_reason: None,
@@ -766,7 +770,7 @@ impl Fixture {
                 runtime: RuntimeRecord {
                     state: RuntimeState::Live,
                     worker_id: Some(worker_id.to_owned()),
-                    runtime_id: Some(runtime_id.to_owned()),
+                    worker_instance_id: Some(worker_instance_id.to_owned()),
                     service_id: Some(worker_key.service_id().to_string()),
                     generation: Some(worker_key.generation().to_owned()),
                     executable: Some(self.worker_executable.clone()),
@@ -949,7 +953,7 @@ fn required_binary(name: &str) -> PathBuf {
     path
 }
 
-fn assert_runtime(info: &SessionInfo, child_pid: u32, worker_id: &str, runtime_id: &str) {
+fn assert_runtime(info: &SessionInfo, child_pid: u32, worker_id: &str, worker_instance_id: &str) {
     assert_eq!(info.pid, child_pid, "session {} PID", info.id.0);
     let runtime = info.runtime.as_ref().expect("session runtime");
     assert_eq!(
@@ -966,7 +970,7 @@ fn assert_runtime(info: &SessionInfo, child_pid: u32, worker_id: &str, runtime_i
     );
     assert_eq!(
         runtime.runtime_id.as_deref(),
-        Some(runtime_id),
+        Some(worker_instance_id),
         "session {} runtime ID",
         info.id.0
     );

@@ -35,7 +35,7 @@ pub const MAX_SESSION_ID_BYTES: usize = 128;
 ///
 /// Runtime identifiers are opaque but participate in every cursor coordinate,
 /// so their wire contribution must remain bounded independently of provider.
-pub const MAX_RUNTIME_ID_BYTES: usize = 128;
+pub const MAX_WORKER_INSTANCE_ID_BYTES: usize = 128;
 
 /// Exact payload length for canonical governance identifiers.
 ///

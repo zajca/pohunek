@@ -124,7 +124,7 @@ pub(super) enum PtyRegistration {
         /// Worker generation being replaced, when known.
         previous_worker_id: Option<String>,
         /// Runtime generation being replaced, when known.
-        previous_runtime_id: Option<String>,
+        previous_worker_instance_id: Option<String>,
         /// Worker job being replaced, when the record names one.
         previous_job: Option<Generation>,
         /// Monotonic generation being replaced.
@@ -634,7 +634,7 @@ impl SessionRegistry {
         let runtime_generation =
             next_runtime_generation(&registration).map_err(LaunchFailure::Cleaned)?;
         let lifecycle = self.lifecycle().map_err(LaunchFailure::Cleaned)?;
-        let (transaction_id, transaction_kind, previous_worker_id, previous_runtime_id) =
+        let (transaction_id, transaction_kind, previous_worker_id, previous_worker_instance_id) =
             match &registration {
                 PtyRegistration::Create => (
                     format!("create-{}", id.0),
@@ -645,7 +645,7 @@ impl SessionRegistry {
                 PtyRegistration::Recover {
                     transaction_id,
                     previous_worker_id,
-                    previous_runtime_id,
+                    previous_worker_instance_id,
                     previous_job,
                     runtime_watch_cancel,
                     ..
@@ -667,7 +667,7 @@ impl SessionRegistry {
                         transaction_id.clone(),
                         TransactionKind::Recover,
                         previous_worker_id.clone(),
-                        previous_runtime_id.clone(),
+                        previous_worker_instance_id.clone(),
                     )
                 }
             };
@@ -727,7 +727,7 @@ impl SessionRegistry {
                 kind: transaction_kind,
                 phase: "preparing".to_owned(),
                 previous_worker_id: previous_worker_id.clone(),
-                previous_runtime_id: previous_runtime_id.clone(),
+                previous_worker_instance_id: previous_worker_instance_id.clone(),
                 daemon_instance_id: None,
             }),
             info: preparing_info,
@@ -753,7 +753,7 @@ impl SessionRegistry {
             runtime: RuntimeRecord {
                 state: RuntimeState::Starting,
                 worker_id: None,
-                runtime_id: None,
+                worker_instance_id: None,
                 service_id: None,
                 generation: None,
                 executable: None,
@@ -898,9 +898,9 @@ impl SessionRegistry {
         match registration {
             PtyRegistration::Create => self.emit(event::SESSION_CREATED, &info),
             PtyRegistration::Recover {
-                previous_runtime_id,
+                previous_worker_instance_id,
                 ..
-            } => self.emit_native_recovered(&info, previous_runtime_id),
+            } => self.emit_native_recovered(&info, previous_worker_instance_id),
         }
         let expected = RuntimeWatchIdentity::from_info(&info)
             .expect("committed live runtime has a complete watcher identity");
@@ -1054,7 +1054,7 @@ impl SessionRegistry {
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
         let worker_session_id = WorkerSessionId::new(&id.0)
             .map_err(|error| runtime_error("worker_initialize_invalid", error.to_string()))?;
-        let runtime_id = worker
+        let worker_instance_id = worker
             .initialize(Initialize {
                 session_id: worker_session_id,
                 transaction_id,
@@ -1104,7 +1104,7 @@ impl SessionRegistry {
                 state: RuntimeState::Live,
                 runtime_generation,
                 worker_id: Some(worker_id.to_string()),
-                runtime_id: Some(runtime_id.to_string()),
+                runtime_id: Some(worker_instance_id.to_string()),
                 started_at: Some(connected_at.clone()),
                 last_connected_at: Some(connected_at),
                 loss_reason: None,
@@ -1201,7 +1201,7 @@ mod tests {
         let registration = PtyRegistration::Recover {
             transaction_id: "recover-overflow".to_owned(),
             previous_worker_id: None,
-            previous_runtime_id: None,
+            previous_worker_instance_id: None,
             previous_runtime_generation: protocol::RuntimeGeneration::new(u64::MAX),
             previous_job: None,
             created_at: "2026-08-04T00:00:00Z".to_owned(),

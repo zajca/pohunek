@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    BaseEnv, DaemonId, DataToken, LeaseChallenge, LeaseId, RequestId, RuntimeId, SecretBytes,
-    SecretEnv, SessionId, StreamId, TransactionId, Version, VersionRange, WorkerId, WriteId,
+    BaseEnv, DaemonId, DataToken, LeaseChallenge, LeaseId, RequestId, SecretBytes, SecretEnv,
+    SessionId, StreamId, TransactionId, Version, VersionRange, WorkerId, WorkerInstanceId, WriteId,
     BASE_ENVIRONMENT_VERSION,
 };
 
@@ -556,7 +556,8 @@ pub struct RuntimeScope {
     /// Expected worker process.
     pub worker_id: WorkerId,
     /// Expected uninterrupted PTY runtime.
-    pub runtime_id: RuntimeId,
+    #[serde(rename = "runtime_id")]
+    pub worker_instance_id: WorkerInstanceId,
 }
 
 /// Selects the purpose of a worker data stream.
@@ -669,7 +670,8 @@ pub struct InspectSnapshot {
     /// Worker process identity.
     pub worker_id: WorkerId,
     /// Runtime generation when initialized.
-    pub runtime_id: Option<RuntimeId>,
+    #[serde(rename = "runtime_id")]
+    pub worker_instance_id: Option<WorkerInstanceId>,
     /// Current lifecycle phase.
     pub phase: RuntimePhase,
     /// Worker operating-system identity.
@@ -830,7 +832,8 @@ pub enum ResponseKind {
         /// Worker process.
         worker_id: WorkerId,
         /// Runtime generation when initialized.
-        runtime_id: Option<RuntimeId>,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: Option<WorkerInstanceId>,
         /// Worker operating-system identity.
         worker_process: ProcessIdentity,
         /// Current runtime phase.
@@ -855,7 +858,8 @@ pub enum ResponseKind {
     /// Reports successful or idempotently repeated initialization.
     Initialized {
         /// New uninterrupted runtime generation.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
         /// Root child process.
         child_process: ProcessIdentity,
     },
@@ -869,7 +873,8 @@ pub enum ResponseKind {
     /// Returns a rendered terminal snapshot for one runtime generation.
     TerminalSnapshot {
         /// Runtime that produced the snapshot.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
         /// Current terminal state.
         snapshot: Box<crate::TerminalSnapshot>,
     },
@@ -972,45 +977,52 @@ pub enum EventKind {
     /// The PTY child started.
     RuntimeStarted {
         /// New runtime generation.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
         /// Root child process.
         child_process: ProcessIdentity,
     },
     /// New PTY output advanced the watermark.
     OutputAdvanced {
         /// Runtime generation.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
         /// Offset after the newest byte.
         next_offset: u64,
     },
     /// Current visible terminal state changed.
     TerminalChanged {
         /// Runtime generation.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
         /// Snapshot watermark.
         watermark: u64,
     },
     /// Worker-local provider identity state changed.
     IdentityChanged {
         /// Runtime generation.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
     },
     /// Provider-managed subagent state changed.
     SubagentsChanged {
         /// Runtime generation.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
     },
     /// Root child reached a terminal outcome.
     ChildExited {
         /// Runtime generation.
-        runtime_id: RuntimeId,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: WorkerInstanceId,
         /// Recorded terminal outcome.
         exit: ExitStatus,
     },
     /// Worker runtime entered a faulted phase.
     RuntimeFault {
         /// Runtime generation when one exists.
-        runtime_id: Option<RuntimeId>,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: Option<WorkerInstanceId>,
         /// Sanitized typed failure.
         error: ControlError,
     },
@@ -1190,7 +1202,7 @@ mod tests {
             lease_id: LeaseId::new("lease-1").expect("valid lease"),
             session_id: SessionId::new("s-1").expect("valid session"),
             worker_id: WorkerId::new("w-1").expect("valid worker"),
-            runtime_id: RuntimeId::new("runtime-1").expect("valid runtime"),
+            worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
         };
         let request = ControlMessage::Request(ControlRequest {
             request_id: RequestId::new("observation-1").expect("valid request"),

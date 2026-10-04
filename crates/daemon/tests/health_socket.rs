@@ -3443,7 +3443,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     assert_eq!(created.branch.as_deref(), Some("feat/x"));
     assert_eq!(created.cwd, worktree_path);
 
-    let runtime_id = created
+    let worker_instance_id = created
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.runtime_id.as_deref())
@@ -3454,7 +3454,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
         serde_json::to_value(
             SessionReportNativeIdParams::new(
                 created.id.clone(),
-                runtime_id,
+                worker_instance_id,
                 bin_name,
                 created.pid,
                 process_start_identity(created.pid),

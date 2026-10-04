@@ -676,7 +676,7 @@ where
     let identity = WorkerFrameIdentity {
         version: data.version,
         stream_id: data.stream_id.clone(),
-        runtime_id: data.runtime_id.clone(),
+        worker_instance_id: data.worker_instance_id.clone(),
     };
     bridge_worker_frames(
         stream,
@@ -695,7 +695,7 @@ where
 struct WorkerFrameIdentity {
     version: pohunek_worker_protocol::Version,
     stream_id: pohunek_worker_protocol::StreamId,
-    runtime_id: pohunek_worker_protocol::RuntimeId,
+    worker_instance_id: pohunek_worker_protocol::WorkerInstanceId,
 }
 
 /// Copies worker frames to the public stream and public bytes to the worker.
@@ -737,7 +737,7 @@ where
                     break;
                 };
                 let (header, payload) = frame.into_parts();
-                if header.stream_id != identity.stream_id || header.runtime_id != identity.runtime_id {
+                if header.stream_id != identity.stream_id || header.worker_instance_id != identity.worker_instance_id {
                     return Err(AttachBridgeError::worker_message(
                         "worker attach frame identity mismatch",
                     ));
@@ -916,7 +916,7 @@ where
         FrameHeader {
             version: identity.version,
             stream_id: identity.stream_id.clone(),
-            runtime_id: identity.runtime_id.clone(),
+            worker_instance_id: identity.worker_instance_id.clone(),
             kind: FrameKind::Input { write_id },
         },
         bytes,
@@ -1112,7 +1112,7 @@ mod pending_socket_tests {
 mod tests {
     use pohunek_worker_protocol::{
         CloseReason, ControlCode, ControlError, Cursor, DataFrame, Dimensions, FrameHeader,
-        FrameKind, RuntimeId, StreamId, TerminalSnapshot, Version,
+        FrameKind, StreamId, TerminalSnapshot, Version, WorkerInstanceId,
     };
     use protocol::{ProtocolVersion, ProtocolVersionRange, Request};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1141,7 +1141,7 @@ mod tests {
             stream,
             version: Version::new(1).expect("version"),
             stream_id: StreamId::new("a-typed-error").expect("stream id"),
-            runtime_id: RuntimeId::new("runtime-typed-error").expect("runtime id"),
+            worker_instance_id: WorkerInstanceId::new("runtime-typed-error").expect("runtime id"),
             dimension_update: None,
         }
     }
@@ -1205,7 +1205,7 @@ mod tests {
             FrameHeader {
                 version: data.version,
                 stream_id: data.stream_id.clone(),
-                runtime_id: data.runtime_id.clone(),
+                worker_instance_id: data.worker_instance_id.clone(),
                 kind: FrameKind::Error {
                     error: ControlError {
                         code: ControlCode::RuntimeFault,
@@ -1283,14 +1283,14 @@ mod tests {
         let identity = WorkerFrameIdentity {
             version: Version::new(1).expect("version"),
             stream_id: StreamId::new("a-partial").expect("stream id"),
-            runtime_id: RuntimeId::new("runtime-partial").expect("runtime id"),
+            worker_instance_id: WorkerInstanceId::new("runtime-partial").expect("runtime id"),
         };
         let frame = |kind, payload: &[u8]| {
             DataFrame::new(
                 FrameHeader {
                     version: identity.version,
                     stream_id: identity.stream_id.clone(),
-                    runtime_id: identity.runtime_id.clone(),
+                    worker_instance_id: identity.worker_instance_id.clone(),
                     kind,
                 },
                 payload.to_vec(),
@@ -1388,7 +1388,7 @@ mod tests {
             FrameHeader {
                 version: data.version,
                 stream_id: data.stream_id.clone(),
-                runtime_id: data.runtime_id.clone(),
+                worker_instance_id: data.worker_instance_id.clone(),
                 kind: FrameKind::Replay { offset: 0 },
             },
             b"historical bytes".to_vec(),

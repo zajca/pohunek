@@ -25,7 +25,7 @@ const PROC_ROOT: &str = "/proc";
 const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
-const ENV_RUNTIME_ID: &str = "POHUNEK_RUNTIME_ID";
+const ENV_WORKER_INSTANCE_ID: &str = "POHUNEK_WORKER_INSTANCE_ID";
 /// `/proc/<pid>/stat` process-group field number (`pgrp`).
 const STAT_PGRP_FIELD: usize = 5;
 /// `/proc/<pid>/stat` parent-process field number (`ppid`).
@@ -447,8 +447,8 @@ fn parse_ownership_markers(environ: &[u8]) -> OwnershipMarkers {
             &mut markers.daemon_id
         } else if key == ENV_SESSION_ID.as_bytes() {
             &mut markers.session_id
-        } else if key == ENV_RUNTIME_ID.as_bytes() {
-            &mut markers.runtime_id
+        } else if key == ENV_WORKER_INSTANCE_ID.as_bytes() {
+            &mut markers.worker_instance_id
         } else {
             continue;
         };
@@ -457,7 +457,7 @@ fn parse_ownership_markers(environ: &[u8]) -> OwnershipMarkers {
         }
         if markers.daemon_id.is_some()
             && markers.session_id.is_some()
-            && markers.runtime_id.is_some()
+            && markers.worker_instance_id.is_some()
         {
             break;
         }
@@ -1184,7 +1184,7 @@ mod tests {
     #[test]
     fn environ_parser_retains_only_allowlisted_markers() {
         let environ = b"AWS_SECRET_ACCESS_KEY=super-secret\0POHUNEK_DAEMON_ID=d-1\0\
-POHUNEK_SESSION_ID=s-1\0POHUNEK_RUNTIME_ID=r-1\0POHUNEK_RUNTIME_IDX=r-2\0HOME=/home/u\0";
+POHUNEK_SESSION_ID=s-1\0POHUNEK_WORKER_INSTANCE_ID=r-1\0POHUNEK_WORKER_INSTANCE_IDX=r-2\0HOME=/home/u\0";
 
         let markers = parse_ownership_markers(environ);
 
@@ -1193,24 +1193,33 @@ POHUNEK_SESSION_ID=s-1\0POHUNEK_RUNTIME_ID=r-1\0POHUNEK_RUNTIME_IDX=r-2\0HOME=/h
             OwnershipMarkers {
                 daemon_id: Some("d-1".to_owned()),
                 session_id: Some("s-1".to_owned()),
-                runtime_id: Some("r-1".to_owned()),
+                worker_instance_id: Some("r-1".to_owned()),
             }
         );
         assert!(!format!("{markers:?}").contains("super-secret"));
     }
 
     #[test]
-    fn environ_parser_keeps_the_first_duplicate_like_getenv() {
-        let markers =
-            parse_ownership_markers(b"POHUNEK_RUNTIME_ID=first\0POHUNEK_RUNTIME_ID=second\0");
+    fn environ_parser_ignores_a_runtime_id_marker() {
+        let markers = parse_ownership_markers(b"POHUNEK_RUNTIME_ID=r-1\0");
 
-        assert_eq!(markers.runtime_id.as_deref(), Some("first"));
+        assert_eq!(markers, OwnershipMarkers::default());
+        assert!(!markers.is_marked());
+    }
+
+    #[test]
+    fn environ_parser_keeps_the_first_duplicate_like_getenv() {
+        let markers = parse_ownership_markers(
+            b"POHUNEK_WORKER_INSTANCE_ID=first\0POHUNEK_WORKER_INSTANCE_ID=second\0",
+        );
+
+        assert_eq!(markers.worker_instance_id.as_deref(), Some("first"));
         assert!(markers.is_marked());
     }
 
     #[test]
     fn environ_parser_ignores_entries_without_a_separator() {
-        let markers = parse_ownership_markers(b"POHUNEK_RUNTIME_ID\0\0garbage");
+        let markers = parse_ownership_markers(b"POHUNEK_WORKER_INSTANCE_ID\0\0garbage");
 
         assert_eq!(markers, OwnershipMarkers::default());
         assert!(!markers.is_marked());
@@ -1223,7 +1232,7 @@ POHUNEK_SESSION_ID=s-1\0POHUNEK_RUNTIME_ID=r-1\0POHUNEK_RUNTIME_IDX=r-2\0HOME=/h
         let mut child = env
             .command("/bin/sleep")
             .arg("30")
-            .env("POHUNEK_RUNTIME_ID", "runtime-live")
+            .env("POHUNEK_WORKER_INSTANCE_ID", "runtime-live")
             .env("POHUNEK_TEST_SECRET", "not-a-marker")
             .spawn()
             .expect("spawn marked child");
@@ -1244,7 +1253,7 @@ POHUNEK_SESSION_ID=s-1\0POHUNEK_RUNTIME_ID=r-1\0POHUNEK_RUNTIME_IDX=r-2\0HOME=/h
         child.wait().expect("reap marked child");
 
         let markers = markers.expect("inspect child markers");
-        assert_eq!(markers.runtime_id.as_deref(), Some("runtime-live"));
+        assert_eq!(markers.worker_instance_id.as_deref(), Some("runtime-live"));
         assert!(!format!("{markers:?}").contains("not-a-marker"));
     }
 

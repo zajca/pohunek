@@ -15,8 +15,8 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    AttachStart, ControlError, DataToken, Dimensions, ExitStatus, RuntimeId, StreamId, StreamMode,
-    Version, WriteId,
+    AttachStart, ControlError, DataToken, Dimensions, ExitStatus, StreamId, StreamMode, Version,
+    WorkerInstanceId, WriteId,
 };
 
 /// Maximum serialized JSON header bytes in one data frame.
@@ -198,7 +198,8 @@ pub struct FrameHeader {
     /// Framed data stream identity.
     pub stream_id: StreamId,
     /// Uninterrupted PTY runtime generation.
-    pub runtime_id: RuntimeId,
+    #[serde(rename = "runtime_id")]
+    pub worker_instance_id: WorkerInstanceId,
     /// Kind-specific metadata.
     #[serde(flatten)]
     pub kind: FrameKind,
@@ -537,7 +538,7 @@ mod tests {
         FrameHeader {
             version: CURRENT_VERSION,
             stream_id: StreamId::new("stream-1").expect("valid stream"),
-            runtime_id: RuntimeId::new("runtime-1").expect("valid runtime"),
+            worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
             kind,
         }
     }

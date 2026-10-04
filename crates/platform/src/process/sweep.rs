@@ -1,9 +1,9 @@
-//! Reaps the processes one lost worker runtime generation left behind.
+//! Reaps the processes one lost worker instance left behind.
 //!
-//! A session worker marks every child it launches with `POHUNEK_RUNTIME_ID`.
+//! A session worker marks every child it launches with `POHUNEK_WORKER_INSTANCE_ID`.
 //! When the worker dies, PTY descendants that ignore hangup can survive it.
 //! [`sweep_runtime`] finds the same-user processes that carry exactly that
-//! runtime marker and terminates them, first with `SIGTERM` and, after a grace
+//! worker-instance marker and terminates them, first with `SIGTERM` and, after a grace
 //! period, with `SIGKILL`. Every signal is preceded by a start-identity check,
 //! so a reused PID is never signalled, and any inspection failure other than a
 //! process disappearing aborts the sweep before further signals are sent.
@@ -18,12 +18,12 @@ use tokio::time::Instant;
 
 use super::{Error, ProcessIdentity, ProcessInspector, StartIdentity};
 
-/// Largest accepted runtime ID, in bytes.
+/// Largest accepted worker instance ID, in bytes.
 ///
 /// Matches the worker-protocol identifier bound (`pohunek-worker-protocol`
-/// `MAX_ID_BYTES`), which is where runtime IDs are minted. It is below the
-/// Darwin marker-value bound, so every valid runtime ID can be observed.
-pub const MAX_RUNTIME_ID_BYTES: usize = 128;
+/// `MAX_ID_BYTES`), which is where worker instance IDs are minted. It is below the
+/// Darwin marker-value bound, so every valid worker instance ID can be observed.
+pub const MAX_WORKER_INSTANCE_ID_BYTES: usize = 128;
 
 /// Longest accepted grace period between `SIGTERM` and `SIGKILL`.
 ///
@@ -34,7 +34,7 @@ pub const MAX_SWEEP_GRACE: Duration = Duration::from_mins(10);
 /// Validated parameters of one runtime sweep.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SweepRequest {
-    runtime_id: String,
+    worker_instance_id: String,
     owner_uid: u32,
     grace: Duration,
     poll: Duration,
@@ -44,7 +44,7 @@ pub struct SweepRequest {
 }
 
 impl SweepRequest {
-    /// Validates the parameters of a sweep of `runtime_id` owned by `owner_uid`.
+    /// Validates the parameters of a sweep of `worker_instance_id` owned by `owner_uid`.
     ///
     /// `grace` bounds both the wait between `SIGTERM` and `SIGKILL` and the
     /// wait for `SIGKILL` to take effect; `poll` is the liveness polling
@@ -52,20 +52,20 @@ impl SweepRequest {
     ///
     /// # Errors
     ///
-    /// Returns [`SweepError::InvalidRuntimeId`] unless `runtime_id` is 1 to
-    /// [`MAX_RUNTIME_ID_BYTES`] bytes of `[A-Za-z0-9._-]` and not `.` or `..`,
+    /// Returns [`SweepError::InvalidWorkerInstanceId`] unless `worker_instance_id` is 1 to
+    /// [`MAX_WORKER_INSTANCE_ID_BYTES`] bytes of `[A-Za-z0-9._-]` and not `.` or `..`,
     /// [`SweepError::InvalidGrace`] unless `grace` is positive and at most
     /// [`MAX_SWEEP_GRACE`], and [`SweepError::InvalidPoll`] unless `poll` is
     /// positive and at most `grace`.
     pub fn new(
-        runtime_id: impl Into<String>,
+        worker_instance_id: impl Into<String>,
         owner_uid: u32,
         grace: Duration,
         poll: Duration,
     ) -> Result<Self, SweepError> {
-        let runtime_id = runtime_id.into();
-        if !valid_runtime_id(&runtime_id) {
-            return Err(SweepError::InvalidRuntimeId);
+        let worker_instance_id = worker_instance_id.into();
+        if !valid_worker_instance_id(&worker_instance_id) {
+            return Err(SweepError::InvalidWorkerInstanceId);
         }
         if grace.is_zero() || grace > MAX_SWEEP_GRACE {
             return Err(SweepError::InvalidGrace);
@@ -74,7 +74,7 @@ impl SweepRequest {
             return Err(SweepError::InvalidPoll);
         }
         Ok(Self {
-            runtime_id,
+            worker_instance_id,
             owner_uid,
             grace,
             poll,
@@ -98,10 +98,10 @@ impl SweepRequest {
         self
     }
 
-    /// Returns the exact runtime ID whose processes are swept.
+    /// Returns the exact worker instance ID whose processes are swept.
     #[must_use]
-    pub fn runtime_id(&self) -> &str {
-        &self.runtime_id
+    pub fn worker_instance_id(&self) -> &str {
+        &self.worker_instance_id
     }
 
     /// Returns the user that must own the swept processes.
@@ -130,9 +130,9 @@ impl SweepRequest {
 }
 
 /// Accepts the worker-protocol identifier alphabet and bound.
-fn valid_runtime_id(value: &str) -> bool {
+fn valid_worker_instance_id(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= MAX_RUNTIME_ID_BYTES
+        && value.len() <= MAX_WORKER_INSTANCE_ID_BYTES
         && !matches!(value, "." | "..")
         && value
             .bytes()
@@ -190,11 +190,11 @@ impl SweepReport {
 /// Typed runtime-sweep failure.
 #[derive(Debug, thiserror::Error)]
 pub enum SweepError {
-    /// The runtime ID is empty, oversized, or outside the identifier alphabet.
+    /// The worker instance ID is empty, oversized, or outside the identifier alphabet.
     #[error(
-        "sweep runtime id must be 1 to {MAX_RUNTIME_ID_BYTES} bytes of [A-Za-z0-9._-] and not `.` or `..`"
+        "sweep worker instance id must be 1 to {MAX_WORKER_INSTANCE_ID_BYTES} bytes of [A-Za-z0-9._-] and not `.` or `..`"
     )]
-    InvalidRuntimeId,
+    InvalidWorkerInstanceId,
     /// The grace period is zero or longer than [`MAX_SWEEP_GRACE`].
     #[error("sweep grace must be positive and at most {} seconds", MAX_SWEEP_GRACE.as_secs())]
     InvalidGrace,
@@ -229,11 +229,11 @@ pub enum SweepError {
     },
 }
 
-/// Terminates every same-user process marked with exactly one runtime ID.
+/// Terminates every same-user process marked with exactly one worker instance ID.
 ///
 /// The sweep enumerates the caller's processes and selects those whose
-/// allowlisted `POHUNEK_RUNTIME_ID` marker equals the request's runtime ID
-/// byte for byte; unmarked processes and other runtime IDs are never
+/// allowlisted `POHUNEK_WORKER_INSTANCE_ID` marker equals the request's worker instance ID
+/// byte for byte; unmarked processes and other worker instance IDs are never
 /// selected. Selection finishes before the first signal, so an inspection
 /// failure during selection signals nothing. Each selected process then gets
 /// `SIGTERM`; those still running after the grace period get `SIGKILL`; and
@@ -441,7 +441,7 @@ fn classify(
         }
         Err(error) => return Err(error),
     };
-    if markers.runtime_id.as_deref() != Some(request.runtime_id()) {
+    if markers.worker_instance_id.as_deref() != Some(request.worker_instance_id()) {
         return Ok(Selection::Foreign);
     }
     Ok(match verify(inspector, identity)? {

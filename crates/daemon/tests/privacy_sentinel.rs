@@ -859,7 +859,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     // `session/tests.rs` does; this is the same call the shipped
     // `pohunek-agent-state.sh` hook falls back to when it cannot reach the
     // worker's private hook socket.
-    let runtime_id = created
+    let worker_instance_id = created
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.runtime_id.as_deref())
@@ -870,7 +870,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         serde_json::to_value(
             SessionReportNativeIdParams::new(
                 created.id.clone(),
-                runtime_id,
+                worker_instance_id,
                 "claude",
                 created.pid,
                 process_start_identity(created.pid),
@@ -899,7 +899,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         &created.id.0,
         serde_json::json!({
             "type": "identity_report",
-            "runtime_id": runtime_id,
+            "runtime_id": worker_instance_id,
             "provider": "claude",
             "pid": created.pid,
             "start_identity": process_start_identity(created.pid).get(),

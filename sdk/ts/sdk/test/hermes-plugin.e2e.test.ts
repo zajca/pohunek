@@ -832,7 +832,7 @@ static enum hook_response read_response(int fd, long long total_deadline) {
 
 static enum hook_response report_identity(void) {
     const char *endpoint = getenv("POHUNEK_WORKER_SOCKET_PATH");
-    const char *runtime = getenv("POHUNEK_RUNTIME_ID");
+    const char *runtime = getenv("POHUNEK_WORKER_INSTANCE_ID");
     if (endpoint == NULL || runtime == NULL) return HOOK_RESPONSE_TERMINAL;
     unsigned long long start = process_start_identity();
     if (start == 0) return HOOK_RESPONSE_TERMINAL;

@@ -41,14 +41,14 @@ export interface ScenarioBackend {
   initialAttachDimensions(sessionId: SessionId): ReadonlyArray<TerminalDimensions>;
   inputs(sessionId: SessionId): ReadonlyArray<Uint8Array>;
   resizes(sessionId: SessionId): ReadonlyArray<ScenarioResize>;
-  replaceRuntime(sessionId: SessionId, runtimeId?: string): void;
+  replaceRuntime(sessionId: SessionId, workerInstanceId?: string): void;
   writeToPty(sessionId: SessionId, bytes: Uint8Array): number;
   queuePtyOutput(sessionId: SessionId, bytes: Uint8Array): void;
   setRetainedOutput(
     sessionId: SessionId,
     bytes: Uint8Array,
     historyStartOffset: number | bigint,
-    runtimeId?: string,
+    workerInstanceId?: string,
   ): void;
   setDiscoveredHosts(hosts: readonly HostRecord[]): void;
   stopAbruptly(): Promise<void>;
@@ -105,8 +105,8 @@ export class FixtureScenario {
   }
 
   /** Replaces one live runtime and wakes runtime-scoped waiters. */
-  public replaceRuntime(sessionId: SessionId, runtimeId?: string): void {
-    this.backend.replaceRuntime(sessionId, runtimeId);
+  public replaceRuntime(sessionId: SessionId, workerInstanceId?: string): void {
+    this.backend.replaceRuntime(sessionId, workerInstanceId);
   }
 
   public writeToPty(sessionId: SessionId, bytes: Uint8Array): number {
@@ -122,9 +122,9 @@ export class FixtureScenario {
     sessionId: SessionId,
     bytes: Uint8Array,
     historyStartOffset: number | bigint = 0,
-    runtimeId?: string,
+    workerInstanceId?: string,
   ): void {
-    this.backend.setRetainedOutput(sessionId, bytes, historyStartOffset, runtimeId);
+    this.backend.setRetainedOutput(sessionId, bytes, historyStartOffset, workerInstanceId);
   }
 
   public setDiscoveredHosts(hosts: readonly HostRecord[]): void {

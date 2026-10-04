@@ -184,7 +184,7 @@ another generation still runs (`runtime_identity_mismatch`), and when the
 session's journals cannot be read or a journaled worker of the generation still
 runs after the retirement (`runtime_supervision_ambiguous`). Every removal,
 including that of a live, terminal, or `lost` session, then sweeps the
-processes carrying the session's `POHUNEK_RUNTIME_ID` markers, because on macOS
+processes carrying the session's `POHUNEK_WORKER_INSTANCE_ID` markers, because on macOS
 a descendant that left the worker's process group survives both the stop and
 the job retirement. A sweep that cannot confirm every marked process exited
 (for example a process whose environment cannot be read) fails the removal
@@ -202,7 +202,7 @@ session and reports `runtime.state=lost`; it never starts provider-native resume
 during reconciliation. When the worker's job ended while its journal still said
 live and the journal's worker process is proven gone, reconciliation first
 sends `SIGTERM`, then after the configured `[sweep] grace_ms` `SIGKILL`, to every
-same-user process that carries exactly that generation's `POHUNEK_RUNTIME_ID`
+same-user process that carries exactly that generation's `POHUNEK_WORKER_INSTANCE_ID`
 ownership marker, checking each process's start identity before each signal.
 It retires the ended job and its definition, then reports `runtime_lost`.
 Uncertain evidence kills nothing.

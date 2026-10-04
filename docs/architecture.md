@@ -397,7 +397,13 @@ error rather than falling back to unsafe defaults.
 
 ## Durable Session Workers
 
-Every live logical session has one opaque `worker_id` and one `runtime_id`.
+Every live logical session has one opaque `worker_id` and one worker instance id
+(public field `runtime_id`; `WorkerInstanceId` in the Rust crates). The private
+worker control wire, data-frame headers, hook messages, the worker journal and
+the persisted runtime record spell the worker instance id `runtime_id`, so a
+live durable worker keeps talking to a newer daemon; only the environment
+marker `POHUNEK_WORKER_INSTANCE_ID` and the CLI flag `--worker-instance-id` use
+the long name.
 The worker owns the PTY master, root child handle, reader and reaper, bounded raw
 output ring, terminal tracker, input deduplication, resize sequencing, and final
 outcome. The daemon owns the stable session id, launch snapshot, project and

@@ -628,7 +628,7 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
         pohunek_daemon::store::RuntimeRecord {
             state: RuntimeState::Lost,
             worker_id: None,
-            runtime_id: None,
+            worker_instance_id: None,
             service_id: None,
             generation: None,
             executable: None,

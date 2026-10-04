@@ -463,7 +463,7 @@ with tempfile.TemporaryDirectory(prefix="pohunek-hermes-doctor-") as directory:
     PROBE_PHASE = 22
     os.environ.update({
         "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "doctor-session",
-        "POHUNEK_RUNTIME_ID": "doctor-runtime", "POHUNEK_WORKER_SOCKET_PATH": endpoint,
+        "POHUNEK_WORKER_INSTANCE_ID": "doctor-runtime", "POHUNEK_WORKER_SOCKET_PATH": endpoint,
         "POHUNEK_PROTOCOL_VERSION": "1", "POHUNEK_HOOK_TIMEOUT_MS": "50",
     })
     PROBE_PHASE = 23

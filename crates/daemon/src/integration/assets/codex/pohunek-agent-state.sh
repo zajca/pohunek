@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=codex
-# POHUNEK_INTEGRATION_VERSION=7
+# POHUNEK_INTEGRATION_VERSION=8
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # native session id for direct-session resume, and journal sanitized child state.
@@ -55,7 +55,7 @@ action = os.environ.get("POHUNEK_HOOK_ACTION")
 socket_path = os.environ.get("POHUNEK_SOCKET_PATH")
 worker_socket_path = os.environ.get("POHUNEK_WORKER_SOCKET_PATH")
 protocol_raw = os.environ.get("POHUNEK_PROTOCOL_VERSION")
-runtime_id = os.environ.get("POHUNEK_RUNTIME_ID")
+worker_instance_id = os.environ.get("POHUNEK_WORKER_INSTANCE_ID")
 agent_pid_raw = os.environ.get("POHUNEK_AGENT_PID")
 
 if not session_id or (not worker_socket_path and (not socket_path or not protocol_raw)):
@@ -153,7 +153,7 @@ def process_start_identity(pid):
 
 
 def send_worker_identity():
-    if not worker_socket_path or not runtime_id or agent_pid is None:
+    if not worker_socket_path or not worker_instance_id or agent_pid is None:
         return False
     start_identity = process_start_identity(agent_pid)
     if start_identity is None:
@@ -162,7 +162,7 @@ def send_worker_identity():
     native_reference = transcript_path if reference_kind == "path" else native_session_id
     request = {
         "type": "identity_report",
-        "runtime_id": runtime_id,
+        "runtime_id": worker_instance_id,
         "provider": agent,
         "pid": agent_pid,
         "start_identity": start_identity,
@@ -188,7 +188,7 @@ def send_worker_identity():
 
 
 def send_worker_subagent(request_type):
-    if not worker_socket_path or not runtime_id or agent_pid is None:
+    if not worker_socket_path or not worker_instance_id or agent_pid is None:
         return False
     start_identity = process_start_identity(agent_pid)
     subagent_id = hook_input.get("agent_id")
@@ -198,7 +198,7 @@ def send_worker_subagent(request_type):
     parent_id = hook_input.get("parent_agent_id")
     request = {
         "type": request_type,
-        "runtime_id": runtime_id,
+        "runtime_id": worker_instance_id,
         "provider": agent,
         "pid": agent_pid,
         "start_identity": start_identity,
@@ -275,12 +275,12 @@ if transcript_path:
 
 send_request("session.report_agent", report_agent_params, "agent")
 
-if runtime_id and agent_pid is not None:
+if worker_instance_id and agent_pid is not None:
     start_identity = process_start_identity(agent_pid)
     if start_identity is not None:
         native_id_params = {
             "session_id": session_id,
-            "runtime_id": runtime_id,
+            "runtime_id": worker_instance_id,
             "agent": agent,
             "pid": agent_pid,
             "pid_start_identity": str(start_identity),

@@ -102,7 +102,7 @@ impl AssistantPaths {
     }
 
     fn assistant_runtime_dir(&self, launch_id: &str) -> Option<PathBuf> {
-        pohunek_paths::valid_runtime_id(launch_id).map(|id| {
+        pohunek_paths::valid_path_id(launch_id).map(|id| {
             self.runtime_dir
                 .join(pohunek_paths::ASSISTANT_RUNTIME_SUBDIR)
                 .join(id)

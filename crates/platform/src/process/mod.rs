@@ -35,8 +35,8 @@ mod sweep;
 #[cfg(unix)]
 #[doc(inline)]
 pub use sweep::{
-    sweep_runtime, SkipReason, Skipped, SweepError, SweepReport, SweepRequest,
-    MAX_RUNTIME_ID_BYTES, MAX_SWEEP_GRACE,
+    sweep_runtime, SkipReason, Skipped, SweepError, SweepReport, SweepRequest, MAX_SWEEP_GRACE,
+    MAX_WORKER_INSTANCE_ID_BYTES,
 };
 
 #[cfg(target_os = "macos")]
@@ -178,18 +178,18 @@ pub struct OwnershipMarkers {
     pub daemon_id: Option<String>,
     /// Value of `POHUNEK_SESSION_ID`, when present.
     pub session_id: Option<String>,
-    /// Value of `POHUNEK_RUNTIME_ID`, when present.
+    /// Value of `POHUNEK_WORKER_INSTANCE_ID`, when present.
     ///
     /// A session worker injects it into every child it launches, so it names
     /// exactly one worker runtime generation.
-    pub runtime_id: Option<String>,
+    pub worker_instance_id: Option<String>,
 }
 
 impl OwnershipMarkers {
     /// Returns whether any ownership marker is present.
     #[must_use]
     pub fn is_marked(&self) -> bool {
-        self.daemon_id.is_some() || self.session_id.is_some() || self.runtime_id.is_some()
+        self.daemon_id.is_some() || self.session_id.is_some() || self.worker_instance_id.is_some()
     }
 }
 

@@ -103,7 +103,7 @@ class StartIdentityTests(unittest.TestCase):
             thread = threading.Thread(target=serve, daemon=True)
             thread.start()
             reporter = HookReporter({
-                "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_RUNTIME_ID": "r-1",
+                "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
                 "POHUNEK_WORKER_SOCKET_PATH": endpoint, "POHUNEK_PROTOCOL_VERSION": "1",
                 "POHUNEK_HOOK_TIMEOUT_MS": "1000",
             })

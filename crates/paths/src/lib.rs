@@ -387,7 +387,7 @@ impl BasePaths {
     /// Runtime directory for assistant material generated for one launch/session.
     #[must_use]
     pub fn assistant_runtime_dir(&self, launch_or_session_id: &str) -> Option<PathBuf> {
-        valid_runtime_id(launch_or_session_id)
+        valid_path_id(launch_or_session_id)
             .map(|id| self.runtime_dir.join(ASSISTANT_RUNTIME_SUBDIR).join(id))
     }
 
@@ -851,9 +851,9 @@ fn path_bytes(path: &Path) -> &[u8] {
     path.as_os_str().as_encoded_bytes()
 }
 
-/// Return a path view of a safe one-component runtime id.
+/// Return a path view of an identifier that is exactly one normal path component.
 #[must_use]
-pub fn valid_runtime_id(id: &str) -> Option<&Path> {
+pub fn valid_path_id(id: &str) -> Option<&Path> {
     let path = Path::new(id);
     let mut components = path.components();
     match (components.next(), components.next()) {

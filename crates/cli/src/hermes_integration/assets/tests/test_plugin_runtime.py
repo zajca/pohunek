@@ -678,27 +678,27 @@ class ToolTests(unittest.TestCase):
         runner.run.return_value = {"data_base64": ""}
         tools._runner = runner
         output = json.loads(tools.handlers()["pohunek_session_output"]({
-            "session": "s", "runtime_id": "r", "runtime_generation": "0",
+            "session": "s", "worker_instance_id": "r", "runtime_generation": "0",
             "after_offset": "18446744073709551615", "max_bytes": 16, "wait_ms": 10,
         }))
         self.assertTrue(output["ok"])
         self.assertEqual(runner.run.call_args.args[0].argv, (
             "--host", "local", "session", "output", "--max-bytes", "16", "--json",
-            "--runtime-id", "r", "--runtime-generation", "0",
+            "--worker-instance-id", "r", "--runtime-generation", "0",
             "--after-offset", "18446744073709551615", "--wait-ms", "10",
             "--", "s",
         ))
         runner.reset_mock()
         runner.run.return_value = {}
         waited = json.loads(tools.handlers()["pohunek_session_wait"]({
-            "session": "s", "runtime_id": "r", "runtime_generation": "18446744073709551615",
+            "session": "s", "worker_instance_id": "r", "runtime_generation": "18446744073709551615",
             "after_terminal_watermark": "0", "after_output_offset": "18446744073709551615",
             "timeout_ms": 10,
         }))
         self.assertTrue(waited["ok"])
         self.assertEqual(runner.run.call_args.args[0].argv, (
             "--host", "local", "session", "wait", "--timeout-ms", "10", "--json",
-            "--runtime-id", "r", "--runtime-generation", "18446744073709551615",
+            "--worker-instance-id", "r", "--runtime-generation", "18446744073709551615",
             "--after-terminal-watermark", "0",
             "--after-output-offset", "18446744073709551615",
             "--", "s",
@@ -717,12 +717,12 @@ class ToolTests(unittest.TestCase):
         cursor = first["result"]["next_offset"]
         generation = first["result"]["runtime_generation"]
         second = json.loads(tools.handlers()["pohunek_session_output"]({
-            "session": "s", "runtime_id": "r", "runtime_generation": generation,
+            "session": "s", "worker_instance_id": "r", "runtime_generation": generation,
             "after_offset": cursor, "max_bytes": 16,
         }))
         self.assertTrue(second["ok"])
         self.assertEqual(runner.run.call_args.args[0].argv[-8:], (
-            "--runtime-id", "r", "--runtime-generation", maximum,
+            "--worker-instance-id", "r", "--runtime-generation", maximum,
             "--after-offset", maximum, "--", "s",
         ))
 
@@ -736,7 +736,7 @@ class ToolTests(unittest.TestCase):
                 tools = Tools(policy(), None)
                 runner = mock.Mock()
                 tools._runner = runner
-                args = {"session": "s", "runtime_id": "r", "runtime_generation": "1"}
+                args = {"session": "s", "worker_instance_id": "r", "runtime_generation": "1"}
                 args[field] = value
                 response = json.loads(tools.handlers()["pohunek_session_output"](args))
                 self.assertEqual(response["error"]["code"], "plugin_invalid_request", (field, value))
@@ -746,7 +746,7 @@ class ToolTests(unittest.TestCase):
                 tools = Tools(policy(), None)
                 runner = mock.Mock()
                 tools._runner = runner
-                args = {"session": "s", "runtime_id": "r", "runtime_generation": "1", "timeout_ms": 10}
+                args = {"session": "s", "worker_instance_id": "r", "runtime_generation": "1", "timeout_ms": 10}
                 args[field] = value
                 response = json.loads(tools.handlers()["pohunek_session_wait"](args))
                 self.assertEqual(response["error"]["code"], "plugin_invalid_request", (field, value))
@@ -893,7 +893,7 @@ class HookTests(unittest.TestCase):
 
     def test_endpoint_failure_respects_short_deadline_and_excludes_payload(self) -> None:
         reporter = HookReporter({
-            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_RUNTIME_ID": "r-1",
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_SOCKET_PATH": "/tmp/does-not-exist", "POHUNEK_PROTOCOL_VERSION": "1",
             "POHUNEK_HOOK_TIMEOUT_MS": "10",
         })
@@ -917,7 +917,7 @@ class HookTests(unittest.TestCase):
 
     def test_continuation_identity_uses_monotonic_sequences(self) -> None:
         reporter = HookReporter({
-            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_RUNTIME_ID": "r-1",
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_PROTOCOL_VERSION": "1",
         })
         reporter._start_identity = 1
@@ -930,7 +930,7 @@ class HookTests(unittest.TestCase):
 
     def test_pending_launch_is_worker_owned_and_does_not_trigger_public_fallback(self) -> None:
         reporter = HookReporter({
-            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_RUNTIME_ID": "r-1",
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
             "POHUNEK_PROTOCOL_VERSION": "1",
         })
@@ -944,7 +944,7 @@ class HookTests(unittest.TestCase):
 
     def test_finalize_prefers_private_release_and_transition_mapping_is_payload_free(self) -> None:
         reporter = HookReporter({
-            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_RUNTIME_ID": "r-1",
+            "POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s-1", "POHUNEK_WORKER_INSTANCE_ID": "r-1",
             "POHUNEK_WORKER_SOCKET_PATH": "/tmp/worker", "POHUNEK_SOCKET_PATH": "/tmp/daemon",
             "POHUNEK_PROTOCOL_VERSION": "1", "POHUNEK_DAEMON_ID": "host-a",
         })
@@ -960,7 +960,7 @@ class HookTests(unittest.TestCase):
         self.assertNotIn("secret", repr(public.call_args_list))
 
     def test_end_outcomes_map_completed_interrupted_and_failed(self) -> None:
-        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_RUNTIME_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_PROTOCOL_VERSION": "1"})
+        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_PROTOCOL_VERSION": "1"})
         reporter._start_identity = 1
         with mock.patch.object(reporter, "_send_public") as public:
             reporter.on_session_end(completed=True)
@@ -972,7 +972,7 @@ class HookTests(unittest.TestCase):
         self.assertEqual(kinds, ["agent_blocked", "error"])
 
     def test_pinned_false_completed_maps_to_failed_and_semantic_response_errors_count(self) -> None:
-        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_RUNTIME_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/w", "POHUNEK_PROTOCOL_VERSION": "1"})
+        reporter = HookReporter({"POHUNEK_ENV": "1", "POHUNEK_SESSION_ID": "s", "POHUNEK_WORKER_INSTANCE_ID": "r", "POHUNEK_SOCKET_PATH": "/tmp/d", "POHUNEK_WORKER_SOCKET_PATH": "/tmp/w", "POHUNEK_PROTOCOL_VERSION": "1"})
         reporter._start_identity = 1
         with mock.patch.object(reporter, "_send_public") as public:
             reporter.on_session_end(completed=False, interrupted=False)

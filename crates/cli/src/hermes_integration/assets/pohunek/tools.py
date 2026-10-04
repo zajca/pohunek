@@ -55,8 +55,8 @@ TOOL_SCHEMAS = {
     "pohunek_sessions": _schema("List bounded Pohunek sessions on one permitted host.", {"host": _STRING_SCHEMA, "filters": {"type": "object", "properties": {key: _STRING_SCHEMA for key in ("id", "state", "activity", "agent", "project")}, "additionalProperties": False}}),
     "pohunek_session_get": _schema("Inspect one session by stable ID or exact name.", _HOST_SESSION_PROPERTIES, ["session"]),
     "pohunek_session_screen": _schema("Read a bounded rendered terminal screen.", _HOST_SESSION_PROPERTIES, ["session"]),
-    "pohunek_session_output": _schema("Read bounded incremental terminal output with cursors.", {**_HOST_SESSION_PROPERTIES, "runtime_id": _STRING_SCHEMA, "runtime_generation": _U64_DECIMAL_SCHEMA, "after_offset": _U64_DECIMAL_SCHEMA, "max_bytes": _INTEGER_SCHEMA, "wait_ms": _INTEGER_SCHEMA}, ["session"]),
-    "pohunek_session_wait": _schema("Wait for one bounded session state, activity, or output change.", {**_HOST_SESSION_PROPERTIES, "runtime_id": _STRING_SCHEMA, "runtime_generation": _U64_DECIMAL_SCHEMA, "after_updated_at": _STRING_SCHEMA, "after_terminal_watermark": _U64_DECIMAL_SCHEMA, "after_output_offset": _U64_DECIMAL_SCHEMA, "states": {"type": "array", "items": _STRING_SCHEMA}, "activities": {"type": "array", "items": _STRING_SCHEMA}, "timeout_ms": _INTEGER_SCHEMA}, ["session", "timeout_ms"]),
+    "pohunek_session_output": _schema("Read bounded incremental terminal output with cursors.", {**_HOST_SESSION_PROPERTIES, "worker_instance_id": _STRING_SCHEMA, "runtime_generation": _U64_DECIMAL_SCHEMA, "after_offset": _U64_DECIMAL_SCHEMA, "max_bytes": _INTEGER_SCHEMA, "wait_ms": _INTEGER_SCHEMA}, ["session"]),
+    "pohunek_session_wait": _schema("Wait for one bounded session state, activity, or output change.", {**_HOST_SESSION_PROPERTIES, "worker_instance_id": _STRING_SCHEMA, "runtime_generation": _U64_DECIMAL_SCHEMA, "after_updated_at": _STRING_SCHEMA, "after_terminal_watermark": _U64_DECIMAL_SCHEMA, "after_output_offset": _U64_DECIMAL_SCHEMA, "states": {"type": "array", "items": _STRING_SCHEMA}, "activities": {"type": "array", "items": _STRING_SCHEMA}, "timeout_ms": _INTEGER_SCHEMA}, ["session", "timeout_ms"]),
     "pohunek_session_diff": _schema("Read a bounded session worktree diff.", {**_HOST_SESSION_PROPERTIES, "base": _STRING_SCHEMA}, ["session"]),
     "pohunek_session_start": _schema("Start a session with a host-inventory agent profile and structured project or worktree selection.", {"host": _STRING_SCHEMA, "agent_profile": _STRING_SCHEMA, "name": _STRING_SCHEMA, "project": {"oneOf": [{"type": "object", "properties": {"id": _STRING_SCHEMA}, "required": ["id"], "additionalProperties": False}, {"type": "object", "properties": {"label": _STRING_SCHEMA}, "required": ["label"], "additionalProperties": False}]}, "worktree": {"type": "object", "properties": {"project": {"oneOf": [{"type": "object", "properties": {"id": _STRING_SCHEMA}, "required": ["id"], "additionalProperties": False}, {"type": "object", "properties": {"label": _STRING_SCHEMA}, "required": ["label"], "additionalProperties": False}]}, "branch": _STRING_SCHEMA, "base_branch": _STRING_SCHEMA}, "required": ["project"], "additionalProperties": False}, "cols": _INTEGER_SCHEMA, "rows": _INTEGER_SCHEMA, "initial_input": _STRING_SCHEMA}, ["agent_profile"]),
     "pohunek_session_send": _schema("Send bounded terminal input through stdin.", {**_HOST_SESSION_PROPERTIES, "input": _STRING_SCHEMA}, ["session", "input"]),
@@ -167,7 +167,7 @@ class Tools:
             if "after_offset" not in args:
                 raise CliError("plugin_invalid_request")
             argv.extend(("--wait-ms", str(_bounded_int(args["wait_ms"], 1, _MAX_WAIT_MS))))
-        if "after_offset" in args and "runtime_id" not in args:
+        if "after_offset" in args and "worker_instance_id" not in args:
             raise CliError("plugin_invalid_request")
         argv.extend(("--", target))
         return _normalize_terminal(self._runner.run(Invocation(tuple(argv))), maximum, decode_output=True)
@@ -177,7 +177,7 @@ class Tools:
         timeout = _bounded_int(args.get("timeout_ms"), 1, _MAX_WAIT_MS)
         argv = ["--host", host, "session", "wait", "--timeout-ms", str(timeout), "--json"]
         _runtime_args(argv, args)
-        if any(name in args for name in ("after_terminal_watermark", "after_output_offset")) and "runtime_id" not in args:
+        if any(name in args for name in ("after_terminal_watermark", "after_output_offset")) and "worker_instance_id" not in args:
             raise CliError("plugin_invalid_request")
         for source, option in (("after_updated_at", "--after-updated-at"), ("after_terminal_watermark", "--after-terminal-watermark"), ("after_output_offset", "--after-output-offset")):
             if source in args:
@@ -444,9 +444,9 @@ def _has_live_runtime(session: dict[str, Any]) -> bool:
     runtime = session.get("runtime")
     if not isinstance(runtime, dict) or runtime.get("state") != "live":
         return False
-    runtime_id = runtime.get("runtime_id")
+    worker_instance_id = runtime.get("runtime_id")
     generation = runtime.get("runtime_generation")
-    if not isinstance(runtime_id, str) or not runtime_id:
+    if not isinstance(worker_instance_id, str) or not worker_instance_id:
         return False
     try:
         _canonical_u64(generation)
@@ -521,12 +521,12 @@ def _dimensions(argv: list[str], args: dict[str, Any], required: bool = False) -
 
 
 def _runtime_args(argv: list[str], args: dict[str, Any]) -> None:
-    runtime_id = args.get("runtime_id")
+    worker_instance_id = args.get("worker_instance_id")
     generation = args.get("runtime_generation")
-    if (runtime_id is None) != (generation is None):
+    if (worker_instance_id is None) != (generation is None):
         raise CliError("plugin_invalid_request")
-    if runtime_id is not None:
-        argv.extend(("--runtime-id", _string(runtime_id, "runtime_id", _MAX_NAME_CHARS), "--runtime-generation", _canonical_u64(generation)))
+    if worker_instance_id is not None:
+        argv.extend(("--worker-instance-id", _string(worker_instance_id, "worker_instance_id", _MAX_NAME_CHARS), "--runtime-generation", _canonical_u64(generation)))
 
 
 def _bounded(value: Any, maximum: int) -> Any:

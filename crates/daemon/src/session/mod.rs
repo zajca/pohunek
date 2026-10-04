@@ -770,7 +770,7 @@ struct ReleasedSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeWatchIdentity {
     worker_id: String,
-    runtime_id: String,
+    worker_instance_id: String,
     generation: protocol::RuntimeGeneration,
 }
 
@@ -785,7 +785,7 @@ impl RuntimeWatchIdentity {
         let runtime = info.runtime.as_ref()?;
         Some(Self {
             worker_id: runtime.worker_id.clone()?,
-            runtime_id: runtime.runtime_id.clone()?,
+            worker_instance_id: runtime.runtime_id.clone()?,
             generation: runtime.runtime_generation,
         })
     }
@@ -793,7 +793,7 @@ impl RuntimeWatchIdentity {
     fn matches(&self, entry: &SessionEntry) -> bool {
         entry.info.runtime.as_ref().is_some_and(|runtime| {
             runtime.worker_id.as_deref() == Some(self.worker_id.as_str())
-                && runtime.runtime_id.as_deref() == Some(self.runtime_id.as_str())
+                && runtime.runtime_id.as_deref() == Some(self.worker_instance_id.as_str())
                 && runtime.runtime_generation == self.generation
         })
     }
@@ -1115,7 +1115,7 @@ impl SessionRegistry {
             RuntimeRecord {
                 state: RuntimeState::Live,
                 worker_id: None,
-                runtime_id: None,
+                worker_instance_id: None,
                 service_id: None,
                 generation: None,
                 executable: None,
@@ -1124,7 +1124,7 @@ impl SessionRegistry {
             |runtime| RuntimeRecord {
                 state: runtime.state,
                 worker_id: runtime.worker_id.clone(),
-                runtime_id: runtime.runtime_id.clone(),
+                worker_instance_id: runtime.runtime_id.clone(),
                 service_id: None,
                 generation: None,
                 executable: None,
@@ -1144,7 +1144,7 @@ impl SessionRegistry {
                 kind: TransactionKind::Create,
                 phase: crate::store::INITIAL_INPUT_PHASE.to_owned(),
                 previous_worker_id: None,
-                previous_runtime_id: None,
+                previous_worker_instance_id: None,
                 daemon_instance_id: Some(owner.clone()),
             })
         });
@@ -2222,7 +2222,7 @@ impl SessionRegistry {
         };
         let runtime_matches = worker_snapshot.session_id.as_str() == session_id.0
             && worker_snapshot
-                .runtime_id
+                .worker_instance_id
                 .as_ref()
                 .is_some_and(|runtime| runtime.as_str() == params.runtime_id());
         let process_matches = worker_snapshot
@@ -2284,7 +2284,7 @@ impl SessionRegistry {
             let previous_native_id = entry.info.native_session_id.clone();
             let previous_native_path = entry.info.native_session_path.clone();
             entry.last_native_report = Some(NativeIdentityReport {
-                runtime_id: params.runtime_id().to_owned(),
+                worker_instance_id: params.runtime_id().to_owned(),
                 pid: params.pid(),
                 pid_start_identity: params.pid_start_identity().get(),
                 sequence: incoming_sequence,
@@ -2315,7 +2315,7 @@ impl SessionRegistry {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(&session_id) {
                 let accepted = NativeIdentityReport {
-                    runtime_id: params.runtime_id().to_owned(),
+                    worker_instance_id: params.runtime_id().to_owned(),
                     pid: params.pid(),
                     pid_start_identity: params.pid_start_identity().get(),
                     sequence: params.sequence().get(),
@@ -2930,7 +2930,7 @@ impl SessionRegistry {
                         kind: transaction_kind,
                         phase: "requested".to_owned(),
                         previous_worker_id: None,
-                        previous_runtime_id: None,
+                        previous_worker_instance_id: None,
                         daemon_instance_id: None,
                     }),
                 ),
@@ -3175,7 +3175,7 @@ impl SessionRegistry {
                         kind: TransactionKind::Remove,
                         phase: "requested".to_owned(),
                         previous_worker_id: None,
-                        previous_runtime_id: None,
+                        previous_worker_instance_id: None,
                         daemon_instance_id: None,
                     }),
                 )
@@ -3184,7 +3184,7 @@ impl SessionRegistry {
             false
         };
 
-        let (job, runtime_id) = {
+        let (job, worker_instance_id) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             (
@@ -3197,7 +3197,7 @@ impl SessionRegistry {
             )
         };
         let released = self
-            .release_removed_session(id, job.as_ref(), runtime_id.as_deref(), cleanup)
+            .release_removed_session(id, job.as_ref(), worker_instance_id.as_deref(), cleanup)
             .await?;
         Ok(SessionRemoveResult {
             removed: released.evicted,
@@ -3215,7 +3215,7 @@ impl SessionRegistry {
     ///
     /// Shared by [`Self::remove_with`] and the reconciliation that finishes a
     /// durable removal intent, so both leave the same state behind. The
-    /// marker sweep of every runtime of `generation` and of `runtime_id`
+    /// marker sweep of every runtime of `generation` and of `worker_instance_id`
     /// ([`Self::sweep_removed_runtimes`], governed by `cleanup`) comes first, because nothing
     /// controls a surviving descendant once the record is gone. The record is
     /// deleted even when no entry is listed (startup reconciliation runs
@@ -3234,19 +3234,19 @@ impl SessionRegistry {
         &self,
         id: &SessionId,
         generation: Option<&Generation>,
-        runtime_id: Option<&str>,
+        worker_instance_id: Option<&str>,
         cleanup: UnconfirmedCleanup,
     ) -> Result<ReleasedSession, ProtocolError> {
         let accepted_unconfirmed = self
-            .sweep_removed_runtimes(id, generation, runtime_id, cleanup)
+            .sweep_removed_runtimes(id, generation, worker_instance_id, cleanup)
             .await?;
         // Every runtime is judged and the cap passed, so the removal proceeds
         // past these processes; logged before the first destructive step so
         // a later failure still leaves the decision on record.
-        for (process, accepted_runtime_id) in &accepted_unconfirmed {
+        for (process, accepted_worker_instance_id) in &accepted_unconfirmed {
             warn!(
                 session_id = %id.0,
-                runtime_id = %accepted_runtime_id,
+                worker_instance_id = %accepted_worker_instance_id,
                 pid = process.pid,
                 start_identity = %process.start_identity,
                 comm = process.command.as_deref().unwrap_or("unavailable"),
@@ -3701,10 +3701,14 @@ impl SessionRegistry {
         worker: Worker,
     ) -> RuntimeTransitionOutcome {
         let worker_id = worker.worker_id().await.to_string();
-        let Some(runtime_id) = worker.runtime_id().await.map(|value| value.to_string()) else {
+        let Some(worker_instance_id) = worker
+            .worker_instance_id()
+            .await
+            .map(|value| value.to_string())
+        else {
             return RuntimeTransitionOutcome::IdentityMismatch;
         };
-        if worker_id != expected.worker_id || runtime_id != expected.runtime_id {
+        if worker_id != expected.worker_id || worker_instance_id != expected.worker_instance_id {
             return RuntimeTransitionOutcome::IdentityMismatch;
         }
         let (base, candidate) = {
@@ -3721,7 +3725,7 @@ impl SessionRegistry {
             if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = RuntimeState::Live;
                 runtime.worker_id = Some(worker_id);
-                runtime.runtime_id = Some(runtime_id);
+                runtime.runtime_id = Some(worker_instance_id);
                 runtime.last_connected_at = Some(timestamp_now());
                 runtime.loss_reason = None;
             }
@@ -4236,8 +4240,12 @@ impl SessionRegistry {
         let _ = self.inner.events.send(event);
     }
 
-    fn emit_native_recovered(&self, info: &SessionInfo, previous_runtime_id: Option<String>) {
-        let runtime_id = info
+    fn emit_native_recovered(
+        &self,
+        info: &SessionInfo,
+        previous_worker_instance_id: Option<String>,
+    ) {
+        let worker_instance_id = info
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.runtime_id.clone());
@@ -4245,8 +4253,8 @@ impl SessionRegistry {
             event::SESSION_NATIVE_RECOVERED,
             event_payload(SessionNativeRecoveredEvent {
                 session: info.clone(),
-                previous_runtime_id,
-                runtime_id,
+                previous_runtime_id: previous_worker_instance_id,
+                runtime_id: worker_instance_id,
             }),
         );
         let _ = self.inner.events.send(event);
@@ -4660,7 +4668,7 @@ fn create_intent_record(
             kind: TransactionKind::Create,
             phase: "preparing".to_owned(),
             previous_worker_id: None,
-            previous_runtime_id: None,
+            previous_worker_instance_id: None,
             daemon_instance_id: None,
         }),
         info,
@@ -4669,7 +4677,7 @@ fn create_intent_record(
         runtime: RuntimeRecord {
             state: RuntimeState::Starting,
             worker_id: None,
-            runtime_id: None,
+            worker_instance_id: None,
             service_id: None,
             generation: None,
             executable: None,
@@ -4865,10 +4873,12 @@ fn report_seq_is_newer(current: Option<u64>, incoming: Option<u64>) -> bool {
 
 fn native_report_is_current(
     current: Option<&NativeIdentityReport>,
-    runtime_id: &str,
+    worker_instance_id: &str,
     sequence: u64,
 ) -> bool {
-    current.is_none_or(|current| current.runtime_id != runtime_id || sequence > current.sequence)
+    current.is_none_or(|current| {
+        current.worker_instance_id != worker_instance_id || sequence > current.sequence
+    })
 }
 
 fn release_matches(

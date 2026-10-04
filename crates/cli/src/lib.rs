@@ -1193,8 +1193,8 @@ enum SessionAction {
     Output {
         target: Target,
         #[arg(long, requires = "runtime_generation")]
-        runtime_id: Option<String>,
-        #[arg(long, requires = "runtime_id")]
+        worker_instance_id: Option<String>,
+        #[arg(long, requires = "worker_instance_id")]
         runtime_generation: Option<u64>,
         #[arg(long)]
         after_offset: Option<u64>,
@@ -1210,8 +1210,8 @@ enum SessionAction {
     Wait {
         target: Target,
         #[arg(long, requires = "runtime_generation")]
-        runtime_id: Option<String>,
-        #[arg(long, requires = "runtime_id")]
+        worker_instance_id: Option<String>,
+        #[arg(long, requires = "worker_instance_id")]
         runtime_generation: Option<u64>,
         #[arg(long)]
         after_updated_at: Option<String>,
@@ -1878,7 +1878,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Output {
                     target,
-                    runtime_id,
+                    worker_instance_id,
                     runtime_generation,
                     after_offset,
                     max_bytes,
@@ -1891,7 +1891,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         &paths,
                         &target,
                         commands::session::OutputArgs {
-                            runtime_id,
+                            worker_instance_id,
                             runtime_generation,
                             after_offset,
                             max_bytes,
@@ -1903,7 +1903,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 SessionAction::Wait {
                     target,
-                    runtime_id,
+                    worker_instance_id,
                     runtime_generation,
                     after_updated_at,
                     after_terminal_watermark,
@@ -1919,7 +1919,7 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                         &paths,
                         &target,
                         commands::session::WaitArgs {
-                            runtime_id,
+                            worker_instance_id,
                             runtime_generation,
                             after_updated_at,
                             after_terminal_watermark,
@@ -3133,7 +3133,7 @@ mod tests {
             "session",
             "output",
             "s-42",
-            "--runtime-id",
+            "--worker-instance-id",
             "r-1",
             "--runtime-generation",
             "7",

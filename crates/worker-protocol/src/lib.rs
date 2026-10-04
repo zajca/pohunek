@@ -52,8 +52,8 @@ pub use env::{
 };
 #[doc(inline)]
 pub use id::{
-    DaemonId, IdError, LeaseId, RequestId, RuntimeId, SessionId, StreamId, TransactionId, WorkerId,
-    WriteId,
+    DaemonId, IdError, LeaseId, RequestId, SessionId, StreamId, TransactionId, WorkerId,
+    WorkerInstanceId, WriteId,
 };
 #[doc(inline)]
 pub use secret::{DataToken, LeaseChallenge, SecretBytes, SecretEnv, SecretError};

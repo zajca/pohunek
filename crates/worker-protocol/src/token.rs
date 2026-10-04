@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 
-use crate::{DataToken, LeaseId, RuntimeId, StreamId};
+use crate::{DataToken, LeaseId, StreamId, WorkerInstanceId};
 
 /// Binds a one-use data token to one lease and runtime stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,7 +19,7 @@ pub struct TokenClaims {
     /// Controller lease that minted the token.
     pub lease_id: LeaseId,
     /// Runtime generation authorized by the token.
-    pub runtime_id: RuntimeId,
+    pub worker_instance_id: WorkerInstanceId,
     /// Exact data stream authorized by the token.
     pub stream_id: StreamId,
     /// Worker monotonic millisecond expiry.
@@ -90,7 +90,7 @@ impl TokenVault {
         &mut self,
         token: &DataToken,
         lease_id: &LeaseId,
-        runtime_id: &RuntimeId,
+        worker_instance_id: &WorkerInstanceId,
         stream_id: &StreamId,
         now_ms: u64,
     ) -> Result<TokenClaims, TokenError> {
@@ -99,7 +99,7 @@ impl TokenVault {
             return Err(TokenError::Expired);
         }
         if &claims.lease_id != lease_id
-            || &claims.runtime_id != runtime_id
+            || &claims.worker_instance_id != worker_instance_id
             || &claims.stream_id != stream_id
         {
             return Err(TokenError::ScopeMismatch);
@@ -167,7 +167,7 @@ mod tests {
     fn claims(expires_at_ms: u64) -> TokenClaims {
         TokenClaims {
             lease_id: LeaseId::new("lease-1").expect("valid lease"),
-            runtime_id: RuntimeId::new("runtime-1").expect("valid runtime"),
+            worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
             stream_id: StreamId::new("stream-1").expect("valid stream"),
             expires_at_ms,
         }
@@ -187,7 +187,7 @@ mod tests {
                 .redeem(
                     &token,
                     &expected.lease_id,
-                    &expected.runtime_id,
+                    &expected.worker_instance_id,
                     &expected.stream_id,
                     15,
                 )
@@ -199,7 +199,7 @@ mod tests {
                 .redeem(
                     &token,
                     &LeaseId::new("lease-1").expect("valid lease"),
-                    &RuntimeId::new("runtime-1").expect("valid runtime"),
+                    &WorkerInstanceId::new("runtime-1").expect("valid runtime"),
                     &StreamId::new("stream-1").expect("valid stream"),
                     15,
                 )
@@ -226,7 +226,7 @@ mod tests {
                 .redeem(
                     &expired,
                     &expected.lease_id,
-                    &expected.runtime_id,
+                    &expected.worker_instance_id,
                     &expected.stream_id,
                     20,
                 )
@@ -238,7 +238,7 @@ mod tests {
                 .redeem(
                     &mismatched,
                     &LeaseId::new("other").expect("valid lease"),
-                    &expected.runtime_id,
+                    &expected.worker_instance_id,
                     &expected.stream_id,
                     15,
                 )

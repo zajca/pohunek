@@ -754,7 +754,7 @@ fn hooks_reach_a_worker_socket_resolved_at_the_darwin_staged_limit() {
         .env("POHUNEK_WORKER_SOCKET_PATH", &socket)
         .env("POHUNEK_NATIVE_REFERENCE_KIND", "id")
         .env(super::ENV_SESSION_ID, "session-123")
-        .env("POHUNEK_RUNTIME_ID", "runtime-123")
+        .env("POHUNEK_WORKER_INSTANCE_ID", "runtime-123")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

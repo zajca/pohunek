@@ -7,7 +7,7 @@ use rustix::process::Signal;
 
 use super::{
     sweep_runtime, sweep_with, verify, Delivery, Fault, SkipReason, Skipped, SweepError,
-    SweepReport, SweepRequest, MAX_RUNTIME_ID_BYTES, MAX_SWEEP_GRACE,
+    SweepReport, SweepRequest, MAX_SWEEP_GRACE, MAX_WORKER_INSTANCE_ID_BYTES,
 };
 use crate::process::{
     Error, ExitWatch, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity, ProcessInspector,
@@ -239,8 +239,9 @@ async fn scripted_sweep(
     .await
 }
 
-fn request(runtime_id: &str) -> SweepRequest {
-    SweepRequest::new(runtime_id, OWNER, SCRIPTED_GRACE, SCRIPTED_POLL).expect("valid request")
+fn request(worker_instance_id: &str) -> SweepRequest {
+    SweepRequest::new(worker_instance_id, OWNER, SCRIPTED_GRACE, SCRIPTED_POLL)
+        .expect("valid request")
 }
 
 fn identity(pid: Pid, start: u64) -> ProcessIdentity {
@@ -250,9 +251,9 @@ fn identity(pid: Pid, start: u64) -> ProcessIdentity {
     }
 }
 
-fn marked(runtime_id: &str) -> MarkerAnswer {
+fn marked(worker_instance_id: &str) -> MarkerAnswer {
     MarkerAnswer::Markers(OwnershipMarkers {
-        runtime_id: Some(runtime_id.to_owned()),
+        worker_instance_id: Some(worker_instance_id.to_owned()),
         ..OwnershipMarkers::default()
     })
 }
@@ -313,10 +314,11 @@ fn unreadable_marker_processes_are_classified_by_their_start_time() {
 
 #[test]
 fn request_validation_rejects_invalid_parameters() {
-    let valid =
-        |runtime_id: &str| SweepRequest::new(runtime_id, OWNER, SCRIPTED_GRACE, SCRIPTED_POLL);
+    let valid = |worker_instance_id: &str| {
+        SweepRequest::new(worker_instance_id, OWNER, SCRIPTED_GRACE, SCRIPTED_POLL)
+    };
     valid("runtime_01.test-value").expect("identifier alphabet is accepted");
-    valid(&"r".repeat(MAX_RUNTIME_ID_BYTES)).expect("the bound is inclusive");
+    valid(&"r".repeat(MAX_WORKER_INSTANCE_ID_BYTES)).expect("the bound is inclusive");
     for invalid in [
         String::new(),
         ".".to_owned(),
@@ -324,10 +326,10 @@ fn request_validation_rejects_invalid_parameters() {
         "runtime a".to_owned(),
         "runtime/a".to_owned(),
         "runtime\u{0}a".to_owned(),
-        "r".repeat(MAX_RUNTIME_ID_BYTES + 1),
+        "r".repeat(MAX_WORKER_INSTANCE_ID_BYTES + 1),
     ] {
         assert!(
-            matches!(valid(&invalid), Err(SweepError::InvalidRuntimeId)),
+            matches!(valid(&invalid), Err(SweepError::InvalidWorkerInstanceId)),
             "{invalid:?} must be rejected"
         );
     }
@@ -545,7 +547,7 @@ async fn selection_matches_the_runtime_marker_exactly() {
             MarkerAnswer::Markers(OwnershipMarkers {
                 session_id: Some(RUNTIME.to_owned()),
                 daemon_id: Some(RUNTIME.to_owned()),
-                runtime_id: None,
+                worker_instance_id: None,
             }),
         );
     let sender = RecordingSender::fatal_on(&[Signal::TERM]);
@@ -686,7 +688,20 @@ mod host {
         }
     }
 
-    fn spawn(inspector: HostInspector, script: &str, runtime_id: Option<&str>) -> Fixture {
+    fn spawn(inspector: HostInspector, script: &str, worker_instance_id: Option<&str>) -> Fixture {
+        spawn_marked(
+            inspector,
+            script,
+            worker_instance_id.map(|value| ("POHUNEK_WORKER_INSTANCE_ID", value)),
+        )
+    }
+
+    /// Spawns the fixture with one `(name, value)` environment marker, if any.
+    fn spawn_marked(
+        inspector: HostInspector,
+        script: &str,
+        marker: Option<(&str, &str)>,
+    ) -> Fixture {
         let env = pohunek_test_support::env::TestEnv::new().expect("test environment");
         let mut command = env.command("/bin/sh");
         command
@@ -694,8 +709,8 @@ mod host {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(runtime_id) = runtime_id {
-            command.env("POHUNEK_RUNTIME_ID", runtime_id);
+        if let Some((name, value)) = marker {
+            command.env(name, value);
         }
         let child = command.spawn().expect("spawn fixture");
         let pid = child.id();
@@ -728,14 +743,14 @@ mod host {
         }
     }
 
-    /// Returns a runtime ID no other test or process uses.
+    /// Returns a worker instance ID no other test or process uses.
     fn unique_runtime(tag: &str) -> String {
         format!("sweep-test-{}-{tag}", std::process::id())
     }
 
-    fn request(runtime_id: &str) -> SweepRequest {
+    fn request(worker_instance_id: &str) -> SweepRequest {
         SweepRequest::new(
-            runtime_id,
+            worker_instance_id,
             rustix::process::geteuid().as_raw(),
             HOST_GRACE,
             HOST_POLL,
@@ -800,7 +815,7 @@ mod host {
     }
 
     #[tokio::test]
-    async fn a_runtime_id_prefix_does_not_match_a_longer_runtime_id() {
+    async fn a_worker_instance_id_prefix_does_not_match_a_longer_worker_instance_id() {
         let inspector = HostInspector::new();
         let runtime = unique_runtime("prefix");
         let exact = spawn(inspector, COMPLIANT, Some(&runtime));
@@ -812,5 +827,28 @@ mod host {
 
         assert_eq!(report.terminated, vec![exact.identity]);
         assert_untouched(inspector, &report, &longer);
+    }
+
+    /// The sweep matches the one `POHUNEK_WORKER_INSTANCE_ID` marker name; a
+    /// process carrying the same value only under `POHUNEK_RUNTIME_ID` is not
+    /// selected, so an unknown marker fails closed.
+    #[tokio::test]
+    async fn a_process_with_only_a_runtime_id_marker_is_not_swept() {
+        let inspector = HostInspector::new();
+        let runtime = unique_runtime("old-marker");
+        let marked = spawn(inspector, COMPLIANT, Some(&runtime));
+        let old_marker = spawn_marked(
+            inspector,
+            COMPLIANT,
+            Some(("POHUNEK_RUNTIME_ID", runtime.as_str())),
+        );
+
+        let report = sweep_runtime(&inspector, &request(&runtime))
+            .await
+            .expect("sweep worker instance");
+
+        assert_eq!(report.terminated, vec![marked.identity]);
+        assert!(report.is_complete());
+        assert_untouched(inspector, &report, &old_marker);
     }
 }

@@ -554,11 +554,11 @@ fn input_runtime_identity(
     if runtime.state != protocol::RuntimeState::Live {
         return Err(unavailable_runtime_error(session_id, runtime.state));
     }
-    let runtime_id = runtime
+    let worker_instance_id = runtime
         .runtime_id
         .clone()
         .ok_or_else(ProtocolError::session_terminal_unavailable)?;
-    SessionRuntimeIdentity::new(runtime_id, runtime.runtime_generation)
+    SessionRuntimeIdentity::new(worker_instance_id, runtime.runtime_generation)
         .map_err(|_error| ProtocolError::session_terminal_unavailable())
 }
 

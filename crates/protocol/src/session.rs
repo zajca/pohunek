@@ -14,8 +14,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     envelope::StateSource, ActivityRevision, OutputOffset, ProcessStartIdentity, ProtocolError,
     ReportSequence, RuntimeGeneration, RuntimeId, RuntimeRef, SubagentRevision, TerminalWatermark,
-    MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
-    MAX_SESSION_WAIT_MS,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
+    MAX_WORKER_INSTANCE_ID_BYTES,
 };
 
 /// The kind of agent backing a session.
@@ -1074,7 +1074,7 @@ impl SessionRuntimeIdentity {
         runtime_generation: RuntimeGeneration,
     ) -> Result<Self, ObservationParamsError> {
         let runtime_id = runtime_id.into();
-        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_RUNTIME_ID_BYTES)?;
+        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_WORKER_INSTANCE_ID_BYTES)?;
         Ok(Self {
             runtime_id,
             runtime_generation,
@@ -1830,7 +1830,7 @@ impl SessionReportNativeIdParams {
         let agent = agent.into();
         let expires_at = expires_at.into();
         let native_session_id = native_session_id.into();
-        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_RUNTIME_ID_BYTES)?;
+        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_WORKER_INSTANCE_ID_BYTES)?;
         validate_identifier(&agent, "agent")?;
         validate_identifier(&native_session_id, "native_session_id")?;
         if pid == 0 {

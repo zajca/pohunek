@@ -269,7 +269,11 @@ async fn version_six_child_gets_only_base_term_profile_and_identity() {
 
     let environment = child_environment(&worker, initialize).await;
 
-    let runtime_id = worker.runtime_id().await.expect("runtime id").to_string();
+    let worker_instance_id = worker
+        .worker_instance_id()
+        .await
+        .expect("runtime id")
+        .to_string();
     let socket_path = fixture.socket_path();
     let daemon_socket = fixture.root.join("runtime/pohunek/daemon.sock");
     let expected = BTreeMap::from([
@@ -282,7 +286,7 @@ async fn version_six_child_gets_only_base_term_profile_and_identity() {
         ("POHUNEK_ENV", "1"),
         ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
         ("POHUNEK_PROTOCOL_VERSION", "7"),
-        ("POHUNEK_RUNTIME_ID", runtime_id.as_str()),
+        ("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id.as_str()),
         ("POHUNEK_SESSION_ID", fixture.session_id.as_str()),
         (
             "POHUNEK_SOCKET_PATH",

@@ -28,8 +28,8 @@ use protocol::{
     SessionScreenResult, SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult,
     SessionWarning, SessionWarningKind, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, TerminalCursor, TerminalDimensions, TerminalWatermark,
-    MAX_CONTROL_LINE_BYTES, MAX_RUNTIME_ID_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
@@ -272,7 +272,7 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     .expect("writing to a String cannot fail");
     writeln!(
         body,
-        "export const MAX_RUNTIME_ID_BYTES = {MAX_RUNTIME_ID_BYTES} as const;"
+        "export const MAX_WORKER_INSTANCE_ID_BYTES = {MAX_WORKER_INSTANCE_ID_BYTES} as const;"
     )
     .expect("writing to a String cannot fail");
     writeln!(

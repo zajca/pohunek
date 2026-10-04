@@ -84,7 +84,7 @@ pub(crate) fn retry(
             continue;
         }
         let current = journal.phase == RuntimePhase::Live
-            && journal.runtime_id.as_ref() == Some(&claim.runtime_id)
+            && journal.worker_instance_id.as_ref() == Some(&claim.worker_instance_id)
             && journal.child.as_ref() == Some(&claim.root)
             && OffsetDateTime::parse(&claim.expires_at, &Rfc3339).is_ok_and(|expiry| expiry > now);
         if !current || journal.launch_identity.is_some() {
@@ -140,11 +140,11 @@ mod tests {
             "now".into(),
         );
         journal.phase = RuntimePhase::Live;
-        journal.runtime_id = Some("runtime-1".into());
+        journal.worker_instance_id = Some("runtime-1".into());
         journal.child = Some(root.clone());
         let claim = PendingLaunchClaim {
             retry_pending: true,
-            runtime_id: "runtime-1".into(),
+            worker_instance_id: "runtime-1".into(),
             root: root.clone(),
             identity: LaunchIdentity {
                 provider: "claude".into(),
@@ -206,7 +206,7 @@ mod tests {
             submit(&mut journal, claim, 1, unavailable).unwrap();
             match mutation {
                 0 => journal.pending_launch_claims[0].expires_at = now.format(&Rfc3339).unwrap(),
-                1 => journal.runtime_id = Some("replacement".into()),
+                1 => journal.worker_instance_id = Some("replacement".into()),
                 2 => journal.child.as_mut().unwrap().start_identity = "101".into(),
                 3 => journal.phase = RuntimePhase::Terminal,
                 _ => unreachable!(),

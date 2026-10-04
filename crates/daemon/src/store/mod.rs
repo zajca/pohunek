@@ -437,8 +437,10 @@ pub struct SessionTransaction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_worker_id: Option<String>,
     /// Runtime generation replaced by a recovery transaction, when known.
+    /// The persisted key stays `runtime_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_runtime_id: Option<String>,
+    #[serde(rename = "previous_runtime_id")]
+    pub previous_worker_instance_id: Option<String>,
     /// Daemon instance whose in-memory work the transaction depends on.
     ///
     /// Set on the `initial_input` marker, whose input only that instance
@@ -471,8 +473,10 @@ pub struct RuntimeRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
     /// Stable PTY generation identity.
+    /// The persisted key stays `runtime_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_id: Option<String>,
+    #[serde(rename = "runtime_id")]
+    pub worker_instance_id: Option<String>,
     /// Supervisor service identifier `<session-id>.<generation>` of the
     /// current worker job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -492,7 +496,9 @@ pub struct RuntimeRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeIdentityOrdering {
     /// Runtime generation that accepted the report.
-    pub runtime_id: String,
+    /// The persisted key stays `runtime_id`.
+    #[serde(rename = "runtime_id")]
+    pub worker_instance_id: String,
     /// Process id validated for the runtime root.
     pub pid: u32,
     /// Kernel start identity that protects against pid reuse.
@@ -1322,14 +1328,17 @@ pub(crate) fn preserve_newer_native_identity(
     let Some(ordering) = existing.native_identity_ordering.as_ref() else {
         return;
     };
-    if replacement.runtime.runtime_id.as_deref() != Some(ordering.runtime_id.as_str()) {
+    if replacement.runtime.worker_instance_id.as_deref()
+        != Some(ordering.worker_instance_id.as_str())
+    {
         return;
     }
     if let Some(candidate) = replacement
         .native_identity_ordering
         .as_ref()
         .filter(|candidate| {
-            candidate.runtime_id == ordering.runtime_id && candidate.sequence >= ordering.sequence
+            candidate.worker_instance_id == ordering.worker_instance_id
+                && candidate.sequence >= ordering.sequence
         })
     {
         if candidate.sequence > ordering.sequence {
@@ -1410,12 +1419,12 @@ fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord)
 
     let current_id = existing
         .runtime
-        .runtime_id
+        .worker_instance_id
         .as_deref()
         .or(current.runtime_id.as_deref());
     let candidate_id = replacement
         .runtime
-        .runtime_id
+        .worker_instance_id
         .as_deref()
         .or(candidate.runtime_id.as_deref());
     current_id.is_some() && candidate_id != current_id
@@ -1506,13 +1515,52 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use protocol::{AgentActivity, AgentKind, ProjectSource};
+    use protocol::{AgentActivity, AgentKind, ProjectSource, RuntimeState};
 
     use super::{
-        ProjectRecord, ProjectResolution, ResumeBinding, SessionRefKind, Store, StoreMutation,
-        StoredInputRules, WorktreeBinding, WorktreeStatus,
+        NativeIdentityOrdering, ProjectRecord, ProjectResolution, ResumeBinding, RuntimeRecord,
+        SessionRefKind, SessionTransaction, Store, StoreMutation, StoredInputRules,
+        WorktreeBinding, WorktreeStatus,
     };
     use crate::agent::{NativeArgs, NativeSessionLaunch};
+
+    /// Persisted runtime records keep the `runtime_id` key for the worker
+    /// instance, so records written by an earlier daemon build still load.
+    #[test]
+    fn persisted_worker_instance_ids_keep_the_runtime_id_key() {
+        let runtime: RuntimeRecord = serde_json::from_value(serde_json::json!({
+            "state": "live",
+            "runtime_id": "instance-1",
+        }))
+        .expect("decode runtime record from the persisted key");
+        assert_eq!(runtime.state, RuntimeState::Live);
+        assert_eq!(runtime.worker_instance_id.as_deref(), Some("instance-1"));
+        let encoded = serde_json::to_value(&runtime).expect("encode runtime record");
+        assert_eq!(encoded["runtime_id"], "instance-1");
+        assert!(encoded.get("worker_instance_id").is_none());
+
+        let ordering = NativeIdentityOrdering {
+            worker_instance_id: "instance-1".to_owned(),
+            pid: 7,
+            pid_start_identity: 9,
+            sequence: 3,
+        };
+        let encoded = serde_json::to_value(&ordering).expect("encode ordering");
+        assert_eq!(encoded["runtime_id"], "instance-1");
+        assert!(encoded.get("worker_instance_id").is_none());
+
+        let transaction: SessionTransaction = serde_json::from_value(serde_json::json!({
+            "id": "t-1",
+            "kind": "recover",
+            "phase": "started",
+            "previous_runtime_id": "instance-0",
+        }))
+        .expect("decode transaction from the persisted key");
+        assert_eq!(
+            transaction.previous_worker_instance_id.as_deref(),
+            Some("instance-0")
+        );
+    }
 
     fn launch(kind: SessionRefKind, resume: &[&str], fork: Option<&[&str]>) -> NativeSessionLaunch {
         NativeSessionLaunch::new(
