@@ -3547,7 +3547,19 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
         }
     };
     let actual_fingerprint = format!("{:x}", Sha256::digest(store_bytes));
-    if actual_fingerprint != manifest.store_sha256 {
+    // The preflight fingerprints the store as the legacy daemon left it, which
+    // the startup schema migration has already rewritten; the pre-migration
+    // backup proves the current bytes derive from exactly those bytes.
+    if actual_fingerprint != manifest.store_sha256
+        && !store
+            .is_schema_migration_of(&manifest.store_sha256)
+            .map_err(|error| {
+                runtime_error(
+                    "migration_import_failed",
+                    format!("failed to verify the metadata store against its backup: {error}"),
+                )
+            })?
+    {
         return Err(runtime_error(
             "migration_store_changed",
             "metadata store changed after migration preflight; rerun preflight",

@@ -130,3 +130,108 @@ async fn an_older_store_is_migrated_with_a_backup_before_the_daemon_serves() {
     daemon.kill().await.expect("stop daemon");
     let _ = daemon.wait().await;
 }
+
+/// The legacy-manifest file the importer reads at startup.
+const LEGACY_MANIFEST: &str = "migrations/durable-session-workers.json";
+
+/// The schema-1 store without its session record: the shape a legacy daemon
+/// left behind, which is what `pohunek migration preflight` fingerprints.
+fn resume_only_store() -> String {
+    let mut store = String::new();
+    for line in V0_33_0_STORE
+        .lines()
+        .filter(|line| !line.contains("\"kind\":\"session\""))
+    {
+        store.push_str(line);
+        store.push('\n');
+    }
+    store
+}
+
+/// Writes a pending legacy manifest fingerprinting `store_content`.
+fn write_pending_manifest(layout: &Layout, store_content: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let data_dir = layout.store.parent().expect("data dir");
+    let path = data_dir.join(LEGACY_MANIFEST);
+    fs::create_dir_all(path.parent().expect("migrations dir")).expect("create migrations dir");
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "created_at": "2026-07-01T00:00:00Z",
+        "store_sha256": format!("{:x}", Sha256::digest(store_content.as_bytes())),
+        "accept_runtime_loss": false,
+        "live_session_ids": [],
+        "sessions": [{
+            "id": "s-legacy-done",
+            "agent": "claude",
+            "agent_base": "claude",
+            "cwd": "/workspace/project",
+            "pid": 1,
+            "cols": 80,
+            "rows": 24,
+            "state": "done",
+            "state_source": "process",
+            "created_at": "2026-06-19T00:00:00Z",
+            "updated_at": "2026-06-19T00:00:01Z"
+        }],
+    });
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write manifest");
+    path
+}
+
+#[tokio::test]
+async fn a_pending_legacy_manifest_still_imports_after_the_schema_migration() {
+    let env = TestEnv::new().expect("create short test environment");
+    let store_content = resume_only_store();
+    let layout = Layout::new(&env, &store_content);
+    let manifest = write_pending_manifest(&layout, &store_content);
+
+    let mut daemon = daemon_command(&env, &layout)
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn daemon");
+    wait_until_ready(&mut daemon, &layout.socket()).await;
+
+    assert!(!manifest.exists(), "the imported manifest is archived");
+    let migrated = fs::read_to_string(&layout.store).expect("read store");
+    assert!(
+        migrated.contains("\"s-legacy-done\""),
+        "the legacy session is imported: {migrated}"
+    );
+    assert_eq!(
+        fs::read_to_string(layout.backup(1)).expect("read backup"),
+        store_content,
+        "the backup holds the bytes the manifest fingerprints"
+    );
+
+    daemon.kill().await.expect("stop daemon");
+    let _ = daemon.wait().await;
+}
+
+#[tokio::test]
+async fn a_store_edited_after_preflight_is_still_refused_after_the_schema_migration() {
+    let env = TestEnv::new().expect("create short test environment");
+    let preflight_content = resume_only_store();
+    let edited = format!(
+        "{preflight_content}{{\"kind\":\"project\",\"git_common_dir\":\"/other/.git\",\"repo_root\":\"/other\",\"is_bare\":false,\"source\":\"auto\",\"added_at\":\"t\",\"last_used_at\":\"t\"}}\n"
+    );
+    let layout = Layout::new(&env, &edited);
+    let manifest = write_pending_manifest(&layout, &preflight_content);
+
+    let output = daemon_command(&env, &layout)
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon")
+        .wait_with_output()
+        .await
+        .expect("collect daemon output");
+
+    assert!(!output.status.success(), "startup must fail closed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("migration_store_changed"), "{stderr}");
+    assert!(manifest.exists(), "the refused manifest stays pending");
+    assert!(!layout.socket().exists(), "no listener before the refusal");
+}

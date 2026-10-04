@@ -22,13 +22,14 @@ use std::sync::atomic::Ordering;
 
 use pohunek_platform::filesystem::{MoveOutcome, StageOutcome, TrustedDir};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::error::DaemonError;
 
 use super::{
-    fs_error_to_io, parent_directory, Store, OWNER_PRIVATE_DIRECTORY_MODE, OWNER_PRIVATE_FILE_MODE,
-    TEMP_SEQUENCE,
+    fs_error_to_io, parent_directory, Store, MAX_METADATA_STORE_BYTES,
+    OWNER_PRIVATE_DIRECTORY_MODE, OWNER_PRIVATE_FILE_MODE, TEMP_SEQUENCE,
 };
 
 /// Schema version every line written by this daemon carries.
@@ -310,6 +311,31 @@ pub(super) fn stamp_current_schema(value: &mut Value) -> io::Result<()> {
     Ok(())
 }
 
+/// Renders the current-schema store body for `lines`.
+///
+/// Deterministic: the same input lines always yield the same bytes, which is
+/// what lets [`Store::is_schema_migration_of`] recognise a migrated store.
+fn migrated_body(lines: Vec<ParsedLine<'_>>, capacity: usize) -> io::Result<(String, usize)> {
+    let mut body = String::with_capacity(capacity);
+    let mut records = 0;
+    for line in lines {
+        match line {
+            ParsedLine::Record {
+                mut value, version, ..
+            } => {
+                apply_steps(MIGRATIONS, STORE_SCHEMA_VERSION, &mut value, version);
+                let encoded = serde_json::to_string(&value)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                body.push_str(&encoded);
+                records += 1;
+            }
+            ParsedLine::Corrupt { text, .. } => body.push_str(text),
+        }
+        body.push('\n');
+    }
+    Ok((body, records))
+}
+
 impl Store {
     /// Migrates the store to the current schema, backing it up first.
     ///
@@ -343,23 +369,7 @@ impl Store {
 
         let backup = self.write_backup(content.as_bytes(), oldest)?;
 
-        let mut body = String::with_capacity(content.len());
-        let mut records = 0;
-        for line in lines {
-            match line {
-                ParsedLine::Record {
-                    mut value, version, ..
-                } => {
-                    apply_steps(MIGRATIONS, STORE_SCHEMA_VERSION, &mut value, version);
-                    let encoded = serde_json::to_string(&value)
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    body.push_str(&encoded);
-                    records += 1;
-                }
-                ParsedLine::Corrupt { text, .. } => body.push_str(text),
-            }
-            body.push('\n');
-        }
+        let (body, records) = migrated_body(lines, content.len())?;
         self.commit_body(&body)?.with_value(());
         info!(
             store.path = %self.path.display(),
@@ -374,6 +384,68 @@ impl Store {
             records,
             backup,
         })
+    }
+
+    /// Whether the store is exactly the schema migration of bytes that hash to
+    /// `original_sha256` (lowercase hex SHA-256).
+    ///
+    /// A pre-migration backup (`<store>.pre-schema-<n>`) must hash to
+    /// `original_sha256` and migrating its bytes must reproduce the store
+    /// byte for byte. A store edited after the backup was taken, or a backup of
+    /// an already edited store, therefore never matches. Lets a fingerprint
+    /// taken before the schema migration (the legacy migration manifest's
+    /// `store_sha256`) be validated against the original bytes afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error when the store or a backup cannot be read.
+    pub fn is_schema_migration_of(&self, original_sha256: &str) -> io::Result<bool> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(current) = self.read_content()? else {
+            return Ok(false);
+        };
+        let store_name = self.path.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata store has no filename",
+            )
+        })?;
+        let directory =
+            TrustedDir::open_absolute(parent_directory(&self.path), OWNER_PRIVATE_DIRECTORY_MODE)
+                .map_err(fs_error_to_io)?;
+        for schema in 1..STORE_SCHEMA_VERSION {
+            let mut backup_name = store_name.to_os_string();
+            backup_name.push(format!("{BACKUP_SUFFIX}{schema}"));
+            let bytes = match directory.read_file(
+                &backup_name,
+                OWNER_PRIVATE_FILE_MODE,
+                MAX_METADATA_STORE_BYTES,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) if error.io_kind() == Some(io::ErrorKind::NotFound) => continue,
+                Err(error) => return Err(fs_error_to_io(error)),
+            };
+            if format!("{:x}", Sha256::digest(&bytes)) != original_sha256 {
+                continue;
+            }
+            let Ok(original) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let lines = parse_lines(&self.path, &original)?;
+            if !matches!(
+                classify(&self.path, &lines)?,
+                SchemaState::Migratable { .. }
+            ) {
+                continue;
+            }
+            if migrated_body(lines, original.len())?.0 == current {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Copies `bytes` to `<store>.pre-schema-<schema>` unless a backup exists.
@@ -789,6 +861,56 @@ mod tests {
             raw_lines(&path)[0]["schema_version"],
             json!(STORE_SCHEMA_VERSION),
             "every written record carries the current schema"
+        );
+    }
+
+    fn sha256_hex(content: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(content.as_bytes()))
+    }
+
+    #[test]
+    fn a_migrated_store_is_recognised_as_the_migration_of_its_original_bytes() {
+        let (store, path) = store_with("recognise", V0_33_0_STORE);
+        let original = sha256_hex(V0_33_0_STORE);
+        assert!(
+            !store.is_schema_migration_of(&original).expect("check"),
+            "an unmigrated store has no backup yet"
+        );
+
+        store.migrate_to_current().expect("migrate");
+
+        assert!(store.is_schema_migration_of(&original).expect("check"));
+        assert!(
+            !store
+                .is_schema_migration_of(&sha256_hex("something else\n"))
+                .expect("check"),
+            "a different fingerprint never matches"
+        );
+
+        // A store edited after the migration no longer derives from the backup.
+        let mut edited = fs::read_to_string(&path).expect("read store");
+        edited.push_str("{not json\n");
+        write_private(&path, &edited);
+        assert!(!store.is_schema_migration_of(&original).expect("check"));
+    }
+
+    #[test]
+    fn a_stale_backup_does_not_vouch_for_a_store_edited_before_the_rerun() {
+        let (store, path) = store_with("stale-backup", V0_33_0_STORE);
+        store.fail_next_write_before_rename();
+        store.migrate_to_current().expect_err("interrupted");
+        // The store is edited between the interrupted run and the rerun.
+        let edited = format!("{V0_33_0_STORE}{{not json\n");
+        write_private(&path, &edited);
+
+        store.migrate_to_current().expect("rerun");
+
+        assert!(
+            !store
+                .is_schema_migration_of(&sha256_hex(V0_33_0_STORE))
+                .expect("check"),
+            "the kept backup holds the original bytes but the store derives from edited ones"
         );
     }
 
