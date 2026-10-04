@@ -27,9 +27,9 @@ pub use native_reference::{
     NativeReferenceStrategy, ReferenceCheckFailure, ReferenceExistence, MAX_EXISTENCE_DEPTH,
     MAX_EXISTENCE_ENTRIES, MAX_EXISTENCE_PATH_COMPONENTS, MAX_EXISTENCE_TEXT_BYTES,
 };
-pub(crate) use profile::{
-    apply_pin, check_structure, parse_head, BindError, Pin, ProfileRegistry, ResolvedAgent,
-};
+#[cfg(test)]
+pub(crate) use profile::MAX_PROFILE_BYTES;
+pub(crate) use profile::{apply_pin, parse_head, BindError, Pin, ProfileRegistry, ResolvedAgent};
 
 /// Shell launched when the host reports no usable login shell.
 pub(crate) const FALLBACK_LOGIN_SHELL: &str = "/bin/sh";

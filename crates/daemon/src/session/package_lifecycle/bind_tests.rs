@@ -527,3 +527,157 @@ async fn a_bind_and_an_uninstall_racing_on_worker_threads_keep_the_invariant() {
         race_once(&format!("bind-race-threads-{round}"), round % 2 == 0).await;
     }
 }
+
+// ----- the candidate must launch as the target ------------------------------
+
+/// A package at `version` whose descriptor is the fixture's with `transform`
+/// applied, so its native recovery capabilities differ from the default
+/// (assigned reference, fork supported).
+fn capability_variant(version: &str, transform: impl FnOnce(String) -> String) -> Package {
+    use crate::agent::host::fixture::{pi_shaped_document, PI_SHAPED_NO_CHECK};
+    let document = pi_shaped_document(std::path::Path::new(INERT_PROGRAM), PI_SHAPED_NO_CHECK)
+        .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
+        .replace(
+            "detect_manifest = \"any\"",
+            "detect_manifest = \"detect.toml\"",
+        );
+    Package::with_descriptor(&transform(document))
+}
+
+/// The fixture descriptor with a hook-reported reference instead of an
+/// assigned one.
+fn hook_strategy(document: String) -> String {
+    let start = document
+        .find("[native_reference]")
+        .expect("the native reference table");
+    format!(
+        "{}[native_reference]\nstrategy = \"hook\"\n",
+        &document[..start]
+    )
+}
+
+/// A hook runtime that cannot fork.
+fn hook_without_fork(document: String) -> String {
+    hook_strategy(document).replace(
+        "[fork]\nsupported = true\nargs = [\"--fork\", \"{reference}\"]",
+        "[fork]\nsupported = false",
+    )
+}
+
+const RESUME_OVERRIDE: &str =
+    "\n[resume]\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n";
+
+/// Binds `profile` to `target` in a preview and a commit and expects both to
+/// be refused with the original untouched.
+async fn expect_refused(fixture: &Fixture, path: &Path, target: &Package) {
+    let before = state_of(path);
+    for dry_run in [true, false] {
+        let refused = fixture
+            .registry
+            .package_bind_profile(bind(PROFILE, Some(&target.digest), dry_run))
+            .await
+            .expect_err("the candidate would not launch");
+        assert_eq!(
+            refused,
+            PackageErrorKind::ProfileUnusable,
+            "dry_run {dry_run}"
+        );
+        assert_eq!(state_of(path), before, "the profile is untouched");
+    }
+}
+
+#[tokio::test]
+async fn a_resume_override_that_conflicts_with_an_assigned_target_is_refused() {
+    let fixture = Fixture::new("bind-hook-to-assigned");
+    let hook = capability_variant("1.0.0", hook_strategy);
+    let assigned = capability_variant("2.0.0", |document| document);
+    install(&fixture, &hook).await;
+    install_with(&fixture, &assigned, true, false).await;
+    // Valid against the hook runtime, which lets a profile restate [resume].
+    let path = fixture.write_profile(
+        PROFILE,
+        &format!("{}{RESUME_OVERRIDE}", pinned(&hook.digest)),
+    );
+    fixture
+        .registry
+        .package_bind_profile(bind(PROFILE, Some(&hook.digest), false))
+        .await
+        .expect("already pinned to the hook version");
+
+    expect_refused(&fixture, &path, &assigned).await;
+}
+
+#[tokio::test]
+async fn a_fork_override_is_refused_when_the_target_cannot_fork() {
+    let fixture = Fixture::new("bind-fork-removed");
+    let forking = capability_variant("1.0.0", hook_strategy);
+    let plain = capability_variant("2.0.0", hook_without_fork);
+    install(&fixture, &forking).await;
+    install_with(&fixture, &plain, true, false).await;
+    let override_with_fork = format!(
+        "{}{RESUME_OVERRIDE}fork_args = [\"--fork\", \"{{reference}}\"]\n",
+        pinned(&forking.digest)
+    );
+    let path = fixture.write_profile(PROFILE, &override_with_fork);
+
+    expect_refused(&fixture, &path, &plain).await;
+}
+
+#[tokio::test]
+async fn a_profile_without_overrides_migrates_across_a_strategy_change() {
+    let fixture = Fixture::new("bind-strategy-change");
+    let hook = capability_variant("1.0.0", hook_strategy);
+    let assigned = capability_variant("2.0.0", |document| document);
+    install(&fixture, &hook).await;
+    install_with(&fixture, &assigned, true, false).await;
+    fixture.write_profile(PROFILE, &pinned(&hook.digest));
+
+    let bound = fixture
+        .registry
+        .package_bind_profile(bind(PROFILE, Some(&assigned.digest), false))
+        .await
+        .expect("nothing in the profile conflicts with the target");
+
+    assert_eq!(bound.status, PackageBindStatus::Bound);
+    assert_eq!(pin_of(&fixture, PROFILE), Some(assigned.digest.to_string()));
+}
+
+#[tokio::test]
+async fn the_rewritten_profile_must_fit_the_size_limit_the_loader_applies() {
+    let fixture = Fixture::new("bind-size-boundary");
+    let package = Package::pi();
+    install(&fixture, &package).await;
+    let limit = usize::try_from(crate::agent::MAX_PROFILE_BYTES).expect("limit fits");
+    let pad = |length: usize| {
+        let base = format!("base = \"{RUNTIME}\"\n");
+        let comment = "#".repeat(length - base.len() - 1);
+        format!("{base}{comment}\n")
+    };
+
+    // A few bytes under the limit, the two added keys push it over.
+    let near = pad(limit - 10);
+    let path = fixture.write_profile(PROFILE, &near);
+    assert_eq!(near.len(), limit - 10);
+    let before = state_of(&path);
+    for dry_run in [true, false] {
+        let refused = fixture
+            .registry
+            .package_bind_profile(bind(PROFILE, None, dry_run))
+            .await
+            .expect_err("the rewrite would exceed the loader's limit");
+        assert_eq!(refused, PackageErrorKind::ProfileUnusable);
+        assert_eq!(state_of(&path), before, "the original is untouched");
+    }
+
+    // With room for the keys it migrates and still loads.
+    let room = pad(limit - 400);
+    fixture.write_profile(PROFILE, &room);
+    let bound = fixture
+        .registry
+        .package_bind_profile(bind(PROFILE, None, false))
+        .await
+        .expect("a profile with room migrates");
+    assert_eq!(bound.status, PackageBindStatus::Bound);
+    let written = fs::read(&path).expect("read").len();
+    assert!(written <= limit, "{written} bytes");
+}

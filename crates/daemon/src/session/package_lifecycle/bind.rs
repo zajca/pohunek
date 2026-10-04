@@ -18,7 +18,9 @@ use tracing::warn;
 
 use super::{inspect_record, prove_loadable, read_state, Context, Inspected};
 use crate::agent::host::ServedBy;
-use crate::agent::{apply_pin, check_structure, parse_head, BindError, Pin, ProfileRegistry};
+use std::sync::Arc;
+
+use crate::agent::{apply_pin, parse_head, BindError, Pin, ProfileRegistry};
 use crate::session::SessionRegistry;
 
 impl SessionRegistry {
@@ -163,7 +165,17 @@ fn bind_profile(
         return Ok(result(PackageBindStatus::Unchanged, false, true));
     }
     let rewritten = apply_pin(file.text(), &pin).map_err(|detail| unusable(name, &detail))?;
-    check_structure(&rewritten).map_err(|detail| unusable(name, &detail))?;
+    // The candidate must resolve against the target exactly as a launch of it
+    // would (size bound, structure, resume and fork overrides against the
+    // target's capabilities), in a preview as in a commit, so a published
+    // profile is never one the launch or retention path rejects.
+    let definition = context
+        .store
+        .read_definition(&pin.digest, &target.inspected.info.package)
+        .map_err(|_rejection| PackageErrorKind::ProfileTargetInvalid)?;
+    profiles
+        .validate_candidate(name, &rewritten, &Arc::new(definition))
+        .map_err(|error| unusable(name, &error.msg))?;
     if params.dry_run {
         return Ok(result(
             PackageBindStatus::Preview,

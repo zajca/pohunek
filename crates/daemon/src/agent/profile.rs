@@ -433,6 +433,26 @@ impl ProfileRegistry {
         unavailable
     }
 
+    /// Checks that the profile `name` with file text `content` would launch
+    /// from `definition`, through the same resolution a launch applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `invalid_profile` (or runtime) error a launch would return
+    /// for that text.
+    pub(crate) fn validate_candidate(
+        &self,
+        name: &str,
+        content: &str,
+        definition: &Arc<RuntimeDefinition>,
+    ) -> Result<(), ProtocolError> {
+        let dir = self
+            .dir
+            .as_deref()
+            .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
+        resolve_profile_text(name, content, dir, &self.runtimes, Some(definition)).map(|_agent| ())
+    }
+
     /// The package digests that host profiles pin.
     ///
     /// Every `*.toml` of the agents directory is read through the same
@@ -534,7 +554,7 @@ fn scanned_profile_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> 
 /// authority, so a huge or endless file must not stall package mutations and
 /// fresh launches, and a launch applies the same bound so the two always
 /// agree on what a loadable profile is.
-const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
 
 /// Reads the text of the profile file `path` of profile `name`.
 ///
@@ -692,8 +712,27 @@ fn load_profile(
     pinned: Option<&Arc<RuntimeDefinition>>,
 ) -> Result<ResolvedAgent, ProtocolError> {
     let content = read_profile_text(dir, name, path)?;
-    let raw: RawProfile = toml::from_str(&content)
-        .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+    resolve_profile_text(name, &content, dir, runtimes, pinned)
+}
+
+/// Resolves the profile `name` whose file text is `content`.
+///
+/// This is everything a launch does with a profile after reading its file, so
+/// a candidate text validated through it (a rewrite about to be published) is
+/// accepted exactly when a launch would accept it. `pinned` supplies the
+/// definition of the base runtime when the caller already holds it.
+fn resolve_profile_text(
+    name: &str,
+    content: &str,
+    dir: &Path,
+    runtimes: &RuntimeHost,
+    pinned: Option<&Arc<RuntimeDefinition>>,
+) -> Result<ResolvedAgent, ProtocolError> {
+    if u64::try_from(content.len()).map_or(true, |length| length > MAX_PROFILE_BYTES) {
+        return Err(invalid_profile(name, "profile file is too large"));
+    }
+    let raw: RawProfile = toml::from_str(content)
+        .map_err(|err| invalid_profile(name, &toml_diagnostic(content, &err)))?;
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
     let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
@@ -742,7 +781,7 @@ fn load_profile(
     let binding_json = serde_json::to_vec(definition.binding())
         .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
     let inputs = ProfileInputs::of(
-        &content,
+        content,
         manifest_source.as_ref().map(|source| source.text.as_str()),
         &binding_json,
         &program,
@@ -992,7 +1031,7 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
 }
 
 mod bind;
-pub(crate) use bind::{apply_pin, check_structure, parse_head, BindError, Pin};
+pub(crate) use bind::{apply_pin, parse_head, BindError, Pin};
 
 #[cfg(test)]
 mod pin_tests;

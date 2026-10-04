@@ -23,9 +23,7 @@ use protocol::{PackageId, RuntimeId};
 use toml_edit::{DocumentMut, Item, TomlError, Value};
 use tracing::warn;
 
-use super::{
-    read_profile_text, ProfileRegistry, RawProfile, MAX_PROFILE_BYTES, MAX_SCANNED_PROFILES,
-};
+use super::{read_profile_text, ProfileRegistry, MAX_PROFILE_BYTES, MAX_SCANNED_PROFILES};
 use crate::project::config::validate_name;
 
 /// Extension of a profile file.
@@ -227,16 +225,6 @@ pub(crate) fn apply_pin(text: &str, pin: &Pin) -> Result<String, String> {
         return Err("the rewrite would change content other than the pin".to_owned());
     }
     Ok(rewritten)
-}
-
-/// Checks that `text` deserializes as a profile, so a rewrite never publishes
-/// a file the loader refuses on its structure.
-///
-/// The detail names a line or a field, never a value.
-pub(crate) fn check_structure(text: &str) -> Result<(), String> {
-    toml::from_str::<RawProfile>(text)
-        .map(|_profile| ())
-        .map_err(|error| super::toml_diagnostic(text, &error))
 }
 
 /// A profile file as read for a rewrite.

@@ -113,14 +113,6 @@ fn toml_syntax_errors_report_the_line_and_never_the_source() {
     assert!(!error.contains(SENTINEL), "{error}");
 }
 
-#[test]
-fn structure_check_refuses_unknown_keys_without_echoing_values() {
-    let text = format!("base = \"acme-pi\"\nunknown = \"{SENTINEL}\"\n");
-    let error = check_structure(&text).expect_err("unknown key");
-    assert!(!error.contains(SENTINEL), "{error}");
-    check_structure(&profile_text()).expect("a well-formed profile");
-}
-
 // ----- rewriting -----------------------------------------------------------
 
 fn lines_without_pin(text: &str) -> String {
