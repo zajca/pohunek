@@ -89,7 +89,7 @@ Interpret the runtime independently from the agent lifecycle:
 | `reconnecting` | Reconciliation knows the worker but has not finished adoption; `runtime_supervision_unavailable` means the service manager could not be inspected | Wait; reconciliation retries on its own. Do not recover or restart the worker |
 | `terminal` | The worker observed child exit | Inspect the terminal result; acknowledge or recover explicitly when eligible |
 | `lost` | The PTY generation no longer exists; `runtime_lost` after its leftover processes were swept, `runtime_lost_cleanup_unconfirmed` when the sweep could not confirm that | Preserve the logical record; use explicit native recovery only when available. After `runtime_lost_cleanup_unconfirmed`, check `ps` for that session's processes first |
-| `conflict` | More than one or mismatched runtime identity is present: `runtime_supervision_ambiguous` (job present, worker socket silent, journal not terminal) or `runtime_identity_mismatch` (job definition or process does not match the record) | Preserve evidence; do not kill a worker automatically. After diagnosis, `session rm` may remove only the logical record. |
+| `conflict` | More than one or mismatched runtime identity is present: `runtime_supervision_ambiguous` (job present, worker socket silent, journal not terminal) or `runtime_identity_mismatch` (job definition or process does not match the record) | Preserve evidence; the daemon never kills a worker automatically and re-checks the conflict in the background (1 s doubling to 60 s) until it adopts the worker `live` (only while no other socket claims the session) or the session becomes `lost`. `session stop` ends a conflict whose recorded identity the journal proves; `session rm` removes the logical record. |
 | `incompatible` | A live worker has no compatible private protocol | Run a compatible daemon; leave the worker alive |
 
 `pohunek session runtime-inventory --json` lists worker endpoints and jobs
@@ -149,6 +149,35 @@ Intentional session stop:
 pohunek session stop s-42
 ```
 
+`session stop` also ends a `conflict` session by the identity its record
+names. Before anything is written it proves that the journal of the recorded
+generation names the recorded worker and that the service manager's job under
+that generation (executable, `--session-id`, `--worker-generation`, main
+process) is that worker's. It refuses with `session_runtime_conflict` (no
+recorded generation or worker), `runtime_identity_mismatch` (no journal names
+the recorded worker, or the job is not that worker's),
+`runtime_supervision_ambiguous` (journals unreadable, or no job holds the
+recorded worker process while it still runs), or
+`runtime_supervision_unavailable` (job cannot be inspected). It then retires
+the exact generation's job, requires every worker journaled for it to be gone,
+and sweeps the session's ownership-marked processes; a sweep that cannot
+confirm every marked process exited refuses with
+`runtime_supervision_ambiguous` and a `recover` hint, and a stop never accepts
+unconfirmed cleanup. A refusal leaves the record unchanged; a record naming a runtime the journal
+does not is refused with `runtime_identity_mismatch`, and only journal-proven
+runtimes are swept. A stop interrupted
+after the job was retired (or whose retirement failed without the worker being
+proven untouched) keeps its persisted intent, even over a `resume_binding_*`
+conflict, and ends only with a confirmed marked-process sweep (also when the
+worker left a terminal journal): reconciliation finishes it
+as `stopped` once the worker is gone and the sweep is confirmed, and never
+turns a committed stop into `lost`. `session stop` of
+a `lost`, `reconnecting`, or `incompatible` session is refused with
+`session_runtime_lost`, `session_runtime_reconnecting`, or
+`worker_protocol_incompatible`. Each classification as `conflict`, `lost`,
+`reconnecting`, or `incompatible` logs one WARN, `session runtime is {runtime.state}:
+{reason}`, to `pohunekd.jsonl`.
+
 Do not restart a worker job, and do not start one by hand. The old worker's
 exit destroys its PTY, while a new process would be a different runtime
 generation without a valid recovery transaction. Stopping a worker job
@@ -162,7 +191,7 @@ Do not:
 
 - unlink a worker socket because the daemon cannot connect;
 - delete a journal or a launchd definition while its job is active;
-- kill a worker to clear `conflict` or `incompatible`;
+- kill a worker by hand to clear `conflict` or `incompatible`; use `session stop` for a provable `conflict`;
 - interpret daemon disconnection as child exit;
 - invoke `session.resume` for a live or reconnecting runtime;
 - edit `worker_id` or the persisted `runtime_id` in metadata by hand.

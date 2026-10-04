@@ -300,7 +300,26 @@ not lose precision.
 
 `lost` means the worker or host runtime is gone and the PTY cannot be
 reattached. `conflict` means discovery found ambiguous or mismatched live
-identity; Pohunek quarantines it and does not kill a worker automatically.
+identity; Pohunek quarantines it and does not kill a worker automatically. A
+`conflict` whose record names a worker generation is re-checked in the
+background (after 1 s, doubling to at most 60 s) while a worker still answers
+or its job is supervised: a pass never kills, the session stays `conflict`
+while the evidence holds, a worker that becomes adoptable is adopted `live`,
+and once the worker is gone and its job ended the session becomes `lost` with
+`runtime_lost` (an orderly exit with a terminal journal is imported as
+`terminal`). Resume-binding conflicts, journal-only conflicts, and records
+naming no worker generation are not re-checked. `session stop <id>` on a
+`conflict` stops the supervised job by the identity the record names, but only
+after proving that the recorded generation's journal names the recorded worker
+and that the service manager's job under that generation is that worker's;
+otherwise it refuses (`session_runtime_conflict`, `runtime_identity_mismatch`,
+`runtime_supervision_ambiguous`, or `runtime_supervision_unavailable`) and
+leaves the record untouched. A stop never accepts unconfirmed cleanup, and
+`session stop` of a `lost`, `reconnecting`, or `incompatible` session is
+refused with `session_runtime_lost`, `session_runtime_reconnecting`, or
+`worker_protocol_incompatible`. Each classification as `conflict`, `lost`,
+`reconnecting`, or `incompatible` logs one WARN, `session runtime is
+{runtime.state}: {reason}`, to `pohunekd.jsonl`.
 `incompatible` means the worker is alive but has no compatible private protocol
 version, so the daemon leaves it running. Attach, input, and resize are not
 available in these degraded states, but list and inspect retain the logical

@@ -156,7 +156,7 @@ const SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// First delay before re-reconciling sessions whose supervisor was unavailable.
 ///
 /// A restarting user manager usually answers again within a second.
-const SUPERVISION_RETRY_INITIAL: Duration = Duration::from_secs(1);
+pub(super) const SUPERVISION_RETRY_INITIAL: Duration = Duration::from_secs(1);
 
 /// Interval between inspections of an abandoned create's job while it is
 /// watched until its initialization deadline.
@@ -444,6 +444,12 @@ pub(super) struct RetryState {
     /// runs and is inserted again when that pass does not settle it.
     pub(super) pending: BTreeSet<String>,
     pub(super) running: bool,
+    /// Session whose pass is running. A schedule for it comes from its own
+    /// pass and keeps the backoff.
+    serving: Option<String>,
+    /// Wakes the retry task when a session newly joins the pending set, so
+    /// the backoff of the sessions already waiting never delays it.
+    wake: Arc<tokio::sync::Notify>,
     /// Test barrier notified after each pass and before the pass outcome is
     /// applied; the retry loop waits until the receiver resumes it.
     #[cfg(test)]
@@ -708,11 +714,16 @@ impl SessionRegistry {
     ///
     /// Sessions wait here while their supervisor is unavailable, while their
     /// generation is ambiguous (a job or process that may still be live but
-    /// no reachable worker), while the job of a terminal session's
+    /// no reachable worker), while they are in conflict over a worker that
+    /// still answers or a job the supervisor still shows (the conflict ends
+    /// when that worker or job does), while the job of a terminal session's
     /// proven-ended generation could not be retired, or while an unfinished
     /// create's worktree, binding, or record could not be removed. One task
     /// serves every pending session with a doubling delay bounded by
-    /// [`SUPERVISION_RETRY_MAX`]; each pass classifies from fresh evidence and
+    /// [`SUPERVISION_RETRY_MAX`], which restarts from
+    /// [`SUPERVISION_RETRY_INITIAL`] whenever a session newly joins, so a new
+    /// session's first re-check is never delayed by the backoff of the ones
+    /// already waiting; each pass classifies from fresh evidence and
     /// never kills while it stays ambiguous. The task stops when no session is
     /// pending, when daemon shutdown starts, or when the registry is dropped;
     /// however it ends, a later call starts a new one.
@@ -724,7 +735,10 @@ impl SessionRegistry {
                 .state
                 .lock()
                 .expect("supervision retry state is never poisoned");
-            state.pending.insert(id.0.clone());
+            let joined = state.pending.insert(id.0.clone());
+            if joined && state.serving.as_deref() != Some(id.0.as_str()) {
+                state.wake.notify_one();
+            }
             !std::mem::replace(&mut state.running, true)
         };
         if start {
@@ -779,14 +793,14 @@ impl SessionRegistry {
         }
     }
 
-    /// Re-reconciles one session left `runtime_supervision_unavailable` or
-    /// `runtime_supervision_ambiguous`, re-attempts retiring the job of a
-    /// terminal session's generation, or repeats the compensation of a create
-    /// left `create_compensation_pending`.
+    /// Re-reconciles one session left `runtime_supervision_unavailable` or in
+    /// `conflict` over a recorded generation, re-attempts retiring the job of
+    /// a terminal session's generation, or repeats the compensation of a
+    /// create left `create_compensation_pending`.
     ///
     /// Returns whether the session no longer needs a retry: it was resolved,
     /// removed, or changed by another lifecycle operation.
-    async fn retry_supervised_session(&self, id: &SessionId) -> bool {
+    pub(super) async fn retry_supervised_session(&self, id: &SessionId) -> bool {
         let _guard = self.lock_lifecycle(id).await;
         let waiting = self.inner.sessions.lock().await.get(id).and_then(|entry| {
             if !matches!(entry.runtime, super::RuntimeHandle::Unavailable(_)) {
@@ -796,6 +810,19 @@ impl SessionRegistry {
             match (runtime.state, runtime.loss_reason.as_deref()) {
                 (RuntimeState::Reconnecting, Some(SUPERVISION_UNAVAILABLE))
                 | (RuntimeState::Conflict, Some(SUPERVISION_AMBIGUOUS)) => Some(Waiting::Evidence),
+                // A conflicted runtime that names a generation can still be
+                // classified once its worker or job is gone. A conflict
+                // between the record and its resume binding quarantines
+                // adoption only: a persisted stop or removal intent is
+                // finished whatever the binding says.
+                (RuntimeState::Conflict, reason)
+                    if entry.job.is_some()
+                        && (entry.desired_state != super::DesiredState::Running
+                            || !reason
+                                .is_some_and(super::reconcile::is_resume_binding_conflict)) =>
+                {
+                    Some(Waiting::Evidence)
+                }
                 (RuntimeState::Reconnecting, Some(CREATE_COMPENSATION_PENDING)) => {
                     Some(Waiting::Compensation)
                 }
@@ -1023,12 +1050,14 @@ impl SessionRegistry {
         );
         match self.load_durable_session_record(id).await {
             Ok(Some(record)) => {
-                self.insert_unavailable_record(
-                    record,
-                    RuntimeState::Reconnecting,
-                    SUPERVISION_UNAVAILABLE,
-                )
-                .await;
+                // The retry is scheduled whether or not the listing was committed.
+                let _persisted = self
+                    .insert_unavailable_record(
+                        record,
+                        RuntimeState::Reconnecting,
+                        SUPERVISION_UNAVAILABLE,
+                    )
+                    .await;
                 self.schedule_supervision_retry(id);
             }
             Ok(None) => {}
@@ -1048,11 +1077,30 @@ async fn run_supervision_retries(
         inner: Weak::clone(&inner),
         armed: true,
     };
+    let wake = Arc::clone(
+        &inner
+            .upgrade()
+            .map(|inner| {
+                Arc::clone(
+                    &inner
+                        .supervision_retries
+                        .state
+                        .lock()
+                        .expect("supervision retry state is never poisoned")
+                        .wake,
+                )
+            })
+            .unwrap_or_default(),
+    );
     let mut delay = SUPERVISION_RETRY_INITIAL;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
             () = tokio::time::sleep(delay) => {}
+            () = wake.notified() => {
+                delay = SUPERVISION_RETRY_INITIAL;
+                continue;
+            }
         }
         let Some(inner) = inner.upgrade() else {
             return;
@@ -1085,18 +1133,25 @@ async fn run_supervision_retries(
                 continue;
             }
             let id = SessionId(session_id);
+            registry
+                .inner
+                .supervision_retries
+                .state
+                .lock()
+                .expect("supervision retry state is never poisoned")
+                .serving = Some(id.0.clone());
             let settled = registry.retry_supervised_session_isolated(&id).await;
             #[cfg(test)]
             registry.supervision_pass_finished(&id).await;
+            let mut state = registry
+                .inner
+                .supervision_retries
+                .state
+                .lock()
+                .expect("supervision retry state is never poisoned");
+            state.serving = None;
             if !settled {
-                registry
-                    .inner
-                    .supervision_retries
-                    .state
-                    .lock()
-                    .expect("supervision retry state is never poisoned")
-                    .pending
-                    .insert(id.0);
+                state.pending.insert(id.0);
             }
         }
         {
