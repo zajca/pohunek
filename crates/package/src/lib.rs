@@ -20,6 +20,7 @@
 //! - [`install`] extracts a [`VerifiedArchive`] into an owner-private,
 //!   content-addressed package root through directory descriptors.
 //! - [`verify`] re-verifies a root against its per-file [`manifest`].
+//! - [`registry`] keeps the transactional record of installed packages.
 //!
 //! Signatures are covered by the signed runtime catalog; the runtime manifest
 //! inside a package is a separate concern. The formats are described in
@@ -38,7 +39,7 @@ mod compression;
 mod error;
 mod limits;
 
-// Extraction and verification need descriptor-relative
+// Extraction, verification and the registry need descriptor-relative
 // filesystem primitives.
 #[cfg(unix)]
 mod hash;
@@ -48,6 +49,8 @@ pub mod install;
 mod layout;
 #[cfg(unix)]
 pub mod manifest;
+#[cfg(unix)]
+pub mod registry;
 #[cfg(unix)]
 pub mod verify;
 

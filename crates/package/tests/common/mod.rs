@@ -93,3 +93,45 @@ pub(crate) fn set_mode(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
+
+/// A temporary directory whose `plugins` child is the registry root.
+pub(crate) struct PluginFixture {
+    _dir: tempfile::TempDir,
+    pub(crate) base: PathBuf,
+}
+
+impl PluginFixture {
+    pub(crate) fn new() -> Self {
+        let dir = pohunek_test_support::tempdir().expect("private fixture directory");
+        let base = dir.path().to_path_buf();
+        Self { _dir: dir, base }
+    }
+
+    pub(crate) fn plugins(&self) -> PathBuf {
+        self.base.join("plugins")
+    }
+
+    pub(crate) fn packages(&self) -> PathBuf {
+        self.plugins().join("packages")
+    }
+
+    pub(crate) fn registry_file(&self) -> PathBuf {
+        self.plugins().join("registry.json")
+    }
+
+    pub(crate) fn root(&self, digest: &package::PackageDigest) -> PathBuf {
+        let hex = digest
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("digest prefix");
+        self.packages().join(hex)
+    }
+
+    pub(crate) fn open(&self) -> package::registry::Registry {
+        self.open_with(Limits::DEFAULT)
+    }
+
+    pub(crate) fn open_with(&self, limits: Limits) -> package::registry::Registry {
+        package::registry::Registry::open_at(&self.plugins(), limits).expect("open registry")
+    }
+}

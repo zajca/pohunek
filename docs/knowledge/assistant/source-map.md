@@ -474,8 +474,10 @@ Runtime package archive format:
 - `crates/package/src/manifest.rs` — per-file manifest schema and manifest digest.
 - `crates/package/src/layout.rs` — package root names, modes and bounds.
 - `crates/package/src/hash.rs` — SHA-256 helpers.
+- `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`
 - `crates/package/tests/install.rs`
+- `crates/package/tests/registry.rs`
 
 Signed runtime catalog:
 

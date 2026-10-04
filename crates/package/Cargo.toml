@@ -20,7 +20,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 
-# Extraction and verification use descriptor-relative filesystem primitives that
+# Extraction and the registry use descriptor-relative filesystem primitives that
 # exist on Unix only.
 [target.'cfg(unix)'.dependencies]
 pohunek-platform = { workspace = true }

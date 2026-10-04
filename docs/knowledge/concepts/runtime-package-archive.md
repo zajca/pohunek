@@ -2,7 +2,7 @@
 type: Concept
 id: concept/runtime-package-archive
 title: Runtime package archive
-description: The canonical deterministic tar.zst format of a runtime package, its strict reader, the size limits, safe extraction into a verified package root and how to build and verify one.
+description: The canonical deterministic tar.zst format of a runtime package, its strict reader, the size limits, safe extraction into a verified package root, the registry store, and how to build and verify one.
 source_kind: manual
 intents: [debug, help, project]
 ---
@@ -13,7 +13,8 @@ A runtime package is shipped as one canonical `tar.zst` archive. Its identity is
 the package digest: `sha256:` plus the lowercase hex SHA-256 of the archive
 bytes. Implemented by the `pohunek-package` crate (`crates/package`). The crate
 builds the archive, reads it into memory, extracts it into an owner-private
-package root, and re-verifies that root. The runtime manifest inside the package, signatures, and the daemon
+package root, re-verifies that root, and keeps the registry of installed
+packages. The runtime manifest inside the package, signatures, and the daemon
 wiring are separate layers.
 
 ## Canonical form
@@ -130,3 +131,49 @@ bytes that are hashed against the manifest.
 
 Extraction applies the archive limits again (file count, per-file size, total
 size, path rules) to the manifest it writes and reads back.
+
+## Registry store
+
+`package::registry::Registry` owns one plugin root, `<state>/plugins` (exact
+`0700`, owner-private):
+
+```text
+registry.json     versioned record (schema 1, unknown fields denied), 0600
+registry.lock     advisory lock serializing every mutation
+packages/<hex>/   package roots
+```
+
+Every mutation is a transaction under the exclusive lock: collect staging and
+temporary residue, read the record, change it, bump the `generation` counter and
+atomically replace the record. A held lock is a typed `Busy` error, never a
+wait. Reads are lock-free and see one whole committed record. A missing record
+is the empty registry; a corrupt, oversized or unknown-schema record is a typed
+error and is never overwritten or repaired.
+
+A record holds, per package: archive digest, package identity (id and
+version), source (`official`, `explicit_digest`, `link`), the recorded manifest
+digest, the caller-supplied install time, and the enabled flag. `selected`
+maps a package id to the digest bare requests use. The registry does not read
+the clock or parse the runtime manifest; the caller supplies both.
+
+- `install` verifies the archive against the expected digest and the limits,
+  extracts and verifies the root, then records it. The same digest and identity
+  is idempotent; the same digest under another identity, or an identity
+  installed from another digest, is refused. A recorded package whose root is
+  missing is extracted again; one whose root is present but invalid is refused.
+- `set_enabled` and `select` change one flag; enabling or selecting requires a
+  root that verifies.
+- `uninstall` takes the set of retained digests (referenced by live workers,
+  live or lost sessions and durable resume bindings, supplied by the daemon) and
+  refuses while the digest is in it. A modified root is refused; a missing root
+  is simply unrecorded. The record is replaced before the root is deleted.
+- `retained_roots` verifies each referenced digest and returns `Ready` or
+  `Incompatible` with a typed reason: not registered, root missing, or root
+  invalid (including a manifest that differs from the recorded one). The
+  runtime is then read-only; no other package and no shell stands in.
+- `unregistered_roots` lists roots on disk the record does not name (left by an
+  interrupted install or uninstall). Installing the same archive adopts one;
+  nothing deletes it automatically.
+
+Install publishes the root before it records it, and uninstall un-records
+before it deletes, so the record never names a root that was never published.
