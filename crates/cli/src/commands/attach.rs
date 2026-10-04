@@ -83,8 +83,9 @@ const ATTACH_TERMINAL_MODE_CLEANUP: &[u8] = concat!(
 /// modal from growing memory without bound. Reaching the cap closes the modal
 /// and resumes raw passthrough without dropping bytes.
 const MAX_MODAL_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-// Below three rows a bordered dialog has no room for its title and one line.
-const MIN_ROWS_FOR_MENU: u16 = 3;
+// Five rows fit the borders, the title and the first two lines of a dialog, so
+// the action line of a confirmation stays visible.
+const MIN_ROWS_FOR_MENU: u16 = 5;
 // Two spaces keep dense header fields readable in monospace terminals.
 const HEADER_FIELD_SEPARATOR: &str = "  ";
 /// Starting diagnostic generation for menu RPCs.
@@ -1110,10 +1111,20 @@ where
     if end != AttachStreamEnd::StreamClosed || !terminating {
         return Ok(end);
     }
+    let action = menu.task.as_ref().map(|task| task.action);
     let Ok(result) =
         time::timeout(MENU_TASK_SETTLE_TIMEOUT, wait_for_menu_task(&mut menu.task)).await
     else {
-        return Ok(end);
+        menu.task = None;
+        terminal.take();
+        let message = format!(
+            "no reply within {}s; check the session state with `pohunek session list`",
+            MENU_TASK_SETTLE_TIMEOUT.as_secs()
+        );
+        return Err(termination_failed(
+            action.unwrap_or(MenuTaskAction::Kill),
+            &message,
+        ));
     };
     if let Some(MenuTaskResult {
         action,
@@ -1617,6 +1628,7 @@ where
             }
             Shortcut::Menu => {
                 ctx.menu.generation = next_menu_generation(ctx.menu.generation);
+                ctx.menu.decoder = MenuInputDecoder::new();
                 if let Some(state) = ctx.menu.state.as_mut() {
                     *state = MenuState::open_root();
                     sync_menu_view(state, ctx.modal, ctx.stdout).await?;
@@ -2081,8 +2093,17 @@ where
         return Ok(None);
     };
     if *state == MenuState::Closed {
-        log_abandoned_menu_task_result(target, &result);
-        return Ok(None);
+        // A failed stop or remove must stay visible even when its dialog was
+        // dismissed; a log line alone leaves the operator believing it worked.
+        if !(result.outcome.is_err()
+            && matches!(result.action, MenuTaskAction::Kill | MenuTaskAction::Remove))
+        {
+            log_abandoned_menu_task_result(target, &result);
+            return Ok(None);
+        }
+        *state = MenuState::Busy {
+            label: "Session termination".to_owned(),
+        };
     }
 
     let event = menu_event_from_task_outcome(result.outcome);
@@ -3700,7 +3721,7 @@ mod tests {
     #[tokio::test]
     async fn closed_menu_task_failure_keeps_modal_closed_and_clears_task() {
         let generation = FIRST_MENU_GENERATION;
-        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Kill));
+        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Fork));
         let mut menu_state = Some(MenuState::Closed);
         let mut modal = None;
         let mut terminal = None;
@@ -3710,8 +3731,8 @@ mod tests {
         let end = handle_menu_task_result(
             Some(MenuTaskResult {
                 generation,
-                action: MenuTaskAction::Kill,
-                outcome: Err("stop failed".to_owned()),
+                action: MenuTaskAction::Fork,
+                outcome: Err("fork failed".to_owned()),
             }),
             &target,
             &mut menu_task,
@@ -3729,6 +3750,69 @@ mod tests {
             menu_task.is_none(),
             "failed abandoned task must clear the slot"
         );
+    }
+
+    #[tokio::test]
+    async fn dismissed_termination_failure_is_shown_again_in_the_dialog() {
+        for action in [MenuTaskAction::Kill, MenuTaskAction::Remove] {
+            let mut menu_task = Some(placeholder_menu_task(FIRST_MENU_GENERATION, action));
+            let mut menu_state = Some(MenuState::Closed);
+            let target: Target = "host-a/s-42".parse().expect("target");
+
+            let end = handle_menu_task_result(
+                Some(MenuTaskResult {
+                    generation: FIRST_MENU_GENERATION,
+                    action,
+                    outcome: Err("refused".to_owned()),
+                }),
+                &target,
+                &mut menu_task,
+                &mut menu_state,
+                &mut None,
+                &mut None,
+                &mut Vec::new(),
+            )
+            .await
+            .expect("handle task result");
+
+            assert_eq!(end, None);
+            assert_eq!(
+                menu_state,
+                Some(MenuState::Result {
+                    message: "Error: refused".to_owned()
+                }),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_close_with_an_unanswered_remove_reports_the_unknown_outcome() {
+        let mut menu = MenuRuntime::new(true);
+        menu.task = Some(MenuTask {
+            generation: FIRST_MENU_GENERATION,
+            action: MenuTaskAction::Remove,
+            handle: tokio::spawn(std::future::pending()),
+        });
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let err = settle_stream_close(
+            AttachStreamEnd::StreamClosed,
+            &target,
+            &mut menu,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("an unanswered remove must not look like an ordinary close");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("remove failed") && text.contains("no reply"),
+            "{text}"
+        );
+        assert!(menu.task.is_none());
     }
 
     #[tokio::test]

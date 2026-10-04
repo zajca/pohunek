@@ -19,6 +19,8 @@
 
 use std::fmt;
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 /// Minimum physical rows of the shadow grid.
 ///
 /// One row keeps the vt100 grid addressable and leaves at least one row for
@@ -436,7 +438,7 @@ fn write_overlay_row(
 }
 
 fn cell_width(text: &str) -> u16 {
-    u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
+    u16::try_from(text.width()).unwrap_or(u16::MAX)
 }
 
 fn len_u16<T>(items: &[T]) -> u16 {
@@ -493,12 +495,20 @@ fn write_overlay_text_row(out: &mut Vec<u8>, width: u16, text: &str, attrs: Opti
     out.extend_from_slice(RESET_ATTRS);
 }
 
+/// Writes `text` clipped to `width` terminal cells and returns the cells used.
+///
+/// Wide characters occupy two cells and combining marks none, so a character
+/// that would cross the right edge is dropped instead of being split.
 fn write_clipped_text(out: &mut Vec<u8>, text: &str, width: u16) -> u16 {
-    let mut written = 0;
-    for ch in text.chars().take(usize::from(width)) {
+    let mut written = 0_u16;
+    for ch in text.chars() {
+        let cells = u16::try_from(ch.width().unwrap_or(0)).unwrap_or(u16::MAX);
+        if written.saturating_add(cells) > width {
+            break;
+        }
         let mut buf = [0; 4];
         out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        written += 1;
+        written += cells;
     }
     written
 }
@@ -958,6 +968,30 @@ mod tests {
             frame.contains(&format!("{}\x1b[?25h", move_to(4, CURSOR_TEST_COL))),
             "cursor row must skip the header rows: {frame:?}"
         );
+    }
+
+    #[test]
+    fn wide_header_characters_keep_the_box_border_aligned() {
+        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
+        let mut overlay = test_overlay();
+        overlay.header = vec!["\u{3042}\u{3042}\u{3042}".to_owned()];
+        compositor.set_overlay(Some(overlay));
+
+        let frame = render_string(&mut compositor);
+
+        // Six cells of text fit the box width derived from the footer, so the
+        // wide characters are written whole and the row ends at the border.
+        assert!(
+            frame.contains("| \u{3042}\u{3042}\u{3042}"),
+            "wide characters must be kept: {frame:?}"
+        );
+        assert_eq!(super::cell_width("\u{3042}\u{3042}"), 4);
+        let mut out = Vec::new();
+        assert_eq!(
+            super::write_clipped_text(&mut out, "\u{3042}\u{3042}", 3),
+            2
+        );
+        assert_eq!(out, "\u{3042}".as_bytes());
     }
 
     #[test]
