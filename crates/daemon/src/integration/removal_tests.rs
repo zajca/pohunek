@@ -653,13 +653,9 @@ fn doctor_flags_a_stale_hook_that_reads_only_the_old_environment_name() {
 /// The shipped state hook rewritten to report the worker instance to the
 /// daemon under the `runtime_id` key of the previous public protocol.
 fn state_asset_reporting_runtime_id(asset: &str) -> String {
-    let shipped =
-        "\"session_id\": session_id,\n            \"worker_instance_id\": worker_instance_id,";
+    let shipped = "worker_instance_key: worker_instance_id,";
     assert!(asset.contains(shipped));
-    asset.replace(
-        shipped,
-        "\"session_id\": session_id,\n            \"runtime_id\": worker_instance_id,",
-    )
+    asset.replace(shipped, "\"runtime_id\": worker_instance_id,")
 }
 
 /// A hook that sends the pre-protocol-4 report key is rejected by the

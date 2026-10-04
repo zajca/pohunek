@@ -3014,7 +3014,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after bounded in-memory state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=10";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=11";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -4476,8 +4476,10 @@ mod tests {
         assert_eq!(request["params"]["source"], json!("pohunek:claude"));
         assert_eq!(request["params"]["agent"], json!("claude"));
         assert!(
-            request["params"]["seq"].as_u64().is_some(),
-            "Claude release request must carry a fresh sequence"
+            request["params"]["seq"]
+                .as_str()
+                .is_some_and(|seq| seq.parse::<u64>().is_ok()),
+            "Claude release request must carry a fresh decimal-string sequence"
         );
     }
 
