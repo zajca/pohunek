@@ -106,6 +106,12 @@ impl Paths {
         self.state_dir.join(pohunek_paths::HOST_STATE_SUBDIR)
     }
 
+    /// Returns the owner-private runtime package store directory.
+    #[must_use]
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.state_dir.join(pohunek_paths::PLUGINS_SUBDIR)
+    }
+
     /// Returns the stable host identity record path.
     #[must_use]
     pub fn host_identity_path(&self) -> PathBuf {
@@ -292,6 +298,20 @@ mod tests {
         assert_eq!(
             crate::session::SessionRegistryConfig::default().config_dir,
             None
+        );
+    }
+
+    #[test]
+    fn plugins_dir_matches_the_shared_path_contract() {
+        let base = tmp_base("plugins");
+        let env = all_present(&base);
+        let paths = Paths::resolve_from(&env).expect("resolve paths");
+
+        assert_eq!(
+            paths.plugins_dir(),
+            base.join("state")
+                .join(APP_DIR)
+                .join(pohunek_paths::PLUGINS_SUBDIR)
         );
     }
 
