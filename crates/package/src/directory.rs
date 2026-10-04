@@ -202,6 +202,25 @@ fn identity(stat: &Stat) -> Listed {
     }
 }
 
+/// The type of the entry `name` below `dir`.
+///
+/// The type a directory listing reports is used when it is known; some
+/// filesystems report `DT_UNKNOWN`, and then the entry is inspected through the
+/// directory descriptor without following it, so a subdirectory is never
+/// charged against the file budget.
+fn entry_kind(
+    dir: &OwnedFd,
+    name: &std::ffi::CStr,
+    reported: FileType,
+) -> Result<FileType, DirectoryError> {
+    if reported != FileType::Unknown {
+        return Ok(reported);
+    }
+    statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(|stat| FileType::from_raw_mode(stat.st_mode))
+        .map_err(open_error)
+}
+
 /// Inspects `name` below `dir` without following it.
 fn list_entry(dir: &OwnedFd, name: &str) -> Result<Listed, DirectoryError> {
     statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
@@ -266,7 +285,8 @@ fn collect(
         if bytes == b"." || bytes == b".." {
             continue;
         }
-        let (seen, room) = if item.file_type() == FileType::Directory {
+        let kind = entry_kind(dir, item.file_name(), item.file_type())?;
+        let (seen, room) = if kind == FileType::Directory {
             (&mut directories_seen, directory_room)
         } else {
             (&mut files_seen, file_room)
@@ -714,6 +734,43 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn an_unknown_reported_type_is_resolved_through_the_descriptor() {
+        use std::ffi::CString;
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("sub")).expect("mkdir");
+        fs::write(dir.path().join("file"), b"x").expect("write");
+        symlink("file", dir.path().join("link")).expect("symlink");
+        let root = open_root(dir.path());
+        let kind =
+            |name: &str, reported| entry_kind(&root, &CString::new(name).expect("name"), reported);
+        assert_eq!(kind("sub", FileType::Unknown), Ok(FileType::Directory));
+        assert_eq!(kind("file", FileType::Unknown), Ok(FileType::RegularFile));
+        assert_eq!(kind("link", FileType::Unknown), Ok(FileType::Symlink));
+        // A reported type is trusted without touching the filesystem.
+        assert_eq!(kind("absent", FileType::Directory), Ok(FileType::Directory));
+        assert_eq!(
+            kind("absent", FileType::Unknown),
+            Err(DirectoryError::Io {
+                kind: io::ErrorKind::NotFound
+            })
+        );
+    }
+
+    #[test]
+    fn a_full_file_budget_still_admits_a_subdirectory() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        for index in 0..3 {
+            fs::write(dir.path().join(format!("f{index}")), b"x").expect("write");
+        }
+        fs::create_dir(dir.path().join("empty")).expect("mkdir");
+        let limits = Limits {
+            max_files: 3,
+            ..Limits::DEFAULT
+        };
+        build_directory_archive(dir.path(), &limits).expect("3 files and an empty directory fit");
     }
 
     #[test]
