@@ -9,6 +9,7 @@ use protocol::{event, AgentKind, CwdSource, SessionInfo};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
+use crate::agent::host::{LaunchProgram, RuntimeHost};
 use crate::detect::{identify_agent, DetectorConfig};
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdentity};
 
@@ -358,7 +359,7 @@ impl SessionRegistry {
         facts
             .into_iter()
             .filter_map(|fact| {
-                let agent_base = identify_agent(&fact)?;
+                let agent_base = identify_agent(self.inner.profiles.runtimes(), &fact)?;
                 if self.is_foreign_owned_agent(id, fact.pid) {
                     return None;
                 }
@@ -574,7 +575,13 @@ impl SessionRegistry {
             reported_at: now,
             activity_reported: false,
         };
-        Some(apply_observed_transition(entry, observed, report, agent))
+        Some(apply_observed_transition(
+            self.inner.profiles.runtimes(),
+            entry,
+            observed,
+            report,
+            agent,
+        ))
     }
 
     fn procwatch_tombstone_for(
@@ -592,6 +599,19 @@ impl SessionRegistry {
             reported_at: now,
             activity_reported: false,
         }
+    }
+
+    /// Whether a session launched as `agent_base` runs an agent as its root
+    /// process; a host-shell runtime only hosts agents, and a kind without an
+    /// installed definition is treated as an agent.
+    pub(super) fn launch_root_is_agent(&self, agent_base: &AgentKind) -> bool {
+        self.inner
+            .profiles
+            .runtimes()
+            .resolve_kind(agent_base)
+            .map_or(true, |definition| {
+                !matches!(definition.program(), LaunchProgram::HostShell(_))
+            })
     }
 
     fn reconcile_foreground_agent(
@@ -614,7 +634,7 @@ impl SessionRegistry {
         if foreground_group == root_pid {
             let active_is_launch_root = entry.active_agent.as_ref().is_some_and(|active| {
                 active.pid == Some(root_pid)
-                    && entry.info.agent_base != AgentKind::Shell
+                    && self.launch_root_is_agent(&entry.info.agent_base)
                     && entry.info.active_agent_base.as_ref() == Some(&entry.info.agent_base)
             });
             if active_is_launch_root {
@@ -636,7 +656,13 @@ impl SessionRegistry {
                 reported_at: now,
                 activity_reported: false,
             };
-            let _ = apply_observed_transition(entry, &observed, report, agent);
+            let _ = apply_observed_transition(
+                self.inner.profiles.runtimes(),
+                entry,
+                &observed,
+                report,
+                agent,
+            );
             return ForegroundDecision::Updated;
         }
 
@@ -809,6 +835,7 @@ fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &Observed
 }
 
 fn apply_observed_transition(
+    runtimes: &RuntimeHost,
     entry: &mut SessionEntry,
     observed: &ObservedAgent,
     report: ActiveAgentReport,
@@ -829,7 +856,10 @@ fn apply_observed_transition(
         entry.info.activity = None;
         entry.info.state_source = protocol::StateSource::Process;
     }
-    send_detector_config(entry, DetectorConfig::for_agent(&observed.agent_base));
+    send_detector_config(
+        entry,
+        DetectorConfig::for_agent(runtimes, &observed.agent_base),
+    );
     entry.info.updated_at = timestamp_now();
     entry.info.clone()
 }

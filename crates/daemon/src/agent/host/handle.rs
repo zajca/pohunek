@@ -6,7 +6,7 @@
 //! place that turns an [`AgentKind`] into a launchable [`RuntimeDefinition`],
 //! so every caller answers an unknown runtime with the same stable error.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use protocol::{AgentKind, ProtocolError, RuntimeId};
 
@@ -136,16 +136,4 @@ impl Default for RuntimeHost {
     fn default() -> Self {
         Self::from_host_environment()
     }
-}
-
-static BUILTIN_HOST: LazyLock<RuntimeHost> = LazyLock::new(RuntimeHost::from_host_environment);
-
-/// The process-wide host of built-in runtimes.
-///
-/// Serves the callers that hold only an [`AgentKind`] and no session registry:
-/// the capability probe and input-rule lookups. Both are scheduled to read the
-/// session registry's host instead.
-#[must_use]
-pub(crate) fn builtin_host() -> &'static RuntimeHost {
-    &BUILTIN_HOST
 }

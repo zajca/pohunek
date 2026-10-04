@@ -800,7 +800,11 @@ impl SessionRegistry {
         let runtime_watch_cancel = CancellationToken::new();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
-        let default_detector_config = DetectorConfig::for_profile(&agent_base, manifest_override);
+        let default_detector_config = DetectorConfig::for_profile(
+            self.inner.profiles.runtimes(),
+            &agent_base,
+            manifest_override,
+        );
         let (detector_config, detector_config_rx) = watch::channel(DetectorConfigUpdate {
             generation: 0,
             config: default_detector_config.clone(),

@@ -2,7 +2,7 @@
 
 use super::{
     agent_fork_unsupported, agent_not_resumable, fork_pty_command_from_launch, host,
-    input_rules_for_agent, is_terminal, resume_pty_command_from_launch, runtime_error,
+    input_rules_for_definition, is_terminal, resume_pty_command_from_launch, runtime_error,
     session_not_found, validate_session_name, warn, LaunchOpts, NativeSessionLaunch, Ordering,
     PathBuf, ProtocolError, PtySessionSpec, ResumeBinding, SessionEntry, SessionForkParams,
     SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
@@ -284,7 +284,7 @@ impl SessionRegistry {
         let input_rules = if has_snapshot {
             binding.input_rules.to_input_rules(definition.input_rules())
         } else {
-            input_rules_for_agent(&binding.agent_base, &self.inner.config)
+            input_rules_for_definition(&definition, &self.inner.config)
         };
 
         let (profile_env, manifest_override) = match self
@@ -481,7 +481,7 @@ impl SessionRegistry {
         let input_rules = if has_snapshot {
             binding.input_rules.to_input_rules(definition.input_rules())
         } else {
-            input_rules_for_agent(&binding.agent_base, &self.inner.config)
+            input_rules_for_definition(&definition, &self.inner.config)
         };
 
         // Re-resolve the profile by NAME to recover its (possibly-secret) env + its

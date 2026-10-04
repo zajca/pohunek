@@ -4,14 +4,15 @@ use pohunek_worker_protocol::{InputFragment as WorkerInputFragment, SecretBytes}
 
 use protocol::{ActivityRevision, AgentStateEvent, SessionRuntimeIdentity};
 
+use crate::agent::host::{RuntimeDefinition, RuntimeHost};
 use crate::runtime::WriteReservation;
 
 use super::{
-    adapter_for, broadcast, session_not_found, session_not_running, unavailable_runtime_error,
-    warn, worker_error_to_protocol, ActivityEvidence, AgentActivity, AgentKind, Duration,
-    ErrorClass, InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent,
-    RuntimeHandle, SessionEntry, SessionId, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionRegistry, SessionRegistryConfig, SessionState, Worker,
+    broadcast, session_not_found, session_not_running, unavailable_runtime_error, warn,
+    worker_error_to_protocol, ActivityEvidence, AgentActivity, AgentKind, Duration, ErrorClass,
+    InputRules, LaunchCommand, LaunchCommandPlan, ProtocolError, ResolvedAgent, RuntimeHandle,
+    SessionEntry, SessionId, SessionInputParams, SessionInputResult, SessionInputWait,
+    SessionRegistry, SessionRegistryConfig, SessionState, Worker,
 };
 
 pub(super) const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -613,7 +614,7 @@ pub(super) fn plan_initial_input_delivery(
     mut command: LaunchCommand,
     initial_input: Option<String>,
 ) -> LaunchCommandPlan {
-    if resolved.profile.is_none() && prompt_arg_supported(&resolved.base) {
+    if resolved.profile.is_none() && resolved.definition.prompt_arg() {
         if let Some(input) = initial_input {
             command.args.push(input);
         }
@@ -629,19 +630,32 @@ pub(super) fn plan_initial_input_delivery(
     }
 }
 
-pub(super) fn prompt_arg_supported(agent: &AgentKind) -> bool {
-    matches!(agent, AgentKind::Codex | AgentKind::Claude)
+/// Input rules for `definition`: the descriptor's framing, with its submit
+/// delay replaced by the configured override when the descriptor allows one.
+pub(super) fn input_rules_for_definition(
+    definition: &RuntimeDefinition,
+    config: &SessionRegistryConfig,
+) -> InputRules {
+    let mut rules = definition.input_rules();
+    if definition.submit_delay_configurable() {
+        if let Some(delay) = config.submit_delay_overrides.get(definition.runtime_id()) {
+            rules.submit_delay = *delay;
+        }
+    }
+    rules
 }
 
+/// [`input_rules_for_definition`] for the runtime `agent` names; a kind
+/// without an installed definition gets unrestricted, unframed input.
 pub(super) fn input_rules_for_agent(
+    host: &RuntimeHost,
     agent: &AgentKind,
     config: &SessionRegistryConfig,
 ) -> InputRules {
-    let mut rules = adapter_for(agent).input_rules();
-    if *agent == AgentKind::Claude {
-        rules.submit_delay = config.claude_submit_delay;
-    }
-    rules
+    host.resolve_kind(agent).map_or_else(
+        |_unresolved| crate::agent::input_rules_for_kind(host, agent),
+        |definition| input_rules_for_definition(definition, config),
+    )
 }
 
 pub(super) fn build_input_writes(
