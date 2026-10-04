@@ -469,6 +469,13 @@ Runtime package archive format:
 - `crates/package/src/limits.rs` — named size limits.
 - `crates/package/src/error.rs` — typed rejections that never echo archive content.
 - `crates/package/tests/archive.rs`
+
+Signed runtime catalog:
+
+- `docs/knowledge/concepts/runtime-catalog.md`
+- `crates/package/src/catalog.rs` — catalog schema, key chain, signature verification, authorization, local trust.
+- `crates/package/src/canonical_json.rs` — strict JSON parsing and the canonical signed byte form.
+- `crates/package/tests/catalog.rs`
 - `crates/xtask/src/runtime_package.rs` — `cargo xtask package build|verify`.
 
 Hermes compatibility evidence:

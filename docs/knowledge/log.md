@@ -1,5 +1,12 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-04, runtime catalog)
+
+- Added the runtime catalog concept: the signed catalog that authorizes official
+  runtime packages, canonical signed bytes, key rotation and revocation,
+  anti-rollback, reserved runtime ids, and explicit-digest local trust. The
+  source map lists the new `crates/package` files.
+
 ## Unreleased (2026-10-04, runtime package archive)
 
 - Added the runtime package archive concept: the canonical deterministic
