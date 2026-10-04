@@ -137,6 +137,24 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/runtime_incompatible` error.
+    ///
+    /// The runtime is installed, but the package root it launches from is
+    /// missing, was modified, or no longer matches the identity recorded for
+    /// the session. The state is read-only: nothing else stands in for it. The
+    /// message carries no path and no reason text; the daemon log records the
+    /// typed cause. The identity is a validated [`RuntimeId`], so echoing it is
+    /// safe.
+    #[must_use]
+    pub fn runtime_incompatible(runtime: &RuntimeId) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "runtime_incompatible",
+            format!("runtime `{runtime}` is installed but its package cannot be used"),
+            Some("reinstall the runtime package and retry".to_owned()),
+        )
+    }
+
     /// Creates one payload-free M1 observation error.
     #[must_use]
     pub fn observation(code: &'static str, msg: &'static str) -> Self {

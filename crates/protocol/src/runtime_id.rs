@@ -810,6 +810,21 @@ mod tests {
     }
 
     #[test]
+    fn runtime_incompatible_error_is_stable_and_never_echoes_paths() {
+        let error = ProtocolError::runtime_incompatible(&RuntimeId::parse("acme").unwrap());
+        assert_eq!(error.class, crate::ErrorClass::Runtime);
+        assert_eq!(error.code, "runtime_incompatible");
+        assert!(error.msg.contains("`acme`"));
+        assert!(!error.msg.contains('/'));
+        assert!(error.recover.is_some());
+        let json = serde_json::to_string(&error).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<ProtocolError>(&json).expect("roundtrip"),
+            error
+        );
+    }
+
+    #[test]
     fn version_and_digest_validation() {
         PackageVersion::parse("1.0.0").expect("must be valid");
         PackageVersion::parse("1.0.0+build_7-rc").expect("must be valid");
