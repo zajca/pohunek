@@ -546,12 +546,9 @@ fn host_inspect_reports_a_pinned_profile_unavailable_when_its_package_is_uninsta
 fn the_retention_scan_never_blocks_on_a_fifo_or_follows_a_symlink() {
     let fixture = Fixture::new();
     let fifo = fixture.agents.join("fifo.toml");
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
+    nix::unistd::mkfifo(
         &fifo,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
     )
     .expect("create a fifo");
     // The listing already skips a fifo; the reader itself must also refuse one
