@@ -33,6 +33,7 @@ mod limits;
 pub mod method;
 mod notification;
 mod project;
+mod runtime_id;
 mod session;
 mod version;
 
@@ -104,6 +105,12 @@ pub use project::{
     ProjectPromptParams, ProjectPromptResult, ProjectRemoveParams, ProjectRemoveResult,
     ProjectRenameParams, ProjectShowParams, ProjectShowResult, ProjectSource, ProjectWorktree,
     PromptLayer, ProviderKind, WorktreeRemoveParams, WorktreeRemoveResult,
+};
+#[doc(inline)]
+pub use runtime_id::{
+    BindingFieldError, BindingProvenance, DescriptorDigest, LaunchBinding, PackageDigest,
+    PackageId, PackageVersion, RuntimeId, RuntimeIdError, RuntimeRef, MAX_AGENT_RUNTIME_ID_BYTES,
+    MAX_PACKAGE_ID_BYTES, MAX_PACKAGE_VERSION_BYTES,
 };
 #[doc(inline)]
 pub use session::{

@@ -13,8 +13,9 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     envelope::StateSource, ActivityRevision, OutputOffset, ProcessStartIdentity, ProtocolError,
-    ReportSequence, RuntimeGeneration, SubagentRevision, TerminalWatermark, MAX_RUNTIME_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
+    ReportSequence, RuntimeGeneration, RuntimeId, RuntimeRef, SubagentRevision, TerminalWatermark,
+    MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    MAX_SESSION_WAIT_MS,
 };
 
 /// The kind of agent backing a session.
@@ -45,6 +46,22 @@ impl AgentKind {
             Self::Claude => "claude",
             Self::Hermes => "hermes",
             Self::Unknown(value) => value,
+        }
+    }
+
+    /// Returns this kind as a runtime reference.
+    ///
+    /// Built-in kinds map to their [`RuntimeId`]. An unknown value is always
+    /// [`RuntimeRef::Historical`], even when its text is a well-formed id, so a
+    /// presentation-only kind never becomes launchable through this conversion.
+    #[must_use]
+    pub fn as_runtime_ref(&self) -> RuntimeRef {
+        match self {
+            Self::Shell => RuntimeRef::Id(RuntimeId::from_trusted("shell")),
+            Self::Codex => RuntimeRef::Id(RuntimeId::from_trusted("codex")),
+            Self::Claude => RuntimeRef::Id(RuntimeId::from_trusted("claude")),
+            Self::Hermes => RuntimeRef::Id(RuntimeId::from_trusted("hermes")),
+            Self::Unknown(value) => RuntimeRef::Historical(value.clone()),
         }
     }
 
