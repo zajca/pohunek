@@ -2254,7 +2254,7 @@ fn request_roundtrip() {
 #[test]
 fn request_missing_params_defaults_to_null() {
     // A parameterless method may omit `params` entirely on the wire.
-    let raw = r#"{"v":{"minimum":3,"maximum":3},"id":"req-1","method":"daemon.health"}"#;
+    let raw = r#"{"v":{"minimum":4,"maximum":4},"id":"req-1","method":"daemon.health"}"#;
     let req: Request = serde_json::from_str(raw).expect("deserialize");
     assert_eq!(req.method(), method::DAEMON_HEALTH);
     assert_eq!(req.params(), &Value::Null);
@@ -2396,7 +2396,7 @@ fn event_with_id_roundtrip() {
 
 #[test]
 fn request_unknown_fields_are_rejected() {
-    let raw = r#"{"v":{"minimum":3,"maximum":3},"id":"req-1","method":"daemon.health","params":null,"future_field":true}"#;
+    let raw = r#"{"v":{"minimum":4,"maximum":4},"id":"req-1","method":"daemon.health","params":null,"future_field":true}"#;
     serde_json::from_str::<Request>(raw).expect_err("unknown request field must fail");
 }
 

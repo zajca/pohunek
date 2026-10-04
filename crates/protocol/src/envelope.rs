@@ -5,7 +5,7 @@
 //!
 //! ```jsonc
 //! // request
-//! {"v":{"minimum":3,"maximum":3},"id":"req-7f3","method":"session.new","params":{...}}
+//! {"v":{"minimum":4,"maximum":4},"id":"req-7f3","method":"session.new","params":{...}}
 //! // response (ok)
 //! {"v":4,"id":"req-7f3","ok":{...}}
 //! // response (typed error)
