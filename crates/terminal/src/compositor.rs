@@ -3,7 +3,7 @@
 //! [`Compositor`] shadows the attached PTY byte stream in a `vt100` grid while
 //! the client normally forwards bytes unchanged. When a modal opens, it freezes
 //! the current grid as a background, saves the physical cursor state, and draws
-//! a one-row status banner plus an overlay. The caller buffers agent bytes until
+//! an overlay dialog. The caller buffers agent bytes until
 //! [`Compositor::restore`] repaints the frozen background; replaying those bytes
 //! then returns the physical terminal to the exact agent-authored state.
 //!
@@ -11,23 +11,21 @@
 //!
 //! - The shadow grid uses the full physical terminal size, preserving raw
 //!   passthrough geometry and native scrollback outside the modal.
-//! - Physical row 1 is overwritten by the banner only while the modal is open.
-//! - Physical rows `2..=N` are available to the centered overlay.
+//! - Physical rows `1..=N` are available to the centered overlay; session
+//!   details travel in the overlay's own header rows.
 //! - Modal drawing never changes the scroll region or alternate-screen mode.
 
-// Rust guideline compliant 2026-07-22
+// Rust guideline compliant 2026-10-03
 
 use std::fmt;
 
-/// Physical rows occupied by the transient banner.
-///
-/// Changing this requires updating overlay geometry and banner restoration.
-pub const BANNER_ROWS: u16 = 1;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// Minimum physical rows required to host a banner plus a usable agent row.
+/// Minimum physical rows of the shadow grid.
 ///
-/// One row for the banner and at least one row for modal content.
-pub const MIN_ROWS_WITH_BANNER: u16 = 2;
+/// One row keeps the vt100 grid addressable and leaves at least one row for
+/// modal content.
+pub const MIN_ROWS: u16 = 1;
 
 /// No scrollback: the compositor mirrors the visible screen like a raw attach.
 const SCROLLBACK_LINES: usize = 0;
@@ -41,16 +39,11 @@ const CLEAR_LINE: &[u8] = b"\x1b[2K";
 /// DEC save/restore preserves the agent cursor, attributes, and origin mode.
 const SAVE_CURSOR: &[u8] = b"\x1b7";
 const RESTORE_CURSOR: &[u8] = b"\x1b8";
-// Reverse video for the banner, cleared to end of line so stale text never
-// shows through when the banner shrinks.
-const BANNER_OPEN: &[u8] = b"\x1b[7m\x1b[2K";
 
 /// The first physical terminal column in one-based cursor coordinates.
 const FIRST_PHYSICAL_COL: u16 = 1;
 /// The first physical terminal row in one-based cursor coordinates.
 const FIRST_PHYSICAL_ROW: u16 = 1;
-/// The first physical row available for the agent grid and overlays.
-const FIRST_AGENT_ROW: u16 = BANNER_ROWS + FIRST_PHYSICAL_ROW;
 
 /// One-cell padding on both sides keeps overlay text away from the border.
 const OVERLAY_HORIZONTAL_PADDING_COLUMNS: u16 = 2;
@@ -98,11 +91,14 @@ const OVERLAY_HIGHLIGHT_ATTRS: &[u8] = b"\x1b[7m";
 pub struct OverlayFrame {
     /// Heading rendered in the first interior row.
     pub title: String,
+    /// Plain detail rows rendered between the title and the body lines.
+    pub header: Vec<String>,
     /// Body lines rendered below the title.
     pub lines: Vec<OverlayLine>,
     /// Optional footer rendered after body lines when space permits.
     pub footer: Option<String>,
-    /// Zero-based cursor cell relative to the box interior.
+    /// Zero-based cursor cell: the row is relative to the first body line and
+    /// the column to the box interior.
     ///
     /// `None` hides the physical cursor while the overlay is visible.
     pub cursor: Option<(u16, u16)>,
@@ -144,10 +140,10 @@ impl Compositor {
     /// Creates a compositor for a physical terminal of `cols` by `rows`.
     ///
     /// The shadow grid uses full passthrough geometry. `rows` is clamped to at
-    /// least [`MIN_ROWS_WITH_BANNER`].
+    /// least [`MIN_ROWS`].
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
-        let rows = rows.max(MIN_ROWS_WITH_BANNER);
+        let rows = rows.max(MIN_ROWS);
         Self {
             parser: vt100::Parser::new(rows, cols, SCROLLBACK_LINES),
             background: None,
@@ -167,6 +163,13 @@ impl Compositor {
         self.overlay = overlay;
     }
 
+    /// Replaces the header rows of the current overlay; a no-op without one.
+    pub fn set_overlay_header(&mut self, header: Vec<String>) {
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.header = header;
+        }
+    }
+
     /// Resizes the shadow grid while no modal is open.
     ///
     /// # Panics
@@ -177,7 +180,7 @@ impl Compositor {
             self.background.is_none(),
             "cannot resize the compositor while a modal is active"
         );
-        let rows = rows.max(MIN_ROWS_WITH_BANNER);
+        let rows = rows.max(MIN_ROWS);
         self.cols = cols;
         self.rows = rows;
         self.parser.screen_mut().set_size(rows, cols);
@@ -191,13 +194,11 @@ impl Compositor {
 
     /// Renders physical-terminal bytes that update the screen to the fed state.
     ///
-    /// `banner` is the plain banner text; the compositor styles and clamps it to
-    /// the terminal width and draws it on the top row. The first call freezes
-    /// the current shadow grid and saves the physical
+    /// The first call freezes the current shadow grid and saves the physical
     /// cursor state. Later calls repaint that same background before drawing the
-    /// latest banner and overlay, clearing stale modal geometry.
+    /// latest overlay, clearing stale modal geometry.
     #[must_use]
-    pub fn render(&mut self, banner: &str) -> Vec<u8> {
+    pub fn render(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if self.background.is_none() {
             self.background = Some(self.parser.screen().clone());
@@ -206,7 +207,6 @@ impl Compositor {
         }
         out.extend_from_slice(HIDE_CURSOR);
         self.write_background(&mut out);
-        write_banner(&mut out, banner, self.cols);
         if let Some(overlay) = self.overlay.as_ref() {
             self.write_overlay(&mut out, overlay);
         }
@@ -260,7 +260,7 @@ impl Compositor {
             return None;
         }
 
-        let grid_height = modal_rows(self.rows);
+        let grid_height = self.rows.max(1);
         let max_content_width = overlay_content_width(overlay);
         let desired_width = max_content_width
             .saturating_add(OVERLAY_HORIZONTAL_BORDER_COLUMNS)
@@ -268,13 +268,14 @@ impl Compositor {
         let width = desired_width.max(OVERLAY_MIN_WIDTH).min(self.cols);
 
         let footer_rows = overlay.footer.as_ref().map_or(0, |_| OVERLAY_FOOTER_ROWS);
-        let desired_height = OVERLAY_VERTICAL_BORDER_ROWS
+        let fixed_height = OVERLAY_VERTICAL_BORDER_ROWS
             .saturating_add(OVERLAY_TITLE_ROWS)
-            .saturating_add(lines_len_u16(&overlay.lines))
+            .saturating_add(len_u16(&overlay.lines))
             .saturating_add(footer_rows);
-        let height = desired_height.min(grid_height);
+        let header_rows = len_u16(&overlay.header).min(grid_height.saturating_sub(fixed_height));
+        let height = fixed_height.saturating_add(header_rows).min(grid_height);
 
-        let row = FIRST_AGENT_ROW.saturating_add((grid_height.saturating_sub(height)) / 2);
+        let row = FIRST_PHYSICAL_ROW.saturating_add((grid_height.saturating_sub(height)) / 2);
         let col = FIRST_PHYSICAL_COL.saturating_add((self.cols.saturating_sub(width)) / 2);
 
         Some(OverlayGeometry {
@@ -282,6 +283,7 @@ impl Compositor {
             col,
             width,
             height,
+            header_rows,
         })
     }
 
@@ -329,11 +331,8 @@ struct OverlayGeometry {
     col: u16,
     width: u16,
     height: u16,
-}
-
-/// Modal content height below the transient banner.
-fn modal_rows(rows: u16) -> u16 {
-    rows.saturating_sub(BANNER_ROWS).max(1)
+    /// Header rows that fit; body and footer rows take priority over them.
+    header_rows: u16,
 }
 
 /// One-based grid row for the zero-based `vt100` visible-row `index`.
@@ -356,20 +355,14 @@ fn push_move(out: &mut Vec<u8>, row: u16, col: u16) {
     out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
 }
 
-/// Draws the banner text on the physical top row, clamped to `cols`.
-///
-/// The caller is responsible for having origin mode disabled so `\x1b[1;1H`
-/// addresses the physical top row.
-fn write_banner(out: &mut Vec<u8>, banner: &str, cols: u16) {
-    push_move(out, FIRST_PHYSICAL_ROW, FIRST_PHYSICAL_COL);
-    out.extend_from_slice(BANNER_OPEN);
-    let clamped: String = banner.chars().take(usize::from(cols)).collect();
-    out.extend_from_slice(clamped.as_bytes());
-    out.extend_from_slice(RESET_ATTRS);
-}
-
 fn overlay_content_width(overlay: &OverlayFrame) -> u16 {
     let title_width = cell_width(&overlay.title);
+    let header_width = overlay
+        .header
+        .iter()
+        .map(|text| cell_width(text))
+        .max()
+        .unwrap_or(0);
     let line_width = overlay
         .lines
         .iter()
@@ -378,7 +371,10 @@ fn overlay_content_width(overlay: &OverlayFrame) -> u16 {
         .unwrap_or(0);
     let footer_width = overlay.footer.as_deref().map_or(0, cell_width);
 
-    title_width.max(line_width).max(footer_width)
+    title_width
+        .max(header_width)
+        .max(line_width)
+        .max(footer_width)
 }
 
 fn write_overlay_row(
@@ -413,14 +409,24 @@ fn write_overlay_row(
         return;
     }
 
-    let line_offset = interior_offset.saturating_sub(OVERLAY_TITLE_ROWS);
+    let after_title = interior_offset.saturating_sub(OVERLAY_TITLE_ROWS);
+    if after_title < geometry.header_rows {
+        let text = overlay
+            .header
+            .get(usize::from(after_title))
+            .map_or("", String::as_str);
+        write_overlay_text_row(out, geometry.width, text, None);
+        return;
+    }
+
+    let line_offset = after_title.saturating_sub(geometry.header_rows);
     if let Some(line) = overlay.lines.get(usize::from(line_offset)) {
         let attrs = line.highlighted.then_some(OVERLAY_HIGHLIGHT_ATTRS);
         write_overlay_text_row(out, geometry.width, &line.text, attrs);
         return;
     }
 
-    let footer_offset = line_offset.saturating_sub(lines_len_u16(&overlay.lines));
+    let footer_offset = line_offset.saturating_sub(len_u16(&overlay.lines));
     if footer_offset == 0 {
         if let Some(footer) = overlay.footer.as_ref() {
             write_overlay_text_row(out, geometry.width, footer, None);
@@ -432,11 +438,11 @@ fn write_overlay_row(
 }
 
 fn cell_width(text: &str) -> u16 {
-    u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
+    u16::try_from(text.width()).unwrap_or(u16::MAX)
 }
 
-fn lines_len_u16(lines: &[OverlayLine]) -> u16 {
-    u16::try_from(lines.len()).unwrap_or(u16::MAX)
+fn len_u16<T>(items: &[T]) -> u16 {
+    u16::try_from(items.len()).unwrap_or(u16::MAX)
 }
 
 fn write_overlay_border_row(out: &mut Vec<u8>, width: u16, left: u8, right: u8) {
@@ -489,12 +495,20 @@ fn write_overlay_text_row(out: &mut Vec<u8>, width: u16, text: &str, attrs: Opti
     out.extend_from_slice(RESET_ATTRS);
 }
 
+/// Writes `text` clipped to `width` terminal cells and returns the cells used.
+///
+/// Wide characters occupy two cells and combining marks none, so a character
+/// that would cross the right edge is dropped instead of being split.
 fn write_clipped_text(out: &mut Vec<u8>, text: &str, width: u16) -> u16 {
-    let mut written = 0;
-    for ch in text.chars().take(usize::from(width)) {
+    let mut written = 0_u16;
+    for ch in text.chars() {
+        let cells = u16::try_from(ch.width().unwrap_or(0)).unwrap_or(u16::MAX);
+        if written.saturating_add(cells) > width {
+            break;
+        }
         let mut buf = [0; 4];
         out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        written += 1;
+        written += cells;
     }
     written
 }
@@ -512,7 +526,10 @@ fn overlay_cursor_position(geometry: OverlayGeometry, row: u16, col: u16) -> Opt
         return None;
     }
 
-    let row = row.min(interior_height.saturating_sub(1));
+    let row = row
+        .saturating_add(OVERLAY_TITLE_ROWS)
+        .saturating_add(geometry.header_rows)
+        .min(interior_height.saturating_sub(1));
     let col = col.min(interior_width.saturating_sub(1));
     Some((
         geometry
@@ -528,7 +545,7 @@ fn overlay_cursor_position(geometry: OverlayGeometry, row: u16, col: u16) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{Compositor, OverlayFrame, OverlayLine, BANNER_ROWS};
+    use super::{Compositor, OverlayFrame, OverlayLine, MIN_ROWS};
 
     const SHORT_TEST_COLS: u16 = 20;
     const SHORT_TEST_ROWS: u16 = 8;
@@ -541,8 +558,8 @@ mod tests {
     const CURSOR_TEST_ROW: u16 = 4;
     const CURSOR_TEST_COL: u16 = 7;
 
-    fn render_string(compositor: &mut Compositor, banner: &str) -> String {
-        String::from_utf8(compositor.render(banner)).expect("frame is utf8")
+    fn render_string(compositor: &mut Compositor) -> String {
+        String::from_utf8(compositor.render()).expect("frame is utf8")
     }
 
     fn move_to(row: u16, col: u16) -> String {
@@ -552,6 +569,7 @@ mod tests {
     fn test_overlay() -> OverlayFrame {
         OverlayFrame {
             title: "Menu".to_owned(),
+            header: Vec::new(),
             lines: vec![
                 OverlayLine {
                     text: "Kill".to_owned(),
@@ -575,31 +593,26 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_clamped_to_leave_a_usable_grid() {
-        let compositor = Compositor::new(80, 1);
+    fn rows_are_clamped_to_leave_an_addressable_grid() {
+        let compositor = Compositor::new(80, 0);
 
-        assert_eq!(compositor.grid_size(), (2, 80));
+        assert_eq!(compositor.grid_size(), (MIN_ROWS, 80));
     }
 
     #[test]
-    fn first_frame_saves_terminal_state_and_draws_banner() {
+    fn first_frame_saves_terminal_state_and_keeps_row_one_for_the_agent() {
         let mut compositor = Compositor::new(40, 10);
         compositor.feed(b"hello");
 
-        let frame = render_string(&mut compositor, "[kill]");
+        let frame = render_string(&mut compositor);
 
         assert!(
             frame.starts_with("\x1b7\x1b[?6l"),
             "first frame must save the cursor before using absolute coordinates: {frame:?}"
         );
-        // Banner is drawn on the physical top row with origin mode off.
         assert!(
-            frame.contains("\x1b[?6l"),
-            "banner must be drawn with origin mode disabled: {frame:?}"
-        );
-        assert!(
-            frame.contains("\x1b[1;1H\x1b[7m\x1b[2K[kill]"),
-            "banner text must render reverse-video on row 1: {frame:?}"
+            !frame.contains("\x1b[7m\x1b[2K"),
+            "no banner row may be drawn over the agent grid: {frame:?}"
         );
         assert!(
             !frame.contains("\x1b[2;10r") && !frame.contains("\x1b[?1049"),
@@ -617,18 +630,13 @@ mod tests {
         // A full-screen TUI: enter the alternate screen, home the cursor, draw.
         compositor.feed(b"\x1b[?1049h\x1b[2J\x1b[1;1HTUI");
 
-        let frame = render_string(&mut compositor, "banner");
+        let frame = render_string(&mut compositor);
 
         // The raw alternate-screen switch must never reach the physical
         // terminal; it was absorbed into the grid.
         assert!(
             !frame.contains("\x1b[?1049h"),
             "alternate-screen switch must be swallowed, not forwarded: {frame:?}"
-        );
-        // The banner still owns row 1.
-        assert!(
-            frame.contains("\x1b[1;1H\x1b[7m\x1b[2Kbanner"),
-            "banner must survive a full-screen TUI frame: {frame:?}"
         );
         assert!(
             frame.contains("TUI"),
@@ -646,7 +654,7 @@ mod tests {
         // Application cursor keys + bracketed paste, as a TUI would enable.
         compositor.feed(b"\x1b[?1h\x1b[?2004h");
 
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             !frame.contains("\x1b[?1h"),
@@ -662,10 +670,10 @@ mod tests {
     fn second_frame_keeps_the_frozen_background() {
         let mut compositor = Compositor::new(40, 6);
         compositor.feed(b"line one\r\nline two");
-        let _ = compositor.render("b");
+        let _ = compositor.render();
 
         compositor.feed(b"\r\nline two changed");
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             !frame.contains("\x1b[2;6r"),
@@ -682,69 +690,23 @@ mod tests {
     }
 
     #[test]
-    fn banner_is_redrawn_to_clear_agent_repaints() {
-        let mut compositor = Compositor::new(40, 6);
-        compositor.feed(b"x");
-        let _ = compositor.render("same");
-
-        compositor.feed(b"y");
-        let frame = render_string(&mut compositor, "same");
-
-        assert!(
-            frame.contains("\x1b[7m\x1b[2Ksame"),
-            "an unchanged banner must still be restored above the modal: {frame:?}"
-        );
-    }
-
-    #[test]
-    fn changed_banner_is_redrawn_on_an_incremental_frame() {
-        let mut compositor = Compositor::new(40, 6);
-        compositor.feed(b"x");
-        let _ = compositor.render("first");
-
-        let frame = render_string(&mut compositor, "second");
-
-        assert!(
-            frame.contains("\x1b[1;1H\x1b[7m\x1b[2Ksecond"),
-            "a changed banner must be redrawn on the top row: {frame:?}"
-        );
-    }
-
-    #[test]
-    fn banner_is_clamped_to_the_terminal_width() {
-        let mut compositor = Compositor::new(4, 6);
-        compositor.feed(b"x");
-
-        let frame = render_string(&mut compositor, "abcdefgh");
-
-        assert!(
-            frame.contains("\x1b[2Kabcd\x1b[m"),
-            "banner must be clamped to the terminal width: {frame:?}"
-        );
-        assert!(
-            !frame.contains("abcde"),
-            "banner must not exceed the terminal width: {frame:?}"
-        );
-    }
-
-    #[test]
     fn resize_uses_full_passthrough_geometry_after_restore() {
         let mut compositor = Compositor::new(40, 6);
         compositor.feed(b"content");
-        let _ = compositor.render("b");
+        let _ = compositor.render();
         let _ = compositor.restore();
 
         compositor.resize(50, 12);
         assert_eq!(compositor.grid_size(), (12, 50));
 
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
         assert!(
             !frame.contains("\x1b[2;12r"),
             "modal rendering must not establish a scroll region: {frame:?}"
         );
         assert!(
-            frame.contains("\x1b[1;1H\x1b[7m\x1b[2Kb"),
-            "resize must redraw the banner: {frame:?}"
+            frame.contains("\x1b[1;1H"),
+            "resize must repaint the full grid: {frame:?}"
         );
     }
 
@@ -752,7 +714,7 @@ mod tests {
     fn restore_repaints_background_and_restores_saved_cursor() {
         let mut compositor = Compositor::new(40, 8);
         compositor.feed(b"base");
-        let _ = compositor.render("b");
+        let _ = compositor.render();
 
         let teardown = String::from_utf8(compositor.restore()).expect("teardown is utf8");
 
@@ -780,7 +742,7 @@ mod tests {
         let mut compositor = Compositor::new(40, 6);
         compositor.feed(b"\x1b[?25l");
 
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             frame.trim_end().ends_with("\x1b[?25l"),
@@ -789,24 +751,15 @@ mod tests {
     }
 
     #[test]
-    fn banner_rows_constant_is_one_physical_row() {
-        assert_eq!(BANNER_ROWS, 1);
-    }
-
-    #[test]
-    fn overlay_draws_centered_within_the_agent_region() {
+    fn overlay_draws_centered_within_the_grid() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.set_overlay(Some(test_overlay()));
 
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             frame.contains(&move_to(SHORT_OVERLAY_TOP_ROW, SHORT_OVERLAY_LEFT_COL)),
             "overlay must start centered in physical agent rows: {frame:?}"
-        );
-        assert!(
-            !frame.contains("\x1b[1;4H+"),
-            "overlay must not draw on the banner row: {frame:?}"
         );
         assert!(
             frame.contains("Menu"),
@@ -827,6 +780,7 @@ mod tests {
         let mut compositor = Compositor::new(CLIPPED_TEST_COLS, CLIPPED_TEST_ROWS);
         compositor.set_overlay(Some(OverlayFrame {
             title: "Very long overlay title".to_owned(),
+            header: Vec::new(),
             lines: vec![
                 OverlayLine {
                     text: "First long row".to_owned(),
@@ -841,11 +795,11 @@ mod tests {
             cursor: None,
         }));
 
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
-            frame.contains(&move_to(BANNER_ROWS + 1, 1)),
-            "clipped overlay must start at the first agent row: {frame:?}"
+            frame.contains(&move_to(1, 1)),
+            "clipped overlay must start at the first physical row: {frame:?}"
         );
         assert!(
             frame.contains(&move_to(CLIPPED_OVERLAY_BOTTOM_ROW, 1)),
@@ -869,10 +823,10 @@ mod tests {
     fn agent_output_during_modal_does_not_replace_the_overlay() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.set_overlay(Some(test_overlay()));
-        let _ = compositor.render("b");
+        let _ = compositor.render();
 
         compositor.feed(b"\x1b[1;1HUNDERLAY");
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             !frame.contains("UNDERLAY") && frame.contains("Menu"),
@@ -884,10 +838,10 @@ mod tests {
     fn opening_overlay_repaints_the_frozen_background() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.feed(b"base");
-        let _ = compositor.render("b");
+        let _ = compositor.render();
 
         compositor.set_overlay(Some(test_overlay()));
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             frame.contains("base"),
@@ -899,13 +853,13 @@ mod tests {
     fn updating_open_overlay_repaints_its_content() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.set_overlay(Some(test_overlay()));
-        let _ = compositor.render("b");
+        let _ = compositor.render();
 
         let mut updated = test_overlay();
         updated.lines[0].highlighted = false;
         updated.lines[1].highlighted = true;
         compositor.set_overlay(Some(updated));
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             frame.contains("Detach"),
@@ -918,7 +872,7 @@ mod tests {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.feed(b"covered");
         compositor.set_overlay(Some(test_overlay()));
-        let _ = compositor.render("b");
+        let _ = compositor.render();
 
         compositor.set_overlay(None);
         let frame = String::from_utf8(compositor.restore()).expect("restore is utf8");
@@ -934,7 +888,7 @@ mod tests {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         compositor.set_overlay(Some(test_overlay()));
 
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             frame.trim_end().ends_with("\x1b[?25l"),
@@ -946,10 +900,10 @@ mod tests {
     fn overlay_cursor_is_parked_inside_the_box_and_shown() {
         let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
         let mut overlay = test_overlay();
-        overlay.cursor = Some((1, 2));
+        overlay.cursor = Some((0, 2));
         compositor.set_overlay(Some(overlay));
 
-        let frame = render_string(&mut compositor, "b");
+        let frame = render_string(&mut compositor);
 
         assert!(
             frame.contains(&format!(
@@ -957,6 +911,118 @@ mod tests {
                 move_to(CURSOR_TEST_ROW, CURSOR_TEST_COL)
             )),
             "overlay cursor must use absolute physical coordinates and be shown: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_header_rows_render_between_title_and_body() {
+        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
+        let mut overlay = test_overlay();
+        overlay.header = vec!["host: local".to_owned(), "branch: main".to_owned()];
+        compositor.set_overlay(Some(overlay));
+
+        let frame = render_string(&mut compositor);
+
+        let title = frame.find("Menu").expect("title rendered");
+        let host = frame
+            .find("host: local")
+            .expect("first header row rendered");
+        let branch = frame
+            .find("branch: main")
+            .expect("second header row rendered");
+        let body = frame.find("Kill").expect("body rendered");
+        assert!(
+            title < host && host < branch && branch < body,
+            "header rows must sit between the title and the body: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_header_is_clipped_to_the_terminal_width() {
+        let mut compositor = Compositor::new(CLIPPED_TEST_COLS, SHORT_TEST_ROWS);
+        let mut overlay = test_overlay();
+        overlay.header = vec!["branch: a-very-long-branch-name".to_owned()];
+        compositor.set_overlay(Some(overlay));
+
+        let frame = render_string(&mut compositor);
+
+        assert!(
+            !frame.contains("a-very-long"),
+            "header text must be horizontally clipped to the box width: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_cursor_accounts_for_header_rows() {
+        let mut with_header = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
+        let mut overlay = test_overlay();
+        overlay.header = vec!["host".to_owned()];
+        overlay.cursor = Some((0, 2));
+        with_header.set_overlay(Some(overlay));
+
+        let frame = render_string(&mut with_header);
+
+        // The taller box starts one row higher (row 1) and the first body line
+        // sits after the border, title and one header row.
+        assert!(
+            frame.contains(&format!("{}\x1b[?25h", move_to(4, CURSOR_TEST_COL))),
+            "cursor row must skip the header rows: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn wide_header_characters_keep_the_box_border_aligned() {
+        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
+        let mut overlay = test_overlay();
+        overlay.header = vec!["\u{3042}\u{3042}\u{3042}".to_owned()];
+        compositor.set_overlay(Some(overlay));
+
+        let frame = render_string(&mut compositor);
+
+        // Six cells of text fit the box width derived from the footer, so the
+        // wide characters are written whole and the row ends at the border.
+        assert!(
+            frame.contains("| \u{3042}\u{3042}\u{3042}"),
+            "wide characters must be kept: {frame:?}"
+        );
+        assert_eq!(super::cell_width("\u{3042}\u{3042}"), 4);
+        let mut out = Vec::new();
+        assert_eq!(
+            super::write_clipped_text(&mut out, "\u{3042}\u{3042}", 3),
+            2
+        );
+        assert_eq!(out, "\u{3042}".as_bytes());
+    }
+
+    #[test]
+    fn set_overlay_header_updates_the_current_overlay_only() {
+        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
+        compositor.set_overlay_header(vec!["ignored".to_owned()]);
+        compositor.set_overlay(Some(test_overlay()));
+        compositor.set_overlay_header(vec!["host: local".to_owned()]);
+
+        let frame = render_string(&mut compositor);
+
+        assert!(frame.contains("host: local"), "{frame:?}");
+        assert!(!frame.contains("ignored"), "{frame:?}");
+    }
+
+    #[test]
+    fn short_terminal_drops_header_rows_before_body_and_footer() {
+        // Box needs 2 borders + title + 2 lines + footer = 6 rows of fixed
+        // content, so only one of the three header rows fits in 7 rows.
+        let mut compositor = Compositor::new(SHORT_TEST_COLS, 7);
+        let mut overlay = test_overlay();
+        overlay.header = vec!["first".to_owned(), "second".to_owned(), "third".to_owned()];
+        compositor.set_overlay(Some(overlay));
+
+        let frame = render_string(&mut compositor);
+
+        assert!(frame.contains("first"), "{frame:?}");
+        assert!(!frame.contains("second"), "{frame:?}");
+        assert!(
+            frame.contains("Kill") && frame.contains("Detach") && frame.contains("Esc closes"),
+            "body and footer must survive a short terminal: {frame:?}"
         );
     }
 }

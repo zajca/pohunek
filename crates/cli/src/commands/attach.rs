@@ -16,9 +16,9 @@ use pohunek_terminal::{step, Compositor, MenuEffect, MenuEvent, MenuKey, MenuOut
 use protocol::{
     event, method, ForkCwdMode, Request, SessionAttachParams, SessionAttachResult,
     SessionDetachParams, SessionDetachResult, SessionForkParams, SessionForkResult, SessionId,
-    SessionInfo, SessionNewParams, SessionNewResult, SessionRenameParams, SessionRenameResult,
-    SessionResizeParams, SessionState, TerminalDimensions, ENV_DAEMON_ID, ENV_SESSION_ID,
-    ENV_WORKER_ID,
+    SessionInfo, SessionNewParams, SessionNewResult, SessionRemoveResult, SessionRenameParams,
+    SessionRenameResult, SessionResizeParams, SessionState, TerminalDimensions, ENV_DAEMON_ID,
+    ENV_SESSION_ID, ENV_WORKER_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
@@ -40,6 +40,12 @@ const IO_BUFFER_BYTES: usize = 8192;
 /// single read. Twenty-five milliseconds still accommodates a split CSI-u
 /// report without making a standalone Escape key perceptibly sluggish.
 const SHORTCUT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(25);
+/// Longest wait for a stop or remove reply after the daemon closed the stream.
+///
+/// The daemon closes the attach stream while it executes the request, so the
+/// close can be read before the reply. The wait only bridges that ordering gap;
+/// when it elapses the close is handled as an ordinary stream loss.
+const MENU_TASK_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Selective terminal reset emitted whenever raw attach passthrough ends.
 ///
 /// Agent TUIs may enable these DEC modes through ordinary PTY output. Termios
@@ -77,11 +83,11 @@ const ATTACH_TERMINAL_MODE_CLEANUP: &[u8] = concat!(
 /// modal from growing memory without bound. Reaching the cap closes the modal
 /// and resumes raw passthrough without dropping bytes.
 const MAX_MODAL_BUFFER_BYTES: usize = 4 * 1024 * 1024;
-// Two rows are not enough for a banner plus a usable agent viewport.
-const MIN_ROWS_WITH_BANNER: u16 = 3;
-const BANNER_MENU_LABEL: &str = "[menu:Ctrl-\\]";
-// Two spaces keep dense banner fields readable in monospace terminals.
-const BANNER_FIELD_SEPARATOR: &str = "  ";
+// Five rows fit the borders, the title and the first two lines of a dialog, so
+// the action line of a confirmation stays visible.
+const MIN_ROWS_FOR_MENU: u16 = 5;
+// Two spaces keep dense header fields readable in monospace terminals.
+const HEADER_FIELD_SEPARATOR: &str = "  ";
 /// Starting diagnostic generation for menu RPCs.
 ///
 /// Result delivery is governed by the single in-flight task slot and current
@@ -91,6 +97,10 @@ const FIRST_MENU_GENERATION: u64 = 0;
 const MENU_GENERATION_STEP: u64 = 1;
 /// ASCII Escape starts keyboard CSI sequences and mouse reports.
 const MENU_ESC_BYTE: u8 = 0x1b;
+/// Opens a bracketed paste (`ESC [ 200 ~`).
+const MENU_PASTE_START: &[u8] = b"\x1b[200~";
+/// Closes a bracketed paste (`ESC [ 201 ~`).
+const MENU_PASTE_END: &[u8] = b"\x1b[201~";
 /// CSI sequences handled by the attach menu use `ESC [`.
 const MENU_CSI_OPEN: u8 = b'[';
 /// SGR mouse reports use `ESC [ < ...`.
@@ -279,6 +289,7 @@ struct AttachStatusSnapshot {
     id: String,
     name: String,
     project: String,
+    branch: Option<String>,
     agent: String,
     state: String,
     activity: String,
@@ -292,7 +303,6 @@ struct AttachStatusSnapshot {
 struct ModalState {
     compositor: Compositor,
     snapshot: AttachStatusSnapshot,
-    cols: u16,
     pending_output: Vec<u8>,
     active: bool,
 }
@@ -300,6 +310,8 @@ struct ModalState {
 #[derive(Debug)]
 struct MenuInputDecoder {
     pending: Vec<u8>,
+    /// Inside a bracketed paste, whose payload never counts as menu keys.
+    in_paste: bool,
 }
 
 #[derive(Debug)]
@@ -318,6 +330,7 @@ struct MenuTask {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MenuTaskAction {
     Kill,
+    Remove,
     NewSession,
     Fork,
     Rename,
@@ -327,6 +340,7 @@ impl MenuTaskAction {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Kill => "kill",
+            Self::Remove => "remove",
             Self::NewSession => "new_session",
             Self::Fork => "fork",
             Self::Rename => "rename",
@@ -357,7 +371,7 @@ struct AttachControlContext {
 }
 
 #[derive(Debug)]
-struct BannerUpdates {
+struct StatusUpdates {
     receiver: mpsc::UnboundedReceiver<AttachStatusSnapshot>,
     cancel: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
@@ -418,6 +432,7 @@ impl AttachStatusSnapshot {
             id: id.to_owned(),
             name: id.to_owned(),
             project: "-".to_owned(),
+            branch: None,
             agent: "<unknown>".to_owned(),
             state: "<unknown>".to_owned(),
             activity: "-".to_owned(),
@@ -443,8 +458,12 @@ impl AttachStatusSnapshot {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("-"),
         );
+        self.branch = value
+            .get("branch")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         if value.get("agent").is_some() || value.get("active_agent").is_some() {
-            let agent = banner_agent_label(value, &self.agent);
+            let agent = status_agent_label(value, &self.agent);
             replace_string(&mut self.agent, &agent);
         }
         if let Some(state) = value.get("state").and_then(serde_json::Value::as_str) {
@@ -482,7 +501,7 @@ fn replace_string(target: &mut String, value: &str) {
     target.push_str(value);
 }
 
-fn banner_agent_label(value: &serde_json::Value, current: &str) -> String {
+fn status_agent_label(value: &serde_json::Value, current: &str) -> String {
     let launch = value
         .get("agent")
         .and_then(serde_json::Value::as_str)
@@ -527,6 +546,15 @@ pub(crate) async fn run_attach(host: &str, paths: &Paths, target: &Target) -> Re
             origin_worker_id.clone(),
         )
         .await?;
+        if let AttachStreamEnd::SessionRemoved { worktrees_failed } = end {
+            if worktrees_failed > 0 {
+                eprintln!(
+                    "[pohunek] session {} removed, but {worktrees_failed} worktree checkout(s) \
+                     could not be deleted and need manual cleanup",
+                    target.session_id
+                );
+            }
+        }
         if end != AttachStreamEnd::StreamClosed {
             return Ok(());
         }
@@ -623,6 +651,10 @@ enum AttachStreamEnd {
     Detached,
     InputClosed,
     SessionStopped,
+    /// The session was removed; `worktrees_failed` checkouts stay on disk.
+    SessionRemoved {
+        worktrees_failed: u32,
+    },
     StreamClosed,
 }
 
@@ -640,13 +672,13 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (modal, status_updates) = if let Some((cols, rows)) =
-        terminal_size(libc::STDOUT_FILENO).filter(|&(_, rows)| rows >= MIN_ROWS_WITH_BANNER)
+        terminal_size(libc::STDOUT_FILENO).filter(|&(_, rows)| rows >= MIN_ROWS_FOR_MENU)
     {
-        let snapshot = load_initial_banner_snapshot(&mut client, host, &target.session_id).await;
+        let snapshot = load_initial_status_snapshot(&mut client, host, &target.session_id).await;
         // Best-effort live status updates keep the transient modal current. A
         // dropped subscription leaves the last snapshot available without
         // interrupting raw terminal passthrough.
-        let updates = spawn_banner_updates(
+        let updates = spawn_status_updates(
             host.to_owned(),
             paths.clone(),
             target.session_id.clone(),
@@ -655,7 +687,6 @@ where
         let state = ModalState {
             compositor: Compositor::new(cols, rows),
             snapshot,
-            cols,
             pending_output: Vec::new(),
             active: false,
         };
@@ -680,12 +711,12 @@ where
     .await
 }
 
-async fn load_initial_banner_snapshot(
+async fn load_initial_status_snapshot(
     client: &mut Client,
     host: &str,
     session_id: &str,
 ) -> AttachStatusSnapshot {
-    let mut snapshot = AttachStatusSnapshot::unknown(&banner_host_label(host), session_id);
+    let mut snapshot = AttachStatusSnapshot::unknown(&status_host_label(host), session_id);
     let Ok(request) =
         request_with_params(method::SESSION_INSPECT, &SessionId(session_id.to_owned()))
     else {
@@ -826,66 +857,33 @@ fn build_menu_fork_request(target: &Target, cols: u16, rows: u16) -> Result<Requ
     )
 }
 
-fn render_banner_text(cols: u16, snapshot: &AttachStatusSnapshot) -> String {
-    let max_cols = usize::from(cols);
-    let mut text = truncate_banner_text(BANNER_MENU_LABEL, cols);
-    let priority_segments = [
-        format!("agent={}", snapshot.agent),
-        format!("state={}", snapshot.state),
-        format!("activity={}", snapshot.activity),
-        format!("host={}", snapshot.host),
-        format!("id={}", snapshot.id),
-    ];
-    for segment in priority_segments {
-        push_banner_segment(&mut text, &segment, max_cols, true);
-    }
-
-    let optional_segments = [
-        format!("session={}", snapshot.name),
-        format!("project={}", snapshot.project),
-    ];
-    for segment in optional_segments {
-        push_banner_segment(&mut text, &segment, max_cols, false);
-    }
-    text
-}
-
-fn push_banner_segment(text: &mut String, segment: &str, max_cols: usize, required: bool) {
-    if max_cols == 0 {
-        return;
-    }
-
-    let current_cols = text.chars().count();
-    let separator_cols = if text.is_empty() {
-        0
+/// Builds the dialog header rows: session identity first, live state last.
+fn render_dialog_header(snapshot: &AttachStatusSnapshot) -> Vec<String> {
+    let session = if snapshot.name == snapshot.id {
+        snapshot.id.clone()
     } else {
-        BANNER_FIELD_SEPARATOR.chars().count()
+        format!("{} ({})", snapshot.name, snapshot.id)
     };
-    let segment_cols = segment.chars().count();
-    if current_cols + separator_cols + segment_cols <= max_cols {
-        if separator_cols > 0 {
-            text.push_str(BANNER_FIELD_SEPARATOR);
-        }
-        text.push_str(segment);
-        return;
+    let mut rows = vec![
+        format!("session: {session}"),
+        format!("host: {}", snapshot.host),
+        format!("project: {}", snapshot.project),
+    ];
+    if let Some(branch) = snapshot.branch.as_deref() {
+        rows.push(format!("branch: {branch}"));
     }
-
-    if !required || current_cols + separator_cols >= max_cols {
-        return;
-    }
-
-    if separator_cols > 0 {
-        text.push_str(BANNER_FIELD_SEPARATOR);
-    }
-    let remaining_cols = max_cols.saturating_sub(text.chars().count());
-    text.extend(segment.chars().take(remaining_cols));
+    rows.push(
+        [
+            format!("agent: {}", snapshot.agent),
+            format!("state: {}", snapshot.state),
+            format!("activity: {}", snapshot.activity),
+        ]
+        .join(HEADER_FIELD_SEPARATOR),
+    );
+    rows
 }
 
-fn truncate_banner_text(text: &str, cols: u16) -> String {
-    text.chars().take(usize::from(cols)).collect()
-}
-
-fn banner_host_label(host: &str) -> String {
+fn status_host_label(host: &str) -> String {
     if host.is_empty() {
         "local".to_owned()
     } else {
@@ -893,28 +891,28 @@ fn banner_host_label(host: &str) -> String {
     }
 }
 
-fn spawn_banner_updates(
+fn spawn_status_updates(
     host: String,
     paths: Paths,
     session_id: String,
     initial: AttachStatusSnapshot,
-) -> BannerUpdates {
+) -> StatusUpdates {
     let (tx, rx) = mpsc::unbounded_channel();
     let (cancel_tx, mut cancel_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         tokio::select! {
             _ = &mut cancel_rx => {}
-            () = run_banner_updates(host, paths, session_id, initial, tx) => {}
+            () = run_status_updates(host, paths, session_id, initial, tx) => {}
         }
     });
-    BannerUpdates {
+    StatusUpdates {
         receiver: rx,
         cancel: Some(cancel_tx),
         task,
     }
 }
 
-async fn run_banner_updates(
+async fn run_status_updates(
     host: String,
     paths: Paths,
     session_id: String,
@@ -959,7 +957,7 @@ async fn run_banner_updates(
     }
 }
 
-impl BannerUpdates {
+impl StatusUpdates {
     async fn shutdown(mut self) {
         if let Some(cancel) = self.cancel.take() {
             let _ = cancel.send(());
@@ -968,14 +966,14 @@ impl BannerUpdates {
     }
 }
 
-async fn shutdown_banner_updates(updates: &mut Option<BannerUpdates>) {
+async fn shutdown_status_updates(updates: &mut Option<StatusUpdates>) {
     if let Some(updates) = updates.take() {
         updates.shutdown().await;
     }
 }
 
 async fn prepare_attach_terminal(
-    updates: &mut Option<BannerUpdates>,
+    updates: &mut Option<StatusUpdates>,
 ) -> Result<
     (
         Option<RawTerminal>,
@@ -987,14 +985,14 @@ async fn prepare_attach_terminal(
     let terminal = match RawTerminal::enable(libc::STDIN_FILENO) {
         Ok(terminal) => terminal,
         Err(error) => {
-            shutdown_banner_updates(updates).await;
+            shutdown_status_updates(updates).await;
             return Err(error);
         }
     };
     let winch = match signal(SignalKind::window_change()) {
         Ok(winch) => winch,
         Err(error) => {
-            shutdown_banner_updates(updates).await;
+            shutdown_status_updates(updates).await;
             return Err(CliError::Io(error));
         }
     };
@@ -1005,7 +1003,7 @@ async fn prepare_attach_terminal(
     Ok((terminal, output, winch))
 }
 
-/// Renders the active modal and its status banner.
+/// Renders the active modal dialog with its session header.
 async fn paint_modal<W>(writer: &mut W, modal: &mut ModalState) -> Result<(), CliError>
 where
     W: AsyncWrite + Unpin,
@@ -1013,8 +1011,10 @@ where
     if !modal.active {
         return Ok(());
     }
-    let text = render_banner_text(modal.cols, &modal.snapshot);
-    let frame = modal.compositor.render(&text);
+    modal
+        .compositor
+        .set_overlay_header(render_dialog_header(&modal.snapshot));
+    let frame = modal.compositor.render();
     writer.write_all(&frame).await?;
     writer.flush().await?;
     Ok(())
@@ -1057,15 +1057,105 @@ where
     Ok(())
 }
 
-/// Awaits the next banner snapshot, or never resolves when updates are absent.
+/// Awaits the next status snapshot, or never resolves when updates are absent.
 ///
 /// Kept as a named future so the `select!` arm stays a single line and the loop
 /// body fits its line budget.
-async fn recv_banner_update(updates: &mut Option<BannerUpdates>) -> Option<AttachStatusSnapshot> {
+async fn recv_status_update(updates: &mut Option<StatusUpdates>) -> Option<AttachStatusSnapshot> {
     match updates.as_mut() {
         Some(updates) => updates.receiver.recv().await,
         None => None,
     }
+}
+
+/// Handles one socket read, settling a stream close against any pending
+/// termination request.
+async fn handle_socket_read<W>(
+    input: &[u8],
+    stdout: &mut W,
+    modal: &mut Option<ModalState>,
+    menu: &mut MenuRuntime,
+    (target, terminal): (&Target, &mut Option<RawTerminal>),
+) -> Result<Option<AttachStreamEnd>, CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(end) = handle_socket_output(input, stdout, modal, menu).await? else {
+        return Ok(None);
+    };
+    settle_stream_close(end, target, menu, modal, terminal, stdout)
+        .await
+        .map(Some)
+}
+
+/// Lets an in-flight stop or remove finish before a closed stream is treated
+/// as a loss to reconnect from.
+///
+/// A deliberate termination ends the attach for good; reconnecting to a removed
+/// session would only fail with `session_not_found`.
+async fn settle_stream_close<W>(
+    end: AttachStreamEnd,
+    target: &Target,
+    menu: &mut MenuRuntime,
+    modal: &mut Option<ModalState>,
+    terminal: &mut Option<RawTerminal>,
+    stdout: &mut W,
+) -> Result<AttachStreamEnd, CliError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let terminating = menu
+        .task
+        .as_ref()
+        .is_some_and(|task| matches!(task.action, MenuTaskAction::Kill | MenuTaskAction::Remove));
+    if end != AttachStreamEnd::StreamClosed || !terminating {
+        return Ok(end);
+    }
+    let action = menu.task.as_ref().map(|task| task.action);
+    let Ok(result) =
+        time::timeout(MENU_TASK_SETTLE_TIMEOUT, wait_for_menu_task(&mut menu.task)).await
+    else {
+        menu.task = None;
+        terminal.take();
+        let message = format!(
+            "no reply within {}s; check the session state with `pohunek session list`",
+            MENU_TASK_SETTLE_TIMEOUT.as_secs()
+        );
+        return Err(termination_failed(
+            action.unwrap_or(MenuTaskAction::Kill),
+            &message,
+        ));
+    };
+    if let Some(MenuTaskResult {
+        action,
+        outcome: Err(message),
+        ..
+    }) = &result
+    {
+        menu.task = None;
+        terminal.take();
+        return Err(termination_failed(*action, message));
+    }
+    let settled = handle_menu_task_result(
+        result,
+        target,
+        &mut menu.task,
+        &mut menu.state,
+        modal,
+        terminal,
+        stdout,
+    )
+    .await?;
+    Ok(settled.unwrap_or(end))
+}
+
+/// The daemon closed the stream for a stop or remove that then failed, so the
+/// attach cannot continue and the failure must reach the operator.
+fn termination_failed(action: MenuTaskAction, message: &str) -> CliError {
+    CliError::Io(std::io::Error::other(format!(
+        "session {} failed after the attach stream closed: {message}",
+        action.as_str()
+    )))
 }
 
 async fn wait_for_menu_task(task: &mut Option<MenuTask>) -> Option<MenuTaskResult> {
@@ -1123,7 +1213,27 @@ impl MenuInputDecoder {
     fn new() -> Self {
         Self {
             pending: Vec::new(),
+            in_paste: false,
         }
+    }
+
+    /// Skips pasted text so it can never act as menu keys. Returns whether the
+    /// whole remaining input was consumed (the paste is still open).
+    fn skip_paste(&mut self, bytes: &[u8], index: &mut usize) -> bool {
+        let rest = &bytes[*index..];
+        if let Some(end) = rest
+            .windows(MENU_PASTE_END.len())
+            .position(|window| window == MENU_PASTE_END)
+        {
+            *index += end + MENU_PASTE_END.len();
+            self.in_paste = false;
+            return false;
+        }
+        // Keep a possible split terminator for the next read.
+        let keep = rest.len().min(MENU_PASTE_END.len() - 1);
+        self.pending.extend_from_slice(&rest[rest.len() - keep..]);
+        *index = bytes.len();
+        true
     }
 
     fn push(&mut self, input: &[u8]) -> Vec<MenuEvent> {
@@ -1134,7 +1244,26 @@ impl MenuInputDecoder {
         let mut events = Vec::new();
         let mut index = 0;
         while index < bytes.len() {
-            let parsed = parse_menu_key(&bytes[index..]);
+            if self.in_paste {
+                if self.skip_paste(&bytes, &mut index) {
+                    break;
+                }
+                continue;
+            }
+            let rest = &bytes[index..];
+            if rest.starts_with(MENU_PASTE_START) {
+                self.in_paste = true;
+                index += MENU_PASTE_START.len();
+                continue;
+            }
+            if rest.len() > 2
+                && rest.len() < MENU_PASTE_START.len()
+                && MENU_PASTE_START.starts_with(rest)
+            {
+                self.pending.extend_from_slice(rest);
+                break;
+            }
+            let parsed = parse_menu_key(rest);
             if parsed.pending {
                 self.pending.extend_from_slice(&bytes[index..]);
                 break;
@@ -1240,8 +1369,14 @@ fn handle_menu_input_chunk_with_decoder(
         let before = state.clone();
         let (next, mut next_effects) = step(before.clone(), event);
         changed |= next != before;
+        let entered_confirmation = next != before && next.is_destructive_confirmation();
         *state = next;
         effects.append(&mut next_effects);
+        // A confirmation needs its own deliberate key press; bytes batched in
+        // the same read (a paste or key repeat) must not confirm it.
+        if entered_confirmation {
+            break;
+        }
     }
     MenuInputOutcome { effects, changed }
 }
@@ -1425,7 +1560,6 @@ where
         *state = MenuState::Closed;
     }
     if let Some(modal) = modal.as_mut() {
-        modal.cols = cols;
         modal.compositor.resize(cols, rows);
     }
     if let Ok(request) = build_resize_request(target, cols, rows) {
@@ -1494,6 +1628,7 @@ where
             }
             Shortcut::Menu => {
                 ctx.menu.generation = next_menu_generation(ctx.menu.generation);
+                ctx.menu.decoder = MenuInputDecoder::new();
                 if let Some(state) = ctx.menu.state.as_mut() {
                     *state = MenuState::open_root();
                     sync_menu_view(state, ctx.modal, ctx.stdout).await?;
@@ -1608,7 +1743,7 @@ async fn forward_attached_stream<S>(
     stream_id: String,
     control: AttachControlContext,
     mut modal: Option<ModalState>,
-    mut status_updates: Option<BannerUpdates>,
+    mut status_updates: Option<StatusUpdates>,
     initial_dimensions: Option<TerminalDimensions>,
 ) -> Result<AttachStreamEnd, CliError>
 where
@@ -1635,14 +1770,10 @@ where
         loop {
             tokio::select! {
                 read = socket_read.read(&mut socket_buf) => {
-                    let bytes_read = read?;
-                    if let Some(end) = handle_socket_output(
-                        &socket_buf[..bytes_read],
-                        &mut stdout,
-                        &mut modal,
-                        &mut menu,
-                    )
-                    .await?
+                    let input = &socket_buf[..read?];
+                    let args = (&control.target, &mut terminal);
+                    if let Some(end) =
+                        handle_socket_read(input, &mut stdout, &mut modal, &mut menu, args).await?
                     {
                         return Ok(end);
                     }
@@ -1681,7 +1812,7 @@ where
                         &mut stdout,
                     ).await?;
                 }
-                update = recv_banner_update(&mut status_updates), if status_updates.is_some() => {
+                update = recv_status_update(&mut status_updates), if status_updates.is_some() => {
                     if let Some(update) = update {
                         if handle_status_update(update, &mut modal) {
                             paint_modal(
@@ -1690,7 +1821,7 @@ where
                             ).await?;
                         }
                     } else {
-                        shutdown_banner_updates(&mut status_updates).await;
+                        shutdown_status_updates(&mut status_updates).await;
                     }
                 }
                 task = wait_for_menu_task(&mut menu.task), if menu.task.is_some() => {
@@ -1715,7 +1846,7 @@ where
     // write error.
     let _ = close_modal(&mut stdout, modal.as_mut()).await;
     let _ = terminal_output.restore(&mut stdout).await;
-    shutdown_banner_updates(&mut status_updates).await;
+    shutdown_status_updates(&mut status_updates).await;
     finish_attach_outcome(&mut client, &stream_id, outcome).await
 }
 
@@ -1872,6 +2003,16 @@ async fn handle_menu_effects(
                     ));
                 }
             }
+            MenuEffect::RunRemove => {
+                if ctx.menu_task.is_none() {
+                    *ctx.menu_task = Some(spawn_menu_task(
+                        ctx.generation,
+                        MenuTaskAction::Remove,
+                        ctx.control,
+                        MenuTaskArgs::Remove,
+                    ));
+                }
+            }
             MenuEffect::RunNewSession => {
                 if let (None, Some(modal)) = (ctx.menu_task.as_ref(), ctx.modal) {
                     let (rows, cols) = modal.compositor.grid_size();
@@ -1926,9 +2067,25 @@ where
         return Ok(None);
     };
     *menu_task = None;
-    if result.action == MenuTaskAction::Kill && result.outcome.is_ok() {
-        terminal.take();
-        return Ok(Some(AttachStreamEnd::SessionStopped));
+    if let Ok(outcome) = &result.outcome {
+        match (result.action, outcome) {
+            (MenuTaskAction::Kill, _) => {
+                terminal.take();
+                return Ok(Some(AttachStreamEnd::SessionStopped));
+            }
+            (
+                MenuTaskAction::Remove,
+                MenuOutcome::Removed {
+                    worktrees_failed, ..
+                },
+            ) => {
+                terminal.take();
+                return Ok(Some(AttachStreamEnd::SessionRemoved {
+                    worktrees_failed: *worktrees_failed,
+                }));
+            }
+            _ => {}
+        }
     }
 
     let Some(state) = menu_state.as_mut() else {
@@ -1936,8 +2093,17 @@ where
         return Ok(None);
     };
     if *state == MenuState::Closed {
-        log_abandoned_menu_task_result(target, &result);
-        return Ok(None);
+        // A failed stop or remove must stay visible even when its dialog was
+        // dismissed; a log line alone leaves the operator believing it worked.
+        if !(result.outcome.is_err()
+            && matches!(result.action, MenuTaskAction::Kill | MenuTaskAction::Remove))
+        {
+            log_abandoned_menu_task_result(target, &result);
+            return Ok(None);
+        }
+        *state = MenuState::Busy {
+            label: "Session termination".to_owned(),
+        };
     }
 
     let event = menu_event_from_task_outcome(result.outcome);
@@ -2001,6 +2167,19 @@ fn log_abandoned_menu_task_result(target: &Target, result: &MenuTaskResult) {
             );
         }
         Ok(MenuOutcome::Killed) => {}
+        Ok(MenuOutcome::Removed {
+            worktrees_removed,
+            worktrees_failed,
+        }) => {
+            tracing::info!(
+                session_id = %target.session_id,
+                action = result.action.as_str(),
+                generation = result.generation,
+                worktrees_removed,
+                worktrees_failed,
+                "abandoned attach menu task removed the session"
+            );
+        }
     }
 }
 
@@ -2066,6 +2245,15 @@ fn spawn_menu_task(
                     .map_err(|err| err.to_string())?;
                 Ok(MenuOutcome::Killed)
             }
+            MenuTaskArgs::Remove => {
+                let removed = send_remove(&mut client, &control.target)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                Ok(MenuOutcome::Removed {
+                    worktrees_removed: removed.worktrees_removed,
+                    worktrees_failed: removed.worktrees_failed,
+                })
+            }
             MenuTaskArgs::NewSession { cols, rows } => {
                 let created = send_menu_new_session(&mut client, &control.target, cols, rows)
                     .await
@@ -2102,6 +2290,7 @@ fn spawn_menu_task(
 #[derive(Debug)]
 enum MenuTaskArgs {
     Kill,
+    Remove,
     NewSession { cols: u16, rows: u16 },
     Fork { cols: u16, rows: u16 },
     Rename { name: String },
@@ -2111,6 +2300,24 @@ async fn send_stop(client: &mut Client, target: &Target) -> Result<(), CliError>
     let request = build_stop_request(target)?;
     let _ = client.request(&request).await?;
     Ok(())
+}
+
+/// Evicts the session through the refusing `session.remove`; consent to
+/// unconfirmed cleanup is never implied by a menu keypress.
+async fn send_remove(
+    client: &mut Client,
+    target: &Target,
+) -> Result<SessionRemoveResult, CliError> {
+    let request = build_remove_request(target)?;
+    let value = client.request(&request).await?;
+    Ok(serde_json::from_value(value)?)
+}
+
+fn build_remove_request(target: &Target) -> Result<Request, CliError> {
+    request_with_params(
+        method::SESSION_REMOVE,
+        &SessionId(target.session_id.clone()),
+    )
 }
 
 fn build_stop_request(target: &Target) -> Result<Request, CliError> {
@@ -2277,15 +2484,15 @@ mod tests {
     use super::*;
 
     #[derive(Debug)]
-    struct BannerConnectionControl {
+    struct StatusConnectionControl {
         release_event: oneshot::Sender<()>,
         closed: oneshot::Receiver<()>,
     }
 
     #[derive(Debug)]
-    struct BannerTestDaemon {
+    struct StatusTestDaemon {
         paths: Paths,
-        controls: mpsc::UnboundedReceiver<BannerConnectionControl>,
+        controls: mpsc::UnboundedReceiver<StatusConnectionControl>,
         active: Arc<AtomicUsize>,
         task: JoinHandle<()>,
         _env: TestEnv,
@@ -2350,7 +2557,7 @@ mod tests {
     async fn connect_stdin_test_client() -> (Client, UnixStream, Paths, StdinTestSocket) {
         let (env, path) = test_socket();
         let listener = UnixListener::bind(&path).expect("bind stdin test daemon");
-        let paths = banner_test_paths(path);
+        let paths = status_test_paths(path);
         let client = Client::connect("local", &paths)
             .await
             .expect("connect stdin test client");
@@ -2465,13 +2672,13 @@ mod tests {
         let (client, server, paths, _socket) = connect_stdin_test_client().await;
         let server_task = tokio::spawn(async move {
             let mut server = BufReader::new(server);
-            let request = read_banner_test_request(&mut server).await;
+            let request = read_status_test_request(&mut server).await;
             assert_request(
                 &request,
                 method::SESSION_DETACH,
                 json!({"stream_id": "stream-test"}),
             );
-            write_banner_test_response(
+            write_status_test_response(
                 &mut server,
                 &request,
                 json!({"detached": true, "error": null}),
@@ -2556,7 +2763,7 @@ mod tests {
         assert_eq!(enter_effects, vec![MenuEffect::RunRename("a".to_owned())]);
     }
 
-    fn banner_test_paths(socket: PathBuf) -> Paths {
+    fn status_test_paths(socket: PathBuf) -> Paths {
         let root = socket
             .parent()
             .expect("test socket has a parent")
@@ -2573,30 +2780,30 @@ mod tests {
         }
     }
 
-    fn spawn_banner_test_daemon(connection_count: usize) -> BannerTestDaemon {
+    fn spawn_status_test_daemon(connection_count: usize) -> StatusTestDaemon {
         let (env, socket) = test_socket();
-        let listener = UnixListener::bind(&socket).expect("bind banner test daemon");
+        let listener = UnixListener::bind(&socket).expect("bind status test daemon");
         let (controls_tx, controls) = mpsc::unbounded_channel();
         let active = Arc::new(AtomicUsize::new(0));
         let task_active = Arc::clone(&active);
         let task = tokio::spawn(async move {
             let mut connections = Vec::with_capacity(connection_count);
             for _ in 0..connection_count {
-                let (stream, _) = listener.accept().await.expect("accept banner client");
+                let (stream, _) = listener.accept().await.expect("accept status client");
                 let tx = controls_tx.clone();
                 let active = Arc::clone(&task_active);
                 connections.push(tokio::spawn(async move {
-                    handle_banner_test_connection(stream, tx, active).await;
+                    handle_status_test_connection(stream, tx, active).await;
                 }));
             }
             drop(controls_tx);
             for connection in connections {
-                connection.await.expect("banner connection task");
+                connection.await.expect("status connection task");
             }
         });
 
-        BannerTestDaemon {
-            paths: banner_test_paths(socket.clone()),
+        StatusTestDaemon {
+            paths: status_test_paths(socket.clone()),
             controls,
             active,
             task,
@@ -2609,19 +2816,19 @@ mod tests {
     fn test_socket() -> (TestEnv, PathBuf) {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let path = env
-            .socket_path("banner.sock")
+            .socket_path("status.sock")
             .expect("socket path fits the sun_path limit");
         (env, path)
     }
 
-    async fn handle_banner_test_connection(
+    async fn handle_status_test_connection(
         stream: UnixStream,
-        controls: mpsc::UnboundedSender<BannerConnectionControl>,
+        controls: mpsc::UnboundedSender<StatusConnectionControl>,
         active: Arc<AtomicUsize>,
     ) {
         let mut stream = BufReader::new(stream);
-        let inspect = read_banner_test_request(&mut stream).await;
-        write_banner_test_response(
+        let inspect = read_status_test_request(&mut stream).await;
+        write_status_test_response(
             &mut stream,
             &inspect,
             json!({
@@ -2633,18 +2840,18 @@ mod tests {
             }),
         )
         .await;
-        let subscribe = read_banner_test_request(&mut stream).await;
-        write_banner_test_response(&mut stream, &subscribe, json!({"subscribed": true})).await;
+        let subscribe = read_status_test_request(&mut stream).await;
+        write_status_test_response(&mut stream, &subscribe, json!({"subscribed": true})).await;
 
         let (release_event, release_rx) = oneshot::channel();
         let (closed_tx, closed) = oneshot::channel();
         active.fetch_add(1, Ordering::SeqCst);
         controls
-            .send(BannerConnectionControl {
+            .send(StatusConnectionControl {
                 release_event,
                 closed,
             })
-            .expect("send banner connection control");
+            .expect("send status connection control");
 
         let mut eof = String::new();
         tokio::select! {
@@ -2655,7 +2862,7 @@ mod tests {
                     "session_id": "s-42",
                     "activity": "working"
                 }))
-                .expect("serialize banner event");
+                .expect("serialize status event");
                 let _ = stream.get_mut().write_all(event.as_bytes()).await;
                 let _ = stream.get_mut().write_all(b"\n").await;
                 let _ = stream.get_mut().flush().await;
@@ -2667,16 +2874,16 @@ mod tests {
         let _ = closed_tx.send(());
     }
 
-    async fn read_banner_test_request(stream: &mut BufReader<UnixStream>) -> Request {
+    async fn read_status_test_request(stream: &mut BufReader<UnixStream>) -> Request {
         let mut line = String::new();
         stream
             .read_line(&mut line)
             .await
-            .expect("read banner request");
-        serde_json::from_str(&line).expect("decode banner request")
+            .expect("read status request");
+        serde_json::from_str(&line).expect("decode status request")
     }
 
-    async fn write_banner_test_response(
+    async fn write_status_test_response(
         stream: &mut BufReader<UnixStream>,
         request: &Request,
         value: serde_json::Value,
@@ -2687,24 +2894,24 @@ mod tests {
                 request.id().to_owned(),
                 value,
             )
-            .expect("valid banner response"),
+            .expect("valid status response"),
         )
-        .expect("serialize banner response");
+        .expect("serialize status response");
         stream
             .get_mut()
             .write_all(line.as_bytes())
             .await
-            .expect("write banner response");
+            .expect("write status response");
         stream
             .get_mut()
             .write_all(b"\n")
             .await
-            .expect("write banner response newline");
+            .expect("write status response newline");
         stream
             .get_mut()
             .flush()
             .await
-            .expect("flush banner response");
+            .expect("flush status response");
     }
 
     #[expect(
@@ -3072,12 +3279,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn banner_shutdown_returns_subscription_connections_to_baseline() {
+    async fn status_shutdown_returns_subscription_connections_to_baseline() {
         const ATTEMPTS: usize = 3;
-        let mut daemon = spawn_banner_test_daemon(ATTEMPTS);
+        let mut daemon = spawn_status_test_daemon(ATTEMPTS);
 
         for _ in 0..ATTEMPTS {
-            let updates = spawn_banner_updates(
+            let updates = spawn_status_updates(
                 "local".to_owned(),
                 daemon.paths.clone(),
                 "s-42".to_owned(),
@@ -3085,28 +3292,28 @@ mod tests {
             );
             let control = time::timeout(Duration::from_secs(2), daemon.controls.recv())
                 .await
-                .expect("banner subscription established promptly")
-                .expect("banner daemon control remains open");
+                .expect("status subscription established promptly")
+                .expect("status daemon control remains open");
             assert_eq!(daemon.active.load(Ordering::SeqCst), 1);
 
             updates.shutdown().await;
             time::timeout(Duration::from_secs(2), control.closed)
                 .await
-                .expect("banner connection closes after shutdown")
-                .expect("banner connection reports close");
+                .expect("status connection closes after shutdown")
+                .expect("status connection reports close");
             assert_eq!(daemon.active.load(Ordering::SeqCst), 0);
         }
 
         time::timeout(Duration::from_secs(2), &mut daemon.task)
             .await
-            .expect("banner daemon exits after all attempts")
-            .expect("banner daemon task succeeds");
+            .expect("status daemon exits after all attempts")
+            .expect("status daemon task succeeds");
     }
 
     #[tokio::test]
-    async fn dropping_banner_receiver_terminates_subscription_task() {
-        let mut daemon = spawn_banner_test_daemon(1);
-        let updates = spawn_banner_updates(
+    async fn dropping_status_receiver_terminates_subscription_task() {
+        let mut daemon = spawn_status_test_daemon(1);
+        let updates = spawn_status_updates(
             "local".to_owned(),
             daemon.paths.clone(),
             "s-42".to_owned(),
@@ -3114,9 +3321,9 @@ mod tests {
         );
         let control = time::timeout(Duration::from_secs(2), daemon.controls.recv())
             .await
-            .expect("banner subscription established promptly")
-            .expect("banner daemon control remains open");
-        let BannerUpdates {
+            .expect("status subscription established promptly")
+            .expect("status daemon control remains open");
+        let StatusUpdates {
             receiver,
             cancel,
             task,
@@ -3125,26 +3332,26 @@ mod tests {
         control
             .release_event
             .send(())
-            .expect("release banner event");
+            .expect("release status event");
 
         time::timeout(Duration::from_secs(2), task)
             .await
-            .expect("dropped receiver terminates banner task")
-            .expect("banner task exits normally");
+            .expect("dropped receiver terminates status task")
+            .expect("status task exits normally");
         drop(cancel);
         time::timeout(Duration::from_secs(2), control.closed)
             .await
-            .expect("banner connection closes after receiver drop")
-            .expect("banner connection reports close");
+            .expect("status connection closes after receiver drop")
+            .expect("status connection reports close");
         assert_eq!(daemon.active.load(Ordering::SeqCst), 0);
         time::timeout(Duration::from_secs(2), &mut daemon.task)
             .await
-            .expect("banner daemon exits")
-            .expect("banner daemon task succeeds");
+            .expect("status daemon exits")
+            .expect("status daemon task succeeds");
     }
 
     #[test]
-    fn attach_banner_text_prioritizes_live_state_and_menu_shortcut() {
+    fn attach_dialog_header_lists_session_identity_then_live_state() {
         let mut snapshot = AttachStatusSnapshot::unknown("local", "s-42");
         snapshot.update_from_session_value(&json!({
             "id": "s-42",
@@ -3153,39 +3360,38 @@ mod tests {
             "state": "running",
             "activity": "blocked",
             "project_id": "p-abc123",
-            "project_label": "ui"
+            "project_label": "ui",
+            "branch": "feature/menu"
         }));
 
-        let text = render_banner_text(120, &snapshot);
-
         assert_eq!(
-            text,
-            "[menu:Ctrl-\\]  agent=claude  state=running  activity=blocked  host=local  id=s-42  session=review branch  project=ui",
-            "banner text must start with the menu action and prioritize live state: {text:?}"
+            render_dialog_header(&snapshot),
+            vec![
+                "session: review branch (s-42)",
+                "host: local",
+                "project: ui",
+                "branch: feature/menu",
+                "agent: claude  state: running  activity: blocked",
+            ]
         );
     }
 
     #[test]
-    fn attach_banner_narrow_width_keeps_live_state_visible() {
+    fn attach_dialog_header_omits_branch_for_sessions_without_one() {
         let mut snapshot = AttachStatusSnapshot::unknown("local", "s-37");
         snapshot.update_from_session_value(&json!({
             "id": "s-37",
-            "name": "debug s31",
             "agent": "codex",
             "state": "running",
-            "activity": "blocked",
+            "activity": "idle",
             "project_id": "p-8d0114ca"
         }));
-        let text = render_banner_text(80, &snapshot);
 
-        assert!(
-            text.contains("agent=codex  state=running  activity=blocked"),
-            "narrow banner must preserve the live state before lower-priority labels: {text:?}"
-        );
-        assert!(
-            text.chars().count() <= 80,
-            "banner text must fit the declared terminal width: {text:?}"
-        );
+        let header = render_dialog_header(&snapshot);
+
+        assert!(header.iter().all(|row| !row.starts_with("branch:")));
+        assert_eq!(header[0], "session: s-37");
+        assert_eq!(header[2], "project: p-8d0114ca");
     }
 
     #[test]
@@ -3229,6 +3435,241 @@ mod tests {
             action,
             handle: tokio::spawn(async { Ok(MenuOutcome::Killed) }),
         }
+    }
+
+    #[test]
+    fn attach_menu_open_state_routes_remove_hotkey_through_confirmation() {
+        let mut state = MenuState::open_root();
+
+        let effects = handle_menu_input_chunk(&mut state, b"t");
+        assert_eq!(state, MenuState::ConfirmRemove);
+        assert!(effects.is_empty());
+
+        let effects = handle_menu_input_chunk(&mut state, b"y");
+        assert_eq!(effects, vec![MenuEffect::RunRemove]);
+    }
+
+    #[test]
+    fn batched_input_cannot_confirm_a_destructive_action() {
+        for (keys, confirm) in [
+            (b"ty".as_slice(), MenuState::ConfirmRemove),
+            (b"ky", MenuState::ConfirmKill),
+        ] {
+            let mut state = MenuState::open_root();
+
+            let effects = handle_menu_input_chunk(&mut state, keys);
+
+            assert_eq!(state, confirm);
+            assert!(effects.is_empty(), "{keys:?}");
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_never_reaches_the_menu() {
+        let mut state = MenuState::open_root();
+        let mut decoder = MenuInputDecoder::new();
+
+        let outcome =
+            handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, b"\x1b[200~ty\x1b[201~");
+
+        assert_eq!(state, MenuState::open_root());
+        assert!(outcome.effects.is_empty());
+        assert!(!decoder.in_paste);
+    }
+
+    #[test]
+    fn bracketed_paste_split_across_reads_never_reaches_the_menu() {
+        let input = b"\x1b[200~ty\x1b[201~";
+        // A lone leading Escape byte is the Escape key by design, so splits
+        // start after the two-byte CSI introducer.
+        for split in 2..input.len() {
+            let mut state = MenuState::open_root();
+            let mut decoder = MenuInputDecoder::new();
+
+            let mut effects = Vec::new();
+            for chunk in [&input[..split], &input[split..]] {
+                effects.extend(
+                    handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, chunk).effects,
+                );
+            }
+
+            assert_eq!(state, MenuState::open_root(), "split={split}");
+            assert!(effects.is_empty(), "split={split}");
+            assert!(!decoder.in_paste, "split={split}");
+        }
+    }
+
+    #[test]
+    fn menu_keys_work_again_after_a_paste() {
+        let mut state = MenuState::open_root();
+        let mut decoder = MenuInputDecoder::new();
+
+        handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, b"\x1b[200~x\x1b[201~");
+        handle_menu_input_chunk_with_decoder(&mut state, &mut decoder, b"t");
+
+        assert_eq!(state, MenuState::ConfirmRemove);
+    }
+
+    #[test]
+    fn remove_request_uses_the_refusing_remove_method() {
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let request = build_remove_request(&target).expect("request");
+
+        assert_eq!(request.method(), method::SESSION_REMOVE);
+    }
+
+    fn removed_outcome() -> MenuOutcome {
+        MenuOutcome::Removed {
+            worktrees_removed: 1,
+            worktrees_failed: 2,
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_remove_ends_the_attach_as_removed() {
+        let mut menu_task = Some(placeholder_menu_task(
+            FIRST_MENU_GENERATION,
+            MenuTaskAction::Remove,
+        ));
+        let mut menu_state = Some(MenuState::open_root());
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let end = handle_menu_task_result(
+            Some(MenuTaskResult {
+                generation: FIRST_MENU_GENERATION,
+                action: MenuTaskAction::Remove,
+                outcome: Ok(removed_outcome()),
+            }),
+            &target,
+            &mut menu_task,
+            &mut menu_state,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("handle task result");
+
+        assert_eq!(
+            end,
+            Some(AttachStreamEnd::SessionRemoved {
+                worktrees_failed: 2
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remove_is_shown_in_the_dialog_and_keeps_the_attach() {
+        let mut menu_task = Some(placeholder_menu_task(
+            FIRST_MENU_GENERATION,
+            MenuTaskAction::Remove,
+        ));
+        let mut menu_state = Some(MenuState::Busy {
+            label: "Terminating and deleting session".to_owned(),
+        });
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let end = handle_menu_task_result(
+            Some(MenuTaskResult {
+                generation: FIRST_MENU_GENERATION,
+                action: MenuTaskAction::Remove,
+                outcome: Err("unconfirmed cleanup".to_owned()),
+            }),
+            &target,
+            &mut menu_task,
+            &mut menu_state,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("handle task result");
+
+        assert_eq!(end, None);
+        assert_eq!(
+            menu_state,
+            Some(MenuState::Result {
+                message: "Error: unconfirmed cleanup".to_owned()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_close_during_remove_settles_to_removed_instead_of_reconnecting() {
+        let mut menu = MenuRuntime::new(true);
+        menu.task = Some(MenuTask {
+            generation: FIRST_MENU_GENERATION,
+            action: MenuTaskAction::Remove,
+            handle: tokio::spawn(async { Ok(removed_outcome()) }),
+        });
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let end = settle_stream_close(
+            AttachStreamEnd::StreamClosed,
+            &target,
+            &mut menu,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("settle");
+
+        assert_eq!(
+            end,
+            AttachStreamEnd::SessionRemoved {
+                worktrees_failed: 2
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_close_during_a_failed_remove_reports_the_failure() {
+        let mut menu = MenuRuntime::new(true);
+        menu.task = Some(MenuTask {
+            generation: FIRST_MENU_GENERATION,
+            action: MenuTaskAction::Remove,
+            handle: tokio::spawn(async { Err("cleanup unconfirmed".to_owned()) }),
+        });
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let err = settle_stream_close(
+            AttachStreamEnd::StreamClosed,
+            &target,
+            &mut menu,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("a failed termination must not look like an ordinary close");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("remove failed") && text.contains("cleanup unconfirmed"),
+            "{text}"
+        );
+        assert!(menu.task.is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_close_without_a_terminating_task_stays_a_stream_loss() {
+        let mut menu = MenuRuntime::new(true);
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let end = settle_stream_close(
+            AttachStreamEnd::StreamClosed,
+            &target,
+            &mut menu,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("settle");
+
+        assert_eq!(end, AttachStreamEnd::StreamClosed);
     }
 
     #[tokio::test]
@@ -3280,7 +3721,7 @@ mod tests {
     #[tokio::test]
     async fn closed_menu_task_failure_keeps_modal_closed_and_clears_task() {
         let generation = FIRST_MENU_GENERATION;
-        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Kill));
+        let mut menu_task = Some(placeholder_menu_task(generation, MenuTaskAction::Fork));
         let mut menu_state = Some(MenuState::Closed);
         let mut modal = None;
         let mut terminal = None;
@@ -3290,8 +3731,8 @@ mod tests {
         let end = handle_menu_task_result(
             Some(MenuTaskResult {
                 generation,
-                action: MenuTaskAction::Kill,
-                outcome: Err("stop failed".to_owned()),
+                action: MenuTaskAction::Fork,
+                outcome: Err("fork failed".to_owned()),
             }),
             &target,
             &mut menu_task,
@@ -3309,6 +3750,69 @@ mod tests {
             menu_task.is_none(),
             "failed abandoned task must clear the slot"
         );
+    }
+
+    #[tokio::test]
+    async fn dismissed_termination_failure_is_shown_again_in_the_dialog() {
+        for action in [MenuTaskAction::Kill, MenuTaskAction::Remove] {
+            let mut menu_task = Some(placeholder_menu_task(FIRST_MENU_GENERATION, action));
+            let mut menu_state = Some(MenuState::Closed);
+            let target: Target = "host-a/s-42".parse().expect("target");
+
+            let end = handle_menu_task_result(
+                Some(MenuTaskResult {
+                    generation: FIRST_MENU_GENERATION,
+                    action,
+                    outcome: Err("refused".to_owned()),
+                }),
+                &target,
+                &mut menu_task,
+                &mut menu_state,
+                &mut None,
+                &mut None,
+                &mut Vec::new(),
+            )
+            .await
+            .expect("handle task result");
+
+            assert_eq!(end, None);
+            assert_eq!(
+                menu_state,
+                Some(MenuState::Result {
+                    message: "Error: refused".to_owned()
+                }),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_close_with_an_unanswered_remove_reports_the_unknown_outcome() {
+        let mut menu = MenuRuntime::new(true);
+        menu.task = Some(MenuTask {
+            generation: FIRST_MENU_GENERATION,
+            action: MenuTaskAction::Remove,
+            handle: tokio::spawn(std::future::pending()),
+        });
+        let target: Target = "host-a/s-42".parse().expect("target");
+
+        let err = settle_stream_close(
+            AttachStreamEnd::StreamClosed,
+            &target,
+            &mut menu,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("an unanswered remove must not look like an ordinary close");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("remove failed") && text.contains("no reply"),
+            "{text}"
+        );
+        assert!(menu.task.is_none());
     }
 
     #[tokio::test]
@@ -3424,7 +3928,6 @@ mod tests {
         let mut modal = Some(ModalState {
             compositor: Compositor::new(80, 24),
             snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
-            cols: 80,
             pending_output: Vec::new(),
             active: false,
         });
@@ -3507,7 +4010,6 @@ mod tests {
         let mut modal = ModalState {
             compositor: Compositor::new(80, 24),
             snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
-            cols: 80,
             pending_output: b"\x1b[?1003h\x1b[?1049hbuffered".to_vec(),
             active: true,
         };
@@ -3542,7 +4044,6 @@ mod tests {
         let mut modal = Some(ModalState {
             compositor: Compositor::new(80, 24),
             snapshot: AttachStatusSnapshot::unknown("local", "s-42"),
-            cols: 80,
             pending_output: Vec::new(),
             active: false,
         });
@@ -3573,7 +4074,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_snapshot_updates_from_inspect_and_event_payloads() {
+    fn attach_status_snapshot_updates_from_inspect_and_event_payloads() {
         let mut snapshot = AttachStatusSnapshot::unknown("local", "s-42");
 
         snapshot.update_from_session_value(&json!({
@@ -3587,9 +4088,8 @@ mod tests {
             "project_label": "ui"
         }));
         assert!(
-            render_banner_text(140, &snapshot)
-                .contains("host=local  id=s-42  session=review branch  project=ui"),
-            "banner text should include project and session name"
+            render_dialog_header(&snapshot).contains(&"project: ui".to_owned()),
+            "header should include the project label"
         );
         assert_eq!(snapshot.agent, "claude->codex");
         assert_eq!(snapshot.state, "running");
@@ -3624,7 +4124,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_banner_snapshot_falls_back_to_ids_for_missing_display_labels() {
+    fn attach_status_snapshot_falls_back_to_ids_for_missing_display_labels() {
         let mut snapshot = AttachStatusSnapshot::unknown("local", "s-42");
 
         snapshot.update_from_session_value(&json!({
@@ -3635,10 +4135,11 @@ mod tests {
             "project_id": "p-abc123"
         }));
 
-        let text = render_banner_text(120, &snapshot);
-        assert!(
-            text.contains("host=local  id=s-42  session=s-42  project=p-abc123"),
-            "banner text should fall back to ids when display labels are absent: {text:?}"
+        let header = render_dialog_header(&snapshot);
+        assert_eq!(
+            &header[..3],
+            ["session: s-42", "host: local", "project: p-abc123"],
+            "header should fall back to ids when display labels are absent"
         );
     }
 }

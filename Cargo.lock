@@ -3118,6 +3118,7 @@ name = "pohunek-terminal"
 version = "0.33.0"
 dependencies = [
  "serde",
+ "unicode-width",
  "vt100",
 ]
 

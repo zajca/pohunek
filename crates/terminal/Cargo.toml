@@ -8,6 +8,7 @@ description = "pohunek terminal screen model: vt100-backed grid scraping and an 
 
 [dependencies]
 serde = { workspace = true }
+unicode-width = { workspace = true }
 vt100 = { workspace = true }
 
 [lints]
