@@ -2864,6 +2864,7 @@ dependencies = [
  "pohunek-worker-protocol",
  "regex",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

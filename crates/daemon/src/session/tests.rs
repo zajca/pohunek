@@ -170,11 +170,11 @@ macro_rules! native_report {
 /// A fixed `/bin/sh` keeps the sessions independent of the host user's
 /// `$SHELL` and its startup files, whose background helpers can hold the PTY
 /// open past the stop deadline.
-fn hermetic_shell() -> ShellCommand {
+pub(super) fn hermetic_shell() -> ShellCommand {
     ShellCommand::new("/bin/sh", std::iter::empty::<String>())
 }
 
-fn params() -> SessionNewParams {
+pub(super) fn params() -> SessionNewParams {
     SessionNewParams {
         name: None,
         agent: "shell".to_owned(),
@@ -1404,7 +1404,7 @@ async fn the_shell_command_text_never_breaks_the_registry_or_the_snapshot_progra
 
 /// Returns the metadata store path inside a fresh private directory that is
 /// removed when the calling test thread ends.
-fn temp_store_path(tag: &str) -> PathBuf {
+pub(super) fn temp_store_path(tag: &str) -> PathBuf {
     crate::test_support::thread_scoped_dir(&format!("pohunek-session-{tag}-"))
         .join("metadata.jsonl")
 }
@@ -1435,7 +1435,7 @@ fn test_native_launch(kind: SessionRefKind, fork: bool) -> NativeSessionLaunch {
     .expect("valid test templates")
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
+pub(super) fn temp_dir(tag: &str) -> PathBuf {
     let dir = temp_store_path(tag)
         .parent()
         .expect("store parent")
@@ -16843,7 +16843,10 @@ async fn recoveries_of_different_sessions_are_not_serialized() {
 /// every start. A start with `--session-id` stays alive until the returned gate
 /// is written; every other start (resume, fork) stays alive for the whole test.
 #[cfg(unix)]
-fn assigned_agent_script(dir: &std::path::Path, marker: &std::path::Path) -> (PathBuf, fs::File) {
+pub(super) fn assigned_agent_script(
+    dir: &std::path::Path,
+    marker: &std::path::Path,
+) -> (PathBuf, fs::File) {
     let script = dir.join("pi-like");
     let gate_path = dir.join("exit.gate");
     let gate = hook_gate(&gate_path);
@@ -17028,7 +17031,10 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
 
 /// The durable recovery binding of `id`, as a restarted daemon reads it.
 #[cfg(unix)]
-fn durable_recovery(store_path: &std::path::Path, id: &SessionId) -> crate::store::ResumeBinding {
+pub(super) fn durable_recovery(
+    store_path: &std::path::Path,
+    id: &SessionId,
+) -> crate::store::ResumeBinding {
     crate::store::Store::new(store_path.to_path_buf())
         .load_sessions()
         .expect("durable sessions")

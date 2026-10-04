@@ -17,6 +17,7 @@ use protocol::{BindingProvenance, LaunchBinding, ProtocolError, RuntimeId, Runti
 use tracing::warn;
 
 use super::builtin::BuiltinSource;
+use super::claim::ServedBy;
 use super::definition::{DefinitionError, LaunchProgram, RuntimeDefinition};
 use super::launch::{check_pin, LaunchPin};
 use super::package::{PackageSource, PackageStore, RejectedPackage};
@@ -240,6 +241,17 @@ impl RuntimeHost {
         self.registry()
             .resolve(reference.launchable()?)
             .map(Arc::clone)
+    }
+
+    /// Who serves `runtime_id` in the current registry, if anyone.
+    #[must_use]
+    pub fn served_by(&self, runtime_id: &RuntimeId) -> Option<ServedBy> {
+        let registry = self.registry();
+        let definition = registry.resolve(runtime_id).ok()?;
+        Some(match &definition.binding().provenance {
+            BindingProvenance::Package { package, .. } => ServedBy::Package(package.id.clone()),
+            BindingProvenance::Builtin { .. } => ServedBy::Builtin,
+        })
     }
 
     /// What the package layer reported when the current registry was built.

@@ -22,14 +22,14 @@ use std::sync::Arc;
 
 use package::registry::{IncompatibleReason, RegistryError, RetainedDigests, RetainedState};
 use package::verify::{VerifiedRoot, VerifyError};
-use package::{Limits, PackageDigest};
+use package::{ArchiveEntry, Limits, PackageDigest};
 use protocol::{BindingProvenance, PackageIdentity, ProtocolError, RuntimeId};
 use thiserror::Error;
 
+use super::claim::is_reserved;
 use super::definition::{
-    DefinitionError, DefinitionOrigin, RuntimeDefinition, MAX_DEFINITION_BYTES,
+    DefinitionError, DefinitionInvariant, DefinitionOrigin, RuntimeDefinition, MAX_DEFINITION_BYTES,
 };
-use super::registry::RESERVED_RUNTIME_IDS;
 use crate::detect::Manifest;
 
 /// Package-relative path of the runtime descriptor inside every runtime
@@ -73,6 +73,22 @@ pub enum PackageRejection {
 }
 
 impl PackageRejection {
+    /// Whether the descriptor claims the shell runtime id.
+    ///
+    /// The shell is a built-in that launches the host login shell, so a
+    /// package descriptor that names it fails the shell invariants before any
+    /// id check runs.
+    #[must_use]
+    pub fn claims_shell(&self) -> bool {
+        matches!(
+            self,
+            Self::Descriptor(DefinitionError::Invariant(
+                DefinitionInvariant::ShellRequiresHostShell
+                    | DefinitionInvariant::ShellIsPackageless
+            ))
+        )
+    }
+
     /// The stable protocol error a refused runtime answers with.
     ///
     /// A digest the registry does not know is the same condition as an
@@ -241,41 +257,124 @@ impl PackageStore {
         }
     }
 
-    /// Verifies the root of `digest` and builds its definition.
-    fn load_definition(
+    /// Verifies the root of `digest` and builds its definition, whatever
+    /// runtime id it claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PackageRejection`] when the package is not installed, its
+    /// root fails verification, the descriptor is missing or invalid, or it
+    /// names another package identity than `identity`.
+    pub fn read_definition(
         &self,
         digest: &PackageDigest,
         identity: &PackageIdentity,
     ) -> Result<RuntimeDefinition, PackageRejection> {
         let root = self.ready_root(digest)?;
-        let definition = definition_from_root(&root, digest)?;
+        let definition = definition_from_files(&RootFiles(&root), digest)?;
         match &definition.binding().provenance {
-            BindingProvenance::Package { package, .. } if package == identity => {}
-            _ => return Err(PackageRejection::IdentityMismatch),
+            BindingProvenance::Package { package, .. } if package == identity => Ok(definition),
+            _ => Err(PackageRejection::IdentityMismatch),
         }
-        if RESERVED_RUNTIME_IDS.contains(&definition.runtime_id().as_str()) {
+    }
+
+    /// [`Self::read_definition`] for a package a fresh launch may use: a
+    /// reserved runtime id is refused outright.
+    fn load_definition(
+        &self,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Result<RuntimeDefinition, PackageRejection> {
+        let definition = self.read_definition(digest, identity)?;
+        if is_reserved(definition.runtime_id()) {
             return Err(PackageRejection::ReservedRuntimeId);
         }
         Ok(definition)
     }
 }
 
-/// Parses the descriptor of a verified root.
-fn definition_from_root(
-    root: &VerifiedRoot,
+/// Builds the definition a package archive declares, from the archive entries
+/// alone.
+///
+/// Installation validates a package with this before anything is extracted or
+/// recorded, so the daemon never records a package whose descriptor it would
+/// reject. It runs the same parser as [`PackageStore::read_definition`]. The
+/// returned definition's binding carries the package identity the descriptor
+/// declares.
+///
+/// # Errors
+///
+/// Returns [`PackageRejection::DescriptorMissing`] without a `runtime.toml`,
+/// [`PackageRejection::ReservedRuntimeId`] for a descriptor that claims the
+/// shell, and [`PackageRejection::Descriptor`] for every other invalid
+/// descriptor.
+pub fn definition_from_archive(
+    entries: &[ArchiveEntry],
     digest: &PackageDigest,
 ) -> Result<RuntimeDefinition, PackageRejection> {
-    let size = root
-        .files()
-        .iter()
-        .find(|file| file.path == RUNTIME_DESCRIPTOR_PATH)
-        .map(|file| file.size)
+    definition_from_files(&ArchiveFiles(entries), digest)
+}
+
+/// Read access to the files of a package, either a verified root on disk or
+/// the entries of a verified archive in memory.
+trait PackageFiles {
+    /// Size of the file at `path`, `None` when the package has no such file.
+    fn size(&self, path: &str) -> Option<u64>;
+
+    /// Contents of the file at `path`.
+    fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError>;
+}
+
+/// The files of a verified root; every read re-verifies the tree.
+struct RootFiles<'a>(&'a VerifiedRoot);
+
+impl PackageFiles for RootFiles<'_> {
+    fn size(&self, path: &str) -> Option<u64> {
+        self.0
+            .files()
+            .iter()
+            .find(|file| file.path == path)
+            .map(|file| file.size)
+    }
+
+    fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError> {
+        self.0.read_file(path)
+    }
+}
+
+/// The entries of an archive the package crate already verified.
+struct ArchiveFiles<'a>(&'a [ArchiveEntry]);
+
+impl PackageFiles for ArchiveFiles<'_> {
+    fn size(&self, path: &str) -> Option<u64> {
+        self.0
+            .iter()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| u64::try_from(entry.contents.len()).ok())
+    }
+
+    fn read(&self, path: &str) -> Result<Vec<u8>, VerifyError> {
+        self.0
+            .iter()
+            .find(|entry| entry.path == path)
+            .map(|entry| entry.contents.clone())
+            .ok_or(VerifyError::UnknownPath)
+    }
+}
+
+/// Parses the descriptor of a package.
+fn definition_from_files(
+    files: &impl PackageFiles,
+    digest: &PackageDigest,
+) -> Result<RuntimeDefinition, PackageRejection> {
+    let size = files
+        .size(RUNTIME_DESCRIPTOR_PATH)
         .ok_or(PackageRejection::DescriptorMissing)?;
     if size > u64::try_from(MAX_DEFINITION_BYTES).unwrap_or(u64::MAX) {
         return Err(PackageRejection::Descriptor(DefinitionError::TooLarge));
     }
-    let bytes = root
-        .read_file(RUNTIME_DESCRIPTOR_PATH)
+    let bytes = files
+        .read(RUNTIME_DESCRIPTOR_PATH)
         .map_err(PackageRejection::Root)?;
     let text = std::str::from_utf8(&bytes).map_err(|_error| {
         PackageRejection::Descriptor(DefinitionError::Malformed { line: None })
@@ -286,15 +385,18 @@ fn definition_from_root(
             package,
             digest: digest.clone(),
         },
-        |name| detection_manifest(root, name),
+        |name| detection_manifest(files, name),
     )
     .map_err(PackageRejection::Descriptor)
 }
 
 /// Resolves the `detect_manifest` a package descriptor names: a package file,
-/// read through the verified root, parsed as a detection manifest.
-fn detection_manifest(root: &VerifiedRoot, name: &str) -> Result<Arc<Manifest>, DefinitionError> {
-    let bytes = root.read_file(name).map_err(|error| match error {
+/// parsed as a detection manifest.
+fn detection_manifest(
+    files: &impl PackageFiles,
+    name: &str,
+) -> Result<Arc<Manifest>, DefinitionError> {
+    let bytes = files.read(name).map_err(|error| match error {
         VerifyError::UnknownPath => DefinitionError::UnknownManifest,
         _ => DefinitionError::Field {
             field: "detect_manifest",

@@ -225,8 +225,9 @@ and is reported by the host (package-pinned sessions are then incompatible).
   left out and reported with a typed reason; it never fails other packages or
   the built-ins.
 - Reload is explicit (`SessionRegistry::reload_runtimes`); nothing watches the
-  directory. A failed rebuild keeps the previous registry. The wire methods
-  that call it arrive with the CLI lifecycle (#143).
+  directory. A failed rebuild keeps the previous registry. Each committed
+  `package.*` change (install, link, enable, disable, select, uninstall) calls
+  it and reports `reloaded`.
 - Fresh launches and integration changes re-verify the package root and require
   it to be enabled; a package modified, disabled or uninstalled after load
   never launches. Disabling or selecting another version retires a package for
@@ -255,3 +256,27 @@ and is reported by the host (package-pinned sessions are then incompatible).
   and detector rules of its observed agent, resolve against the definition the
   session was launched from (kept on the session entry), not the registry's
   current selection.
+- The `package.list|inspect|doctor|install|link|set_enabled|select|uninstall`
+  wire methods are local-only: the daemon refuses them on a remote overlay
+  connection with `local_only_method`. They are additive and do not change the
+  protocol version. Every mutation holds the lifecycle guard, so launches never
+  interleave with it.
+- Install and link validate the package in memory (`runtime.toml` parsed from
+  the verified archive) before anything is extracted; the package identity (id
+  and version) comes from the descriptor. `package.link` copies a developer
+  directory into content-addressed storage and installs it disabled and
+  unselected; the directory itself is never loaded.
+- Claim rules: `shell` is never claimable. An official alias (a reserved runtime
+  id other than `shell`) is served only by a package the signed catalog
+  authorizes as official and only while no built-in runtime serves it. A runtime
+  id served by a loaded package of a different package id is a conflict. Trust
+  `explicit_digest` requires the archive digest to equal the supplied digest and
+  is never official. The runtime registry reserves the aliases for built-in
+  runtimes, so an alias claim is a conflict even for an official package; trust `catalog` fails closed with
+  `official_trust_unavailable` on a host without a trust anchor.
+- `package.uninstall` is refused with `package_referenced` while a live, lost or
+  resumable session or a host profile pins the digest. `remove_modified` removes
+  only a root that fails verification; a verified root answers
+  `package_root_intact`. A modified root makes enable, select and uninstall fail
+  with `package_root_invalid`. `package.doctor` reports faults, unregistered
+  roots on disk and pinned digests that are not installed.
