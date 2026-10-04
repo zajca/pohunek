@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=claude
-# POHUNEK_INTEGRATION_VERSION=9
+# POHUNEK_INTEGRATION_VERSION=10
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # agent's native session id for direct-session resume, release active-agent

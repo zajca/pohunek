@@ -43,6 +43,17 @@ pub(crate) const DEFAULT_MAX_SNAPSHOT_BYTES: usize = DEFAULT_CONTROL_LINE_BYTES;
 const DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Bounds deferred claims from concurrent provider descendants.
 const DEFAULT_PENDING_LAUNCH_CLAIMS: usize = 16;
+/// Default ceiling for one forwarded daemon notification exchange.
+///
+/// Hooks wait on the worker, so the bound keeps a stalled daemon from holding
+/// the agent's hook open; the hook then falls back to its own daemon dial.
+const DEFAULT_NOTIFICATION_FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+/// Default maximum serialized size of one forwarded notification's parameters.
+const DEFAULT_MAX_NOTIFICATION_PARAMS_BYTES: usize = 16 * 1024;
+/// Hard cap for forwarded notification parameters.
+const MAX_NOTIFICATION_PARAMS_BYTES: usize = 64 * 1024;
+/// Hard maximum of the forwarded notification exchange.
+const MAX_NOTIFICATION_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard cap for deferred launch-identity work and retained references.
 const MAX_PENDING_LAUNCH_CLAIMS: usize = 64;
 
@@ -135,6 +146,10 @@ pub struct WorkerConfig {
     pub launch_claim_retry_interval: Duration,
     /// Maximum retained unverified launch claims.
     pub pending_launch_claims: usize,
+    /// Maximum time one notification forwarded to the daemon may take.
+    pub notification_forward_timeout: Duration,
+    /// Maximum serialized size of one forwarded notification's parameters.
+    pub max_notification_params_bytes: usize,
 }
 
 impl WorkerConfig {
@@ -159,6 +174,8 @@ impl WorkerConfig {
             max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
             launch_claim_retry_interval: DEFAULT_LAUNCH_CLAIM_RETRY_INTERVAL,
             pending_launch_claims: DEFAULT_PENDING_LAUNCH_CLAIMS,
+            notification_forward_timeout: DEFAULT_NOTIFICATION_FORWARD_TIMEOUT,
+            max_notification_params_bytes: DEFAULT_MAX_NOTIFICATION_PARAMS_BYTES,
         }
     }
 
@@ -215,6 +232,22 @@ impl WorkerConfig {
                 maximum: MAX_OBSERVATION_WAIT,
             });
         }
+        validate_duration(
+            "notification_forward_timeout",
+            self.notification_forward_timeout,
+        )?;
+        if self.notification_forward_timeout > MAX_NOTIFICATION_FORWARD_TIMEOUT {
+            return Err(ConfigError::DurationMaximum {
+                field: "notification_forward_timeout",
+                actual: self.notification_forward_timeout,
+                maximum: MAX_NOTIFICATION_FORWARD_TIMEOUT,
+            });
+        }
+        validate_bytes(
+            "max_notification_params_bytes",
+            self.max_notification_params_bytes,
+            MAX_NOTIFICATION_PARAMS_BYTES,
+        )?;
         validate_count(
             "max_snapshot_rows",
             usize::from(self.max_snapshot_rows),
@@ -381,6 +414,43 @@ mod tests {
             above.validate(),
             Err(ConfigError::DurationMaximum {
                 field: "max_observation_wait",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn notification_forwarding_bounds_are_enforced() {
+        let zero = WorkerConfig {
+            notification_forward_timeout: Duration::ZERO,
+            ..WorkerConfig::new()
+        };
+        assert!(matches!(
+            zero.validate(),
+            Err(ConfigError::Duration {
+                field: "notification_forward_timeout"
+            })
+        ));
+        let too_long = WorkerConfig {
+            notification_forward_timeout: super::MAX_NOTIFICATION_FORWARD_TIMEOUT
+                + Duration::from_millis(1),
+            ..WorkerConfig::new()
+        };
+        assert!(matches!(
+            too_long.validate(),
+            Err(ConfigError::DurationMaximum {
+                field: "notification_forward_timeout",
+                ..
+            })
+        ));
+        let too_big = WorkerConfig {
+            max_notification_params_bytes: super::MAX_NOTIFICATION_PARAMS_BYTES + 1,
+            ..WorkerConfig::new()
+        };
+        assert!(matches!(
+            too_big.validate(),
+            Err(ConfigError::Bytes {
+                field: "max_notification_params_bytes",
                 ..
             })
         ));

@@ -548,6 +548,11 @@ same-session sibling reporting another process is rejected. Nested
 active-agent reports remain runtime evidence only: they can expose the active
 agent and active native metadata while that process runs, but never populate or
 replace `native_session_id` / `native_session_path` for the parent session.
+Notification hooks also prefer the worker endpoint: the worker applies the same
+peer binding, replaces any session id in the hook's parameters with its own, and
+forwards one public `notification.create` to the stable daemon socket. A worker
+that refuses or does not know the request leaves the hook to dial the daemon
+socket itself, so an older worker keeps working.
 Subagent lifecycle hooks use the same owner-private endpoint without a public
 daemon fallback, so their durable worker state continues to advance while the
 daemon or a client is disconnected.
