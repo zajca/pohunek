@@ -73,6 +73,7 @@ impl BuiltinSource {
             native: None,
             prompt_arg: false,
             version_probe_parser: None,
+            version_probe_policy: None,
             integration_handler: None,
         })
     }

@@ -116,6 +116,38 @@ pub(crate) fn pi_shaped_definition(program: &Path, existence: &str) -> RuntimeDe
     .expect("the Pi-shaped fixture document is valid")
 }
 
+/// `version_probe` value of the data-driven probe, accepting `[1.0.0, 1.1.0)`.
+pub(crate) const PI_SHAPED_PROBE: &str =
+    r#"{ parser = "semver-v1", args = ["--version"], min = "1.0.0", below = "1.1.0" }"#;
+
+/// Like [`pi_shaped_host`], with the fixture runtime declaring `probe` as its
+/// `version_probe`.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid, which would be a
+/// defect of the fixture.
+pub(crate) fn pi_shaped_probed_host(program: &Path, existence: &str, probe: &str) -> RuntimeHost {
+    let document = pi_shaped_document(program, existence).replace(
+        "prompt_arg = true\n",
+        &format!("prompt_arg = true\nversion_probe = {probe}\n"),
+    );
+    let definition = RuntimeDefinition::from_toml(
+        &document,
+        |package| DefinitionOrigin::Package {
+            package,
+            digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),
+        },
+        |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+    )
+    .expect("the probed fixture document is valid");
+    let builtin = BuiltinSource::new("/bin/sh");
+    let fixture = FixtureSource(vec![definition]);
+    let registry =
+        RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
+    RuntimeHost::new(registry)
+}
+
 #[derive(Debug)]
 struct FixtureSource(Vec<RuntimeDefinition>);
 

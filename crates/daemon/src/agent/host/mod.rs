@@ -15,6 +15,7 @@ mod launch;
 mod package;
 mod registry;
 mod source;
+mod version_probe;
 
 pub use builtin::BuiltinSource;
 pub use claim::{decide_claim, is_reserved, Authority, ClaimRefusal, ServedBy};
@@ -38,6 +39,7 @@ pub use registry::{
 };
 pub use source::{LaunchSource, ProfileRevision};
 pub(crate) use source::{ProfileInputs, RevisionKeys};
+pub use version_probe::{ProbeVersion, VersionProbePolicy, MAX_PROBE_ARGS, SEMVER_PARSER_ID};
 
 #[cfg(test)]
 mod package_tests;

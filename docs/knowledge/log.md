@@ -18,6 +18,14 @@
   client against an N-1 daemon remains #527). The source
   map lists `crates/protocol/src/compat/`.
 
+## Unreleased (2026-10-04, data-driven version probe)
+
+- Runtime descriptors can declare `version_probe = { parser = "semver-v1", args,
+  min, below }`: the daemon probes the program with the declared argv in the
+  sandboxed probe environment and accepts a release in `[min, below)`, so a
+  package moves its supported range without a daemon release. Documented in the
+  public API reference and the source map.
+
 ## Unreleased (2026-10-04, README and reference pages)
 
 - The README is an agent-focused entry point; the human reference lives in

@@ -291,10 +291,13 @@ impl SessionRegistry {
             .ok_or_else(agent_fork_unsupported)?;
         let session_ref = session_ref_from_binding(launch.reference_kind(), &binding)?;
 
+        // A fork starts a new process of the runtime, so a runtime with a
+        // version probe is probed again before anything is allocated.
+        let program = binding_program(&binding, &definition);
+        let validated_program = host::validate_launch_runtime(&definition, &program)?;
         let id = Self::allocate_session_id();
         self.ensure_worker_socket(&id)?;
         let has_snapshot = !binding.program.is_empty();
-        let program = binding_program(&binding, &definition);
         let input_rules = if has_snapshot {
             binding.input_rules.to_input_rules(definition.input_rules())
         } else {
@@ -319,7 +322,7 @@ impl SessionRegistry {
             cols: params.cols,
             rows: params.rows,
             env_extra,
-            validated_program: None,
+            validated_program,
         };
         let command = fork_pty_command_from_launch(
             &program,

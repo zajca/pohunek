@@ -115,6 +115,7 @@ fn package_definition(runtime: &str) -> RuntimeDefinition {
         native: None,
         prompt_arg: false,
         version_probe_parser: None,
+        version_probe_policy: None,
         integration_handler: None,
     })
     .expect("valid package definition")
@@ -305,6 +306,7 @@ fn descriptor_digest_changes_with_launch_fields() {
             native: None,
             prompt_arg,
             version_probe_parser: None,
+            version_probe_policy: None,
             integration_handler: None,
         })
         .expect("valid")
@@ -651,6 +653,7 @@ fn definitions_reject_unsafe_launch_text() {
             native: None,
             prompt_arg: false,
             version_probe_parser: None,
+            version_probe_policy: None,
             integration_handler: None,
         })
     };
@@ -700,6 +703,7 @@ fn builtin_parts() -> DefinitionParts {
         native: None,
         prompt_arg: false,
         version_probe_parser: None,
+        version_probe_policy: None,
         integration_handler: None,
     }
 }
@@ -1068,6 +1072,7 @@ fn a_pin_needs_the_same_runtime_from_the_same_origin() {
         native: None,
         prompt_arg: false,
         version_probe_parser: None,
+        version_probe_policy: None,
         integration_handler: None,
     })
     .expect("valid package definition");
@@ -1152,6 +1157,7 @@ mod launch_validation {
             version_probe_parser: Some(
                 super::super::HandlerId::parse("acme-v1", "test").expect("handler id"),
             ),
+            version_probe_policy: None,
             integration_handler: None,
         })
         .expect("valid package definition");

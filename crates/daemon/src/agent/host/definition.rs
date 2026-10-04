@@ -20,6 +20,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::version_probe::{VersionProbePolicy, SEMVER_PARSER_ID};
 use crate::agent::{
     AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
     NativeReferenceError, NativeReferenceStrategy, NativeSessionLaunch, ReferenceExistence,
@@ -248,6 +249,9 @@ pub struct DefinitionParts {
     pub prompt_arg: bool,
     /// Compiled parser for the runtime's version probe, if it has one.
     pub version_probe_parser: Option<HandlerId>,
+    /// Probe arguments and supported release range; required by the
+    /// data-driven parser and rejected for every other one.
+    pub version_probe_policy: Option<VersionProbePolicy>,
     /// Compiled integration handler, if the runtime has an integration.
     pub integration_handler: Option<HandlerId>,
 }
@@ -265,6 +269,7 @@ pub struct RuntimeDefinition {
     native: Option<NativeSessionLaunch>,
     prompt_arg: bool,
     version_probe_parser: Option<HandlerId>,
+    version_probe_policy: Option<VersionProbePolicy>,
     integration_handler: Option<HandlerId>,
 }
 
@@ -288,8 +293,10 @@ impl RuntimeDefinition {
             native,
             prompt_arg,
             version_probe_parser,
+            version_probe_policy,
             integration_handler,
         } = parts;
+        validate_version_probe(version_probe_parser.as_ref(), version_probe_policy.as_ref())?;
         validate_identity_invariants(&runtime_id, &origin, &program)?;
         validate_label(&display_name, "runtime.name")?;
         validate_token(program.as_str(), "runtime.program")?;
@@ -358,6 +365,7 @@ impl RuntimeDefinition {
             native,
             prompt_arg,
             version_probe_parser,
+            version_probe_policy,
             integration_handler,
         })
     }
@@ -437,8 +445,16 @@ impl RuntimeDefinition {
             version_probe_parser: raw
                 .runtime
                 .version_probe
+                .as_ref()
                 .map(|probe| HandlerId::parse(&probe.parser, "runtime.version_probe.parser"))
                 .transpose()?,
+            version_probe_policy: raw
+                .runtime
+                .version_probe
+                .as_ref()
+                .map(RawVersionProbe::policy)
+                .transpose()?
+                .flatten(),
             integration_handler: raw
                 .integration
                 .map(|integration| HandlerId::parse(&integration.handler, "integration.handler"))
@@ -522,10 +538,37 @@ impl RuntimeDefinition {
         self.version_probe_parser.as_ref()
     }
 
+    /// Probe arguments and supported release range of a data-driven version
+    /// probe, if the runtime declares one.
+    #[must_use]
+    pub fn version_probe_policy(&self) -> Option<&VersionProbePolicy> {
+        self.version_probe_policy.as_ref()
+    }
+
     /// Compiled integration handler id, if any.
     #[must_use]
     pub fn integration_handler(&self) -> Option<&HandlerId> {
         self.integration_handler.as_ref()
+    }
+}
+
+/// A parser that takes a supported-version policy requires one, and every
+/// other parser must not carry one.
+fn validate_version_probe(
+    parser: Option<&HandlerId>,
+    policy: Option<&VersionProbePolicy>,
+) -> Result<(), DefinitionError> {
+    let data_driven = parser.is_some_and(|parser| parser.as_str() == SEMVER_PARSER_ID);
+    match (data_driven, policy.is_some()) {
+        (true, false) => Err(DefinitionError::Field {
+            field: "runtime.version_probe",
+            reason: "this parser requires args, min and below",
+        }),
+        (false, true) => Err(DefinitionError::Field {
+            field: "runtime.version_probe",
+            reason: "args, min and below are only accepted by the semver-v1 parser",
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -737,6 +780,34 @@ struct RawRuntime {
 #[serde(deny_unknown_fields)]
 struct RawVersionProbe {
     parser: String,
+    /// Probe argv; the data-driven parser only.
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    /// Lowest supported release, inclusive; the data-driven parser only.
+    #[serde(default)]
+    min: Option<String>,
+    /// First unsupported release; the data-driven parser only.
+    #[serde(default)]
+    below: Option<String>,
+}
+
+impl RawVersionProbe {
+    /// The declared policy, `None` when the parser takes none.
+    ///
+    /// Presence is checked against the parser by [`validate_version_probe`];
+    /// here a partial declaration is already malformed.
+    fn policy(&self) -> Result<Option<VersionProbePolicy>, DefinitionError> {
+        match (&self.args, &self.min, &self.below) {
+            (None, None, None) => Ok(None),
+            (Some(args), Some(min), Some(below)) => {
+                VersionProbePolicy::new(args.clone(), min, below).map(Some)
+            }
+            _ => Err(DefinitionError::Field {
+                field: "runtime.version_probe",
+                reason: "args, min and below are declared together",
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

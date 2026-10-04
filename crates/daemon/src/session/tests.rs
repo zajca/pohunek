@@ -13319,6 +13319,7 @@ fn acme_definition(submit_delay_configurable: bool, prompt_arg: bool) -> Runtime
         native: None,
         prompt_arg,
         version_probe_parser: None,
+        version_probe_policy: None,
         integration_handler: None,
     })
     .expect("valid definition")
@@ -17027,6 +17028,113 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
 
     let _ = registry.stop(&forked.id).await;
     let _ = registry.stop(&created.id).await;
+}
+
+/// A Pi-shaped agent that answers `--version` from `version_file` and records
+/// every other start in `marker`. A start with `--session-id` stays alive until
+/// the returned gate is written; every other start stays alive for the whole
+/// test.
+#[cfg(unix)]
+fn probed_agent_script(
+    dir: &std::path::Path,
+    marker: &std::path::Path,
+    version_file: &std::path::Path,
+) -> (PathBuf, fs::File) {
+    let script = dir.join("pi-probed");
+    let gate_path = dir.join("exit.gate");
+    let gate = hook_gate(&gate_path);
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then cat '{version}'; exit 0; fi\nprintf 'launch\\n' >> '{marker}'\nprintf '%s\\n' \"$@\" >> '{marker}'\ncase \" $* \" in *\" --session-id \"*) read _ < '{gate}'; exit 0 ;; *) sleep 30 ;; esac\n",
+            version = version_file.display(),
+            marker = marker.display(),
+            gate = gate_path.display(),
+        ),
+    );
+    (script, gate)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_probed_package_runtime_is_revalidated_before_every_launch_kind() {
+    let dir = temp_dir("probed-launch");
+    let marker = dir.join("argv.txt");
+    let version_file = dir.join("version.txt");
+    fs::write(&version_file, "1.0.2\n").expect("write the version");
+    let (script, mut gate) = probed_agent_script(&dir, &marker, &version_file);
+    let store_path = temp_store_path("probed-launch");
+    let registry = SessionRegistry::new_with_runtimes(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path),
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_probed_host(
+            &script,
+            crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+            crate::agent::host::fixture::PI_SHAPED_PROBE,
+        ),
+    );
+    let fork = |id: &SessionId| SessionForkParams {
+        session_id: id.clone(),
+        name: None,
+        cwd_mode: ForkCwdMode::Same,
+        cols: 80,
+        rows: 24,
+    };
+    let launches = |marker: &std::path::Path| {
+        fs::read_to_string(marker).map_or(0, |text| text.matches("launch\n").count())
+    };
+
+    // A release inside the range launches and forks.
+    let created = registry
+        .create(SessionNewParams {
+            agent: "pi".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("a release in the range launches");
+    wait_for_file_contains(&marker, "--session-id\n").await;
+    let forked = registry
+        .fork(fork(&created.id))
+        .await
+        .expect("a release in the range forks");
+    wait_for_file_contains(&marker, "--fork\n").await;
+    assert_eq!(launches(&marker), 2);
+
+    // A release outside the range is refused before anything starts.
+    fs::write(&version_file, "1.1.0\n").expect("write the newer version");
+    let refused = registry
+        .fork(fork(&created.id))
+        .await
+        .expect_err("fork re-runs the probe");
+    assert_eq!(refused.code, "agent_runtime_unsupported");
+    assert_eq!(launches(&marker), 2, "nothing was launched");
+    let refused = registry
+        .create(SessionNewParams {
+            agent: "pi".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect_err("create re-runs the probe");
+    assert_eq!(refused.code, "agent_runtime_unsupported");
+
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("the source session exits");
+    let refused = registry
+        .resume(&created.id)
+        .await
+        .expect_err("resume re-runs the probe");
+    assert_eq!(refused.code, "agent_runtime_unsupported");
+    assert_eq!(launches(&marker), 2, "nothing was launched");
+    let _ = registry.stop(&forked.id).await;
 }
 
 /// The durable recovery binding of `id`, as a restarted daemon reads it.

@@ -21,17 +21,18 @@ use protocol::{
 use serde::Deserialize;
 
 use crate::agent::host::{
-    HandlerId, LaunchProgram, RuntimeDefinition, RuntimeRegistry, RESERVED_RUNTIME_IDS,
+    LaunchProgram, RuntimeDefinition, RuntimeRegistry, VersionProbePolicy, RESERVED_RUNTIME_IDS,
+    SEMVER_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
 
 /// The reviewed Hermes release metadata shipped with this Pohunek build.
 const HERMES_COMPATIBILITY_LOCK: &str =
     include_str!("../../../compat/hermes/compatibility-lock.json");
-/// Maximum wall time for the local `hermes --version` inventory probe.
-const HERMES_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Maximum wall time for a local version probe, including interpreter startup.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Maximum stdout the version probe may write or retain.
-const HERMES_VERSION_OUTPUT_LIMIT: usize = 4 * 1024;
+const VERSION_OUTPUT_LIMIT: usize = 4 * 1024;
 /// Maximum normalized version length accepted from untrusted probe output.
 const MAX_HERMES_VERSION_BYTES: usize = 64;
 /// Poll cadence balances bounded shutdown with negligible idle CPU use.
@@ -39,27 +40,32 @@ const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// A deterministic executable search path avoids inheriting user shims or hooks.
 const HERMES_PROBE_PATH: &str = "/usr/bin:/bin";
 /// A deterministic locale keeps provider version output stable.
-const HERMES_PROBE_LOCALE: &str = "C";
+const PROBE_LOCALE: &str = "C";
 
 /// Version-probe parsers the daemon compiles in, selected by the parser id a
 /// runtime definition names under `version_probe.parser`.
 ///
-/// Each parser owns the probe sandbox, the output grammar and the version the
+/// Each parser owns the probe sandbox, the output grammar and the versions the
 /// daemon accepts for launch. The Hermes lock is core data until the Hermes
-/// package owns its own compatibility policy.
+/// package owns its own compatibility policy; the data-driven parser takes its
+/// arguments and release range from the runtime definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VersionProbe {
+enum VersionProbe<'a> {
     /// Parser id `hermes-v1`: `hermes --version` pinned to the checked-in
     /// compatibility lock release.
     HermesV1,
+    /// Parser id `semver-v1`: the declared arguments print one
+    /// `MAJOR.MINOR.PATCH` release that must lie in the declared range.
+    SemverV1(&'a VersionProbePolicy),
 }
 
-impl VersionProbe {
+impl<'a> VersionProbe<'a> {
     /// Resolves a definition's parser id, or `None` for an id this daemon does
-    /// not compile in.
-    fn from_parser_id(parser: &HandlerId) -> Option<Self> {
-        match parser.as_str() {
+    /// not compile in or a data-driven parser without its policy.
+    fn for_definition(definition: &'a RuntimeDefinition) -> Option<Self> {
+        match definition.version_probe_parser()?.as_str() {
             "hermes-v1" => Some(Self::HermesV1),
+            SEMVER_PARSER_ID => definition.version_probe_policy().map(Self::SemverV1),
             _ => None,
         }
     }
@@ -70,13 +76,18 @@ impl VersionProbe {
             Self::HermesV1 => {
                 run_hermes_version_probe(path).and_then(|output| parse_hermes_version(&output))
             }
+            Self::SemverV1(policy) => run_semver_version_probe(path, policy).and_then(|output| {
+                VersionProbePolicy::parse_output(&output).map(|version| version.to_string())
+            }),
         }
     }
 
-    /// The only version this daemon accepts for launch.
-    fn pinned_version(self) -> &'static str {
+    /// Whether this daemon accepts `version` for launch.
+    fn accepts(self, version: &str) -> bool {
         match self {
-            Self::HermesV1 => supported_hermes_version(),
+            Self::HermesV1 => version == supported_hermes_version(),
+            Self::SemverV1(policy) => crate::agent::host::ProbeVersion::parse(version)
+                .is_some_and(|version| policy.supports(version)),
         }
     }
 }
@@ -217,7 +228,7 @@ fn probe_definition(
     program: &str,
 ) -> AgentRuntime {
     match definition.version_probe_parser() {
-        Some(parser) => probe_versioned_runtime(agent, agent_base, program, parser),
+        Some(_) => probe_versioned_runtime(agent, agent_base, program, definition),
         None => probe_runtime(agent, agent_base, program),
     }
 }
@@ -248,17 +259,17 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
     }
 }
 
-/// Probe an executable with the compiled `parser` and classify its version
-/// without exposing output.
+/// Probe an executable with the compiled parser `definition` names and
+/// classify its version without exposing output.
 ///
-/// A present runtime always reports `supported`: `Some(true)` only for the
-/// pinned version, `Some(false)` for any other version, unparseable output or a
-/// parser id this daemon does not compile in.
+/// A present runtime always reports `supported`: `Some(true)` only for an
+/// accepted version, `Some(false)` for any other version, unparseable output or
+/// a parser id this daemon does not compile in.
 fn probe_versioned_runtime(
     agent: &str,
     agent_base: RuntimeRef,
     binary: &str,
-    parser: &HandlerId,
+    definition: &RuntimeDefinition,
 ) -> AgentRuntime {
     let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
         return AgentRuntime {
@@ -271,9 +282,11 @@ fn probe_versioned_runtime(
         };
     };
 
-    let probe = VersionProbe::from_parser_id(parser);
+    let probe = VersionProbe::for_definition(definition);
     let version = probe.and_then(|probe| probe.detect_version(program.as_path()));
-    let supported = probe.is_some_and(|probe| version.as_deref() == Some(probe.pinned_version()));
+    let supported = probe
+        .zip(version.as_deref())
+        .is_some_and(|(probe, version)| probe.accepts(version));
     AgentRuntime {
         agent: agent.to_owned(),
         agent_base: Some(agent_base),
@@ -315,14 +328,16 @@ pub(crate) fn validate_definition_launch(
     definition: &RuntimeDefinition,
     binary: &str,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    let Some(parser) = definition.version_probe_parser() else {
+    if definition.version_probe_parser().is_none() {
         return Ok(None);
-    };
+    }
 
     let program = ValidatedLaunchProgram::resolve(binary)
         .ok_or_else(ProtocolError::agent_runtime_unsupported)?;
-    let supported = VersionProbe::from_parser_id(parser).is_some_and(|probe| {
-        probe.detect_version(program.as_path()).as_deref() == Some(probe.pinned_version())
+    let supported = VersionProbe::for_definition(definition).is_some_and(|probe| {
+        probe
+            .detect_version(program.as_path())
+            .is_some_and(|version| probe.accepts(&version))
     });
     supported
         .then_some(Some(program))
@@ -348,7 +363,7 @@ fn supported_hermes_version() -> &'static str {
 
 /// Run `--version` with isolated Hermes state, bounded time, and bounded output.
 fn run_hermes_version_probe(path: &std::path::Path) -> Option<String> {
-    run_hermes_version_probe_with_timeout(path, HERMES_VERSION_PROBE_TIMEOUT)
+    run_hermes_version_probe_with_timeout(path, VERSION_PROBE_TIMEOUT)
 }
 
 fn run_hermes_version_probe_with_timeout(
@@ -406,11 +421,41 @@ fn probe_hermes_version_with_clock(
     seeded_env: &[(&str, &str)],
     now: impl Fn() -> Instant,
 ) -> ProbeOutcome {
-    spawn_and_collect_probe(path, timeout, seeded_env, &now).unwrap_or(ProbeOutcome::Unavailable)
+    spawn_and_collect_probe(path, ProbeKind::Pinned, timeout, seeded_env, &now)
+        .unwrap_or(ProbeOutcome::Unavailable)
 }
+
+/// Runs the data-driven probe `policy` declares with isolated state, bounded
+/// time and bounded output, and returns its standard output.
+fn run_semver_version_probe(path: &Path, policy: &VersionProbePolicy) -> Option<String> {
+    match spawn_and_collect_probe(
+        path,
+        ProbeKind::Semver(policy),
+        VERSION_PROBE_TIMEOUT,
+        &[],
+        &Instant::now,
+    )? {
+        ProbeOutcome::Output(output) => Some(output),
+        ProbeOutcome::Failed | ProbeOutcome::TimedOut | ProbeOutcome::Unavailable => None,
+    }
+}
+
+/// Which probe `spawn_and_collect_probe` runs: it fixes the arguments and the
+/// environment the child sees.
+#[derive(Clone, Copy)]
+enum ProbeKind<'a> {
+    /// `--version` under the fixed search path of the compiled probe.
+    Pinned,
+    /// The declared arguments under a runtime-neutral environment.
+    Semver(&'a VersionProbePolicy),
+}
+
+/// The environment variable that holds the executable search path.
+const SEARCH_PATH_VAR: &str = "PATH";
 
 fn spawn_and_collect_probe(
     path: &std::path::Path,
+    kind: ProbeKind<'_>,
     timeout: Duration,
     seeded_env: &[(&str, &str)],
     now: &impl Fn() -> Instant,
@@ -426,23 +471,38 @@ fn spawn_and_collect_probe(
     command.envs(seeded_env.iter().copied());
     command
         .env_clear()
-        .arg("--version")
         .current_dir(&sandbox.cwd_path)
-        .env("PATH", HERMES_PROBE_PATH)
-        .env("LANG", HERMES_PROBE_LOCALE)
-        .env("LC_ALL", HERMES_PROBE_LOCALE)
+        .env("LANG", PROBE_LOCALE)
+        .env("LC_ALL", PROBE_LOCALE)
         .env("HOME", &sandbox.home_path)
-        .env("HERMES_HOME", &sandbox.hermes_home_path)
         .env("XDG_CONFIG_HOME", &sandbox.xdg_config_path)
         .env("XDG_CACHE_HOME", &sandbox.xdg_cache_path)
         .env("XDG_DATA_HOME", &sandbox.xdg_data_path)
         .env("XDG_STATE_HOME", &sandbox.xdg_state_path)
         .env("XDG_RUNTIME_DIR", &sandbox.xdg_runtime_path)
-        .env("TMPDIR", &sandbox.tmp_path)
-        .env("PYTHONNOUSERSITE", "1")
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env("PYTHONSAFEPATH", "1")
-        .env("PYTHONPYCACHEPREFIX", &sandbox.python_cache_path)
+        .env("TMPDIR", &sandbox.tmp_path);
+    match kind {
+        ProbeKind::Pinned => {
+            command
+                .arg("--version")
+                .env(SEARCH_PATH_VAR, HERMES_PROBE_PATH)
+                .env("HERMES_HOME", &sandbox.hermes_home_path)
+                .env("PYTHONNOUSERSITE", "1")
+                .env("PYTHONDONTWRITEBYTECODE", "1")
+                .env("PYTHONSAFEPATH", "1")
+                .env("PYTHONPYCACHEPREFIX", &sandbox.python_cache_path);
+        }
+        ProbeKind::Semver(policy) => {
+            // The probed program may be an interpreter script (`#!/usr/bin/env
+            // node`); the search path the daemon launches agents with finds the
+            // same interpreter the launch will use.
+            command.args(policy.args());
+            if let Some(search_path) = std::env::var_os(SEARCH_PATH_VAR) {
+                command.env(SEARCH_PATH_VAR, search_path);
+            }
+        }
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file))
         .stderr(Stdio::null());
@@ -467,10 +527,10 @@ fn spawn_and_collect_probe(
         }
     };
     terminate_probe_process_group(child.id());
-    let mut output = Vec::with_capacity(HERMES_VERSION_OUTPUT_LIMIT);
+    let mut output = Vec::with_capacity(VERSION_OUTPUT_LIMIT);
     File::open(&sandbox.output_path)
         .ok()?
-        .take(u64::try_from(HERMES_VERSION_OUTPUT_LIMIT).ok()?)
+        .take(u64::try_from(VERSION_OUTPUT_LIMIT).ok()?)
         .read_to_end(&mut output)
         .ok()?;
     Some(if status.success() {
@@ -500,10 +560,8 @@ struct VersionProbeSandbox {
 impl VersionProbeSandbox {
     fn create() -> Option<Self> {
         for _ in 0..4 {
-            let dir = std::env::temp_dir().join(format!(
-                "pohunek-hermes-version-probe-{}",
-                ulid::Ulid::new()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("pohunek-version-probe-{}", ulid::Ulid::new()));
             match create_owner_only_dir(&dir) {
                 Ok(()) => {
                     let sandbox = Self {
@@ -598,8 +656,8 @@ fn configure_probe_process_group(command: &mut Command) {
     unsafe {
         command.pre_exec(|| {
             let output_limit = libc::rlimit {
-                rlim_cur: HERMES_VERSION_OUTPUT_LIMIT as libc::rlim_t,
-                rlim_max: HERMES_VERSION_OUTPUT_LIMIT as libc::rlim_t,
+                rlim_cur: VERSION_OUTPUT_LIMIT as libc::rlim_t,
+                rlim_max: VERSION_OUTPUT_LIMIT as libc::rlim_t,
             };
             if libc::setrlimit(libc::RLIMIT_FSIZE, &raw const output_limit) == 0 {
                 Ok(())
@@ -716,7 +774,7 @@ mod tests {
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
 
     use super::*;
-    use crate::agent::host::BuiltinSource;
+    use crate::agent::host::{BuiltinSource, DefinitionOrigin};
     use crate::procwatch::{HostInspector, Pid, ProcessFact, ProcessIdentity, ProcessInspector};
 
     /// How long fixture processes block; well beyond `HANG_GUARD` so a fixture
@@ -815,13 +873,65 @@ mod tests {
         );
     }
 
-    fn hermes_parser() -> HandlerId {
-        HandlerId::parse("hermes-v1", "version_probe.parser").expect("valid parser id")
+    /// A package-served definition whose `[runtime]` table carries `probe` as
+    /// its `version_probe` value.
+    fn probed_definition(probe: &str) -> RuntimeDefinition {
+        let document = format!(
+            r#"schema = 1
+id = "acme.runtime.tool"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "tool"
+name = "Tool"
+program = "tool"
+args = []
+detect_manifest = "any"
+version_probe = {probe}
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = false
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "none"
+"#
+        );
+        RuntimeDefinition::from_toml(
+            &document,
+            |package| DefinitionOrigin::Package {
+                package,
+                digest: protocol::PackageDigest::parse(&format!("sha256:{}", "3".repeat(64)))
+                    .expect("digest"),
+            },
+            |_| Ok(Arc::new(crate::detect::generic_shell_manifest().clone())),
+        )
+        .expect("valid definition")
+    }
+
+    fn hermes_definition() -> Arc<RuntimeDefinition> {
+        let registry = test_registry();
+        Arc::clone(
+            registry
+                .resolve(&RuntimeId::hermes())
+                .expect("hermes registered"),
+        )
     }
 
     fn probe_hermes_for_test(binary: &str) -> AgentRuntime {
-        probe_versioned_runtime("hermes", RuntimeRef::hermes(), binary, &hermes_parser())
+        probe_versioned_runtime("hermes", RuntimeRef::hermes(), binary, &hermes_definition())
     }
+
+    const SEMVER_PROBE: &str =
+        r#"{ parser = "semver-v1", args = ["--version"], min = "1.0.0", below = "1.1.0" }"#;
 
     /// Registry whose shell runtime launches a fixed program, so the
     /// inventory does not depend on the host's `$SHELL`.
@@ -897,9 +1007,9 @@ mod tests {
         let host = crate::agent::host::RuntimeHost::default();
         let registry = host.registry();
         for definition in registry.definitions() {
-            if let Some(parser) = definition.version_probe_parser() {
+            if definition.version_probe_parser().is_some() {
                 assert!(
-                    VersionProbe::from_parser_id(parser).is_some(),
+                    VersionProbe::for_definition(definition).is_some(),
                     "{} names an uncompiled parser",
                     definition.runtime_id()
                 );
@@ -910,7 +1020,9 @@ mod tests {
             .resolve(&RuntimeId::parse("hermes").expect("id"))
             .expect("hermes registered");
         assert_eq!(
-            hermes.version_probe_parser().map(HandlerId::as_str),
+            hermes
+                .version_probe_parser()
+                .map(crate::agent::host::HandlerId::as_str),
             Some("hermes-v1")
         );
     }
@@ -920,13 +1032,13 @@ mod tests {
         let dir = temp_agents_dir();
         let program = dir.join("tool");
         write_test_executable(&program, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
-        let parser = HandlerId::parse("not-compiled", "version_probe.parser").expect("id");
+        let definition = probed_definition(r#"{ parser = "not-compiled" }"#);
 
         let runtime = probe_versioned_runtime(
             "custom",
             RuntimeRef::hermes(),
             &program.display().to_string(),
-            &parser,
+            &definition,
         );
         assert!(runtime.available);
         assert_eq!(runtime.version, None);
@@ -1093,7 +1205,7 @@ mod tests {
         ];
         assert!(run_hermes_version_probe_with_seeded_env(
             &hermes,
-            HERMES_VERSION_PROBE_TIMEOUT,
+            VERSION_PROBE_TIMEOUT,
             &seeded_env,
         )
         .is_some());
@@ -1428,5 +1540,159 @@ mod tests {
         let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(path, permissions).expect("set executable mode");
+    }
+    #[test]
+    fn semver_probe_reports_and_validates_the_declared_range() {
+        let dir = temp_agents_dir();
+        let tool = dir.join("tool");
+        let binary = tool.display().to_string();
+        let definition = probed_definition(SEMVER_PROBE);
+
+        write_test_executable(&tool, "#!/bin/sh\necho 1.0.2\n");
+        let supported =
+            probe_versioned_runtime("tool", RuntimeRef::from_wire("tool"), &binary, &definition);
+        assert!(supported.available);
+        assert_eq!(supported.version.as_deref(), Some("1.0.2"));
+        assert_eq!(supported.supported, Some(true));
+        let validated = validate_definition_launch(&definition, &binary)
+            .expect("a release inside the range launches")
+            .expect("the probed executable is pinned");
+        assert_eq!(validated.as_path(), tool.canonicalize().expect("canonical"));
+
+        for (output, version) in [
+            ("1.1.0", Some("1.1.0")),
+            ("0.99.0", Some("0.99.0")),
+            ("pi 1.0.2", None),
+            ("1.0.2-beta", None),
+            ("", None),
+        ] {
+            write_test_executable(&tool, &format!("#!/bin/sh\necho '{output}'\n"));
+            let runtime = probe_versioned_runtime(
+                "tool",
+                RuntimeRef::from_wire("tool"),
+                &binary,
+                &definition,
+            );
+            assert!(runtime.available, "{output:?}");
+            assert_eq!(runtime.version.as_deref(), version, "{output:?}");
+            assert_eq!(runtime.supported, Some(false), "{output:?}");
+            let error = validate_definition_launch(&definition, &binary)
+                .expect_err("a release outside the range is refused");
+            assert_eq!(error.code, "agent_runtime_unsupported");
+            assert!(!error.msg.contains(output) || output.is_empty());
+        }
+
+        write_test_executable(&tool, "#!/bin/sh\necho 1.0.2\nexit 3\n");
+        let failing =
+            probe_versioned_runtime("tool", RuntimeRef::from_wire("tool"), &binary, &definition);
+        assert_eq!(
+            failing.supported,
+            Some(false),
+            "a failing probe is unsupported"
+        );
+
+        let missing = probe_versioned_runtime(
+            "tool",
+            RuntimeRef::from_wire("tool"),
+            &dir.join("missing").display().to_string(),
+            &definition,
+        );
+        assert!(!missing.available);
+        assert_eq!(missing.supported, None);
+    }
+
+    #[test]
+    fn semver_probe_passes_the_declared_arguments_and_only_the_search_path() {
+        let dir = temp_agents_dir();
+        let tool = dir.join("tool");
+        let marker = dir.join("isolation.txt");
+        write_test_executable(
+            &tool,
+            &format!(
+                "#!/bin/sh\n\
+                 [ \"$#\" = 2 ] || exit 20\n\
+                 [ \"$1\" = -V ] || exit 21\n\
+                 [ \"$2\" = --plain ] || exit 22\n\
+                 [ \"${{POHUNEK_PROBE_SENTINEL+x}}\" != x ] || exit 23\n\
+                 [ \"${{PI_CODING_AGENT_DIR+x}}\" != x ] || exit 24\n\
+                 [ \"${{HERMES_HOME+x}}\" != x ] || exit 25\n\
+                 [ \"${{PYTHONNOUSERSITE+x}}\" != x ] || exit 26\n\
+                 [ \"$PATH\" = '{path}' ] || exit 27\n\
+                 [ \"${{HOME##*/}}\" = home ] || exit 28\n\
+                 [ \"${{XDG_CONFIG_HOME##*/}}\" = xdg-config ] || exit 29\n\
+                 [ \"${{TMPDIR##*/}}\" = tmp ] || exit 30\n\
+                 [ -d \"$HOME\" ] || exit 31\n\
+                 printf 'isolated' > {marker}\n\
+                 echo 1.0.2\n",
+                marker = marker.display(),
+                path = std::env::var("PATH").expect("the test process has a PATH"),
+            ),
+        );
+        let definition = probed_definition(
+            r#"{ parser = "semver-v1", args = ["-V", "--plain"], min = "1.0.0", below = "1.1.0" }"#,
+        );
+        let policy = definition.version_probe_policy().expect("policy");
+        let seeded_env = [
+            ("POHUNEK_PROBE_SENTINEL", "ambient"),
+            ("PI_CODING_AGENT_DIR", "ambient"),
+            ("HOME", "ambient-home-sentinel"),
+        ];
+        let outcome = spawn_and_collect_probe(
+            &tool,
+            ProbeKind::Semver(policy),
+            HANG_GUARD,
+            &seeded_env,
+            &Instant::now,
+        )
+        .expect("the probe runs");
+        assert!(
+            matches!(&outcome, ProbeOutcome::Output(output) if output.trim() == "1.0.2"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("marker"),
+            "isolated"
+        );
+    }
+
+    #[test]
+    fn semver_parser_without_its_policy_or_with_foreign_fields_is_not_a_definition() {
+        let document = |probe: &str| {
+            format!(
+                "schema = 1\nid = \"acme.runtime.tool\"\nversion = \"1.0.0\"\nruntime_api = 1\n\n\
+                 [runtime]\nid = \"tool\"\nname = \"Tool\"\nprogram = \"tool\"\nargs = []\n\
+                 detect_manifest = \"any\"\nversion_probe = {probe}\n\n\
+                 [input]\nbracketed_paste = false\nsubmit_delay_ms = 0\ntext_policy = \"unrestricted\"\n\n\
+                 [resume]\nsupported = false\n\n[fork]\nsupported = false\n\n\
+                 [native_reference]\nstrategy = \"none\"\n"
+            )
+        };
+        let parse = |probe: &str| {
+            RuntimeDefinition::from_toml(
+                &document(probe),
+                |package| DefinitionOrigin::Package {
+                    package,
+                    digest: protocol::PackageDigest::parse(&format!("sha256:{}", "3".repeat(64)))
+                        .expect("digest"),
+                },
+                |_| Ok(Arc::new(crate::detect::generic_shell_manifest().clone())),
+            )
+        };
+        for invalid in [
+            r#"{ parser = "semver-v1" }"#,
+            r#"{ parser = "semver-v1", args = ["--version"], min = "1.0.0" }"#,
+            r#"{ parser = "hermes-v1", args = ["--version"], min = "1.0.0", below = "1.1.0" }"#,
+            r#"{ parser = "semver-v1", args = ["--version"], min = "1.1.0", below = "1.0.0" }"#,
+        ] {
+            assert!(
+                matches!(
+                    parse(invalid),
+                    Err(crate::agent::host::DefinitionError::Field { .. })
+                ),
+                "{invalid}"
+            );
+        }
+        parse(SEMVER_PROBE).expect("the data-driven probe parses");
+        parse(r#"{ parser = "hermes-v1" }"#).expect("the compiled probe parses");
     }
 }

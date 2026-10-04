@@ -774,8 +774,39 @@ max_depth = 1                                    # directory levels below dir
 - A forked session of an assigned reference still shows the frozen
   `capabilities.resume = true` but holds no reference, so `session.resume`
   answers `not_resumable` for it.
-- The Pi values in the example are illustrative; verify a runtime's flag and
-  on-disk layout before declaring them.
+- The values in the example are those of the repository's `pi` package
+  (`runtime-packages/pi`), verified against a real Pi. Verify any other
+  runtime's flag and on-disk layout before declaring them.
+
+### Version probe
+
+A runtime definition may declare a version probe in `[runtime]`:
+
+```toml
+version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", below = "1.1.0" }
+```
+
+`parser` names a compiled parser. `semver-v1` is data-driven: `args` (one to
+four tokens) is the probe argv, and `[min, below)` is the supported release
+range, so a package update can move the range without a daemon release. The
+declaration is rejected unless `args`, `min` and `below` are all present, `min`
+is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH`. The
+`hermes-v1` parser takes none of these fields.
+
+Before `session.new`, `session.resume` and `session.fork`, and for the `host.inspect` runtime inventory
+(`version`, `supported`), the daemon resolves the program once, runs it with the
+declared argv, and parses the trimmed first line of its standard output as one
+release (ASCII digits only, no leading zeros, no pre-release or build suffix).
+Standard error is discarded. The probe runs with a cleared environment, a
+private `HOME`, XDG and temporary directories and a private working directory,
+a 2 second deadline and a 4 KiB output cap; only `PATH` is inherited from the
+daemon, so an interpreter script such as `#!/usr/bin/env node` resolves the
+interpreter from the same `PATH` that the default agent environment allowlist
+forwards to the launched agent (an allowlist without `PATH` leaves the agent
+without one). A release outside the range, unparseable
+output, a failing or timed-out probe, or a parser id this daemon does not
+compile in refuses the launch with payload-free `agent_runtime_unsupported`,
+and the exact probed executable is the one launched.
 
 ### `SessionInfo`
 
