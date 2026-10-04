@@ -90,7 +90,7 @@ JSON contract is what agents should parse.
 ```sh
 pohunek session screen <target> --json
 pohunek session read <target> --source recent --lines 200 --json
-pohunek session output <target> --runtime-id <runtime-id> --runtime-generation 1 --after-offset 0 --max-bytes 65536 --json
+pohunek session output <target> --worker-instance-id <runtime_id> --runtime-generation 1 --after-offset 0 --max-bytes 65536 --json
 pohunek session detection <target> --json
 ```
 
@@ -101,9 +101,9 @@ pohunek session detection <target> --json
   fallback in `source_used`: a `--source recent` read is not recent history.
   Check `source_used` on every read and use `session output` for actually
   retained output.
-- `session output` reads bounded retained output; carry the `runtime-id`,
-  `runtime-generation`, and `after-offset` values exactly as the daemon last
-  reported them. A `gap` in the result means retained history was evicted:
+- `session output` reads bounded retained output; carry the `worker-instance-id` (the `runtime_id`
+  field of the session's runtime), `runtime-generation`, and `after-offset`
+  values exactly as the daemon last reported them. A `gap` in the result means retained history was evicted:
   discard the old cursor and re-read from a fresh screen or the newest tail. A
   runtime change invalidates prior cursors the same way.
 - `session detection` previews the active detection manifest regions, which is
@@ -163,7 +163,7 @@ pohunek session new --agent codex --project <project> --branch <branch> --input-
 pohunek session inspect <target> --json
 pohunek session read <target> --json
 pohunek session input <coding-agent-target> --stdin --json
-pohunek session wait <target> --runtime-id <runtime-id> --runtime-generation 1 --after-terminal-watermark 1 --timeout-ms 8000 --json
+pohunek session wait <target> --worker-instance-id <runtime_id> --runtime-generation 1 --after-terminal-watermark 1 --timeout-ms 8000 --json
 pohunek session screen <target> --json
 pohunek session wait <target> --activity idle --activity blocked --state done --state failed --state stopped --timeout-ms 8000 --json
 ```
@@ -186,7 +186,7 @@ settles into any other state — a coding agent that finishes normally reports
 Order the observation instead of trusting the predicate. Before sending,
 capture the pre-send runtime and terminal revision from `session read --json`
 (`runtime_id`, `runtime_generation`, and `revision`). After sending, wait
-with `--after-terminal-watermark` plus the matching `--runtime-id` and
+with `--after-terminal-watermark` plus the matching `--worker-instance-id` and
 `--runtime-generation`, passing the captured values exactly as the daemon
 reported them: it completes only once the terminal has repainted after the
 captured snapshot. Then confirm the post-send `session screen` shows the new

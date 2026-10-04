@@ -93,7 +93,7 @@ impl Paths {
     /// Runtime directory for assistant material generated for one session or launch.
     #[must_use]
     pub fn assistant_runtime_dir(&self, session_or_launch_id: &str) -> Option<PathBuf> {
-        pohunek_paths::valid_runtime_id(session_or_launch_id).map(|id| {
+        pohunek_paths::valid_path_id(session_or_launch_id).map(|id| {
             self.runtime_dir
                 .join(pohunek_paths::ASSISTANT_RUNTIME_SUBDIR)
                 .join(id)

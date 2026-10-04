@@ -3010,7 +3010,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after bounded in-memory state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=7";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=8";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -3204,7 +3204,7 @@ mod tests {
                 ENV_PROTOCOL_VERSION,
                 protocol::PROTOCOL_VERSION.get().to_string(),
             )
-            .env("POHUNEK_RUNTIME_ID", "runtime-123")
+            .env("POHUNEK_WORKER_INSTANCE_ID", "runtime-123")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -3254,7 +3254,7 @@ mod tests {
                 temp.join("missing-worker.sock"),
             )
             .env(ENV_SESSION_ID, "session-123")
-            .env("POHUNEK_RUNTIME_ID", "runtime-123")
+            .env("POHUNEK_WORKER_INSTANCE_ID", "runtime-123")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3356,6 +3356,26 @@ mod tests {
         worker_response: &'static [u8],
         expected_public_requests: usize,
     ) -> (Value, Vec<Value>) {
+        run_worker_state_asset_with_env(
+            agent,
+            action,
+            input,
+            worker_response,
+            expected_public_requests,
+            &[("POHUNEK_WORKER_INSTANCE_ID", "runtime-123")],
+        )
+    }
+
+    /// Runs the state hook with `instance_env` as the worker instance
+    /// environment variables the worker injected.
+    fn run_worker_state_asset_with_env(
+        agent: &str,
+        action: &str,
+        input: &Value,
+        worker_response: &'static [u8],
+        expected_public_requests: usize,
+        instance_env: &[(&str, &str)],
+    ) -> (Value, Vec<Value>) {
         let asset_path = state_asset(agent);
         let path = inherited_path();
         let temp = scoped_dir(&format!("{agent}-worker-state-run"));
@@ -3414,7 +3434,7 @@ mod tests {
                 ENV_PROTOCOL_VERSION,
                 protocol::PROTOCOL_VERSION.get().to_string(),
             )
-            .env("POHUNEK_RUNTIME_ID", "runtime-123")
+            .envs(instance_env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3930,6 +3950,54 @@ mod tests {
             CLAUDE_HOOK_ASSET.contains(STATE_RELEASE_ACTION),
             "Claude state hook must accept the release action"
         );
+    }
+
+    /// A worker that sets only `POHUNEK_WORKER_INSTANCE_ID` and a worker that
+    /// sets only `POHUNEK_RUNTIME_ID` both identify the same instance to the
+    /// state hooks.
+    #[test]
+    fn state_hooks_accept_either_worker_instance_environment_name() {
+        let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
+        for agent in ["claude", "codex"] {
+            for (name, instance_env) in [
+                ("current", [("POHUNEK_WORKER_INSTANCE_ID", "runtime-123")]),
+                ("runtime id only", [("POHUNEK_RUNTIME_ID", "runtime-123")]),
+            ] {
+                let (report, public_requests) = run_worker_state_asset_with_env(
+                    agent,
+                    STATE_SESSION_ACTION,
+                    &input,
+                    WORKER_HOOK_SUCCESS_RESPONSE,
+                    0,
+                    &instance_env,
+                );
+
+                assert_eq!(report["type"], "identity_report", "{agent} {name}");
+                assert_eq!(report["runtime_id"], "runtime-123", "{agent} {name}");
+                assert!(public_requests.is_empty(), "{agent} {name}");
+            }
+        }
+    }
+
+    /// With both names set, `POHUNEK_WORKER_INSTANCE_ID` wins.
+    #[test]
+    fn state_hooks_prefer_the_worker_instance_environment_name() {
+        let input = json!({"session_id": "native-1", "transcript_path": "/work/t.jsonl"});
+        for agent in ["claude", "codex"] {
+            let (report, _public) = run_worker_state_asset_with_env(
+                agent,
+                STATE_SESSION_ACTION,
+                &input,
+                WORKER_HOOK_SUCCESS_RESPONSE,
+                0,
+                &[
+                    ("POHUNEK_RUNTIME_ID", "runtime-other"),
+                    ("POHUNEK_WORKER_INSTANCE_ID", "runtime-123"),
+                ],
+            );
+
+            assert_eq!(report["runtime_id"], "runtime-123", "{agent}");
+        }
     }
 
     /// Every managed hook runs its interpreter in isolated mode.

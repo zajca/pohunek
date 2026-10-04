@@ -9,8 +9,8 @@ use pohunek_worker_protocol::{
     read_frame, write_frame, AttachStart, Capability, ControlCode, ControlMessage, ControlReader,
     ControlRequest, ControlResponse, ControlWriter, DaemonId, DataFrame, Dimensions, ExitStatus,
     FrameHeader, FrameKind, Initialize, InputFragment, InputPlan, InspectSnapshot, LeaseId,
-    OutputGap, RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeId, RuntimeScope,
-    SessionId, StopRequest, StreamId, StreamMode, TransactionId, Version, WorkerId, WriteId,
+    OutputGap, RequestId, RequestKind, ResizeRequest, ResponseKind, RuntimeScope, SessionId,
+    StopRequest, StreamId, StreamMode, TransactionId, Version, WorkerId, WorkerInstanceId, WriteId,
     ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -90,7 +90,7 @@ pub enum WorkerError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservedOutput {
     /// Runtime that produced the output.
-    pub runtime_id: RuntimeId,
+    pub worker_instance_id: WorkerInstanceId,
     /// First currently retained byte offset.
     pub history_start_offset: u64,
     /// Offset of the first returned byte.
@@ -132,7 +132,7 @@ struct Inner {
     selected_version: Version,
     session_id: SessionId,
     worker_id: WorkerId,
-    runtime_id: Option<RuntimeId>,
+    worker_instance_id: Option<WorkerInstanceId>,
     lease_id: LeaseId,
     capabilities: Vec<Capability>,
     next_write_sequence: u64,
@@ -205,7 +205,7 @@ pub struct DataStream {
     /// Stream identity.
     pub stream_id: StreamId,
     /// Runtime generation.
-    pub runtime_id: RuntimeId,
+    pub worker_instance_id: WorkerInstanceId,
     /// Serialized dimension update held until the registry records it.
     pub dimension_update: Option<DimensionUpdate>,
 }
@@ -331,13 +331,13 @@ impl Worker {
             },
         )
         .await?;
-        let (selected_version, session_id, worker_id, runtime_id, challenge, capabilities) =
+        let (selected_version, session_id, worker_id, worker_instance_id, challenge, capabilities) =
             match response.kind {
                 ResponseKind::Negotiated {
                     selected_version,
                     session_id,
                     worker_id,
-                    runtime_id,
+                    worker_instance_id,
                     challenge,
                     capabilities,
                     ..
@@ -345,7 +345,7 @@ impl Worker {
                     selected_version,
                     session_id,
                     worker_id,
-                    runtime_id,
+                    worker_instance_id,
                     challenge,
                     capabilities,
                 ),
@@ -382,7 +382,7 @@ impl Worker {
                 selected_version,
                 session_id,
                 worker_id,
-                runtime_id,
+                worker_instance_id,
                 lease_id,
                 capabilities,
                 next_write_sequence: 1,
@@ -411,8 +411,8 @@ impl Worker {
     }
 
     /// Returns the current runtime identity.
-    pub async fn runtime_id(&self) -> Option<RuntimeId> {
-        self.inner.lock().await.runtime_id.clone()
+    pub async fn worker_instance_id(&self) -> Option<WorkerInstanceId> {
+        self.inner.lock().await.worker_instance_id.clone()
     }
 
     /// Returns the worker's authoritative runtime snapshot.
@@ -431,7 +431,9 @@ impl Worker {
         .await?;
         match response {
             ResponseKind::Inspected { snapshot } => {
-                inner.runtime_id.clone_from(&snapshot.runtime_id);
+                inner
+                    .worker_instance_id
+                    .clone_from(&snapshot.worker_instance_id);
                 Ok(*snapshot)
             }
             other => response_error(other),
@@ -450,7 +452,10 @@ impl Worker {
     /// Returns [`WorkerError`] for connection, identity, spawn, or journal
     /// failure, and [`WorkerError::Protocol`] when a worker that negotiated
     /// the base-environment version receives no base environment.
-    pub async fn initialize(&self, mut initialize: Initialize) -> Result<RuntimeId, WorkerError> {
+    pub async fn initialize(
+        &self,
+        mut initialize: Initialize,
+    ) -> Result<WorkerInstanceId, WorkerError> {
         let mut inner = self.inner.lock().await;
         if inner.selected_version < pohunek_worker_protocol::BASE_ENVIRONMENT_VERSION {
             initialize.base_environment = None;
@@ -469,9 +474,11 @@ impl Worker {
         )
         .await?;
         match response {
-            ResponseKind::Initialized { runtime_id, .. } => {
-                inner.runtime_id = Some(runtime_id.clone());
-                Ok(runtime_id)
+            ResponseKind::Initialized {
+                worker_instance_id, ..
+            } => {
+                inner.worker_instance_id = Some(worker_instance_id.clone());
+                Ok(worker_instance_id)
             }
             other => response_error(other),
         }
@@ -497,9 +504,9 @@ impl Worker {
         .await?;
         match response {
             ResponseKind::TerminalSnapshot {
-                runtime_id,
+                worker_instance_id,
                 snapshot,
-            } if inner.runtime_id.as_ref() == Some(&runtime_id) => Ok(*snapshot),
+            } if inner.worker_instance_id.as_ref() == Some(&worker_instance_id) => Ok(*snapshot),
             ResponseKind::TerminalSnapshot { .. } => Err(WorkerError::ResponseMismatch),
             other => response_error(other),
         }
@@ -561,7 +568,7 @@ impl Worker {
                 token,
                 version: inner.selected_version,
                 stream_id,
-                runtime_id: scope.runtime_id,
+                worker_instance_id: scope.worker_instance_id,
                 after_offset,
                 max_bytes,
             }),
@@ -771,7 +778,7 @@ impl Worker {
             FrameHeader {
                 version,
                 stream_id: stream_id.clone(),
-                runtime_id: scope.runtime_id.clone(),
+                worker_instance_id: scope.worker_instance_id.clone(),
                 kind: FrameKind::Open {
                     token,
                     mode,
@@ -790,7 +797,7 @@ impl Worker {
                 read_ordered_attach_ready(
                     &mut stream,
                     &stream_id,
-                    &scope.runtime_id,
+                    &scope.worker_instance_id,
                     dimension_order.ok_or_else(|| {
                         WorkerError::Protocol(
                             "snapshot attach lost its dimension ordering guard".to_owned(),
@@ -806,7 +813,7 @@ impl Worker {
             stream,
             version,
             stream_id,
-            runtime_id: scope.runtime_id,
+            worker_instance_id: scope.worker_instance_id,
             dimension_update,
         })
     }
@@ -878,7 +885,7 @@ struct ObservationOpen {
     token: pohunek_worker_protocol::DataToken,
     version: Version,
     stream_id: StreamId,
-    runtime_id: RuntimeId,
+    worker_instance_id: WorkerInstanceId,
     after_offset: Option<u64>,
     max_bytes: u32,
 }
@@ -898,7 +905,7 @@ async fn read_observation_stream(
         FrameHeader {
             version: open.version,
             stream_id: open.stream_id.clone(),
-            runtime_id: open.runtime_id.clone(),
+            worker_instance_id: open.worker_instance_id.clone(),
             kind: FrameKind::Open {
                 token: open.token,
                 mode: StreamMode::Observation,
@@ -917,7 +924,7 @@ async fn read_observation_stream(
         &mut stream,
         open.version,
         open.stream_id,
-        open.runtime_id,
+        open.worker_instance_id,
         open.max_bytes,
     )
     .await
@@ -927,10 +934,10 @@ async fn collect_observation_frames(
     stream: &mut UnixStream,
     version: Version,
     stream_id: StreamId,
-    runtime_id: RuntimeId,
+    worker_instance_id: WorkerInstanceId,
     requested_max_bytes: u32,
 ) -> Result<ObservedOutput, WorkerError> {
-    let start = read_matching_frame(stream, version, &stream_id, &runtime_id).await?;
+    let start = read_matching_frame(stream, version, &stream_id, &worker_instance_id).await?;
     let (
         history_start_offset,
         start_offset,
@@ -979,7 +986,7 @@ async fn collect_observation_frames(
     let mut data = Vec::with_capacity(expected_bytes);
     let mut expected_offset = start_offset;
     loop {
-        let frame = read_matching_frame(stream, version, &stream_id, &runtime_id).await?;
+        let frame = read_matching_frame(stream, version, &stream_id, &worker_instance_id).await?;
         match frame.header().kind.clone() {
             FrameKind::Replay { offset } if offset == expected_offset => {
                 let accumulated = data
@@ -1010,7 +1017,7 @@ async fn collect_observation_frames(
         }
     }
     Ok(ObservedOutput {
-        runtime_id,
+        worker_instance_id,
         history_start_offset,
         start_offset,
         next_offset,
@@ -1026,7 +1033,7 @@ async fn read_matching_frame(
     stream: &mut UnixStream,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
 ) -> Result<DataFrame, WorkerError> {
     let frame = read_frame(stream)
         .await
@@ -1034,7 +1041,7 @@ async fn read_matching_frame(
         .ok_or_else(|| WorkerError::Protocol("observation stream closed early".to_owned()))?;
     if frame.header().version != version
         || frame.header().stream_id != *stream_id
-        || frame.header().runtime_id != *runtime_id
+        || frame.header().worker_instance_id != *worker_instance_id
     {
         return Err(WorkerError::ResponseMismatch);
     }
@@ -1096,30 +1103,31 @@ fn select_attach_start(
 }
 
 fn scope(inner: &Inner) -> Result<RuntimeScope, WorkerError> {
-    let runtime_id = inner
-        .runtime_id
+    let worker_instance_id = inner
+        .worker_instance_id
         .clone()
         .ok_or(WorkerError::NotInitialized)?;
     Ok(RuntimeScope {
         lease_id: inner.lease_id.clone(),
         session_id: inner.session_id.clone(),
         worker_id: inner.worker_id.clone(),
-        runtime_id,
+        worker_instance_id,
     })
 }
 
 async fn read_attach_ready(
     stream: &mut UnixStream,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
 ) -> Result<Dimensions, WorkerError> {
-    read_attach_ready_with_timeout(stream, stream_id, runtime_id, ATTACH_READY_TIMEOUT).await
+    read_attach_ready_with_timeout(stream, stream_id, worker_instance_id, ATTACH_READY_TIMEOUT)
+        .await
 }
 
 async fn read_attach_ready_with_timeout(
     stream: &mut UnixStream,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     timeout: Duration,
 ) -> Result<Dimensions, WorkerError> {
     let frame = tokio::time::timeout(timeout, read_frame(stream))
@@ -1130,7 +1138,10 @@ async fn read_attach_ready_with_timeout(
             WorkerError::Protocol("worker attach closed before readiness confirmation".to_owned())
         })?;
     let (header, payload) = frame.into_parts();
-    if header.stream_id != *stream_id || header.runtime_id != *runtime_id || !payload.is_empty() {
+    if header.stream_id != *stream_id
+        || header.worker_instance_id != *worker_instance_id
+        || !payload.is_empty()
+    {
         return Err(WorkerError::Protocol(
             "worker attach readiness frame did not match its stream".to_owned(),
         ));
@@ -1151,10 +1162,10 @@ async fn read_attach_ready_with_timeout(
 async fn read_ordered_attach_ready(
     stream: &mut UnixStream,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     order: OwnedMutexGuard<()>,
 ) -> Result<DimensionUpdate, WorkerError> {
-    let dimensions = read_attach_ready(stream, stream_id, runtime_id).await?;
+    let dimensions = read_attach_ready(stream, stream_id, worker_instance_id).await?;
     Ok(DimensionUpdate {
         dimensions,
         _order: order,
@@ -1379,7 +1390,7 @@ mod tests {
     async fn write_observation_fixture(
         stream: &mut UnixStream,
         stream_id: &StreamId,
-        runtime_id: &RuntimeId,
+        worker_instance_id: &WorkerInstanceId,
         payloads: &[&[u8]],
     ) {
         let byte_count = payloads.iter().map(|payload| payload.len()).sum::<usize>();
@@ -1388,7 +1399,7 @@ mod tests {
             FrameHeader {
                 version: pohunek_worker_protocol::CURRENT_VERSION,
                 stream_id: stream_id.clone(),
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 kind: FrameKind::ObservationStart {
                     history_start_offset: 0,
                     start_offset: 0,
@@ -1409,7 +1420,7 @@ mod tests {
                 FrameHeader {
                     version: pohunek_worker_protocol::CURRENT_VERSION,
                     stream_id: stream_id.clone(),
-                    runtime_id: runtime_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
                     kind: FrameKind::Replay { offset },
                 },
                 payload.to_vec(),
@@ -1422,7 +1433,7 @@ mod tests {
             FrameHeader {
                 version: pohunek_worker_protocol::CURRENT_VERSION,
                 stream_id: stream_id.clone(),
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 kind: FrameKind::Close {
                     reason: pohunek_worker_protocol::CloseReason::ObservationComplete,
                 },
@@ -1442,7 +1453,7 @@ mod tests {
         writer: &mut ControlWriter<OwnedWriteHalf>,
         session_id: &SessionId,
         worker_id: &WorkerId,
-        runtime_id: Option<&RuntimeId>,
+        worker_instance_id: Option<&WorkerInstanceId>,
         challenge: &pohunek_worker_protocol::LeaseChallenge,
     ) {
         let request = read_control_request(reader, "negotiation").await;
@@ -1455,7 +1466,7 @@ mod tests {
                 supported_range: pohunek_worker_protocol::SUPPORTED_RANGE,
                 session_id: session_id.clone(),
                 worker_id: worker_id.clone(),
-                runtime_id: runtime_id.cloned(),
+                worker_instance_id: worker_instance_id.cloned(),
                 worker_process: pohunek_worker_protocol::ProcessIdentity {
                     pid: std::process::id(),
                     start_identity: 1,
@@ -1520,13 +1531,13 @@ mod tests {
     async fn write_terminal_snapshot(
         writer: &mut ControlWriter<OwnedWriteHalf>,
         request_id: &RequestId,
-        runtime_id: &RuntimeId,
+        worker_instance_id: &WorkerInstanceId,
     ) {
         write_response(
             writer,
             request_id.clone(),
             ResponseKind::TerminalSnapshot {
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 snapshot: Box::new(pohunek_worker_protocol::TerminalSnapshot {
                     watermark: 0,
                     dimensions: Dimensions::new(80, 24).expect("dimensions"),
@@ -1665,7 +1676,7 @@ mod tests {
             let mut writer = ControlWriter::new(write_half);
             let session_id = SessionId::new("session-torn").expect("session id");
             let worker_id = WorkerId::new("worker-torn").expect("worker id");
-            let runtime_id = RuntimeId::new("runtime-torn").expect("runtime id");
+            let worker_instance_id = WorkerInstanceId::new("runtime-torn").expect("runtime id");
             let challenge =
                 pohunek_worker_protocol::LeaseChallenge::new("challenge-torn").expect("challenge");
             // The peer answers the handshake and then never reads: the
@@ -1676,7 +1687,7 @@ mod tests {
                 &mut writer,
                 &session_id,
                 &worker_id,
-                Some(&runtime_id),
+                Some(&worker_instance_id),
                 &challenge,
             )
             .await;
@@ -1738,7 +1749,7 @@ mod tests {
             let mut writer = ControlWriter::new(write_half);
             let session_id = SessionId::new("session-drain").expect("session id");
             let worker_id = WorkerId::new("worker-drain").expect("worker id");
-            let runtime_id = RuntimeId::new("runtime-drain").expect("runtime id");
+            let worker_instance_id = WorkerInstanceId::new("runtime-drain").expect("runtime id");
             let challenge =
                 pohunek_worker_protocol::LeaseChallenge::new("challenge-drain").expect("challenge");
             negotiate_and_acquire(
@@ -1746,7 +1757,7 @@ mod tests {
                 &mut writer,
                 &session_id,
                 &worker_id,
-                Some(&runtime_id),
+                Some(&worker_instance_id),
                 &challenge,
             )
             .await;
@@ -1755,11 +1766,11 @@ mod tests {
             assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
             request_seen_tx.send(()).expect("signal request");
             respond_rx.await.expect("allow delayed response");
-            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+            write_terminal_snapshot(&mut writer, &request.request_id, &worker_instance_id).await;
 
             let request = read_control_request(&mut reader, "second snapshot request").await;
             assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
-            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+            write_terminal_snapshot(&mut writer, &request.request_id, &worker_instance_id).await;
         });
 
         let worker = Worker::connect(&socket_path, "session-drain", "daemon-drain")
@@ -1819,24 +1830,25 @@ mod tests {
     ) -> (
         ControlReader<OwnedReadHalf>,
         ControlWriter<OwnedWriteHalf>,
-        RuntimeId,
+        WorkerInstanceId,
     ) {
         let (stream, _) = listener.accept().await.expect("accept control");
         let (read_half, write_half) = stream.into_split();
         let mut reader = ControlReader::new(read_half);
         let mut writer = ControlWriter::new(write_half);
-        let runtime_id = RuntimeId::new(format!("runtime-{name}")).expect("runtime id");
+        let worker_instance_id =
+            WorkerInstanceId::new(format!("runtime-{name}")).expect("runtime id");
         negotiate_and_acquire(
             &mut reader,
             &mut writer,
             &SessionId::new(format!("session-{name}")).expect("session id"),
             &WorkerId::new(format!("worker-{name}")).expect("worker id"),
-            Some(&runtime_id),
+            Some(&worker_instance_id),
             &pohunek_worker_protocol::LeaseChallenge::new(format!("challenge-{name}"))
                 .expect("challenge"),
         )
         .await;
-        (reader, writer, runtime_id)
+        (reader, writer, worker_instance_id)
     }
 
     /// One input fragment, so a reserved plan is non-empty.
@@ -1862,7 +1874,8 @@ mod tests {
         let (half_sent_tx, half_sent_rx) = tokio::sync::oneshot::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
-            let (mut reader, writer, runtime_id) = accept_scripted(&listener, "partial").await;
+            let (mut reader, writer, worker_instance_id) =
+                accept_scripted(&listener, "partial").await;
             let mut writer = writer.into_inner();
 
             let request = read_control_request(&mut reader, "snapshot request").await;
@@ -1872,7 +1885,7 @@ mod tests {
             let mut line = serde_json::to_vec(&ControlMessage::Response(ControlResponse {
                 request_id: request.request_id,
                 kind: ResponseKind::TerminalSnapshot {
-                    runtime_id: runtime_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
                     snapshot: Box::new(pohunek_worker_protocol::TerminalSnapshot {
                         watermark: 0,
                         dimensions: Dimensions::new(80, 24).expect("dimensions"),
@@ -1903,7 +1916,7 @@ mod tests {
             let mut writer = ControlWriter::new(writer);
             let request = read_control_request(&mut reader, "second snapshot request").await;
             assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
-            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+            write_terminal_snapshot(&mut writer, &request.request_id, &worker_instance_id).await;
         });
 
         let worker = Worker::connect(&socket_path, "session-partial", "daemon-partial")
@@ -1952,7 +1965,8 @@ mod tests {
         let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
         let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
-            let (mut reader, mut writer, runtime_id) = accept_scripted(&listener, "ack").await;
+            let (mut reader, mut writer, worker_instance_id) =
+                accept_scripted(&listener, "ack").await;
 
             let request = read_control_request(&mut reader, "write plan").await;
             let RequestKind::WritePlan { plan, .. } = request.kind else {
@@ -1974,7 +1988,7 @@ mod tests {
 
             let request = read_control_request(&mut reader, "snapshot request").await;
             assert!(matches!(request.kind, RequestKind::TerminalSnapshot { .. }));
-            write_terminal_snapshot(&mut writer, &request.request_id, &runtime_id).await;
+            write_terminal_snapshot(&mut writer, &request.request_id, &worker_instance_id).await;
         });
 
         let worker = Worker::connect(&socket_path, "session-ack", "daemon-ack")
@@ -2020,7 +2034,8 @@ mod tests {
         let socket_path = root.join("worker.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind fake worker");
         let server_task = tokio::spawn(async move {
-            let (mut reader, writer, _runtime_id) = accept_scripted(&listener, "failed").await;
+            let (mut reader, writer, _worker_instance_id) =
+                accept_scripted(&listener, "failed").await;
             let mut writer = writer.into_inner();
             let request = read_control_request(&mut reader, "write plan").await;
             assert!(matches!(request.kind, RequestKind::WritePlan { .. }));
@@ -2083,7 +2098,7 @@ mod tests {
         let worker = Worker::connect(&socket_path, SESSION_ID, "daemon-e2e")
             .await
             .expect("control handshake");
-        let runtime_id = worker
+        let worker_instance_id = worker
             .initialize(observation_initialize(&root, output_bytes))
             .await
             .expect("initialize runtime");
@@ -2111,7 +2126,7 @@ mod tests {
             )
             .await
             .expect("dedicated observation stream");
-        assert_eq!(observed.runtime_id, runtime_id);
+        assert_eq!(observed.worker_instance_id, worker_instance_id);
         assert_eq!(observed.data.expose().len(), output_bytes);
         assert_eq!(observed.start_offset, 0);
         assert_eq!(
@@ -2147,7 +2162,7 @@ mod tests {
             let mut writer = ControlWriter::new(write_half);
             let session_id = SessionId::new("session-cancel").expect("session id");
             let worker_id = WorkerId::new("worker-cancel").expect("worker id");
-            let runtime_id = RuntimeId::new("runtime-cancel").expect("runtime id");
+            let worker_instance_id = WorkerInstanceId::new("runtime-cancel").expect("runtime id");
             let challenge = pohunek_worker_protocol::LeaseChallenge::new("challenge-cancel")
                 .expect("challenge");
 
@@ -2168,7 +2183,7 @@ mod tests {
                         supported_range: pohunek_worker_protocol::SUPPORTED_RANGE,
                         session_id: session_id.clone(),
                         worker_id: worker_id.clone(),
-                        runtime_id: Some(runtime_id.clone()),
+                        worker_instance_id: Some(worker_instance_id.clone()),
                         worker_process: pohunek_worker_protocol::ProcessIdentity {
                             pid: std::process::id(),
                             start_identity: 1,
@@ -2243,7 +2258,7 @@ mod tests {
                 .write(&ControlMessage::Response(ControlResponse {
                     request_id: request.request_id,
                     kind: ResponseKind::TerminalSnapshot {
-                        runtime_id,
+                        worker_instance_id,
                         snapshot: Box::new(pohunek_worker_protocol::TerminalSnapshot {
                             watermark: 0,
                             dimensions: Dimensions::new(80, 24).expect("dimensions"),
@@ -2290,11 +2305,11 @@ mod tests {
     async fn observation_client_reassembles_multiple_frames() {
         let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
         let stream_id = StreamId::new("observation-client").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-client").expect("runtime id");
         write_observation_fixture(
             &mut worker,
             &stream_id,
-            &runtime_id,
+            &worker_instance_id,
             &[&b"first"[..], &b"-second"[..]],
         )
         .await;
@@ -2303,7 +2318,7 @@ mod tests {
             &mut client,
             pohunek_worker_protocol::CURRENT_VERSION,
             stream_id,
-            runtime_id,
+            worker_instance_id,
             64,
         )
         .await
@@ -2316,8 +2331,8 @@ mod tests {
     async fn observation_client_rejects_runtime_mismatch_without_payload_leak() {
         let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
         let stream_id = StreamId::new("observation-client").expect("stream id");
-        let expected_runtime = RuntimeId::new("runtime-expected").expect("runtime id");
-        let wrong_runtime = RuntimeId::new("runtime-wrong").expect("runtime id");
+        let expected_runtime = WorkerInstanceId::new("runtime-expected").expect("runtime id");
+        let wrong_runtime = WorkerInstanceId::new("runtime-wrong").expect("runtime id");
         write_observation_fixture(&mut worker, &stream_id, &wrong_runtime, &[&b"secret"[..]]).await;
 
         let error = collect_observation_frames(
@@ -2337,12 +2352,12 @@ mod tests {
     async fn observation_client_rejects_oversized_declared_span_before_allocation() {
         let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
         let stream_id = StreamId::new("observation-client").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-client").expect("runtime id");
         let metadata = DataFrame::new(
             FrameHeader {
                 version: pohunek_worker_protocol::CURRENT_VERSION,
                 stream_id: stream_id.clone(),
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 kind: FrameKind::ObservationStart {
                     history_start_offset: 0,
                     start_offset: 0,
@@ -2364,7 +2379,7 @@ mod tests {
             &mut client,
             pohunek_worker_protocol::CURRENT_VERSION,
             stream_id,
-            runtime_id,
+            worker_instance_id,
             1_024,
         )
         .await
@@ -2376,14 +2391,20 @@ mod tests {
     async fn observation_client_rejects_v3_v4_frame_header_mismatch() {
         let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
         let stream_id = StreamId::new("observation-client").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
-        write_observation_fixture(&mut worker, &stream_id, &runtime_id, &[&b"data"[..]]).await;
+        let worker_instance_id = WorkerInstanceId::new("runtime-client").expect("runtime id");
+        write_observation_fixture(
+            &mut worker,
+            &stream_id,
+            &worker_instance_id,
+            &[&b"data"[..]],
+        )
+        .await;
 
         let error = collect_observation_frames(
             &mut client,
             pohunek_worker_protocol::PREVIOUS_VERSION,
             stream_id,
-            runtime_id,
+            worker_instance_id,
             64,
         )
         .await
@@ -2395,12 +2416,12 @@ mod tests {
     async fn observation_client_caps_cumulative_replay_before_copying() {
         let (mut client, mut worker) = UnixStream::pair().expect("socket pair");
         let stream_id = StreamId::new("observation-client").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-client").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-client").expect("runtime id");
         let metadata = DataFrame::new(
             FrameHeader {
                 version: pohunek_worker_protocol::CURRENT_VERSION,
                 stream_id: stream_id.clone(),
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 kind: FrameKind::ObservationStart {
                     history_start_offset: 0,
                     start_offset: 0,
@@ -2421,7 +2442,7 @@ mod tests {
             FrameHeader {
                 version: pohunek_worker_protocol::CURRENT_VERSION,
                 stream_id: stream_id.clone(),
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 kind: FrameKind::Replay { offset: 0 },
             },
             b"12345".to_vec(),
@@ -2435,7 +2456,7 @@ mod tests {
             &mut client,
             pohunek_worker_protocol::CURRENT_VERSION,
             stream_id,
-            runtime_id,
+            worker_instance_id,
             4,
         )
         .await
@@ -2504,13 +2525,13 @@ mod tests {
     async fn attach_ready_reports_authoritative_dimensions() {
         let (mut client, mut worker) = UnixStream::pair().expect("worker stream pair");
         let stream_id = StreamId::new("a-ready").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-ready").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-ready").expect("runtime id");
         let dimensions = Dimensions::new(100, 30).expect("dimensions");
         let frame = DataFrame::new(
             FrameHeader {
                 version: pohunek_worker_protocol::CURRENT_VERSION,
                 stream_id: stream_id.clone(),
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 kind: FrameKind::AttachReady { dimensions },
             },
             Vec::new(),
@@ -2521,7 +2542,7 @@ mod tests {
             .expect("write ready frame");
 
         assert_eq!(
-            read_attach_ready(&mut client, &stream_id, &runtime_id)
+            read_attach_ready(&mut client, &stream_id, &worker_instance_id)
                 .await
                 .expect("read ready frame"),
             dimensions
@@ -2532,12 +2553,12 @@ mod tests {
     async fn attach_ready_surfaces_the_worker_error() {
         let (mut client, mut worker) = UnixStream::pair().expect("worker stream pair");
         let stream_id = StreamId::new("a-error").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-error").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-error").expect("runtime id");
         let frame = DataFrame::new(
             FrameHeader {
                 version: pohunek_worker_protocol::CURRENT_VERSION,
                 stream_id: stream_id.clone(),
-                runtime_id: runtime_id.clone(),
+                worker_instance_id: worker_instance_id.clone(),
                 kind: FrameKind::Error {
                     error: pohunek_worker_protocol::ControlError {
                         code: ControlCode::InvalidState,
@@ -2554,7 +2575,7 @@ mod tests {
             .expect("write error frame");
 
         assert!(matches!(
-            read_attach_ready(&mut client, &stream_id, &runtime_id).await,
+            read_attach_ready(&mut client, &stream_id, &worker_instance_id).await,
             Err(WorkerError::Rejected {
                 code: ControlCode::InvalidState,
                 retryable: false,
@@ -2567,12 +2588,12 @@ mod tests {
     async fn attach_ready_timeout_releases_dimension_order() {
         let (mut client, _worker) = UnixStream::pair().expect("worker stream pair");
         let stream_id = StreamId::new("a-timeout").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-timeout").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-timeout").expect("runtime id");
         let order = Arc::new(Mutex::new(()));
         let guard = Arc::clone(&order).lock_owned().await;
 
         let ready = tokio::spawn(async move {
-            read_ordered_attach_ready(&mut client, &stream_id, &runtime_id, guard).await
+            read_ordered_attach_ready(&mut client, &stream_id, &worker_instance_id, guard).await
         });
         tokio::task::yield_now().await;
         tokio::time::advance(ATTACH_READY_TIMEOUT).await;

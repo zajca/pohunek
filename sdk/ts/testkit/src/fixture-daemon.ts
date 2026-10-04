@@ -14,9 +14,9 @@ import {
   EVENT_SESSION_UPDATED,
   EVENT_SUBAGENT_STATE,
   MAX_CONTROL_LINE_BYTES,
-  MAX_RUNTIME_ID_BYTES,
   MAX_SESSION_OUTPUT_BYTES,
   MAX_SESSION_WAIT_MS,
+  MAX_WORKER_INSTANCE_ID_BYTES,
   PROTOCOL_VERSION,
   type AgentActivity,
   type AgentKind,
@@ -430,20 +430,20 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     return (this.sessionInputs.get(sessionId) ?? []).map(copyBytes);
   }
 
-  public replaceRuntime(sessionId: string, runtimeId?: string): void {
+  public replaceRuntime(sessionId: string, workerInstanceId?: string): void {
     const session = this.requireSession(sessionId);
     const current = this.observation(sessionId);
     const nextGeneration = incrementU64(current.runtime_generation, "fixture runtime generation");
-    const nextRuntimeId = runtimeId ?? `${current.runtime_id}-replacement`;
+    const nextWorkerInstanceId = workerInstanceId ?? `${current.runtime_id}-replacement`;
     const nextWorkerId = `${current.worker_id}-replacement`;
-    if (!isBoundedRuntimeId(nextRuntimeId)) {
+    if (!isBoundedWorkerInstanceId(nextWorkerInstanceId)) {
       throw new Error("fixture replacement runtime id must be a bounded control-free identifier");
     }
     session.runtime = {
       state: "live",
       runtime_generation: nextGeneration.toString(),
       worker_id: nextWorkerId,
-      runtime_id: nextRuntimeId,
+      runtime_id: nextWorkerInstanceId,
       started_at: timestamp(),
       last_connected_at: timestamp(),
     };
@@ -451,7 +451,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     session.state_source = "process";
     session.updated_at = timestamp();
     this.observations.set(sessionId, {
-      runtime_id: nextRuntimeId,
+      runtime_id: nextWorkerInstanceId,
       runtime_generation: nextGeneration,
       worker_id: nextWorkerId,
       history_start_offset: 0n,
@@ -482,7 +482,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     sessionId: string,
     bytes: Uint8Array,
     historyStartOffset: number | bigint,
-    runtimeId?: string,
+    workerInstanceId?: string,
   ): void {
     this.requireSession(sessionId);
     const parsedHistoryStart = fixtureU64(historyStartOffset);
@@ -492,13 +492,13 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (checkedAddU64(parsedHistoryStart, BigInt(bytes.byteLength)) === undefined) {
       throw new Error("fixture retained output end exceeds u64");
     }
-    if (runtimeId !== undefined && !isBoundedRuntimeId(runtimeId)) {
+    if (workerInstanceId !== undefined && !isBoundedWorkerInstanceId(workerInstanceId)) {
       throw new Error("fixture runtime id must be a bounded control-free identifier");
     }
     const current = this.observation(sessionId);
     this.observations.set(sessionId, {
       ...current,
-      runtime_id: runtimeId ?? current.runtime_id,
+      runtime_id: workerInstanceId ?? current.runtime_id,
       history_start_offset: parsedHistoryStart,
       output: copyBytes(bytes),
       watermark: incrementU64(current.watermark, "fixture terminal watermark"),
@@ -1629,12 +1629,12 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (runtimeGeneration === undefined) {
       throw new Error("fixture session runtime generation must be an unsigned u64");
     }
-    const runtimeId = session.runtime?.runtime_id ?? `runtime-${sessionId}`;
-    if (!isBoundedRuntimeId(runtimeId)) {
+    const workerInstanceId = session.runtime?.runtime_id ?? `runtime-${sessionId}`;
+    if (!isBoundedWorkerInstanceId(workerInstanceId)) {
       throw new Error("fixture session runtime id must be a bounded control-free identifier");
     }
     const observation: FixtureObservation = {
-      runtime_id: runtimeId,
+      runtime_id: workerInstanceId,
       runtime_generation: runtimeGeneration,
       worker_id: session.runtime?.worker_id ?? `worker-${sessionId}`,
       history_start_offset: 0n,
@@ -2334,7 +2334,7 @@ function sameRuntime(
 function isRuntimeIdentity(value: unknown): value is SessionRuntimeIdentity {
   return isRecord(value)
     && hasOnlyKeys(value, ["runtime_id", "runtime_generation"])
-    && isBoundedRuntimeId(value["runtime_id"])
+    && isBoundedWorkerInstanceId(value["runtime_id"])
     && parseDecimalU64(value["runtime_generation"]) !== undefined;
 }
 
@@ -2384,10 +2384,10 @@ function minU64(left: bigint, right: bigint): bigint {
   return left < right ? left : right;
 }
 
-function isBoundedRuntimeId(value: unknown): value is string {
+function isBoundedWorkerInstanceId(value: unknown): value is string {
   return typeof value === "string"
     && value.length > 0
-    && Buffer.byteLength(value, "utf8") <= MAX_RUNTIME_ID_BYTES
+    && Buffer.byteLength(value, "utf8") <= MAX_WORKER_INSTANCE_ID_BYTES
     && !/\p{Cc}/u.test(value);
 }
 

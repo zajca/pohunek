@@ -200,7 +200,9 @@ pub struct PendingLaunchClaim {
     /// reports from replacing the original native reference during this runtime.
     pub retry_pending: bool,
     /// Runtime generation that accepted this claim.
-    pub runtime_id: String,
+    /// The persisted key stays `runtime_id`.
+    #[serde(rename = "runtime_id")]
+    pub worker_instance_id: String,
     /// Exact PTY root generation authorizing the claim.
     pub root: ChildIdentity,
     /// Unverified immutable launch reference; never exposed as verified state.
@@ -288,7 +290,9 @@ pub struct JournalRecord {
     #[serde(flatten)]
     pub origin: WorkerOrigin,
     /// Runtime generation identifier after initialization.
-    pub runtime_id: Option<String>,
+    /// The persisted key stays `runtime_id`.
+    #[serde(rename = "runtime_id")]
+    pub worker_instance_id: Option<String>,
     /// Lowest supported private-protocol version.
     pub protocol_minimum: u16,
     /// Highest supported private-protocol version.
@@ -341,7 +345,7 @@ impl Debug for JournalRecord {
             .field("session_id", &self.session_id)
             .field("worker_id", &self.worker_id)
             .field("origin", &self.origin)
-            .field("runtime_id", &self.runtime_id)
+            .field("worker_instance_id", &self.worker_instance_id)
             .field("protocol_minimum", &self.protocol_minimum)
             .field("protocol_maximum", &self.protocol_maximum)
             .field("worker_pid", &self.worker_pid)
@@ -388,7 +392,7 @@ impl JournalRecord {
             session_id,
             worker_id,
             origin,
-            runtime_id: None,
+            worker_instance_id: None,
             protocol_minimum: protocol_range.0,
             protocol_maximum: protocol_range.1,
             worker_pid: process_id,
@@ -649,7 +653,7 @@ mod tests {
             .pending_launch_claims
             .push(super::PendingLaunchClaim {
                 retry_pending: true,
-                runtime_id: "runtime-1".to_owned(),
+                worker_instance_id: "runtime-1".to_owned(),
                 root: record.launch_identity.as_ref().unwrap().process.clone(),
                 identity: record.launch_identity.as_ref().unwrap().clone(),
                 expires_at: "2026-07-23T00:01:00Z".to_owned(),
@@ -699,6 +703,26 @@ mod tests {
                 .mode()
                 & 0o777,
             0o700
+        );
+    }
+
+    /// Journals are read across worker and daemon builds, so the worker
+    /// instance identifier keeps its `runtime_id` key.
+    #[test]
+    fn journal_keeps_the_runtime_id_key_for_the_worker_instance() {
+        let mut record = record("native-reference");
+        record.worker_instance_id = Some("instance-1".to_owned());
+        let json = serde_json::to_value(&record).expect("serialize journal");
+
+        assert_eq!(json["runtime_id"], "instance-1");
+        assert!(json.get("worker_instance_id").is_none());
+        assert_eq!(json["pending_launch_claims"][0]["runtime_id"], "runtime-1");
+        assert!(json["pending_launch_claims"][0]
+            .get("worker_instance_id")
+            .is_none());
+        assert_eq!(
+            serde_json::from_value::<JournalRecord>(json).expect("deserialize journal"),
+            record
         );
     }
 

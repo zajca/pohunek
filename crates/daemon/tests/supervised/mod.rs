@@ -135,7 +135,7 @@ pub(crate) struct Snapshot {
     /// Worker identifier the daemon reports.
     pub(crate) worker_id: String,
     /// Runtime identifier the daemon reports.
-    pub(crate) runtime_id: String,
+    pub(crate) worker_instance_id: String,
 }
 
 impl Snapshot {
@@ -576,7 +576,7 @@ impl Installation {
             child: self.identity(info.pid).expect("PTY child is running"),
             tty: tty(info.pid),
             worker_id: runtime.worker_id.clone().expect("worker id"),
-            runtime_id: runtime.runtime_id.clone().expect("runtime id"),
+            worker_instance_id: runtime.runtime_id.clone().expect("runtime id"),
         }
     }
 
@@ -714,7 +714,7 @@ impl Installation {
                 state: runtime.state,
                 runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: runtime.worker_id.clone(),
-                runtime_id: runtime.runtime_id.clone(),
+                runtime_id: runtime.worker_instance_id.clone(),
                 started_at: Some(now.clone()),
                 last_connected_at: Some(now.clone()),
                 loss_reason: runtime.reason.clone(),
@@ -794,7 +794,7 @@ impl Installation {
         RuntimeRecord {
             state,
             worker_id: None,
-            runtime_id: None,
+            worker_instance_id: None,
             service_id: Some(key.service_id().to_string()),
             generation: Some(key.generation().to_owned()),
             executable: Some(self.config.worker_executable()),

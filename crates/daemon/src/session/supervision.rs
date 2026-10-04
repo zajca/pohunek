@@ -209,7 +209,7 @@ pub(super) struct JournalWorker<'a> {
     pub(super) start_identity: &'a str,
     /// Runtime (PTY) identifier after initialization; its processes carry it
     /// as their ownership marker.
-    pub(super) runtime_id: Option<&'a str>,
+    pub(super) worker_instance_id: Option<&'a str>,
 }
 
 impl JournalWorker<'_> {
@@ -257,9 +257,9 @@ pub(super) enum Unreachable {
         /// Runtime whose marked processes may have survived the worker; set
         /// only when `journaled`, since only the journal's PID check proves
         /// which runtime died.
-        runtime_id: Option<String>,
+        worker_instance_id: Option<String>,
         /// Start identity of the journaled worker process instance; set
-        /// alongside `runtime_id`. The marker sweep compares it against the
+        /// alongside `worker_instance_id`. The marker sweep compares it against the
         /// start identity of unreadable-marker processes, so long-lived
         /// non-dumpable bystanders are provably not descendants of the
         /// runtime.
@@ -303,7 +303,7 @@ pub(super) fn classify_unreachable(
     let Some(worker) = worker else {
         return Unreachable::Ended {
             journaled: false,
-            runtime_id: None,
+            worker_instance_id: None,
             worker_start_identity: None,
         };
     };
@@ -314,7 +314,7 @@ pub(super) fn classify_unreachable(
     match inspector.is_running(identity) {
         Ok(false) => Unreachable::Ended {
             journaled: true,
-            runtime_id: worker.runtime_id.map(ToOwned::to_owned),
+            worker_instance_id: worker.worker_instance_id.map(ToOwned::to_owned),
             worker_start_identity: Some(identity.start_identity),
         },
         Ok(true) => Unreachable::Ambiguous(format!(
@@ -367,7 +367,7 @@ impl UnreadableCandidate {
 pub(super) fn record_accepted_process(
     accepted: &mut Vec<(UnconfirmedProcess, String)>,
     candidate: &UnreadableCandidate,
-    runtime_id: &str,
+    worker_instance_id: &str,
 ) {
     if accepted.iter().any(|(known, _)| {
         known.pid == candidate.identity.pid
@@ -375,7 +375,10 @@ pub(super) fn record_accepted_process(
     }) {
         return;
     }
-    accepted.push((candidate.to_unconfirmed_process(), runtime_id.to_owned()));
+    accepted.push((
+        candidate.to_unconfirmed_process(),
+        worker_instance_id.to_owned(),
+    ));
 }
 
 /// The verdict of a lost-runtime sweep together with what blocked it.
@@ -466,10 +469,10 @@ impl SessionRegistry {
     pub(super) async fn sweep_lost_runtime(
         &self,
         session_id: &str,
-        runtime_id: &str,
+        worker_instance_id: &str,
         worker_start_identity: Option<StartIdentity>,
     ) -> Cleanup {
-        self.sweep_lost_runtime_detailed(session_id, runtime_id, worker_start_identity)
+        self.sweep_lost_runtime_detailed(session_id, worker_instance_id, worker_start_identity)
             .await
             .cleanup
     }
@@ -479,7 +482,7 @@ impl SessionRegistry {
     pub(super) async fn sweep_lost_runtime_detailed(
         &self,
         session_id: &str,
-        runtime_id: &str,
+        worker_instance_id: &str,
         worker_start_identity: Option<StartIdentity>,
     ) -> SweepOutcome {
         let Some(grace) = self
@@ -491,20 +494,20 @@ impl SessionRegistry {
         else {
             tracing::warn!(
                 session_id,
-                runtime_id,
+                worker_instance_id,
                 "lost runtime is not swept without a supervision configuration"
             );
             return SweepOutcome::blocked_by_other();
         };
         let request = match SweepRequest::new(
-            runtime_id,
+            worker_instance_id,
             rustix::process::geteuid().as_raw(),
             grace,
             SWEEP_POLL_INTERVAL.min(grace),
         ) {
             Ok(request) => request.with_worker_start_identity(worker_start_identity),
             Err(error) => {
-                tracing::warn!(session_id, runtime_id, error = %error, "lost runtime cannot be swept");
+                tracing::warn!(session_id, worker_instance_id, error = %error, "lost runtime cannot be swept");
                 return SweepOutcome::blocked_by_other();
             }
         };
@@ -515,7 +518,7 @@ impl SessionRegistry {
                 Err(error) => {
                     tracing::warn!(
                         session_id,
-                        runtime_id,
+                        worker_instance_id,
                         sweep.pass = pass,
                         error = %error,
                         "lost runtime sweep aborted; remaining processes are left alone"
@@ -530,7 +533,7 @@ impl SessionRegistry {
                 .count();
             tracing::info!(
                 session_id,
-                runtime_id,
+                worker_instance_id,
                 sweep.pass = pass,
                 sweep.terminated = report.terminated.len(),
                 sweep.killed = report.killed.len(),
@@ -550,7 +553,7 @@ impl SessionRegistry {
             {
                 tracing::warn!(
                     session_id,
-                    runtime_id,
+                    worker_instance_id,
                     "lost runtime sweep could not confirm every process exited"
                 );
                 return SweepOutcome::blocked_by_other();
@@ -568,7 +571,7 @@ impl SessionRegistry {
         }
         tracing::warn!(
             session_id,
-            runtime_id,
+            worker_instance_id,
             sweep.passes = MAX_SWEEP_PASSES,
             "lost runtime still had marked or unreadable processes after every sweep pass"
         );

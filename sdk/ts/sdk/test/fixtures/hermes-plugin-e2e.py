@@ -221,7 +221,7 @@ def settle_output(
     """Advance past startup bytes and prove one bounded output no-change result."""
     for _ in range(20):
         settled = invoke(handlers, "pohunek_session_output", {
-            "session": session_id, "runtime_id": runtime_id, "runtime_generation": generation,
+            "session": session_id, "worker_instance_id": runtime_id, "runtime_generation": generation,
             "after_offset": cursor, "max_bytes": 4096, "wait_ms": 50,
         })
         next_cursor = require_output_shape(settled, session_id, runtime_id, generation)
@@ -332,7 +332,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_output",
         {
             "session": session_id,
-            "runtime_id": runtime_id,
+            "worker_instance_id": runtime_id,
             "runtime_generation": generation,
             "max_bytes": 4096,
         },
@@ -345,7 +345,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_wait",
         {
             "session": session_id,
-            "runtime_id": runtime_id,
+            "worker_instance_id": runtime_id,
             "runtime_generation": generation,
             "after_output_offset": cursor,
             "timeout_ms": 25,
@@ -359,7 +359,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_wait",
         {
             "session": session_id,
-            "runtime_id": runtime_id,
+            "worker_instance_id": runtime_id,
             "runtime_generation": generation,
             "after_output_offset": cursor,
             "timeout_ms": 2_000,
@@ -372,7 +372,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_output",
         {
             "session": session_id,
-            "runtime_id": runtime_id,
+            "worker_instance_id": runtime_id,
             "runtime_generation": generation,
             "after_offset": cursor,
             "max_bytes": 4096,
@@ -392,7 +392,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "host": args.remote_host, "session": session_id, "input": f"printf '{_REMOTE_MARKER}\\n'\n",
     })
     remote_wait = invoke(handlers, "pohunek_session_wait", {
-        "host": args.remote_host, "session": session_id, "runtime_id": runtime_id,
+        "host": args.remote_host, "session": session_id, "worker_instance_id": runtime_id,
         "runtime_generation": generation, "after_output_offset": cursor, "timeout_ms": 2_000,
     })
     require_wait(remote_wait, session_id, "output_advanced")
@@ -413,7 +413,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     gap_page = None
     for _ in range(_MAX_RETRIES):
         candidate = invoke(handlers, "pohunek_session_output", {
-            "session": session_id, "runtime_id": runtime_id, "runtime_generation": generation,
+            "session": session_id, "worker_instance_id": runtime_id, "runtime_generation": generation,
             "after_offset": "0", "max_bytes": 262_144,
         })
         if isinstance(candidate, dict) and isinstance(candidate.get("gap"), dict):
@@ -428,7 +428,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         raise FixtureError("gap did not begin at the requested cursor")
     canonical_u64(gap.get("end_offset"), "gap.end")
     recovered = invoke(handlers, "pohunek_session_output", {
-        "session": session_id, "runtime_id": runtime_id, "runtime_generation": generation,
+        "session": session_id, "worker_instance_id": runtime_id, "runtime_generation": generation,
         "after_offset": gap_cursor, "max_bytes": 4096,
     })
     require_output_shape(recovered, session_id, runtime_id, generation)
@@ -466,7 +466,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     hermes_session, hermes_runtime, hermes_generation = inspect_until_native(handlers, hermes_id)
     require_session_result(hermes_session, hermes_id, "Hermes start")
     hermes_output = invoke(handlers, "pohunek_session_output", {
-        "session": hermes_id, "runtime_id": hermes_runtime,
+        "session": hermes_id, "worker_instance_id": hermes_runtime,
         "runtime_generation": hermes_generation, "max_bytes": 4096,
     })
     old_cursor = require_output_shape(hermes_output, hermes_id, hermes_runtime, hermes_generation)
@@ -485,7 +485,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     if resumed_runtime == hermes_runtime or int(resumed_generation) <= int(hermes_generation):
         raise FixtureError("Hermes resume did not mint a new runtime identity")
     stale = invoke(handlers, "pohunek_session_wait", {
-        "session": hermes_id, "runtime_id": hermes_runtime, "runtime_generation": hermes_generation,
+        "session": hermes_id, "worker_instance_id": hermes_runtime, "runtime_generation": hermes_generation,
         "after_output_offset": old_cursor, "timeout_ms": 2_000,
     })
     require_wait(stale, hermes_id, "runtime_changed")

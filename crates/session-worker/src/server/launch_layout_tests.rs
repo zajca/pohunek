@@ -168,7 +168,7 @@ fn claim(provider: &str, pid: Pid, start: u64) -> PendingLaunchClaim {
     };
     PendingLaunchClaim {
         retry_pending: true,
-        runtime_id: "runtime-a".to_owned(),
+        worker_instance_id: "runtime-a".to_owned(),
         root: child(ROOT_PID, ROOT_START),
         identity: LaunchIdentity {
             provider: provider.to_owned(),

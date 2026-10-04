@@ -451,7 +451,7 @@ port is retained.
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
 | `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
-| `pohunek session output <target>` | Read a newest retained tail or continue with `--runtime-id`, `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
+| `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `runtime_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
 | `pohunek session wait <target>` | Long-poll up to 8000 ms for explicit state, activity, metadata, terminal, output, or runtime predicates. |
 | `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (currently Claude Code). |
 | `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |
@@ -544,10 +544,10 @@ pohunek session screen s-01J00000000000000000000000 --json
 pohunek session detection s-01J00000000000000000000000 --json
 pohunek session output s-01J00000000000000000000000 --max-bytes 65536 --json
 pohunek session output s-01J00000000000000000000000 \
-  --runtime-id runtime-1 --runtime-generation 3 --after-offset 4096 \
+  --worker-instance-id runtime-1 --runtime-generation 3 --after-offset 4096 \
   --max-bytes 65536 --wait-ms 5000 --json
 pohunek session wait s-01J00000000000000000000000 \
-  --runtime-id runtime-1 --runtime-generation 3 --after-output-offset 4096 \
+  --worker-instance-id runtime-1 --runtime-generation 3 --after-output-offset 4096 \
   --timeout-ms 8000 --json
 ```
 

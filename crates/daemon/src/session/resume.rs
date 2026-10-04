@@ -167,7 +167,7 @@ impl SessionRegistry {
                         .runtime
                         .as_ref()
                         .and_then(|runtime| runtime.worker_id.clone()),
-                    previous_runtime_id: entry
+                    previous_worker_instance_id: entry
                         .info
                         .runtime
                         .as_ref()
@@ -399,7 +399,7 @@ impl SessionRegistry {
                 ),
                 previous_job: super::Generation::from_record(&id.0, &record.runtime)?,
                 previous_worker_id: record.runtime.worker_id,
-                previous_runtime_id: record.runtime.runtime_id,
+                previous_worker_instance_id: record.runtime.worker_instance_id,
                 previous_runtime_generation: record
                     .info
                     .runtime

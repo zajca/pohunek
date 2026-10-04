@@ -86,17 +86,23 @@ async fn native_report_params(
             .inspect()
             .await
             .ok()
-            .and_then(|snapshot| Some((snapshot.runtime_id?, snapshot.child_process?)))
+            .and_then(|snapshot| Some((snapshot.worker_instance_id?, snapshot.child_process?)))
     } else {
         None
     };
-    let (runtime_id, pid, pid_start_identity) = identity.map_or_else(
+    let (worker_instance_id, pid, pid_start_identity) = identity.map_or_else(
         || ("runtime-unavailable".to_owned(), 1, 1),
-        |(runtime_id, process)| (runtime_id.to_string(), process.pid, process.start_identity),
+        |(worker_instance_id, process)| {
+            (
+                worker_instance_id.to_string(),
+                process.pid,
+                process.start_identity,
+            )
+        },
     );
     SessionReportNativeIdParams::new(
         session_id,
-        runtime_id,
+        worker_instance_id,
         agent,
         pid,
         ProcessStartIdentity::new(pid_start_identity),
@@ -112,7 +118,7 @@ macro_rules! native_report {
     (
         $registry:expr;
         session_id: $session_id:expr,
-        runtime_id: $runtime_id:expr,
+        worker_instance_id: $worker_instance_id:expr,
         agent: $agent:expr,
         pid: $pid:expr,
         pid_start_identity: $pid_start_identity:expr,
@@ -122,7 +128,7 @@ macro_rules! native_report {
         transcript_path: $transcript_path:expr $(,)?
     ) => {{
         let _ = (
-            $runtime_id,
+            $worker_instance_id,
             $pid,
             $pid_start_identity,
             $sequence,
@@ -880,7 +886,7 @@ def send(request):
 
 report = {
     "type": "identity_report",
-    "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
+    "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
     "provider": "claude",
     "pid": pid,
     "start_identity": start_identity,
@@ -905,7 +911,7 @@ assert send(stale) is False
 wait_for_test()
 assert send({
     "type": "identity_release",
-    "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
+    "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
     "provider": "claude",
     "pid": pid,
     "start_identity": start_identity,
@@ -919,7 +925,7 @@ assert send(reasserted) is True
 wait_for_test()
 assert send({
     "type": "identity_release",
-    "runtime_id": os.environ["POHUNEK_RUNTIME_ID"],
+    "runtime_id": os.environ["POHUNEK_WORKER_INSTANCE_ID"],
     "provider": "claude",
     "pid": pid,
     "start_identity": start_identity,
@@ -1899,6 +1905,7 @@ async fn foreign_foreground_process_does_not_hijack_reconciliation() {
         OwnershipMarkers {
             daemon_id: Some("foreign-daemon".to_owned()),
             session_id: Some("foreign-session".to_owned()),
+            worker_instance_id: None,
             runtime_id: None,
         },
     );
@@ -6239,12 +6246,15 @@ async fn wait_for_current_worker_metadata_record(
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
 ) {
     let worker_id = snapshot.worker_id.to_string();
-    let runtime_id = snapshot.runtime_id.as_ref().map(ToString::to_string);
+    let worker_instance_id = snapshot
+        .worker_instance_id
+        .as_ref()
+        .map(ToString::to_string);
     let is_current = |record: &crate::store::SessionRecord| {
         super::reconcile::worker_metadata_record_is_current(
             record,
             &worker_id,
-            runtime_id.as_deref(),
+            worker_instance_id.as_deref(),
         )
     };
     let mut memory_current = false;
@@ -7212,7 +7222,7 @@ async fn failed_stop_intent_rollback_does_not_overwrite_replacement_runtime() {
         .runtime
         .as_mut()
         .expect("runtime metadata")
-        .runtime_id = Some(original_runtime.runtime_id);
+        .runtime_id = Some(original_runtime.worker_instance_id);
     drop(sessions);
     let _ = registry.stop(&created.id).await;
 }
@@ -9239,6 +9249,7 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some("d-foreign".to_owned()),
             session_id: Some("s-1".to_owned()),
+            worker_instance_id: None,
             runtime_id: None,
         },
     );
@@ -9266,6 +9277,7 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some(registry.daemon_instance_id().to_owned()),
             session_id: Some(format!("{}-other", created.id.0)),
+            worker_instance_id: None,
             runtime_id: None,
         },
     );
@@ -9284,6 +9296,7 @@ async fn procwatch_skips_agents_owned_by_another_daemon_or_session() {
         OwnershipMarkers {
             daemon_id: Some(registry.daemon_instance_id().to_owned()),
             session_id: Some(created.id.0.clone()),
+            worker_instance_id: None,
             runtime_id: None,
         },
     );
@@ -9320,6 +9333,7 @@ async fn external_rescan_skips_processes_marked_by_any_pohunek_daemon() {
         OwnershipMarkers {
             daemon_id: Some("d-foreign".to_owned()),
             session_id: None,
+            worker_instance_id: None,
             runtime_id: None,
         },
     );
@@ -9800,7 +9814,11 @@ async fn report_native_id_records_binding_and_updates_info() {
         .as_ref()
         .expect("native identity ordering persisted");
     assert!(
-        !native_report_is_current(Some(ordering), &ordering.runtime_id, ordering.sequence - 1),
+        !native_report_is_current(
+            Some(ordering),
+            &ordering.worker_instance_id,
+            ordering.sequence - 1
+        ),
         "a lower sequence must remain stale after the ordering key is reloaded"
     );
 
@@ -9838,19 +9856,23 @@ async fn concurrent_session_writes_cannot_regress_native_ordering() {
         .expect("load base record")
         .pop()
         .expect("base session record");
-    let runtime_id = base.runtime.runtime_id.clone().expect("runtime identity");
+    let instance_id = base
+        .runtime
+        .worker_instance_id
+        .clone()
+        .expect("runtime identity");
     let older = native_ordering_record(
         &base,
-        &runtime_id,
+        &instance_id,
         created.pid,
         u64::MAX - 1,
         "native-older",
     );
-    let newer = native_ordering_record(&base, &runtime_id, created.pid, u64::MAX, "native-newer");
+    let newer = native_ordering_record(&base, &instance_id, created.pid, u64::MAX, "native-newer");
     write_newer_then_older(Arc::clone(&store), older.clone(), newer);
     let collision = native_ordering_record(
         &base,
-        &runtime_id,
+        &instance_id,
         created.pid,
         u64::MAX,
         "native-collision",
@@ -9926,7 +9948,7 @@ fn assert_previous_runtime_cannot_overwrite(
         .expect("runtime projection");
     runtime.runtime_generation = RuntimeGeneration::new(next_generation);
     runtime.runtime_id = Some("runtime-next".to_owned());
-    next_runtime.runtime.runtime_id = Some("runtime-next".to_owned());
+    next_runtime.runtime.worker_instance_id = Some("runtime-next".to_owned());
     next_runtime.native_identity_ordering = None;
     next_runtime.info.cols = 144;
     store
@@ -9953,7 +9975,7 @@ fn assert_previous_runtime_cannot_overwrite(
     );
     assert_eq!(runtime.runtime_id.as_deref(), Some("runtime-next"));
     assert_eq!(
-        persisted.runtime.runtime_id.as_deref(),
+        persisted.runtime.worker_instance_id.as_deref(),
         Some("runtime-next")
     );
     assert_eq!(persisted.info.cols, 144);
@@ -10027,7 +10049,7 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
         .as_mut()
         .expect("preparing runtime")
         .runtime_id = None;
-    preparing.runtime.runtime_id = None;
+    preparing.runtime.worker_instance_id = None;
     let store = crate::store::Store::new(store_path);
     assert_eq!(
         store.record_session(&preparing).expect("persist preparing"),
@@ -10554,15 +10576,15 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         .into_iter()
         .find(|record| record.session_id == created.id.0)
         .expect("durable pre-exit session");
-    let runtime_id = durable_before_exit
+    let worker_instance_id = durable_before_exit
         .runtime
-        .runtime_id
+        .worker_instance_id
         .clone()
         .expect("durable runtime id");
     durable_before_exit.info.native_session_id = Some("durable-native-newer".to_owned());
     durable_before_exit.info.native_session_path = Some("/work/durable-native-newer".to_owned());
     durable_before_exit.native_identity_ordering = Some(crate::store::NativeIdentityOrdering {
-        runtime_id,
+        worker_instance_id,
         pid: 4242,
         pid_start_identity: 777,
         sequence: 9,
@@ -10774,20 +10796,20 @@ async fn stop_test_worker(worker: crate::runtime::Worker) {
     let _ = worker.stop(transaction).await;
 }
 
-fn runtime_commit_candidate(entry: SessionEntry, runtime_id: &str) -> SessionEntry {
-    runtime_commit_candidate_for_generation(entry, runtime_id, 2)
+fn runtime_commit_candidate(entry: SessionEntry, worker_instance_id: &str) -> SessionEntry {
+    runtime_commit_candidate_for_generation(entry, worker_instance_id, 2)
 }
 
 fn runtime_commit_candidate_for_generation(
     mut entry: SessionEntry,
-    runtime_id: &str,
+    worker_instance_id: &str,
     generation: u64,
 ) -> SessionEntry {
     entry.info.state = SessionState::Running;
     let runtime = entry.info.runtime.as_mut().expect("candidate runtime");
     runtime.state = RuntimeState::Live;
     runtime.runtime_generation = RuntimeGeneration::new(generation);
-    runtime.runtime_id = Some(runtime_id.to_owned());
+    runtime.runtime_id = Some(worker_instance_id.to_owned());
     entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Live);
     entry.last_native_report = None;
     entry
@@ -10799,7 +10821,7 @@ async fn commit_runtime_candidate(
     id: SessionId,
     entry: SessionEntry,
 ) -> Result<String, protocol::ProtocolError> {
-    let runtime_id = entry
+    let worker_instance_id = entry
         .info
         .runtime
         .as_ref()
@@ -10809,7 +10831,7 @@ async fn commit_runtime_candidate(
     barrier.wait().await;
     registry.commit_session_entry(&id, entry).await?;
     registry.emit(protocol::event::SESSION_UPDATED, &info);
-    Ok(runtime_id)
+    Ok(worker_instance_id)
 }
 
 async fn assert_runtime_commit_winner(
@@ -10829,7 +10851,7 @@ async fn assert_runtime_commit_winner(
         memory.runtime.and_then(|runtime| runtime.runtime_id),
         Some(winner.to_owned())
     );
-    assert_eq!(durable.runtime.runtime_id.as_deref(), Some(winner));
+    assert_eq!(durable.runtime.worker_instance_id.as_deref(), Some(winner));
     registry
         .write_session_record(durable)
         .await
@@ -10838,14 +10860,14 @@ async fn assert_runtime_commit_winner(
 
 fn native_ordering_record(
     base: &crate::store::SessionRecord,
-    runtime_id: &str,
+    worker_instance_id: &str,
     pid: u32,
     sequence: u64,
     native: &str,
 ) -> crate::store::SessionRecord {
     let mut record = base.clone();
     record.native_identity_ordering = Some(crate::store::NativeIdentityOrdering {
-        runtime_id: runtime_id.to_owned(),
+        worker_instance_id: worker_instance_id.to_owned(),
         pid,
         pid_start_identity: 1,
         sequence,
@@ -10976,14 +10998,14 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
     )
     .await;
     let claim = |session_id: SessionId,
-                 runtime_id: &str,
+                 worker_instance_id: &str,
                  start_identity: ProcessStartIdentity,
                  sequence: u64,
                  expires_at: &str,
                  native_id: &str| {
         SessionReportNativeIdParams::new(
             session_id,
-            runtime_id,
+            worker_instance_id,
             "claude",
             coordinates.pid(),
             start_identity,
@@ -11425,7 +11447,7 @@ async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
         .expect("create non-resumable Claude session");
     assert!(!created.capabilities.resume);
     assert!(!created.capabilities.fork);
-    let runtime_id = created
+    let worker_instance_id = created
         .runtime
         .as_ref()
         .and_then(|runtime| runtime.runtime_id.clone())
@@ -11434,7 +11456,7 @@ async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
     let result = registry
         .report_native_id(native_report!(&registry;
             session_id: created.id.clone(),
-            runtime_id: runtime_id,
+            worker_instance_id: worker_instance_id,
             agent: "claude".to_owned(),
             pid: created.pid,
             pid_start_identity: 1,
@@ -12474,7 +12496,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
 }
 
 #[tokio::test]
-async fn native_recovered_event_carries_previous_and_new_runtime_ids() {
+async fn native_recovered_event_carries_previous_and_new_worker_instance_ids() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
@@ -15587,7 +15609,7 @@ async fn reconciled_create_whose_worker_ended_is_retired_then_compensated() {
         kind: crate::store::TransactionKind::Create,
         phase: "preparing".to_owned(),
         previous_worker_id: None,
-        previous_runtime_id: None,
+        previous_worker_instance_id: None,
         daemon_instance_id: None,
     });
     record.desired_state = crate::store::DesiredState::Running;

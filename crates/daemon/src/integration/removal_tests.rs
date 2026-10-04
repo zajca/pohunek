@@ -177,9 +177,17 @@ fn uninstall_after_upgrade_removes_an_older_marked_script() {
     let claude = scoped_dir("rm-upgrade-claude");
     install_claude(&claude).expect("install");
     let state = claude.join("hooks").join(STATE_HOOK_INSTALL_NAME);
-    fs::write(&state, CLAUDE_HOOK_ASSET.replace("VERSION=7", "VERSION=1")).expect("age script");
+    fs::write(
+        &state,
+        CLAUDE_HOOK_ASSET.replace(&expected_version_marker(), "VERSION=1"),
+    )
+    .expect("age script");
     install_claude(&claude).expect("upgrade");
-    fs::write(&state, CLAUDE_HOOK_ASSET.replace("VERSION=7", "VERSION=2")).expect("age again");
+    fs::write(
+        &state,
+        CLAUDE_HOOK_ASSET.replace(&expected_version_marker(), "VERSION=2"),
+    )
+    .expect("age again");
 
     let report = uninstall_claude(&claude).expect("uninstall aged install");
 
@@ -190,7 +198,7 @@ fn uninstall_after_upgrade_removes_an_older_marked_script() {
     install_codex(&codex).expect("install");
     fs::write(
         codex.join(STATE_HOOK_INSTALL_NAME),
-        CODEX_HOOK_ASSET.replace("VERSION=7", "VERSION=1"),
+        CODEX_HOOK_ASSET.replace(&expected_version_marker(), "VERSION=1"),
     )
     .expect("age script");
     uninstall_codex(&codex).expect("uninstall aged Codex");
@@ -585,6 +593,63 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set mode");
 }
 
+/// The version marker the shipped assets carry.
+fn expected_version_marker() -> String {
+    format!("VERSION={}", protocol::EXPECTED_INTEGRATION_VERSION)
+}
+
+/// The shipped state hook rewritten to the previous asset's single-name read
+/// of the worker instance (`POHUNEK_RUNTIME_ID` only).
+fn state_asset_reading_only_runtime_id(asset: &str) -> String {
+    let shipped =
+        "os.environ.get(\"POHUNEK_WORKER_INSTANCE_ID\") or os.environ.get(\"POHUNEK_RUNTIME_ID\")";
+    assert!(asset.contains(shipped));
+    asset.replace(shipped, "os.environ.get(\"POHUNEK_RUNTIME_ID\")")
+}
+
+/// An installed script from the previous asset version differs from the
+/// shipped one, so the doctor reports it for reinstall whether or not its
+/// version marker was kept.
+#[test]
+fn doctor_flags_a_stale_hook_that_reads_only_the_old_environment_name() {
+    let stale_version = format!("VERSION={}", protocol::EXPECTED_INTEGRATION_VERSION - 1);
+    let variants = [
+        (
+            "same version marker",
+            state_asset_reading_only_runtime_id(CLAUDE_HOOK_ASSET),
+        ),
+        (
+            "previous version marker",
+            state_asset_reading_only_runtime_id(CLAUDE_HOOK_ASSET)
+                .replace(&expected_version_marker(), &stale_version),
+        ),
+    ];
+    for (name, content) in variants {
+        let dir = fresh_claude();
+        write_file(dir.join("hooks").join(STATE_HOOK_INSTALL_NAME), content);
+
+        let status = explicit_status(&dir, AgentKind::Claude);
+        let doctor = diagnose(status.clone(), &[]);
+
+        assert_eq!(status.state, IntegrationInstallState::Outdated, "{name}");
+        assert_eq!(
+            status.recovery,
+            protocol::IntegrationRecovery::Reinstall,
+            "{name}"
+        );
+        assert!(!doctor.ok, "{name}");
+        let finding = find(&doctor.findings, Code::AssetModified);
+        assert_eq!(finding.severity, Severity::Error, "{name}");
+        assert!(
+            finding
+                .remediation
+                .as_deref()
+                .is_some_and(|text| text.contains("pohunek integration install --agent claude")),
+            "{name}: {finding:?}"
+        );
+    }
+}
+
 #[test]
 fn doctor_maps_every_claude_drift_cause_to_its_finding() {
     type Mutation = fn(&Path);
@@ -609,7 +674,7 @@ fn doctor_maps_every_claude_drift_cause_to_its_finding() {
             |d| {
                 write_file(
                     d.join("hooks").join(STATE_HOOK_INSTALL_NAME),
-                    CLAUDE_HOOK_ASSET.replace("VERSION=7", "VERSION=1"),
+                    CLAUDE_HOOK_ASSET.replace(&expected_version_marker(), "VERSION=1"),
                 );
             },
             Code::AssetModified,

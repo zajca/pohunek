@@ -20,7 +20,7 @@ use super::{
 pub(super) struct ManagedSession {
     pub(super) worker: Worker,
     pub(super) worker_id: String,
-    pub(super) runtime_id: String,
+    pub(super) worker_instance_id: String,
     pub(super) runtime_generation: RuntimeGeneration,
 }
 
@@ -78,7 +78,7 @@ impl SessionRegistry {
         let result = SessionScreenResult {
             session_id: id.clone(),
             worker_id: managed.worker_id,
-            runtime: runtime_identity(managed.runtime_id, managed.runtime_generation)?,
+            runtime: runtime_identity(managed.worker_instance_id, managed.runtime_generation)?,
             watermark: TerminalWatermark::new(snapshot.watermark),
             dimensions: TerminalDimensions::new(
                 snapshot.dimensions.columns(),
@@ -142,8 +142,10 @@ impl SessionRegistry {
             return Err(ProtocolError::session_wait_limit_exceeded());
         }
         let managed = self.managed_session(params.session_id()).await?;
-        let current_runtime =
-            runtime_identity(managed.runtime_id.clone(), managed.runtime_generation)?;
+        let current_runtime = runtime_identity(
+            managed.worker_instance_id.clone(),
+            managed.runtime_generation,
+        )?;
         if params
             .runtime()
             .is_some_and(|runtime| runtime != &current_runtime)
@@ -164,7 +166,7 @@ impl SessionRegistry {
             )
             .await
             .map_err(observation_worker_error)?;
-        if output.runtime_id.as_str() != managed.runtime_id {
+        if output.worker_instance_id.as_str() != managed.worker_instance_id {
             return Err(ProtocolError::session_runtime_changed());
         }
         self.verify_managed_identity(params.session_id(), &managed)
@@ -322,7 +324,7 @@ impl SessionRegistry {
             .worker_id
             .clone()
             .ok_or_else(ProtocolError::session_terminal_unavailable)?;
-        let runtime_id = runtime
+        let worker_instance_id = runtime
             .runtime_id
             .clone()
             .ok_or_else(ProtocolError::session_terminal_unavailable)?;
@@ -330,7 +332,7 @@ impl SessionRegistry {
         Ok(ManagedSession {
             worker: worker.clone(),
             worker_id,
-            runtime_id,
+            worker_instance_id,
             runtime_generation,
         })
     }
@@ -351,7 +353,7 @@ impl SessionRegistry {
             return Err(ProtocolError::session_runtime_changed());
         };
         if runtime.worker_id.as_deref() != Some(observed.worker_id.as_str())
-            || runtime.runtime_id.as_deref() != Some(observed.runtime_id.as_str())
+            || runtime.runtime_id.as_deref() != Some(observed.worker_instance_id.as_str())
             || runtime.runtime_generation != observed.runtime_generation
         {
             return Err(ProtocolError::session_runtime_changed());
@@ -514,10 +516,10 @@ fn log_wait_completed(params: &SessionWaitParams, result: &SessionWaitResult, st
 }
 
 pub(crate) fn runtime_identity(
-    runtime_id: String,
+    worker_instance_id: String,
     runtime_generation: RuntimeGeneration,
 ) -> Result<SessionRuntimeIdentity, ProtocolError> {
-    SessionRuntimeIdentity::new(runtime_id, runtime_generation)
+    SessionRuntimeIdentity::new(worker_instance_id, runtime_generation)
         .map_err(|_error| ProtocolError::session_terminal_unavailable())
 }
 

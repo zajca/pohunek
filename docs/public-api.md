@@ -902,7 +902,8 @@ nothing else can shadow them:
 - `POHUNEK_ENV=1`
 - `POHUNEK_SESSION_ID`
 - `POHUNEK_WORKER_ID`
-- `POHUNEK_RUNTIME_ID`
+- `POHUNEK_WORKER_INSTANCE_ID` (identifies one worker instance, the PTY
+  generation that the public session runtime reports as `runtime_id`)
 - `POHUNEK_WORKER_SOCKET_PATH`
 - `POHUNEK_WORKER_HOOK_PROTOCOL_VERSION` (private worker-hook protocol version)
 - `POHUNEK_SOCKET_PATH` for daemon-targeted notification delivery
@@ -998,10 +999,21 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=7`, run their interpreter in isolated mode (`-I`,
-so the session working directory never shadows the standard library), read
+`POHUNEK_INTEGRATION_VERSION=8`, run their interpreter in isolated mode (`-I`,
+so the session working directory never shadows the standard library), read the
+worker instance from `POHUNEK_WORKER_INSTANCE_ID` (falling back to
+`POHUNEK_RUNTIME_ID`), read
 provider JSON through a bounded direct pipe without staging it on disk, and send the hook process's parent PID on
-`SessionStart`.
+`SessionStart`. An installed hook from an earlier asset version reads only
+`POHUNEK_RUNTIME_ID`, which current workers do not set, so it cannot report identity; `integration.status` reports it as
+`outdated` with `reinstall` recovery, and `integration.doctor` as an asset
+finding, until it is reinstalled. A worker sets only
+`POHUNEK_WORKER_INSTANCE_ID` and strips an inherited `POHUNEK_RUNTIME_ID` from its
+children. The hooks and the process sweep also read `POHUNEK_RUNTIME_ID` as the
+same worker instance marker, so descendants of a worker that set only that name
+are still reaped and still report identity; a process whose two markers name
+different instances, one of them the swept instance, is never signalled and
+leaves the cleanup unconfirmed (a pair naming other instances only is ignored).
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an
 optional `seq`. A release clears only the current matching active-agent claim;

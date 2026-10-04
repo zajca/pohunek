@@ -27,10 +27,10 @@ use protocol::{
     Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameError,
     FrameHeader, FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId, OutputGap,
     ProcessIdentity as WireProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
-    RequestKind, ResponseKind, RuntimeId, RuntimePhase as WireRuntimePhase, RuntimeScope,
-    SessionId, StreamId, StreamMode, SubagentPhase as WireSubagentPhase, SubagentSnapshot,
-    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WriteAck, WriteId,
-    ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    RequestKind, ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId,
+    StreamMode, SubagentPhase as WireSubagentPhase, SubagentSnapshot,
+    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
+    WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -79,7 +79,7 @@ const MAX_SUBAGENT_ID_BYTES: usize = 256;
 const MAX_SUBAGENT_TYPE_BYTES: usize = 128;
 /// Maximum outstanding one-use data tokens per worker.
 const DATA_TOKEN_CAPACITY: usize = 4_096;
-/// Entropy bytes used for opaque worker credentials and runtime IDs.
+/// Entropy bytes used for opaque worker credentials and worker instance IDs.
 const RANDOM_BYTES: usize = 16;
 /// Prefix shared by daemon-generated control input identifiers.
 const CONTROL_INPUT_PREFIX: &str = "input-";
@@ -519,7 +519,7 @@ impl Shared {
 #[derive(Debug)]
 struct State {
     phase: WireRuntimePhase,
-    runtime_id: Option<RuntimeId>,
+    worker_instance_id: Option<WorkerInstanceId>,
     pty: Option<PtyOwner>,
     initialize_transaction: Option<TransactionId>,
     launch_agent_base: Option<String>,
@@ -534,7 +534,7 @@ impl State {
     fn new(journal: JournalRecord) -> Self {
         Self {
             phase: WireRuntimePhase::Uninitialized,
-            runtime_id: None,
+            worker_instance_id: None,
             pty: None,
             initialize_transaction: None,
             launch_agent_base: None,
@@ -660,7 +660,7 @@ struct DataGrant {
     lease_epoch: u64,
     version: Version,
     expires_at_ms: u64,
-    runtime_id: RuntimeId,
+    worker_instance_id: WorkerInstanceId,
     stream_id: StreamId,
     mode: StreamMode,
     after_offset: Option<u64>,
@@ -991,7 +991,7 @@ async fn negotiate_request(
         supported_range: SUPPORTED_RANGE,
         session_id: shared.session_id.clone(),
         worker_id: shared.worker_id.clone(),
-        runtime_id: state.runtime_id.clone(),
+        worker_instance_id: state.worker_instance_id.clone(),
         worker_process: shared.worker_process,
         phase: state.phase,
         capabilities: capabilities(selected),
@@ -1077,14 +1077,14 @@ async fn initialize_request(
 
     {
         let state = shared.state.lock().await;
-        if let (Some(transaction), Some(runtime_id), Some(pty)) = (
+        if let (Some(transaction), Some(worker_instance_id), Some(pty)) = (
             state.initialize_transaction.as_ref(),
-            state.runtime_id.as_ref(),
+            state.worker_instance_id.as_ref(),
             state.pty.as_ref(),
         ) {
             if transaction == &initialize.transaction_id {
                 return Ok(ResponseKind::Initialized {
-                    runtime_id: runtime_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
                     child_process: wire_identity(pty.identity())?,
                 });
             }
@@ -1101,22 +1101,22 @@ async fn initialize_request(
 
     let runtime_value = random_value("runtime")
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
-    let runtime_id = RuntimeId::new(runtime_value)
+    let worker_instance_id = WorkerInstanceId::new(runtime_value)
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     {
         let mut state = shared.state.lock().await;
         state.phase = WireRuntimePhase::Starting;
         state.initialize_transaction = Some(initialize.transaction_id.clone());
-        state.runtime_id = Some(runtime_id.clone());
+        state.worker_instance_id = Some(worker_instance_id.clone());
         state.journal.phase = JournalPhase::Starting;
-        state.journal.runtime_id = Some(runtime_id.to_string());
+        state.journal.worker_instance_id = Some(worker_instance_id.to_string());
         state.journal.updated_at = timestamp();
         persist_control(shared.journal.clone(), state.journal.clone()).await?;
     };
     #[cfg(test)]
     pause_after_starting(shared).await;
 
-    let command = command_from_initialize(shared, &initialize, &runtime_id);
+    let command = command_from_initialize(shared, &initialize, &worker_instance_id);
     let history_bytes = usize::try_from(initialize.limits.output_history_bytes())
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
     let subscriber_bytes = usize::try_from(initialize.limits.subscriber_queue_bytes())
@@ -1146,12 +1146,12 @@ async fn initialize_request(
     .await?;
     shared.initialized_tx.send_replace(true);
     shared.emit(EventKind::RuntimeStarted {
-        runtime_id: runtime_id.clone(),
+        worker_instance_id: worker_instance_id.clone(),
         child_process,
     });
-    spawn_runtime_monitors(Arc::clone(shared), pty, runtime_id.clone());
+    spawn_runtime_monitors(Arc::clone(shared), pty, worker_instance_id.clone());
     Ok(ResponseKind::Initialized {
-        runtime_id,
+        worker_instance_id,
         child_process,
     })
 }
@@ -1242,7 +1242,7 @@ async fn open_data_request(
         lease_epoch,
         version,
         expires_at_ms,
-        runtime_id: scope.runtime_id.clone(),
+        worker_instance_id: scope.worker_instance_id.clone(),
         stream_id: stream_id.clone(),
         mode,
         after_offset,
@@ -1300,7 +1300,7 @@ async fn terminal_snapshot_request(
         .map_err(|error| control_error(ControlCode::RuntimeFault, error, true))?;
     validate_terminal_snapshot_dimensions(&snapshot, &shared.config)?;
     Ok(ResponseKind::TerminalSnapshot {
-        runtime_id: scope.runtime_id.clone(),
+        worker_instance_id: scope.worker_instance_id.clone(),
         snapshot: Box::new(snapshot),
     })
 }
@@ -1363,7 +1363,7 @@ async fn read_output_request(
         lease_epoch,
         version,
         expires_at_ms,
-        runtime_id: scope.runtime_id.clone(),
+        worker_instance_id: scope.worker_instance_id.clone(),
         stream_id,
         mode: StreamMode::Observation,
         after_offset,
@@ -1674,7 +1674,7 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
     Ok(InspectSnapshot {
         session_id: shared.session_id.clone(),
         worker_id: shared.worker_id.clone(),
-        runtime_id: state.runtime_id.clone(),
+        worker_instance_id: state.worker_instance_id.clone(),
         phase: state.phase,
         worker_process: shared.worker_process,
         child_process,
@@ -1742,11 +1742,15 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
     })
 }
 
-fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: RuntimeId) {
+fn spawn_runtime_monitors(
+    shared: Arc<Shared>,
+    pty: PtyOwner,
+    worker_instance_id: WorkerInstanceId,
+) {
     let (output_eof_tx, output_eof_rx) = oneshot::channel();
     let output_shared = Arc::clone(&shared);
     let output_pty = pty.clone();
-    let output_runtime = runtime_id.clone();
+    let output_runtime = worker_instance_id.clone();
     tokio::spawn(async move {
         let result = monitor_runtime_output(&output_shared, &output_pty, &output_runtime).await;
         let _ = output_eof_tx.send(result);
@@ -1755,7 +1759,7 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
     tokio::spawn(coordinate_runtime_completion(
         shared,
         pty,
-        runtime_id,
+        worker_instance_id,
         output_eof_rx,
     ));
 }
@@ -1763,7 +1767,7 @@ fn spawn_runtime_monitors(shared: Arc<Shared>, pty: PtyOwner, runtime_id: Runtim
 async fn monitor_runtime_output(
     shared: &Shared,
     pty: &PtyOwner,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
 ) -> Result<OutputCompletion, WorkerError> {
     let mut subscriber = pty
         .subscribe_output(Some(0))
@@ -1773,7 +1777,7 @@ async fn monitor_runtime_output(
             Some(OutputEvent::Replay(_) | OutputEvent::TerminalSnapshot(_)) => {}
             Some(OutputEvent::Output(chunk)) => {
                 shared.emit(EventKind::OutputAdvanced {
-                    runtime_id: runtime_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
                     next_offset: chunk
                         .offset
                         .saturating_add(u64::try_from(chunk.bytes.len()).unwrap_or(u64::MAX)),
@@ -1781,7 +1785,7 @@ async fn monitor_runtime_output(
             }
             Some(OutputEvent::Gap { watermark, .. }) => {
                 shared.emit(EventKind::TerminalChanged {
-                    runtime_id: runtime_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
                     watermark,
                 });
             }
@@ -1810,7 +1814,7 @@ async fn monitor_runtime_output(
 async fn coordinate_runtime_completion(
     shared: Arc<Shared>,
     pty: PtyOwner,
-    runtime_id: RuntimeId,
+    worker_instance_id: WorkerInstanceId,
     mut output_eof_rx: oneshot::Receiver<Result<OutputCompletion, WorkerError>>,
 ) {
     let exit = match wait_runtime_exit(&pty).await {
@@ -1819,7 +1823,7 @@ async fn coordinate_runtime_completion(
             let _ = pty
                 .stop("root-observation-failure", shared.config.stop_grace)
                 .await;
-            mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+            mark_runtime_faulted(&shared, worker_instance_id, WorkerError::Pty(error)).await;
             shared.shutdown.cancel();
             return;
         }
@@ -1835,7 +1839,7 @@ async fn coordinate_runtime_completion(
     let completion = match wait_for_output_completion(&shared, &pty, &mut output_eof_rx).await {
         Ok(completion) => completion,
         Err(error) => {
-            mark_runtime_faulted(&shared, runtime_id, error).await;
+            mark_runtime_faulted(&shared, worker_instance_id, error).await;
             shared.shutdown.cancel();
             return;
         }
@@ -1845,7 +1849,7 @@ async fn coordinate_runtime_completion(
         OutputCompletion::ForcedClosed { next_offset } => {
             mark_runtime_faulted_at_offset(
                 &shared,
-                runtime_id,
+                worker_instance_id,
                 WorkerError::Pty(PtyError::OutputForcedClosed),
                 Some(next_offset),
             )
@@ -1855,7 +1859,7 @@ async fn coordinate_runtime_completion(
         }
     };
     if let Err(error) = pty.finish_natural().await {
-        mark_runtime_faulted(&shared, runtime_id, WorkerError::Pty(error)).await;
+        mark_runtime_faulted(&shared, worker_instance_id, WorkerError::Pty(error)).await;
         shared.shutdown.cancel();
         return;
     }
@@ -1872,7 +1876,7 @@ async fn coordinate_runtime_completion(
         return;
     };
     shared.emit(EventKind::ChildExited {
-        runtime_id,
+        worker_instance_id,
         exit: status,
     });
     tokio::select! {
@@ -2006,13 +2010,17 @@ async fn wait_runtime_exit(pty: &PtyOwner) -> Result<Exit, PtyError> {
     pty.wait_exit().await
 }
 
-async fn mark_runtime_faulted(shared: &Shared, runtime_id: RuntimeId, error: WorkerError) {
-    mark_runtime_faulted_at_offset(shared, runtime_id, error, None).await;
+async fn mark_runtime_faulted(
+    shared: &Shared,
+    worker_instance_id: WorkerInstanceId,
+    error: WorkerError,
+) {
+    mark_runtime_faulted_at_offset(shared, worker_instance_id, error, None).await;
 }
 
 async fn mark_runtime_faulted_at_offset(
     shared: &Shared,
-    runtime_id: RuntimeId,
+    worker_instance_id: WorkerInstanceId,
     error: WorkerError,
     next_output_offset: Option<u64>,
 ) {
@@ -2039,7 +2047,7 @@ async fn mark_runtime_faulted_at_offset(
         );
     }
     shared.emit(EventKind::RuntimeFault {
-        runtime_id: Some(runtime_id),
+        worker_instance_id: Some(worker_instance_id),
         error: control_error(ControlCode::RuntimeFault, error, false),
     });
 }
@@ -2119,7 +2127,7 @@ async fn serve_data(
             &mut write_half,
             header.version,
             &header.stream_id,
-            &header.runtime_id,
+            &header.worker_instance_id,
             after_offset,
             observation,
             grant.lease_epoch,
@@ -2140,7 +2148,7 @@ async fn serve_data(
                     &mut write_half,
                     header.version,
                     &header.stream_id,
-                    &header.runtime_id,
+                    &header.worker_instance_id,
                     control_error(ControlCode::RuntimeFault, error, true),
                 )
                 .await;
@@ -2156,7 +2164,7 @@ async fn serve_data(
             &mut write_half,
             header.version,
             &header.stream_id,
-            &header.runtime_id,
+            &header.worker_instance_id,
             FrameKind::AttachReady { dimensions },
             Vec::new(),
         )
@@ -2173,7 +2181,7 @@ async fn serve_data(
         &mut write_half,
         header.version,
         &header.stream_id,
-        &header.runtime_id,
+        &header.worker_instance_id,
         mode,
         subscriber,
         grant.lease_epoch,
@@ -2204,7 +2212,7 @@ async fn serve_stream_data<R, W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     mode: StreamMode,
     mut subscriber: OutputSubscriber,
     expected_lease_epoch: u64,
@@ -2232,7 +2240,7 @@ where
                     writer,
                     version,
                     stream_id,
-                    runtime_id,
+                    worker_instance_id,
                     FrameKind::Close { reason: CloseReason::LeaseReleased },
                     Vec::new(),
                 ).await?;
@@ -2252,7 +2260,7 @@ where
                         writer,
                         version,
                         stream_id,
-                        runtime_id,
+                        worker_instance_id,
                         shared.config.data_payload_bytes,
                         output,
                         pty.output_forced_closed(),
@@ -2274,7 +2282,7 @@ where
                     writer,
                     version,
                     stream_id,
-                    runtime_id,
+                    worker_instance_id,
                     shared.config.data_payload_bytes,
                     output,
                     pty.output_forced_closed(),
@@ -2290,7 +2298,7 @@ where
                             writer,
                             version,
                             stream_id,
-                            runtime_id,
+                            worker_instance_id,
                             control_error(ControlCode::InvalidRequest, error, false),
                         ).await;
                     }
@@ -2301,7 +2309,7 @@ where
                         writer,
                         version,
                         stream_id,
-                        runtime_id,
+                        worker_instance_id,
                         control_error_message(
                             ControlCode::InvalidRequest,
                             "output data stream received a client frame",
@@ -2315,7 +2323,7 @@ where
                         writer,
                         version,
                         stream_id,
-                        runtime_id,
+                        worker_instance_id,
                         control_error_message(
                             ControlCode::InvalidRequest,
                             "attach data stream received a non-input frame",
@@ -2323,12 +2331,12 @@ where
                         ),
                     ).await;
                 };
-                if input_header.runtime_id != *runtime_id || input_header.stream_id != *stream_id {
+                if input_header.worker_instance_id != *worker_instance_id || input_header.stream_id != *stream_id {
                     return write_data_error(
                         writer,
                         version,
                         stream_id,
-                        runtime_id,
+                        worker_instance_id,
                         identity_mismatch(),
                     ).await;
                 }
@@ -2339,7 +2347,7 @@ where
                         writer,
                         version,
                         stream_id,
-                        runtime_id,
+                        worker_instance_id,
                         error,
                     ).await;
                 }
@@ -2352,7 +2360,7 @@ where
                         writer,
                         version,
                         stream_id,
-                        runtime_id,
+                        worker_instance_id,
                         input_control_error(error),
                     ).await;
                 }
@@ -2360,7 +2368,7 @@ where
                     writer,
                     version,
                     stream_id,
-                    runtime_id,
+                    worker_instance_id,
                     FrameKind::InputAck {
                         write_id,
                         bytes_written: byte_count,
@@ -2374,7 +2382,7 @@ where
                             writer,
                             version,
                             stream_id,
-                            runtime_id,
+                            worker_instance_id,
                             control_error_message(
                                 ControlCode::InvalidRequest,
                                 "attach input sequence was exhausted",
@@ -2447,7 +2455,7 @@ fn redeem_data_grant(
             ));
         }
         if grant.version != header.version
-            || grant.runtime_id != header.runtime_id
+            || grant.worker_instance_id != header.worker_instance_id
             || grant.stream_id != header.stream_id
             || grant.mode != mode
             || grant.after_offset != after_offset
@@ -2472,7 +2480,7 @@ async fn serve_observation_data<R, W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     after_offset: Option<u64>,
     observation: ObservationGrant,
     expected_lease_epoch: u64,
@@ -2502,7 +2510,7 @@ where
                 writer,
                 version,
                 stream_id,
-                runtime_id,
+                worker_instance_id,
                 FrameKind::Close {
                     reason: CloseReason::LeaseReleased,
                 },
@@ -2516,7 +2524,7 @@ where
                 writer,
                 version,
                 stream_id,
-                runtime_id,
+                worker_instance_id,
                 control_error_message(
                     ControlCode::InvalidRequest,
                     "observation stream is output-only",
@@ -2536,7 +2544,7 @@ where
             writer,
             version,
             stream_id,
-            runtime_id,
+            worker_instance_id,
             FrameKind::Close {
                 reason: CloseReason::LeaseReleased,
             },
@@ -2549,7 +2557,7 @@ where
         writer,
         version,
         stream_id,
-        runtime_id,
+        worker_instance_id,
         shared.config.data_payload_bytes,
         page,
         timed_out,
@@ -2648,7 +2656,7 @@ async fn write_observation_page<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
     page: crate::ObservationPage,
     timed_out: bool,
@@ -2664,7 +2672,7 @@ where
         writer,
         version,
         stream_id,
-        runtime_id,
+        worker_instance_id,
         FrameKind::ObservationStart {
             history_start_offset: page.history_start_offset,
             start_offset: page.start_offset,
@@ -2681,7 +2689,7 @@ where
         writer,
         version,
         stream_id,
-        runtime_id,
+        worker_instance_id,
         payload_limit,
         OutputChunk {
             offset: page.start_offset,
@@ -2694,7 +2702,7 @@ where
         writer,
         version,
         stream_id,
-        runtime_id,
+        worker_instance_id,
         FrameKind::Close {
             reason: CloseReason::ObservationComplete,
         },
@@ -2707,7 +2715,7 @@ async fn write_data_error<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     error: ControlError,
 ) -> Result<(), WorkerError>
 where
@@ -2717,7 +2725,7 @@ where
         writer,
         version,
         stream_id,
-        runtime_id,
+        worker_instance_id,
         FrameKind::Error { error },
         Vec::new(),
     )
@@ -2728,7 +2736,7 @@ async fn write_output_event<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
     output: OutputEvent,
 ) -> Result<(), WorkerError>
@@ -2742,7 +2750,7 @@ where
                 writer,
                 version,
                 stream_id,
-                runtime_id,
+                worker_instance_id,
                 payload_limit,
                 chunk,
                 true,
@@ -2754,7 +2762,7 @@ where
                 writer,
                 version,
                 stream_id,
-                runtime_id,
+                worker_instance_id,
                 payload_limit,
                 chunk,
                 false,
@@ -2766,7 +2774,7 @@ where
                 writer,
                 version,
                 stream_id,
-                runtime_id,
+                worker_instance_id,
                 FrameKind::Gap {
                     missing_start: missing.start,
                     missing_end: missing.end,
@@ -2782,7 +2790,7 @@ where
                 writer,
                 version,
                 stream_id,
-                runtime_id,
+                worker_instance_id,
                 payload_limit,
                 &snapshot,
                 &chunk.bytes,
@@ -2794,7 +2802,7 @@ where
                 writer,
                 version,
                 stream_id,
-                runtime_id,
+                worker_instance_id,
                 FrameKind::Close {
                     reason: CloseReason::RuntimeExited,
                 },
@@ -2809,7 +2817,7 @@ async fn write_runtime_output_event<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
     output: OutputEvent,
     forced_closed: bool,
@@ -2822,7 +2830,7 @@ where
             writer,
             version,
             stream_id,
-            runtime_id,
+            worker_instance_id,
             control_error(
                 ControlCode::RuntimeFault,
                 PtyError::OutputForcedClosed,
@@ -2835,7 +2843,7 @@ where
         writer,
         version,
         stream_id,
-        runtime_id,
+        worker_instance_id,
         payload_limit,
         output,
     )
@@ -2846,7 +2854,7 @@ async fn write_output_chunks<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
     chunk: OutputChunk,
     replay: bool,
@@ -2865,7 +2873,15 @@ where
                 offset: chunk_offset,
             }
         };
-        write_data_frame(writer, version, stream_id, runtime_id, kind, bytes.to_vec()).await?;
+        write_data_frame(
+            writer,
+            version,
+            stream_id,
+            worker_instance_id,
+            kind,
+            bytes.to_vec(),
+        )
+        .await?;
         chunk_offset = chunk_offset
             .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
             .ok_or_else(|| WorkerError::Protocol("output frame offset overflowed".to_owned()))?;
@@ -2877,7 +2893,7 @@ async fn write_terminal_chunks<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     payload_limit: usize,
     snapshot: &WireTerminalSnapshot,
     ansi: &[u8],
@@ -2890,7 +2906,7 @@ where
             writer,
             version,
             stream_id,
-            runtime_id,
+            worker_instance_id,
             FrameKind::TerminalSnapshot {
                 snapshot: snapshot.clone(),
             },
@@ -2905,7 +2921,7 @@ async fn write_data_frame<W>(
     writer: &mut W,
     version: Version,
     stream_id: &StreamId,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
     kind: FrameKind,
     payload: Vec<u8>,
 ) -> Result<(), WorkerError>
@@ -2916,7 +2932,7 @@ where
         FrameHeader {
             version,
             stream_id: stream_id.clone(),
-            runtime_id: runtime_id.clone(),
+            worker_instance_id: worker_instance_id.clone(),
             kind,
         },
         payload,
@@ -2931,7 +2947,8 @@ where
 #[serde(tag = "type", rename_all = "snake_case")]
 enum HookRequest {
     IdentityReport {
-        runtime_id: String,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: String,
         provider: String,
         pid: u32,
         start_identity: u64,
@@ -2941,14 +2958,16 @@ enum HookRequest {
         native_reference: Option<String>,
     },
     IdentityRelease {
-        runtime_id: String,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: String,
         provider: String,
         pid: u32,
         start_identity: u64,
         sequence: u64,
     },
     SubagentStart {
-        runtime_id: String,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: String,
         provider: String,
         pid: u32,
         start_identity: u64,
@@ -2958,7 +2977,8 @@ enum HookRequest {
         agent_type: Option<String>,
     },
     SubagentStop {
-        runtime_id: String,
+        #[serde(rename = "runtime_id")]
+        worker_instance_id: String,
         provider: String,
         pid: u32,
         start_identity: u64,
@@ -3004,9 +3024,9 @@ where
     let request: HookRequest =
         serde_json::from_value(value).map_err(|error| WorkerError::Protocol(error.to_string()))?;
     let mut launch_identity_status = LaunchClaimStatus::NotApplicable;
-    let (accepted, launch_identity_accepted, runtime_id, subagent_changed) = match request {
+    let (accepted, launch_identity_accepted, worker_instance_id, subagent_changed) = match request {
         HookRequest::IdentityReport {
-            runtime_id,
+            worker_instance_id,
             provider,
             pid,
             start_identity,
@@ -3016,10 +3036,10 @@ where
             native_reference,
         } => {
             let mut state = shared.state.lock().await;
-            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
             let inadmissible = hook_claim_admissible(
                 known_identity_provider(&provider),
-                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
             )
             .or_else(|| {
@@ -3076,7 +3096,7 @@ where
                         if &provider == launch_base {
                             let claim = PendingLaunchClaim {
                                 retry_pending: true,
-                                runtime_id,
+                                worker_instance_id,
                                 root: journal_identity(&root_identity),
                                 identity: LaunchIdentity {
                                     provider,
@@ -3115,17 +3135,17 @@ where
             }
         }
         HookRequest::IdentityRelease {
-            runtime_id,
+            worker_instance_id,
             provider,
             pid,
             start_identity,
             sequence,
         } => {
             let mut state = shared.state.lock().await;
-            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
             let inadmissible = hook_claim_admissible(
                 known_identity_provider(&provider),
-                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 true,
             );
             if let Some(reason) = inadmissible {
@@ -3181,7 +3201,7 @@ where
             }
         }
         HookRequest::SubagentStart {
-            runtime_id,
+            worker_instance_id,
             provider,
             pid,
             start_identity,
@@ -3192,10 +3212,10 @@ where
         } => {
             let occurred_at_ms = unix_ms();
             let mut state = shared.state.lock().await;
-            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
             let inadmissible = hook_claim_admissible(
                 known_subagent_provider(&provider),
-                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
             )
             .or_else(|| {
@@ -3244,7 +3264,7 @@ where
             }
         }
         HookRequest::SubagentStop {
-            runtime_id,
+            worker_instance_id,
             provider,
             pid,
             start_identity,
@@ -3254,10 +3274,10 @@ where
         } => {
             let occurred_at_ms = unix_ms();
             let mut state = shared.state.lock().await;
-            let current_runtime = state.runtime_id.as_ref().map(ToString::to_string);
+            let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
             let inadmissible = hook_claim_admissible(
                 known_subagent_provider(&provider),
-                current_runtime.as_deref() == Some(runtime_id.as_str()),
+                current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
             )
             .or_else(|| {
@@ -3301,11 +3321,13 @@ where
         }
     };
     if accepted {
-        if let Some(runtime_id) = runtime_id.and_then(|value| RuntimeId::new(value).ok()) {
+        if let Some(worker_instance_id) =
+            worker_instance_id.and_then(|value| WorkerInstanceId::new(value).ok())
+        {
             if subagent_changed {
-                shared.emit(EventKind::SubagentsChanged { runtime_id });
+                shared.emit(EventKind::SubagentsChanged { worker_instance_id });
             } else {
-                shared.emit(EventKind::IdentityChanged { runtime_id });
+                shared.emit(EventKind::IdentityChanged { worker_instance_id });
             }
         }
     }
@@ -3388,8 +3410,10 @@ async fn retry_launch_claims(
         // cannot overwrite ownership or a subsequently verified launch identity.
         persist(shared.journal.clone(), journal.clone()).await?;
         state.journal = journal;
-        if let (true, Some(runtime_id)) = (launch_became_accepted, state.runtime_id.clone()) {
-            shared.emit(EventKind::IdentityChanged { runtime_id });
+        if let (true, Some(worker_instance_id)) =
+            (launch_became_accepted, state.worker_instance_id.clone())
+        {
+            shared.emit(EventKind::IdentityChanged { worker_instance_id });
         }
         event!(name: "worker.launch_identity.retry.resolved", Level::INFO,
             launch.accepted = state.journal.launch_identity.is_some(),
@@ -3581,7 +3605,7 @@ fn validate_hook_process(pid: u32, start_identity: u64, root_pid: u32) -> Result
 /// Hermes plugin reports from the agent process. Binding a claim to the process
 /// that vouches for it keeps an unrelated command in the same terminal from
 /// rewriting another process's identity, which matters because the PTY root's
-/// environment carries the runtime id and the private socket path to everything
+/// environment carries the worker instance id and the private socket path to everything
 /// the operator runs.
 ///
 /// The ancestry walk reads live parent links, so the relationship holds only
@@ -3745,7 +3769,7 @@ async fn validate_scope(
     let state = shared.state.lock().await;
     if scope.session_id != shared.session_id
         || scope.worker_id != shared.worker_id
-        || state.runtime_id.as_ref() != Some(&scope.runtime_id)
+        || state.worker_instance_id.as_ref() != Some(&scope.worker_instance_id)
     {
         return Err(identity_mismatch());
     }
@@ -3777,7 +3801,7 @@ fn validate_lease(
 fn command_from_initialize(
     shared: &Shared,
     initialize: &Initialize,
-    runtime_id: &RuntimeId,
+    worker_instance_id: &WorkerInstanceId,
 ) -> Command {
     let mut environment = BTreeMap::new();
     let base = match &initialize.base_environment {
@@ -3806,7 +3830,10 @@ fn command_from_initialize(
             shared.session_id.to_string(),
         ),
         ("POHUNEK_WORKER_ID".to_owned(), shared.worker_id.to_string()),
-        ("POHUNEK_RUNTIME_ID".to_owned(), runtime_id.to_string()),
+        (
+            "POHUNEK_WORKER_INSTANCE_ID".to_owned(),
+            worker_instance_id.to_string(),
+        ),
         (
             "POHUNEK_WORKER_SOCKET_PATH".to_owned(),
             shared.socket_path.to_string_lossy().into_owned(),
@@ -4442,8 +4469,8 @@ mod tests {
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
         ControlResponse, Cursor, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
-        FrameKind, LeaseId, RequestId, ResponseKind, RuntimeId, StreamId, StreamMode, Version,
-        WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
+        FrameKind, LeaseId, RequestId, ResponseKind, StreamId, StreamMode, Version,
+        WorkerInstanceId, WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
@@ -4566,11 +4593,11 @@ mod tests {
         {
             let mut state = server.shared.state.lock().await;
             state.phase = super::WireRuntimePhase::Running;
-            state.runtime_id = Some(RuntimeId::new("runtime-claim").unwrap());
+            state.worker_instance_id = Some(WorkerInstanceId::new("runtime-claim").unwrap());
             state.launch_agent_base = Some("claude".into());
             state.pty = Some(pty.clone());
             state.journal.phase = super::JournalPhase::Live;
-            state.journal.runtime_id = Some("runtime-claim".into());
+            state.journal.worker_instance_id = Some("runtime-claim".into());
             state.journal.child = Some(super::journal_identity(pty.identity()));
         };
         (server, pty, directory)
@@ -5106,20 +5133,21 @@ mod tests {
             &config,
         )
         .expect("spawn PTY");
-        let runtime_id = RuntimeId::new("runtime-bounded-drain").expect("runtime id");
+        let worker_instance_id =
+            WorkerInstanceId::new("runtime-bounded-drain").expect("runtime id");
         let mut state = server.shared.state.lock().await;
         state.phase = super::WireRuntimePhase::Running;
-        state.runtime_id = Some(runtime_id.clone());
+        state.worker_instance_id = Some(worker_instance_id.clone());
         state.pty = Some(pty.clone());
         state.stop_grace = config.stop_grace;
         state.journal.phase = super::JournalPhase::Live;
-        state.journal.runtime_id = Some(runtime_id.as_str().to_owned());
+        state.journal.worker_instance_id = Some(worker_instance_id.as_str().to_owned());
         state.journal.child = Some(super::journal_identity(pty.identity()));
         drop(state);
         super::spawn_runtime_monitors(
             std::sync::Arc::clone(&server.shared),
             pty.clone(),
-            runtime_id,
+            worker_instance_id,
         );
 
         pohunek_test_support::wait::wait_until("the natural drain to complete", || async {
@@ -5272,21 +5300,22 @@ mod tests {
             &config,
         )
         .expect("spawn PTY");
-        let runtime_id = RuntimeId::new("runtime-escaped-output").expect("runtime id");
+        let worker_instance_id =
+            WorkerInstanceId::new("runtime-escaped-output").expect("runtime id");
         let () = {
             let mut state = server.shared.state.lock().await;
             state.phase = super::WireRuntimePhase::Running;
-            state.runtime_id = Some(runtime_id.clone());
+            state.worker_instance_id = Some(worker_instance_id.clone());
             state.pty = Some(pty.clone());
             state.stop_grace = config.stop_grace;
             state.journal.phase = super::JournalPhase::Live;
-            state.journal.runtime_id = Some(runtime_id.as_str().to_owned());
+            state.journal.worker_instance_id = Some(worker_instance_id.as_str().to_owned());
             state.journal.child = Some(super::journal_identity(pty.identity()));
         };
         super::spawn_runtime_monitors(
             std::sync::Arc::clone(&server.shared),
             pty.clone(),
-            runtime_id,
+            worker_instance_id,
         );
 
         pohunek_test_support::wait::wait_until("the forced-close fault", || async {
@@ -5487,7 +5516,7 @@ mod tests {
         let event = protocol::ControlEvent {
             event_sequence: 1,
             kind: EventKind::SubagentsChanged {
-                runtime_id: RuntimeId::new("runtime-1").expect("runtime id"),
+                worker_instance_id: WorkerInstanceId::new("runtime-1").expect("runtime id"),
             },
         };
         let mut previous = Connection::new(std::sync::Arc::new(
@@ -5524,7 +5553,7 @@ mod tests {
             lease_epoch,
             version,
             expires_at_ms: 100,
-            runtime_id: RuntimeId::new("runtime-token").expect("runtime id"),
+            worker_instance_id: WorkerInstanceId::new("runtime-token").expect("runtime id"),
             stream_id: StreamId::new("stream-token").expect("stream id"),
             mode: StreamMode::Detector,
             after_offset: None,
@@ -5557,7 +5586,7 @@ mod tests {
         FrameHeader {
             version,
             stream_id: grant.stream_id.clone(),
-            runtime_id: grant.runtime_id.clone(),
+            worker_instance_id: grant.worker_instance_id.clone(),
             kind: FrameKind::Open {
                 token,
                 mode: grant.mode,
@@ -5632,7 +5661,7 @@ mod tests {
         let output = crate::OutputHub::new(64, 64, 2, 10).expect("output hub");
         let subscriber = output.subscribe(Some(0)).expect("live output subscriber");
         let stream_id = StreamId::new("a-partial").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-claim").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-claim").expect("runtime id");
         let write_id =
             WriteId::new(format!("{ATTACH_INPUT_PREFIX}{stream_id}-1")).expect("write id");
         let typed = b"typed-mid-frame";
@@ -5643,7 +5672,7 @@ mod tests {
                 FrameHeader {
                     version: CURRENT_VERSION,
                     stream_id: stream_id.clone(),
-                    runtime_id: runtime_id.clone(),
+                    worker_instance_id: worker_instance_id.clone(),
                     kind: FrameKind::Input {
                         write_id: write_id.clone(),
                     },
@@ -5668,7 +5697,7 @@ mod tests {
                 &mut worker_out,
                 CURRENT_VERSION,
                 &stream_id,
-                &runtime_id,
+                &worker_instance_id,
                 StreamMode::Attach,
                 subscriber,
                 0,
@@ -5749,7 +5778,7 @@ mod tests {
             &mut written,
             CURRENT_VERSION,
             &StreamId::new("stream-observe").expect("stream id"),
-            &RuntimeId::new("runtime-claim").expect("runtime id"),
+            &WorkerInstanceId::new("runtime-claim").expect("runtime id"),
             Some(0),
             ObservationGrant {
                 max_bytes: 64,
@@ -6041,7 +6070,7 @@ mod tests {
         let response = ControlResponse {
             request_id: RequestId::new("snapshot-boundary").expect("request id"),
             kind: ResponseKind::TerminalSnapshot {
-                runtime_id: RuntimeId::new("runtime-snapshot").expect("runtime id"),
+                worker_instance_id: WorkerInstanceId::new("runtime-snapshot").expect("runtime id"),
                 snapshot: Box::new(snapshot.clone()),
             },
         };
@@ -6279,7 +6308,7 @@ mod tests {
     #[tokio::test]
     async fn data_stream_failure_is_emitted_as_a_typed_error_frame() {
         let stream_id = StreamId::new("a-error").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-error").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-error").expect("runtime id");
         let (mut reader, mut writer) = tokio::io::duplex(4_096);
         let expected = ControlError {
             code: ControlCode::RuntimeFault,
@@ -6291,7 +6320,7 @@ mod tests {
             &mut writer,
             CURRENT_VERSION,
             &stream_id,
-            &runtime_id,
+            &worker_instance_id,
             expected.clone(),
         )
         .await
@@ -6302,21 +6331,21 @@ mod tests {
             .expect("error frame");
 
         assert_eq!(frame.header().stream_id, stream_id);
-        assert_eq!(frame.header().runtime_id, runtime_id);
+        assert_eq!(frame.header().worker_instance_id, worker_instance_id);
         assert_eq!(frame.header().kind, FrameKind::Error { error: expected });
     }
 
     #[tokio::test]
     async fn forced_output_close_is_framed_as_a_runtime_fault() {
         let stream_id = StreamId::new("forced-close").expect("stream id");
-        let runtime_id = RuntimeId::new("runtime-forced-close").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-forced-close").expect("runtime id");
         let (mut reader, mut writer) = tokio::io::duplex(4_096);
 
         write_runtime_output_event(
             &mut writer,
             CURRENT_VERSION,
             &stream_id,
-            &runtime_id,
+            &worker_instance_id,
             1_024,
             crate::OutputEvent::Exit { next_offset: 42 },
             true,
@@ -6342,14 +6371,14 @@ mod tests {
             .map(|index| u8::try_from(index % 251).expect("value fits u8"))
             .collect::<Vec<_>>();
         let stream_id = StreamId::new("stream-1").expect("valid stream");
-        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let worker_instance_id = WorkerInstanceId::new("runtime-1").expect("valid runtime");
         let (mut reader, mut writer) = tokio::io::duplex(payload.len() * 2);
 
         write_output_chunks(
             &mut writer,
             CURRENT_VERSION,
             &stream_id,
-            &runtime_id,
+            &worker_instance_id,
             MAX_DATA_PAYLOAD_BYTES,
             crate::OutputChunk {
                 offset: 41,
@@ -6388,7 +6417,7 @@ mod tests {
             .map(|index| u8::try_from(index % 251).expect("value fits u8"))
             .collect::<Vec<_>>();
         let stream_id = StreamId::new("observation-1").expect("valid stream");
-        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let worker_instance_id = WorkerInstanceId::new("runtime-1").expect("valid runtime");
         let (mut reader, mut writer) = tokio::io::duplex(payload.len() * 2);
         let end = u64::try_from(payload.len()).expect("payload fits u64");
 
@@ -6396,7 +6425,7 @@ mod tests {
             &mut writer,
             CURRENT_VERSION,
             &stream_id,
-            &runtime_id,
+            &worker_instance_id,
             MAX_DATA_PAYLOAD_BYTES,
             crate::ObservationPage {
                 history_start_offset: 0,
@@ -6478,14 +6507,14 @@ mod tests {
             visible_lines: vec!["bounded repaint".to_owned()],
         };
         let stream_id = StreamId::new("stream-1").expect("valid stream");
-        let runtime_id = RuntimeId::new("runtime-1").expect("valid runtime");
+        let worker_instance_id = WorkerInstanceId::new("runtime-1").expect("valid runtime");
         let (mut reader, mut writer) = tokio::io::duplex(ansi.len() * 2);
 
         write_terminal_chunks(
             &mut writer,
             CURRENT_VERSION,
             &stream_id,
-            &runtime_id,
+            &worker_instance_id,
             MAX_DATA_PAYLOAD_BYTES,
             &snapshot,
             &ansi,
@@ -6594,11 +6623,13 @@ mod tests {
                 ("WATCHDOG_USEC", "1"),
                 ("XPC_SERVICE_NAME", "profile"),
                 ("POHUNEK_SESSION_ID", "s-spoofed"),
+                ("POHUNEK_RUNTIME_ID", "runtime-spoofed"),
             ],
         );
-        let runtime_id = RuntimeId::new("runtime-environment").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");
 
-        let command = super::command_from_initialize(&server.shared, &initialize, &runtime_id);
+        let command =
+            super::command_from_initialize(&server.shared, &initialize, &worker_instance_id);
 
         assert_eq!(command.base, crate::EnvBase::Empty);
         let environment = command
@@ -6617,7 +6648,7 @@ mod tests {
                 ("POHUNEK_ENV", "1"),
                 ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
                 ("POHUNEK_PROTOCOL_VERSION", "7"),
-                ("POHUNEK_RUNTIME_ID", "runtime-environment"),
+                ("POHUNEK_WORKER_INSTANCE_ID", "runtime-environment"),
                 ("POHUNEK_SESSION_ID", "s-114"),
                 (
                     "POHUNEK_SOCKET_PATH",
@@ -6642,9 +6673,10 @@ mod tests {
             .await
             .expect("bind worker");
         let initialize = environment_initialize(Some(base_environment(&[])), &[("TERM", "screen")]);
-        let runtime_id = RuntimeId::new("runtime-environment").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");
 
-        let command = super::command_from_initialize(&server.shared, &initialize, &runtime_id);
+        let command =
+            super::command_from_initialize(&server.shared, &initialize, &worker_instance_id);
 
         assert!(command
             .env
@@ -6665,9 +6697,10 @@ mod tests {
                 ("POHUNEK_BOOTSTRAP_TOKEN", "token"),
             ],
         );
-        let runtime_id = RuntimeId::new("runtime-environment").expect("runtime id");
+        let worker_instance_id = WorkerInstanceId::new("runtime-environment").expect("runtime id");
 
-        let command = super::command_from_initialize(&server.shared, &initialize, &runtime_id);
+        let command =
+            super::command_from_initialize(&server.shared, &initialize, &worker_instance_id);
 
         assert_eq!(command.base, crate::EnvBase::Inherited);
         let names = command

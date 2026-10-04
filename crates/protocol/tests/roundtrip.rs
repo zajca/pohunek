@@ -41,9 +41,9 @@ use protocol::{
     TeamId, TerminalCursor, TerminalDimensions, TerminalWatermark, TransferCoordinates,
     TransferOutcomeCandidate, TransferOutcomeId, TransferProposal, UnconfirmedProcess,
     GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
-    MAX_RUNTIME_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
     MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
-    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
+    MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::{json, Value};
@@ -2674,7 +2674,7 @@ fn typed_output_result_fits_reserved_envelope_at_exact_raw_limit() {
     let result = SessionOutputResult::new(
         SessionId("\\".repeat(MAX_SESSION_ID_BYTES)),
         SessionRuntimeIdentity::new(
-            "\\".repeat(MAX_RUNTIME_ID_BYTES),
+            "\\".repeat(MAX_WORKER_INSTANCE_ID_BYTES),
             RuntimeGeneration::new(u64::MAX),
         )
         .expect("maximum runtime id is valid"),
@@ -2714,7 +2714,7 @@ fn typed_output_result_fits_reserved_envelope_at_exact_raw_limit() {
     let over_limit = SessionOutputResult::new(
         SessionId("\\".repeat(MAX_SESSION_ID_BYTES)),
         SessionRuntimeIdentity::new(
-            "\\".repeat(MAX_RUNTIME_ID_BYTES),
+            "\\".repeat(MAX_WORKER_INSTANCE_ID_BYTES),
             RuntimeGeneration::new(u64::MAX),
         )
         .expect("maximum runtime id is valid"),
@@ -3155,7 +3155,7 @@ fn session_output_result_rejects_gap_flag_and_identifier_invariants() {
     assert!(matches!(
         output_result(
             valid_session,
-            "r".repeat(MAX_RUNTIME_ID_BYTES + 1),
+            "r".repeat(MAX_WORKER_INSTANCE_ID_BYTES + 1),
             String::new(),
             0,
             0,

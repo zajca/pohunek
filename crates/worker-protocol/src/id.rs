@@ -133,8 +133,10 @@ macro_rules! define_id {
 define_id!(SessionId, "Identifies one durable logical session.");
 define_id!(WorkerId, "Identifies one session-worker process.");
 define_id!(
-    RuntimeId,
-    "Identifies one uninterrupted PTY runtime generation."
+    WorkerInstanceId,
+    "Identifies one worker instance, one uninterrupted PTY generation.\n\n\
+     Every serialized field of this type uses the key `runtime_id`; the key is\n\
+     fixed so a live durable worker and a newer daemon read each other's messages."
 );
 define_id!(DaemonId, "Identifies one daemon process instance.");
 define_id!(RequestId, "Correlates one control request and response.");
@@ -152,9 +154,10 @@ mod tests {
 
     #[test]
     fn valid_id_round_trips_through_json() {
-        let id = RuntimeId::new("runtime_01.test-value").expect("valid identifier");
+        let id = WorkerInstanceId::new("runtime_01.test-value").expect("valid identifier");
         let json = serde_json::to_string(&id).expect("serialize identifier");
-        let decoded: RuntimeId = serde_json::from_str(&json).expect("deserialize identifier");
+        let decoded: WorkerInstanceId =
+            serde_json::from_str(&json).expect("deserialize identifier");
 
         assert_eq!(decoded, id);
     }

@@ -18,6 +18,8 @@ pub(super) const ENV_DAEMON_ID: &str = "POHUNEK_DAEMON_ID";
 /// Allowlisted session ownership marker.
 pub(super) const ENV_SESSION_ID: &str = "POHUNEK_SESSION_ID";
 /// Allowlisted worker runtime-generation ownership marker.
+pub(super) const ENV_WORKER_INSTANCE_ID: &str = "POHUNEK_WORKER_INSTANCE_ID";
+/// Read-only alternate spelling of the worker instance marker.
 pub(super) const ENV_RUNTIME_ID: &str = "POHUNEK_RUNTIME_ID";
 
 /// Width of the leading `KERN_PROCARGS2` argument count, written as a C `int`.
@@ -182,6 +184,8 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
             &mut markers.daemon_id
         } else if key == ENV_SESSION_ID.as_bytes() {
             &mut markers.session_id
+        } else if key == ENV_WORKER_INSTANCE_ID.as_bytes() {
+            &mut markers.worker_instance_id
         } else if key == ENV_RUNTIME_ID.as_bytes() {
             &mut markers.runtime_id
         } else {
@@ -196,6 +200,7 @@ fn collect_ownership_markers(mut region: &[u8]) -> Result<OwnershipMarkers, Layo
         }
         if markers.daemon_id.is_some()
             && markers.session_id.is_some()
+            && markers.worker_instance_id.is_some()
             && markers.runtime_id.is_some()
         {
             break;
@@ -407,14 +412,17 @@ mod tests {
             b"/bin/sleep",
             0,
             &[b"sleep"],
-            &[b"POHUNEK_RUNTIME_ID=runtime-a"],
+            &[b"POHUNEK_WORKER_INSTANCE_ID=runtime-a"],
         );
 
         let ArgumentRegion::Present(arguments) = decode_argument_region(&buffer) else {
             panic!("a well-formed region must decode");
         };
         assert_eq!(arguments.argv, vec!["sleep".to_owned()]);
-        assert_eq!(arguments.markers.runtime_id.as_deref(), Some("runtime-a"));
+        assert_eq!(
+            arguments.markers.worker_instance_id.as_deref(),
+            Some("runtime-a")
+        );
     }
 
     #[test]
@@ -437,7 +445,7 @@ mod tests {
             0,
             &[b"sh"],
             &[format!(
-                "POHUNEK_RUNTIME_ID={}",
+                "POHUNEK_WORKER_INSTANCE_ID={}",
                 "r".repeat(MAX_MARKER_VALUE_BYTES + 1)
             )
             .as_bytes()],
@@ -567,25 +575,69 @@ mod tests {
             2,
             b"/bin/sh",
             1,
-            &[b"sh", b"POHUNEK_RUNTIME_ID=argv-not-a-marker"],
+            &[b"sh", b"POHUNEK_WORKER_INSTANCE_ID=argv-not-a-marker"],
             &[
-                b"POHUNEK_RUNTIME_IDX=near-miss",
-                b"POHUNEK_RUNTIME_ID=runtime-a",
-                b"POHUNEK_RUNTIME_ID=runtime-b",
+                b"POHUNEK_WORKER_INSTANCE_IDX=near-miss",
+                b"POHUNEK_WORKER_INSTANCE_ID=runtime-a",
+                b"POHUNEK_WORKER_INSTANCE_ID=runtime-b",
             ],
         );
 
         let parsed = parse_process_arguments(&buffer).expect("kernel layout");
 
-        assert_eq!(parsed.markers.runtime_id.as_deref(), Some("runtime-a"));
+        assert_eq!(
+            parsed.markers.worker_instance_id.as_deref(),
+            Some("runtime-a")
+        );
         assert_eq!(parsed.markers.session_id, None);
         assert_eq!(parsed.markers.daemon_id, None);
         assert!(parsed.markers.is_marked());
     }
 
     #[test]
+    fn a_runtime_id_marker_is_read_as_the_alternate_worker_instance_marker() {
+        let buffer = procargs(
+            1,
+            b"/bin/sh",
+            1,
+            &[b"sh"],
+            &[b"POHUNEK_RUNTIME_ID=runtime-a"],
+        );
+
+        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
+
+        assert_eq!(parsed.markers.worker_instance_id, None);
+        assert_eq!(
+            parsed.markers.worker_instance(),
+            super::super::WorkerInstanceMarker::Instance("runtime-a")
+        );
+        assert!(parsed.markers.is_marked());
+    }
+
+    #[test]
+    fn disagreeing_worker_instance_spellings_conflict() {
+        let buffer = procargs(
+            1,
+            b"/bin/sh",
+            1,
+            &[b"sh"],
+            &[
+                b"POHUNEK_RUNTIME_ID=runtime-a",
+                b"POHUNEK_WORKER_INSTANCE_ID=runtime-b",
+            ],
+        );
+
+        let parsed = parse_process_arguments(&buffer).expect("kernel layout");
+
+        assert_eq!(
+            parsed.markers.worker_instance(),
+            super::super::WorkerInstanceMarker::Conflicting
+        );
+    }
+
+    #[test]
     fn an_oversized_runtime_marker_is_malformed() {
-        let mut entry = b"POHUNEK_RUNTIME_ID=".to_vec();
+        let mut entry = b"POHUNEK_WORKER_INSTANCE_ID=".to_vec();
         entry.extend(std::iter::repeat_n(b'r', MAX_MARKER_VALUE_BYTES + 1));
         let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &[&entry]);
 
@@ -601,7 +653,7 @@ mod tests {
         let mut environment: Vec<Vec<u8>> = (0..filler)
             .map(|index| format!("FILLER_{index}=x").into_bytes())
             .collect();
-        environment.push(b"POHUNEK_RUNTIME_ID=runtime-a".to_vec());
+        environment.push(b"POHUNEK_WORKER_INSTANCE_ID=runtime-a".to_vec());
         environment
     }
 
@@ -613,7 +665,10 @@ mod tests {
 
         let parsed = parse_process_arguments(&buffer).expect("kernel layout");
 
-        assert_eq!(parsed.markers.runtime_id.as_deref(), Some("runtime-a"));
+        assert_eq!(
+            parsed.markers.worker_instance_id.as_deref(),
+            Some("runtime-a")
+        );
     }
 
     #[test]

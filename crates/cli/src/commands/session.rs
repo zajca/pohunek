@@ -874,7 +874,7 @@ fn render_read_text(result: &SessionReadResult) -> String {
 /// Cursor and filtering arguments for `session output`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OutputArgs {
-    pub runtime_id: Option<String>,
+    pub worker_instance_id: Option<String>,
     pub runtime_generation: Option<u64>,
     pub after_offset: Option<u64>,
     pub max_bytes: u32,
@@ -884,7 +884,7 @@ pub(crate) struct OutputArgs {
 /// Predicate and cursor arguments for `session wait`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WaitArgs {
-    pub runtime_id: Option<String>,
+    pub worker_instance_id: Option<String>,
     pub runtime_generation: Option<u64>,
     pub after_updated_at: Option<String>,
     pub after_terminal_watermark: Option<u64>,
@@ -895,20 +895,22 @@ pub(crate) struct WaitArgs {
 }
 
 fn runtime_identity(
-    runtime_id: Option<String>,
+    worker_instance_id: Option<String>,
     runtime_generation: Option<u64>,
 ) -> Result<Option<SessionRuntimeIdentity>, CliError> {
-    match (runtime_id, runtime_generation) {
+    match (worker_instance_id, runtime_generation) {
         (None, None) => Ok(None),
-        (Some(runtime_id), Some(runtime_generation)) => {
-            SessionRuntimeIdentity::new(runtime_id, RuntimeGeneration::new(runtime_generation))
-                .map(Some)
-                .map_err(|error| CliError::InvalidObservation {
-                    detail: error.to_string(),
-                })
-        }
+        (Some(worker_instance_id), Some(runtime_generation)) => SessionRuntimeIdentity::new(
+            worker_instance_id,
+            RuntimeGeneration::new(runtime_generation),
+        )
+        .map(Some)
+        .map_err(|error| CliError::InvalidObservation {
+            detail: error.to_string(),
+        }),
         _ => Err(CliError::InvalidObservation {
-            detail: "--runtime-id and --runtime-generation must be supplied together".to_owned(),
+            detail: "--worker-instance-id and --runtime-generation must be supplied together"
+                .to_owned(),
         }),
     }
 }
@@ -927,7 +929,7 @@ pub(crate) async fn run_output(
             ),
         });
     }
-    let runtime = runtime_identity(args.runtime_id, args.runtime_generation)?;
+    let runtime = runtime_identity(args.worker_instance_id, args.runtime_generation)?;
     let after_offset = args.after_offset.map(OutputOffset::new);
     SessionOutputParams::new(
         SessionId(target.session_id.clone()),
@@ -974,7 +976,7 @@ pub(crate) async fn run_wait(
     args: WaitArgs,
     json: bool,
 ) -> Result<(), CliError> {
-    let runtime = runtime_identity(args.runtime_id, args.runtime_generation)?;
+    let runtime = runtime_identity(args.worker_instance_id, args.runtime_generation)?;
     let states = (!args.states.is_empty()).then_some(args.states);
     let activities = (!args.activities.is_empty()).then_some(args.activities);
     let terminal_watermark = args.after_terminal_watermark.map(TerminalWatermark::new);

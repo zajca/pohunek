@@ -50,7 +50,7 @@ impl SessionRegistry {
         let result = SessionReadResult {
             text: lines.join("\n"),
             source_used: available_source(requested_source),
-            runtime: runtime_identity(managed.runtime_id, managed.runtime_generation)?,
+            runtime: runtime_identity(managed.worker_instance_id, managed.runtime_generation)?,
             revision: TerminalWatermark::new(snapshot.watermark),
             alternate_screen: snapshot.alternate_screen,
             lines_requested: effective_lines,
