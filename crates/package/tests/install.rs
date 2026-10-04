@@ -574,3 +574,74 @@ fn errors_never_echo_paths_or_contents() {
         }
     }
 }
+
+/// Environment marker that makes the test below run its descriptor-limited
+/// body instead of spawning itself.
+const FD_LIMIT_CHILD: &str = "PACKAGE_TEST_FD_LIMIT_CHILD";
+
+/// Descriptor limit of the child: far below the 512 trees x 20 levels an
+/// extraction that kept every directory open would need, and above the
+/// handful the test harness and a 21-deep path hold.
+const FD_LIMIT: u64 = 128;
+
+/// Directory levels below each tree root.
+const TREE_DEPTH: usize = 20;
+
+fn deep_tree_entries() -> Vec<package::ArchiveEntry> {
+    (0..Limits::DEFAULT.max_files)
+        .map(|tree| {
+            let levels = vec!["d"; TREE_DEPTH].join("/");
+            entry(
+                &format!("t{tree:03}/{levels}/f"),
+                format!("{tree}").as_bytes(),
+                false,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn extraction_holds_descriptors_bounded_by_depth_not_directory_count() {
+    use rustix::process::{setrlimit, Resource, Rlimit};
+
+    if std::env::var_os(FD_LIMIT_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "extraction_holds_descriptors_bounded_by_depth_not_directory_count",
+                "--nocapture",
+            ])
+            .env(FD_LIMIT_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("fd-limit-extraction-ok"),
+            "child did not run its body:\n{stdout}"
+        );
+        return;
+    }
+
+    let entries = deep_tree_entries();
+    let archive = verified(&entries);
+    let fixture = Fixture::new();
+    setrlimit(
+        Resource::Nofile,
+        Rlimit {
+            current: Some(FD_LIMIT),
+            maximum: Some(FD_LIMIT),
+        },
+    )
+    .unwrap();
+
+    let installation = install_archive(&fixture.packages, &archive, &Limits::DEFAULT)
+        .expect("extraction fits the descriptor limit");
+    assert_eq!(installation.root.files().len(), entries.len());
+    verify_root(&fixture.packages, archive.digest(), &Limits::DEFAULT).expect("root verifies");
+    println!("fd-limit-extraction-ok");
+}

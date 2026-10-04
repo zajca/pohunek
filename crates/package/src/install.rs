@@ -14,7 +14,6 @@
 
 // Rust guideline compliant 2026-10-04
 
-use std::collections::BTreeMap;
 use std::io::ErrorKind;
 
 use pohunek_platform::filesystem::{EntryKind, FsError, MoveOutcome, StageOutcome, TrustedDir};
@@ -196,26 +195,32 @@ fn write_tree(staging: &TrustedDir, archive: &VerifiedArchive) -> Result<(), Ins
     let files = staging
         .create_child_exclusive(FILES_DIR, DIRECTORY_MODE)
         .map_err(|error| fs_failure(&error))?;
-    let mut directories: BTreeMap<String, TrustedDir> = BTreeMap::new();
+    // Entries arrive sorted by path, so the files of one directory are
+    // contiguous. The open descriptors form the path of the current entry: a
+    // directory is synced and closed as soon as the walk leaves it, which
+    // bounds the descriptors held by the path depth, not by the directory
+    // count.
+    let mut open: Vec<(&str, TrustedDir)> = Vec::new();
     for entry in archive.entries() {
         let mut segments: Vec<&str> = entry.path.split('/').collect();
         let name = segments.pop().ok_or(InstallError::LimitsExceeded)?;
-        let mut key = String::new();
-        for segment in segments {
-            let parent_key = key.clone();
-            if !key.is_empty() {
-                key.push('/');
-            }
-            key.push_str(segment);
-            if !directories.contains_key(&key) {
-                let parent = directories.get(&parent_key).unwrap_or(&files);
-                let child = parent
-                    .open_or_create_child(segment, DIRECTORY_MODE)
-                    .map_err(|error| fs_failure(&error))?;
-                directories.insert(key.clone(), child);
-            }
+        let shared = open
+            .iter()
+            .zip(&segments)
+            .take_while(|((open_name, _), segment)| open_name == *segment)
+            .count();
+        while open.len() > shared {
+            let (_, finished) = open.pop().ok_or(InstallError::LimitsExceeded)?;
+            finished.sync().map_err(|error| fs_failure(&error))?;
         }
-        let parent = directories.get(&key).unwrap_or(&files);
+        for segment in &segments[shared..] {
+            let parent = open.last().map_or(&files, |(_, directory)| directory);
+            let child = parent
+                .open_or_create_child(segment, DIRECTORY_MODE)
+                .map_err(|error| fs_failure(&error))?;
+            open.push((segment, child));
+        }
+        let parent = open.last().map_or(&files, |(_, directory)| directory);
         let mode = if entry.executable {
             EXECUTABLE_MODE
         } else {
@@ -225,8 +230,8 @@ fn write_tree(staging: &TrustedDir, archive: &VerifiedArchive) -> Result<(), Ins
             .create_file(name, &entry.contents, mode)
             .map_err(|error| fs_failure(&error))?;
     }
-    for directory in directories.values() {
-        directory.sync().map_err(|error| fs_failure(&error))?;
+    while let Some((_, finished)) = open.pop() {
+        finished.sync().map_err(|error| fs_failure(&error))?;
     }
     files.sync().map_err(|error| fs_failure(&error))
 }

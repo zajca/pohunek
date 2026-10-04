@@ -30,7 +30,7 @@ ruzstd = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 pohunek-test-support = { workspace = true }
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
 tempfile = { workspace = true }
 
 [lints]
