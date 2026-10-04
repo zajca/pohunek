@@ -16,12 +16,16 @@ use super::ProfileRegistry;
 use crate::agent::host::fixture::{install_pi_package, installed_pi_host, PI_SHAPED_PACKAGE_ID};
 use crate::agent::host::{LaunchSource, RuntimeHost};
 
-/// Program of the first fixture version.
-const FIRST_PROGRAM: &str = "/bin/sh";
+/// File name of the first fixture version's program, an executable written
+/// into the fixture root so no host binary location is assumed.
+const FIRST_PROGRAM: &str = "pin-first";
 
-/// Program of the second fixture version; a different program makes the two
-/// versions distinguishable through the capability inventory.
-const SECOND_PROGRAM: &str = "/bin/true";
+/// File name of the second fixture version's program; a different program
+/// makes the two versions distinguishable through the capability inventory.
+const SECOND_PROGRAM: &str = "pin-second";
+
+/// Contents of both fixture programs.
+const PROGRAM_SCRIPT: &str = "#!/bin/sh\nexit 0\n";
 
 /// A plugin root with the fixture package installed, an agents directory and
 /// a host state directory, over one runtime host.
@@ -44,7 +48,12 @@ impl Fixture {
         fs::create_dir_all(&state).expect("state directory");
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
             .expect("owner-private state directory");
-        let (host, digest) = installed_pi_host(&plugins, Path::new(FIRST_PROGRAM));
+        for name in [FIRST_PROGRAM, SECOND_PROGRAM] {
+            pohunek_test_support::fs::write_executable(root.path().join(name), PROGRAM_SCRIPT)
+                .expect("write a fixture program");
+        }
+        let first = root.path().join(FIRST_PROGRAM);
+        let (host, digest) = installed_pi_host(&plugins, &first);
         Self {
             _root: root,
             plugins,
@@ -81,7 +90,12 @@ impl Fixture {
 
     /// Installs version 2.0.0 and selects it, then reloads the host.
     fn update_to_second_version(&self) -> PackageDigest {
-        let digest = install_pi_package(&self.plugins, Path::new(SECOND_PROGRAM), "2.0.0", true);
+        let digest = install_pi_package(
+            &self.plugins,
+            &self._root.path().join(SECOND_PROGRAM),
+            "2.0.0",
+            true,
+        );
         self.host.reload().expect("reload");
         digest
     }
@@ -477,14 +491,14 @@ fn host_inspect_describes_a_pinned_profile_from_its_pinned_definition() {
         pinned
             .path
             .as_deref()
-            .is_some_and(|path| path.ends_with("sh")),
+            .is_some_and(|path| path.ends_with(FIRST_PROGRAM)),
         "{:?}",
         pinned.path
     );
     assert!(
         bare.path
             .as_deref()
-            .is_some_and(|path| path.ends_with("true")),
+            .is_some_and(|path| path.ends_with(SECOND_PROGRAM)),
         "{:?}",
         bare.path
     );
