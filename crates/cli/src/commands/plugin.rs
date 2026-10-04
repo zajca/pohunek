@@ -1092,6 +1092,14 @@ fn render_install_result(result: &PackageInstallResult, ingest: Ingest) -> Strin
             short_digest(&info.digest).trim_start_matches(DIGEST_PREFIX)
         );
     }
+    if !info.selected {
+        let _ = writeln!(
+            output,
+            "Bare requests do not resolve to it yet; select it with `pohunek plugin select {} --digest {}`.",
+            info.package.id,
+            short_digest(&info.digest).trim_start_matches(DIGEST_PREFIX)
+        );
+    }
     if ingest == Ingest::Link {
         let _ = writeln!(
             output,

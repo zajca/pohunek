@@ -534,9 +534,10 @@ production host today.
 
 A catalog install checks the catalog signature, the persisted high-water
 sequence and revoked key ids, then that an entry binds the package id, runtime
-id, version and digest and supports this core version and platform; after the
-install it persists the catalog's sequence and revocations, and a failure to do
-so is answered with `package_registry_failed` once the package is installed.
+id, version and digest and supports this core version and platform; before the
+package is published it persists the catalog's sequence and revocations, and a
+failure to do so is answered with `package_registry_failed` with nothing
+installed, enabled or reloaded.
 
 After each committed change the daemon rebuilds its runtime registry and
 reports `reloaded`. Every mutation holds the lifecycle guard, so launches never

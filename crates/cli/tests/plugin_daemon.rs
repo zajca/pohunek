@@ -566,20 +566,50 @@ async fn link_installs_disabled_and_enable_serves_the_runtime() {
     assert_eq!(without_consent.status.code(), Some(1));
     assert!(harness.registry().packages().is_empty());
 
-    let (code, linked) = harness
-        .json(&["plugin", "link", path_str(&dir), "--yes"])
+    let linked = harness
+        .run(&["plugin", "link", path_str(&dir), "--yes"])
         .await;
-    assert_eq!(code, 0, "{linked}");
+    assert_eq!(linked.status.code(), Some(0), "{}", stderr_text(&linked));
     let state = harness.registry();
     let [record] = state.packages() else {
         panic!("one package is linked: {:?}", state.packages());
     };
     assert!(!record.enabled(), "a linked package starts disabled");
+    assert!(state.selected(&record.identity().id).is_none());
     assert!(!serves_agent(&harness, RUNTIME).await);
 
-    let (code, enabled) = harness.json(&["plugin", "enable", PACKAGE_ID]).await;
-    assert_eq!(code, 0, "{enabled}");
-    assert!(harness.registry().packages()[0].enabled());
+    // Follow exactly the commands the output tells the owner to run.
+    let output = stdout_text(&linked);
+    let instructions: Vec<Vec<String>> = output
+        .lines()
+        .filter_map(|line| {
+            let start = line.find("`pohunek ")? + "`pohunek ".len();
+            let end = line[start..].find('`')? + start;
+            Some(
+                line[start..end]
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+        })
+        .collect();
+    assert!(
+        instructions.iter().any(|words| words[1] == "enable"),
+        "the output says how to enable it: {output}"
+    );
+    assert!(
+        instructions.iter().any(|words| words[1] == "select"),
+        "the output says how to select it: {output}"
+    );
+    for words in &instructions {
+        let arguments: Vec<&str> = words.iter().map(String::as_str).collect();
+        let result = harness.run(&arguments).await;
+        assert_eq!(result.status.code(), Some(0), "{}", stderr_text(&result));
+    }
+    assert!(
+        serves_agent(&harness, RUNTIME).await,
+        "the runtime is served once the displayed steps ran"
+    );
 
     harness.stop().await;
 }
