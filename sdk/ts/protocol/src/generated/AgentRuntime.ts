@@ -33,8 +33,9 @@ export type AgentRuntime = {
   /**
    * Whether the detected version is supported by this daemon.
    *
-   * `None` means the runtime has no compiled version policy. A present
-   * runtime with an unparseable version reports `Some(false)`.
+   * `None` means the runtime has no version policy. A present runtime with a
+   * policy always reports `Some(_)`: `Some(false)` for an unparseable or
+   * unaccepted version, so clients treat `Some(false)` as not launchable.
    */
   supported?: boolean;
 };

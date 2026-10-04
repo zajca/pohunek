@@ -7,13 +7,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{AgentKind, RuntimeId};
+use protocol::RuntimeId;
 
 use super::definition::{
     DefinitionError, DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition,
 };
 use super::registry::{RuntimeSource, SourceTrust};
-use crate::agent::{default_program, InputRules};
+use crate::agent::InputRules;
 use crate::detect::{self, Manifest};
 
 /// Embedded descriptors of the built-in agent runtimes.
@@ -41,10 +41,18 @@ impl BuiltinSource {
         }
     }
 
-    /// Creates a source whose shell runtime launches the host's login shell.
+    /// Creates a source whose shell runtime launches the host's login shell,
+    /// resolved by [`crate::agent::host_login_shell`].
     #[must_use]
     pub fn from_host_environment() -> Self {
-        Self::new(default_program(&AgentKind::Shell))
+        Self::new(crate::agent::host_login_shell())
+    }
+
+    /// Creates a source from a raw `$SHELL` value, resolved by
+    /// [`crate::agent::resolve_login_shell`].
+    #[must_use]
+    pub fn from_login_shell(raw: Option<String>) -> Self {
+        Self::new(crate::agent::resolve_login_shell(raw))
     }
 
     fn shell_definition(&self) -> Result<RuntimeDefinition, DefinitionError> {

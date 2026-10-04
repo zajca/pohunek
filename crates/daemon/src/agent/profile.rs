@@ -368,7 +368,7 @@ pub(crate) fn base_kind_from_name(name: &str) -> Option<AgentKind> {
 /// `program`, and as the frozen snapshot program for a profile-less session).
 pub(crate) fn default_program(base: &AgentKind) -> String {
     match base {
-        AgentKind::Shell => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned()),
+        AgentKind::Shell => super::host_login_shell(),
         AgentKind::Codex => "codex".to_owned(),
         AgentKind::Claude => "claude".to_owned(),
         AgentKind::Hermes => "hermes".to_owned(),

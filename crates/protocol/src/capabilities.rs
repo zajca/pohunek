@@ -43,8 +43,9 @@ pub struct AgentRuntime {
     pub version: Option<String>,
     /// Whether the detected version is supported by this daemon.
     ///
-    /// `None` means the runtime has no compiled version policy. A present
-    /// runtime with an unparseable version reports `Some(false)`.
+    /// `None` means the runtime has no version policy. A present runtime with a
+    /// policy always reports `Some(_)`: `Some(false)` for an unparseable or
+    /// unaccepted version, so clients treat `Some(false)` as not launchable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub supported: Option<bool>,

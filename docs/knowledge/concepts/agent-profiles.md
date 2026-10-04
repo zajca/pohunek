@@ -37,8 +37,9 @@ client fails closed instead of inventing a fallback set.
 entry has a user-facing `agent`; optional `agent_base` identifies its compiled
 adapter. For Hermes, `version` and `supported` enforce the pinned 0.20.0 policy:
 an unavailable executable omits them, while a detected unparseable or other
-version reports `supported: false`. Launch Hermes only when `available` and
-`supported` are both true. The daemon re-runs that isolated, bounded version
+version reports `supported: false`. Launch a runtime only when `available` is true and `supported` is not
+`false`; a present runtime with a version policy (Hermes) always reports
+`supported`, so Hermes launches only on `supported: true`. The daemon re-runs that isolated, bounded version
 probe for bare and profile-based Hermes immediately before `session.new` and
 `session.resume`; a missing, unparseable, or non-pinned executable returns
 `agent_runtime_unsupported` before it creates a worker, session, worktree, or

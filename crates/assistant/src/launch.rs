@@ -21,8 +21,8 @@ use protocol::{
 use serde::Serialize;
 
 use crate::{
-    connect_client, runtime_is_assistant_capable, runtime_is_launchable, AssistantError,
-    ConnectionOptions, HostConfig, HostTransport,
+    connect_client, runtime_is_assistant_capable, AssistantError, ConnectionOptions, HostConfig,
+    HostTransport,
 };
 
 const SNAPSHOT_FILE: &str = "snapshot.json";
@@ -182,8 +182,9 @@ const RANKED_AGENTS: [&str; 4] = ["pohunek-assistant", "codex", "claude", "herme
 
 /// Resolve which agent should run the assistant.
 ///
-/// Explicit Hermes choices must be available with positive support confirmation.
-/// Other explicit names remain daemon-authoritative for profile resolution.
+/// An explicit choice is rejected when the host reports its version policy as
+/// refusing it; other explicit names remain daemon-authoritative for profile
+/// resolution and launch validation.
 /// Automatic choices must be available supported non-shell runtimes.
 ///
 /// # Errors
@@ -363,23 +364,17 @@ fn is_assistant_runtime(capabilities: &HostCapabilities, agent: &str) -> bool {
 }
 
 fn explicit_agent_is_allowed(capabilities: &HostCapabilities, agent: &str) -> bool {
-    let runtime = capabilities
+    let Some(runtime) = capabilities
         .runtimes
         .iter()
-        .find(|runtime| runtime.agent == agent);
-    if runtime
-        .is_some_and(|runtime| matches!(runtime.agent_base.as_ref(), Some(AgentKind::Unknown(_))))
-    {
-        return false;
-    }
-
-    if agent == "hermes"
-        || runtime.is_some_and(|runtime| runtime.agent_base.as_ref() == Some(&AgentKind::Hermes))
-    {
-        return runtime.is_some_and(runtime_is_launchable);
-    }
-
-    true
+        .find(|runtime| runtime.agent == agent)
+    else {
+        return true;
+    };
+    // A refused version policy or an unknown base is decided by the host's
+    // report; every other case stays with the daemon's own launch checks.
+    runtime.supported != Some(false)
+        && !matches!(runtime.agent_base.as_ref(), Some(AgentKind::Unknown(_)))
 }
 
 fn validate_target(config: &HostConfig, params: &LaunchParams) -> Result<(), AssistantError> {

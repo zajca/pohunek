@@ -233,8 +233,18 @@ impl ShellCommand {
 
 impl Default for ShellCommand {
     fn default() -> Self {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
-        Self::new(shell, std::iter::empty::<String>())
+        Self::from_login_shell(std::env::var("SHELL").ok())
+    }
+}
+
+impl ShellCommand {
+    /// Build the login-shell command from a raw `$SHELL` value, falling back
+    /// to the daemon's default shell when it is unusable.
+    pub(crate) fn from_login_shell(raw: Option<String>) -> Self {
+        Self::new(
+            crate::agent::resolve_login_shell(raw),
+            std::iter::empty::<String>(),
+        )
     }
 }
 

@@ -94,88 +94,80 @@ fn auto_agent_falls_back_to_an_available_custom_profile() {
 }
 
 #[test]
-fn explicit_bare_hermes_requires_a_runtime_entry() {
-    let err = assistant::select_agent(&caps(Vec::new()), Some("hermes"))
-        .expect_err("missing Hermes runtime cannot launch the assistant");
+fn explicit_agent_without_a_runtime_entry_is_daemon_authoritative() {
+    let selected = assistant::select_agent(&caps(Vec::new()), Some("hermes"))
+        .expect("an agent the host does not list is left to the daemon");
 
-    assert_eq!(err.code, "no_capable_agent");
+    assert_eq!(selected.name, "hermes");
 }
 
 #[test]
-fn explicit_bare_hermes_requires_an_available_runtime() {
-    let err = assistant::select_agent(&caps(vec![("hermes", false)]), Some("hermes"))
-        .expect_err("unavailable Hermes runtime cannot launch the assistant");
+fn explicit_runtime_with_refused_version_policy_is_rejected() {
+    // The refusal comes from the reported policy, not from the runtime's name
+    // or compiled base.
+    for (name, base) in [
+        ("hermes", Some(AgentKind::Hermes)),
+        ("pinned-tool", Some(AgentKind::Codex)),
+        ("unlabelled", None),
+    ] {
+        let capabilities = capabilities(vec![runtime(name, base, true, Some(false))]);
 
-    assert_eq!(err.code, "no_capable_agent");
-}
+        let err = assistant::select_agent(&capabilities, Some(name))
+            .expect_err("a runtime whose version policy refuses it must not launch");
 
-#[test]
-fn explicit_supported_hermes_profile_is_selected() {
-    let capabilities = capabilities(vec![runtime(
-        "hermes-review",
-        Some(AgentKind::Hermes),
-        true,
-        Some(true),
-    )]);
-
-    let selected = assistant::select_agent(&capabilities, Some("hermes-review"))
-        .expect("available supported Hermes profile selected explicitly");
-
-    assert_eq!(selected.name, "hermes-review");
-}
-
-#[test]
-fn explicit_unsupported_hermes_is_rejected() {
-    let capabilities = capabilities(vec![runtime(
-        "hermes",
-        Some(AgentKind::Hermes),
-        true,
-        Some(false),
-    )]);
-
-    let err = assistant::select_agent(&capabilities, Some("hermes"))
-        .expect_err("unsupported Hermes must not launch an assistant");
-
-    assert_eq!(err.code, "no_capable_agent");
-}
-
-#[test]
-fn explicit_bare_hermes_requires_positive_support_confirmation() {
-    let capabilities = capabilities(vec![runtime("hermes", None, true, None)]);
-
-    let err = assistant::select_agent(&capabilities, Some("hermes"))
-        .expect_err("Hermes without version-policy confirmation must not launch");
-
-    assert_eq!(err.code, "no_capable_agent");
-}
-
-#[test]
-fn explicit_hermes_profile_requires_positive_support_confirmation() {
-    for (available, supported) in [(false, Some(true)), (true, None), (true, Some(false))] {
-        let capabilities = capabilities(vec![runtime(
-            "hermes-review",
-            Some(AgentKind::Hermes),
-            available,
-            supported,
-        )]);
-
-        let err = assistant::select_agent(&capabilities, Some("hermes-review"))
-            .expect_err("unconfirmed or unsupported Hermes profile must not launch");
-
-        assert_eq!(err.code, "no_capable_agent");
+        assert_eq!(err.code, "no_capable_agent", "{name}");
     }
 }
 
 #[test]
-fn auto_agent_skips_unconfirmed_hermes_for_a_legacy_custom_runtime() {
+fn explicit_runtime_with_confirmed_version_policy_is_selected() {
+    for name in ["hermes", "hermes-review", "pinned-tool"] {
+        let capabilities = capabilities(vec![runtime(
+            name,
+            Some(AgentKind::Hermes),
+            true,
+            Some(true),
+        )]);
+
+        let selected = assistant::select_agent(&capabilities, Some(name))
+            .expect("a runtime whose version policy accepts it is selected explicitly");
+
+        assert_eq!(selected.name, name);
+    }
+}
+
+#[test]
+fn launchability_follows_availability_and_version_policy_only() {
+    let cases = [
+        // (available, supported, launchable)
+        (false, Some(true), false),
+        (false, None, false),
+        (true, Some(false), false),
+        (true, Some(true), true),
+        (true, None, true),
+    ];
+    for (available, supported, expected) in cases {
+        for base in [None, Some(AgentKind::Hermes), Some(AgentKind::Claude)] {
+            let candidate = runtime("any-name", base.clone(), available, supported);
+            assert_eq!(
+                runtime_is_launchable(&candidate),
+                expected,
+                "available={available} supported={supported:?} base={base:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn auto_agent_skips_a_refused_runtime_for_a_later_candidate() {
     let capabilities = capabilities(vec![
-        runtime("hermes", Some(AgentKind::Hermes), true, None),
+        runtime("hermes", Some(AgentKind::Hermes), true, Some(false)),
         runtime("shell-profile", Some(AgentKind::Shell), true, None),
         runtime("legacy-custom", None, true, None),
     ]);
 
     let selected = assistant::select_agent(&capabilities, None)
-        .expect("available legacy custom runtime selected after unconfirmed Hermes");
+        .expect("available legacy custom runtime selected after the refused runtime");
 
     assert_eq!(selected.name, "legacy-custom");
 }

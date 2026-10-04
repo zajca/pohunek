@@ -31,6 +31,31 @@ pub use native_launch::{
 pub(crate) use profile::{default_args, default_program, ProfileRegistry, ResolvedAgent};
 pub use shell::ShellAdapter;
 
+/// Shell launched when the host reports no usable login shell.
+pub(crate) const FALLBACK_LOGIN_SHELL: &str = "/bin/sh";
+
+/// Resolves the login shell from a raw `$SHELL` value.
+///
+/// The value is host input: it is used only when it is non-empty, at most
+/// [`host::MAX_ARG_BYTES`] long and free of control characters, so it always
+/// satisfies the runtime definition's program rules. Anything else, or an unset
+/// value, resolves to [`FALLBACK_LOGIN_SHELL`]. Every consumer of the login
+/// shell (registry source, shell launch, profile defaults, resume snapshots)
+/// goes through here, so they cannot disagree.
+pub(crate) fn resolve_login_shell(raw: Option<String>) -> String {
+    raw.filter(|shell| {
+        !shell.is_empty()
+            && shell.len() <= host::MAX_ARG_BYTES
+            && !shell.chars().any(char::is_control)
+    })
+    .unwrap_or_else(|| FALLBACK_LOGIN_SHELL.to_owned())
+}
+
+/// The login shell of this host's environment, resolved by [`resolve_login_shell`].
+pub(crate) fn host_login_shell() -> String {
+    resolve_login_shell(std::env::var("SHELL").ok())
+}
+
 static SHELL_ADAPTER: ShellAdapter = ShellAdapter;
 static CODEX_ADAPTER: CodexAdapter = CodexAdapter;
 static CLAUDE_ADAPTER: ClaudeAdapter = ClaudeAdapter;

@@ -12,13 +12,20 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use protocol::{AgentKind, AgentRuntime, HostCapabilities, ProtocolError, PROTOCOL_VERSION};
+use protocol::{
+    AgentKind, AgentRuntime, HostCapabilities, ProtocolError, RuntimeId, RuntimeRef,
+    PROTOCOL_VERSION,
+};
 use serde::Deserialize;
 
-use crate::agent::{default_program, which_executable, ProfileRegistry, ValidatedLaunchProgram};
+use crate::agent::host::{
+    BuiltinSource, HandlerId, LaunchProgram, RuntimeDefinition, RuntimeRegistry,
+    RESERVED_RUNTIME_IDS,
+};
+use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
 
 /// The reviewed Hermes release metadata shipped with this Pohunek build.
 const HERMES_COMPATIBILITY_LOCK: &str =
@@ -36,13 +43,94 @@ const HERMES_PROBE_PATH: &str = "/usr/bin:/bin";
 /// A deterministic locale keeps provider version output stable.
 const HERMES_PROBE_LOCALE: &str = "C";
 
+/// Version-probe parsers the daemon compiles in, selected by the parser id a
+/// runtime definition names under `version_probe.parser`.
+///
+/// Each parser owns the probe sandbox, the output grammar and the version the
+/// daemon accepts for launch. The Hermes lock is core data until the Hermes
+/// package owns its own compatibility policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionProbe {
+    /// Parser id `hermes-v1`: `hermes --version` pinned to the checked-in
+    /// compatibility lock release.
+    HermesV1,
+}
+
+impl VersionProbe {
+    /// Resolves a definition's parser id, or `None` for an id this daemon does
+    /// not compile in.
+    fn from_parser_id(parser: &HandlerId) -> Option<Self> {
+        match parser.as_str() {
+            "hermes-v1" => Some(Self::HermesV1),
+            _ => None,
+        }
+    }
+
+    /// Runs the probe against `path` and returns the normalized version.
+    fn detect_version(self, path: &Path) -> Option<String> {
+        match self {
+            Self::HermesV1 => {
+                run_hermes_version_probe(path).and_then(|output| parse_hermes_version(&output))
+            }
+        }
+    }
+
+    /// The only version this daemon accepts for launch.
+    fn pinned_version(self) -> &'static str {
+        match self {
+            Self::HermesV1 => supported_hermes_version(),
+        }
+    }
+}
+
+/// Process-wide registry of the built-in runtimes.
+///
+/// The descriptors are embedded in the binary and validated by the registry
+/// tests, so a build failure here is a defect of the binary, not of the host.
+fn builtin_registry() -> &'static RuntimeRegistry {
+    static REGISTRY: OnceLock<RuntimeRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        RuntimeRegistry::from_sources(&[&BuiltinSource::from_host_environment()])
+            .expect("embedded built-in runtime definitions must be valid")
+    })
+}
+
+/// Resolves the definition a compiled base kind launches, when one is registered.
+fn definition_for_base<'a>(
+    registry: &'a RuntimeRegistry,
+    base: &AgentKind,
+) -> Option<&'a Arc<RuntimeDefinition>> {
+    let runtime_id = base.as_runtime_ref();
+    let RuntimeRef::Id(runtime_id) = &runtime_id else {
+        return None;
+    };
+    registry.resolve(runtime_id).ok()
+}
+
+/// Wire `agent_base` of a registered runtime: the compiled kind sharing its id.
+fn agent_base_of(runtime_id: &RuntimeId) -> AgentKind {
+    serde_json::from_value(serde_json::Value::String(runtime_id.as_str().to_owned()))
+        .unwrap_or_else(|_| AgentKind::Unknown(runtime_id.to_string()))
+}
+
+/// Position of a runtime id in the reported inventory: the reserved built-ins
+/// keep their documented order, every other runtime follows in id order.
+fn inventory_rank(runtime_id: &RuntimeId) -> usize {
+    RESERVED_RUNTIME_IDS
+        .iter()
+        .position(|reserved| *reserved == runtime_id.as_str())
+        .unwrap_or(RESERVED_RUNTIME_IDS.len())
+}
+
 /// Build the live capability snapshot for this host.
 ///
-/// `supported_agents` is the four compiled base kinds plus every resolvable host
-/// agent profile (Part C). `runtimes` reports, per agent, whether its backing
-/// program is present on `PATH`: the shell runtime is always available (no path),
-/// `codex`/`claude`/`hermes` are probed, and each profile probes its (possibly-overridden)
-/// program. Probing uses the same executable check as the launch path
+/// `supported_agents` is every built-in runtime in the registry plus every
+/// resolvable host agent profile (Part C). `runtimes` reports, per agent, whether
+/// its backing program is present on `PATH`: a runtime launched through the
+/// host's login shell is always available (no path), and every other runtime
+/// probes its (possibly-overridden) program. A runtime whose definition names a
+/// version-probe parser additionally reports its version and whether the daemon
+/// accepts it. Probing uses the same executable check as the launch path
 /// ([`which_executable`]) so "available" agrees with what a launch would accept.
 /// `git_available` reflects a `git` probe and currently also gates worktree support.
 #[must_use]
@@ -50,41 +138,69 @@ pub(crate) fn host_capabilities(
     daemon_version: &str,
     profiles: &ProfileRegistry,
 ) -> HostCapabilities {
-    let mut supported_agents = vec![
-        "shell".to_owned(),
-        "codex".to_owned(),
-        "claude".to_owned(),
-        "hermes".to_owned(),
-    ];
+    host_capabilities_for(daemon_version, profiles, builtin_registry())
+}
 
-    let mut runtimes = vec![
-        // The shell runtime is always available; the daemon falls back to a
-        // login shell and does not require a named binary on PATH.
-        AgentRuntime {
-            agent: "shell".to_owned(),
-            agent_base: Some(AgentKind::Shell),
-            available: true,
-            path: None,
-            version: None,
-            supported: None,
-        },
-        probe_runtime("codex", AgentKind::Codex, "codex"),
-        probe_runtime("claude", AgentKind::Claude, "claude"),
-        probe_hermes_runtime("hermes", "hermes"),
-    ];
+/// [`host_capabilities`] against an explicit runtime registry.
+fn host_capabilities_for(
+    daemon_version: &str,
+    profiles: &ProfileRegistry,
+    registry: &RuntimeRegistry,
+) -> HostCapabilities {
+    let mut definitions: Vec<&Arc<RuntimeDefinition>> = registry.definitions().collect();
+    // The sort is stable, so runtimes outside the reserved set stay in id order.
+    definitions.sort_by_key(|definition| inventory_rank(definition.runtime_id()));
+
+    let mut supported_agents = Vec::with_capacity(definitions.len());
+    let mut runtimes = Vec::with_capacity(definitions.len());
+    for definition in definitions {
+        let agent = definition.runtime_id().as_str();
+        let agent_base = agent_base_of(definition.runtime_id());
+        runtimes.push(match definition.program() {
+            // A host-shell runtime needs no named binary on PATH.
+            LaunchProgram::HostShell(_) => AgentRuntime {
+                agent: agent.to_owned(),
+                agent_base: Some(agent_base),
+                available: true,
+                path: None,
+                version: None,
+                supported: None,
+            },
+            LaunchProgram::Fixed(program) => {
+                probe_definition(agent, agent_base, definition, program)
+            }
+        });
+        supported_agents.push(agent.to_owned());
+    }
 
     // Host profiles: each resolvable profile is a launchable agent name; probe its
-    // resolved program exactly as a base kind, so availability is consistent.
+    // resolved program exactly as its base runtime, so availability is consistent.
     for agent in profiles.enumerate() {
-        let program = agent.profile.as_ref().map_or_else(
-            || default_program(&agent.base),
-            |profile| profile.program.clone(),
-        );
-        runtimes.push(if agent.base == AgentKind::Hermes {
-            probe_hermes_runtime(&agent.name, &program)
-        } else {
-            probe_runtime(&agent.name, agent.base, &program)
-        });
+        let definition = definition_for_base(registry, &agent.base);
+        let runtime = match (definition, agent.profile.as_ref()) {
+            (Some(definition), Some(profile)) => probe_definition(
+                &agent.name,
+                agent.base.clone(),
+                definition,
+                &profile.program,
+            ),
+            (Some(definition), None) => probe_definition(
+                &agent.name,
+                agent.base.clone(),
+                definition,
+                definition.program().as_str(),
+            ),
+            // A base without a registered runtime has nothing to launch.
+            (None, _) => AgentRuntime {
+                agent: agent.name.clone(),
+                agent_base: Some(agent.base.clone()),
+                available: false,
+                path: None,
+                version: None,
+                supported: None,
+            },
+        };
+        runtimes.push(runtime);
         supported_agents.push(agent.name);
     }
 
@@ -102,6 +218,19 @@ pub(crate) fn host_capabilities(
         terminal_read_supported: true,
         output_read_supported: true,
         session_wait_supported: true,
+    }
+}
+
+/// Probe `program` for `definition`, honouring its version-probe parser.
+fn probe_definition(
+    agent: &str,
+    agent_base: AgentKind,
+    definition: &RuntimeDefinition,
+    program: &str,
+) -> AgentRuntime {
+    match definition.version_probe_parser() {
+        Some(parser) => probe_versioned_runtime(agent, agent_base, program, parser),
+        None => probe_runtime(agent, agent_base, program),
     }
 }
 
@@ -131,12 +260,22 @@ fn probe_runtime(agent: &str, agent_base: AgentKind, binary: &str) -> AgentRunti
     }
 }
 
-/// Probe a Hermes executable and classify its version without exposing output.
-fn probe_hermes_runtime(agent: &str, binary: &str) -> AgentRuntime {
+/// Probe an executable with the compiled `parser` and classify its version
+/// without exposing output.
+///
+/// A present runtime always reports `supported`: `Some(true)` only for the
+/// pinned version, `Some(false)` for any other version, unparseable output or a
+/// parser id this daemon does not compile in.
+fn probe_versioned_runtime(
+    agent: &str,
+    agent_base: AgentKind,
+    binary: &str,
+    parser: &HandlerId,
+) -> AgentRuntime {
     let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
         return AgentRuntime {
             agent: agent.to_owned(),
-            agent_base: Some(AgentKind::Hermes),
+            agent_base: Some(agent_base),
             available: false,
             path: None,
             version: None,
@@ -144,12 +283,12 @@ fn probe_hermes_runtime(agent: &str, binary: &str) -> AgentRuntime {
         };
     };
 
-    let version = run_hermes_version_probe(program.as_path())
-        .and_then(|output| parse_hermes_version(&output));
-    let supported = version.as_deref() == Some(supported_hermes_version());
+    let probe = VersionProbe::from_parser_id(parser);
+    let version = probe.and_then(|probe| probe.detect_version(program.as_path()));
+    let supported = probe.is_some_and(|probe| version.as_deref() == Some(probe.pinned_version()));
     AgentRuntime {
         agent: agent.to_owned(),
-        agent_base: Some(AgentKind::Hermes),
+        agent_base: Some(agent_base),
         available: true,
         path: Some(program.as_path().display().to_string()),
         version,
@@ -157,25 +296,30 @@ fn probe_hermes_runtime(agent: &str, binary: &str) -> AgentRuntime {
     }
 }
 
-/// Validates a launch runtime and pins the resolved Hermes executable path.
+/// Validates a launch runtime and pins the resolved executable path when its
+/// definition names a version-probe parser.
 ///
-/// Non-Hermes adapters retain their existing launch behavior. Hermes resolves
-/// the executable once, probes it in the same isolated bounded sandbox used by
-/// inventory, and returns that exact path only for the pinned supported release.
-/// Probe output, configured paths, and detected versions never enter the error.
+/// Runtimes without a version-probe parser keep plain launch behavior. A
+/// runtime with one resolves the executable once, probes it in the same
+/// isolated bounded sandbox used by inventory, and returns that exact path only
+/// for the pinned supported release. A parser id this daemon does not compile in
+/// refuses the launch. Probe output, configured paths, and detected versions
+/// never enter the error.
 pub(crate) fn validate_launch_runtime(
     base: &AgentKind,
     binary: &str,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    if *base != AgentKind::Hermes {
+    let Some(parser) = definition_for_base(builtin_registry(), base)
+        .and_then(|definition| definition.version_probe_parser())
+    else {
         return Ok(None);
-    }
+    };
 
     let program = ValidatedLaunchProgram::resolve(binary)
         .ok_or_else(ProtocolError::agent_runtime_unsupported)?;
-    let supported = run_hermes_version_probe(program.as_path())
-        .and_then(|output| parse_hermes_version(&output))
-        .is_some_and(|version| version == supported_hermes_version());
+    let supported = VersionProbe::from_parser_id(parser).is_some_and(|probe| {
+        probe.detect_version(program.as_path()).as_deref() == Some(probe.pinned_version())
+    });
     supported
         .then_some(Some(program))
         .ok_or_else(ProtocolError::agent_runtime_unsupported)
@@ -666,6 +810,146 @@ mod tests {
         );
     }
 
+    fn hermes_parser() -> HandlerId {
+        HandlerId::parse("hermes-v1", "version_probe.parser").expect("valid parser id")
+    }
+
+    fn probe_hermes_for_test(binary: &str) -> AgentRuntime {
+        probe_versioned_runtime("hermes", AgentKind::Hermes, binary, &hermes_parser())
+    }
+
+    /// Registry whose shell runtime launches a fixed program, so the
+    /// inventory does not depend on the host's `$SHELL`.
+    fn test_registry() -> RuntimeRegistry {
+        RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh")])
+            .expect("built-in registry builds")
+    }
+
+    #[test]
+    fn invalid_login_shell_never_breaks_the_registry_or_non_shell_runtimes() {
+        let oversized = "s".repeat(crate::agent::host::MAX_ARG_BYTES + 1);
+        for shell in [
+            Some(String::new()),
+            Some(oversized),
+            Some("/bin/s\nh".to_owned()),
+            Some("/bin/s\u{7f}h".to_owned()),
+            None,
+        ] {
+            let registry =
+                RuntimeRegistry::from_sources(&[&BuiltinSource::from_login_shell(shell)])
+                    .expect("an invalid login shell must not fail the registry");
+            let caps = host_capabilities_for("0.0.0", &no_profiles(), &registry);
+            let names: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
+            assert_eq!(names, RESERVED_RUNTIME_IDS);
+            let shell_def = registry
+                .resolve(&RuntimeId::parse("shell").expect("id"))
+                .expect("shell registered");
+            assert_eq!(shell_def.program().as_str(), "/bin/sh");
+            assert!(definition_for_base(&registry, &AgentKind::Hermes).is_some());
+        }
+        let valid = BuiltinSource::from_login_shell(Some("/usr/bin/zsh".to_owned()));
+        let registry = RuntimeRegistry::from_sources(&[&valid]).expect("registry");
+        let shell_def = registry
+            .resolve(&RuntimeId::parse("shell").expect("id"))
+            .expect("shell registered");
+        assert_eq!(shell_def.program().as_str(), "/usr/bin/zsh");
+    }
+
+    #[test]
+    fn inventory_lists_builtins_in_reserved_order_with_their_wire_shape() {
+        let caps = host_capabilities_for("0.0.0", &no_profiles(), &test_registry());
+        let order: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
+        assert_eq!(order, RESERVED_RUNTIME_IDS);
+        assert_eq!(caps.supported_agents, RESERVED_RUNTIME_IDS);
+
+        let bases: Vec<AgentKind> = caps
+            .runtimes
+            .iter()
+            .map(|r| r.agent_base.clone().expect("base reported"))
+            .collect();
+        assert_eq!(
+            bases,
+            [
+                AgentKind::Shell,
+                AgentKind::Codex,
+                AgentKind::Claude,
+                AgentKind::Hermes
+            ]
+        );
+        // Only the runtime with a version-probe parser reports a policy.
+        for runtime in &caps.runtimes {
+            assert_eq!(
+                runtime.supported.is_some(),
+                runtime.agent == "hermes" && runtime.available,
+                "{}",
+                runtime.agent
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_definitions_name_only_compiled_version_probes() {
+        for definition in builtin_registry().definitions() {
+            if let Some(parser) = definition.version_probe_parser() {
+                assert!(
+                    VersionProbe::from_parser_id(parser).is_some(),
+                    "{} names an uncompiled parser",
+                    definition.runtime_id()
+                );
+            }
+        }
+        let hermes = builtin_registry()
+            .resolve(&RuntimeId::parse("hermes").expect("id"))
+            .expect("hermes registered");
+        assert_eq!(
+            hermes.version_probe_parser().map(HandlerId::as_str),
+            Some("hermes-v1")
+        );
+    }
+
+    #[test]
+    fn unknown_parser_id_reports_unsupported_in_inventory() {
+        let dir = temp_agents_dir();
+        let program = dir.join("tool");
+        write_test_executable(&program, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
+        let parser = HandlerId::parse("not-compiled", "version_probe.parser").expect("id");
+
+        let runtime = probe_versioned_runtime(
+            "custom",
+            AgentKind::Hermes,
+            &program.display().to_string(),
+            &parser,
+        );
+        assert!(runtime.available);
+        assert_eq!(runtime.version, None);
+        assert_eq!(runtime.supported, Some(false));
+    }
+
+    #[test]
+    fn profile_over_hermes_base_is_probed_with_the_hermes_parser() {
+        let dir = temp_agents_dir();
+        let hermes = dir.join("hermes-bin");
+        write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v0.21.0'\n");
+        std::fs::write(
+            dir.join("hermes-review.toml"),
+            format!("base = \"hermes\"\nprogram = \"{}\"\n", hermes.display()),
+        )
+        .expect("write profile");
+        let caps = host_capabilities_for(
+            "0.0.0",
+            &ProfileRegistry::new(Some(dir.clone())),
+            &test_registry(),
+        );
+        let runtime = caps
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.agent == "hermes-review")
+            .expect("profile runtime reported");
+        assert_eq!(runtime.agent_base, Some(AgentKind::Hermes));
+        assert_eq!(runtime.version.as_deref(), Some("0.21.0"));
+        assert_eq!(runtime.supported, Some(false));
+    }
+
     #[test]
     fn hermes_inventory_distinguishes_supported_unsupported_and_missing() {
         let dir = temp_agents_dir();
@@ -675,25 +959,25 @@ mod tests {
             &hermes,
             "#!/bin/sh\necho 'Hermes Agent v0.20.0 (2026-08-03)'\n",
         );
-        let supported = probe_hermes_runtime("hermes", &hermes.display().to_string());
+        let supported = probe_hermes_for_test(&hermes.display().to_string());
         assert!(supported.available);
         assert_eq!(supported.agent_base, Some(AgentKind::Hermes));
         assert_eq!(supported.version.as_deref(), Some("0.20.0"));
         assert_eq!(supported.supported, Some(true));
 
         write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v0.21.0 (future)'\n");
-        let wrong = probe_hermes_runtime("hermes", &hermes.display().to_string());
+        let wrong = probe_hermes_for_test(&hermes.display().to_string());
         assert!(wrong.available);
         assert_eq!(wrong.version.as_deref(), Some("0.21.0"));
         assert_eq!(wrong.supported, Some(false));
 
         write_test_executable(&hermes, "#!/bin/sh\necho 'unexpected output'\n");
-        let unparseable = probe_hermes_runtime("hermes", &hermes.display().to_string());
+        let unparseable = probe_hermes_for_test(&hermes.display().to_string());
         assert!(unparseable.available);
         assert_eq!(unparseable.version, None);
         assert_eq!(unparseable.supported, Some(false));
 
-        let missing = probe_hermes_runtime("hermes", &dir.join("missing").display().to_string());
+        let missing = probe_hermes_for_test(&dir.join("missing").display().to_string());
         assert!(!missing.available);
         assert_eq!(missing.agent_base, Some(AgentKind::Hermes));
         assert_eq!(missing.path, None);
