@@ -558,7 +558,7 @@ fn hook_strategy(document: &str) -> String {
 
 /// A hook runtime that cannot fork.
 fn hook_without_fork(document: String) -> String {
-    hook_strategy(document).replace(
+    hook_strategy(&document).replace(
         "[fork]\nsupported = true\nargs = [\"--fork\", \"{reference}\"]",
         "[fork]\nsupported = false",
     )

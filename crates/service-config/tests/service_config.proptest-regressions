@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 8aebfb46048c4680bd185ace68807a4f2860b482390dc6b2a9e02fae9b9adc60 # shrinks to value = ConfigSpec { prefix: "/a", active_version: "A", uid: 0, state_root: "/a", runtime_root: "/a", deadlines: Deadlines { worker_connect: 1ms, worker_initialize: 1ms, launchctl_command: 1ms, worker_exit_timeout: 1ms, daemon_exit_timeout: 1ms, daemon_restart_throttle: 1ms }, environment_allowlist: ["a"], search_path: SearchPath { entries: [] }, sweep_grace: 1ms, open_files: 256 }
