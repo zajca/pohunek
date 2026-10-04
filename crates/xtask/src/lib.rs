@@ -78,6 +78,8 @@ pub enum XtaskError {
     Json(serde_json::Error),
     Yaml(serde_yaml::Error),
     Package(::package::ArchiveError),
+    /// The archive output path lies inside the package directory it packs.
+    OutputInsideInput(PathBuf),
     InvalidPath(PathBuf),
     /// A delegated command ran and exited unsuccessfully.
     ChildExit {
@@ -123,6 +125,11 @@ impl fmt::Display for XtaskError {
             Self::Json(error) => write!(f, "failed to serialize json: {error}"),
             Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
             Self::Package(error) => write!(f, "package archive: {error}"),
+            Self::OutputInsideInput(path) => write!(
+                f,
+                "archive output `{}` is inside the package directory",
+                path.display()
+            ),
             Self::InvalidPath(path) => write!(
                 f,
                 "path `{}` cannot be represented as a deterministic relative path",
@@ -144,6 +151,7 @@ impl Error for XtaskError {
             Self::Usage(_)
             | Self::UnsupportedFileType(_)
             | Self::InvalidPath(_)
+            | Self::OutputInsideInput(_)
             | Self::ChildExit { .. } => None,
         }
     }

@@ -82,9 +82,25 @@ pub fn build_archive(entries: &[ArchiveEntry], limits: &Limits) -> Result<Vec<u8
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by(|&left, &right| entries[left].path.cmp(&entries[right].path));
 
+    // The canonical stream size is known up front, so the limit applies before
+    // any entry is copied.
+    let mut expanded = END_MARKER_BYTES;
+    for entry in entries {
+        let size = BLOCK_BYTES
+            .checked_add(entry.contents.len())
+            .and_then(|total| total.checked_add(padding_len(entry.contents.len())))
+            .and_then(|total| expanded.checked_add(total));
+        expanded = size.unwrap_or(usize::MAX);
+        if u64::try_from(expanded).unwrap_or(u64::MAX) > limits.max_expanded_bytes {
+            return Err(ArchiveError::ExpandedTooLarge {
+                limit: limits.max_expanded_bytes,
+            });
+        }
+    }
+
     let mut paths = PathIndex::default();
     let mut previous: Option<&str> = None;
-    let mut tar = Vec::new();
+    let mut tar = Vec::with_capacity(expanded);
     for &index in &order {
         let entry = &entries[index];
         if previous == Some(entry.path.as_str()) {
@@ -106,11 +122,6 @@ pub fn build_archive(entries: &[ArchiveEntry], limits: &Limits) -> Result<Vec<u8
         tar.resize(tar.len() + padding_len(entry.contents.len()), 0);
     }
     tar.resize(tar.len() + END_MARKER_BYTES, 0);
-    if u64::try_from(tar.len()).unwrap_or(u64::MAX) > limits.max_expanded_bytes {
-        return Err(ArchiveError::ExpandedTooLarge {
-            limit: limits.max_expanded_bytes,
-        });
-    }
 
     let bytes = compression::encode(&tar);
     read_archive(&bytes, limits)?;
@@ -160,6 +171,11 @@ fn read_checked(
     }
     let tar = compression::decode(bytes, limits)?;
     let entries = parse_tar(&tar, limits)?;
+    // One archive per content: the frame must be exactly what the pinned
+    // encoder produces for the validated tar stream.
+    if compression::encode(&tar) != bytes {
+        return Err(ArchiveError::NonCanonicalCompression);
+    }
     Ok(VerifiedArchive { digest, entries })
 }
 

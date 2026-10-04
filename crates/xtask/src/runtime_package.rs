@@ -7,21 +7,30 @@
 // Rust guideline compliant 2026-10-04
 
 use std::fs;
+use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
-use package::{build_archive, read_archive, ArchiveEntry, Limits};
+use package::{
+    build_archive, read_archive, ArchiveEntry, ArchiveError, EntryRejection, Limits, MAX_PATH_BYTES,
+};
 
 use crate::XtaskError;
 
 /// Any execute bit marks the file executable in the canonical archive.
 const EXECUTE_BITS: u32 = 0o111;
 
+/// Bytes of a tar block; every file costs one header block plus data padded to
+/// a block boundary in the canonical stream.
+const TAR_BLOCK_BYTES: u64 = 512;
+
 /// Builds the canonical archive of `dir` and writes it to `output`.
 ///
-/// Returns the package digest.
+/// `output` must not lie inside `dir`, otherwise a previous archive would
+/// become an input of the next build. Returns the package digest.
 pub(crate) fn build(dir: &Path, output: &Path) -> Result<String, XtaskError> {
-    let bytes = build_bytes(dir)?;
+    reject_output_inside(dir, output)?;
+    let bytes = build_bytes(dir, &Limits::DEFAULT)?;
     let digest = read_archive(&bytes, &Limits::DEFAULT)
         .map_err(XtaskError::Package)?
         .digest()
@@ -37,8 +46,8 @@ pub(crate) fn build(dir: &Path, output: &Path) -> Result<String, XtaskError> {
 ///
 /// Returns the package digest.
 pub(crate) fn verify(dir: &Path) -> Result<String, XtaskError> {
-    let first = build_bytes(dir)?;
-    let second = build_bytes(dir)?;
+    let first = build_bytes(dir, &Limits::DEFAULT)?;
+    let second = build_bytes(dir, &Limits::DEFAULT)?;
     if first != second {
         return Err(XtaskError::Usage(
             "package verify failed: two builds of the same directory differ".to_string(),
@@ -50,23 +59,120 @@ pub(crate) fn verify(dir: &Path) -> Result<String, XtaskError> {
         .to_string())
 }
 
-fn build_bytes(dir: &Path) -> Result<Vec<u8>, XtaskError> {
+fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> XtaskError {
+    let path = path.to_path_buf();
+    move |source| XtaskError::Io { path, source }
+}
+
+/// Fails when the resolved destination of `output` is inside `dir`.
+fn reject_output_inside(dir: &Path, output: &Path) -> Result<(), XtaskError> {
+    let root = fs::canonicalize(dir).map_err(io_error(dir))?;
+    let resolved = if output.exists() {
+        fs::canonicalize(output).map_err(io_error(output))?
+    } else {
+        let parent = match output.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let name = output
+            .file_name()
+            .ok_or_else(|| XtaskError::InvalidPath(output.to_path_buf()))?;
+        fs::canonicalize(parent)
+            .map_err(io_error(parent))?
+            .join(name)
+    };
+    if resolved.starts_with(&root) {
+        return Err(XtaskError::OutputInsideInput(output.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// Running totals of one directory walk, checked against the package limits
+/// before any file content is read.
+struct Budget<'a> {
+    limits: &'a Limits,
+    files: usize,
+    expanded: u64,
+}
+
+impl Budget<'_> {
+    /// Accounts for one file of `len` bytes at a path of `path_len` bytes.
+    fn admit(&mut self, path_len: usize, len: u64) -> Result<(), XtaskError> {
+        let index = self.files;
+        if self.files >= self.limits.max_files {
+            return Err(XtaskError::Package(ArchiveError::TooManyFiles {
+                limit: self.limits.max_files,
+            }));
+        }
+        if path_len > self.limits.max_path_bytes.min(MAX_PATH_BYTES) {
+            return Err(XtaskError::Package(ArchiveError::Entry {
+                index,
+                reason: EntryRejection::PathTooLong,
+            }));
+        }
+        if len > self.limits.max_file_bytes {
+            return Err(XtaskError::Package(ArchiveError::Entry {
+                index,
+                reason: EntryRejection::FileTooLarge,
+            }));
+        }
+        let cost = len
+            .div_ceil(TAR_BLOCK_BYTES)
+            .saturating_mul(TAR_BLOCK_BYTES)
+            .saturating_add(TAR_BLOCK_BYTES);
+        // The two-block end marker is not counted here; the archive builder
+        // applies the exact limit.
+        self.expanded = self.expanded.saturating_add(cost);
+        if self.expanded > self.limits.max_expanded_bytes {
+            return Err(XtaskError::Package(ArchiveError::ExpandedTooLarge {
+                limit: self.limits.max_expanded_bytes,
+            }));
+        }
+        self.files += 1;
+        Ok(())
+    }
+}
+
+fn build_bytes(dir: &Path, limits: &Limits) -> Result<Vec<u8>, XtaskError> {
     let mut entries = Vec::new();
-    collect(dir, dir, &mut entries)?;
-    build_archive(&entries, &Limits::DEFAULT).map_err(XtaskError::Package)
+    let mut budget = Budget {
+        limits,
+        files: 0,
+        expanded: 0,
+    };
+    collect(dir, dir, &mut budget, &mut entries)?;
+    build_archive(&entries, limits).map_err(XtaskError::Package)
+}
+
+/// Reads at most `limit` bytes of `path`; a file that grows past the limit
+/// after its metadata was checked is rejected instead of buffered.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, XtaskError> {
+    let file = fs::File::open(path).map_err(io_error(path))?;
+    let mut contents = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut contents)
+        .map_err(io_error(path))?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > limit {
+        return Err(XtaskError::Package(ArchiveError::Entry {
+            index: 0,
+            reason: EntryRejection::FileTooLarge,
+        }));
+    }
+    Ok(contents)
 }
 
 /// Collects regular files below `dir`; symlinks and special files are errors.
-fn collect(root: &Path, dir: &Path, entries: &mut Vec<ArchiveEntry>) -> Result<(), XtaskError> {
-    let io_error = |path: &Path| {
-        let path = path.to_path_buf();
-        move |source| XtaskError::Io { path, source }
-    };
+fn collect(
+    root: &Path,
+    dir: &Path,
+    budget: &mut Budget<'_>,
+    entries: &mut Vec<ArchiveEntry>,
+) -> Result<(), XtaskError> {
     for item in fs::read_dir(dir).map_err(io_error(dir))? {
         let path = item.map_err(io_error(dir))?.path();
         let metadata = fs::symlink_metadata(&path).map_err(io_error(&path))?;
         if metadata.is_dir() {
-            collect(root, &path, entries)?;
+            collect(root, &path, budget, entries)?;
         } else if metadata.is_file() {
             let relative = path
                 .strip_prefix(root)
@@ -77,9 +183,10 @@ fn collect(root: &Path, dir: &Path, entries: &mut Vec<ArchiveEntry>) -> Result<(
                 .collect::<Option<Vec<&str>>>()
                 .ok_or_else(|| XtaskError::InvalidPath(path.clone()))?
                 .join("/");
+            budget.admit(name.len(), metadata.len())?;
             entries.push(ArchiveEntry {
                 path: name,
-                contents: fs::read(&path).map_err(io_error(&path))?,
+                contents: read_bounded(&path, budget.limits.max_file_bytes)?,
                 executable: metadata.permissions().mode() & EXECUTE_BITS != 0,
             });
         } else {
@@ -140,7 +247,7 @@ mod tests {
         let script = dir.path().join("hook.sh");
         fs::write(&script, b"#!/bin/sh\n").expect("write");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).expect("chmod");
-        let bytes = build_bytes(dir.path()).expect("build");
+        let bytes = build_bytes(dir.path(), &Limits::DEFAULT).expect("build");
         let archive = read_archive(&bytes, &Limits::DEFAULT).expect("read");
         let hook = archive
             .entries()
@@ -155,7 +262,7 @@ mod tests {
         let dir = package_dir();
         symlink("runtime.toml", dir.path().join("link")).expect("symlink");
         assert!(matches!(
-            build_bytes(dir.path()),
+            build_bytes(dir.path(), &Limits::DEFAULT),
             Err(XtaskError::UnsupportedFileType(_))
         ));
     }
@@ -165,8 +272,107 @@ mod tests {
         let dir = package_dir();
         fs::write(dir.path().join("with space"), b"x").expect("write");
         assert!(matches!(
-            build_bytes(dir.path()),
+            build_bytes(dir.path(), &Limits::DEFAULT),
             Err(XtaskError::Package(_))
         ));
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_from_metadata_without_reading() {
+        let dir = package_dir();
+        let big = fs::File::create(dir.path().join("big")).expect("create");
+        big.set_len(Limits::DEFAULT.max_file_bytes + 1)
+            .expect("sparse");
+        assert!(matches!(
+            build_bytes(dir.path(), &Limits::DEFAULT),
+            Err(XtaskError::Package(ArchiveError::Entry {
+                reason: EntryRejection::FileTooLarge,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn bounded_read_rejects_a_file_larger_than_the_limit() {
+        let dir = package_dir();
+        let path = dir.path().join("runtime.toml");
+        assert_eq!(read_bounded(&path, 11).expect("at the limit").len(), 11);
+        assert!(matches!(
+            read_bounded(&path, 10),
+            Err(XtaskError::Package(ArchiveError::Entry {
+                reason: EntryRejection::FileTooLarge,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn aggregate_size_is_limited_before_files_are_read() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        for name in ["a", "b", "c"] {
+            let file = fs::File::create(dir.path().join(name)).expect("create");
+            file.set_len(4096).expect("sparse");
+        }
+        // Three files cost 3 x (512 + 4096) bytes of tar stream.
+        let limits = Limits {
+            max_expanded_bytes: 3 * (512 + 4096) - 1,
+            ..Limits::DEFAULT
+        };
+        assert!(matches!(
+            build_bytes(dir.path(), &limits),
+            Err(XtaskError::Package(ArchiveError::ExpandedTooLarge { .. }))
+        ));
+    }
+
+    #[test]
+    fn file_count_and_path_length_are_limited_during_traversal() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        for name in ["a", "b", "c"] {
+            fs::write(dir.path().join(name), b"x").expect("write");
+        }
+        let few = Limits {
+            max_files: 2,
+            ..Limits::DEFAULT
+        };
+        assert!(matches!(
+            build_bytes(dir.path(), &few),
+            Err(XtaskError::Package(ArchiveError::TooManyFiles { limit: 2 }))
+        ));
+        let short = Limits {
+            max_path_bytes: 0,
+            ..Limits::DEFAULT
+        };
+        assert!(matches!(
+            build_bytes(dir.path(), &short),
+            Err(XtaskError::Package(ArchiveError::Entry {
+                reason: EntryRejection::PathTooLong,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn output_inside_the_input_tree_is_rejected() {
+        let dir = package_dir();
+        let inside = dir.path().join("out.tar.zst");
+        assert!(matches!(
+            build(dir.path(), &inside),
+            Err(XtaskError::OutputInsideInput(_))
+        ));
+        assert!(!inside.exists());
+        let nested = dir.path().join("detect/../out.tar.zst");
+        assert!(matches!(
+            build(dir.path(), &nested),
+            Err(XtaskError::OutputInsideInput(_))
+        ));
+    }
+
+    #[test]
+    fn output_outside_the_tree_is_accepted_and_rebuilds_identically() {
+        let dir = package_dir();
+        let out = pohunek_test_support::tempdir().expect("tempdir");
+        let path = out.path().join("a.tar.zst");
+        let first = build(dir.path(), &path).expect("build");
+        assert_eq!(build(dir.path(), &path).expect("rebuild"), first);
     }
 }

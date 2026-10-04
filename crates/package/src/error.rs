@@ -101,6 +101,9 @@ pub enum ArchiveError {
     /// The zstd content checksum is absent or does not match.
     #[error("zstd content checksum is missing or wrong")]
     ZstdChecksum,
+    /// The zstd frame is valid but not the canonical encoding of its content.
+    #[error("zstd frame is not the canonical encoding of the archive content")]
+    NonCanonicalCompression,
     /// Bytes follow the single zstd frame.
     #[error("data follows the zstd frame")]
     TrailingCompressedData,

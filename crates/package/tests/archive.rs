@@ -859,3 +859,46 @@ fn error_messages_never_echo_entry_names() {
     let text = read_forged(&tar).unwrap_err().to_string();
     assert!(!text.contains("SECRET"), "{text}");
 }
+
+// ------------------------------------------- one identity per archive content
+
+#[test]
+fn reader_rejects_a_valid_zstd_frame_that_is_not_the_canonical_encoding() {
+    let canonical = build_archive(&sample(), &Limits::DEFAULT).expect("build");
+    let tar = ruzstd_decode(&canonical);
+    let alternate = compress_to_vec(tar.as_slice(), CompressionLevel::Uncompressed);
+    assert_ne!(
+        alternate, canonical,
+        "fixture must differ from the canonical frame"
+    );
+    assert_eq!(
+        read_archive(&alternate, &lenient()).unwrap_err(),
+        ArchiveError::NonCanonicalCompression
+    );
+}
+
+// ------------------------------------------------- expanded size before copy
+
+#[test]
+fn builder_applies_the_expanded_limit_before_copying_entries() {
+    // Each entry is valid on its own; only the aggregate exceeds the limit.
+    let entries: Vec<ArchiveEntry> = (0..8)
+        .map(|n| entry(&format!("f{n}"), &[1_u8; 4096]))
+        .collect();
+    let limits = Limits {
+        max_expanded_bytes: tar_len(&entries) - 1,
+        ..Limits::DEFAULT
+    };
+    assert_eq!(
+        build_archive(&entries, &limits).unwrap_err(),
+        ArchiveError::ExpandedTooLarge {
+            limit: limits.max_expanded_bytes
+        }
+    );
+    let at = Limits {
+        max_expanded_bytes: tar_len(&entries),
+        max_expansion_ratio: u64::MAX,
+        ..Limits::DEFAULT
+    };
+    build_archive(&entries, &at).expect("exactly at the aggregate limit");
+}
