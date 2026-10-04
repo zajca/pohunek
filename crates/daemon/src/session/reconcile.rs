@@ -2920,6 +2920,7 @@ fn merge_persisted_recovery(
             binding
                 .native_session_path
                 .clone_from(&recovery.native_session_path);
+            binding.native_reference_provenance = recovery.native_reference_provenance;
         }
     }
 
@@ -5298,6 +5299,7 @@ while os.getppid() == parent:
             input_rules: StoredInputRules::from(InputRules::unrestricted(false, Duration::ZERO)),
             native_launch: Some(test_native_launch(SessionRefKind::Id, true)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
+            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         };
         store
             .record_session(&SessionRecord {
@@ -6621,6 +6623,7 @@ while os.getppid() == parent:
                 input_rules: StoredInputRules::default(),
                 native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
                 launch_binding: crate::agent::host::LaunchPin::Unpinned,
+                native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
             }),
             runtime: RuntimeRecord {
                 state: RuntimeState::Live,
@@ -7101,6 +7104,7 @@ while os.getppid() == parent:
             input_rules: StoredInputRules::default(),
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
+            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         };
         store
             .record_resume(&recoverable_binding)
@@ -7419,6 +7423,7 @@ while os.getppid() == parent:
             input_rules: StoredInputRules::default(),
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
+            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         }
     }
 

@@ -386,8 +386,8 @@ All params and result type names below refer to structs exported by
 | `session.list` | `SessionListParams` or `null` | `Vec<SessionInfo>` | Lists sessions; filters use AND semantics. |
 | `session.inspect` | `SessionId` | `SessionInfo` | `SessionId` is a JSON string, e.g. `"s-1"`. |
 | `session.stop` | `SessionId` | `SessionStopResult` | Stops a live session (the entry stays in `list`). |
-| `session.resume` | `SessionId` | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but starting a new worker generation (a new native service job) with a new runtime id. The previous generation must be proven ended first; two generations of one session are never live at once. Hermes recovery revalidates the frozen executable against the pinned release before any recovery write or worker launch and returns payload-free `agent_runtime_unsupported` when unavailable or incompatible. Live, reconnecting, conflicting, or incompatible runtimes are rejected; sessions without native metadata return `not_resumable` or `agent_not_resumable`. Daemon restart never calls this method automatically. |
-| `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; Codex- and Hermes-backed sessions return `agent_fork_unsupported`; unmigrated legacy resume bindings return `migration_manifest_missing` as for `session.new`. A successful fork emits `session_created`. |
+| `session.resume` | `SessionId` | `SessionResumeResult` | Explicitly recovers a terminal or lost logical session from captured native recovery metadata, reusing the logical session id but starting a new worker generation (a new native service job) with a new runtime id. The previous generation must be proven ended first; two generations of one session are never live at once. Hermes recovery revalidates the frozen executable against the pinned release before any recovery write or worker launch and returns payload-free `agent_runtime_unsupported` when unavailable or incompatible. Live, reconnecting, conflicting, or incompatible runtimes are rejected; sessions without native metadata return `not_resumable` or `agent_not_resumable`; an assigned reference whose conversation cannot be found returns `agent_native_reference_missing` before a worker launches. Daemon restart never calls this method automatically. |
+| `session.fork` | `SessionForkParams` | `SessionForkResult` | Forks a native agent conversation into a new pohunek session id and PTY, using the source session's cwd/worktree for `cwd_mode: "same"`. Live sources are allowed. Unknown ids return `session_not_found`; external sessions return `session_external_read_only`; sources without launch-agent native metadata return `not_resumable` or `agent_not_resumable`; an assigned reference whose conversation cannot be found returns `agent_native_reference_missing` before anything launches; Codex- and Hermes-backed sessions return `agent_fork_unsupported`; unmigrated legacy resume bindings return `migration_manifest_missing` as for `session.new`. A successful fork emits `session_created`. |
 | `session.remove` | `SessionId` | `SessionRemoveResult` | Evicts a session from the registry, stopping it first if still live. Unknown id is `session_not_found`. A `reconnecting` or `incompatible` runtime, or a `conflict` whose reason is `runtime_supervision_ambiguous`, is retired through the service manager by the exact worker generation its record names, and every worker the session's journals record for that generation must then be gone, before the record is deleted. A record in one of those states that names no generation, or a `conflict` for any other reason, fails with `session_runtime_conflict`, `session_runtime_reconnecting`, or `worker_protocol_incompatible`; a retirement the service manager cannot complete fails with `runtime_supervision_unavailable`; a still-running worker journaled under another generation fails with `runtime_identity_mismatch`; unreadable session journals or a journaled worker still running after the retirement fail with `runtime_supervision_ambiguous`. The record is kept in every refused case. Every removal then sweeps the processes carrying the session's runtime ownership markers (every runtime its record or a journal of its generation names); a sweep that cannot confirm every marked process exited fails with `runtime_supervision_ambiguous` after the removal intent was recorded, keeping the session listed so a retried removal, or the next daemon start, finishes it. When same-user processes whose environment cannot be read are the only obstacle, the error `msg` lists them (`pid`, start identity, command name; at most eight, then `and N more`) and `recover` tells the operator to inspect and end the ones belonging to the session and retry; no environment values are included. It always refuses on an unconfirmed sweep; `session.remove_accepting_unconfirmed` is the consent variant. Worktree cleanup is best-effort: the result reports `worktrees_removed` for checkouts that are gone and `worktrees_failed` for an owned checkout whose `git worktree remove` failed, whose binding is dropped regardless, so the leftover directory needs manual cleanup. This is an explicit operator removal and is deliberately not subject to the retention sweep's unsaved-work hold. |
 | `session.remove_accepting_unconfirmed` | `SessionId` | `SessionRemoveResult` | Removes a session exactly like `session.remove`, except that when the marker sweep of its runtimes is unconfirmed solely because same-user processes with unreadable environments may belong to them, it proceeds instead of refusing with `runtime_supervision_ambiguous`. The daemon never signals those processes; it logs each accepted process at `warn` once the sweep lets the removal proceed, before any cleanup, and lists the set in `accepted_unconfirmed_processes` (`pid`, `start_identity`, optional `command`; the field is omitted when empty). The list is deduplicated and capped at 64 candidates, checked before anything is deleted, and each `command` is a kernel command name with every character outside ASCII letters, digits, space and `._-+:@/` escaped as `\u{..}` and long names shortened with `...`, so it is safe to print. Consent covers this one call only: nothing stores it, a retried removal needs it again, and the reconciliation finalizer and the retention sweep never have it. Every other unconfirmed reason (a signalled process still running, a sweep error, a missing supervision configuration) and every other refusal of `session.remove` still applies with the same error codes. A process among the accepted ones that does carry the runtime marker keeps running unsupervised after the worktree, logs and record are deleted. A daemon without this method answers `method_not_found`. |
 | `session.runtime_inventory` | `null` | `RuntimeInventoryResult` | Returns the durable-worker runtime inventory captured at startup reconciliation: one `RuntimeInventoryEntry` per discovered worker with its runtime slot, claimed session id, worker/runtime ids, and classification (`managed`, `orphaned`, `conflict`, `incompatible`, or `identity_mismatch`). Read-only operator diagnostic; it never mutates or kills a worker. |
@@ -536,6 +536,96 @@ returns exactly `daemon/host_governance_unavailable` with the fixed message
 `host governance status is unavailable` and recovery hint `reload or restart
 the daemon, then retry`. It does not reveal a state path, raw I/O error, record
 contents, key material, proposal, nonce, signature, or previous snapshot.
+
+### Native reference strategies
+
+A runtime definition declares in `[native_reference]` how core obtains the native
+session reference that resume and fork consume. The table is required.
+
+| `strategy` | Reference source | Resume and fork |
+|------------|------------------|-----------------|
+| `none` | none | frozen off; requires `resume.supported = false` |
+| `hook` | a validated integration report (process-bound, ancestry, sequence and expiry checked) | on once a report arrived; requires a supported resume |
+| `assigned` | generated by core and passed to the agent at launch | on from the first moment; requires a supported resume |
+
+The built-in runtimes declare `shell` = `none` and `codex`, `claude`, `hermes`
+= `hook`, so their behavior is unchanged.
+
+Rule for runtime packages without an integration handler: such a package gets
+terminal launch and activity detection. It gets resume and fork only when its
+agent CLI accepts a caller-chosen session id and the definition declares
+`strategy = "assigned"`; with `hook` or `none` it is not resumable. A package
+cannot obtain a reference through `session.report_native_id`, because that
+method accepts only a report from the launch process itself.
+
+`assigned` takes, in addition to a supported `[resume]` with
+`reference_kind = "id"` (core can generate an id, not a path):
+
+```toml
+[native_reference]
+strategy = "assigned"
+launch_args = ["--session-id", "{reference}"]   # passed at launch
+
+[native_reference.existence]                     # required, explicit
+check = "file"                                   # or "none"
+root_env = "PI_CODING_AGENT_DIR"                 # config home variable
+root_home = ".pi/agent"                          # used when the variable is unset
+dir = "sessions"                                 # directory below the root
+file_name = "_{reference}.jsonl"                 # exactly one {reference}
+name_match = "ends_with"                         # or "exact"
+max_depth = 1                                    # directory levels below dir
+```
+
+- `launch_args` follows the same whole-token `{reference}` rules and bounds as
+  `[resume] args`. At launch the daemon generates a fresh hyphenated UUID (never
+  taken from a client or user), appends the rendered `launch_args` after the
+  runtime's fixed arguments and before the initial prompt argument, and stores
+  the reference in the session and its recovery binding before the agent starts.
+  Resume and fork use the declared `[resume]` / `[fork]` argv with that
+  reference; the start flag is never repeated.
+- The binding records a provenance: `assigned` for a generated reference,
+  `reported` for one a validated report delivered (also the value for records
+  written before the field existed). An assigned reference is not identity
+  evidence: it creates no ordering key and takes no part in ancestry, sequence,
+  expiry or pid-identity validation, which stay mandatory for reports. Any
+  write of the stored reference by a validated report labels it `reported`, so
+  the provenance is never stale.
+- An assigned reference goes stale when the user changes conversation inside the
+  agent (for example `/clear` or an in-session resume), and it names nothing
+  when the agent never wrote the conversation. Before `session.resume` or
+  `session.fork` launches anything, the declared `existence` check runs against
+  the frozen declaration. `check = "none"` skips verification and relaunches
+  from the reference unchecked. `check = "file"` lists directories below the
+  config home (the environment variable named by `root_env`, read from the session's
+  profile environment only because the agent sees no other custom variables,
+  else `root_home` below the daemon's `$HOME`), descends at most `max_depth` levels below `dir`
+  (at most 4) visiting at most 50 000 entries, and matches regular files whose
+  name equals (`exact`) or ends with (`ends_with`) `file_name` with the
+  reference substituted. It runs no shell, expands no glob, never follows a
+  symlink, and checks that `dir` stays inside the root. `root_env`, `root_home`,
+  `dir` and `file_name` accept only plain components (ASCII letters, digits,
+  `.`, `_`, `-`), so no path, `..`, glob or `POHUNEK_*` variable is
+  expressible. A missing conversation, an unset or relative root, an
+  unverifiable reference or a store over the entry bound fails closed with
+  `runtime/agent_native_reference_missing`; recovery never falls back to another
+  runtime, to the shell or to "continue latest". The `ends_with` form matches any
+  file whose name ends with the rendered text, so the template must start with
+  the separator the agent writes (`_` above).
+- A fork of an assigned reference starts a new conversation whose reference core
+  cannot learn without an integration report, so the forked session holds no
+  reference and is not resumable until a validated report arrives.
+- A host profile on an `assigned` base inherits the assignment; one that
+  restates `[resume]` is rejected with `invalid_profile`, and
+  `resumable = false` switches recovery off (no reference is generated).
+- Not yet shipped: the handling of `/clear`-style conversation switches, where
+  a later `reported` reference supersedes an assigned one, with its fixture
+  tests, lands with the integration-report work (#144, #52). A package without
+  an integration cannot send a report.
+- A forked session of an assigned reference still shows the frozen
+  `capabilities.resume = true` but holds no reference, so `session.resume`
+  answers `not_resumable` for it.
+- The Pi values in the example are illustrative; verify a runtime's flag and
+  on-disk layout before declaring them.
 
 ### `SessionInfo`
 
@@ -1450,7 +1540,7 @@ Canonical public codes currently emitted include:
 | `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
-| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required` |
+| `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required` |
 
 Protocol v4 emits these runtime codes for provider-neutral agent and
 observation behavior: `agent_kind_unsupported`,

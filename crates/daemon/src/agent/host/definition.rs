@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::agent::{
-    InputRules, InputTextPolicy, NativeArgs, NativeLaunchError, NativeSessionLaunch, SessionRefKind,
+    AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
+    NativeReferenceError, NativeReferenceStrategy, NativeSessionLaunch, ReferenceExistence,
+    SessionRefKind,
 };
 use crate::detect::Manifest;
 
@@ -111,6 +113,9 @@ pub enum DefinitionError {
         /// Underlying rule violation.
         source: NativeLaunchError,
     },
+    /// The `[native_reference]` declaration is invalid.
+    #[error("{0}")]
+    NativeReference(NativeReferenceError),
     /// A field violates a size, character or consistency rule.
     #[error("{field}: {reason}")]
     Field {
@@ -495,6 +500,16 @@ impl RuntimeDefinition {
         self.native.as_ref()
     }
 
+    /// How this runtime obtains the native reference its recovery needs.
+    #[must_use]
+    pub fn native_reference_strategy(&self) -> NativeReferenceStrategy {
+        match &self.native {
+            None => NativeReferenceStrategy::None,
+            Some(native) if native.assigned().is_some() => NativeReferenceStrategy::Assigned,
+            Some(_) => NativeReferenceStrategy::Hook,
+        }
+    }
+
     /// Whether the initial prompt is passed as a trailing launch argument.
     #[must_use]
     pub fn prompt_arg(&self) -> bool {
@@ -574,11 +589,21 @@ fn submit_delay_millis(delay: Duration) -> Result<u64, DefinitionError> {
     u64::try_from(delay.as_millis()).map_err(|_error| INVALID)
 }
 
-/// Bounds the token count and size of the resume and fork templates.
+/// Bounds the token count and size of the resume, fork and assigned launch
+/// templates, and checks that an assigned reference is an id.
 fn validate_native(native: &NativeSessionLaunch) -> Result<(), DefinitionError> {
+    if native.assigned().is_some() && native.reference_kind() != SessionRefKind::Id {
+        return Err(DefinitionError::NativeReference(
+            NativeReferenceError::AssignedRequiresIdReference,
+        ));
+    }
     let templates = [
         ("resume.args", Some(native.resume_args())),
         ("fork.args", native.fork_args()),
+        (
+            "native_reference.launch_args",
+            native.assigned().map(AssignedReference::launch_args),
+        ),
     ];
     for (field, args) in templates {
         let Some(args) = args else { continue };
@@ -688,6 +713,7 @@ struct RawDefinition {
     input: RawInput,
     resume: RawResume,
     fork: RawFork,
+    native_reference: RawNativeReference,
     #[serde(default)]
     integration: Option<RawIntegration>,
 }
@@ -742,6 +768,27 @@ struct RawFork {
     args: Option<Vec<String>>,
 }
 
+/// Strategy names accepted in `[native_reference]`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawStrategy {
+    None,
+    Hook,
+    Assigned,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNativeReference {
+    strategy: RawStrategy,
+    /// Argv that passes the generated reference at launch; `assigned` only.
+    #[serde(default)]
+    launch_args: Option<Vec<String>>,
+    /// How recovery confirms the conversation exists; `assigned` only.
+    #[serde(default)]
+    existence: Option<ExistenceSpec>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawIntegration {
@@ -749,12 +796,81 @@ struct RawIntegration {
 }
 
 impl RawDefinition {
+    /// Resolves `[resume]`, `[fork]` and `[native_reference]` into one native
+    /// launch spec, or `None` for a runtime that does not recover natively.
+    fn native(&self) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
+        let native = self.resume_and_fork()?;
+        self.apply_strategy(native)
+    }
+
+    /// Applies the declared `[native_reference]` strategy to the resume and
+    /// fork launch the other tables describe.
+    ///
+    /// `none` freezes recovery off, so it must sit next to `resume.supported =
+    /// false`; `hook` and `assigned` both need a supported resume, and only
+    /// `assigned` carries a launch template and an explicit existence check.
+    fn apply_strategy(
+        &self,
+        native: Option<NativeSessionLaunch>,
+    ) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
+        let declaration = &self.native_reference;
+        let invalid = |error| DefinitionError::NativeReference(error);
+        let reject_assigned_fields = || {
+            if declaration.launch_args.is_some() {
+                return Err(invalid(NativeReferenceError::UnexpectedField {
+                    field: "launch_args",
+                }));
+            }
+            if declaration.existence.is_some() {
+                return Err(invalid(NativeReferenceError::UnexpectedField {
+                    field: "existence",
+                }));
+            }
+            Ok(())
+        };
+        match (declaration.strategy, native) {
+            (RawStrategy::None, None) => {
+                reject_assigned_fields()?;
+                Ok(None)
+            }
+            (RawStrategy::None, Some(_)) => {
+                Err(invalid(NativeReferenceError::NoneRequiresNoResume))
+            }
+            (RawStrategy::Hook, None) => Err(invalid(NativeReferenceError::HookRequiresResume)),
+            (RawStrategy::Hook, Some(native)) => {
+                reject_assigned_fields()?;
+                Ok(Some(native))
+            }
+            (RawStrategy::Assigned, None) => {
+                Err(invalid(NativeReferenceError::AssignedRequiresResume))
+            }
+            (RawStrategy::Assigned, Some(native)) => {
+                let tokens = declaration
+                    .launch_args
+                    .as_deref()
+                    .ok_or(invalid(NativeReferenceError::AssignedRequiresLaunchArgs))?;
+                let launch_args = NativeArgs::from_template(tokens)
+                    .map_err(|source| invalid(NativeReferenceError::LaunchArgs(source)))?;
+                let existence = declaration
+                    .existence
+                    .clone()
+                    .ok_or(invalid(NativeReferenceError::AssignedRequiresExistence))?;
+                let existence = ReferenceExistence::try_from(existence)
+                    .map_err(|source| invalid(NativeReferenceError::Existence(source)))?;
+                native
+                    .with_assigned(AssignedReference::new(launch_args, existence))
+                    .map(Some)
+                    .map_err(|_source| invalid(NativeReferenceError::AssignedRequiresIdReference))
+            }
+        }
+    }
+
     /// Resolves `[resume]` and `[fork]` into one native launch spec.
     ///
     /// A fork is expressible only alongside the resume that declares the
     /// reference kind, and each `supported = false` table must be empty so a
     /// leftover argv cannot be mistaken for an active one.
-    fn native(&self) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
+    fn resume_and_fork(&self) -> Result<Option<NativeSessionLaunch>, DefinitionError> {
         if !self.resume.supported {
             if self.resume.reference_kind.is_some() || self.resume.args.is_some() {
                 return Err(DefinitionError::Field {

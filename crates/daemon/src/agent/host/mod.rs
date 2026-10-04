@@ -7,6 +7,8 @@
 
 mod builtin;
 mod definition;
+#[cfg(test)]
+pub(crate) mod fixture;
 mod handle;
 mod launch;
 mod registry;

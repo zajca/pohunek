@@ -15,7 +15,7 @@
 use protocol::{ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
-use super::{SessionRef, SessionRefKind};
+use super::{AssignedReference, SessionRef, SessionRefKind};
 
 /// Whole-token sentinel that marks the reference slot in a profile template.
 pub const REFERENCE_PLACEHOLDER: &str = "{reference}";
@@ -66,6 +66,10 @@ pub enum NativeLaunchError {
     /// More than one token is the reference placeholder.
     #[error("the argument list has more than one `{{reference}}` placeholder")]
     DuplicateReference,
+    /// An assigned reference needs an id-kind spec: core can generate an id but
+    /// not a path.
+    #[error("an assigned reference requires an id reference kind")]
+    AssignedRequiresId,
 }
 
 /// A validated argv fragment with exactly one reference slot.
@@ -181,6 +185,11 @@ pub struct NativeSessionLaunch {
     resume_args: NativeArgs,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fork_args: Option<NativeArgs>,
+    /// Present when core generates the reference and passes it at launch
+    /// instead of waiting for an integration report. Boxed: most specs have
+    /// none, and this keeps the persisted binding small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assigned: Option<Box<AssignedReference>>,
 }
 
 impl NativeSessionLaunch {
@@ -195,7 +204,22 @@ impl NativeSessionLaunch {
             reference_kind,
             resume_args,
             fork_args,
+            assigned: None,
         }
+    }
+
+    /// Marks the reference as core-assigned at launch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NativeLaunchError::AssignedRequiresId`] unless the spec's
+    /// reference kind is [`SessionRefKind::Id`].
+    pub fn with_assigned(mut self, assigned: AssignedReference) -> Result<Self, NativeLaunchError> {
+        if self.reference_kind != SessionRefKind::Id {
+            return Err(NativeLaunchError::AssignedRequiresId);
+        }
+        self.assigned = Some(Box::new(assigned));
+        Ok(self)
     }
 
     /// Build a spec from resume and optional fork templates, applying the
@@ -220,6 +244,12 @@ impl NativeSessionLaunch {
     #[must_use]
     pub fn reference_kind(&self) -> SessionRefKind {
         self.reference_kind
+    }
+
+    /// The launch-time assignment of the reference, when core assigns it.
+    #[must_use]
+    pub fn assigned(&self) -> Option<&AssignedReference> {
+        self.assigned.as_deref()
     }
 
     /// The resume argv fragment.
@@ -432,5 +462,46 @@ mod tests {
         let corrupt = r#"{"reference_kind":"id","resume_args":["reference","reference"]}"#;
         serde_json::from_str::<NativeSessionLaunch>(corrupt)
             .expect_err("a spec with two reference slots must not decode");
+    }
+
+    fn assignment() -> AssignedReference {
+        AssignedReference::new(
+            NativeArgs::from_template(&["--session-id", "{reference}"]).expect("template"),
+            crate::agent::ReferenceExistence::Unchecked,
+        )
+    }
+
+    #[test]
+    fn an_assignment_needs_an_id_reference_kind() {
+        assert_eq!(
+            launch(None).with_assigned(assignment()),
+            Err(NativeLaunchError::AssignedRequiresId)
+        );
+        let id_spec = NativeSessionLaunch::new(
+            SessionRefKind::Id,
+            NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
+            None,
+        )
+        .with_assigned(assignment())
+        .expect("an id spec accepts an assignment");
+        assert!(id_spec.assigned().is_some());
+    }
+
+    #[test]
+    fn an_assignment_roundtrips_and_a_plain_spec_omits_it() {
+        let spec = NativeSessionLaunch::new(
+            SessionRefKind::Id,
+            NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
+            None,
+        )
+        .with_assigned(assignment())
+        .expect("assigned");
+        let encoded = serde_json::to_string(&spec).expect("encode");
+        assert_eq!(
+            serde_json::from_str::<NativeSessionLaunch>(&encoded).expect("decode"),
+            spec
+        );
+        let plain = serde_json::to_string(&launch(None)).expect("encode");
+        assert!(!plain.contains("assigned"));
     }
 }

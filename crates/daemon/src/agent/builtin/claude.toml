@@ -32,5 +32,8 @@ args = ["--resume", "{reference}"]
 supported = true
 args = ["--resume", "{reference}", "--fork-session"]
 
+[native_reference]
+strategy = "hook"
+
 [integration]
 handler = "claude-hook-v1"

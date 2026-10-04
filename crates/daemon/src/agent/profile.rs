@@ -550,6 +550,17 @@ fn resolve_native(
         }
         return Ok(None);
     }
+    // The launch template and existence check of an assigned reference belong
+    // to the runtime; a profile restating `[resume]` would drop them.
+    if definition
+        .native()
+        .is_some_and(|native| native.assigned().is_some())
+    {
+        return Err(invalid_profile(
+            name,
+            "a base runtime that assigns its native reference cannot override [resume]",
+        ));
+    }
     let reference_kind = raw
         .reference_kind
         .as_deref()
@@ -1350,5 +1361,51 @@ mod tests {
                 .code,
             "invalid_profile"
         );
+    }
+
+    fn assigned_registry(dir: &std::path::Path) -> ProfileRegistry {
+        ProfileRegistry::with_runtimes(
+            Some(dir.to_path_buf()),
+            crate::agent::host::fixture::pi_shaped_host(
+                std::path::Path::new("/bin/sh"),
+                crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+            ),
+        )
+    }
+
+    #[test]
+    fn a_profile_inherits_the_assignment_of_its_base_runtime() {
+        let dir = tmp_agents_dir("assigned-inherit");
+        write_profile(&dir, "mine", "base = \"pi\"\nargs = [\"--x\"]\n");
+        let agent = assigned_registry(&dir)
+            .resolve_agent("mine")
+            .expect("resolves");
+        let native = agent.native_launch().expect("recovers");
+        assert!(native.assigned().is_some());
+        assert_eq!(native, agent.definition.native().cloned().expect("base"));
+    }
+
+    #[test]
+    fn a_profile_cannot_override_resume_on_an_assigned_base() {
+        let dir = tmp_agents_dir("assigned-override");
+        write_profile(
+            &dir,
+            "restated",
+            "base = \"pi\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n",
+        );
+        let error = assigned_registry(&dir)
+            .resolve_agent("restated")
+            .expect_err("override rejected");
+        assert_eq!(error.code, "invalid_profile");
+    }
+
+    #[test]
+    fn a_profile_may_switch_recovery_off_on_an_assigned_base() {
+        let dir = tmp_agents_dir("assigned-off");
+        write_profile(&dir, "off", "base = \"pi\"\n[resume]\nresumable = false\n");
+        let agent = assigned_registry(&dir)
+            .resolve_agent("off")
+            .expect("resolves");
+        assert_eq!(agent.native_launch(), None);
     }
 }

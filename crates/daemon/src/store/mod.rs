@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::agent::host::{LaunchPin, RESERVED_RUNTIME_IDS};
-use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
+use crate::agent::{InputRules, NativeReferenceProvenance, NativeSessionLaunch, SessionRefKind};
 use crate::project::detect::project_id;
 
 #[cfg(unix)]
@@ -141,6 +141,12 @@ pub struct ResumeBinding {
     /// line written without one is [`LaunchPin::Unpinned`].
     #[serde(default, skip_serializing_if = "LaunchPin::is_unpinned")]
     pub launch_binding: LaunchPin,
+    /// Where the captured native reference came from; absent means reported.
+    #[serde(
+        default,
+        skip_serializing_if = "NativeReferenceProvenance::is_reported"
+    )]
+    pub native_reference_provenance: NativeReferenceProvenance,
 }
 
 impl ResumeBinding {
@@ -203,6 +209,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             native_launch: Option<NativeSessionLaunch>,
             #[serde(default)]
             launch_binding: LaunchPin,
+            #[serde(default)]
+            native_reference_provenance: NativeReferenceProvenance,
         }
 
         let raw = RawResumeBinding::deserialize(deserializer)?;
@@ -236,6 +244,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             input_rules: raw.input_rules,
             native_launch: raw.native_launch,
             launch_binding: raw.launch_binding,
+            native_reference_provenance: raw.native_reference_provenance,
         })
     }
 }
@@ -880,6 +889,7 @@ impl Store {
             replacement
                 .native_session_path
                 .clone_from(&authoritative.native_session_path);
+            replacement.native_reference_provenance = authoritative.native_reference_provenance;
         }
         if let Some(existing) = resume
             .iter_mut()
@@ -1391,6 +1401,7 @@ pub(crate) fn preserve_newer_native_identity(
             replacement
                 .native_session_path
                 .clone_from(&existing.native_session_path);
+            replacement.native_reference_provenance = existing.native_reference_provenance;
         }
         (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
         _ => {}
@@ -1421,6 +1432,9 @@ fn preserve_nonempty_native_identity(existing: &SessionRecord, replacement: &mut
                 replacement
                     .native_session_path
                     .clone_from(&existing.native_session_path);
+            }
+            if existing.native_session_id.is_some() || existing.native_session_path.is_some() {
+                replacement.native_reference_provenance = existing.native_reference_provenance;
             }
         }
         (None, Some(existing)) => replacement.recovery = Some(existing.clone()),
@@ -1558,6 +1572,8 @@ mod tests {
 
     use protocol::{AgentActivity, ProjectSource, RuntimeRef, RuntimeState};
 
+    use crate::agent::NativeReferenceProvenance;
+
     use super::{
         NativeIdentityOrdering, ProjectRecord, ProjectResolution, ResumeBinding, RuntimeRecord,
         SessionRefKind, SessionTransaction, Store, StoreMutation, StoredInputRules,
@@ -1692,6 +1708,7 @@ mod tests {
                 Some(&["--resume", "{reference}", "--fork-session"]),
             )),
             launch_binding: LaunchPin::Unpinned,
+            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         }
     }
 
@@ -1802,6 +1819,7 @@ mod tests {
                 Some(&["--fork", "{reference}"]),
             )),
             launch_binding: LaunchPin::Unpinned,
+            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
         };
         store.record_resume(&binding).expect("record");
         let loaded = store.load_resume().expect("load");
@@ -1864,6 +1882,39 @@ mod tests {
         let loaded = store.load_resume().expect("load");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].native_launch, None);
+    }
+
+    #[test]
+    fn resume_provenance_defaults_to_reported_and_roundtrips_when_assigned() {
+        let store = Store::new(temp_store_path("resume-provenance"));
+        let legacy = concat!(
+            r#"{"kind":"resume","session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
+            "\n"
+        );
+        write_private(store.path(), legacy);
+        let loaded = store.load_resume().expect("load");
+        assert_eq!(
+            loaded[0].native_reference_provenance,
+            NativeReferenceProvenance::Reported
+        );
+        assert!(!serde_json::to_string(&loaded[0])
+            .expect("encode")
+            .contains("native_reference_provenance"));
+
+        let mut assigned = resume("s-assigned", "assigned-ref");
+        assigned.native_reference_provenance = NativeReferenceProvenance::Assigned;
+        store.record_resume(&assigned).expect("record");
+        let loaded = store.load_resume().expect("load");
+        let stored = loaded
+            .iter()
+            .find(|binding| binding.session_id == "s-assigned")
+            .expect("stored");
+        assert_eq!(stored, &assigned);
+        assert_eq!(
+            stored.native_reference_provenance,
+            NativeReferenceProvenance::Assigned
+        );
     }
 
     #[test]

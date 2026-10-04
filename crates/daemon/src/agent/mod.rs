@@ -15,10 +15,17 @@ use serde::{Deserialize, Serialize};
 
 pub mod host;
 mod native_launch;
+mod native_reference;
 mod profile;
 
 pub use native_launch::{
     NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
+};
+pub use native_reference::{
+    generate_assigned_reference, AssignedReference, ExistenceCheckKind, ExistenceError,
+    ExistenceSpec, FileExistence, NameMatch, NativeReferenceError, NativeReferenceProvenance,
+    NativeReferenceStrategy, ReferenceCheckFailure, ReferenceExistence, MAX_EXISTENCE_DEPTH,
+    MAX_EXISTENCE_ENTRIES, MAX_EXISTENCE_PATH_COMPONENTS, MAX_EXISTENCE_TEXT_BYTES,
 };
 pub(crate) use profile::{ProfileRegistry, ResolvedAgent};
 
