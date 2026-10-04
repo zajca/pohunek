@@ -206,7 +206,8 @@ sends `SIGTERM`, then after the configured `[sweep] grace_ms` `SIGKILL`, to ever
 same-user process that carries exactly that generation's `POHUNEK_WORKER_INSTANCE_ID`
 (or `POHUNEK_RUNTIME_ID`) ownership marker, checking each process's start identity before each signal.
 It retires the ended job and its definition, then reports `runtime_lost`.
-A process whose two markers name different instances is ambiguous: it is not
+A process whose two markers name different instances, one of them this
+generation's, is ambiguous: it is not
 signalled and the loss is reported with `runtime_lost_cleanup_unconfirmed`.
 Uncertain evidence kills nothing.
 

@@ -446,12 +446,20 @@ fn classify(
     };
     match markers.worker_instance() {
         WorkerInstanceMarker::Instance(id) if id == request.worker_instance_id() => {}
-        // A process claiming two instances is attributed to neither, so it is
-        // never signalled, and the skip keeps the caller's cleanup unconfirmed.
-        WorkerInstanceMarker::Conflicting => {
+        // A process claiming two instances, one of them the requested one, is
+        // attributed to neither, so it is never signalled, and the skip keeps
+        // the caller's cleanup unconfirmed. A conflicting pair that names
+        // other instances only is foreign to this sweep.
+        WorkerInstanceMarker::Conflicting
+            if [&markers.worker_instance_id, &markers.runtime_id]
+                .into_iter()
+                .any(|marker| marker.as_deref() == Some(request.worker_instance_id())) =>
+        {
             return Ok(Selection::Skip(SkipReason::MarkersConflicting));
         }
-        WorkerInstanceMarker::Absent | WorkerInstanceMarker::Instance(_) => {
+        WorkerInstanceMarker::Conflicting
+        | WorkerInstanceMarker::Absent
+        | WorkerInstanceMarker::Instance(_) => {
             return Ok(Selection::Foreign);
         }
     }

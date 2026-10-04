@@ -336,6 +336,41 @@ async fn a_process_with_conflicting_instance_markers_is_skipped_and_never_signal
     );
 }
 
+/// A conflicting pair that names other instances only is foreign:
+/// it is not signalled, not reported and does not block the sweep of another
+/// instance, while a pair naming the swept instance in either spelling is
+/// skipped.
+#[tokio::test]
+async fn a_conflicting_pair_blocks_only_the_sweep_of_an_instance_it_names() {
+    let unrelated = identity(10, 100);
+    let names_target_current = identity(11, 110);
+    let names_target_alternate = identity(12, 120);
+    let target = identity(13, 130);
+    let inspector = ScriptedInspector::default()
+        .with_process(unrelated, marked_both("runtime-x", "runtime-y"))
+        .with_process(names_target_current, marked_both(RUNTIME, "runtime-y"))
+        .with_process(names_target_alternate, marked_both("runtime-x", RUNTIME))
+        .with_process(target, marked(RUNTIME));
+    let sender = RecordingSender::fatal_on(&[Signal::TERM]);
+
+    let report = scripted_sweep(&inspector, &sender).await.expect("sweep");
+
+    assert_eq!(sender.sent(), vec![(target, Signal::TERM)]);
+    assert_eq!(
+        report.skipped,
+        vec![
+            Skipped {
+                identity: names_target_current,
+                reason: SkipReason::MarkersConflicting,
+            },
+            Skipped {
+                identity: names_target_alternate,
+                reason: SkipReason::MarkersConflicting,
+            },
+        ]
+    );
+}
+
 #[test]
 fn unreadable_marker_processes_are_classified_by_their_start_time() {
     use super::{classify, Selection, START_IDENTITY_ORDERS_PROCESS_STARTS};
@@ -962,5 +997,31 @@ mod host {
         assert!(inspector
             .is_running(conflicting.identity)
             .expect("inspect survivor"));
+    }
+
+    /// A process whose conflicting markers both name other instances is not
+    /// part of this sweep: untouched and absent from the report.
+    #[tokio::test]
+    async fn an_unrelated_conflicting_pair_is_neither_swept_nor_reported() {
+        let inspector = HostInspector::new();
+        let runtime = unique_runtime("unrelated-target");
+        let a = unique_runtime("unrelated-a");
+        let b = unique_runtime("unrelated-b");
+        let target = spawn(inspector, COMPLIANT, Some(&runtime));
+        let unrelated = spawn_marked(
+            inspector,
+            COMPLIANT,
+            &[
+                ("POHUNEK_WORKER_INSTANCE_ID", a.as_str()),
+                ("POHUNEK_RUNTIME_ID", b.as_str()),
+            ],
+        );
+
+        let report = sweep_runtime(&inspector, &request(&runtime))
+            .await
+            .expect("sweep worker instance");
+
+        assert_eq!(report.terminated, vec![target.identity]);
+        assert_untouched(inspector, &report, &unrelated);
     }
 }

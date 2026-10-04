@@ -1012,7 +1012,8 @@ finding, until it is reinstalled. A worker sets only
 children. The hooks and the process sweep also read `POHUNEK_RUNTIME_ID` as the
 same worker instance marker, so descendants of a worker that set only that name
 are still reaped and still report identity; a process whose two markers name
-different instances is never signalled and leaves the cleanup unconfirmed.
+different instances, one of them the swept instance, is never signalled and
+leaves the cleanup unconfirmed (a pair naming other instances only is ignored).
 
 `session.release_agent` accepts the same `source`/`agent` identity plus an
 optional `seq`. A release clears only the current matching active-agent claim;

@@ -405,8 +405,9 @@ live durable worker keeps talking to a newer daemon. The environment marker is
 `POHUNEK_WORKER_INSTANCE_ID`; `POHUNEK_RUNTIME_ID` is accepted as a read-only
 alternate spelling of it by the process inspectors, the sweep and the state
 hooks, and no worker writes it or passes an inherited value to its children. A
-process whose two markers name different instances is ambiguous: the sweep
-never signals it and the cleanup stays unconfirmed. The CLI flag is
+process whose two markers name different instances, one of them the swept
+instance, is ambiguous: the sweep never signals it and the cleanup stays
+unconfirmed; a conflicting pair naming other instances only is ignored. The CLI flag is
 `--worker-instance-id`.
 The worker owns the PTY master, root child handle, reader and reaper, bounded raw
 output ring, terminal tracker, input deduplication, resize sequencing, and final
