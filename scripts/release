@@ -13,6 +13,9 @@
 # Options:
 #   --dry-run    Show what would happen without changing anything.
 #   --no-push    Commit and tag locally, but do not push.
+#   --notes FILE Release-notes file with one line naming each schema or protocol
+#                constant that changed since the previous tag (required when
+#                any changed; see the compatibility check below).
 
 set -eu
 
@@ -20,6 +23,8 @@ pohunek_fail() {
   printf 'pohunek: %s\n' "$*" >&2
   exit 1
 }
+
+pohunek_info() { printf 'release: %s\n' "$*"; }
 
 pohunek_need_cmd() {
   command -v "$1" >/dev/null 2>&1 || pohunek_fail "required command not found: $1"
@@ -34,22 +39,31 @@ release_branch="${POHUNEK_RELEASE_BRANCH:-main}"
 dry_run=false
 push=true
 bump=""
+notes_file=""
+expect_notes=false
 
 for arg in "$@"; do
+  if [ "$expect_notes" = true ]; then
+    notes_file="$arg"
+    expect_notes=false
+    continue
+  fi
   case "$arg" in
+    --notes) expect_notes=true ;;
     --dry-run) dry_run=true ;;
     --no-push) push=false ;;
     patch | minor | major) bump="$arg" ;;
     [0-9]*.[0-9]*.[0-9]*) bump="$arg" ;;
     -h | --help)
-      sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
-    *) pohunek_fail "unknown argument: $arg (use patch|minor|major|X.Y.Z, --dry-run, --no-push)" ;;
+    *) pohunek_fail "unknown argument: $arg (use patch|minor|major|X.Y.Z, --dry-run, --no-push, --notes FILE)" ;;
   esac
 done
 
-[ -n "$bump" ] || pohunek_fail "usage: scripts/release <patch|minor|major|X.Y.Z> [--dry-run] [--no-push]"
+[ "$expect_notes" = false ] || pohunek_fail "--notes needs a file argument"
+[ -n "$bump" ] || pohunek_fail "usage: scripts/release <patch|minor|major|X.Y.Z> [--dry-run] [--no-push] [--notes FILE]"
 
 pohunek_need_cmd git
 pohunek_need_cmd cargo
@@ -93,10 +107,96 @@ esac
 
 tag="v$next"
 
-pohunek_info() { printf 'release: %s\n' "$*"; }
+# Persisted-state and wire-compatibility constants, as "NAME|git pathspec". A
+# change to any of them alters the upgrade contract (AGENTS.md, "Upgrade
+# window"), so the release notes must carry a line naming each changed one.
+compat_constants="
+STORE_SCHEMA_VERSION|crates/daemon/src/store
+PROTOCOL_VERSION|crates/protocol/src/version.rs
+MIN_PROTOCOL_VERSION|crates/protocol/src/version.rs
+CURRENT_VERSION|crates/worker-protocol/src/version.rs
+PREVIOUS_VERSION|crates/worker-protocol/src/version.rs
+WORKER_JOURNAL_SCHEMA_VERSION|crates/daemon/src/runtime
+EXPECTED_INTEGRATION_VERSION|crates/protocol/src/integration.rs
+"
+
+# Prints the value of `const NAME` under pathspec at git ref, or nothing when
+# the constant does not exist there. An initializer that names another constant
+# (`= OTHER`, `= OTHER - 1`, `= OTHER + 1`, looked up in the same crate) is
+# resolved to its final value, so an alias changes when its target does. An
+# initializer it cannot evaluate is an error, never a silent "unchanged".
+# Arguments: ref name pathspec [depth].
+pohunek_const_value() {
+  pcv_depth=${4:-0}
+  if [ "$pcv_depth" -gt 8 ]; then
+    printf 'release: alias chain too deep while resolving %s\n' "$2" >&2
+    return 1
+  fi
+  pcv_rhs="$(git -C "$repo_root" grep -h -E "^[[:space:]]*(pub(\([a-z]+\))? )?const $2:" "$1" -- "$3" 2>/dev/null |
+    head -n 1 | sed -E 's/^[^=]*=[[:space:]]*//; s/;[[:space:]]*$//')"
+  [ -n "$pcv_rhs" ] || return 0
+  if ! printf '%s' "$pcv_rhs" | grep -qE '[A-Z][A-Z0-9_]{2,}'; then
+    printf '%s\n' "$pcv_rhs"
+    return 0
+  fi
+  pcv_crate="$(printf '%s' "$3" | cut -d/ -f1-2)"
+  if printf '%s' "$pcv_rhs" | grep -qE '^[A-Z][A-Z0-9_]+$'; then
+    pcv_target="$(pohunek_const_value "$1" "$pcv_rhs" "$pcv_crate" $((pcv_depth + 1)))" || return 1
+    [ -n "$pcv_target" ] || { printf 'release: cannot resolve %s = %s at %s\n' "$2" "$pcv_rhs" "$1" >&2; return 1; }
+    printf '%s\n' "$pcv_target"
+    return 0
+  fi
+  if printf '%s' "$pcv_rhs" | grep -qE '^[A-Z][A-Z0-9_]+[[:space:]]*[-+][[:space:]]*[0-9]+$'; then
+    pcv_base_name="$(printf '%s' "$pcv_rhs" | sed -E 's/^([A-Z][A-Z0-9_]+).*$/\1/')"
+    pcv_op="$(printf '%s' "$pcv_rhs" | sed -E 's/^[A-Z][A-Z0-9_]+[[:space:]]*([-+]).*$/\1/')"
+    pcv_operand="$(printf '%s' "$pcv_rhs" | sed -E 's/^.*[-+][[:space:]]*([0-9]+)$/\1/')"
+    pcv_base="$(pohunek_const_value "$1" "$pcv_base_name" "$pcv_crate" $((pcv_depth + 1)))" || return 1
+    if printf '%s' "$pcv_base" | grep -qE '^([A-Za-z_]+\()?[0-9]+\)?$'; then
+      pcv_prefix="$(printf '%s' "$pcv_base" | sed -E 's/[0-9]+.*$//')"
+      pcv_number="$(printf '%s' "$pcv_base" | sed -E 's/^[^0-9]*([0-9]+).*$/\1/')"
+      pcv_suffix="${pcv_base#"$pcv_prefix$pcv_number"}"
+      printf '%s%s%s\n' "$pcv_prefix" "$((pcv_number $pcv_op pcv_operand))" "$pcv_suffix"
+      return 0
+    fi
+  fi
+  printf 'release: cannot evaluate the initializer of %s at %s: %s\n' "$2" "$1" "$pcv_rhs" >&2
+  return 1
+}
+
+# Fails unless every constant that differs between the previous tag and HEAD is
+# named on a line of the notes file.
+pohunek_check_compat_notes() {
+  prev_tag="$(git -C "$repo_root" describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)"
+  if [ -z "$prev_tag" ]; then
+    pohunek_info "compat check: no previous tag, skipped"
+    return 0
+  fi
+  changed=""
+  for entry in $compat_constants; do
+    name=${entry%%|*}
+    path=${entry#*|}
+    old="$(pohunek_const_value "$prev_tag" "$name" "$path")"
+    new="$(pohunek_const_value HEAD "$name" "$path")"
+    if [ "$old" != "$new" ]; then
+      changed="$changed $name"
+      pohunek_info "compat check: $name changed since $prev_tag (${old:-absent} -> ${new:-absent})"
+    fi
+  done
+  [ -n "$changed" ] || { pohunek_info "compat check: no schema or protocol constant changed since $prev_tag"; return 0; }
+  [ -n "$notes_file" ] || pohunek_fail "constants changed since $prev_tag:$changed; pass --notes FILE with one line per changed constant"
+  [ -r "$notes_file" ] || pohunek_fail "cannot read notes file: $notes_file"
+  missing=""
+  for name in $changed; do
+    grep -qwF "$name" "$notes_file" || missing="$missing $name"
+  done
+  [ -z "$missing" ] || pohunek_fail "release notes $notes_file lack a line for:$missing"
+  pohunek_info "compat check: release notes name every changed constant"
+}
 
 pohunek_info "current version: $current"
 pohunek_info "next version:    $next  (tag $tag)"
+
+pohunek_check_compat_notes
 
 if [ "$dry_run" = true ]; then
   pohunek_info "dry run: would bump $manifest to $next, refresh Cargo.lock, commit, tag $tag$( [ "$push" = true ] && printf ', and push' )"

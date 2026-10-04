@@ -391,6 +391,13 @@ Daemon, sessions, integrations, and project state:
 - `crates/paths/fixtures/runtime-paths.json`
 - `crates/daemon/src/host_state/`
 - `crates/daemon/src/store/mod.rs`
+- `crates/daemon/src/store/schema.rs` — `STORE_SCHEMA_VERSION`, the `MIGRATIONS`
+  table, the `.pre-schema-<old>` backup, and `StoreSchemaError`.
+- `crates/daemon/src/store/shape_guard.rs` — persisted-shape guard test and its
+  `fixtures/shape/schema-<N>.txt` snapshots.
+- `crates/protocol/src/version.rs`
+- `crates/worker-protocol/src/version.rs`
+- `scripts/release` — compatibility-constant check against the previous tag.
 - `crates/session-worker/src/journal.rs`
 - `crates/cli/src/hermes_integration/lifecycle.rs`
 - `sdk/ts/sdk/test/runtime-path-contract.test.ts`

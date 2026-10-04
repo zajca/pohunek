@@ -18,7 +18,69 @@ future direction adds an optional trusted team relay without replacing these
 direct owner paths; it is not implemented yet.
 
 It is pre-1.0 and experimental: wire shapes, config files, and on-disk metadata
-may change freely. **Do not add backward-compatibility shims** unless asked.
+may change freely. **Do not add backward-compatibility shims** unless asked,
+except inside the upgrade window below.
+
+### Upgrade window
+
+The contract: release N stays compatible with release N-1 in exactly four
+places, and nowhere else; everything outside this window keeps the no-shim
+rule. The current state of each place is stated separately.
+
+- **Live workers.** Contract and state: the private worker protocol accepts
+  `PREVIOUS_VERSION` as well as `CURRENT_VERSION`
+  (`crates/worker-protocol/src/version.rs`), so a daemon update leaves running
+  sessions alone.
+- **Worker journal.** Contract: the daemon reads the previous journal schema.
+  State: the readable schemas are the explicit list
+  `WORKER_JOURNAL_READABLE_SCHEMAS` (`crates/daemon/src/runtime/lifecycle.rs`);
+  a schema is listed only when its layout names the worker generation, so today
+  only the current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is readable. Any other
+  schema gets a typed reason and a WARN.
+- **Public-protocol clients.** Contract: a protocol change keeps the previous
+  version served through daemon-side adapters. An adapter translates shape
+  only. A semantic change raises `MIN_PROTOCOL_VERSION` too and is an announced
+  break; the oldest adapter is deleted on the next bump. State: no adapters
+  exist yet and `MIN_PROTOCOL_VERSION` equals `PROTOCOL_VERSION`, so the
+  supported public window is `4..=4` and all peers upgrade in one pass. The
+  adapters are delivered by
+  [#526](https://github.com/zajca/pohunek/issues/526).
+- **Persisted daemon state.** Contract and state: `metadata.jsonl` migrates
+  from any older kept schema, because skipping releases is normal with
+  `update-pohunek`. A persisted shape change requires a schema bump and a
+  migration step.
+
+Every persisted record that cannot be migrated or adopted is logged at WARN,
+surfaced to the operator, and carries a recovery hint. A store newer than the
+binary, or older than every kept migration, makes the daemon refuse to start
+and leaves the store untouched.
+
+`scripts/release` compares these constants with the previous tag and requires
+a release-notes line for each changed one (see the `release` skill).
+
+#### Store schema and the shape guard
+
+Every line of `metadata.jsonl` (session, resume, worktree and project records)
+carries `schema_version`; a line without it is schema 1. The current schema is
+`STORE_SCHEMA_VERSION` in `crates/daemon/src/store/schema.rs`. The daemon runs
+`store::migrate_at_startup` in `crates/daemon/src/main.rs` before the session
+registry exists, and copies the store to `<store>.pre-schema-<old>` before the
+first migrating write.
+
+The guard test in `crates/daemon/src/store/shape_guard.rs` compares the
+serialized field set of every persisted record kind, including the nested
+`SessionInfo` protocol type, with the snapshot
+`crates/daemon/src/store/fixtures/shape/schema-<STORE_SCHEMA_VERSION>.txt`. It
+fails when a field is added, removed or renamed without a schema bump, and when
+an older schema has no migration step. A protocol field change in `SessionInfo`
+trips it on purpose: the field lands in `metadata.jsonl`. To resolve a failure:
+
+1. bump `STORE_SCHEMA_VERSION`;
+2. add a step for the previous schema to `MIGRATIONS` in `schema.rs`;
+3. add `fixtures/shape/schema-<new>.txt` (the failure prints the key set) and
+   register it in `SHAPE_SNAPSHOTS`;
+4. freeze a store written by the previous release as a fixture under
+   `crates/daemon/src/store/fixtures/` and test that it migrates.
 
 Authoritative design lives in `docs/architecture.md` (it wins over `idea.md`).
 Hard constraints, decided on purpose — respect them in every change:

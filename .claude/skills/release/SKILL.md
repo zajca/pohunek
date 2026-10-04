@@ -26,22 +26,35 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
 
 ## Steps
 
-1. **Confirm the bump.** Determine `patch`, `minor`, `major`, or an explicit
+1. **Compare the compatibility constants.** The script diffs these constants
+   between the previous tag and `HEAD`: `STORE_SCHEMA_VERSION`
+   (`crates/daemon/src/store/`), `PROTOCOL_VERSION` and `MIN_PROTOCOL_VERSION`
+   (`crates/protocol/src/version.rs`), the worker protocol `CURRENT_VERSION` and
+   `PREVIOUS_VERSION` (`crates/worker-protocol/src/version.rs`),
+   `WORKER_JOURNAL_SCHEMA_VERSION` (`crates/daemon/src/runtime/lifecycle.rs`),
+   and `EXPECTED_INTEGRATION_VERSION` (`crates/protocol/src/integration.rs`).
+   Each one that changed alters the upgrade contract in `AGENTS.md` ("Upgrade
+   window"), so the release needs a notes file with one line naming each changed
+   constant and what an operator must do. Write it before the dry run and pass
+   it as `--notes FILE`; the script aborts when a changed constant has no line.
+
+2. **Confirm the bump.** Determine `patch`, `minor`, `major`, or an explicit
    `X.Y.Z` from the user's request ("minor release" → `minor`).
 
-2. **Dry-run first.** Show what will happen without changing anything:
+3. **Dry-run first.** Show what will happen without changing anything:
 
    ```bash
-   scripts/release <patch|minor|major|X.Y.Z> --dry-run
+   scripts/release <patch|minor|major|X.Y.Z> [--notes FILE] --dry-run
    ```
 
-   This prints the current and next version and the tag. Confirm it matches
+   This prints the current and next version, the tag, and every changed
+   compatibility constant with its old and new value. Confirm it matches
    intent.
 
-3. **Cut the release.** Run the real thing:
+4. **Cut the release.** Run the real thing:
 
    ```bash
-   scripts/release <patch|minor|major|X.Y.Z>
+   scripts/release <patch|minor|major|X.Y.Z> [--notes FILE]
    ```
 
    The script bumps `version` in `[workspace.package]` in `Cargo.toml`, refreshes
@@ -50,13 +63,17 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    wants to inspect the commit/tag locally before pushing (then push the branch
    and tag manually as the script prints).
 
-4. **Record the release.** Via the `github-workflow` skill, comment the
+5. **Publish the notes.** When a notes file was needed, attach it to the GitHub
+   Release once the workflow has created it (`gh release edit "vX.Y.Z"
+   --notes-file FILE`) and confirm with `gh release view "vX.Y.Z"`.
+
+6. **Record the release.** Via the `github-workflow` skill, comment the
    version/tag and release URL on any issue whose delivery this release
    completes (or opens a dedicated tracking issue beforehand when the release
    itself is planned work), and update the project status accordingly. Verify
    the writes from the API response.
 
-5. **Verify the Release workflow — do not trust, confirm.** Pushing the `vX.Y.Z`
+7. **Verify the Release workflow — do not trust, confirm.** Pushing the `vX.Y.Z`
    tag triggers `.github/workflows/release.yml`, which runs the fmt/clippy/test
    gate + docs-gate, then builds `pohunek` and `pohunekd` for
    both `x86_64-unknown-linux-gnu` (dynamic glibc, primary) and
@@ -73,7 +90,7 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    gh release view "vX.Y.Z"   # confirm the tarballs + .sha256 (incl. the three pohunek-ts-*.tgz) are attached
    ```
 
-6. **Report.** State the published version/tag, the workflow conclusion
+8. **Report.** State the published version/tag, the workflow conclusion
    (success/failure with the failing job if any), and the attached artifacts. If
    the workflow failed, report why with output — a failed gate means no binary
    was published.
