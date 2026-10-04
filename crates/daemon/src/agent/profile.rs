@@ -485,6 +485,38 @@ fn profile_files(dir: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// Largest profile file the retention scan reads: 1 MiB.
+///
+/// The scan runs while the package lifecycle authority is held, so a file that
+/// is huge or endless must not stall package mutations and fresh launches. A
+/// profile is a few hundred bytes of launch settings; the ceiling is far above
+/// any real one.
+const MAX_SCANNED_PROFILE_BYTES: u64 = 1024 * 1024;
+
+/// Reads a profile file for the retention scan without following a final
+/// symlink and without blocking on a fifo or device swapped in after the
+/// listing, refusing anything that is not a regular file within
+/// [`MAX_SCANNED_PROFILE_BYTES`].
+fn read_bounded_profile(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    let mut text = String::new();
+    file.take(MAX_SCANNED_PROFILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if u64::try_from(text.len()).map_or(true, |read| read > MAX_SCANNED_PROFILE_BYTES) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    Ok(text)
+}
+
 /// The package binding keys of one profile file, parsed without the rest of
 /// the profile.
 #[derive(Debug, Deserialize)]
@@ -514,7 +546,7 @@ fn read_binding(dir: &Path, name: &str, path: &Path) -> Result<Option<FileBindin
         ));
     }
     let content =
-        std::fs::read_to_string(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
+        read_bounded_profile(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
     let raw: RawBinding = toml::from_str(&content)
         .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
     let Some(digest) = raw.digest else {

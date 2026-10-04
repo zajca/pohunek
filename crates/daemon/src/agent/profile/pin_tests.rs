@@ -541,3 +541,37 @@ fn host_inspect_reports_a_pinned_profile_unavailable_when_its_package_is_uninsta
 
     assert!(!runtime_of(&capabilities, "pinned").available);
 }
+
+#[test]
+fn the_retention_scan_never_blocks_on_a_fifo_or_follows_a_symlink() {
+    let fixture = Fixture::new();
+    let fifo = fixture.agents.join("fifo.toml");
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .expect("create a fifo");
+    // The listing already skips a fifo; the reader itself must also refuse one
+    // that replaces a listed regular file, without waiting for a writer.
+    super::read_bounded_profile(&fifo).expect_err("refused");
+
+    let target = fixture.agents.join("target.toml");
+    fs::write(&target, "base = \"pi\"\n").expect("write");
+    let link = fixture.agents.join("link.toml");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    super::read_bounded_profile(&link).expect_err("refused");
+    assert!(pinned_set(&fixture.profiles()).iter().next().is_none());
+}
+
+#[test]
+fn the_retention_scan_refuses_an_oversized_profile() {
+    let fixture = Fixture::new();
+    let big = fixture.agents.join("big.toml");
+    let file = fs::File::create(&big).expect("create");
+    file.set_len(super::MAX_SCANNED_PROFILE_BYTES + 1)
+        .expect("sparse file");
+    super::read_bounded_profile(&big).expect_err("refused");
+}
