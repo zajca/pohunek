@@ -478,6 +478,9 @@ Runtime package archive format:
 - `crates/package/src/verify.rs` — per-file re-verification of a package root and manifest-checked reads.
 - `crates/package/src/manifest.rs` — per-file manifest schema and manifest digest.
 - `crates/package/src/layout.rs` — package root names, modes and bounds.
+- `crates/daemon/src/agent/host/package.rs` — package-backed runtime loading and pin resolution.
+- `crates/daemon/src/agent/host/handle.rs` — runtime host snapshot, reload and launch verification.
+- `crates/daemon/src/session/packages.rs` — reload and retention-checked uninstall.
 - `crates/package/src/hash.rs` — SHA-256 helpers.
 - `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`
