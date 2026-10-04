@@ -440,12 +440,19 @@ impl ProfileRegistry {
     /// `package`/`digest` keys are parsed. A file that fails a check or does
     /// not parse pins nothing and logs a warning, so one broken profile never
     /// blocks the lifecycle of another package.
-    pub(crate) fn pinned_digests(&self) -> RetainedDigests {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agents directory holds more than
+    /// [`MAX_SCANNED_PROFILES`] entries or cannot be listed: the scan runs
+    /// under the package lifecycle authority, and an unbounded or unreadable
+    /// listing must refuse the change rather than be assumed to pin nothing.
+    pub(crate) fn pinned_digests(&self) -> std::io::Result<RetainedDigests> {
         let mut pinned = RetainedDigests::new();
         let Some(dir) = &self.dir else {
-            return pinned;
+            return Ok(pinned);
         };
-        for (stem, path) in profile_files(dir) {
+        for (stem, path) in scanned_profile_files(dir)? {
             match read_binding(dir, &stem, &path) {
                 Ok(Some(binding)) => pinned.insert(binding.digest),
                 Ok(None) => {}
@@ -454,7 +461,7 @@ impl ProfileRegistry {
                 }
             }
         }
-        pinned
+        Ok(pinned)
     }
 }
 
@@ -483,6 +490,41 @@ fn profile_files(dir: &Path) -> Vec<(String, PathBuf)> {
             Some((stem, path))
         })
         .collect()
+}
+
+/// Most directory entries the retention scan lists: 4096.
+///
+/// A host has a handful of profiles; the ceiling keeps the scan, which runs
+/// under the package lifecycle authority, from walking an arbitrarily large
+/// directory.
+const MAX_SCANNED_PROFILES: usize = 4096;
+
+/// The profile files of `dir` for the retention scan, listing at most
+/// [`MAX_SCANNED_PROFILES`] entries.
+fn scanned_profile_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    let mut seen = 0_usize;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        seen += 1;
+        if seen > MAX_SCANNED_PROFILES {
+            return Err(std::io::Error::other(
+                "the agents directory holds too many entries to scan",
+            ));
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+            files.push((stem.to_owned(), path));
+        }
+    }
+    Ok(files)
 }
 
 /// Largest profile file the retention scan reads: 1 MiB.

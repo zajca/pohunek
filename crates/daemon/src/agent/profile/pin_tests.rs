@@ -371,7 +371,9 @@ fn a_disabled_pinned_package_still_resolves_for_existing_sessions() {
 }
 
 fn pinned_set(profiles: &ProfileRegistry) -> RetainedDigests {
-    profiles.pinned_digests()
+    profiles
+        .pinned_digests()
+        .expect("the agents directory scans")
 }
 
 #[test]
@@ -446,7 +448,7 @@ fn pinned_digests_skips_an_unparsable_profile_and_keeps_the_others() {
 #[test]
 fn pinned_digests_is_empty_without_an_agents_directory() {
     let profiles = ProfileRegistry::new(None);
-    assert!(profiles.pinned_digests().iter().next().is_none());
+    assert!(pinned_set(&profiles).iter().next().is_none());
 }
 
 fn runtime_of<'a>(
@@ -571,4 +573,16 @@ fn the_retention_scan_refuses_an_oversized_profile() {
     file.set_len(super::MAX_SCANNED_PROFILE_BYTES + 1)
         .expect("sparse file");
     super::read_bounded_profile(&big).expect_err("refused");
+}
+
+#[test]
+fn the_retention_scan_refuses_a_directory_with_too_many_entries() {
+    let fixture = Fixture::new();
+    for index in 0..=super::MAX_SCANNED_PROFILES {
+        fs::write(fixture.agents.join(format!("n{index}.txt")), b"").expect("write");
+    }
+    fixture
+        .profiles()
+        .pinned_digests()
+        .expect_err("an oversized directory is not assumed to pin nothing");
 }

@@ -76,7 +76,7 @@ impl SessionRegistry {
         retained.extend(
             tokio::task::spawn_blocking(move || profiles.pinned_digests())
                 .await
-                .map_err(|join_error| io::Error::other(join_error.to_string()))?
+                .map_err(|join_error| io::Error::other(join_error.to_string()))??
                 .iter()
                 .cloned(),
         );
