@@ -541,6 +541,14 @@ Two rules keep the window bounded:
   Additive changes (optional fields, new methods, new error codes) need no
   bump; an event or enum value new to the daemon is withheld from an older
   subscriber by the adapter's known-event and known-value lists.
+- **New-in-N rule.** A method added after the previous release has no
+  previous-release fixture and no older shape to translate to. It goes on the
+  adapter's `INTRODUCED_METHODS` list (`crates/protocol/src/compat/v3.rs`), and a
+  connection of the older version gets `method_not_found` for it; its results
+  are never translated or sent. An event added after the previous release is
+  withheld from older subscribers by the known-event list. The coverage tests
+  stay strict: a method without a fixture that is not on the list fails them.
+  The list is deleted with its adapter.
 - **Adapter deletion rule.** A `PROTOCOL_VERSION` bump deletes the oldest
   adapter and its fixtures in the same change and adds the adapter for the
   version being left behind.

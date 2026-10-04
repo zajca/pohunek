@@ -626,6 +626,35 @@ async fn invalid_input_on_a_previous_version_connection_is_answered_in_that_vers
 }
 
 #[tokio::test]
+async fn methods_added_after_the_previous_version_are_unknown_to_it() {
+    let daemon = Daemon::start("window-introduced").await;
+    let mut previous = daemon.connect().await;
+    for name in protocol::compat::introduced_methods(MIN_PROTOCOL_VERSION) {
+        let response = exchange(
+            &mut previous,
+            &previous_request("introduced-1", name, json!({})),
+        )
+        .await;
+        assert_eq!(response["v"], PREVIOUS_VERSION, "{name}: {response}");
+        assert_eq!(response["err"]["code"], "method_not_found", "{name}");
+        assert!(response.get("ok").is_none(), "{name}: {response}");
+    }
+
+    // The same method is served on a current connection.
+    let mut current = daemon.connect().await;
+    let request =
+        Request::new("package-list", method::PACKAGE_LIST, json!({})).expect("valid request");
+    let response = exchange(
+        &mut current,
+        &serde_json::to_value(&request).expect("serialize request"),
+    )
+    .await;
+    assert_eq!(response["v"], PROTOCOL_VERSION.get());
+    assert_ne!(response["err"]["code"], "method_not_found", "{response}");
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn a_client_two_versions_back_is_rejected_with_a_typed_mismatch() {
     let daemon = Daemon::start("window-below").await;
     let mut client = daemon.connect().await;

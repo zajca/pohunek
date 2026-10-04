@@ -245,6 +245,15 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
 
     let adapted = match compat::upgrade_request(request.clone(), selected_version) {
         Ok(adapted) => adapted,
+        // A method added after the negotiated version is unknown to it.
+        Err(compat::CompatError::MethodNotDefined { method }) => {
+            return Response::err(
+                selected_version,
+                request.id(),
+                ProtocolError::method_not_found(&method),
+            )
+            .expect("deserialized request ids satisfy response validation");
+        }
         Err(error) => {
             warn!(
                 method = %request.method(),
@@ -1383,6 +1392,20 @@ mod tests {
         assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
         let ok = ok_value(response, "daemon.health");
         assert_eq!(ok["protocol_version"], protocol::MIN_PROTOCOL_VERSION.get());
+    }
+
+    #[tokio::test]
+    async fn a_method_added_after_the_previous_version_is_unknown_to_it() {
+        for name in protocol::compat::introduced_methods(protocol::MIN_PROTOCOL_VERSION) {
+            let response = handle_request(
+                &previous_version_request(name, serde_json::Value::Null),
+                &idle_state(),
+            )
+            .await;
+            assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION, "{name}");
+            let error = error_value(response, name);
+            assert_eq!(error.code, "method_not_found", "{name}");
+        }
     }
 
     #[tokio::test]

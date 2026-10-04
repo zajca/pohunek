@@ -9,7 +9,8 @@
 //!
 //! Adapters translate shape only: key renames and moved fields, plus dropping
 //! values the older version cannot decode (events and enum values it never
-//! defined). A semantic change (a new required parameter, a removed method, a
+//! defined). A method added after the older version is refused for it with
+//! [`CompatError::MethodNotDefined`], never served. A semantic change (a new required parameter, a removed method, a
 //! changed error code or meaning) cannot be expressed as a shape translation.
 //! It raises [`crate::MIN_PROTOCOL_VERSION`] instead and is announced as a
 //! break. On the next [`crate::PROTOCOL_VERSION`] bump the oldest adapter is
@@ -48,9 +49,31 @@ pub enum CompatError {
         /// Key that was about to be written.
         key: &'static str,
     },
+    /// The method was added after the older version and has no shape in it.
+    ///
+    /// The caller answers `method_not_found`; the method is never served to a
+    /// connection of that version.
+    #[error("method `{method}` is not defined in this protocol version")]
+    MethodNotDefined {
+        /// Method name the older version never defined.
+        method: String,
+    },
     /// Rebuilding the translated envelope failed.
     #[error("translated envelope is invalid: {0}")]
     Envelope(#[from] EnvelopeError),
+}
+
+/// Lists the methods `version` never defined, because they were added later.
+///
+/// Empty for the current version. These have no previous-release fixtures; the
+/// adapter refuses them instead of translating (see
+/// [`CompatError::MethodNotDefined`]). The list goes away with its adapter.
+#[must_use]
+pub fn introduced_methods(version: ProtocolVersion) -> &'static [&'static str] {
+    match adapter(version) {
+        Ok(Adapter::V3) => v3::INTRODUCED_METHODS,
+        _ => &[],
+    }
 }
 
 /// Translates request parameters of `version` into the current shape.

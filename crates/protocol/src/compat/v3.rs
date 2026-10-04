@@ -42,6 +42,24 @@ const LEGACY_PREVIOUS_KEY: &str = "previous_runtime_id";
 /// Object key holding a nested runtime identity or a session runtime.
 const RUNTIME_FIELD: &str = "runtime";
 
+/// Methods added after protocol 3 was released.
+///
+/// Protocol 3 never defined them, so there is no previous-release fixture and
+/// no shape to translate to. A protocol 3 connection gets `method_not_found`
+/// for them, and their results are never translated or sent. A method added
+/// after the previous release belongs on this list; the list is deleted with
+/// this adapter.
+pub(super) const INTRODUCED_METHODS: &[&str] = &[
+    method::PACKAGE_LIST,
+    method::PACKAGE_INSPECT,
+    method::PACKAGE_DOCTOR,
+    method::PACKAGE_INSTALL,
+    method::PACKAGE_LINK,
+    method::PACKAGE_SET_ENABLED,
+    method::PACKAGE_SELECT,
+    method::PACKAGE_UNINSTALL,
+];
+
 /// Event names protocol 3 defined; every other event is withheld from a
 /// protocol 3 subscriber.
 const KNOWN_EVENTS: &[&str] = &[
@@ -81,6 +99,7 @@ const SESSION_EVENTS: &[&str] = &[
 
 /// Translates protocol 3 request parameters into the current shape.
 pub(super) fn request_params(method: &str, mut params: Value) -> Result<Value, CompatError> {
+    reject_introduced(method)?;
     match method {
         method::SESSION_OUTPUT | method::SESSION_WAIT => {
             nested_identity(&mut params, "params.runtime", Direction::ToCurrent)?;
@@ -95,6 +114,7 @@ pub(super) fn request_params(method: &str, mut params: Value) -> Result<Value, C
 
 /// Translates a current success payload into the protocol 3 shape.
 pub(super) fn result(method: &str, mut result: Value) -> Result<Value, CompatError> {
+    reject_introduced(method)?;
     match method {
         method::SESSION_LIST => {
             if let Value::Array(sessions) = &mut result {
@@ -165,6 +185,16 @@ pub(super) fn event_payload(name: &str, mut payload: Value) -> Result<Option<Val
         _ => {}
     }
     Ok(Some(payload))
+}
+
+fn reject_introduced(method: &str) -> Result<(), CompatError> {
+    if INTRODUCED_METHODS.contains(&method) {
+        Err(CompatError::MethodNotDefined {
+            method: method.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 /// Which spelling a rename writes.
@@ -258,7 +288,10 @@ fn field<'a>(value: &'a mut Value, key: &str) -> Option<&'a mut Value> {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{event_payload, request_params, result, KNOWN_EVENTS, KNOWN_WARNING_KINDS};
+    use super::{
+        event_payload, request_params, result, INTRODUCED_METHODS, KNOWN_EVENTS,
+        KNOWN_WARNING_KINDS,
+    };
     use crate::{compat::CompatError, event, method};
 
     fn session_with_runtime() -> Value {
@@ -518,6 +551,17 @@ mod tests {
             event_payload("event_from_the_future", json!({"a": 1})).expect("adapter"),
             None
         );
+    }
+
+    #[test]
+    fn methods_introduced_after_protocol_3_are_refused_in_both_directions() {
+        for name in INTRODUCED_METHODS {
+            let expected = CompatError::MethodNotDefined {
+                method: (*name).to_owned(),
+            };
+            assert_eq!(request_params(name, json!({})), Err(expected.clone()));
+            assert_eq!(result(name, json!({})), Err(expected));
+        }
     }
 
     #[test]
