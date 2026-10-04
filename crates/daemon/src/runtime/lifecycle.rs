@@ -115,11 +115,85 @@ pub const DEV_SWEEP_GRACE: Duration = Duration::from_secs(5);
 /// launcher records it in the definition but inherits the caller's limit.
 pub const DEV_OPEN_FILES: u64 = 8_192;
 
-/// Durable worker journal schema this daemon understands.
+/// Durable worker journal schema written by `pohunek-sessiond`.
 ///
-/// Written by `pohunek-sessiond`; a journal with another schema is never used
-/// as generation evidence.
+/// The daemon does not link the worker crate, so a test ties this value to
+/// the worker's `JOURNAL_SCHEMA_VERSION`.
 pub(crate) const WORKER_JOURNAL_SCHEMA_VERSION: u32 = 4;
+
+/// Journal schemas read as generation evidence, each decoded by the
+/// [`JournalFacts`] reader.
+///
+/// A schema is listed only when its layout names the worker generation: a
+/// generation is never inferred from the journal path, the persisted record
+/// or the supervisor job, because callers compare the journal's generation
+/// with those very sources and a substituted value would make that check
+/// vacuous. Schema 3 (never released) lacks `generation`, `executable` and
+/// `version` and is therefore unreadable. A schema bump keeps the previous
+/// schema (N-1) readable by listing it here once the reader decodes its
+/// layout; a layout the reader cannot decode needs its own reader first.
+pub(crate) const WORKER_JOURNAL_READABLE_SCHEMAS: &[u32] = &[WORKER_JOURNAL_SCHEMA_VERSION];
+
+/// A worker journal names a schema this daemon does not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "worker journal schema {found} is unsupported (readable: {WORKER_JOURNAL_READABLE_SCHEMAS:?})"
+)]
+pub(crate) struct UnsupportedJournalSchema {
+    /// Schema the journal declares.
+    pub(crate) found: u32,
+}
+
+/// Whether `found` is `current` or its predecessor and listed in `readable`.
+pub(crate) fn schema_in_window(found: u32, current: u32, readable: &[u32]) -> bool {
+    readable.contains(&found) && found <= current && current - found <= 1
+}
+
+/// Whether a journal of `schema_version` is read as generation evidence.
+pub(crate) fn journal_schema_supported(schema_version: u32) -> bool {
+    schema_in_window(
+        schema_version,
+        WORKER_JOURNAL_SCHEMA_VERSION,
+        WORKER_JOURNAL_READABLE_SCHEMAS,
+    )
+}
+
+/// Refuses a journal whose declared schema this daemon does not read.
+///
+/// Only the schema number is decoded, so a schema whose other fields differ
+/// is still named instead of surfacing as a missing-field error. An
+/// unsupported schema is logged: its journal is evidence the daemon cannot
+/// use, never an absence of evidence.
+///
+/// # Errors
+///
+/// Returns `InvalidData` carrying [`UnsupportedJournalSchema`] for an
+/// unsupported schema, or the decoding error when no schema is declared.
+pub(crate) fn require_supported_journal_schema(
+    bytes: &[u8],
+    session_id: &str,
+    worker_id: &str,
+) -> std::io::Result<()> {
+    #[derive(Deserialize)]
+    struct SchemaProbe {
+        schema_version: u32,
+    }
+    let SchemaProbe { schema_version } = serde_json::from_slice(bytes)?;
+    if journal_schema_supported(schema_version) {
+        return Ok(());
+    }
+    let reason = UnsupportedJournalSchema {
+        found: schema_version,
+    };
+    tracing::warn!(
+        session_id,
+        worker.id = worker_id,
+        journal.schema_version = schema_version,
+        error = %reason,
+        "worker journal schema is unsupported; it is not used as generation evidence"
+    );
+    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+}
 
 /// Largest worker journal read as lifecycle evidence.
 ///
@@ -1487,8 +1561,9 @@ fn read_journal(
         .map_err(|error| {
             std::io::Error::new(error.io_kind().unwrap_or(std::io::ErrorKind::Other), error)
         })?;
+    require_supported_journal_schema(&bytes, session_id, worker_id)?;
     let journal = serde_json::from_slice::<JournalFacts>(&bytes)?;
-    if journal.schema_version != WORKER_JOURNAL_SCHEMA_VERSION
+    if !journal_schema_supported(journal.schema_version)
         || journal.session_id != session_id
         || journal.worker_id != worker_id
     {

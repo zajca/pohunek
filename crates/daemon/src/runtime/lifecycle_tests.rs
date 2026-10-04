@@ -2222,3 +2222,263 @@ async fn an_ended_job_stops_the_busy_lease_retries_after_the_first_refusal() {
     );
     fake.abort();
 }
+
+/// A journal of `schema_version` otherwise shaped like the current one.
+fn journal_of_schema(
+    schema_version: u32,
+    generation: &Generation,
+    worker_id: &str,
+    phase: &str,
+    pid: u32,
+) -> serde_json::Value {
+    let mut facts = journal("s-1", worker_id, generation.generation(), phase, pid);
+    facts["schema_version"] = schema_version.into();
+    facts
+}
+
+/// A schema-3 journal as the worker serialized it: the current layout
+/// without the worker origin (`executable`, `version`, `generation`).
+fn schema_three_journal(worker_id: &str, phase: &str, pid: u32) -> serde_json::Value {
+    let mut facts = journal("s-1", worker_id, "unused0", phase, pid);
+    let object = facts.as_object_mut().expect("journal object");
+    for key in ["executable", "version", "generation"] {
+        object.remove(key);
+    }
+    object.insert("schema_version".to_owned(), 3.into());
+    facts
+}
+
+#[test]
+fn journal_schema_constants_match_the_worker() {
+    assert_eq!(
+        WORKER_JOURNAL_SCHEMA_VERSION,
+        pohunek_session_worker::JOURNAL_SCHEMA_VERSION,
+        "the daemon and the worker must name the same current journal schema"
+    );
+}
+
+#[test]
+fn readable_journal_schemas_include_the_current_one_and_stay_within_the_window() {
+    assert!(WORKER_JOURNAL_READABLE_SCHEMAS.contains(&WORKER_JOURNAL_SCHEMA_VERSION));
+    for &schema in WORKER_JOURNAL_READABLE_SCHEMAS {
+        assert!(
+            schema_in_window(
+                schema,
+                WORKER_JOURNAL_SCHEMA_VERSION,
+                WORKER_JOURNAL_READABLE_SCHEMAS
+            ),
+            "schema {schema} is outside the N and N-1 window"
+        );
+    }
+}
+
+#[test]
+fn journal_schema_window_is_the_current_and_the_previous_schema() {
+    assert!(schema_in_window(5, 5, &[4, 5]));
+    assert!(schema_in_window(4, 5, &[4, 5]), "N-1 is read once listed");
+    assert!(!schema_in_window(4, 5, &[5]), "an unlisted layout is not");
+    assert!(!schema_in_window(3, 5, &[3, 4, 5]), "N-2 is never read");
+    assert!(!schema_in_window(6, 5, &[5, 6]), "a newer schema is not");
+}
+
+#[tokio::test]
+async fn a_current_schema_worker_journal_is_generation_evidence_for_adoption() {
+    let harness = Harness::over_worker(GENEROUS, GENEROUS);
+    let generation = harness.generation("s-1");
+    let worker = harness
+        .lifecycle()
+        .launch(&generation)
+        .await
+        .expect("launched generation connects");
+    drop(worker);
+
+    let adopted = harness
+        .lifecycle()
+        .try_connect(&generation, Instant::now() + GENEROUS, None)
+        .await;
+
+    assert!(adopted.is_some(), "the journaled worker is adopted");
+    drop(adopted);
+    harness
+        .lifecycle()
+        .retire(&generation)
+        .await
+        .expect("retire test worker");
+}
+
+#[tokio::test]
+async fn a_schema_three_journal_is_not_generation_evidence_for_adoption() {
+    let logs = LogCapture::default();
+    let _subscriber = logs.install();
+    let harness = Harness::over_worker(GENEROUS, GENEROUS);
+    let generation = harness.generation("s-1");
+    let worker = harness
+        .lifecycle()
+        .launch(&generation)
+        .await
+        .expect("launched generation connects");
+    let worker_id = worker.worker_id().await;
+    drop(worker);
+    let path = harness
+        .state_root
+        .join("s-1")
+        .join(format!("{}.json", worker_id.as_str()));
+    let mut facts: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read journal")).expect("journal json");
+    let object = facts.as_object_mut().expect("journal object");
+    for key in ["executable", "version", "generation"] {
+        object.remove(key);
+    }
+    object.insert("schema_version".to_owned(), 3.into());
+    std::fs::write(&path, facts.to_string()).expect("rewrite journal at schema 3");
+
+    let adopted = harness
+        .lifecycle()
+        .try_connect(&generation, Instant::now() + GENEROUS, None)
+        .await;
+
+    assert!(
+        adopted.is_none(),
+        "a journal without a generation never adopts a worker"
+    );
+    assert!(logs.text().contains("worker journal schema is unsupported"));
+    harness
+        .lifecycle()
+        .retire(&generation)
+        .await
+        .expect("retire test worker");
+}
+
+#[tokio::test]
+async fn recovery_reads_a_current_schema_journal_as_proof_its_worker_is_gone() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([LOADED_WITHOUT_PROCESS]);
+    let (generation, previous) = previous(&harness, Some("worker-gone"));
+    harness.write_journal(
+        "s-1",
+        "worker-gone",
+        &journal_of_schema(
+            WORKER_JOURNAL_SCHEMA_VERSION,
+            &generation,
+            "worker-gone",
+            "live",
+            exited_pid(),
+        ),
+    );
+
+    harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect("the journal proves the worker gone");
+
+    assert_eq!(harness.supervisor.retired(), [generation.service_id()]);
+}
+
+#[tokio::test]
+async fn an_unsupported_journal_schema_is_a_typed_reason_and_a_warning() {
+    let logs = LogCapture::default();
+    let _subscriber = logs.install();
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    let (generation, _) = previous(&harness, Some("worker-old"));
+    harness.write_journal(
+        "s-1",
+        "worker-old",
+        &schema_three_journal("worker-old", "live", std::process::id()),
+    );
+    // The directory exists after the first write; further journals join it.
+    let newer = journal_of_schema(
+        WORKER_JOURNAL_SCHEMA_VERSION + 1,
+        &generation,
+        "worker-new",
+        "live",
+        std::process::id(),
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(harness.state_root.join("s-1").join("worker-new.json"))
+        .expect("create newer journal");
+    std::io::Write::write_all(&mut file, newer.to_string().as_bytes()).expect("write journal");
+
+    for (worker_id, found) in [
+        ("worker-old", 3),
+        ("worker-new", WORKER_JOURNAL_SCHEMA_VERSION + 1),
+    ] {
+        let error = read_journal(&harness.state_root, "s-1", worker_id)
+            .expect_err("an unsupported schema is not evidence");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        let reason = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<UnsupportedJournalSchema>())
+            .expect("the error carries the typed schema reason");
+        assert_eq!(reason.found, found);
+    }
+
+    let logged = logs.text();
+    assert!(
+        logged.contains("WARN")
+            && logged.contains("worker journal schema is unsupported")
+            && logged.contains("journal.schema_version=3"),
+        "{logged}"
+    );
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_schema_three_journal_and_names_its_schema() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([LOADED_WITHOUT_PROCESS]);
+    let (_, previous) = previous(&harness, Some("worker-old"));
+    harness.write_journal(
+        "s-1",
+        "worker-old",
+        &schema_three_journal("worker-old", "terminal", exited_pid()),
+    );
+
+    let refusal = harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect_err("a journal without a generation proves nothing");
+
+    assert!(
+        matches!(
+            &refusal,
+            PreviousLive::Ambiguous(error)
+                if error.code == SUPERVISION_AMBIGUOUS
+                    && error.msg.contains("schema 3 is unsupported")
+        ),
+        "{refusal:?}"
+    );
+    assert!(harness.supervisor.retired().is_empty());
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_journal_missing_its_generation_without_a_schema_reason() {
+    let harness = Harness::scripted(CONNECT, INITIALIZE);
+    harness.supervisor.script_inspects([LOADED_WITHOUT_PROCESS]);
+    let (generation, previous) = previous(&harness, Some("worker-bare"));
+    let mut facts = journal_of_schema(
+        WORKER_JOURNAL_SCHEMA_VERSION,
+        &generation,
+        "worker-bare",
+        "terminal",
+        exited_pid(),
+    );
+    facts.as_object_mut().expect("object").remove("generation");
+    harness.write_journal("s-1", "worker-bare", &facts);
+
+    let refusal = harness
+        .lifecycle()
+        .retire_previous(&previous)
+        .await
+        .expect_err("missing evidence is not proof of termination");
+
+    assert!(
+        matches!(&refusal, PreviousLive::Ambiguous(error) if error.code == SUPERVISION_AMBIGUOUS),
+        "{refusal:?}"
+    );
+    assert!(harness.supervisor.retired().is_empty());
+}

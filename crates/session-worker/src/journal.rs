@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use pohunek_platform::filesystem::{AtomicReplaceError, TrustedDir};
 use serde::{Deserialize, Serialize};
 
-/// Worker journal schema understood by this crate.
-const JOURNAL_SCHEMA_VERSION: u32 = 4;
+/// Worker journal schema this crate writes and the daemon reads as current.
+pub const JOURNAL_SCHEMA_VERSION: u32 = 4;
 /// Owner-only directory permissions.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 /// Owner-only journal permissions.
