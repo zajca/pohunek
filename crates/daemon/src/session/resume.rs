@@ -241,8 +241,8 @@ impl SessionRegistry {
             .profiles
             .runtimes()
             .resolve_ref(&binding.agent_base)?;
-        host::check_pin(&binding.launch_binding, definition)?;
-        Ok(Arc::clone(definition))
+        host::check_pin(&binding.launch_binding, &definition)?;
+        Ok(definition)
     }
 
     async fn persist_failed_recovery_rollback(&self, id: &SessionId) {

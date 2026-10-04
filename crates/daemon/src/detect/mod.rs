@@ -63,7 +63,7 @@ impl DetectorConfig {
     pub fn for_agent(host: &RuntimeHost, agent: &RuntimeRef) -> Self {
         host.resolve_ref(agent).map_or_else(
             |_unresolved| Self::generic_shell(),
-            |definition| Self::for_definition(definition),
+            |definition| Self::for_definition(&definition),
         )
     }
 

@@ -114,7 +114,7 @@ pub(crate) fn host_capabilities(
     daemon_version: &str,
     profiles: &ProfileRegistry,
 ) -> HostCapabilities {
-    host_capabilities_for(daemon_version, profiles, profiles.runtimes().registry())
+    host_capabilities_for(daemon_version, profiles, &profiles.runtimes().registry())
 }
 
 /// [`host_capabilities`] against an explicit runtime registry.
@@ -286,11 +286,8 @@ pub(crate) fn validate_launch_runtime(
     base: &RuntimeRef,
     binary: &str,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    let host = crate::agent::host::RuntimeHost::default();
-    match base
-        .id()
-        .and_then(|id| definition_for_base(host.registry(), id))
-    {
+    let registry = crate::agent::host::RuntimeHost::default().registry();
+    match base.id().and_then(|id| definition_for_base(&registry, id)) {
         Some(definition) => validate_definition_launch(definition, binary),
         None => Ok(None),
     }
@@ -886,7 +883,8 @@ mod tests {
     #[test]
     fn builtin_definitions_name_only_compiled_version_probes() {
         let host = crate::agent::host::RuntimeHost::default();
-        for definition in host.registry().definitions() {
+        let registry = host.registry();
+        for definition in registry.definitions() {
             if let Some(parser) = definition.version_probe_parser() {
                 assert!(
                     VersionProbe::from_parser_id(parser).is_some(),
@@ -895,8 +893,8 @@ mod tests {
                 );
             }
         }
-        let hermes = host
-            .registry()
+        let registry = host.registry();
+        let hermes = registry
             .resolve(&RuntimeId::parse("hermes").expect("id"))
             .expect("hermes registered");
         assert_eq!(

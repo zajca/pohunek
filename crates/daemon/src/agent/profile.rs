@@ -335,7 +335,7 @@ impl ProfileRegistry {
             return Ok(ResolvedAgent {
                 name: name.to_owned(),
                 base: definition.runtime_id().clone(),
-                definition: Arc::clone(definition),
+                definition,
                 profile: None,
             });
         }
@@ -463,7 +463,7 @@ fn load_profile(
         .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
-    let definition = Arc::clone(runtimes.resolve_id(&base_id)?);
+    let definition = runtimes.resolve_id(&base_id)?;
     // A runtime without native resume (the shell) cannot have a profile claim one.
     if definition.native().is_none()
         && raw

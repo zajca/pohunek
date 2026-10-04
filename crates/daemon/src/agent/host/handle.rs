@@ -5,8 +5,12 @@
 //! resolution, launch, resume, fork and the mutation guards. It is the only
 //! place that turns an [`RuntimeRef`] into a launchable [`RuntimeDefinition`],
 //! so every caller answers an unknown runtime with the same stable error.
+//!
+//! The registry is a snapshot: every clone of a host observes the same current
+//! snapshot, and a resolution hands out an owned definition that stays valid
+//! after the snapshot is replaced.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use protocol::{ProtocolError, RuntimeId, RuntimeRef};
 
@@ -23,7 +27,7 @@ use super::registry::RuntimeRegistry;
 /// descriptor arguments, and it can never make the registry fail to build.
 #[derive(Debug, Clone)]
 pub struct RuntimeHost {
-    registry: Arc<RuntimeRegistry>,
+    registry: Arc<RwLock<Arc<RuntimeRegistry>>>,
     shell_command: Arc<ShellLaunch>,
 }
 
@@ -47,7 +51,7 @@ impl RuntimeHost {
             })
             .unwrap_or_default();
         Self {
-            registry: Arc::new(registry),
+            registry: Arc::new(RwLock::new(Arc::new(registry))),
             shell_command: Arc::new(ShellLaunch {
                 program,
                 args: Vec::new(),
@@ -101,10 +105,10 @@ impl RuntimeHost {
         Self::new(registry)
     }
 
-    /// The underlying registry.
+    /// The current registry snapshot.
     #[must_use]
-    pub fn registry(&self) -> &RuntimeRegistry {
-        &self.registry
+    pub fn registry(&self) -> Arc<RuntimeRegistry> {
+        Arc::clone(&self.registry.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Resolves a runtime identity.
@@ -115,8 +119,8 @@ impl RuntimeHost {
     pub fn resolve_id(
         &self,
         runtime_id: &RuntimeId,
-    ) -> Result<&Arc<RuntimeDefinition>, ProtocolError> {
-        self.registry.resolve(runtime_id)
+    ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+        self.registry().resolve(runtime_id).map(Arc::clone)
     }
 
     /// Resolves the runtime a [`RuntimeRef`] names.
@@ -128,8 +132,10 @@ impl RuntimeHost {
     pub fn resolve_ref(
         &self,
         reference: &RuntimeRef,
-    ) -> Result<&Arc<RuntimeDefinition>, ProtocolError> {
-        self.registry.resolve(reference.launchable()?)
+    ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+        self.registry()
+            .resolve(reference.launchable()?)
+            .map(Arc::clone)
     }
 }
 

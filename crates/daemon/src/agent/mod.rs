@@ -521,7 +521,7 @@ mod tests {
         let host = RuntimeHost::from_host_environment();
         let runtime_id = protocol::RuntimeId::parse(name).expect("runtime id");
         let definition = host.resolve_id(&runtime_id).expect("built-in resolves");
-        launch_command(&host, definition, opts)
+        launch_command(&host, &definition, opts)
     }
 
     #[test]
