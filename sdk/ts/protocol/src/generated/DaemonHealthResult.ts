@@ -15,7 +15,7 @@ export type DaemonHealthResult = {
    */
   daemon_version: string;
   /**
-   * Protocol version spoken by the daemon.
+   * Protocol version negotiated for the connection that asked.
    */
   protocol_version: ProtocolVersion;
 };

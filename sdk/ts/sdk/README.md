@@ -70,7 +70,7 @@ const client = await connectTcp("build-box", {
 separate client when you also need ordinary requests:
 
 ```ts
-import { SUPPORTED_PROTOCOL_VERSIONS, connectLocal, type Request } from "@pohunek/sdk";
+import { CLIENT_PROTOCOL_VERSIONS, connectLocal, type Request } from "@pohunek/sdk";
 
 const socketPath = process.env["POHUNEK_SOCKET"];
 if (socketPath === undefined) {
@@ -78,7 +78,7 @@ if (socketPath === undefined) {
 }
 
 const request: Request = {
-  v: SUPPORTED_PROTOCOL_VERSIONS,
+  v: CLIENT_PROTOCOL_VERSIONS,
   id: "readme-subscribe-1",
   method: "subscribe",
   params: null,

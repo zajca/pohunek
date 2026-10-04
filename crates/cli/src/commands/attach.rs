@@ -2919,10 +2919,7 @@ mod tests {
         reason = "test helper takes the json! literal by value to keep call sites terse"
     )]
     fn assert_request(request: &Request, method_name: &str, params: serde_json::Value) {
-        assert_eq!(
-            request.version_range(),
-            protocol::SUPPORTED_PROTOCOL_VERSIONS
-        );
+        assert_eq!(request.version_range(), protocol::CLIENT_PROTOCOL_VERSIONS);
         assert_eq!(request.method(), method_name, "method");
         assert_eq!(request.params(), &params, "params");
         // The id is now a unique per-call SDK correlation id; assert only its

@@ -27,7 +27,7 @@ mod util;
 mod worktree;
 
 use protocol::{
-    method, negotiate, ProtocolError, Request, Response, PROTOCOL_VERSION,
+    compat, method, negotiate, ProtocolError, ProtocolVersion, Request, Response, PROTOCOL_VERSION,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::json;
@@ -166,13 +166,23 @@ pub(crate) enum Dispatch {
 /// mismatches are turned into typed error responses (`Reply`) so the connection
 /// can stay open for the next request. A valid `subscribe` request yields
 /// `Subscribe` with the OK ack line for the caller to write before streaming.
-pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
+///
+/// `connection_version` is the version already frozen for this connection. A
+/// line that cannot be parsed has no range of its own, so its error is stamped
+/// with that version; before the first successful request nothing is negotiated
+/// yet and the daemon's current version is the only honest stamp.
+pub(crate) async fn dispatch_line(
+    line: &str,
+    state: &DaemonState,
+    connection_version: Option<ProtocolVersion>,
+) -> Dispatch {
+    let error_version = connection_version.unwrap_or(PROTOCOL_VERSION);
     let trimmed = line.trim();
     if trimmed.is_empty() {
         // Tolerate blank keep-alive lines; reply with a framing error tied to a
         // synthetic id so the client still gets a parseable line.
         let resp = Response::err(
-            PROTOCOL_VERSION,
+            error_version,
             "invalid-request",
             ProtocolError::bad_request("empty request line"),
         )
@@ -190,7 +200,7 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
             warn!(error = %err, "failed to parse control request");
             // We cannot recover the request id from unparseable JSON; use empty.
             let resp = Response::err(
-                PROTOCOL_VERSION,
+                error_version,
                 "invalid-request",
                 ProtocolError::bad_request(format!("invalid request JSON: {err}")),
             )
@@ -209,13 +219,14 @@ pub(crate) async fn dispatch_line(line: &str, state: &DaemonState) -> Dispatch {
 
 /// Dispatch a parsed request to its method handler.
 ///
+/// Negotiates the protocol version first. A request of the previous protocol
+/// version is translated to the current shape before it reaches a handler and
+/// its response is translated back (see [`protocol::compat`]), so handlers only
+/// ever see and produce the current wire shape.
+///
 /// Exposed within the crate (and re-exported) so integration tests can exercise
 /// dispatch without a live socket.
 #[must_use]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the public method table stays centralized so version and origin guards apply uniformly"
-)]
 pub async fn handle_request(request: &Request, state: &DaemonState) -> Response {
     debug!(id = %request.id(), method = %request.method(), "control request");
 
@@ -228,7 +239,59 @@ pub async fn handle_request(request: &Request, state: &DaemonState) -> Response 
                 .expect("deserialized request ids satisfy response validation");
         }
     };
+    if selected_version == PROTOCOL_VERSION {
+        return handle_negotiated(request, state, selected_version).await;
+    }
 
+    let adapted = match compat::upgrade_request(request.clone(), selected_version) {
+        Ok(adapted) => adapted,
+        Err(error) => {
+            warn!(
+                method = %request.method(),
+                protocol_version = selected_version.get(),
+                %error,
+                "request does not match the negotiated protocol version"
+            );
+            return Response::err(
+                selected_version,
+                request.id(),
+                ProtocolError::bad_request(format!(
+                    "request is not valid for protocol version {selected_version}: {error}"
+                )),
+            )
+            .expect("deserialized request ids satisfy response validation");
+        }
+    };
+    let response = handle_negotiated(&adapted, state, selected_version).await;
+    match compat::downgrade_response(response, request.method()) {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(
+                method = %request.method(),
+                protocol_version = selected_version.get(),
+                %error,
+                "response cannot be expressed in the negotiated protocol version"
+            );
+            Response::err(
+                selected_version,
+                request.id(),
+                ProtocolError::version_adapter_failed(selected_version),
+            )
+            .expect("deserialized request ids satisfy response validation")
+        }
+    }
+}
+
+/// Dispatch a request whose parameters already have the current shape.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the public method table stays centralized so version and origin guards apply uniformly"
+)]
+async fn handle_negotiated(
+    request: &Request,
+    state: &DaemonState,
+    selected_version: protocol::ProtocolVersion,
+) -> Response {
     if mutation_target(request).is_some_and(|target| {
         state.sessions.is_origin_session(
             request.origin_session_id(),
@@ -421,7 +484,7 @@ pub(crate) fn serialize_response(resp: &Response) -> String {
         warn!(error = %err, "failed to serialize response; sending fallback error");
         format!(
             r#"{{"v":{},"id":"{}","err":{{"class":"daemon","code":"serialize_failed","msg":"response serialization failed"}}}}"#,
-            PROTOCOL_VERSION.get(),
+            resp.version().get(),
             resp.id().replace('"', "")
         )
     })
@@ -1283,5 +1346,142 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Builds a request line of the previous public protocol version.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "test helper takes the json! literal by value to keep call sites terse"
+    )]
+    fn previous_version_request(method: &str, params: serde_json::Value) -> Request {
+        let previous = protocol::MIN_PROTOCOL_VERSION.get();
+        serde_json::from_value(serde_json::json!({
+            "v": {"minimum": previous, "maximum": previous},
+            "id": "previous-1",
+            "method": method,
+            "params": params,
+        }))
+        .expect("valid previous-version request")
+    }
+
+    fn idle_state() -> DaemonState {
+        daemon_state(
+            HealthInfo::new("test"),
+            SessionRegistry::new(SessionRegistryConfig::default()),
+        )
+    }
+
+    #[tokio::test]
+    async fn previous_version_health_reports_the_negotiated_version() {
+        let response = handle_request(
+            &previous_version_request(method::DAEMON_HEALTH, serde_json::Value::Null),
+            &idle_state(),
+        )
+        .await;
+
+        // A previous-version SDK compares this field with its own version.
+        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
+        let ok = ok_value(response, "daemon.health");
+        assert_eq!(ok["protocol_version"], protocol::MIN_PROTOCOL_VERSION.get());
+    }
+
+    #[tokio::test]
+    async fn previous_version_host_inspect_reports_the_negotiated_version() {
+        let response = handle_request(
+            &previous_version_request(method::HOST_INSPECT, serde_json::Value::Null),
+            &idle_state(),
+        )
+        .await;
+
+        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
+        let ok = ok_value(response, "host.inspect");
+        assert_eq!(ok["protocol_version"], protocol::MIN_PROTOCOL_VERSION.get());
+    }
+
+    #[tokio::test]
+    async fn current_version_health_reports_the_current_version() {
+        let response = handle_request(
+            &request(
+                "health-current",
+                method::DAEMON_HEALTH,
+                serde_json::Value::Null,
+            ),
+            &idle_state(),
+        )
+        .await;
+
+        assert_eq!(response.version(), protocol::PROTOCOL_VERSION);
+        let ok = ok_value(response, "daemon.health");
+        assert_eq!(ok["protocol_version"], protocol::PROTOCOL_VERSION.get());
+    }
+
+    #[tokio::test]
+    async fn previous_version_native_id_report_reaches_the_handler_with_the_current_key() {
+        let params = serde_json::json!({
+            "session_id": "s-missing",
+            "runtime_id": "worker-instance-1",
+            "agent": "claude",
+            "pid": 42,
+            "pid_start_identity": "7",
+            "sequence": "1",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "native_session_id": "native-1",
+        });
+        let response = handle_request(
+            &previous_version_request(method::SESSION_REPORT_NATIVE_ID, params),
+            &idle_state(),
+        )
+        .await;
+
+        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
+        // Without the adapter the strict parse answers `bad_request` for the
+        // unknown `runtime_id` key before the session lookup runs.
+        let accepted = response.is_ok()
+            || response
+                .result()
+                .err()
+                .is_some_and(|error| error.code != "bad_request");
+        assert!(accepted, "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn previous_version_request_with_the_current_key_is_a_typed_bad_request() {
+        let params = serde_json::json!({
+            "session_id": "s-missing",
+            "worker_instance_id": "worker-instance-1",
+            "agent": "claude",
+            "pid": 42,
+            "pid_start_identity": "7",
+            "sequence": "1",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "native_session_id": "native-1",
+        });
+        let response = handle_request(
+            &previous_version_request(method::SESSION_REPORT_NATIVE_ID, params),
+            &idle_state(),
+        )
+        .await;
+
+        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
+        let error = error_value(response, "session.report_native_id");
+        assert_eq!(error.code, "bad_request");
+    }
+
+    #[tokio::test]
+    async fn a_version_below_the_window_is_rejected_before_any_method_runs() {
+        let below = protocol::MIN_PROTOCOL_VERSION.get() - 1;
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "v": {"minimum": below, "maximum": below},
+            "id": "below-1",
+            "method": method::DAEMON_HEALTH,
+            "params": null,
+        }))
+        .expect("valid request");
+
+        let response = handle_request(&request, &idle_state()).await;
+
+        assert_eq!(response.version(), protocol::PROTOCOL_VERSION);
+        let error = error_value(response, "daemon.health");
+        assert_eq!(error.code, "version_mismatch");
     }
 }

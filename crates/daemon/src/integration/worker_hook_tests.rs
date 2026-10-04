@@ -72,7 +72,7 @@ impl DaemonStub {
                         return;
                     }
                     lines.lock().expect("lines lock").push(line.clone());
-                    let Dispatch::Reply(reply) = dispatch_line(&line, &state).await else {
+                    let Dispatch::Reply(reply) = dispatch_line(&line, &state, None).await else {
                         return;
                     };
                     let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
@@ -101,7 +101,8 @@ impl DaemonStub {
             "method": method::NOTIFICATION_LIST,
             "params": {},
         });
-        let Dispatch::Reply(reply) = dispatch_line(&request.to_string(), &self.state).await else {
+        let Dispatch::Reply(reply) = dispatch_line(&request.to_string(), &self.state, None).await
+        else {
             panic!("notification.list returns a one-shot reply");
         };
         let reply: Value = serde_json::from_str(&reply).expect("reply is JSON");

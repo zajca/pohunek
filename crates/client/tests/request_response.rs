@@ -1685,7 +1685,7 @@ fn canonical_legacy_protocol_mismatch() -> ProtocolError {
     let legacy = legacy_protocol_version();
     let legacy_range =
         protocol::ProtocolVersionRange::new(legacy, legacy).expect("valid exact legacy range");
-    ProtocolError::version_mismatch(protocol::SUPPORTED_PROTOCOL_VERSIONS, legacy_range)
+    ProtocolError::version_mismatch(protocol::CLIENT_PROTOCOL_VERSIONS, legacy_range)
 }
 
 fn request_with_id(id: &str) -> Request {

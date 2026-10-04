@@ -8361,7 +8361,7 @@ async fn detection_rpc_returns_a_bounded_typed_error_for_oversized_previews() {
     );
 
     let line = serde_json::to_string(&request).expect("request serializes");
-    let crate::api::Dispatch::Reply(serialized) = dispatch_line(&line, &state).await else {
+    let crate::api::Dispatch::Reply(serialized) = dispatch_line(&line, &state, None).await else {
         panic!("session.detection returns a one-shot reply");
     };
     assert!(serialized.len() <= MAX_CONTROL_LINE_BYTES);

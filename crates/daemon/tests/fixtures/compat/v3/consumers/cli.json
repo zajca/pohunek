@@ -1,0 +1,295 @@
+{
+  "release": "v0.33.0",
+  "commit": "e6fcf2377ba14a51d8e7de971c13e1e86a864134",
+  "consumer": "pohunek CLI (cargo build -p pohunek-cli)",
+  "capture": "cargo build -p pohunek-cli at the v0.33.0 tag (CARGO_TARGET_DIR outside /tmp); then, for every entry, the debug binary was run as `env -i PATH=$PATH HOME=<scratch> XDG_RUNTIME_DIR=<dir> pohunek <args>` against a throwaway python3 capture server (unix socket, one NDJSON request per line, logs the raw line, replies with a canned protocol-3 envelope {\"v\":3,\"id\":<echo>,\"ok\":...} so the consumer proceeds; not checked in) listening on $XDG_RUNTIME_DIR/pohunek/daemon.sock. Commands per label: health -> `health --json`; session.list -> `session list --json`; session.new shell -> `session new --agent shell --cwd /tmp --json`; session.inspect/stop/screen/read -> `session <cmd> ses_0123456789abcdef --json`; session.input -> `session input <id> 'echo hi' --json`; session.input wait -> adds `--until idle --timeout 1000`; session.output runtime -> `session output <id> --runtime-id rt-0123456789abcdef --runtime-generation 1 --after-offset 0 --json`; session.wait runtime -> `session wait <id> --runtime-id rt-0123456789abcdef --runtime-generation 1 --timeout-ms 1000 --json`; session.wait state -> adds `--state running --after-output-offset 0`; session.resize -> `--cols 100 --rows 30`; session.metadata -> `--set k=v`; session.rename -> `session rename <id> name`; session.runtime_inventory -> `session runtime-inventory --json`; notification.list -> `notifications list --json`; project.list -> `project list --json`; host.inspect local -> `host inspect local --json`. The CLI resolves every session target with a session.list round-trip first; only the first resolution request is kept. The canned session carried runtime_id/runtime_generation so the CLI proceeds. Only the request ids were normalized: the CLI derives the middle id token from the clock, so it is replaced by twenty zeros (shape sdk-<method>-<token>-<counter> unchanged); all other values are as received.",
+  "requests": [
+    {
+      "label": "health",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-daemon.health-00000000000000000000-0",
+        "method": "daemon.health",
+        "params": null
+      }
+    },
+    {
+      "label": "session.list",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.list-00000000000000000000-0",
+        "method": "session.list",
+        "params": {}
+      }
+    },
+    {
+      "label": "session.new shell",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.new-00000000000000000000-0",
+        "method": "session.new",
+        "params": {
+          "agent": "shell",
+          "cols": 80,
+          "cwd": "/tmp",
+          "rows": 24
+        }
+      }
+    },
+    {
+      "label": "session.inspect",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.inspect-00000000000000000000-1",
+        "method": "session.inspect",
+        "params": "ses_0123456789abcdef"
+      }
+    },
+    {
+      "label": "session.stop",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.stop-00000000000000000000-1",
+        "method": "session.stop",
+        "params": "ses_0123456789abcdef"
+      }
+    },
+    {
+      "label": "session.screen",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.screen-00000000000000000000-1",
+        "method": "session.screen",
+        "params": {
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.input",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.input-00000000000000000000-1",
+        "method": "session.input",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "text": "echo hi"
+        }
+      }
+    },
+    {
+      "label": "session.input wait",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.input-00000000000000000000-1",
+        "method": "session.input",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "text": "echo hi",
+          "wait": {
+            "timeout_ms": 1000,
+            "until": [
+              "idle"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "label": "session.output runtime",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.output-00000000000000000000-1",
+        "method": "session.output",
+        "params": {
+          "after_offset": "0",
+          "max_bytes": 16384,
+          "runtime": {
+            "runtime_generation": "1",
+            "runtime_id": "rt-0123456789abcdef"
+          },
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.wait runtime",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.wait-00000000000000000000-1",
+        "method": "session.wait",
+        "params": {
+          "runtime": {
+            "runtime_generation": "1",
+            "runtime_id": "rt-0123456789abcdef"
+          },
+          "session_id": "ses_0123456789abcdef",
+          "timeout_ms": 1000
+        }
+      }
+    },
+    {
+      "label": "session.wait state",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.wait-00000000000000000000-1",
+        "method": "session.wait",
+        "params": {
+          "after_output_offset": "0",
+          "runtime": {
+            "runtime_generation": "1",
+            "runtime_id": "rt-0123456789abcdef"
+          },
+          "session_id": "ses_0123456789abcdef",
+          "states": [
+            "running"
+          ],
+          "timeout_ms": 1000
+        }
+      }
+    },
+    {
+      "label": "session.read",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.read-00000000000000000000-1",
+        "method": "session.read",
+        "params": {
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.resize",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.resize-00000000000000000000-1",
+        "method": "session.resize",
+        "params": {
+          "cols": 100,
+          "rows": 30,
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.metadata",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.set_metadata-00000000000000000000-1",
+        "method": "session.set_metadata",
+        "params": {
+          "metadata": {
+            "k": "v"
+          },
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.rename",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.rename-00000000000000000000-1",
+        "method": "session.rename",
+        "params": {
+          "name": "name",
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "session.runtime_inventory",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-session.runtime_inventory-00000000000000000000-0",
+        "method": "session.runtime_inventory",
+        "params": null
+      }
+    },
+    {
+      "label": "notification.list",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-notification.list-00000000000000000000-0",
+        "method": "notification.list",
+        "params": {}
+      }
+    },
+    {
+      "label": "project.list",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-project.list-00000000000000000000-0",
+        "method": "project.list",
+        "params": {}
+      }
+    },
+    {
+      "label": "host.inspect local",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "sdk-host.inspect-00000000000000000000-0",
+        "method": "host.inspect",
+        "params": null
+      }
+    }
+  ]
+}

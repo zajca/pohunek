@@ -2396,7 +2396,7 @@ mod tests {
     fn a_connection_rejects_selected_version_changes() {
         let selected = protocol::PROTOCOL_VERSION;
         let mut state = None;
-        validate_selected_version(protocol::SUPPORTED_PROTOCOL_VERSIONS, selected, &mut state)
+        validate_selected_version(protocol::CLIENT_PROTOCOL_VERSIONS, selected, &mut state)
             .expect("first response selects the version");
         let changed = ProtocolVersion::new(selected.get() + 1).expect("nonzero changed version");
         assert!(matches!(

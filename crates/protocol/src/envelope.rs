@@ -26,7 +26,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::error::ProtocolError;
-use crate::version::{ProtocolVersion, ProtocolVersionRange, SUPPORTED_PROTOCOL_VERSIONS};
+use crate::version::{ProtocolVersion, ProtocolVersionRange, CLIENT_PROTOCOL_VERSIONS};
 use crate::SessionId;
 use crate::{MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES};
 
@@ -58,7 +58,7 @@ pub struct Request {
 }
 
 impl Request {
-    /// Builds a request for this build's supported range.
+    /// Builds a request advertising the range a client of this build speaks.
     ///
     /// `params` may be any serializable value; pass `serde_json::Value::Null`
     /// (or `serde_json::json!({})`) for parameterless methods.
@@ -66,10 +66,10 @@ impl Request {
     /// # Examples
     ///
     /// ```
-    /// use protocol::{method, Request, SUPPORTED_PROTOCOL_VERSIONS};
+    /// use protocol::{method, Request, CLIENT_PROTOCOL_VERSIONS};
     ///
     /// let request = Request::new("req-1", method::DAEMON_HEALTH, serde_json::Value::Null)?;
-    /// assert_eq!(request.version_range(), SUPPORTED_PROTOCOL_VERSIONS);
+    /// assert_eq!(request.version_range(), CLIENT_PROTOCOL_VERSIONS);
     /// # Ok::<(), protocol::EnvelopeError>(())
     /// ```
     ///
@@ -88,13 +88,34 @@ impl Request {
             return Err(EnvelopeError::InvalidMethod);
         }
         Ok(Self {
-            v: SUPPORTED_PROTOCOL_VERSIONS,
+            v: CLIENT_PROTOCOL_VERSIONS,
             id,
             method,
             params,
             origin_session_id: None,
             origin_daemon_id: None,
         })
+    }
+
+    /// Replaces the advertised range with the exact `version`.
+    ///
+    /// A daemon-backed probe uses it to speak the version of the connection it
+    /// answers for instead of the client's current version.
+    #[must_use]
+    pub fn with_exact_version(mut self, version: ProtocolVersion) -> Self {
+        self.v = ProtocolVersionRange::new(version, version)
+            .expect("a protocol version is always a valid exact range");
+        self
+    }
+
+    /// Replaces the method parameters, keeping every other envelope coordinate.
+    ///
+    /// The daemon uses it to hand a handler the current-shape parameters of a
+    /// request that arrived in an older protocol version.
+    #[must_use]
+    pub fn with_params(mut self, params: Value) -> Self {
+        self.params = params;
+        self
     }
 
     /// Attach inherited Pohunek origin markers to a request.

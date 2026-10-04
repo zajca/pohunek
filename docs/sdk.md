@@ -33,7 +33,8 @@ entirely through this surface.
   consumed by git tag and the TypeScript packages as release tarballs pinned by
   URL and integrity, never from a registry. Crates beyond `pohunek-client` that a
   Rust client links are a pinned, not a stable, API (no back-compat shims), and
-  clients move in lockstep with the protocol version.
+  clients pin the protocol version they were built against (a daemon one
+  release newer still serves them through the protocol window).
 - **Or skip a client entirely** — every CLI command supports `--json` and
   `subscribe` streams typed events, so a shell script is a legitimate way to
   drive pohunek.

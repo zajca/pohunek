@@ -9,6 +9,15 @@
   runbook points at it, and the source map lists the schema and shape-guard
   sources.
 
+## Unreleased (2026-10-04, public protocol window)
+
+- Documented the public protocol window: a daemon accepts protocol `3..=4`
+  through shape-only edge adapters while clients advertise only their own
+  version, `daemon.health` and `host.inspect` report the negotiated version, and
+  the update runbook now says to upgrade daemons before their clients (a new
+  client against an N-1 daemon remains #527). The source
+  map lists `crates/protocol/src/compat/`.
+
 ## Unreleased (2026-10-04, README and reference pages)
 
 - The README is an agent-focused entry point; the human reference lives in

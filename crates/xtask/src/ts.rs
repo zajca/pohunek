@@ -28,9 +28,9 @@ use protocol::{
     SessionScreenResult, SessionState, SessionWaitParams, SessionWaitReason, SessionWaitResult,
     SessionWarning, SessionWarningKind, StateSource, SubagentInfo, SubagentLifecycle,
     SubagentRevision, TerminalCursor, TerminalDimensions, TerminalWatermark,
-    MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS,
-    MAX_WORKER_INSTANCE_ID_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
-    SUPPORTED_PROTOCOL_VERSIONS,
+    CLIENT_PROTOCOL_VERSIONS, MAX_CONTROL_LINE_BYTES, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
+    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -260,9 +260,26 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     .expect("writing to a String cannot fail");
     writeln!(
         body,
+        "/** Range a daemon of this release accepts; a client does not advertise it. */"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
         "export const SUPPORTED_PROTOCOL_VERSIONS = {{ minimum: {}, maximum: {} }} as const;",
         SUPPORTED_PROTOCOL_VERSIONS.minimum().get(),
         SUPPORTED_PROTOCOL_VERSIONS.maximum().get()
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "/** Range a client of this release advertises in every request. */"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "export const CLIENT_PROTOCOL_VERSIONS = {{ minimum: {}, maximum: {} }} as const;",
+        CLIENT_PROTOCOL_VERSIONS.minimum().get(),
+        CLIENT_PROTOCOL_VERSIONS.maximum().get()
     )
     .expect("writing to a String cannot fail");
     writeln!(

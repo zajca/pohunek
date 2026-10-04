@@ -65,7 +65,7 @@ pub struct AgentRuntime {
 pub struct HostCapabilities {
     /// Version string of the daemon answering on the host.
     pub daemon_version: String,
-    /// Protocol version the host's daemon speaks.
+    /// Protocol version the host's daemon negotiated for the connection that asked.
     pub protocol_version: ProtocolVersion,
     /// Agent profile and built-in base names the host's daemon knows how to launch.
     pub supported_agents: Vec<String>,

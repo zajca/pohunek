@@ -176,12 +176,26 @@ the accepted team relay has shipped.
 
 ## Compatibility Model
 
-The current public protocol version is `4` (`PROTOCOL_VERSION`), and this build
-supports the inclusive range `4..=4` (`SUPPORTED_PROTOCOL_VERSIONS`). Requests
-carry `v: {minimum, maximum}`. The first valid response selects the highest
-overlapping version as an integer `v`, and that selection is fixed for the
-lifetime of the connection. Subscription events use the same selected version.
-A non-overlapping range returns `daemon/version_mismatch`.
+The current public protocol version is `4` (`PROTOCOL_VERSION`). A daemon of this
+build accepts the inclusive range `3..=4` (`SUPPORTED_PROTOCOL_VERSIONS`): its own
+version and the previous one, which it serves through shape-only edge adapters.
+Clients of this build advertise only `4..=4` (`CLIENT_PROTOCOL_VERSIONS`), so a new
+client against an older daemon is refused until
+[#527](https://github.com/zajca/pohunek/issues/527) lands.
+Requests carry `v: {minimum, maximum}`. The first valid response selects the
+highest overlapping version as an integer `v`, and that selection is fixed for the
+lifetime of the connection. Subscription events use the same selected version and
+are shaped for it. A non-overlapping range returns `daemon/version_mismatch`.
+`daemon.health` and `host.inspect` report the version negotiated for the asking
+connection in `protocol_version`.
+
+The window is bounded. Adapters translate shape only (renames and moved fields,
+and withholding events and enum values the older version never defined). A
+semantic change (a new required parameter, a removed method or event, a changed
+error code or meaning) cannot be adapted: it raises the accepted minimum as well
+and is announced as a break in the release notes. The next protocol bump deletes
+the oldest adapter, so each release accepts exactly its predecessor and no more.
+See `docs/architecture.md` "Protocol versioning".
 
 Protocol v3 is the coordinated overlay-routing boundary. It changes
 `HostRecord.address` to an optional IP-only value and adds required `port` and
@@ -199,15 +213,25 @@ Protocol v4 renames the public worker instance identifier from `runtime_id` to
 their params), `SessionRuntime`, `RuntimeInventoryEntry`,
 `SessionReportNativeIdParams`, and `SessionNativeRecoveredEvent` (including
 `previous_runtime_id`, now `previous_worker_instance_id`). `RuntimeId` keeps its
-agent-runtime meaning. A v3 client that sends its range `3..=3` to a v4 daemon
-(or the reverse) receives `daemon/version_mismatch` before any method runs, so
-it never sees a renamed field; there is no `runtime_id` alias on the public wire.
-Every daemon, CLI, SDK, managed hook and Hermes plugin must be upgraded
-together. Notification hooks deliver through the worker socket when
+agent-runtime meaning. Protocol 4 has no `runtime_id` alias for the worker
+instance. A v3 client that sends its range `3..=3` to a v4 daemon is served by
+the protocol 3 adapter: the daemon accepts the `runtime_id` spelling in its
+requests (a request that already carries the v4 spelling is `bad_request`) and
+answers, and streams events, in the `runtime_id` spelling, withholding warning
+kinds and events v3 never defined. A v4 client against a daemon that only speaks
+v3 receives `daemon/version_mismatch` before any method runs. The window covers
+the public daemon protocol only: the CLI's `--json` envelope reports `protocol`
+`4..=4` and its `--runtime-id` flags are now `--worker-instance-id`, so an
+installed v3 Hermes plugin whose policy pins `3..=3` is refused with
+`pohunek_cli_incompatible` until `pohunek integration install hermes` renews it,
+while its hook requests to the daemon keep working. Upgrade daemons before their
+clients; a v4 client needs a v4 daemon.
+Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` hook request is additive to the private
 worker protocol, so a worker that predates it simply refuses it. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=10`; an asset of
-an earlier version still sends the old key (and an earlier notification hook still
+an earlier version still sends the old key, which the daemon accepts only from a
+session whose launch baked protocol 3 (and an earlier notification hook still
 sends a bare integer `v` instead of the `{minimum, maximum}` range, so the daemon
 rejects its notifications), so `integration.status` reports it
 `outdated` and `integration.doctor` as an asset finding until it is reinstalled.
@@ -1657,7 +1681,7 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict` |
-| `daemon` | `version_mismatch`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
+| `daemon` | `version_mismatch`, `version_adapter_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required` |
@@ -2059,8 +2083,10 @@ The web control center and the native desktop GUI live in
 [`zajca/pohunek-work`](https://github.com/zajca/pohunek-work) and are external
 clients of this protocol and the SDKs; nothing in them is private. They pin
 core by git tag (Rust crates) and by release-tarball URL and integrity (the
-TypeScript SDK), and move in lockstep with the protocol version: the TypeScript
-SDK handshake requires the daemon's exact `PROTOCOL_VERSION`. Core crates beyond
+TypeScript SDK), and pin the protocol version they were built against: the
+TypeScript SDK handshake requires the version negotiated for its connection to
+equal its own `PROTOCOL_VERSION`, which a daemon one release newer still
+satisfies by serving the previous version. Core crates beyond
 `pohunek-client` that a Rust client links are a pinned, not a stable, API with no
 back-compat shims. Three methods
 are public obligations whose callers are mostly those external UI clients, so

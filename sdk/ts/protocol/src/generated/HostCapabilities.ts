@@ -15,7 +15,7 @@ export type HostCapabilities = {
    */
   daemon_version: string;
   /**
-   * Protocol version the host's daemon speaks.
+   * Protocol version the host's daemon negotiated for the connection that asked.
    */
   protocol_version: ProtocolVersion;
   /**

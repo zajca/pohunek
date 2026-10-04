@@ -1,0 +1,508 @@
+{
+  "commit": "e6fcf2377ba14a51d8e7de971c13e1e86a864134",
+  "entries": [
+    {
+      "method": "daemon.health",
+      "params": null
+    },
+    {
+      "method": "host.governance.inspect",
+      "params": null
+    },
+    {
+      "method": "session.new",
+      "params": {
+        "agent": "claude",
+        "base_branch": "main",
+        "branch": "feature/auth",
+        "cols": 120,
+        "cwd": "/workspace/project",
+        "input": "start the review",
+        "metadata": {
+          "owner": "cli",
+          "ticket": "DMD-1356"
+        },
+        "name": "review auth flow",
+        "project": "p-7",
+        "repo": "/workspace/project",
+        "rows": 40
+      }
+    },
+    {
+      "method": "session.list",
+      "params": {
+        "filters": [
+          {
+            "key": "state",
+            "value": "running"
+          },
+          {
+            "key": "activity",
+            "value": "blocked"
+          },
+          {
+            "key": "agent",
+            "value": "codex"
+          },
+          {
+            "key": "id",
+            "value": "s-42"
+          },
+          {
+            "key": "project",
+            "value": "p-7"
+          }
+        ]
+      }
+    },
+    {
+      "method": "session.runtime_inventory",
+      "params": null
+    },
+    {
+      "method": "session.inspect",
+      "params": "s-42"
+    },
+    {
+      "method": "session.stop",
+      "params": "s-42"
+    },
+    {
+      "method": "session.resume",
+      "params": "s-42"
+    },
+    {
+      "method": "session.fork",
+      "params": {
+        "cols": 100,
+        "cwd_mode": "same",
+        "name": "forked review",
+        "rows": 30,
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.remove",
+      "params": "s-42"
+    },
+    {
+      "method": "session.remove_accepting_unconfirmed",
+      "params": "s-42"
+    },
+    {
+      "method": "session.attach",
+      "params": {
+        "initial_dimensions": {
+          "cols": 120,
+          "rows": 40
+        },
+        "origin_daemon_id": "daemon-1",
+        "origin_session_id": "s-1",
+        "origin_worker_id": "worker-9",
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.detach",
+      "params": {
+        "stream_id": "stream-1"
+      }
+    },
+    {
+      "method": "session.resize",
+      "params": {
+        "cols": 132,
+        "rows": 43,
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.input",
+      "params": {
+        "session_id": "s-42",
+        "text": "continue\n",
+        "wait": {
+          "timeout_ms": 5000,
+          "until": [
+            "idle",
+            "blocked"
+          ]
+        }
+      }
+    },
+    {
+      "method": "session.screen",
+      "params": {
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.detection",
+      "params": {
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.output",
+      "params": {
+        "max_bytes": 4096,
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.output",
+      "params": {
+        "after_offset": "24",
+        "max_bytes": 1024,
+        "runtime": {
+          "runtime_generation": "3",
+          "runtime_id": "runtime-42"
+        },
+        "session_id": "s-42",
+        "wait_ms": 250
+      }
+    },
+    {
+      "method": "session.read",
+      "params": {
+        "format": "ansi",
+        "lines": 20,
+        "session_id": "s-42",
+        "source": "recent_unwrapped"
+      }
+    },
+    {
+      "method": "session.wait",
+      "params": {
+        "activities": [
+          "blocked"
+        ],
+        "after_output_offset": "8",
+        "after_terminal_watermark": "7",
+        "after_updated_at": "2026-06-17T10:00:00Z",
+        "runtime": {
+          "runtime_generation": "3",
+          "runtime_id": "runtime-42"
+        },
+        "session_id": "s-42",
+        "states": [
+          "stopped",
+          "failed"
+        ],
+        "timeout_ms": 5000
+      }
+    },
+    {
+      "method": "subscribe",
+      "params": null
+    },
+    {
+      "method": "session.report_native_id",
+      "params": {
+        "agent": "claude",
+        "expires_at": "2026-07-27T12:00:10Z",
+        "native_session_id": "claude-native-abc",
+        "pid": 4242,
+        "pid_start_identity": "777",
+        "runtime_id": "runtime-42",
+        "sequence": "3",
+        "session_id": "s-42",
+        "transcript_path": "/home/user/.claude/transcripts/abc.jsonl"
+      }
+    },
+    {
+      "method": "session.report_agent",
+      "params": {
+        "activity": "working",
+        "agent": "claude",
+        "agent_session_id": "claude-active-abc",
+        "agent_session_path": "/home/user/.claude/projects/project/abc.jsonl",
+        "pid": 4300,
+        "seq": "5",
+        "session_id": "s-42",
+        "source": "hook"
+      }
+    },
+    {
+      "method": "session.release_agent",
+      "params": {
+        "agent": "claude",
+        "seq": "6",
+        "session_id": "s-42",
+        "source": "hook"
+      }
+    },
+    {
+      "method": "session.set_metadata",
+      "params": {
+        "metadata": {
+          "obsolete": null,
+          "owner": "gui"
+        },
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.rename",
+      "params": {
+        "name": "renamed review",
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.diff",
+      "params": {
+        "base": "main",
+        "session_id": "s-42"
+      }
+    },
+    {
+      "method": "session.policy.get",
+      "params": null
+    },
+    {
+      "method": "session.policy.set",
+      "params": {
+        "retention": {
+          "enabled": true,
+          "lost_ttl_secs": 3600,
+          "max_removals_per_sweep": 25,
+          "sweep_interval_secs": 600,
+          "terminal_ttl_secs": 86400
+        }
+      }
+    },
+    {
+      "method": "session.retention.sweep",
+      "params": {
+        "dry_run": true,
+        "limit": 10
+      }
+    },
+    {
+      "method": "integration.install",
+      "params": {
+        "agent": "claude"
+      }
+    },
+    {
+      "method": "integration.status",
+      "params": {
+        "agent": "codex"
+      }
+    },
+    {
+      "method": "integration.uninstall",
+      "params": {
+        "agent": "codex"
+      }
+    },
+    {
+      "method": "integration.doctor",
+      "params": {
+        "agent": "claude"
+      }
+    },
+    {
+      "method": "host.inspect",
+      "params": null
+    },
+    {
+      "method": "assistant.materialize",
+      "params": {
+        "snapshot": "{\"sessions\":[],\"projects\":[]}"
+      }
+    },
+    {
+      "method": "daemon.doctor",
+      "params": null
+    },
+    {
+      "method": "host.discover",
+      "params": {
+        "force": true
+      }
+    },
+    {
+      "method": "notification.create",
+      "params": {
+        "agent_kind": "codex",
+        "body": "Codex is waiting for a tool approval.",
+        "dedupe_key": "approval:s-42",
+        "kind": "approval_required",
+        "metadata": {
+          "tool": "bash"
+        },
+        "project_id": "p-7",
+        "session_id": "s-42",
+        "severity": "action_required",
+        "source": {
+          "host_local_source_id": "hook-42",
+          "provider": "codex",
+          "provider_event": "PermissionRequest"
+        },
+        "source_id": "src-1",
+        "title": "Approval required"
+      }
+    },
+    {
+      "method": "notification.list",
+      "params": {
+        "created_after": "2026-07-03T08:00:00Z",
+        "created_before": "2026-07-03T10:00:00Z",
+        "cursor": "page-2",
+        "kind": "approval_required",
+        "limit": 50,
+        "provider": "codex",
+        "session_id": "s-42",
+        "severity": "action_required",
+        "status": "unread"
+      }
+    },
+    {
+      "method": "notification.update",
+      "params": {
+        "id": "n-42",
+        "status": "read"
+      }
+    },
+    {
+      "method": "notification.delete",
+      "params": {
+        "id": "n-42"
+      }
+    },
+    {
+      "method": "notification.policy.get",
+      "params": null
+    },
+    {
+      "method": "notification.policy.set",
+      "params": {
+        "policy": {
+          "attention_debounce_secs": 7,
+          "attention_dedupe_window_secs": 90,
+          "enabled": {
+            "agent_blocked": true,
+            "approval_required": true,
+            "error": true,
+            "session_finished": false,
+            "system": false,
+            "turn_completed": false
+          },
+          "providers": {
+            "claude": {
+              "agent_blocked": true,
+              "approval_required": true,
+              "error": true,
+              "session_finished": false,
+              "system": false,
+              "turn_completed": true
+            },
+            "codex": {
+              "agent_blocked": true,
+              "approval_required": true,
+              "error": true,
+              "session_finished": false,
+              "system": true,
+              "turn_completed": false
+            }
+          },
+          "retention": {
+            "archived_ttl_secs": 2592000,
+            "compaction_min_actions": 100,
+            "info_ttl_secs": 86400,
+            "resolved_attention_ttl_secs": 604800,
+            "resolved_error_ttl_secs": 1209600,
+            "sweep_interval_secs": 3600,
+            "warning_ttl_secs": 172800
+          }
+        }
+      }
+    },
+    {
+      "method": "notification.retention.prune",
+      "params": {
+        "before": "2026-06-01T00:00:00Z",
+        "dry_run": true,
+        "limit": 100,
+        "status": "archived"
+      }
+    },
+    {
+      "method": "project.list",
+      "params": {
+        "filters": [
+          {
+            "key": "source",
+            "value": "manual"
+          },
+          {
+            "key": "label",
+            "value": "project"
+          },
+          {
+            "key": "id",
+            "value": "p-7"
+          }
+        ]
+      }
+    },
+    {
+      "method": "project.add",
+      "params": {
+        "base_branch": "main",
+        "name": "project",
+        "path": "/workspace/project"
+      }
+    },
+    {
+      "method": "project.show",
+      "params": {
+        "reference": "project"
+      }
+    },
+    {
+      "method": "project.rename",
+      "params": {
+        "name": "renamed",
+        "reference": "project"
+      }
+    },
+    {
+      "method": "project.remove",
+      "params": {
+        "prune_worktrees": true,
+        "reference": "project"
+      }
+    },
+    {
+      "method": "project.prompt",
+      "params": {
+        "name": "issue",
+        "reference": "project"
+      }
+    },
+    {
+      "method": "project.action",
+      "params": {
+        "name": "review-pr",
+        "reference": "project"
+      }
+    },
+    {
+      "method": "project.actions",
+      "params": {
+        "reference": "project"
+      }
+    },
+    {
+      "method": "worktree.remove",
+      "params": {
+        "path": "/workspace/project/.worktrees/feature-auth"
+      }
+    }
+  ],
+  "protocol_version": 3,
+  "release": "v0.33.0"
+}

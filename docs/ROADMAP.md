@@ -163,7 +163,7 @@ TypeScript SDKs, the shared prompt renderer (`crates/prompt` and `pohunek
 prompt render`), the opaque `link.*` session metadata (`pohunek prompt link`),
 and atomic launch via `session new --input`. Clients consume core through public
 contracts only (CLI `--json`, and the public protocol through SDKs pinned by git
-tag or release tarball) and move in lockstep with `PROTOCOL_VERSION`. Issue/PR
+tag or release tarball) and pin the `PROTOCOL_VERSION` they were built against. Issue/PR
 providers live only in `zajca/pohunek-work`. Provider credentials never enter
 daemon state, session metadata, or the event log.
 

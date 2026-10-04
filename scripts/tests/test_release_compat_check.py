@@ -156,6 +156,23 @@ class ReleaseCompatCheckTest(unittest.TestCase):
         self.assertIn("MIN_PROTOCOL_VERSION changed since v0.1.1 "
                       "(ProtocolVersion(4) -> ProtocolVersion(5))", result.stdout)
 
+    def test_wrapped_offset_alias_resolves_and_detects_a_move(self):
+        minimum = ("pub const MIN_PROTOCOL_VERSION: ProtocolVersion = "
+                   "ProtocolVersion(PROTOCOL_VERSION.0 - 1);\n")
+        write(self.repo, PROTOCOL_FILE,
+              "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(5);\n" + minimum)
+        self.git("add", "-A")
+        self.commit("window below the maximum")
+        self.git("tag", "-a", "v0.1.1", "-m", "v0.1.1")
+        write(self.repo, PROTOCOL_FILE,
+              "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(6);\n" + minimum)
+        self.git("add", "-A")
+        self.commit("bump protocol")
+        result = self.release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MIN_PROTOCOL_VERSION changed since v0.1.1 "
+                      "(ProtocolVersion(4) -> ProtocolVersion(5))", result.stdout)
+
     def test_an_initializer_it_cannot_evaluate_fails_closed(self):
         write(
             self.repo, PROTOCOL_FILE,

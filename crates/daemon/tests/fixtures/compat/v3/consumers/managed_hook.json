@@ -1,0 +1,254 @@
+{
+  "release": "v0.33.0",
+  "commit": "e6fcf2377ba14a51d8e7de971c13e1e86a864134",
+  "consumer": "managed hook scripts (crates/daemon/src/integration/assets/{claude,codex}/pohunek-agent-{state,notify}.sh)",
+  "capture": "A throwaway python3 driver (not checked in) ran `sh <asset script> <args>` from the v0.33.0 worktree with `env` = {PATH, POHUNEK_ENV=1, POHUNEK_SOCKET_PATH=<capture socket>, POHUNEK_PROTOCOL_VERSION=3, POHUNEK_SESSION_ID=ses_0123456789abcdef, POHUNEK_RUNTIME_ID=rt-0123456789abcdef} (no POHUNEK_WORKER_SOCKET_PATH, so the public fallback is used; the script takes the agent pid from its parent, the driver) against a throwaway python3 capture server (unix socket, one NDJSON request per line, logs the raw line, replies with a canned protocol-3 envelope {\"v\":3,\"id\":<echo>,\"ok\":...} so the consumer proceeds; not checked in) listening on $XDG_RUNTIME_DIR/pohunek/daemon.sock. Cases: claude state `session` and `release`, codex state `session` (stdin {session_id, transcript_path}); claude notify `notification permission_prompt`, `stop`, `stop_failure`; codex notify `permission_request`, `stop` (stdin {hook_event_id}). The notify scripts send a bare integer envelope version (`\"v\":3`, the legacy envelope, recorded as received); the state scripts send {\"minimum\":3,\"maximum\":3}. Subagent actions only use the worker socket and emit no public request. Normalized values that vary per run: the millisecond timestamps in ids/seq/sequence (1790000000000), pid (4242), pid_start_identity (1234567), expires_at (2026-01-01T00:00:30Z); notify ids derive from hook_event_id and are untouched.",
+  "requests": [
+    {
+      "label": "claude state session",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hook:claude:1790000000000:agent",
+        "method": "session.report_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:claude",
+          "agent": "claude",
+          "seq": 1790000000000,
+          "agent_session_id": "native-0123456789abcdef",
+          "pid": 4242,
+          "agent_session_path": "/home/user/.agent/sessions/native-0123456789abcdef.jsonl"
+        }
+      }
+    },
+    {
+      "label": "claude state session",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hook:claude:1790000000000:native",
+        "method": "session.report_native_id",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "runtime_id": "rt-0123456789abcdef",
+          "agent": "claude",
+          "pid": 4242,
+          "pid_start_identity": "1234567",
+          "sequence": "1790000000000",
+          "expires_at": "2026-01-01T00:00:30Z",
+          "native_session_id": "native-0123456789abcdef",
+          "transcript_path": "/home/user/.agent/sessions/native-0123456789abcdef.jsonl"
+        }
+      }
+    },
+    {
+      "label": "claude state release",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hook:claude:1790000000000:release",
+        "method": "session.release_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:claude",
+          "agent": "claude",
+          "seq": 1790000000000
+        }
+      }
+    },
+    {
+      "label": "codex state session",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hook:codex:1790000000000:agent",
+        "method": "session.report_agent",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "source": "pohunek:codex",
+          "agent": "codex",
+          "seq": 1790000000000,
+          "agent_session_id": "native-0123456789abcdef",
+          "pid": 4242,
+          "agent_session_path": "/home/user/.agent/sessions/native-0123456789abcdef.jsonl"
+        }
+      }
+    },
+    {
+      "label": "codex state session",
+      "line": {
+        "v": {
+          "minimum": 3,
+          "maximum": 3
+        },
+        "id": "hook:codex:1790000000000:native",
+        "method": "session.report_native_id",
+        "params": {
+          "session_id": "ses_0123456789abcdef",
+          "runtime_id": "rt-0123456789abcdef",
+          "agent": "codex",
+          "pid": 4242,
+          "pid_start_identity": "1234567",
+          "sequence": "1790000000000",
+          "expires_at": "2026-01-01T00:00:30Z",
+          "native_session_id": "native-0123456789abcdef",
+          "transcript_path": "/home/user/.agent/sessions/native-0123456789abcdef.jsonl"
+        }
+      }
+    },
+    {
+      "label": "claude notify notification permission_prompt",
+      "line": {
+        "v": 3,
+        "id": "hook:claude:Notification.permission_prompt:evt-0123456789:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "claude",
+            "provider_event": "Notification.permission_prompt",
+            "host_local_source_id": "hook:claude:Notification.permission_prompt:evt-0123456789"
+          },
+          "kind": "approval_required",
+          "severity": "action_required",
+          "status": "unread",
+          "title": "Claude approval required",
+          "body": "Claude is waiting for approval.",
+          "metadata": {
+            "provider": "claude",
+            "provider_event": "Notification.permission_prompt",
+            "hook_event_id": "evt-0123456789",
+            "matcher": "permission_prompt"
+          },
+          "agent_kind": "claude",
+          "source_id": "hook:claude:Notification.permission_prompt:evt-0123456789",
+          "session_id": "ses_0123456789abcdef",
+          "dedupe_key": "attention:ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "claude notify stop",
+      "line": {
+        "v": 3,
+        "id": "hook:claude:Stop:evt-0123456789:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "claude",
+            "provider_event": "Stop",
+            "host_local_source_id": "hook:claude:Stop:evt-0123456789"
+          },
+          "kind": "turn_completed",
+          "severity": "info",
+          "status": "unread",
+          "title": "Claude turn completed",
+          "body": "Claude completed an agent turn.",
+          "metadata": {
+            "provider": "claude",
+            "provider_event": "Stop",
+            "hook_event_id": "evt-0123456789"
+          },
+          "agent_kind": "claude",
+          "source_id": "hook:claude:Stop:evt-0123456789",
+          "session_id": "ses_0123456789abcdef",
+          "dedupe_key": "turn:ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "claude notify stop_failure",
+      "line": {
+        "v": 3,
+        "id": "hook:claude:StopFailure:evt-0123456789:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "claude",
+            "provider_event": "StopFailure",
+            "host_local_source_id": "hook:claude:StopFailure:evt-0123456789"
+          },
+          "kind": "error",
+          "severity": "error",
+          "status": "unread",
+          "title": "Claude stop hook failed",
+          "body": "Claude reported a stop hook failure.",
+          "metadata": {
+            "provider": "claude",
+            "provider_event": "StopFailure",
+            "hook_event_id": "evt-0123456789"
+          },
+          "agent_kind": "claude",
+          "source_id": "hook:claude:StopFailure:evt-0123456789",
+          "session_id": "ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "codex notify permission_request",
+      "line": {
+        "v": 3,
+        "id": "hook:codex:PermissionRequest:evt-0123456789:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "codex",
+            "provider_event": "PermissionRequest",
+            "host_local_source_id": "hook:codex:PermissionRequest:evt-0123456789"
+          },
+          "kind": "approval_required",
+          "severity": "action_required",
+          "status": "unread",
+          "title": "Codex approval required",
+          "body": "Codex is waiting for approval.",
+          "metadata": {
+            "provider": "codex",
+            "provider_event": "PermissionRequest",
+            "hook_event_id": "evt-0123456789"
+          },
+          "agent_kind": "codex",
+          "source_id": "hook:codex:PermissionRequest:evt-0123456789",
+          "session_id": "ses_0123456789abcdef",
+          "dedupe_key": "attention:ses_0123456789abcdef"
+        }
+      }
+    },
+    {
+      "label": "codex notify stop",
+      "line": {
+        "v": 3,
+        "id": "hook:codex:Stop:evt-0123456789:create",
+        "method": "notification.create",
+        "params": {
+          "source": {
+            "provider": "codex",
+            "provider_event": "Stop",
+            "host_local_source_id": "hook:codex:Stop:evt-0123456789"
+          },
+          "kind": "turn_completed",
+          "severity": "info",
+          "status": "unread",
+          "title": "Codex turn completed",
+          "body": "Codex completed an agent turn.",
+          "metadata": {
+            "provider": "codex",
+            "provider_event": "Stop",
+            "hook_event_id": "evt-0123456789"
+          },
+          "agent_kind": "codex",
+          "source_id": "hook:codex:Stop:evt-0123456789",
+          "session_id": "ses_0123456789abcdef",
+          "dedupe_key": "turn:ses_0123456789abcdef"
+        }
+      }
+    }
+  ]
+}

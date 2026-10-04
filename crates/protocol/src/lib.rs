@@ -22,6 +22,7 @@
 
 mod assistant;
 mod capabilities;
+pub mod compat;
 mod decimal;
 mod discovery;
 mod doctor;
@@ -147,8 +148,8 @@ pub use session::{
 };
 #[doc(inline)]
 pub use version::{
-    negotiate, ProtocolVersion, ProtocolVersionError, ProtocolVersionRange, MIN_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    negotiate, ProtocolVersion, ProtocolVersionError, ProtocolVersionRange,
+    CLIENT_PROTOCOL_VERSIONS, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 
 /// Control-protocol event names.

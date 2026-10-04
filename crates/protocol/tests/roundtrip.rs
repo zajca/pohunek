@@ -40,11 +40,11 @@ use protocol::{
     SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
     ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId, TerminalCursor,
     TerminalDimensions, TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate,
-    TransferOutcomeId, TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES,
-    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
-    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES,
-    MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
-    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
+    TransferOutcomeId, TransferProposal, UnconfirmedProcess, CLIENT_PROTOCOL_VERSIONS,
+    GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
+    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
+    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
+    MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
     SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use serde_json::{json, Value};
@@ -2245,7 +2245,7 @@ fn request_roundtrip() {
     .expect("valid request");
     let back = line_roundtrip(&req);
     assert_eq!(req, back);
-    assert_eq!(back.version_range(), SUPPORTED_PROTOCOL_VERSIONS);
+    assert_eq!(back.version_range(), CLIENT_PROTOCOL_VERSIONS);
     assert_eq!(back.id(), "req-7f3");
     assert_eq!(back.method(), "session.new");
     assert_eq!(back.params()["agent"], json!("claude"));
@@ -5110,19 +5110,29 @@ fn session_remove_accepting_unconfirmed_is_an_additive_method_with_the_remove_sh
 }
 
 #[test]
-fn protocol_version_four_rejects_a_version_three_peer() {
+fn protocol_version_four_accepts_version_three_and_rejects_version_two() {
     assert_eq!(PROTOCOL_VERSION.get(), 4);
-    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.minimum().get(), 4);
+    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.minimum().get(), 3);
     assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.maximum().get(), 4);
+    assert_eq!(CLIENT_PROTOCOL_VERSIONS.minimum().get(), 4);
+    assert_eq!(CLIENT_PROTOCOL_VERSIONS.maximum().get(), 4);
 
     let previous = ProtocolVersion::new(3).expect("valid version");
-    let old_client = ProtocolVersionRange::new(previous, previous).expect("ordered range");
+    let previous_client = ProtocolVersionRange::new(previous, previous).expect("ordered range");
+    assert_eq!(
+        negotiate(previous_client, SUPPORTED_PROTOCOL_VERSIONS)
+            .expect("a version 3 client is inside the window"),
+        previous
+    );
+
+    let two = ProtocolVersion::new(2).expect("valid version");
+    let old_client = ProtocolVersionRange::new(two, two).expect("ordered range");
     let err = negotiate(old_client, SUPPORTED_PROTOCOL_VERSIONS)
-        .expect_err("a version 3 client has no overlap with version 4");
+        .expect_err("a version 2 client has no overlap with versions 3..=4");
     assert_eq!(err.class, ErrorClass::Daemon);
     assert_eq!(err.code, "version_mismatch");
     assert!(
-        err.msg.contains('3') && err.msg.contains('4'),
+        err.msg.contains('2') && err.msg.contains('3') && err.msg.contains('4'),
         "the error names both ranges: {}",
         err.msg
     );

@@ -15,17 +15,44 @@ use crate::error::ProtocolError;
 ///
 /// Bump this when the wire contract changes in a way that is not purely
 /// additive. New optional fields and methods do not require a bump when their
-/// containing contract explicitly permits them.
+/// containing contract explicitly permits them. A bump deletes the adapter for
+/// the version that falls out of the window and adds one for the version it
+/// leaves behind (see [`crate::compat`]).
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(4);
 
-/// Oldest public protocol version this build accepts.
-pub const MIN_PROTOCOL_VERSION: ProtocolVersion = PROTOCOL_VERSION;
+/// Oldest public protocol version a daemon of this build accepts.
+///
+/// One below [`PROTOCOL_VERSION`]: the daemon serves the previous version
+/// through the shape-only adapters in [`crate::compat`]. A semantic change
+/// (new required parameter, removed method, changed error code or meaning)
+/// cannot be adapted and raises this minimum to [`PROTOCOL_VERSION`].
+pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION.0 - 1);
 
-/// Inclusive public protocol range supported by this build.
+/// Inclusive public protocol range a daemon of this build negotiates with.
+///
+/// Daemon-side only. Clients advertise [`CLIENT_PROTOCOL_VERSIONS`] because
+/// they decode the current wire shape and nothing older.
 pub const SUPPORTED_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
     minimum: MIN_PROTOCOL_VERSION,
     maximum: PROTOCOL_VERSION,
 };
+
+/// Inclusive public protocol range a client of this build advertises.
+///
+/// Clients (CLI, Rust client, TypeScript SDK, Hermes plugin policy) carry no
+/// adapters, so they offer exactly [`PROTOCOL_VERSION`]. A daemon that only
+/// speaks an older version answers `daemon/version_mismatch` instead of a
+/// payload the client would decode wrongly.
+pub const CLIENT_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
+    minimum: PROTOCOL_VERSION,
+    maximum: PROTOCOL_VERSION,
+};
+
+// The window needs a nonzero previous version to adapt.
+const _: () = assert!(
+    PROTOCOL_VERSION.0 >= 2,
+    "the window needs a previous version"
+);
 
 /// A protocol version number selected for responses and events.
 ///
@@ -175,5 +202,67 @@ pub fn negotiate(
         Err(ProtocolError::version_mismatch(client, daemon))
     } else {
         Ok(maximum)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        negotiate, ProtocolVersion, ProtocolVersionRange, CLIENT_PROTOCOL_VERSIONS,
+        MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    };
+
+    fn range(minimum: u32, maximum: u32) -> ProtocolVersionRange {
+        ProtocolVersionRange::new(
+            ProtocolVersion::new(minimum).expect("nonzero"),
+            ProtocolVersion::new(maximum).expect("nonzero"),
+        )
+        .expect("ordered")
+    }
+
+    #[test]
+    fn daemon_window_spans_the_previous_and_current_version() {
+        assert_eq!(MIN_PROTOCOL_VERSION.get() + 1, PROTOCOL_VERSION.get());
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.minimum(), MIN_PROTOCOL_VERSION);
+        assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.maximum(), PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn clients_advertise_only_the_current_version() {
+        assert_eq!(CLIENT_PROTOCOL_VERSIONS.minimum(), PROTOCOL_VERSION);
+        assert_eq!(CLIENT_PROTOCOL_VERSIONS.maximum(), PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn daemon_selects_the_previous_version_for_a_previous_client() {
+        let previous = MIN_PROTOCOL_VERSION.get();
+        let selected = negotiate(range(previous, previous), SUPPORTED_PROTOCOL_VERSIONS)
+            .expect("the previous version is inside the window");
+        assert_eq!(selected, MIN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn daemon_selects_the_current_version_for_an_overlapping_range() {
+        let previous = MIN_PROTOCOL_VERSION.get();
+        let current = PROTOCOL_VERSION.get();
+        let selected = negotiate(range(previous, current), SUPPORTED_PROTOCOL_VERSIONS)
+            .expect("ranges overlap");
+        assert_eq!(selected, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn daemon_rejects_a_version_below_the_window() {
+        let below = MIN_PROTOCOL_VERSION.get() - 1;
+        let error = negotiate(range(below, below), SUPPORTED_PROTOCOL_VERSIONS)
+            .expect_err("two versions back is outside the window");
+        assert_eq!(error.code, "version_mismatch");
+    }
+
+    #[test]
+    fn a_current_only_client_gets_a_mismatch_from_a_previous_only_daemon() {
+        let previous = MIN_PROTOCOL_VERSION.get();
+        let error = negotiate(CLIENT_PROTOCOL_VERSIONS, range(previous, previous))
+            .expect_err("a client without adapters must not accept the older shape");
+        assert_eq!(error.code, "version_mismatch");
     }
 }

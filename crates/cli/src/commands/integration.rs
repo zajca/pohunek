@@ -554,7 +554,7 @@ fn new_policy(
     };
     // Policies always use this binary's range so updates repair drift that
     // `assets/pohunek/cli.py::_validate_envelope` rejects as `pohunek_cli_incompatible`.
-    let versions = protocol::SUPPORTED_PROTOCOL_VERSIONS;
+    let versions = protocol::CLIENT_PROTOCOL_VERSIONS;
     let protocol_min =
         i32::try_from(versions.minimum().get()).map_err(|_error| HermesError::InvalidPolicy)?;
     let protocol_max =
@@ -1345,7 +1345,7 @@ mod tests {
 
     #[test]
     fn update_policy_refreshes_the_supported_protocol_range() {
-        let versions = protocol::SUPPORTED_PROTOCOL_VERSIONS;
+        let versions = protocol::CLIENT_PROTOCOL_VERSIONS;
         let current_min = i32::try_from(versions.minimum().get()).expect("protocol minimum");
         let current_max = i32::try_from(versions.maximum().get()).expect("protocol maximum");
         let old_version = current_min.checked_sub(1).expect("older protocol version");
