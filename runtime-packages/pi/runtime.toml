@@ -1,0 +1,55 @@
+# Runtime descriptor of the Pi coding agent package.
+#
+# Verified against Pi 1.0.2 (compat/pi/compatibility-lock.json). The supported
+# release range below is `[min, below)`; the CI check keeps it equal to the
+# lock's range.
+
+schema = 1
+id = "pohunek.runtime.pi"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "pi"
+name = "Pi"
+program = "pi"
+args = []
+detect_manifest = "detect.toml"
+prompt_arg = true
+# `pi --version` prints exactly the release on stdout; extension noise goes to
+# stderr, which the probe discards.
+version_probe = { parser = "semver-v1", args = ["--version"], min = "1.0.0", below = "1.1.0" }
+
+# Pi enables bracketed paste in its terminal UI; the submit key is a separate
+# Enter written after the paste.
+[input]
+bracketed_paste = true
+submit_delay_ms = 150
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--session", "{reference}"]
+
+[fork]
+supported = true
+args = ["--fork", "{reference}"]
+
+# Pi creates the session with the id it is given (`--session-id`), so the
+# daemon assigns the reference at launch and needs no integration.
+[native_reference]
+strategy = "assigned"
+launch_args = ["--session-id", "{reference}"]
+
+# Pi writes `<agent dir>/sessions/--<encoded cwd>--/<timestamp>_<id>.jsonl`
+# once the first assistant message exists. `--session` for an id with no such
+# file fails to start, so recovery checks for the file first.
+[native_reference.existence]
+check = "file"
+root_env = "PI_CODING_AGENT_DIR"
+root_home = ".pi/agent"
+dir = "sessions"
+file_name = "_{reference}.jsonl"
+name_match = "ends_with"
+max_depth = 1

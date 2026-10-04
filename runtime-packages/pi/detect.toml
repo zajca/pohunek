@@ -1,0 +1,31 @@
+# Pi 1.0.2 activity manifest, matched against a real terminal session.
+#
+# Pi paints its editor between two full-width rules. While a turn runs, the
+# upper rule carries a braille spinner and the word "Working"; otherwise both
+# rules are plain. No blocked signal was verified (extension dialogs and login
+# overlays were not exercised), so no blocked state is declared; a screen no
+# rule matches keeps the byte-activity fallback. The idle rule is only verified
+# against the main editor screen, not against overlays such as selectors.
+
+[process]
+# Pi retitles its process to `pi` shortly after start (kernel name and argv),
+# and runs as `node <install>/coding-agent/dist/bundle/cli.js` before that.
+comm = ["^pi$"]
+cmdline = [
+  '^pi(?: .*)?$',
+  '^(?:[^ ]*/)?node [^ ]*coding-agent/dist/bundle/cli\.js(?: .*)?$',
+]
+
+[[rules]]
+id = "working_rule"
+state = "working"
+priority = 700
+region = "bottom_non_empty_lines(8)"
+line_regex = ['^─+ [\x{2800}-\x{28FF}] Working\b']
+
+[[rules]]
+id = "idle_editor_rule"
+state = "idle"
+priority = 300
+region = "bottom_non_empty_lines(5)"
+line_regex = ['^─{20,}$']
