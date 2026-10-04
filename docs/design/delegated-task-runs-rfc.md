@@ -3,7 +3,9 @@
 - **Status:** Accepted 2026-09-29 (epic #182; implementation tracked by its
   sub-issues). Revised after design review, a Manage-Execute-Audit
   comparison, a code-grounded review on 2026-09-25 and four review rounds on
-  2026-09-28.
+  2026-09-28. Amended 2026-10-04 (#510): provider-initiated prompts,
+  usage-limit attentions, delegation origin and loop guards, multi-target
+  `task.wait`, MCP adapter scope.
 - **Date:** 2026-09-24
 - **Scope:** A task layer over ordinary sessions that lets an orchestrating agent
   delegate bounded coding work to another agent on any owned host and receive a
@@ -117,7 +119,7 @@ the polling entirely.
   for checks, including the name/path safety and in-repo trust rules of
   `docs/design/per-project-actions-and-worktree-hooks.md` (A.2.1, A.5, B.3).
 - **The daemon remains the authority.** Clients, the CLI, the skill and any
-  adapter (including the optional MCP adapter in section 13) only call the
+  adapter (including the MCP adapter in section 13.4) only call the
   public protocol.
 - **Orchestration composes on top.** Manager/auditor loops and any unattended
   delegation "dark factory" are clients of the public protocol (section 16);
@@ -217,8 +219,8 @@ observed strictly after the turn cursor. Settlement produces exactly one
 | Outcome | Meaning |
 | --- | --- |
 | `completed` | The agent finished the turn and returned to its ready state. |
-| `attention` | The agent is blocked on an approval or a question addressed to the owner. |
-| `failed` | The provider reported a turn failure, or the agent process exited with failure. |
+| `attention` | The agent is blocked on an approval or a question addressed to the owner, or paused by a provider usage limit (kind `usage_limit`, section 8.5). |
+| `failed` | The provider reported a turn failure, or the agent process exited with failure. The result carries a typed `failure` (section 10). |
 | `exited` | The agent process exited successfully (for example the agent's own quit command) before the turn settled. |
 | `lost` | The runtime generation was lost before settlement. |
 | `stopped` | The session was stopped or removed by an explicit request. |
@@ -238,13 +240,14 @@ recorded, and each revision increments the turn's `settlement_revision`
   re-evaluated;
 - a `completed` turn whose finality was **heuristic** (section 8.2) is
   **re-opened** when the same provider turn demonstrably continues after
-  settlement. This revision is not requested by anyone; it corrects a
+  settlement (evidence carrying an identifier in the turn's correlation
+  set, or an attributed provider-initiated prompt, section 8.2). This revision is not requested by anyone; it corrects a
   settlement the daemon could not prove final. If the turn is still
   `finalizing`, its checks are cancelled and joined first (section 12) and
   the unpublished result is recorded as superseded with its checks
   `interrupted`;
 - a `timed_out` turn **completes late** when correlated turn-end evidence
-  for it (the same `prompt_id`/`turn_id`, or an OpenCode execution end for
+  for it (an identifier in the turn's correlation set, or an OpenCode execution end for
   the bound execution) arrives after the deadline and before any later turn
   was delivered. Every occupancy acquisition increments a persisted
   **worktree generation**, and a `timed_out` settlement records the
@@ -331,7 +334,8 @@ settles with `completed` (section 12).
 
 1. A turn settles only on evidence observed after its **consumption
    milestone** in the same runtime generation — never merely after the delivery
-   cursor — or on evidence carrying the turn's provider reference. Evidence
+   cursor — or on evidence carrying one of the turn's provider references
+   (its **correlation set**, section 8.2). Evidence
    between delivery and consumption (startup repaints, a previous turn's late
    completion) never settles a turn. A runtime generation change before
    settlement settles the turn as `lost`, never `completed`.
@@ -418,7 +422,9 @@ settles with `completed` (section 12).
    are written only into a daemon-private shadow repository.
 10. Any input written to the task's session during an open turn that the
     task layer did not deliver — attach input or `session.input` from any
-    client, human or agent — marks the turn `steered` (section 8.6). A
+    client, human or agent — marks the turn `steered` (section 8.6), and so
+    does a provider-initiated prompt without a declared pending source
+    (section 8.2), because nothing attributes it to the task's own work. A
     steered turn settles by the same rules, but its result is never presented
     as purely agent-attributable.
 11. At most one task **occupies** a worktree at a time. A task occupies its
@@ -612,8 +618,11 @@ the prompt that opened the turn (Claude `prompt_id`, Codex `turn_id`,
 section 9.2), but they are not always final. Two rules therefore apply:
 
 - **Correlation.** A turn-end hook settles a turn only when its provider
-  identifier equals the one bound at the turn's consumption milestone
-  (section 8.1 form 2). A `Stop` carrying any other identifier is never
+  identifier is in the turn's **correlation set**: the identifier bound at
+  the turn's consumption milestone (section 8.1 form 2) plus the identifiers
+  of provider-initiated prompts attributed to the turn (below). When the set
+  has more than one member, only a `Stop` of its most recently added member
+  can settle the turn. A `Stop` carrying any other identifier is never
   applied to the open turn; if it matches a `timed_out` predecessor it
   completes that turn late (section 6.3), otherwise it is discarded. Such
   settlements are `provider_hooks_correlated`.
@@ -708,6 +717,39 @@ section 9.2), but they are not always final. Two rules therefore apply:
   bound execution) is `finality: provider_confirmed`, because the provider
   itself reports the end of the execution; no re-open window applies.
   Subagent lifecycle events (`SubagentStop`) never settle a turn.
+- **Provider-initiated prompts.** A provider can start a turn without any
+  input. Claude Code runs `UserPromptSubmit` when a scheduled task or `/loop`
+  iteration fires, when a background subagent reports back, when another
+  Claude session sends a message, and when it continues after a usage-limit
+  wait (section 8.5). The daemon classifies a prompt-submit record as
+  **provider-initiated** when its digest matches no task-layer delivery of
+  the task and no input reached the PTY from any client since the previous
+  prompt-submit record; the worker serializes every input write (invariant
+  10), so the second condition is a fact, not an inference. Input that did
+  reach the PTY makes the record steering (section 8.6). A provider-initiated
+  prompt is attributed only through a **declared pending source**: the
+  turn's own latest correlated evidence named work that will wake the agent —
+  a `Stop` with non-empty `background_tasks` or `session_crons`, or a
+  pending `usage_limit` attention.
+  - With a declared source, while the turn is open or settled `attention`,
+    the prompt **continues the turn**: its identifier joins the correlation
+    set, and a `usage_limit` attention resumes as `resolved_elsewhere`
+    (section 8.5). Inside the heuristic re-open window it **re-opens** the
+    turn, exactly like a same-identifier hook event.
+  - Without a declared source — a message from another session, which the
+    payload does not distinguish, or a scheduled task that fires after the
+    re-open window — the prompt is unattributed external input: during an
+    open turn it marks the turn `steered`; with no turn open it marks the
+    next result `drift_since_previous_turn` and `integrity: suspect`, like
+    work that resumes after the window.
+
+  Whether a provider-initiated turn carries a fresh identifier or the
+  original one, and whether the original turn's `Stop` precedes it, is
+  pinned per provider version in the compatibility lock (section 9.2); the
+  rules above hold either way. Every result reports `pending_self_starts`
+  (section 10) from the settling evidence, so an orchestrator sees that the
+  agent may still wake on its own and stops the task before the next round
+  (section 16.2).
 
 Every settlement records which source decided it (`settled_by`:
 `provider_events`, `provider_hooks_correlated`, `provider_hooks_uncorrelated`
@@ -726,11 +768,40 @@ and non-`completed` results are final at publication). `until` is `"final"`
 any other outcome that needs the caller's action returns immediately in
 either mode; waiting through a window only applies to a heuristic
 `completed`. If the turn re-opens during the window, the wait simply keeps
-going and returns the next revision. `task.wait` returns either a result
+going and returns the next revision. A `usage_limit` attention whose `auto_resume` is `expected`
+(section 8.5) needs no caller action: the wait continues through it and
+returns its result only when `auto_resume` becomes `no` or the provider
+resumes and the turn settles again; a timeout reports `phase:
+"usage_limit_wait"`. `task.wait` returns either a result
 (section 10) or `{ reason: "timeout", turn, phase, progress }`, where
 `progress` is a compact summary of the current phase (elapsed time, current
 activity, provider phase when known, checks done and remaining while
 finalizing, re-open window close time).
+
+**Multi-target wait.** `task.wait { targets, mode, timeout_ms, until? }`
+waits on several tasks of the same daemon in one call. `targets` is a list
+of at most `tasks.max_wait_targets` entries `{ task_id, turn?, after? }`;
+`mode` is `"any"` or `"all"`. `after` is a result cursor `{ turn, revision }`
+— the `result_id` the caller last acted on — ordered by turn, then
+revision. A target is **ready** when its named turn (default: the latest)
+reaches the requested point by the single-target rules above **and** that
+turn's `(turn, latest settlement revision)` is greater than `after`
+(default: none), so a later turn of the same task is ready even when its
+revision number is lower than the consumed one. `any` returns as soon as at least one
+target is ready, with every target ready at that moment; `all` returns when
+all are ready. The response lists the ready targets' results and, for the
+others, `{ task_id, turn, phase, progress }`; a timeout returns the same
+shape with `reason: "timeout"`. The call holds no state (invariant 4): a
+caller that has acted on result *n*@*r* of a target passes `after: { turn:
+n, revision: r }`, so a repeated `any` wait never returns the same result
+twice, still sees the next turn after a `task.continue`, and never needs the
+daemon to remember what was consumed. Waiter accounting is per
+target: one call takes one slot of `tasks.max_waiters` and one slot of
+`tasks.max_waiters_per_task` on **every** target, and fails with
+`task_waiter_limit_reached` naming the full task otherwise. A target that is
+unknown, retired or on another host fails the call with `task_wait_target_invalid`
+before any slot is taken. Waiting across hosts is client-side: one routed
+wait per host, raced by the client.
 
 `timeout_ms` is bounded by the daemon configuration key
 `tasks.max_wait_ms`, validated at startup. The shipped default configuration
@@ -791,7 +862,9 @@ cancel, and the relay additionally bounds concurrent waits per principal.
 A wait holds no state beyond its slot: a client that disconnects simply
 calls `task.wait` again (invariant 4). A daemon restart drops waiters;
 settlement state is persisted, so the next `task.wait` returns immediately if
-the turn settled meanwhile.
+the turn settled meanwhile. The CLI (`--wait` and `task wait`) therefore
+re-issues the wait after a dropped connection or a daemon restart until its
+own deadline, so a restart never ends a CLI wait early.
 
 ### 8.4 Turn deadline
 
@@ -834,7 +907,7 @@ marked `resolved_elsewhere`, the turn resumes as a new settlement revision
 `attention_id` (`<turn_id>/a<n>`, unique within the turn) and the turn's
 current `settlement_revision`. One turn can pass through several attention
 cycles; each gets a new id. The attention object carries kind (`approval`,
-`question`), the provider's question or permission text, the choices the
+`question`, `usage_limit`), the provider's question or permission text, the choices the
 provider offers, `attention_id`, `settlement_revision`, and the provider
 reference (permission request id, form id, `prompt_id`/`turn_id`) used to
 check that it is still current.
@@ -884,6 +957,50 @@ input sequence for each; otherwise it fails with `task_answer_unsupported`
 and the attention is resolved by terminal takeover (section 8.6) or
 `task.stop`. The daemon never guesses keystrokes for an approval it cannot
 read.
+
+**Usage-limit attentions.** When the provider reports that a usage limit
+stopped the turn — a Claude `StopFailure` whose `error` is the value the
+compatibility lock pins as a usage limit (`rate_limit` is the value to
+verify), or another provider's typed equivalent pinned in its lock — the turn
+settles `attention` of kind `usage_limit`, not `failed`, because the
+provider may continue the same work by itself: Claude Code 2.1.234 and later
+waits in the open session after a claude.ai usage limit and continues after
+the reset (`autoContinueAtUsageLimit`, on by default). The attention
+carries:
+
+- `auto_resume`: `expected` only on positive evidence that the provider is
+  waiting to continue on its own — the agent's detection manifest classifies
+  the screen as the provider's automatic usage-limit wait (a state
+  classification pinned with goldens, never text extraction). The absence of
+  a dialog is not evidence: Claude continues automatically only for
+  claude.ai subscription limits, so an API-key or cloud-provider session
+  that ends with the same error shows no menu and never resumes. `no` when
+  the provider reports that it will not continue (Claude
+  `Notification` `quota_auto_resume_disabled` or `quota_auto_resume_stale`)
+  or detection shows a blocking dialog (Claude opens its usage-limit options
+  menu when it does not start the wait itself); `unknown` otherwise;
+- `reset_at`: only when structured provider evidence states it. Claude's
+  hook payloads do not, so it is `null` there; the reset time shown on screen
+  is never scraped (invariant 7);
+- `provider_error`: the provider's error enum value, bounded metadata.
+
+The provider resolves the attention itself: a provider-initiated prompt
+whose declared source is this attention (section 8.2), or Claude
+`quota_auto_resume_fired`, marks it `resolved_elsewhere` and re-opens the
+turn as a new settlement revision. A human at the terminal resolves it like
+any attention (section 8.6), and `task.stop` ends it. `task.answer` on a
+`usage_limit` attention fails with `task_answer_unsupported`: there is no
+provider question, and continuing after a stale wait is a terminal action,
+never a daemon keystroke. Time settled in a `usage_limit` attention does not
+count toward the open-time ceiling (section 6.3), and each wait cycle is one
+settlement revision; Claude re-arms its wait at most twice in a row, so the
+cycles stay within `tasks.max_settlement_revisions_per_turn`. Task-capable
+Claude profiles pass `autoContinueAtUsageLimit: true` through `--settings`:
+Claude reads the key only from user, `--settings` and managed scope, and a
+project or local settings file that sets it turns the feature off when none
+of those does. With it disabled Claude opens the options menu in the
+terminal, which blocks every later delivery until a human acts. A provider that does not type its limit settles by the
+ordinary rules (`failed`, or a degraded attention on a detection `blocked`).
 
 ### 8.6 Human takeover
 
@@ -1200,7 +1317,18 @@ pinned in the compatibility lock with its source):
   and directs hooks to `last_assistant_message` instead. `PermissionRequest`
   carries `tool_name`, `tool_input` and optional `permission_suggestions`.
   `Notification` matchers include `permission_prompt` and
-  `elicitation_dialog`.
+  `elicitation_dialog`. Verified 2026-10-04 against the same reference:
+  `UserPromptSubmit` also fires on turns Claude starts on its own (a
+  scheduled task or `/loop` firing, a background subagent reporting back, a
+  message from another session, the continuation after a usage-limit wait);
+  `StopFailure` carries `error` (`rate_limit`, `overloaded`,
+  `authentication_failed`, `billing_error`, `server_error`,
+  `max_output_tokens`, `unknown` and others), optional `error_details` and a
+  `last_assistant_message` holding the API error string, but no reset time;
+  `Notification` types `quota_auto_resume_fired`, `quota_auto_resume_stale`
+  and `quota_auto_resume_disabled` (2.1.234 or later) report how a
+  usage-limit wait ended. The identifier carried by provider-initiated turns
+  is not documented and is pinned from captured goldens.
 - **Codex** (`codex-rs/hooks/src/schema.rs`; installed 0.156.0 registers
   `UserPromptSubmit`, `PermissionRequest` and `Stop`): every turn-scoped hook
   input carries `turn_id`. `UserPromptSubmit` carries `prompt`; `Stop` carries
@@ -1212,7 +1340,7 @@ Codex versions pinned in the lock; below them, settlement is
 
 | Agent | Consumption | Settlement | Attention | Final message | Commands | Metrics |
 | --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | `UserPromptSubmit` (new managed hook), digest-matched, binds `prompt_id` | Managed `Stop` / `StopFailure` hooks with the bound `prompt_id` (section 8.2) | `PermissionRequest` (new managed hook) opens a pending decision (tool name, bounded tool input summary, suggestions); `Notification` `permission_prompt` / `elicitation_dialog` with the same `prompt_id` confirms waiting (section 8.5) | `Stop` payload's `last_assistant_message`, bounded, stored owner-private | Tool events in the transcript, read after the stop grace window | Usage fields in the transcript, read after the stop grace window, including subagent transcripts (see below) |
+| Claude Code | `UserPromptSubmit` (new managed hook), digest-matched, binds `prompt_id` | Managed `Stop` / `StopFailure` hooks with a `prompt_id` in the turn's correlation set (section 8.2); a `StopFailure` whose `error` the lock pins as a usage limit settles a `usage_limit` attention (section 8.5) | `PermissionRequest` (new managed hook) opens a pending decision (tool name, bounded tool input summary, suggestions); `Notification` `permission_prompt` / `elicitation_dialog` with the same `prompt_id` confirms waiting (section 8.5) | `Stop` payload's `last_assistant_message`, bounded, stored owner-private | Tool events in the transcript, read after the stop grace window | Usage fields in the transcript, read after the stop grace window, including subagent transcripts (see below) |
 | Codex | `UserPromptSubmit` (new managed hook), digest-matched, binds `turn_id` | Managed `Stop` hook with the bound `turn_id` | Managed `PermissionRequest` hook opens a pending decision; waiting confirmed by detection (section 8.5) | `Stop` payload's `last_assistant_message`, bounded | Not reported: `unknown` | Not reported: `unknown` |
 | Hermes | Plugin lifecycle hooks | Plugin lifecycle hooks | Plugin-reported when available | Plugin-reported, bounded | Plugin-reported when available | `unknown` unless the pinned runtime reports it |
 | Shell | Not supported for tasks | — | — | — | — | — |
@@ -1242,7 +1370,9 @@ metrics are `unknown`.
 The facts above are pinned with sanitized goldens in `compat/<agent>/`
 (Codex already has `compat/codex/subagent-hooks.json` captured from
 `schema.rs`; Claude and OpenCode locks are new) and re-verified on every
-provider pin bump. Where a field is missing at runtime, the column degrades to
+provider pin bump. Every lock entry records the provider version and the
+capture date of its golden, so a golden older than the pinned minimum
+version fails the gate instead of passing on stale behaviour. Where a field is missing at runtime, the column degrades to
 `unknown` rather than being guessed.
 
 ### 9.3 OpenCode (new agent)
@@ -1539,6 +1669,19 @@ Rules:
   replacement for them.
 - `settled_by` is one of the values defined in section 8.2; `outcome` is one
   of the values in section 6.3.
+- A `failed` result carries `failure: { class, provider_error }`.
+  `provider_error` is the provider's own error enum value when its evidence
+  types one (Claude `StopFailure.error`), else `null`; `class` is one of
+  `provider_error`, `process_exit`, `delivery` (`delivery_uncertain`,
+  `delivery_abandoned`, section 8.8) and `revision_cap`
+  (`revision_limit_reached`, section 6.3).
+  Both are bounded metadata. The provider's error text (Claude puts it in
+  `last_assistant_message`) is owner-private content like a final message
+  (invariant 7). Other outcomes carry `failure: null`.
+- `pending_self_starts` reports the counts of `background_tasks` and
+  `session_crons` named by the settling evidence (zero when the provider
+  reports none, `null` when it reports nothing). A non-zero count means the
+  agent may start a turn on its own after settlement (section 8.2).
 - Drift is computed by comparing the worktree fingerprint at the start of
   a turn with the fingerprint recorded at the previous settlement. The
   fingerprint is a **complete streaming digest** over HEAD, branch, every
@@ -1607,6 +1750,20 @@ Claude profile without a writable-tool deny configuration) refuses
 rather than silently downgrading. Investigation mode on a shared worktree
 (`worktree_of`, section 8.7) checks the same fingerprint: an auditor that
 modified the executor's tree is a `violation`, never a silent edit.
+
+Provider rules deny writes and shell, but a delegation tool is neither: an
+investigate-mode agent that can reach `task.start` through the MCP adapter
+(section 13.4) could otherwise start a writing executor. Investigation mode
+is therefore **monotonic**: a `task.start` whose origin (section 13.1) is
+the session of an investigate-mode task may only start investigate-mode
+tasks, and anything else fails with `task_mode_escalation`. The MCP adapter
+running in such a session registers only its read tools and an
+investigate-only `task_run`. The rule covers origins on other hosts
+through the forwarded `origin_mode` (section 13.1). The origin is
+client-asserted, so this rule binds the delegation paths the provider rules
+leave open to the agent; a
+profile that gives an investigate agent a shell is already not
+investigate-capable.
 
 ### 11.3 Permission prompts
 
@@ -1814,10 +1971,10 @@ the result says so (`baseline_on: "worktree"`).
 | `task.start` | Create the session (project/branch/base/profile/mode, or `worktree_of`), deliver turn 1. Idempotent per `(caller_scope, client_request_id)` on owner paths and per operation ticket on the relay path (invariant 3). |
 | `task.continue` | Deliver feedback as the next turn. |
 | `task.answer` | Answer the pending attention named by `(turn, attention_id, settlement_revision)`; stale answers are refused (section 8.5). Idempotent per `(task_id, caller_scope, client_request_id)` (invariant 3). |
-| `task.wait` | Block until the turn's result is final (default) or published (`until`), or the timeout elapses (dedicated connection, task waiter pool, section 8.3). |
+| `task.wait` | Block until the turn's result is final (default) or published (`until`), or the timeout elapses (dedicated connection, task waiter pool, section 8.3). The multi-target form waits on several tasks of this host (`targets`, `mode: any\|all`, section 8.3). |
 | `task.result` | Read a published result by `(turn, settlement_revision?)` without waiting; the revision defaults to the latest and every response states its `result_id` and whether it is superseded. |
 | `task.inspect` | Task record, lifecycle state, evidence sources and degradation, worktree users, and one page of turns (see paging below). Also resolves a task by `(caller_scope, client_request_id)` for delivery reconciliation. |
-| `task.list` | One page of tasks on the host, filterable by project, lifecycle state, outcome, owner task and run id (see paging below). |
+| `task.list` | One page of tasks on the host, filterable by project, lifecycle state, outcome, owner task, run id, origin session and `orphaned` (see origin and paging below). |
 | `task.extend` | Extend an open turn's deadline, or re-open a `timed_out` turn whose work has not visibly ended, within `tasks.turn_open_ceiling_ms` (section 6.3). |
 | `task.stop` | Cancel and join the task's check processes (section 12), stop its session and settle any open turn — or a settled `attention` turn, as a new revision (section 6.3) — as `stopped`, and seal every other settlement against later revision (section 6.3); on a task without an open turn it is the explicit end of a finished task (section 6.1). Optional preconditions `if_latest_turn` and `require_idle: true` make the stop atomic with a check that the latest turn is exactly that one, is settled **and final** (a heuristic `completed` inside its re-open window is provisional and does not count), has no open or queued turn, no pending attention and no finalizing result, and that the agent satisfies the same readiness condition occupancy release uses (invariant 11); otherwise it fails with `task_stop_precondition_failed` and changes nothing. On a task that is already `ended`, `task.stop` succeeds as a no-op and returns the recorded end (`already_ended: true`) without evaluating preconditions, so a retried cleanup never fails on its own earlier success. The worktree, metadata and result content survive for `task.result` and `task.review`. Idempotent. |
 | `task.review` | Record an external verdict (`accepted`, `changes_requested`, `rejected`) bound to a `result_id` and the `worktree_fingerprint` the reviewer verified, with optional notes and check references (see review binding below). Idempotent per `(task_id, caller_scope, client_request_id)`. |
@@ -1831,6 +1988,39 @@ distinct from any transport correlation id) stored on the task record, returned
 by `task.inspect`, filterable in `task.list`, and never an authorization
 input. Orchestrators use it to group the tasks of one objective so a
 restarted orchestrator can find them again (section 16).
+
+**Origin.** On owner paths `task.start` records the request's origin
+markers (`origin_session_id`, `origin_daemon_id`, `docs/architecture.md`,
+"Origin-session guard") as the task's `origin`, plus `origin_task_id` when
+the origin session is a task session of this daemon, and computes
+`delegation_depth`: the origin task's depth plus one, or 0 without an origin
+task. When the origin session is on **another** daemon, the depth and mode
+cannot be looked up locally, so they travel with the markers: every task
+session's environment carries its task's `delegation_depth` and `mode`
+next to the origin markers, the CLI and the MCP adapter forward them as
+`origin_delegation_depth` and `origin_mode`, and a daemon uses the
+forwarded values for a remote origin. A delegation loop across hosts (A
+starts on B, which starts on A) therefore keeps counting, and an
+investigate task cannot start an executor on another host. `task.inspect`
+returns them and `task.list` filters by origin session
+and by `orphaned` — an `active` task whose origin session belongs to this
+daemon and has ended or been removed. A task whose origin is on another
+daemon is never reported orphaned here; a client checks the origin host
+itself. Like `run_id`, the origin is attribution asserted by
+the client under the owner trust boundary: an agent can omit the markers and
+start at depth 0. It is never an authorization input except for the guards
+below, which bound runaway delegation loops and do not claim security. On
+the relay path the daemon records no client-asserted origin; attribution is
+the relay principal (relay RFC section 17).
+
+**Loop guards.** `tasks.max_delegation_depth` refuses a `task.start` whose
+depth would exceed it (`task_delegation_depth_exceeded`), and
+`tasks.max_active_tasks_per_origin` refuses one while the origin session
+already has that many `active` tasks (`task_origin_limit_reached`); both are
+checked with the global `tasks.max_active_tasks` under the task store lock.
+Both keys are required configuration (section 19) where `0` explicitly means
+unlimited, so the owner path is never capped by an invented default.
+Investigation-mode monotonicity (section 11.2) uses the same origin.
 
 **Review binding.** A verdict names the `result_id` it judges and the
 `worktree_fingerprint` the reviewer verified (normally the one in the result,
@@ -1883,7 +2073,7 @@ Typed errors introduced by this RFC:
 | `task_turn_queued` | `task.extend` | The turn is queued behind a re-open window and has no deadline yet (section 8.2). |
 | `task_worktree_via_investigate` | `task.start` | An executor `worktree_of` start named an investigate-mode task (section 8.7). |
 | `task_turn_ceiling_reached` | `task.extend` | The turn's total open time reached `tasks.turn_open_ceiling_ms`. |
-| `task_answer_unsupported` | `task.answer` | A degraded attention whose manifest declares no approve/deny input (section 8.5). |
+| `task_answer_unsupported` | `task.answer` | A degraded attention whose manifest declares no approve/deny input, or a `usage_limit` attention (section 8.5). |
 | `task_answer_unverifiable` | `task.answer` | A keystroke answer without `allow_unverified_delivery` (section 8.5). |
 | (reason) `task_turn_reopened` / `task_stopped` / `session_ended` | result of a queued turn | A queued turn settled `cancelled` without delivery because the previous turn re-opened, the task was stopped, or the session ended (section 8.2). Returned by `task.wait`/`task.result`, not as a call error. |
 | `task_payload_mismatch` | retried `task.start`, `task.continue`, `task.answer` | The resubmitted payload does not match the stored digest or ticket fingerprint (section 8.8). |
@@ -1905,6 +2095,10 @@ Typed errors introduced by this RFC:
 | `task_investigate_no_checks` | `task.start`, `task.continue` | `checks` or `checks_baseline` requested for an investigate-mode task (section 12). |
 | `task_fork_unsupported` | `session.fork` | The task's agent cannot fork its native session across per-session servers (OpenCode, section 9.3). |
 | `task_investigate_unsupported` | `task.start` | The profile cannot enforce investigation mode (section 11.2). |
+| `task_mode_escalation` | `task.start` | The origin is an investigate-mode task and the request is not investigate-mode (section 11.2). |
+| `task_delegation_depth_exceeded` | `task.start` | The new task's `delegation_depth` would exceed `tasks.max_delegation_depth` (section 13.1, origin). |
+| `task_origin_limit_reached` | `task.start` | The origin session already has `tasks.max_active_tasks_per_origin` active tasks (section 13.1, origin). |
+| `task_wait_target_invalid` | `task.wait` | A multi-target wait names an unknown or retired task, a task on another host, or more than `tasks.max_wait_targets` targets (section 8.3). |
 
 Events on `subscribe`: `task_turn_opened`, `task_result_published` (emitted at publication, after finalization, not at settlement), `task_result_final` (when a heuristic result's re-open window closes),
 `task_turn_attention`, `task_reviewed`. Notifications gain `task_settled` and
@@ -1925,16 +2119,27 @@ printf '%s' "$PROMPT" | pohunek task run --agent opencode-deepseek \
 pohunek task continue t-01... --stdin --wait --json
 pohunek task answer t-01... --turn 2 --attention t-01.../2/a1 --revision 1 approve --json
 pohunek task wait t-01... --timeout 10m [--until published] --json
+pohunek task wait --any t-01.../2@1 t-02... --timeout 10m --json  # t-01 after result 2@1
+pohunek task gc --orphans [--dry-run] --json
 pohunek task extend t-01... --by 10m --json
 pohunek task show t-01... [--turns-cursor ...] --json      # task.inspect
 pohunek task result t-01... --turn 2 [--revision 1] --json
-pohunek task list [--run-id ...] [--cursor ...] --json
+pohunek task list [--run-id ...] [--origin-session ...] [--orphaned] [--cursor ...] --json
 pohunek task check-log t-01... <log-ref> [--offset N] --json
 pohunek task review t-01... --result t-01.../2@1 --fingerprint sha256:... accepted --json
 pohunek task stop t-01... [--if-latest-turn 2 --require-idle] --json
 pohunek task retain-worktree t-01... --json
 pohunek task release-worktree t-01... --json
 ```
+
+`task wait --any`/`--all` is the multi-target form of section 8.3; a target
+written `<task-id>/<turn>@<revision>` (the `result_id` notation) passes that
+result as `after`, and `--run-id`
+expands to that run's `active` tasks through `task.list` on the client
+before the wait. `task gc --orphans` is a client loop, not a daemon method:
+it lists `orphaned` tasks and stops each through `task.stop` with
+`if_latest_turn` and `require_idle`, reports the tasks whose preconditions
+failed and never forces them; `--dry-run` only lists.
 
 Every protocol method in section 13.1 has a subcommand. `--wait` makes `run`
 and `continue` one process that delivers the turn and then waits until the
@@ -1965,18 +2170,39 @@ re-open window closes, to bind every review to the result's `result_id`, and
 to `task.stop` each finished executor and auditor task once its verdict is
 recorded (section 16.2).
 
-### 13.4 Optional MCP adapter
+For parallel executors the skill prescribes one multi-target `task wait
+--any` per host, passing each consumed `result_id` back as the target's
+`after` cursor, instead of one wait per task. It carries a **wake matrix**:
+for each agent, whether a wait started as a background command wakes the
+agent when it finishes. Claude Code does (a background shell task notifies
+the session), so a Claude orchestrator may run `task wait --any` in the
+background and keep working; for an agent whose background wake is not
+verified the skill prescribes a foreground wait. The matrix is re-verified
+with the agent's compatibility lock. The skill also tells orchestrators to
+treat a `usage_limit` attention as a pause the provider ends itself, to stop
+tasks whose result reports `pending_self_starts` before the next round, and
+to run `task gc --orphans` after a crashed manager session.
+
+### 13.4 MCP adapter
 
 `pohunek mcp` is a stdio MCP server inside the CLI binary that exposes
 `task_run`, `task_continue`, `task_wait`, `task_show`, `task_answer` and
 `task_review` as tools. It is a thin client of the public protocol: no state,
-no daemon-side MCP, same host targeting and origin guard. Tool calls block like
-`--wait`, bounded by the same daemon ceiling and by the MCP client's own tool
-timeout, which the adapter reports in its tool descriptions.
+no daemon-side MCP, same host targeting and origin guard. It forwards the
+origin markers of the session it runs in, so origin, loop guards and
+investigation-mode monotonicity (sections 11.2, 13.1) apply to its calls; in
+an investigate-mode session it registers only read tools and an
+investigate-only `task_run`. Tool calls block like `--wait`, bounded by the
+same daemon ceiling and by the MCP client's own tool timeout, which the
+adapter reports in its tool descriptions. A blocking tool call gives no
+background wake, so for agents that have one (section 13.3) the CLI wait is
+preferred.
 
 This does not conflict with the universal assistant's "no MCP knowledge server"
-decision, which concerns serving documentation, not delegating work. Whether
-to ship the adapter in the same milestone is an open question (section 19).
+decision, which concerns serving documentation, not delegating work. The
+adapter ships in this epic after the CLI and skill workstream, for agents
+without a usable shell or background wait (resolved open question,
+section 19).
 
 ## 14. Storage, Retention and Secrets
 
@@ -2070,6 +2296,10 @@ to ship the adapter in the same milestone is an open question (section 19).
 | Agent exits cleanly mid-turn | Open turn settles `exited`; the task becomes `ended`. |
 | Late `Stop` from an earlier prompt | Never applied to the open turn: its `prompt_id`/`turn_id` differs from the one bound to it (section 8.2). If it matches a `timed_out` predecessor, that turn completes late (section 6.3); otherwise it is discarded. Without identifiers it is discarded if it precedes the new turn's consumption milestone, otherwise the settlement is marked `provider_hooks_uncorrelated`. |
 | Another `Stop` hook blocks and the agent continues | Work resumes inside `tasks.stop_settle_grace_ms`; the turn stays open. |
+| Background work wakes the agent after its `Stop` | The `Stop` named the pending work, so the provider-initiated prompt continues the turn and its identifier joins the correlation set (section 8.2); the turn settles on that prompt's `Stop`. |
+| Agent starts a turn with no declared source (another session's message, a late scheduled task) | Unattributed external input: an open turn is marked `steered`; otherwise the next result reports drift and `integrity: suspect` (section 8.2). |
+| Provider usage limit during a turn | `usage_limit` attention; `task.wait` keeps waiting while the provider is expected to continue, and the continuation re-opens the turn as a new revision; a provider that will not continue returns the attention to the caller (section 8.5). |
+| Orchestrator session dies with delegated tasks running | The tasks keep running and are listed as `orphaned`; `task gc --orphans` stops the idle ones (sections 13.1, 13.2). |
 | Task waiter pool full | `task.wait` fails with `task_waiter_limit_reached`; session waits are unaffected. |
 | Client abandons a long `task.wait` | On the Unix socket peer hangup releases the slot at once; over TCP the per-socket keepalive releases it within the configured detection time (section 8.3). |
 | Daemon down across a heuristic completion's windows | Both windows restart at reconnect; the result is `evidence_degraded` with reason `window_overlapped_outage` (section 8.2). |
@@ -2220,8 +2450,8 @@ slices, #227–#228 adapters, #229 CLI and skill, #230 SDKs and clients, #231
 MCP adapter, #232 validation), each with its own DoD, rather than a single
 landing.
 The order below is dependency order, and workstream 7 (the MCP adapter) is
-deliberately last — it may move to a follow-up issue per open question 1
-without blocking the rest.
+deliberately last: it ships in this epic after the CLI and skill
+(section 13.4) and blocks nothing before it.
 
 1. **Protocol:** task types, methods, events, errors, limits as configuration;
    request ids and request fingerprints on every mutating task method (new:
@@ -2232,7 +2462,13 @@ without blocking the rest.
    and a delivery-state query (section 8.8); a hook-evidence endpoint on the
    worker socket, the sequenced evidence journal, forwarding frames with
    acknowledgement and resume-after-sequence on reconnect (section 9.2);
-   secondary child supervision for the OpenCode server (section 9.3).
+   secondary child supervision for the OpenCode server (section 9.3); an
+   **evidence trace recorder**: a sanitized export of one session's PTY
+   output with offsets, evidence journal records with their offset ranges,
+   and every input write, in the journal's own record format, plus a replay
+   harness that feeds a trace into the settlement engine on a deterministic
+   clock with named hold-and-release points for staging races. Workstream 3's
+   settlement tests run on recorded traces of real provider sessions.
 3. **Daemon:** a typed connection origin recorded at accept time and
    passed into `serve_connection` for the Unix and overlay listeners
    (`crates/daemon/src/api/mod.rs:268`, `:399`, `:426`), the persisted
@@ -2258,7 +2494,13 @@ without blocking the rest.
    definitions, owner-private check log capture, check-name authorization,
    result identity and review binding,
    paged `task.list`/`task.inspect`, notification dedupe, content and
-   metadata retention.
+   metadata retention; provider-initiated prompt classification and the
+   turn's correlation set (section 8.2); `usage_limit` attentions with
+   provider resolution and `task.wait` waiting through them (sections 8.3,
+   8.5); the typed `failure` object and `pending_self_starts` (section 10);
+   task `origin`, `delegation_depth`, the `orphaned` filter, the loop guards
+   and investigation-mode monotonicity (sections 11.2, 13.1); multi-target
+   `task.wait` with per-target waiter accounting (section 8.3).
 4. **Adapters:** OpenCode adapter (launch, authenticated loopback server
    child on an ephemeral port with stdout discarded after the listen line,
    fork refused with `task_fork_unsupported`, event mapping, capabilities, manifest,
@@ -2268,12 +2510,20 @@ without blocking the rest.
    `Notification`/`PermissionRequest` that report to the worker socket
    (section 9.2) alongside the existing notify hooks, mapped to turn
    evidence by `prompt_id`/`turn_id`; Claude and Codex compatibility locks pinning the
-   verified payload fields; Hermes plugin evidence.
+   verified payload fields, the identifier behaviour of provider-initiated
+   turns, the usage-limit evidence sequence (`StopFailure` `rate_limit`,
+   `quota_auto_resume_*` notifications, the continuation prompt) and each
+   golden's provider version and capture date; task-capable Claude profiles
+   keep `autoContinueAtUsageLimit` enabled; Hermes plugin evidence.
 5. **CLI and skill:** `task` command group with `--wait`, JSON envelopes,
-   completion; skill section; knowledge bundle update.
+   completion; multi-target `task wait --any`/`--all`, wait re-issue after a
+   daemon restart, `task gc --orphans` and the origin filters of
+   `task list`; skill sections including the wake matrix (section 13.3);
+   knowledge bundle update.
 6. **SDKs and clients:** Rust client and TS SDK methods; `gui-core` and web
    task views (outcome, attention, review) without embedding a terminal.
-7. **MCP adapter** (if accepted in scope).
+7. **MCP adapter:** `pohunek mcp` with origin-marker forwarding and the
+   investigate-mode tool restriction (section 13.4).
 8. **Validation:**
    - unit and integration tests for every outcome, including causal settlement
      (an already-idle screen must not settle a new turn; pre-consumption
@@ -2434,7 +2684,33 @@ without blocking the rest.
      origin-guard refusal), `turn_delta`, drift, modification during checks,
      check-name refusal, waiter pool exhaustion and hangup release, metadata
      retention after session removal, and metrics completeness including
-     subagents;
+     subagents; provider-initiated prompts, replayed from recorded traces:
+     a background task reporting back after a `Stop` with pending
+     `background_tasks` continues and settles the same turn whether the
+     wake-up carries a new or the original identifier, a scheduled task
+     firing inside the re-open window re-opens the turn and after it marks
+     the next result suspect, a prompt-submit with no declared source marks
+     an open turn `steered`, and a prompt-submit that follows client input is
+     steering, never provider-initiated; usage limits: a `StopFailure` with
+     the pinned usage-limit error settles a `usage_limit` attention,
+     `auto_resume` is `expected` only with the manifest's wait state and
+     `unknown` for an API-key session with the same error, `task.wait` waits
+     through it while `auto_resume` is `expected`, the continuation re-opens the turn
+     as a new revision, `quota_auto_resume_disabled` and the options menu
+     return it to the caller, `task.answer` on it fails
+     `task_answer_unsupported`, and its time never counts toward the open-time
+     ceiling; multi-target wait: `any` returns every target ready at that
+     moment, `after` excludes consumed results and still admits a later turn
+     whose revision number is lower, `all` returns partial
+     state on timeout, one call takes a per-task slot on every target, and a
+     target on another host fails `task_wait_target_invalid`; origin: depth
+     computed from the origin task, `task_delegation_depth_exceeded`,
+     `task_origin_limit_reached` (and `0` meaning unlimited),
+     `task_mode_escalation` from an investigate origin, a remote origin
+     using the forwarded `origin_delegation_depth` and `origin_mode` so an
+     A-to-B-to-A loop keeps counting, `orphaned` listing
+     only same-daemon origins, and `task gc --orphans` never stopping a task
+     whose preconditions fail;
    - model-free provider goldens for OpenCode, Claude, Codex and Hermes
      evidence;
    - a delegation benchmark matching section 2.1 (same tasks, hidden tests,
@@ -2474,11 +2750,29 @@ present, no detection-only settlement for OpenCode, and the share of
   reporting channel from inside the provider, and plugin-mediated
   request-addressed answers; none of it was verified. Rejected in favour of
   the two-child design of section 9.3.
+- **Orchestration inside the host process** (as T3 Code Orchestrator V2
+  does: a server-side delegation tool, a server-side message queue with
+  steer and queue modes, and a completion "wake" message written into the
+  parent agent's conversation). It removes a client hop, but makes the
+  daemon decide what work runs next and write input the orchestrator did not
+  send, which section 16.4 excludes and which would mark task turns
+  `steered`. Rejected; the same latency comes from multi-target waits and a
+  background wait where the agent supports one (sections 8.3, 13.3).
+- **Disable provider auto-continue at usage limits** so that a limit always
+  settles `failed` and the client owns resumption. Claude then opens a
+  usage-limit options menu in the terminal that blocks every later delivery
+  until a human acts, and the provider-native resume is lost. Rejected in
+  favour of the `usage_limit` attention (section 8.5).
+- **Bulk `task.stop` by `run_id`.** `run_id` is never an authorization input
+  (section 13.1); per-task preconditions (`if_latest_turn`) cannot be
+  expressed on a run selector; and on the relay path the sum-of-effects rule
+  refuses the whole call whenever the run spans principals, which is exactly
+  the manager/auditor case. Rejected in favour of per-task stops driven by
+  `task.list` (`task gc --orphans`, client round records).
 
 ## 19. Open Questions
 
-1. Whether the MCP adapter ships in the same milestone as the task layer.
-2. Default and ceiling values for `tasks.max_wait_ms`, `tasks.turn_deadline`,
+1. Default and ceiling values for `tasks.max_wait_ms`, `tasks.turn_deadline`,
    `tasks.turn_open_ceiling_ms`, `tasks.stop_settle_grace_ms`,
    `tasks.heuristic_reopen_window_ms`, `tasks.attention_confirm_ms`,
    `tasks.finalize_max_ms`, `tasks.snapshot_max_bytes`,
@@ -2504,14 +2798,17 @@ present, no detection-only settlement for OpenCode, and the share of
    `tasks.max_waiters`, `tasks.max_waiters_per_task`,
    `tasks.result_max_bytes`, `tasks.final_message_max_bytes`,
    `tasks.fingerprint_max_entries`, `tasks.fingerprint_max_bytes`,
+   `tasks.max_wait_targets`, `tasks.max_delegation_depth`,
+   `tasks.max_active_tasks_per_origin` (`0` = unlimited for the last two),
    `tasks.turn_deadline` overrides and
    `tasks.metadata_retention`, and whether per-profile overrides may exceed
    the host ceiling. All are required configuration validated at startup.
-3. Whether investigation mode should refuse to start when a profile declares
+2. Whether investigation mode should refuse to start when a profile declares
    only `provider_rules` enforcement for an untrusted project.
 
 Resolved elsewhere: relay-path `task.answer` authority and relay delegation
 budget scopes are defined by the relay dark factory RFC (sections 7.3 and
 8.1); review verdict retention is `tasks.metadata_retention` (section 14).
 Codex exposes `UserPromptSubmit` with `turn_id` (section 9.2), so Codex
-settlement is correlated like Claude's.
+settlement is correlated like Claude's. The MCP adapter ships in this epic
+after the CLI and skill workstream (section 13.4, amendment #510).

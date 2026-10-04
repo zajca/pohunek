@@ -2,7 +2,8 @@
 
 - **Status:** Accepted 2026-09-29 (epic #185; implementation tracked by its
   sub-issues). Revised after a code-grounded review on 2026-09-25 and four
-  review rounds on 2026-09-28.
+  review rounds on 2026-09-28. Amended 2026-10-04 (#510): usage-limit
+  attentions and multi-target waits in the factory loop.
 - **Date:** 2026-09-24
 - **Scope:** The relay-side authorization, budget, audit, projection and
   escalation changes needed to run unattended manager/auditor delegation loops
@@ -473,7 +474,9 @@ transaction. Three hard counters and one advisory:
 `task.extend` is counted because each extension buys another deadline window
 (task RFC section 6.3); the daemon's `tasks.turn_open_ceiling_ms` bounds a
 single turn, and this counter bounds how often a factory buys time across
-turns.
+turns. A provider continuing a turn by itself after a usage limit (task RFC
+section 8.5) is not an admission and consumes no counter: no principal
+opened anything, and the re-opened turn is the same turn.
 
 `max_active_tasks` is computed from durable admission records (section 8.3),
 not from the projection alone, because a start the host refused, or one whose
@@ -697,7 +700,7 @@ Data classification additions to relay RFC section 17.2:
 
 | Data | Host persistence | Relay persistence | Logs/audit | Retention |
 |---|---|---|---|---|
-| Task/turn metadata (ids, `mode`, lifecycle state, outcomes, `settled_by`, integrity, timings) | Authoritative | Catalog projection (section 10) | IDs, states, decisions | Host: `tasks.metadata_retention`; relay: configured metadata policy |
+| Task/turn metadata (ids, `mode`, lifecycle state, outcomes, `settled_by`, integrity, attention kind, failure class, timings) | Authoritative | Catalog projection (section 10) | IDs, states, decisions | Host: `tasks.metadata_retention`; relay: configured metadata policy |
 | Task results, check logs, final messages | Owner-private host files (task RFC section 14) | Never | Never | Existing host policy (retire with the session) |
 | Prompts (task metadata) | Keyed fingerprint only (task RFC invariant 7) | Keyed fingerprint on the admission record only | Never | Admission-record retention |
 | Prompt text as typed into the PTY | Owner-private scrollback of the session (existing session content, session ACL and retention) | Never | Never | Existing scrollback policy |
@@ -720,7 +723,8 @@ that is a task session, the row carries the metadata of the classification
 row in section 9: task id, immutable `mode` (`execute` or `investigate`,
 which the relay needs to authorize `task.stop` for `task.investigate`
 holders and to refuse an executor `worktree_of` through an investigate task
-before forwarding), lifecycle state, open turn, last outcome, `settled_by`,
+before forwarding), lifecycle state, open turn, last outcome, attention
+kind and `auto_resume` of a pending attention (task RFC section 8.5), `settled_by`,
 integrity, turn count, owner task, `retain_hold`, `run_id` and timestamps. Turn-level detail (per-turn results) is not projected; clients
 fetch it through `task.evidence.read` routed calls.
 
@@ -785,7 +789,15 @@ When a turn settles `attention`:
      suspension; the run's terminal report lists any attention that parked
      unescalated.
 2. The turn stays `attention` until answered or explicitly stopped. There is
-   no escalation timeout that auto-resolves, auto-approves, or auto-fails.
+   no escalation timeout that auto-resolves, auto-approves, or auto-fails. A
+   `usage_limit` attention (task RFC section 8.5) is the one kind the
+   **provider** resolves by continuing on its own; that is provider
+   evidence, not an answer, and nothing in the relay or the factory
+   triggers it. While its `auto_resume` is `expected` the notification is
+   informational: targets learn that the run is paused on a provider limit,
+   and nobody is asked to act. When `auto_resume` is `no` or `unknown`, the
+   attention is escalated like any other; a human resolves it at the
+   terminal or stops the task, because `task.answer` does not apply to it.
 3. An authorized principal answers via `task.answer` under section 7.3.
    Being an escalation target grants nothing: the target also needs the
    `task.answer` class and `session.task.control` on the task's session,
@@ -805,6 +817,9 @@ When a turn settles `attention`:
    time that escalations will not be answerable over the relay.
 4. An unanswered `attention` at a run checkpoint is a stop condition
    (`ask`, section 12.4), not a hang: the factory parks the run and reports.
+   A `usage_limit` attention with `auto_resume: expected` is not
+   unanswered: the factory keeps waiting on it (`task.wait` waits through
+   it) under the run's own wall-clock policy.
 
 A human answering directly in the terminal (task RFC section 8.6) is equally
 valid; the factory observes the resumed turn like any other evidence.
@@ -820,7 +835,15 @@ One round of the Manage-Execute-Audit loop, entirely through public interfaces:
 2. **Execute**: `task.start` (the first round creates the worktree with
    `retain_worktree: true`, so the tree outlives every task of the run; later
    rounds use `worktree_of`, task RFC sections 8.7 and 16.2) or
-   `task.continue`; then `task.wait`. Every task of the run carries the run's
+   `task.continue`; then `task.wait`. Parallel executors on one host are
+   collected with one multi-target `task.wait` (`mode: "any"`, each consumed
+   `result_id` passed back as the target's `after` cursor, task RFC section
+   8.3);
+   executors on several hosts need one such wait per host, raced by the
+   client. The relay authorizes and audits a multi-target wait as one
+   evidence read per target (section 9) and refuses the whole call when
+   any target is not authorized, so the response never reveals a task the
+   caller may not read. Every task of the run carries the run's
    `run_id`. Budget admission and ACLs are the relay's; settlement
    is the daemon's.
 3. **Audit**: read the result's verified fields (task RFC section 10),
@@ -1025,6 +1048,7 @@ condition fired and the last verified state.
 | Auditor principal revoked | Same; in-flight investigate tasks settle `stopped` only if explicitly stopped by an authorized principal. |
 | Budget exhausted | Typed refusal at admission only (section 8.2); the run parks with state intact. |
 | `attention` unanswered | Turn stays `attention`; run parks at `ask`; escalation targets remain notified. |
+| Provider usage limit | Turn settles a `usage_limit` attention. With `auto_resume: expected` the run waits, the targets get an informational notification, and the provider's continuation re-opens the turn without an admission; with `no` or `unknown` it is escalated and the run parks at `ask` (section 11). |
 | Service-account answer grant expires or is revoked | In-flight answer attempts are cancelled; later attentions escalate to humans only. |
 | Relay waiter limits reached by long `task.wait` | Typed overload from relay quotas (relay RFC section 18); the factory retries later. Long waits are sized in the re-measured reference profile (section 15). |
 | Duplicate delivery after timeout | The retry carries the same client key and fingerprint, so the relay resumes the same admission record and operation ticket (sections 7.1, 8.2); the daemon's ticket contract prevents a second execution. Never two inputs; the retry is free and exhaustion-proof. |
@@ -1049,7 +1073,10 @@ condition fired and the last verified state.
    An approval typed into the terminal comes only from a holder of
    `session.terminal.control`, which a service account holds only through an
    explicit grant (section 7.1); it is audited as terminal control and
-   recorded by the task layer as a terminal resolution. Escalation reaches a human whenever one exists and is **fail-closed**
+   recorded by the task layer as a terminal resolution. A provider
+   continuing by itself after a usage limit (task RFC section 8.5) is
+   provider evidence that resolves a `usage_limit` attention, not an answer,
+   and nothing in the relay or the factory triggers it. Escalation reaches a human whenever one exists and is **fail-closed**
    otherwise: turn-opening operations are suspended, in-flight attentions are
    flagged `unescalated`, and operator recovery (installing a human target)
    re-delivers them (section 11); no silent auto-resolution ever fills the
@@ -1130,10 +1157,16 @@ Ordered by dependency; each lands with the tests named:
    (no task fields with existence records), and retirement of task fields
    with their catalog entry.
 6. **Escalation:** `task_attention` routing to human targets, the team
-   escalation role setting, and the no-delegated-answers warning; tests for
-   target resolution, human-only targets, and no-auto-resolve.
+   escalation role setting, and the no-delegated-answers warning;
+   informational delivery of `usage_limit` attentions while `auto_resume` is
+   `expected` and normal escalation once it is not; tests for target
+   resolution, human-only targets, no-auto-resolve, and a provider
+   continuation that re-opens a `usage_limit` turn without consuming a
+   budget counter.
 7. **Client/SDK and skill:** factory loop reference implementation in the SDK
-   (with recovery from task records), the "Delegating long-horizon work" skill
+   (with recovery from task records), multi-target waits per host with
+   `after` cursors for parallel executors, waiting through `usage_limit`
+   attentions under a run wall-clock policy, the "Delegating long-horizon work" skill
    section extended to multi-host runs, `FactoryManager`/`FactoryAuditor`
    setup documentation; knowledge bundle updated (`cargo xtask docs check`).
 8. **Validation:**
