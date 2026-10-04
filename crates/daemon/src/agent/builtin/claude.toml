@@ -1,0 +1,36 @@
+# Built-in runtime descriptor for Claude Code, in the runtime.toml shape.
+#
+# `detect_manifest` names an activity manifest embedded in the daemon.
+# Claude's Ink TUI needs the submit written separately, and the daemon's
+# configured Claude submit delay replaces `submit_delay_ms`.
+
+schema = 1
+id = "pohunek.runtime.claude"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "claude"
+name = "Claude Code"
+program = "claude"
+args = []
+detect_manifest = "claude"
+prompt_arg = true
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 150
+submit_delay_configurable = true
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--resume", "{reference}"]
+
+[fork]
+supported = true
+args = ["--resume", "{reference}", "--fork-session"]
+
+[integration]
+handler = "claude-hook-v1"

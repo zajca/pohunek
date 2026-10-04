@@ -17,6 +17,7 @@ use crate::detect::Manifest;
 mod claude;
 mod codex;
 mod hermes;
+pub mod host;
 mod native_launch;
 mod profile;
 mod shell;

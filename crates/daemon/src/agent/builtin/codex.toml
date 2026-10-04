@@ -1,0 +1,32 @@
+# Built-in runtime descriptor for Codex, in the runtime.toml shape.
+#
+# `detect_manifest` names an activity manifest embedded in the daemon.
+
+schema = 1
+id = "pohunek.runtime.codex"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "codex"
+name = "Codex"
+program = "codex"
+args = []
+detect_manifest = "codex"
+prompt_arg = true
+
+[input]
+bracketed_paste = true
+submit_delay_ms = 150
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["resume", "{reference}"]
+
+[fork]
+supported = false
+
+[integration]
+handler = "codex-hook-v1"
