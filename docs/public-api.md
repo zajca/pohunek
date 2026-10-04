@@ -615,17 +615,22 @@ resume, or fork adapter.
 Agent runtime identities use three Rust types over the same string namespace.
 `RuntimeId` is always valid: lowercase ASCII alphanumerics plus `.`, `_` and
 `-`, 1 to 64 bytes, no leading `.` or `-`, no `..`; deserialization rejects
-anything else. `RuntimeRef` is lenient: any string deserializes, a valid
-`RuntimeId` becomes launchable, and every other value is a historical label
-that is displayable but never launchable (it maps to
-`runtime/agent_kind_unsupported`). A valid `RuntimeId` that no enabled runtime
-resolves is rejected with `runtime/runtime_not_installed`. `PackageId`,
-`PackageVersion`, `PackageDigest` and `DescriptorDigest` (`sha256:` plus 64
-lowercase hex characters) identify where a runtime definition came from.
+anything else. `RuntimeRef` is lenient: any string deserializes, a
+grammar-valid value is an `Id` and every other value is a historical label,
+displayable but rejected with `runtime/agent_kind_unsupported` (a fixed message
+that never echoes the label). The wire form is a bare string, so a reference
+round-trips to the same kind. `Id` does not mean launchable: installation is
+decided by the daemon registry at resolve time, and a valid `RuntimeId` that no
+enabled runtime resolves is rejected with `runtime/runtime_not_installed`.
+`PackageId`, `PackageVersion`, `PackageDigest` and `DescriptorDigest`
+(`sha256:` plus 64 lowercase hex characters) identify where a runtime
+definition came from. `PackageIdentity` pairs a package id with its version.
 `LaunchBinding` pairs a `RuntimeId` with a `provenance`: `builtin` carries an
-optional package identity and a descriptor digest that covers only structural
-launch fields and is not a package digest, `package` carries a package digest.
-All are TypeScript strings except `LaunchBinding` and `BindingProvenance`.
+optional `package` identity (id and version together or not at all) and a
+descriptor digest that covers only structural launch fields and is not a
+package digest, `package` carries a `package` identity and a package digest.
+All are TypeScript strings except `PackageIdentity`, `LaunchBinding` and
+`BindingProvenance`.
 
 ### Session Observation
 
@@ -1381,7 +1386,7 @@ Canonical public codes currently emitted include:
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required` |
 
 Protocol v3 emits these runtime codes for provider-neutral agent and
-observation behavior: `agent_kind_unsupported`, `runtime_not_installed`,
+observation behavior: `agent_kind_unsupported`,
 `agent_fork_unsupported`, `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
 `session_read_ansi_unavailable`, `session_output_limit_exceeded`,
@@ -1391,7 +1396,9 @@ observation behavior: `agent_kind_unsupported`, `runtime_not_installed`,
 `session_input_rejected`, `session_input_blocked`, `session_agent_blocked`,
 `session_input_invalid_wait`, `session_input_wait_unsupported`,
 `session_input_timeout`, and the CLI-local `session_input_interrupted`. Daemon startup may additionally return
-`observation_limits_invalid`. Observation request errors intentionally carry no terminal
+`observation_limits_invalid`. `runtime_not_installed` is reserved and not yet emitted: the daemon returns it
+once session creation resolves runtimes through the registry.
+Observation request errors intentionally carry no terminal
 payload or current-runtime payload; refresh `session.inspect` or restart
 observation from a fresh screen/tail when recovery requires new coordinates.
 

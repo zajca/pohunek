@@ -3,8 +3,11 @@
 /**
  * A runtime reference read from the wire or from history.
  *
- * Deserialization accepts any string: a value that is a valid [`RuntimeId`]
- * becomes [`RuntimeRef::Id`], anything else is kept verbatim as
- * [`RuntimeRef::Historical`] so it can be displayed but never launched.
+ * Deserialization accepts any string: a grammar-valid [`RuntimeId`] becomes
+ * [`RuntimeRef::Id`], anything else is kept verbatim as
+ * [`RuntimeRef::Historical`]. The wire form is a bare string, so a value
+ * round-trips to the same variant. `Id` does not mean launchable: whether a
+ * runtime may be launched is decided by the registry at resolve time, which
+ * answers a valid but uninstalled id with `runtime_not_installed`.
  */
 export type RuntimeRef = string;

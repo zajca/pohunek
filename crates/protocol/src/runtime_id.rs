@@ -3,8 +3,8 @@
 //! A [`RuntimeId`] names one installed agent runtime (for example `codex`). It
 //! is always valid by construction and by deserialization. A [`RuntimeRef`] is
 //! the lenient counterpart for values read back from history or from a newer
-//! peer: it keeps any string for display but only an [`RuntimeRef::Id`] can be
-//! launched. A [`LaunchBinding`] pins the runtime identity a session launched
+//! peer: it keeps any string for display, and a grammar-valid one is an
+//! [`RuntimeRef::Id`] that a registry may still reject as not installed. A [`LaunchBinding`] pins the runtime identity a session launched
 //! with, including an explicit statement of where that identity came from.
 //!
 //! # Examples
@@ -26,7 +26,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use crate::ProtocolError;
+use crate::{ErrorClass, ProtocolError};
 
 /// Maximum UTF-8 bytes in an agent runtime identifier.
 ///
@@ -308,9 +308,12 @@ impl RuntimeId {
 
 /// A runtime reference read from the wire or from history.
 ///
-/// Deserialization accepts any string: a value that is a valid [`RuntimeId`]
-/// becomes [`RuntimeRef::Id`], anything else is kept verbatim as
-/// [`RuntimeRef::Historical`] so it can be displayed but never launched.
+/// Deserialization accepts any string: a grammar-valid [`RuntimeId`] becomes
+/// [`RuntimeRef::Id`], anything else is kept verbatim as
+/// [`RuntimeRef::Historical`]. The wire form is a bare string, so a value
+/// round-trips to the same variant. `Id` does not mean launchable: whether a
+/// runtime may be launched is decided by the registry at resolve time, which
+/// answers a valid but uninstalled id with `runtime_not_installed`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(
@@ -318,9 +321,12 @@ impl RuntimeId {
     ts(export, export_to = "RuntimeRef.ts", type = "string")
 )]
 pub enum RuntimeRef {
-    /// A well-formed runtime identity that the registry may resolve.
+    /// A grammar-valid runtime identity, which the registry may or may not
+    /// have installed.
     Id(RuntimeId),
-    /// A label that is inert: displayable, never launchable or mutable.
+    /// A label that is not a valid [`RuntimeId`]: displayable, never
+    /// launchable. Build it only through [`RuntimeRef::from_wire`] or
+    /// deserialization so a valid string never lands here.
     Historical(String),
 }
 
@@ -340,17 +346,28 @@ impl RuntimeRef {
         }
     }
 
-    /// Returns the identity a launch or mutation may use.
+    /// Returns the identity to hand to a registry for resolution.
+    ///
+    /// This only rejects values that are not grammar-valid runtime ids; it
+    /// does not check installation. A valid id that no enabled runtime
+    /// resolves is rejected later with `runtime_not_installed`.
     ///
     /// # Errors
     ///
-    /// Returns the stable `agent_kind_unsupported` error for a historical
-    /// label. A valid identity can still be rejected later with
-    /// `runtime_not_installed` when no enabled runtime resolves it.
+    /// Returns `agent_kind_unsupported` with a fixed message for a historical
+    /// label. The message never includes the label, which is unvalidated text.
     pub fn launchable(&self) -> Result<&RuntimeId, ProtocolError> {
         match self {
             Self::Id(id) => Ok(id),
-            Self::Historical(label) => Err(ProtocolError::agent_kind_unsupported(label)),
+            Self::Historical(_) => Err(ProtocolError::new(
+                ErrorClass::Runtime,
+                "agent_kind_unsupported",
+                "the agent kind is presentation-only and cannot be mutated or persisted",
+                Some(
+                    "upgrade the daemon to a version that explicitly supports this agent kind"
+                        .to_owned(),
+                ),
+            )),
         }
     }
 }
@@ -386,6 +403,18 @@ impl<'de> Deserialize<'de> for RuntimeRef {
     }
 }
 
+/// Identity of one runtime package: its id and exact version.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PackageIdentity.ts"))]
+#[serde(deny_unknown_fields)]
+pub struct PackageIdentity {
+    /// Package id.
+    pub id: PackageId,
+    /// Package version.
+    pub version: PackageVersion,
+}
+
 /// Where a launch binding's identity comes from.
 ///
 /// The variants never share fields: a built-in runtime has a descriptor
@@ -398,14 +427,11 @@ pub enum BindingProvenance {
     /// A runtime compiled into the daemon.
     Builtin {
         /// Package identity the built-in descriptor stands for, when it has
-        /// one. The shell has none.
+        /// one. The shell has none. Id and version are both present or both
+        /// absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(optional))]
-        package_id: Option<PackageId>,
-        /// Version of the built-in descriptor, when it has a package identity.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[cfg_attr(feature = "ts", ts(optional))]
-        package_version: Option<PackageVersion>,
+        package: Option<PackageIdentity>,
         /// Digest of the descriptor's structural launch fields; not a package
         /// digest.
         descriptor_digest: DescriptorDigest,
@@ -413,9 +439,7 @@ pub enum BindingProvenance {
     /// A runtime installed from an authenticated package.
     Package {
         /// Package that exports the runtime.
-        package_id: PackageId,
-        /// Installed package version.
-        package_version: PackageVersion,
+        package: PackageIdentity,
         /// Digest of the installed package archive.
         package_digest: PackageDigest,
     },
@@ -570,6 +594,13 @@ mod tests {
         assert_eq!(historical.to_string(), "Legacy Agent!");
         let error = historical.launchable().expect_err("never launchable");
         assert_eq!(error.code, "agent_kind_unsupported");
+        assert!(!error.msg.contains("Legacy"));
+
+        let hostile = RuntimeRef::from_wire("line\nbreak\u{1b}[31m secret");
+        let error = hostile.launchable().expect_err("never launchable");
+        assert!(!error.msg.contains('\n') && !error.msg.contains('\u{1b}'));
+        assert!(!error.msg.contains("secret"));
+        assert!(!error.recover.unwrap_or_default().contains("secret"));
         assert_eq!(
             serde_json::to_string(&historical).expect("serialize"),
             r#""Legacy Agent!""#
@@ -618,8 +649,30 @@ mod tests {
             );
         }
         let unknown = AgentKind::Unknown("future-agent".to_owned()).as_runtime_ref();
-        assert_eq!(unknown, RuntimeRef::Historical("future-agent".to_owned()));
-        unknown.launchable().expect_err("must be rejected");
+        assert_eq!(
+            unknown,
+            RuntimeRef::Id(RuntimeId::parse("future-agent").unwrap())
+        );
+        // The wire form is a bare string, so the reference survives a roundtrip.
+        let json = serde_json::to_string(&unknown).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<RuntimeRef>(&json).expect("roundtrip"),
+            unknown
+        );
+        // Without a registry, launchable() accepts a grammar-valid id; the
+        // registry then answers `runtime_not_installed`.
+        assert_eq!(
+            unknown.launchable().expect("grammar-valid").as_str(),
+            "future-agent"
+        );
+
+        let invalid = AgentKind::Unknown("Not Valid".to_owned()).as_runtime_ref();
+        assert_eq!(invalid, RuntimeRef::Historical("Not Valid".to_owned()));
+        let json = serde_json::to_string(&invalid).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<RuntimeRef>(&json).expect("roundtrip"),
+            invalid
+        );
     }
 
     #[test]
@@ -668,8 +721,10 @@ mod tests {
         let builtin = LaunchBinding {
             runtime_id: RuntimeId::parse("codex").unwrap(),
             provenance: BindingProvenance::Builtin {
-                package_id: Some(PackageId::parse("pohunek.runtime.codex").unwrap()),
-                package_version: Some(PackageVersion::parse("1.0.0").unwrap()),
+                package: Some(PackageIdentity {
+                    id: PackageId::parse("pohunek.runtime.codex").unwrap(),
+                    version: PackageVersion::parse("1.0.0").unwrap(),
+                }),
                 descriptor_digest: DescriptorDigest::parse(DIGEST_A).unwrap(),
             },
         };
@@ -684,13 +739,12 @@ mod tests {
         let shell = LaunchBinding {
             runtime_id: RuntimeId::parse("shell").unwrap(),
             provenance: BindingProvenance::Builtin {
-                package_id: None,
-                package_version: None,
+                package: None,
                 descriptor_digest: DescriptorDigest::parse(DIGEST_A).unwrap(),
             },
         };
         let json = serde_json::to_value(&shell).expect("serialize");
-        assert!(json["provenance"].get("package_id").is_none());
+        assert!(json["provenance"].get("package").is_none());
         assert_eq!(
             serde_json::from_value::<LaunchBinding>(json).expect("roundtrip"),
             shell
@@ -699,8 +753,10 @@ mod tests {
         let package = LaunchBinding {
             runtime_id: RuntimeId::parse("acme").unwrap(),
             provenance: BindingProvenance::Package {
-                package_id: PackageId::parse("acme.runtime").unwrap(),
-                package_version: PackageVersion::parse("2.1.0").unwrap(),
+                package: PackageIdentity {
+                    id: PackageId::parse("acme.runtime").unwrap(),
+                    version: PackageVersion::parse("2.1.0").unwrap(),
+                },
                 package_digest: PackageDigest::parse(DIGEST_A).unwrap(),
             },
         };
@@ -729,12 +785,37 @@ mod tests {
             "runtime_id": "acme",
             "provenance": {
                 "kind": "package",
-                "package_id": "acme.runtime",
-                "package_version": "1.0.0",
+                "package": {"id": "acme.runtime", "version": "1.0.0"},
             }
         });
         serde_json::from_value::<LaunchBinding>(package_without_digest)
             .expect_err("must be rejected");
+
+        // Id without version, version without id, and the old flat spelling
+        // are all malformed.
+        for package in [
+            serde_json::json!({"id": "pohunek.runtime.codex"}),
+            serde_json::json!({"version": "1.0.0"}),
+        ] {
+            let half_package = serde_json::json!({
+                "runtime_id": "codex",
+                "provenance": {
+                    "kind": "builtin",
+                    "package": package,
+                    "descriptor_digest": DIGEST_A,
+                }
+            });
+            serde_json::from_value::<LaunchBinding>(half_package).expect_err("must be rejected");
+        }
+        let flat = serde_json::json!({
+            "runtime_id": "codex",
+            "provenance": {
+                "kind": "builtin",
+                "package_id": "pohunek.runtime.codex",
+                "descriptor_digest": DIGEST_A,
+            }
+        });
+        serde_json::from_value::<LaunchBinding>(flat).expect_err("must be rejected");
 
         let extra = serde_json::json!({
             "runtime_id": "codex",

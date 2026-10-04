@@ -2,8 +2,7 @@
 
 import type { DescriptorDigest } from "./DescriptorDigest";
 import type { PackageDigest } from "./PackageDigest";
-import type { PackageId } from "./PackageId";
-import type { PackageVersion } from "./PackageVersion";
+import type { PackageIdentity } from "./PackageIdentity";
 
 /**
  * Where a launch binding's identity comes from.
@@ -15,13 +14,10 @@ export type BindingProvenance = {
   "kind": "builtin";
   /**
    * Package identity the built-in descriptor stands for, when it has
-   * one. The shell has none.
+   * one. The shell has none. Id and version are both present or both
+   * absent.
    */
-  package_id?: PackageId;
-  /**
-   * Version of the built-in descriptor, when it has a package identity.
-   */
-  package_version?: PackageVersion;
+  package?: PackageIdentity;
   /**
    * Digest of the descriptor's structural launch fields; not a package
    * digest.
@@ -32,11 +28,7 @@ export type BindingProvenance = {
   /**
    * Package that exports the runtime.
    */
-  package_id: PackageId;
-  /**
-   * Installed package version.
-   */
-  package_version: PackageVersion;
+  package: PackageIdentity;
   /**
    * Digest of the installed package archive.
    */

@@ -51,9 +51,10 @@ impl AgentKind {
 
     /// Returns this kind as a runtime reference.
     ///
-    /// Built-in kinds map to their [`RuntimeId`]. An unknown value is always
-    /// [`RuntimeRef::Historical`], even when its text is a well-formed id, so a
-    /// presentation-only kind never becomes launchable through this conversion.
+    /// Built-in kinds map to their [`RuntimeId`]. An unknown value is
+    /// classified by the runtime-id grammar like any wire string, so it
+    /// round-trips unchanged; whether it can be launched is decided by the
+    /// registry, not by this conversion.
     #[must_use]
     pub fn as_runtime_ref(&self) -> RuntimeRef {
         match self {
@@ -61,7 +62,7 @@ impl AgentKind {
             Self::Codex => RuntimeRef::Id(RuntimeId::from_trusted("codex")),
             Self::Claude => RuntimeRef::Id(RuntimeId::from_trusted("claude")),
             Self::Hermes => RuntimeRef::Id(RuntimeId::from_trusted("hermes")),
-            Self::Unknown(value) => RuntimeRef::Historical(value.clone()),
+            Self::Unknown(value) => RuntimeRef::from_wire(value),
         }
     }
 

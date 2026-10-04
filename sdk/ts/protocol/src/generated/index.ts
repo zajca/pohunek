@@ -85,6 +85,7 @@ export type { OutputOffset } from "./OutputOffset";
 export type { OwnerRevision } from "./OwnerRevision";
 export type { PackageDigest } from "./PackageDigest";
 export type { PackageId } from "./PackageId";
+export type { PackageIdentity } from "./PackageIdentity";
 export type { PackageVersion } from "./PackageVersion";
 export type { PrincipalId } from "./PrincipalId";
 export type { ProcessStartIdentity } from "./ProcessStartIdentity";
