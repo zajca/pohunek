@@ -1769,7 +1769,10 @@ impl SessionRegistry {
         validate_new_params(&params)?;
         // Resolve and validate the runtime before allocating a logical id or
         // resolving a target: target resolution may bind a git worktree.
-        let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
+        let resolved = host::LaunchSource::OwnerLocal {
+            name: params.agent.clone(),
+        }
+        .resolve(&self.inner.profiles)?;
         let validated_program =
             host::validate_launch_runtime(&resolved.definition, resolved.program())?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's

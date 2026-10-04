@@ -65,6 +65,17 @@ An unknown future base-kind string is presentation-only: it can be displayed
 neutrally but cannot be launched, mutated, recovered, or persisted until the
 daemon explicitly supports it.
 
+## Launch sources
+
+A launch names its agent through a launch source. `session.new` on the owner's
+host resolves an owner-local name: a host profile, else an installed runtime
+id. A relay-selected launch resolves only a locally approved host profile by
+name and approved revision; it can never name a runtime id, package, program or
+argv. A bare runtime id fails with `agent_profile_not_found`, and a profile
+edited after approval fails with `agent_profile_revision_stale`. No relay
+caller exists yet; it depends on the locally approved host share of
+[#82](https://github.com/zajca/pohunek/issues/82).
+
 ## Native recovery spec
 
 A native-session launch spec states how an agent CLI resumes and optionally

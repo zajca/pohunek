@@ -10,6 +10,7 @@ mod definition;
 mod handle;
 mod launch;
 mod registry;
+mod source;
 
 pub use builtin::BuiltinSource;
 pub use definition::{
@@ -24,6 +25,7 @@ pub use registry::{
     InventoryEntry, RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust,
     RESERVED_RUNTIME_IDS,
 };
+pub use source::{LaunchSource, ProfileRevision};
 
 #[cfg(test)]
 mod tests;

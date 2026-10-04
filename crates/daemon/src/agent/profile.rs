@@ -20,7 +20,7 @@ use protocol::{AgentKind, ErrorClass, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::host::{RuntimeDefinition, RuntimeHost};
+use super::host::{ProfileRevision, RuntimeDefinition, RuntimeHost};
 use super::{InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::Manifest;
 use crate::project::config::validate_name;
@@ -169,6 +169,8 @@ pub(crate) struct ResolvedProfile {
     pub native: Option<NativeSessionLaunch>,
     /// Parsed detection-manifest override; `None` ⇒ inherit the base kind's manifest.
     pub manifest: Option<Manifest>,
+    /// Revision of the profile's launch inputs, as approved by the owner.
+    pub revision: ProfileRevision,
 }
 
 /// The resolution of an agent NAME on this host: its base kind plus optional
@@ -193,6 +195,13 @@ impl ResolvedAgent {
             || self.definition.native().cloned(),
             |profile| profile.native.clone(),
         )
+    }
+
+    /// The revision of the host profile this agent resolved from; `None` for a
+    /// bare runtime.
+    #[must_use]
+    pub(crate) fn profile_revision(&self) -> Option<&ProfileRevision> {
+        self.profile.as_ref().map(|profile| &profile.revision)
     }
 
     /// The program the agent launches: the profile's, else the base runtime's.
@@ -450,7 +459,14 @@ fn load_profile(
         )
     });
     let native = resolve_native(name, &definition, raw.resume.as_ref())?;
-    let manifest = resolve_manifest(name, dir, raw.manifest.as_deref())?;
+    let manifest_source = resolve_manifest(name, dir, raw.manifest.as_deref())?;
+    let binding_json = serde_json::to_vec(definition.binding())
+        .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
+    let revision = ProfileRevision::of_inputs(
+        &content,
+        manifest_source.as_ref().map(|source| source.text.as_str()),
+        &binding_json,
+    );
     Ok(ResolvedAgent {
         name: name.to_owned(),
         base,
@@ -461,7 +477,8 @@ fn load_profile(
             env,
             input_rules,
             native,
-            manifest,
+            manifest: manifest_source.map(|source| source.manifest),
+            revision,
         }),
     })
 }
@@ -566,7 +583,7 @@ fn resolve_manifest(
     name: &str,
     dir: &Path,
     manifest_name: Option<&str>,
-) -> Result<Option<Manifest>, ProtocolError> {
+) -> Result<Option<ManifestSource>, ProtocolError> {
     let Some(manifest_name) = manifest_name else {
         return Ok(None);
     };
@@ -583,7 +600,16 @@ fn resolve_manifest(
         .map_err(|err| invalid_profile(name, &format!("manifest '{manifest_name}': {err}")))?;
     let manifest = Manifest::parse_str(&content)
         .map_err(|err| invalid_profile(name, &format!("manifest '{manifest_name}': {err}")))?;
-    Ok(Some(manifest))
+    Ok(Some(ManifestSource {
+        manifest,
+        text: content,
+    }))
+}
+
+/// A parsed override manifest with the file text it was parsed from.
+struct ManifestSource {
+    manifest: Manifest,
+    text: String,
 }
 
 /// `runtime/agent_profile_not_found`: a name resolved to neither a host profile nor

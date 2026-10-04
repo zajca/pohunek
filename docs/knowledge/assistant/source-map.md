@@ -448,6 +448,7 @@ Agent runtime and profile resolution:
 - `crates/daemon/src/agent/native_launch.rs`
 - `crates/daemon/src/agent/profile.rs`
 - `crates/daemon/src/agent/host/`
+- `crates/xtask/tests/no_special_dispatch.rs`
 - `crates/daemon/src/agent/builtin/`
 - `crates/daemon/src/detect/mod.rs`
 - `crates/daemon/src/detect/osc.rs`
