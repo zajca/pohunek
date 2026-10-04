@@ -224,25 +224,26 @@ impl SessionRegistry {
     /// Resolves the runtime a binding relaunches with and checks that it may
     /// serve the binding's frozen launch pin.
     ///
-    /// A runtime that is not installed, or that no longer matches the pin,
-    /// refuses the relaunch; the stored binding is left untouched so it
-    /// resumes once the runtime is available again.
+    /// A package pin resolves from exactly its package digest, verified again
+    /// now, whatever the registry currently selects. A runtime that is not
+    /// installed, or that no longer matches the pin, refuses the relaunch; the
+    /// stored binding is left untouched so it resumes once the runtime is
+    /// available again.
     ///
     /// # Errors
     ///
-    /// Returns `agent_kind_unsupported` for a value that is not a runtime id
-    /// and `runtime_not_installed` for an unresolvable or mismatching runtime.
+    /// Returns `agent_kind_unsupported` for a value that is not a runtime id,
+    /// `runtime_not_installed` for an unresolvable or mismatching runtime and
+    /// `runtime_incompatible` for a pinned package whose root fails
+    /// verification.
     fn binding_definition(
         &self,
         binding: &ResumeBinding,
     ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
-        let definition = self
-            .inner
+        self.inner
             .profiles
             .runtimes()
-            .resolve_ref(&binding.agent_base)?;
-        host::check_pin(&binding.launch_binding, definition)?;
-        Ok(Arc::clone(definition))
+            .resolve_pinned(&binding.agent_base, &binding.launch_binding)
     }
 
     async fn persist_failed_recovery_rollback(&self, id: &SessionId) {
@@ -274,6 +275,10 @@ impl SessionRegistry {
     pub async fn fork(&self, params: SessionForkParams) -> Result<SessionInfo, ProtocolError> {
         self.ensure_migration_settled()?;
         self.ensure_not_external(&params.session_id).await?;
+        // Held from resolving the pin until the detached registration has
+        // persisted the fork's record, so the pinned package cannot be
+        // uninstalled in between. A disabled package still forks.
+        let package_authority = Arc::clone(&self.inner.package_lifecycle).read_owned().await;
         let (binding, repo, branch, worktree_path) = self.fork_source(&params.session_id).await?;
         let definition = self.binding_definition(&binding)?;
 
@@ -368,6 +373,7 @@ impl SessionRegistry {
                     metadata: binding.metadata,
                     warnings: Vec::new(),
                     initial_input_pending: false,
+                    package_authority: Some(package_authority),
                 },
                 guard,
             )
@@ -393,12 +399,19 @@ impl SessionRegistry {
     /// A profile that no longer resolves yields no environment and no override
     /// and a warning: the operation proceeds from the frozen structural
     /// snapshot.
-    fn recovery_profile(
+    pub(super) fn recovery_profile(
         &self,
         binding: &ResumeBinding,
         operation: &'static str,
     ) -> (Vec<(String, String)>, Option<Manifest>) {
-        match self.inner.profiles.resolve_agent(&binding.agent) {
+        let resolved = match self.binding_definition(binding) {
+            Ok(pinned) => self
+                .inner
+                .profiles
+                .resolve_agent_pinned(&binding.agent, &pinned),
+            Err(_unresolved) => self.inner.profiles.resolve_agent(&binding.agent),
+        };
+        match resolved {
             Ok(resolved) => resolved.profile.map_or((Vec::new(), None), |profile| {
                 (profile.env, profile.manifest)
             }),
@@ -620,6 +633,7 @@ impl SessionRegistry {
                 metadata: binding.metadata,
                 warnings: Vec::new(),
                 initial_input_pending: false,
+                package_authority: None,
             },
             guard,
         )

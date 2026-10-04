@@ -738,7 +738,11 @@ with its stored recovery binding, refuses resume, fork and mutation with
 `runtime_not_installed`, and resumes again once the runtime is installed. The
 binding records the runtime identity (`LaunchBinding`) the session was
 launched with; a binding written without one may only resume through a
-built-in runtime.
+built-in runtime. A session launched from an installed runtime package pins the
+package archive digest and resumes only from exactly that digest, verified
+again; installed content that is missing, modified or contradicts the pin is
+rejected with `runtime/runtime_incompatible` and never replaced by another
+package or a built-in.
 
 A launch resolves its agent through a launch source. The owner-local source
 accepts a host profile name or an installed runtime id. A relay-selected launch
@@ -1566,7 +1570,10 @@ id resolves to no enabled runtime: a host profile whose `base` names an
 uninstalled runtime, and resume, fork or mutation of a session whose runtime is
 not installed or no longer matches its recorded launch binding. A bare
 `session.new` agent name that is neither a profile nor an installed runtime
-stays `agent_profile_not_found`. `agent_profile_revision_stale`,
+stays `agent_profile_not_found`. `runtime_incompatible` is emitted when a
+runtime package is installed but its root is missing, modified or contradicts
+the session's pin, for fresh launch, resume, fork and integration changes (the
+message names only the runtime id). `agent_profile_revision_stale`,
 `agent_profile_revision_invalid` and `agent_profile_revision_unavailable` are emitted only by the relay-selected launch
 source (see above), which no wire method reaches yet.
 Observation request errors intentionally carry no terminal

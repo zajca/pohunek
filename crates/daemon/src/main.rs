@@ -227,6 +227,7 @@ async fn run() -> Result<(), DaemonError> {
         // Part C: host agent profiles live under <config_dir>/agents.
         agents_dir: Some(paths.config_dir.join("agents")),
         host_state_dir: Some(paths.state_dir.clone()),
+        plugins_dir: Some(paths.plugins_dir()),
         observe_external_agents: env_bool(OBSERVE_EXTERNAL_AGENTS_ENV)?,
         worker_runtime_root: Some(paths.runtime_dir.join(WORKERS_SUBDIR)),
         worker_state_root: Some(paths.state_dir.join(WORKERS_SUBDIR)),

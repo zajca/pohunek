@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-28
+// Rust guideline compliant 2026-10-04
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -54,6 +54,12 @@ pub const HOST_APPROVAL_KEY_NAME: &str = "approval.key";
 pub const HOST_GOVERNANCE_NAME: &str = "governance.json";
 /// Cross-process host-state lock filename.
 pub const HOST_STATE_LOCK_NAME: &str = "state.lock";
+/// Owner-private runtime package store subdirectory under
+/// [`BasePaths::state_dir`].
+///
+/// It holds the package registry record and the content-addressed package
+/// roots, so it must be an exact `0700` directory owned by the daemon user.
+pub const PLUGINS_SUBDIR: &str = "plugins";
 
 /// Subdirectory for launchd definitions (below state) and job logs (below logs).
 pub const LAUNCHD_SUBDIR: &str = "launchd";
@@ -454,6 +460,12 @@ impl BasePaths {
     #[must_use]
     pub fn host_state_dir(&self) -> PathBuf {
         self.state_dir.join(HOST_STATE_SUBDIR)
+    }
+
+    /// Returns the owner-private runtime package store directory.
+    #[must_use]
+    pub fn plugins_dir(&self) -> PathBuf {
+        self.state_dir.join(PLUGINS_SUBDIR)
     }
 
     /// Returns the stable host identity record path.
@@ -1222,6 +1234,18 @@ mod tests {
             paths.host_state_lock_path(),
             host.join(HOST_STATE_LOCK_NAME)
         );
+    }
+
+    #[test]
+    fn plugins_dir_is_a_state_subdirectory() {
+        let base = tmp_base("plugins");
+        let paths = resolve_in(&all_present(&base)).expect("resolve paths");
+
+        assert_eq!(
+            paths.plugins_dir(),
+            base.join("state").join(APP_DIR).join(PLUGINS_SUBDIR)
+        );
+        assert_ne!(paths.plugins_dir(), paths.host_state_dir());
     }
 
     #[test]

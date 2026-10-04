@@ -321,21 +321,47 @@ impl ProfileRegistry {
     /// 3. `name` is an installed runtime id → the bare base runtime.
     /// 4. else → `agent_profile_not_found` (no silent fallback).
     pub(crate) fn resolve_agent(&self, name: &str) -> Result<ResolvedAgent, ProtocolError> {
+        self.resolve_agent_against(name, None)
+    }
+
+    /// [`Self::resolve_agent`] for a session recovering from a pinned
+    /// definition: a profile whose base is that definition's runtime builds on
+    /// `pinned` instead of whatever the registry serves now, so an unchanged
+    /// profile keeps resolving after its package is disabled or another
+    /// version is selected. The profile file is validated as usual.
+    pub(crate) fn resolve_agent_pinned(
+        &self,
+        name: &str,
+        pinned: &Arc<RuntimeDefinition>,
+    ) -> Result<ResolvedAgent, ProtocolError> {
+        self.resolve_agent_against(name, Some(pinned))
+    }
+
+    fn resolve_agent_against(
+        &self,
+        name: &str,
+        pinned: Option<&Arc<RuntimeDefinition>>,
+    ) -> Result<ResolvedAgent, ProtocolError> {
         validate_name("agent", name)?;
         if let Some(dir) = &self.dir {
             let path = dir.join(format!("{name}.toml"));
             if path.is_file() {
-                return load_profile(name, &path, dir, &self.runtimes);
+                return load_profile(name, &path, dir, &self.runtimes, pinned);
             }
         }
         if let Some(definition) = RuntimeId::parse(name)
             .ok()
-            .and_then(|runtime_id| self.runtimes.resolve_id(&runtime_id).ok())
+            .and_then(|runtime_id| match pinned {
+                Some(definition) if *definition.runtime_id() == runtime_id => {
+                    Some(Arc::clone(definition))
+                }
+                _ => self.runtimes.resolve_id(&runtime_id).ok(),
+            })
         {
             return Ok(ResolvedAgent {
                 name: name.to_owned(),
                 base: definition.runtime_id().clone(),
-                definition: Arc::clone(definition),
+                definition,
                 profile: None,
             });
         }
@@ -447,6 +473,7 @@ fn load_profile(
     path: &Path,
     dir: &Path,
     runtimes: &RuntimeHost,
+    pinned: Option<&Arc<RuntimeDefinition>>,
 ) -> Result<ResolvedAgent, ProtocolError> {
     // Containment first: a symlinked `<name>.toml` that escapes the tree must be
     // rejected before its contents are read or exec'd (C.5).
@@ -463,7 +490,10 @@ fn load_profile(
         .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
-    let definition = Arc::clone(runtimes.resolve_id(&base_id)?);
+    let definition = match pinned {
+        Some(definition) if *definition.runtime_id() == base_id => Arc::clone(definition),
+        _ => runtimes.resolve_id(&base_id)?,
+    };
     // A runtime without native resume (the shell) cannot have a profile claim one.
     if definition.native().is_none()
         && raw

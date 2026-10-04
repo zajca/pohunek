@@ -2853,6 +2853,7 @@ dependencies = [
  "pohunek-logging",
  "pohunek-netbird",
  "pohunek-overlay",
+ "pohunek-package",
  "pohunek-paths",
  "pohunek-platform",
  "pohunek-protocol",

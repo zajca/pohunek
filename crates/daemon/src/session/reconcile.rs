@@ -2448,26 +2448,39 @@ impl SessionRegistry {
                 )
             },
             |binding| {
-                binding
-                    .input_rules
-                    .to_input_rules(crate::agent::input_rules_for_kind(
-                        self.inner.profiles.runtimes(),
-                        &binding.agent_base,
-                    ))
+                crate::agent::recovered_input_rules(
+                    self.inner.profiles.runtimes(),
+                    &binding.agent_base,
+                    &binding.launch_binding,
+                    binding.input_rules,
+                )
             },
         );
         let snapshot = recovery
             .as_ref()
             .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
-        let manifest_override = self
+        let pin = recovery
+            .as_ref()
+            .map(|binding| binding.launch_binding.clone())
+            .unwrap_or_default();
+        let manifest_override = match self
             .inner
             .profiles
-            .resolve_agent(&record.info.agent)
-            .ok()
-            .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
-        let default_detector_config = DetectorConfig::for_profile(
+            .runtimes()
+            .definition_for_pin(&record.info.agent_base, &pin)
+        {
+            Ok(pinned) => self
+                .inner
+                .profiles
+                .resolve_agent_pinned(&record.info.agent, &pinned),
+            Err(_unresolved) => self.inner.profiles.resolve_agent(&record.info.agent),
+        }
+        .ok()
+        .and_then(|resolved| resolved.profile.and_then(|profile| profile.manifest));
+        let default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &record.info.agent_base,
+            &pin,
             manifest_override,
         );
         let detector_cancel = CancellationToken::new();
@@ -2495,6 +2508,11 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             default_detector_config,
+            pinned: self
+                .inner
+                .profiles
+                .runtimes()
+                .pinned_package_definition(&record.info.agent_base, &pin),
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),
@@ -2610,19 +2628,27 @@ impl SessionRegistry {
                 )
             },
             |binding| {
-                binding
-                    .input_rules
-                    .to_input_rules(crate::agent::input_rules_for_kind(
-                        self.inner.profiles.runtimes(),
-                        &binding.agent_base,
-                    ))
+                crate::agent::recovered_input_rules(
+                    self.inner.profiles.runtimes(),
+                    &binding.agent_base,
+                    &binding.launch_binding,
+                    binding.input_rules,
+                )
             },
         );
         let relaunch = recovery
             .as_ref()
             .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
-        let default_detector_config =
-            DetectorConfig::for_agent(self.inner.profiles.runtimes(), &record.info.agent_base);
+        let pin = recovery
+            .as_ref()
+            .map(|binding| binding.launch_binding.clone())
+            .unwrap_or_default();
+        let default_detector_config = DetectorConfig::for_pinned(
+            self.inner.profiles.runtimes(),
+            &record.info.agent_base,
+            &pin,
+            None,
+        );
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
         let (detector_config, _) = watch::channel(DetectorConfigUpdate {
             generation: 0,
@@ -2647,6 +2673,11 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             default_detector_config,
+            pinned: self
+                .inner
+                .profiles
+                .runtimes()
+                .pinned_package_definition(&record.info.agent_base, &pin),
             procwatch_cancel: CancellationToken::new(),
             runtime_watch_cancel: CancellationToken::new(),
             procwatch_rescan: Arc::new(Notify::new()),

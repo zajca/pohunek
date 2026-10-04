@@ -162,6 +162,20 @@ impl InputRules {
         }
     }
 
+    /// Builds the restricted contract a persisted snapshot recorded: safe-text
+    /// validation and no automated input while blocked.
+    pub(crate) const fn restricted(bracketed_paste: bool, submit_delay: Duration) -> Self {
+        Self::hermes(bracketed_paste, submit_delay)
+    }
+
+    /// Whether the rules carry a provider safety contract (restricted text or
+    /// no automated input while blocked), as opposed to historical
+    /// unrestricted input.
+    #[must_use]
+    pub(crate) fn is_restricted(self) -> bool {
+        self.text_policy != InputTextPolicy::Unrestricted || !self.allow_while_blocked
+    }
+
     /// Replaces framing while retaining the compiled provider safety contract.
     pub(crate) const fn with_framing(self, bracketed_paste: bool, submit_delay: Duration) -> Self {
         Self {
@@ -319,6 +333,22 @@ pub(crate) fn builtin_native_launch(kind: &protocol::RuntimeId) -> Option<Native
         .resolve_id(kind)
         .ok()
         .and_then(|definition| definition.native().cloned())
+}
+
+/// Input rules of a recovered session: the persisted framing over the safety
+/// contract of the definition its pin resolves to, or, when the definition
+/// cannot be resolved or verified, the framing and safety contract persisted at
+/// launch. A restricted runtime therefore never degrades to unrestricted input.
+pub(crate) fn recovered_input_rules(
+    host: &host::RuntimeHost,
+    agent: &protocol::RuntimeRef,
+    pin: &host::LaunchPin,
+    stored: crate::store::StoredInputRules,
+) -> InputRules {
+    host.definition_for_pin(agent, pin).map_or_else(
+        |_unresolved| stored.to_standalone_rules(),
+        |definition| stored.to_input_rules(definition.input_rules()),
+    )
 }
 
 /// Input rules of the runtime `agent` names; a kind without an installed
@@ -521,7 +551,7 @@ mod tests {
         let host = RuntimeHost::from_host_environment();
         let runtime_id = protocol::RuntimeId::parse(name).expect("runtime id");
         let definition = host.resolve_id(&runtime_id).expect("built-in resolves");
-        launch_command(&host, definition, opts)
+        launch_command(&host, &definition, opts)
     }
 
     #[test]

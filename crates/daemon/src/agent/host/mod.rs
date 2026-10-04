@@ -11,6 +11,7 @@ mod definition;
 pub(crate) mod fixture;
 mod handle;
 mod launch;
+mod package;
 mod registry;
 mod source;
 
@@ -20,9 +21,15 @@ pub use definition::{
     LaunchProgram, RuntimeDefinition, MAX_ARG_BYTES, MAX_DEFINITION_BYTES, MAX_LABEL_BYTES,
     MAX_LAUNCH_ARGS, SUPPORTED_RUNTIME_API, SUPPORTED_SCHEMA,
 };
-pub use handle::RuntimeHost;
+pub use handle::{PackageReport, ReloadError, RuntimeHost};
+#[cfg(test)]
+pub(crate) use launch::check_pin;
 pub use launch::LaunchPin;
-pub(crate) use launch::{check_pin, launch_command, validate_launch_runtime};
+pub(crate) use launch::{launch_command, validate_launch_runtime};
+pub use package::{
+    PackageLoad, PackageRejection, PackageSource, PackageStore, RejectedPackage,
+    RUNTIME_DESCRIPTOR_PATH,
+};
 pub use registry::{
     InventoryEntry, RegistryError, RuntimeRegistry, RuntimeSource, SourceTrust,
     RESERVED_RUNTIME_IDS,
@@ -30,5 +37,7 @@ pub use registry::{
 pub use source::{LaunchSource, ProfileRevision};
 pub(crate) use source::{ProfileInputs, RevisionKeys};
 
+#[cfg(test)]
+mod package_tests;
 #[cfg(test)]
 mod tests;

@@ -142,3 +142,10 @@ launch binding (runtime id plus where its definition came from). A profile whose
 `invalid_profile`. A recovery binding whose runtime is not installed stays in the
 store, refuses resume and fork with `runtime_not_installed`, and works again once
 the runtime is installed.
+
+A runtime can also come from an installed runtime package (see
+`concept/runtime-package-archive`, "Daemon host"). A session launched from a
+package pins its archive digest; resume resolves exactly that digest, verified
+again, never the currently selected version, a built-in or another package. A
+pinned package whose root is modified or damaged refuses resume with
+`runtime_incompatible` and keeps its binding.

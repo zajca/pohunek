@@ -115,6 +115,7 @@ const ALLOW_LIST: &[Entry] = &[
         "crates/daemon/src/agent/mod.rs",
         Approved::Lines(&[
     "HermesSafeText,",
+    "Self::hermes(bracketed_paste, submit_delay)",
     "if self.text_policy == InputTextPolicy::HermesSafeText",
     "pub(crate) const fn hermes(bracketed_paste: bool, submit_delay: Duration) -> Self {",
     "text_policy: InputTextPolicy::HermesSafeText,",

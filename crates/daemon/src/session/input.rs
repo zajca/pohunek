@@ -654,7 +654,7 @@ pub(super) fn input_rules_for_agent(
 ) -> InputRules {
     host.resolve_ref(agent).map_or_else(
         |_unresolved| crate::agent::input_rules_for_kind(host, agent),
-        |definition| input_rules_for_definition(definition, config),
+        |definition| input_rules_for_definition(&definition, config),
     )
 }
 

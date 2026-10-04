@@ -17380,3 +17380,698 @@ async fn a_home_the_allowlist_does_not_forward_is_not_used_for_recovery() {
         "the agent would not see this HOME, so it is not the store"
     );
 }
+
+/// A Pi-shaped runtime installed as a real package, with the host that
+/// serves it.
+#[cfg(unix)]
+struct PackagedPi {
+    plugins: PathBuf,
+    digest: package::PackageDigest,
+    host: crate::agent::host::RuntimeHost,
+}
+
+#[cfg(unix)]
+impl PackagedPi {
+    /// Installs the package (enabled and selected) into a fresh plugin root
+    /// and builds the host over it.
+    fn install(tag: &str, script: &std::path::Path) -> Self {
+        let plugins = temp_dir(tag).join("plugins");
+        let (host, digest) = crate::agent::host::fixture::installed_pi_host(&plugins, script);
+        Self {
+            plugins,
+            digest,
+            host,
+        }
+    }
+
+    fn registry(&self, store_path: &std::path::Path) -> SessionRegistry {
+        self.registry_with_agents(store_path, None)
+    }
+
+    fn registry_with_agents(
+        &self,
+        store_path: &std::path::Path,
+        agents_dir: Option<PathBuf>,
+    ) -> SessionRegistry {
+        SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                stop_grace: Duration::from_millis(50),
+                store_path: Some(store_path.to_path_buf()),
+                agents_dir,
+                ..SessionRegistryConfig::default()
+            },
+            self.host.clone(),
+        )
+    }
+
+    /// Disables the package and reloads the registry, as the lifecycle
+    /// commands do.
+    fn disable_and_reload(&self, registry: &SessionRegistry) {
+        self.registry_handle()
+            .set_enabled(&self.digest, false)
+            .expect("disable");
+        registry.reload_runtimes().expect("reload");
+    }
+
+    fn registry_handle(&self) -> package::registry::Registry {
+        package::registry::Registry::open_at(&self.plugins, package::Limits::DEFAULT)
+            .expect("registry")
+    }
+
+    /// Rewrites the installed descriptor with other bytes of the same length.
+    fn tamper(&self) {
+        let hex = self
+            .digest
+            .as_str()
+            .strip_prefix("sha256:")
+            .expect("digest prefix");
+        let descriptor = self
+            .plugins
+            .join("packages")
+            .join(hex)
+            .join("files")
+            .join("runtime.toml");
+        let mut bytes = fs::read(&descriptor).expect("read descriptor");
+        let at = bytes
+            .windows(b"fast".len())
+            .position(|window| window == b"fast")
+            .expect("model argument");
+        bytes[at..at + 4].copy_from_slice(b"slow");
+        fs::write(&descriptor, bytes).expect("write descriptor");
+    }
+}
+
+#[cfg(unix)]
+fn packaged_params(dir: &std::path::Path) -> SessionNewParams {
+    SessionNewParams {
+        agent: "pi".to_owned(),
+        cwd: Some(dir.to_path_buf()),
+        ..params()
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_package_session_is_pinned_to_its_archive_digest() {
+    let dir = temp_dir("packaged-pin");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-pin-plugins", &script);
+    let store_path = temp_store_path("packaged-pin");
+    let registry = packaged.registry(&store_path);
+
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+
+    let pin = durable_recovery(&store_path, &created.id).launch_binding;
+    let Some(binding) = pin.binding() else {
+        panic!("the session records a launch binding");
+    };
+    assert!(matches!(
+        &binding.provenance,
+        protocol::BindingProvenance::Package { package_digest, .. }
+            if *package_digest == packaged.digest
+    ));
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_package_modified_after_install_blocks_a_fresh_launch_and_leaves_no_record() {
+    let dir = temp_dir("packaged-tamper-launch");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-tamper-launch-plugins", &script);
+    let store_path = temp_store_path("packaged-tamper-launch");
+    let registry = packaged.registry(&store_path);
+    let first = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("an intact package launches");
+
+    packaged.tamper();
+    let refused = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect_err("a modified package must not launch");
+
+    assert_eq!(refused.code, "runtime_incompatible");
+    let records = crate::store::Store::new(store_path)
+        .load_sessions()
+        .expect("durable sessions");
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.session_id.as_str())
+            .collect::<Vec<_>>(),
+        [first.id.0.as_str()],
+        "the refused launch persisted nothing"
+    );
+    assert_eq!(registry.list().await.len(), 1);
+    let _ = registry.stop(&first.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resume_of_a_session_whose_package_was_modified_is_incompatible_and_keeps_its_binding() {
+    let dir = temp_dir("packaged-tamper-resume");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-tamper-resume-plugins", &script);
+    let store_path = temp_store_path("packaged-tamper-resume");
+    let registry = packaged.registry(&store_path);
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    let before = durable_recovery(&store_path, &created.id);
+
+    packaged.tamper();
+    let refused = registry
+        .resume(&created.id)
+        .await
+        .expect_err("a modified package must not resume");
+
+    assert_eq!(refused.code, "runtime_incompatible");
+    assert_eq!(
+        durable_recovery(&store_path, &created.id).launch_binding,
+        before.launch_binding,
+        "the pin is left untouched, no other runtime takes over"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_session_resumes_from_its_pin_after_the_package_is_disabled() {
+    let dir = temp_dir("packaged-disabled-resume");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-disabled-resume-plugins", &script);
+    let store_path = temp_store_path("packaged-disabled-resume");
+    let registry = packaged.registry(&store_path);
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+
+    packaged
+        .registry_handle()
+        .set_enabled(&packaged.digest, false)
+        .expect("disable");
+    registry.reload_runtimes().expect("reload");
+
+    let fresh = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect_err("a disabled package serves no fresh launch");
+    assert_eq!(fresh.code, "agent_profile_not_found");
+    registry
+        .resume(&created.id)
+        .await
+        .expect("the pin keeps resuming from its own digest");
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn uninstall_is_refused_while_a_live_session_references_the_package() {
+    let dir = temp_dir("packaged-uninstall");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-uninstall-plugins", &script);
+    let store_path = temp_store_path("packaged-uninstall");
+    let registry = packaged.registry(&store_path);
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+
+    let retained = registry.retained_package_digests().await.expect("retained");
+    assert!(retained.contains(&packaged.digest));
+    let refused = registry
+        .uninstall_package(&packaged.digest)
+        .await
+        .expect_err("a referenced package cannot be uninstalled");
+    assert!(matches!(
+        refused,
+        super::packages::PackageUninstallError::Registry(
+            package::registry::RegistryError::StillReferenced
+        )
+    ));
+    packaged
+        .host
+        .resolve_id(&protocol::RuntimeId::parse("pi").expect("id"))
+        .expect("the runtime still serves");
+
+    let _ = registry.stop(&created.id).await;
+    registry.remove(&created.id).await.expect("remove");
+    registry
+        .uninstall_package(&packaged.digest)
+        .await
+        .expect("an unreferenced package uninstalls");
+    assert!(registry
+        .retained_package_digests()
+        .await
+        .expect("retained")
+        .iter()
+        .next()
+        .is_none());
+    assert_eq!(
+        packaged
+            .host
+            .resolve_id(&protocol::RuntimeId::parse("pi").expect("id"))
+            .expect_err("uninstalled and reloaded")
+            .code,
+        "runtime_not_installed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn durable_bindings_without_a_live_session_still_retain_the_package() {
+    let dir = temp_dir("packaged-retained-store");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-retained-store-plugins", &script);
+    let store_path = temp_store_path("packaged-retained-store");
+    let first = packaged.registry(&store_path);
+    let created = first
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    gate.write_all(b"go\n").expect("release the exit gate");
+    first
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    drop(first);
+
+    // A registry that holds no session in memory reads the same durable store.
+    let second = packaged.registry(&store_path);
+    let retained = second.retained_package_digests().await.expect("retained");
+
+    assert!(retained.contains(&packaged.digest));
+    assert!(second.uninstall_package(&packaged.digest).await.is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_registry_without_a_package_store_cannot_uninstall() {
+    let registry = SessionRegistry::default();
+    let digest = package::PackageDigest::parse(
+        "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    )
+    .expect("digest");
+
+    let error = registry
+        .uninstall_package(&digest)
+        .await
+        .expect_err("no store");
+
+    assert!(matches!(
+        error,
+        super::packages::PackageUninstallError::NoPackageStore
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_running_package_session_stays_mutable_when_its_active_agent_is_its_own_runtime() {
+    let dir = temp_dir("packaged-active-agent");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-active-agent-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-active-agent"));
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session")
+        .info
+        .active_agent_base = Some(RuntimeRef::from_wire("pi"));
+
+    packaged.disable_and_reload(&registry);
+
+    registry
+        .resize(&created.id, 100, 30)
+        .await
+        .expect("a running session of an installed package stays mutable");
+    registry.stop(&created.id).await.expect("and stoppable");
+    registry.remove(&created.id).await.expect("and removable");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fork_holds_the_package_authority_until_its_registration_ends() {
+    let dir = temp_dir("packaged-fork-guard");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-fork-guard-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-fork-guard"));
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    packaged.disable_and_reload(&registry);
+
+    // An uninstall in progress holds the exclusive authority.
+    let exclusive = registry.inner.package_lifecycle.write().await;
+    let forking = registry.clone();
+    let source = created.id.clone();
+    let mut fork = tokio::spawn(async move {
+        forking
+            .fork(SessionForkParams {
+                session_id: source,
+                name: None,
+                cwd_mode: ForkCwdMode::Same,
+                cols: 80,
+                rows: 24,
+            })
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut fork)
+            .await
+            .is_err(),
+        "a fork waits for the package authority"
+    );
+    drop(exclusive);
+    let forked = fork
+        .await
+        .expect("fork task")
+        .expect("a pinned disabled package still forks");
+    let _ = registry.stop(&forked.id).await;
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_uninstall_survives_the_cancellation_of_its_caller() {
+    let dir = temp_dir("packaged-uninstall-cancel");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-uninstall-cancel-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-uninstall-cancel"));
+
+    // A launch in progress holds the shared authority.
+    let launch = registry.inner.package_lifecycle.read().await;
+    let caller = registry.clone();
+    let digest = packaged.digest.clone();
+    let outer = tokio::spawn(async move { caller.uninstall_package(&digest).await });
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    outer.abort();
+    let _ = outer.await;
+    drop(launch);
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+
+    // The exclusive authority is free only once the uninstall transaction is
+    // over, whoever awaited it.
+    drop(registry.inner.package_lifecycle.write().await);
+    assert!(
+        packaged
+            .registry_handle()
+            .state()
+            .expect("state")
+            .packages()
+            .is_empty(),
+        "the transaction ran to completion without its caller"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_store_record_blocks_uninstall_instead_of_vanishing_from_retention() {
+    let dir = temp_dir("packaged-strict-retention");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-strict-retention-plugins", &script);
+    let store_path = temp_store_path("packaged-strict-retention");
+    let registry = packaged.registry(&store_path);
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    let _ = registry.stop(&created.id).await;
+    registry.remove(&created.id).await.expect("remove");
+    let mut store = fs::OpenOptions::new()
+        .append(true)
+        .open(&store_path)
+        .expect("open the store");
+    std::io::Write::write_all(&mut store, b"{\"type\":\"resume\",\"damaged\":\n")
+        .expect("append a damaged line");
+    drop(store);
+
+    let refused = registry
+        .uninstall_package(&packaged.digest)
+        .await
+        .expect_err("a record that cannot be read may pin the package");
+
+    assert!(matches!(
+        refused,
+        super::packages::PackageUninstallError::Retention(_)
+    ));
+    assert_eq!(
+        packaged
+            .registry_handle()
+            .state()
+            .expect("state")
+            .packages()
+            .len(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_keeps_an_unchanged_profile_after_its_package_is_disabled() {
+    let dir = temp_dir("packaged-profile-recovery");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-profile-recovery-plugins", &script);
+    let agents_dir = temp_agents_dir_with(
+        "packaged-profile-recovery",
+        "pi-profile",
+        "base = \"pi\"\n\n[env]\nPROFILE_MARK = \"kept\"\n",
+    );
+    let store_path = temp_store_path("packaged-profile-recovery");
+    let registry = packaged.registry_with_agents(&store_path, Some(agents_dir));
+    let created = registry
+        .create(SessionNewParams {
+            agent: "pi-profile".to_owned(),
+            ..packaged_params(&dir)
+        })
+        .await
+        .expect("create a profile session over the package");
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    let binding = durable_recovery(&store_path, &created.id);
+
+    packaged.disable_and_reload(&registry);
+    let (env, _manifest) = registry.recovery_profile(&binding, "resume");
+
+    assert_eq!(
+        env,
+        [("PROFILE_MARK".to_owned(), "kept".to_owned())],
+        "the unchanged profile resolves against the pinned package"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resumed_package_session_detects_with_its_pinned_manifest_after_disable() {
+    let dir = temp_dir("packaged-detector");
+    let marker = dir.join("argv.txt");
+    let (script, mut gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-detector-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-detector"));
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    let pinned = packaged
+        .host
+        .resolve_id(&protocol::RuntimeId::parse("pi").expect("id"))
+        .expect("pinned definition");
+    let expected = format!(
+        "{:?}",
+        crate::detect::DetectorConfig::for_definition(&pinned)
+            .manifest
+            .expect("manifest")
+            .required_regions()
+    );
+    gate.write_all(b"go\n").expect("release the exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    packaged.disable_and_reload(&registry);
+
+    registry.resume(&created.id).await.expect("resume");
+
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(&created.id).expect("session");
+    let actual = format!(
+        "{:?}",
+        entry
+            .detector_config
+            .borrow()
+            .config
+            .manifest
+            .as_ref()
+            .expect("manifest")
+            .required_regions()
+    );
+    drop(sessions);
+    assert_eq!(actual, expected, "the pinned package's rules are in effect");
+    let _ = registry.stop(&created.id).await;
+}
+
+/// Debug text of the regions a session's current detector manifest reads.
+#[cfg(unix)]
+async fn detector_regions(registry: &SessionRegistry, id: &SessionId) -> String {
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(id).expect("session");
+    let regions = format!(
+        "{:?}",
+        entry
+            .detector_config
+            .borrow()
+            .config
+            .manifest
+            .as_ref()
+            .expect("manifest")
+            .required_regions()
+    );
+    regions
+}
+
+#[cfg(unix)]
+fn pi_report(id: &SessionId, agent: &str) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        session_id: id.clone(),
+        source: "pohunek:pi".to_owned(),
+        agent: agent.to_owned(),
+        activity: Some(AgentActivity::Working),
+        seq: Some(ReportSequence::new(1)),
+        pid: None,
+        agent_session_id: None,
+        agent_session_path: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn callbacks_of_a_pinned_session_use_its_own_version_after_another_is_selected() {
+    let dir = temp_dir("packaged-callback-select");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-callback-select-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-callback-select"));
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    let v1_regions = detector_regions(&registry, &created.id).await;
+
+    let second = crate::agent::host::fixture::install_pi_version(
+        &packaged.plugins,
+        &script,
+        "2.0.0",
+        crate::agent::host::fixture::PACKAGED_DETECT_MANIFEST_V2,
+        false,
+    );
+    packaged
+        .registry_handle()
+        .select(&second)
+        .expect("select v2");
+    registry.reload_runtimes().expect("reload");
+    let fresh = packaged
+        .host
+        .resolve_id(&protocol::RuntimeId::parse("pi").expect("id"))
+        .expect("v2 serves fresh launches");
+    let v2_regions = format!(
+        "{:?}",
+        crate::detect::DetectorConfig::for_definition(&fresh)
+            .manifest
+            .expect("manifest")
+            .required_regions()
+    );
+    assert_ne!(v1_regions, v2_regions, "the versions differ");
+
+    assert!(
+        registry
+            .report_agent(pi_report(&created.id, "pi"))
+            .await
+            .recorded
+    );
+
+    assert_eq!(
+        detector_regions(&registry, &created.id).await,
+        v1_regions,
+        "a v1 session keeps v1 detection rules"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn callbacks_of_a_running_package_session_are_accepted_after_disable_and_reload() {
+    let dir = temp_dir("packaged-callback-disable");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-callback-disable-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-callback-disable"));
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    let regions = detector_regions(&registry, &created.id).await;
+    packaged.disable_and_reload(&registry);
+
+    assert!(
+        registry
+            .report_agent(pi_report(&created.id, "pi"))
+            .await
+            .recorded,
+        "the running session's own runtime still reports"
+    );
+    assert_eq!(detector_regions(&registry, &created.id).await, regions);
+    let info = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(info.active_agent.as_deref(), Some("pi"));
+    let release = registry
+        .release_agent(SessionReleaseAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:pi".to_owned(),
+            agent: "pi".to_owned(),
+            seq: Some(ReportSequence::new(2)),
+        })
+        .await;
+    assert!(release.released, "and releases");
+    let _ = registry.stop(&created.id).await;
+}

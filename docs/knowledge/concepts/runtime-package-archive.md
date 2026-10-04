@@ -177,3 +177,53 @@ the clock or parse the runtime manifest; the caller supplies both.
 
 Install publishes the root before it records it, and uninstall un-records
 before it deletes, so the record never names a root that was never published.
+
+## Daemon host
+
+The daemon opens `<state>/plugins` (`pohunek_paths::PLUGINS_SUBDIR`, exact
+`0700`, owner-owned) at startup through `package::registry::Registry::open_at`;
+an unsafe directory fails startup with `plugin_store_unavailable`. A registry
+record that cannot be read keeps the daemon running on the built-in runtimes
+and is reported by the host (package-pinned sessions are then incompatible).
+
+- A package root holds `runtime.toml` at its top level (the runtime descriptor
+  shape of the built-ins) and the detection manifest the descriptor names in
+  `detect_manifest`, as a package-relative file. Both are read through the
+  verified root, so only authenticated bytes are parsed.
+- `PackageSource` loads, for fresh launches, the selected digest of each
+  package id when it is enabled, re-verifying the root first. A package that
+  fails (modified root, bad descriptor, descriptor identity differing from the
+  record, a reserved runtime id, or a runtime id claimed by two packages) is
+  left out and reported with a typed reason; it never fails other packages or
+  the built-ins.
+- Reload is explicit (`SessionRegistry::reload_runtimes`); nothing watches the
+  directory. A failed rebuild keeps the previous registry. The wire methods
+  that call it arrive with the CLI lifecycle (#143).
+- Fresh launches and integration changes re-verify the package root and require
+  it to be enabled; a package modified, disabled or uninstalled after load
+  never launches. Disabling or selecting another version retires a package for
+  fresh launches only: sessions pinned to its digest keep resuming from that
+  digest, and running sessions stay controllable while the registry records it.
+- A pinned package that is not installed answers `runtime_not_installed`;
+  installed content that is missing, modified or contradicts the pin answers
+  `runtime_incompatible` (fixed message, typed cause in the daemon log).
+- Uninstall (`SessionRegistry::uninstall_package`) builds the retained set from
+  the durable session records, resume bindings and in-memory sessions and
+  refuses with `StillReferenced` while any pins the digest. Fresh launches hold
+  a shared guard from verification to their durable record, uninstall holds the
+  exclusive guard, so a launch cannot pin a digest mid-uninstall.
+- A session pinned to a package is observed (detection rules, input framing,
+  profile recovery) and controlled from that pinned definition, also after the
+  package is disabled or another version is selected, and an active agent that
+  is the session's own runtime is covered by the same pin. Fork holds the shared
+  authority until its registration persisted. The uninstall transaction runs in
+  a task of its own, so a caller that stops waiting cannot release the exclusive
+  authority mid-removal. The retained-set scan of the durable store is strict: a
+  record that cannot be interpreted refuses the uninstall.
+  The session's recovery binding also records whether its input safety contract
+  (safe-text validation, no automated input while blocked) applies, so an
+  adopted session whose package no longer verifies keeps those protections.
+  Agent reports and releases from a pinned session, and the process matchers
+  and detector rules of its observed agent, resolve against the definition the
+  session was launched from (kept on the session entry), not the registry's
+  current selection.

@@ -8,6 +8,13 @@
   README. The source map lists those pages, and the macOS install runbook names
   them among the archive contents.
 
+## Unreleased (2026-10-04, daemon package host)
+
+- Documented the daemon side of runtime packages: the `<state>/plugins` store,
+  `PackageSource` loading, explicit reload, pin resolution by digest,
+  verification before launch and integration changes, the
+  `runtime_incompatible` error and retention-checked uninstall.
+
 ## Unreleased (2026-10-04, runtime catalog)
 
 - Added the runtime catalog concept: the signed catalog that authorizes official
