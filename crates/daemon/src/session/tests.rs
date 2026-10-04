@@ -2734,6 +2734,62 @@ async fn incompatible_hermes_profile_fails_before_session_and_worktree_side_effe
     }
 }
 
+/// Raw `$SHELL` values the daemon must never launch or persist.
+fn invalid_login_shells() -> Vec<Option<String>> {
+    vec![
+        Some(String::new()),
+        Some("s".repeat(crate::agent::host::MAX_ARG_BYTES + 1)),
+        Some("/bin/s\nh".to_owned()),
+        Some("/bin/s\u{7f}h".to_owned()),
+    ]
+}
+
+#[test]
+fn invalid_login_shell_resolves_to_the_fallback_everywhere() {
+    for raw in invalid_login_shells().into_iter().chain([None]) {
+        assert_eq!(
+            crate::agent::resolve_login_shell(raw.clone()),
+            crate::agent::FALLBACK_LOGIN_SHELL
+        );
+        assert_eq!(
+            ShellCommand::from_login_shell(raw.clone()).program,
+            crate::agent::FALLBACK_LOGIN_SHELL
+        );
+        assert_eq!(
+            crate::agent::host::RuntimeSource::load(
+                &crate::agent::host::BuiltinSource::from_login_shell(raw)
+            )
+            .expect("built-ins load")
+            .iter()
+            .find(|definition| definition.runtime_id().as_str() == "shell")
+            .expect("shell definition")
+            .program()
+            .as_str(),
+            crate::agent::FALLBACK_LOGIN_SHELL
+        );
+    }
+    assert_eq!(
+        crate::agent::resolve_login_shell(Some("/usr/bin/zsh".to_owned())),
+        "/usr/bin/zsh"
+    );
+}
+
+#[tokio::test]
+async fn shell_session_launches_the_fallback_for_an_invalid_login_shell() {
+    for raw in invalid_login_shells() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::from_login_shell(raw),
+            ..SessionRegistryConfig::default()
+        });
+        let info = registry
+            .create(params())
+            .await
+            .expect("a shell session launches the fallback shell");
+        assert_eq!(info.agent, "shell");
+        registry.stop(&info.id).await.expect("session stops");
+    }
+}
+
 #[tokio::test]
 async fn failed_initial_input_rollback_frees_the_bound_worktree() {
     // A worktree-bound session whose `--input` injection fails must roll the
