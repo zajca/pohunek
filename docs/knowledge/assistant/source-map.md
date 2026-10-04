@@ -17,6 +17,7 @@ Current CLI and command surface:
 - `crates/cli/src/lib.rs`
 - `crates/cli/src/main.rs`
 - `crates/cli/src/completion.rs`
+- `docs/cli.md` — human CLI reference: command table and examples.
 - `crates/cli/src/commands/mod.rs`
 - `crates/cli/src/commands/agent_skill.rs`
 - `crates/cli/src/commands/assistant/mod.rs`
@@ -287,6 +288,8 @@ Release packaging and contributor verification:
 - `sdk/ts/scripts/test/pack-contract.test.ts` — real tarballs, a local HTTP
   server and a real `bun install` of a URL-pinned consumer.
 - `README.md`
+- `docs/install.md` — manual install: release archives, login service, upgrades, quick start.
+- `docs/development.md` — workspace layout, gates, fast loops, release pipeline.
 - `packaging/install-daemon.sh` — release-archive wrapper that re-executes
   itself under `pohunek service lock` and retires a legacy template-unit
   install in a fail-closed order (`pohunek service check` of every check the
