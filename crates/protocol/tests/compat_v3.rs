@@ -7,7 +7,7 @@
 //! typed (strict) decode of the renamed fixture must reproduce it exactly, so a
 //! non-additive change to a current type shows up here as a failing fixture.
 
-use protocol::compat::{event_payload, request_params, result};
+use protocol::compat::{event_payload, introduced_methods, request_params, result};
 use protocol::method::{self, Method};
 use protocol::{
     event, AgentStateEvent, AttachEvent, NotificationCreatedEvent, NotificationDeletedEvent,
@@ -224,6 +224,9 @@ fn fixtures_cover_every_current_method_and_event() {
     let results = fixtures(RESULTS, "results.json");
     let events = fixtures(EVENTS, "events.json");
     for spec in method::METHOD_SPECS {
+        if introduced_methods(v3()).contains(&spec.name) {
+            continue;
+        }
         for (kind, file) in [("request", &requests), ("result", &results)] {
             assert!(
                 file.entries
@@ -261,14 +264,44 @@ fn fixtures_cover_every_current_method_and_event() {
 }
 
 #[test]
+fn methods_added_after_protocol_3_are_listed_exactly_and_have_no_fixture() {
+    let introduced = introduced_methods(v3());
+    assert!(!introduced.is_empty());
+    let requests = fixtures(REQUESTS, "requests.json");
+    let results = fixtures(RESULTS, "results.json");
+    let fixture_methods: Vec<&str> = requests
+        .entries
+        .iter()
+        .chain(&results.entries)
+        .map(|entry| entry_name(entry, "method"))
+        .collect();
+    for name in introduced {
+        assert!(
+            method::METHOD_SPECS.iter().any(|spec| spec.name == *name),
+            "{name} is not a current method"
+        );
+        assert!(
+            !fixture_methods.contains(name),
+            "{name} has a protocol 3 fixture, so it is not new in protocol 4"
+        );
+        assert!(request_params(v3(), name, json!({})).is_err(), "{name}");
+        assert!(result(v3(), name, json!({})).is_err(), "{name}");
+    }
+}
+
+#[test]
 fn the_method_and_event_tables_match_the_registries() {
     let mut methods: Vec<&str> = method_table().iter().map(|(name, ..)| *name).collect();
-    let mut registered: Vec<&str> = method::METHOD_SPECS.iter().map(|spec| spec.name).collect();
+    let mut registered: Vec<&str> = method::METHOD_SPECS
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| !introduced_methods(v3()).contains(name))
+        .collect();
     methods.sort_unstable();
     registered.sort_unstable();
     assert_eq!(
         methods, registered,
-        "update method_table() with the registry"
+        "update method_table() with the registry, or list a method added after protocol 3 in compat::v3::INTRODUCED_METHODS"
     );
     let mut events: Vec<&str> = event_table().iter().map(|(name, _)| *name).collect();
     let mut registered: Vec<&str> = event::EVENT_SPECS.iter().map(|spec| spec.name).collect();

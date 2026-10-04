@@ -692,7 +692,7 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
   and consumer recordings produced by that release's own code, and deletes the
   oldest adapter in the same change. A semantic change (new required parameter,
   removed method or event, changed error code or meaning) cannot be adapted: it
-  also raises `MIN_PROTOCOL_VERSION` and is announced as a break.
+  also raises `MIN_PROTOCOL_VERSION` and is announced as a break. A method added after the previous release is listed in the adapter's `INTRODUCED_METHODS` so older connections get `method_not_found`.
 - Run the full gate set above before declaring done. Report failures honestly
   with output; never claim green without running it.
 - When a task spans 3+ steps, plan first and verify after each major step.

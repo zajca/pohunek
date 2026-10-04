@@ -189,6 +189,9 @@ are shaped for it. A non-overlapping range returns `daemon/version_mismatch`.
 `daemon.health` and `host.inspect` report the version negotiated for the asking
 connection in `protocol_version`.
 
+A protocol 3 connection is answered `method_not_found` for any method added after
+protocol 3 (today the `package.*` methods), and never receives their results.
+
 The window is bounded. Adapters translate shape only (renames and moved fields,
 and withholding events and enum values the older version never defined). A
 semantic change (a new required parameter, a removed method or event, a changed
