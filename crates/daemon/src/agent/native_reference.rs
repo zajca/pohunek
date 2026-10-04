@@ -589,8 +589,14 @@ impl FileExistence {
         for name in subdirectories {
             let child_path = path.join(&name);
             before_open(&child_path);
-            let child = open_child_directory(directory, &name)
-                .map_err(|errno| classify_open_error(errno, ReferenceCheckFailure::StoreChanged))?;
+            // A directory removed after discovery is simply gone; any other
+            // failure (a symlink swapped in, a type change, permissions) is
+            // not something the scan may step over.
+            let child = match open_child_directory(directory, &name) {
+                Ok(child) => child,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(_errno) => return Err(ReferenceCheckFailure::StoreChanged),
+            };
             match self.scan_directory(&child, &child_path, depth + 1, wanted, visited, before_open)
             {
                 Err(ReferenceCheckFailure::Missing) => {}
@@ -1066,6 +1072,60 @@ mod tests {
             Err(ReferenceCheckFailure::StoreChanged),
             "a match behind the swapped-in link must not be found"
         );
+    }
+
+    /// Runs the Pi-shaped scan over `<root>/sessions` with `hook` between
+    /// discovery and open.
+    fn scan_sessions(
+        root: &Path,
+        wanted: &str,
+        hook: &mut dyn FnMut(&Path),
+    ) -> Result<(), ReferenceCheckFailure> {
+        let ReferenceExistence::File(check) = existence(pi_spec()) else {
+            panic!("a file check");
+        };
+        let root = fs::canonicalize(root).expect("canonical root");
+        check.scan_store(&root, wanted, hook)
+    }
+
+    #[test]
+    fn a_directory_that_vanishes_after_discovery_does_not_end_the_scan() {
+        let store = store_with("first", "t_other.jsonl");
+        let sessions = store.root.join("sessions");
+        fs::create_dir_all(sessions.join("second")).expect("second dir");
+        fs::write(sessions.join("second").join("t_other.jsonl"), "{}").expect("file");
+        let mut removed = Vec::new();
+        let outcome = scan_sessions(&store.root, "_abc.jsonl", &mut |directory| {
+            if !removed.is_empty() {
+                return;
+            }
+            // The directory opened first disappears, and the conversation
+            // appears in its sibling, which the scan has not opened yet. The
+            // order the directories are listed in does not matter.
+            let sibling = if directory.ends_with("first") {
+                "second"
+            } else {
+                "first"
+            };
+            fs::write(sessions.join(sibling).join("t_abc.jsonl"), "{}").expect("match");
+            fs::remove_dir_all(directory).expect("remove discovered directory");
+            removed.push(directory.to_path_buf());
+        });
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            outcome,
+            Ok(()),
+            "the sibling holding the match is still searched"
+        );
+    }
+
+    #[test]
+    fn a_scan_whose_only_candidate_vanishes_reports_missing() {
+        let store = store_with("gone", "t_abc.jsonl");
+        let outcome = scan_sessions(&store.root, "_abc.jsonl", &mut |directory| {
+            fs::remove_dir_all(directory).expect("remove discovered directory");
+        });
+        assert_eq!(outcome, Err(ReferenceCheckFailure::Missing));
     }
 
     #[cfg(unix)]
