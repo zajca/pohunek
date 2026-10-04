@@ -121,28 +121,41 @@ pub const DEV_OPEN_FILES: u64 = 8_192;
 /// the worker's `JOURNAL_SCHEMA_VERSION`.
 pub(crate) const WORKER_JOURNAL_SCHEMA_VERSION: u32 = 4;
 
-/// Oldest worker journal schema still accepted as generation evidence.
+/// Journal schemas read as generation evidence, each decoded by the
+/// [`JournalFacts`] reader.
 ///
-/// A daemon reads the schema before its own (N-1) so that workers started
-/// by the previous release stay adoptable across an upgrade. Anything older
-/// or newer is refused with [`UnsupportedJournalSchema`].
-pub(crate) const WORKER_JOURNAL_OLDEST_SCHEMA_VERSION: u32 = WORKER_JOURNAL_SCHEMA_VERSION - 1;
+/// A schema is listed only when its layout names the worker generation: a
+/// generation is never inferred from the journal path, the persisted record
+/// or the supervisor job, because callers compare the journal's generation
+/// with those very sources and a substituted value would make that check
+/// vacuous. Schema 3 (never released) lacks `generation`, `executable` and
+/// `version` and is therefore unreadable. A schema bump keeps the previous
+/// schema (N-1) readable by listing it here once the reader decodes its
+/// layout; a layout the reader cannot decode needs its own reader first.
+pub(crate) const WORKER_JOURNAL_READABLE_SCHEMAS: &[u32] = &[WORKER_JOURNAL_SCHEMA_VERSION];
 
 /// A worker journal names a schema this daemon does not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "worker journal schema {found} is unsupported (this daemon reads \
-     {WORKER_JOURNAL_OLDEST_SCHEMA_VERSION} to {WORKER_JOURNAL_SCHEMA_VERSION})"
+    "worker journal schema {found} is unsupported (readable: {WORKER_JOURNAL_READABLE_SCHEMAS:?})"
 )]
 pub(crate) struct UnsupportedJournalSchema {
     /// Schema the journal declares.
     pub(crate) found: u32,
 }
 
+/// Whether `found` is `current` or its predecessor and listed in `readable`.
+pub(crate) fn schema_in_window(found: u32, current: u32, readable: &[u32]) -> bool {
+    readable.contains(&found) && found <= current && current - found <= 1
+}
+
 /// Whether a journal of `schema_version` is read as generation evidence.
-pub(crate) const fn journal_schema_supported(schema_version: u32) -> bool {
-    schema_version >= WORKER_JOURNAL_OLDEST_SCHEMA_VERSION
-        && schema_version <= WORKER_JOURNAL_SCHEMA_VERSION
+pub(crate) fn journal_schema_supported(schema_version: u32) -> bool {
+    schema_in_window(
+        schema_version,
+        WORKER_JOURNAL_SCHEMA_VERSION,
+        WORKER_JOURNAL_READABLE_SCHEMAS,
+    )
 }
 
 /// Refuses a journal whose declared schema this daemon does not read.

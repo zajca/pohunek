@@ -4507,6 +4507,31 @@ while os.getppid() == parent:
         );
     }
 
+    /// Frozen schema-4 layout: the next schema bump keeps it readable as N-1
+    /// by decoding exactly these fields.
+    const SCHEMA_FOUR_JOURNAL: &str = r#"{
+        "schema_version": 4, "session_id": "s-1", "worker_id": "worker-1",
+        "executable": "/opt/pohunek/libexec/pohunek/0.1.0/pohunek-sessiond",
+        "version": "0.1.0", "generation": "abcd2345", "runtime_id": "runtime-1",
+        "protocol_minimum": 5, "protocol_maximum": 6, "worker_pid": 41,
+        "worker_start_identity": "410", "boot_identity": "boot-test",
+        "child": {"pid": 50}, "cols": 80, "rows": 24, "phase": "live",
+        "outcome": null, "subagents": []
+    }"#;
+
+    #[test]
+    fn frozen_schema_four_layout_decodes_as_the_previous_schema_after_a_bump() {
+        use crate::runtime::lifecycle::{schema_in_window, WORKER_JOURNAL_READABLE_SCHEMAS};
+
+        let evidence = serde_json::from_str::<super::JournalEvidence>(SCHEMA_FOUR_JOURNAL)
+            .expect("the daemon reads the schema-4 layout");
+        assert_eq!(evidence.generation, "abcd2345");
+        assert_eq!(evidence.phase, super::JournalPhase::Live);
+        assert!(schema_in_window(4, 5, &[4, 5]));
+        assert!(!schema_in_window(3, 4, WORKER_JOURNAL_READABLE_SCHEMAS));
+        assert!(!schema_in_window(4, 6, &[4, 5, 6]));
+    }
+
     #[test]
     fn terminal_journal_identity_mismatch_and_duplicates_fail_closed() {
         let record = identity_record();
@@ -8054,62 +8079,48 @@ while os.getppid() == parent:
             assert_eq!(fixture.supervisor.retired(), vec![id]);
         }
 
-        /// Journal of a worker started by the previous release: a proven
-        /// crash sweeps its runtime exactly as for a current-schema journal.
-        #[tokio::test]
-        async fn previous_schema_journal_of_a_dead_worker_is_a_proven_crash() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
-            let lost = Marked::spawn("runtime-s-303");
-            persist_record(&fixture.root, "s-303", Some("runtime-s-303"));
-            write_journal_record(
-                &fixture.root,
-                "s-303",
-                "worker-s-303",
-                TEST_GENERATION,
-                dead_worker_with_realistic_start(),
-                Some("runtime-s-303"),
-                |journal| {
-                    journal.schema_version =
-                        crate::runtime::lifecycle::WORKER_JOURNAL_OLDEST_SCHEMA_VERSION;
-                },
-            );
-            let id = service_id("s-303", TEST_GENERATION);
-            fixture
-                .supervisor
-                .script_job(id.clone(), present(ServiceState::Failed, None));
-
-            Box::pin(fixture.registry.reconcile_workers())
-                .await
-                .expect("reconcile");
-
-            let runtime = runtime_of(&fixture.registry, "s-303").await;
-            assert_eq!(runtime.state, RuntimeState::Lost);
-            assert_eq!(runtime.loss_reason.as_deref(), Some(RUNTIME_LOST));
-            lost.wait_gone().await;
-            assert_eq!(fixture.supervisor.retired(), vec![id]);
+        /// Rewrites the persisted journal of `session_id`'s worker as raw JSON.
+        fn rewrite_journal(
+            root: &Path,
+            session_id: &str,
+            worker_id: &str,
+            edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+        ) {
+            let path = root
+                .join("state/workers")
+                .join(session_id)
+                .join(format!("{worker_id}.json"));
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read journal"))
+                    .expect("journal json");
+            edit(json.as_object_mut().expect("journal object"));
+            std::fs::write(&path, json.to_string()).expect("rewrite journal");
         }
 
-        /// A journal older than the previous schema is not evidence: nothing
-        /// is swept or retired.
-        #[tokio::test]
-        async fn unsupported_schema_journal_of_a_dead_worker_sweeps_nothing() {
+        /// A dead worker whose journal `edit` rewrites; asserts the journal
+        /// is no evidence: nothing is swept, retired or declared lost.
+        async fn assert_unusable_journal_proves_nothing(
+            session_id: &str,
+            edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+        ) {
             let fixture = fixture(Arc::new(RetryInspector::default()));
-            let marked = Marked::spawn("runtime-s-304");
-            persist_record(&fixture.root, "s-304", Some("runtime-s-304"));
-            write_journal_record(
+            let runtime_id = format!("runtime-{session_id}");
+            let marked = Marked::spawn(&runtime_id);
+            persist_record(&fixture.root, session_id, Some(&runtime_id));
+            write_live_journal(
                 &fixture.root,
-                "s-304",
-                "worker-s-304",
-                TEST_GENERATION,
+                session_id,
                 dead_worker_with_realistic_start(),
-                Some("runtime-s-304"),
-                |journal| {
-                    journal.schema_version =
-                        crate::runtime::lifecycle::WORKER_JOURNAL_OLDEST_SCHEMA_VERSION - 1;
-                },
+                Some(&runtime_id),
+            );
+            rewrite_journal(
+                &fixture.root,
+                session_id,
+                &format!("worker-{session_id}"),
+                edit,
             );
             fixture.supervisor.script_job(
-                service_id("s-304", TEST_GENERATION),
+                service_id(session_id, TEST_GENERATION),
                 present(ServiceState::Failed, None),
             );
 
@@ -8117,10 +8128,45 @@ while os.getppid() == parent:
                 .await
                 .expect("reconcile");
 
-            let runtime = runtime_of(&fixture.registry, "s-304").await;
+            let runtime = runtime_of(&fixture.registry, session_id).await;
             assert_ne!(runtime.state, RuntimeState::Lost);
             assert!(marked.alive(), "nothing is swept without evidence");
             assert!(fixture.supervisor.retired().is_empty());
+        }
+
+        /// Schema 3 (never released) carries no generation, executable or
+        /// version, so its journal cannot be generation evidence.
+        #[tokio::test]
+        async fn schema_three_journal_of_a_dead_worker_proves_nothing() {
+            assert_unusable_journal_proves_nothing("s-303", |journal| {
+                for key in ["executable", "version", "generation"] {
+                    journal.remove(key);
+                }
+                journal.insert("schema_version".to_owned(), 3.into());
+            })
+            .await;
+        }
+
+        /// A journal missing required evidence is a conflict, never proof
+        /// that its worker terminated.
+        #[tokio::test]
+        async fn current_schema_journal_missing_its_generation_proves_nothing() {
+            assert_unusable_journal_proves_nothing("s-304", |journal| {
+                journal.remove("generation");
+            })
+            .await;
+        }
+
+        /// A schema older than the previous one is not evidence either.
+        #[tokio::test]
+        async fn schema_older_than_the_previous_proves_nothing() {
+            assert_unusable_journal_proves_nothing("s-305", |journal| {
+                journal.insert(
+                    "schema_version".to_owned(),
+                    (crate::runtime::lifecycle::WORKER_JOURNAL_SCHEMA_VERSION - 2).into(),
+                );
+            })
+            .await;
         }
 
         /// A daemon upgraded while a worker kept running sees descendants that
