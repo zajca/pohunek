@@ -805,6 +805,11 @@ impl SessionRegistry {
         let runtime_watch_cancel = CancellationToken::new();
         let procwatch_rescan = Arc::new(Notify::new());
         let (detector_resize, detector_resize_rx) = watch::channel((rows, cols));
+        let pinned = self
+            .inner
+            .profiles
+            .runtimes()
+            .pinned_package_definition(&agent_base, &snapshot.launch_binding);
         let default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &agent_base,
@@ -870,6 +875,7 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             default_detector_config,
+            pinned,
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),

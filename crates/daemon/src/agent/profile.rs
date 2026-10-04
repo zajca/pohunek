@@ -351,7 +351,12 @@ impl ProfileRegistry {
         }
         if let Some(definition) = RuntimeId::parse(name)
             .ok()
-            .and_then(|runtime_id| self.runtimes.resolve_id(&runtime_id).ok())
+            .and_then(|runtime_id| match pinned {
+                Some(definition) if *definition.runtime_id() == runtime_id => {
+                    Some(Arc::clone(definition))
+                }
+                _ => self.runtimes.resolve_id(&runtime_id).ok(),
+            })
         {
             return Ok(ResolvedAgent {
                 name: name.to_owned(),

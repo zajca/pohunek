@@ -2508,6 +2508,11 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             default_detector_config,
+            pinned: self
+                .inner
+                .profiles
+                .runtimes()
+                .pinned_package_definition(&record.info.agent_base, &pin),
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),
@@ -2634,13 +2639,14 @@ impl SessionRegistry {
         let relaunch = recovery
             .as_ref()
             .map_or_else(ResumeSnapshot::empty, ResumeSnapshot::from_binding);
+        let pin = recovery
+            .as_ref()
+            .map(|binding| binding.launch_binding.clone())
+            .unwrap_or_default();
         let default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &record.info.agent_base,
-            &recovery
-                .as_ref()
-                .map(|binding| binding.launch_binding.clone())
-                .unwrap_or_default(),
+            &pin,
             None,
         );
         let (detector_resize, _) = watch::channel((record.info.rows, record.info.cols));
@@ -2667,6 +2673,11 @@ impl SessionRegistry {
             detector_config,
             detector_preview,
             default_detector_config,
+            pinned: self
+                .inner
+                .profiles
+                .runtimes()
+                .pinned_package_definition(&record.info.agent_base, &pin),
             procwatch_cancel: CancellationToken::new(),
             runtime_watch_cancel: CancellationToken::new(),
             procwatch_rescan: Arc::new(Notify::new()),

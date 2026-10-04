@@ -17951,3 +17951,127 @@ async fn a_resumed_package_session_detects_with_its_pinned_manifest_after_disabl
     assert_eq!(actual, expected, "the pinned package's rules are in effect");
     let _ = registry.stop(&created.id).await;
 }
+
+/// Debug text of the regions a session's current detector manifest reads.
+#[cfg(unix)]
+async fn detector_regions(registry: &SessionRegistry, id: &SessionId) -> String {
+    let sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get(id).expect("session");
+    let regions = format!(
+        "{:?}",
+        entry
+            .detector_config
+            .borrow()
+            .config
+            .manifest
+            .as_ref()
+            .expect("manifest")
+            .required_regions()
+    );
+    regions
+}
+
+#[cfg(unix)]
+fn pi_report(id: &SessionId, agent: &str) -> SessionReportAgentParams {
+    SessionReportAgentParams {
+        session_id: id.clone(),
+        source: "pohunek:pi".to_owned(),
+        agent: agent.to_owned(),
+        activity: Some(AgentActivity::Working),
+        seq: Some(ReportSequence::new(1)),
+        pid: None,
+        agent_session_id: None,
+        agent_session_path: None,
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn callbacks_of_a_pinned_session_use_its_own_version_after_another_is_selected() {
+    let dir = temp_dir("packaged-callback-select");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-callback-select-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-callback-select"));
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    let v1_regions = detector_regions(&registry, &created.id).await;
+
+    let second = crate::agent::host::fixture::install_pi_version(
+        &packaged.plugins,
+        &script,
+        "2.0.0",
+        crate::agent::host::fixture::PACKAGED_DETECT_MANIFEST_V2,
+        false,
+    );
+    packaged
+        .registry_handle()
+        .select(&second)
+        .expect("select v2");
+    registry.reload_runtimes().expect("reload");
+    let fresh = packaged
+        .host
+        .resolve_id(&protocol::RuntimeId::parse("pi").expect("id"))
+        .expect("v2 serves fresh launches");
+    let v2_regions = format!(
+        "{:?}",
+        crate::detect::DetectorConfig::for_definition(&fresh)
+            .manifest
+            .expect("manifest")
+            .required_regions()
+    );
+    assert_ne!(v1_regions, v2_regions, "the versions differ");
+
+    assert!(
+        registry
+            .report_agent(pi_report(&created.id, "pi"))
+            .await
+            .recorded
+    );
+
+    assert_eq!(
+        detector_regions(&registry, &created.id).await,
+        v1_regions,
+        "a v1 session keeps v1 detection rules"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn callbacks_of_a_running_package_session_are_accepted_after_disable_and_reload() {
+    let dir = temp_dir("packaged-callback-disable");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let packaged = PackagedPi::install("packaged-callback-disable-plugins", &script);
+    let registry = packaged.registry(&temp_store_path("packaged-callback-disable"));
+    let created = registry
+        .create(packaged_params(&dir))
+        .await
+        .expect("create a package session");
+    let regions = detector_regions(&registry, &created.id).await;
+    packaged.disable_and_reload(&registry);
+
+    assert!(
+        registry
+            .report_agent(pi_report(&created.id, "pi"))
+            .await
+            .recorded,
+        "the running session's own runtime still reports"
+    );
+    assert_eq!(detector_regions(&registry, &created.id).await, regions);
+    let info = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(info.active_agent.as_deref(), Some("pi"));
+    let release = registry
+        .release_agent(SessionReleaseAgentParams {
+            session_id: created.id.clone(),
+            source: "pohunek:pi".to_owned(),
+            agent: "pi".to_owned(),
+            seq: Some(ReportSequence::new(2)),
+        })
+        .await;
+    assert!(release.released, "and releases");
+    let _ = registry.stop(&created.id).await;
+}

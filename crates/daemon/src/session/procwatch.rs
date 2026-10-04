@@ -9,6 +9,7 @@ use protocol::{event, CwdSource, RuntimeRef, SessionInfo};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
+use crate::agent::host::RuntimeDefinition;
 use crate::agent::host::{LaunchProgram, RuntimeHost};
 use crate::detect::{identify_agent, DetectorConfig};
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdentity};
@@ -155,7 +156,16 @@ impl SessionRegistry {
     ) -> bool {
         let root_pid = root.pid;
         let observed_refresh = match self.inner.inspector.descendants(root_pid) {
-            Ok(facts) => Some(self.observed_agents_from_facts(id, facts, now)),
+            Ok(facts) => {
+                let pinned = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .await
+                    .get(id)
+                    .and_then(|entry| entry.pinned.clone());
+                Some(self.observed_agents_from_facts(id, facts, now, pinned.as_deref()))
+            }
             Err(err) => {
                 warn!(
                     session_id = %id.0,
@@ -355,11 +365,24 @@ impl SessionRegistry {
         id: &SessionId,
         facts: Vec<ProcessFact>,
         now: Instant,
+        pinned: Option<&RuntimeDefinition>,
     ) -> HashMap<Pid, ObservedAgent> {
         facts
             .into_iter()
             .filter_map(|fact| {
-                let agent_base = identify_agent(self.inner.profiles.runtimes(), &fact)?;
+                // The session's own package runtime is recognized by the
+                // process matchers it was launched with, also when the
+                // registry no longer serves that package.
+                let own = pinned.filter(|definition| {
+                    definition
+                        .manifest()
+                        .process_matchers()
+                        .is_some_and(|matchers| matchers.matches(&fact))
+                });
+                let agent_base = match own {
+                    Some(definition) => RuntimeRef::from(definition.runtime_id().clone()),
+                    None => identify_agent(self.inner.profiles.runtimes(), &fact)?,
+                };
                 if self.is_foreign_owned_agent(id, fact.pid) {
                     return None;
                 }
@@ -856,10 +879,13 @@ fn apply_observed_transition(
         entry.info.activity = None;
         entry.info.state_source = protocol::StateSource::Process;
     }
-    send_detector_config(
-        entry,
-        DetectorConfig::for_agent(runtimes, &observed.agent_base),
-    );
+    let config = match &entry.pinned {
+        Some(pinned) if RuntimeRef::from(pinned.runtime_id().clone()) == observed.agent_base => {
+            DetectorConfig::for_definition(pinned)
+        }
+        _ => DetectorConfig::for_agent(runtimes, &observed.agent_base),
+    };
+    send_detector_config(entry, config);
     entry.info.updated_at = timestamp_now();
     entry.info.clone()
 }

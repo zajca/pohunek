@@ -31,7 +31,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::agent::host::{self, RuntimeHost};
+use crate::agent::host::{self, RuntimeDefinition, RuntimeHost};
 use crate::agent::{
     agent_fork_unsupported, agent_not_resumable, build_pty_command, fork_pty_command_from_launch,
     resume_pty_command_from_launch, InputRules, LaunchCommand, LaunchOpts,
@@ -581,6 +581,12 @@ struct SessionEntry {
     detector_config: watch::Sender<DetectorConfigUpdate>,
     detector_preview: mpsc::Sender<DetectionPreviewRequest>,
     default_detector_config: DetectorConfig,
+    /// Definition of the installed package this session was launched from,
+    /// loaded and verified when its runtime was registered. Callbacks and
+    /// observation of the session's own runtime use it instead of whatever the
+    /// registry serves now. `None` for a built-in runtime or a package that
+    /// did not verify.
+    pinned: Option<Arc<RuntimeDefinition>>,
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,
     procwatch_rescan: Arc<Notify>,
@@ -2455,11 +2461,36 @@ impl SessionRegistry {
         SessionReportNativeIdResult { recorded: true }
     }
 
+    /// Resolves the agent a callback of session `id` names. A name that is the
+    /// session's own package runtime, bare or through a profile based on it,
+    /// resolves against the definition the session was launched from, not the
+    /// registry's current selection; every other name resolves normally.
+    async fn resolve_session_agent(
+        &self,
+        id: &SessionId,
+        agent: &str,
+    ) -> Result<ResolvedAgent, ProtocolError> {
+        let pinned = self
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .and_then(|entry| entry.pinned.clone());
+        match pinned {
+            Some(pinned) => self.inner.profiles.resolve_agent_pinned(agent, &pinned),
+            None => self.inner.profiles.resolve_agent(agent),
+        }
+    }
+
     /// Record the active nested agent currently owning a live session.
     pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
         let not_recorded = SessionReportAgentResult { recorded: false };
         let activity_epoch = self.daemon_instance_id().to_owned();
-        let resolved = match self.inner.profiles.resolve_agent(&params.agent) {
+        let resolved = match self
+            .resolve_session_agent(&params.session_id, &params.agent)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(err) => {
                 debug!(
@@ -2562,7 +2593,10 @@ impl SessionRegistry {
     ) -> SessionReleaseAgentResult {
         let not_released = SessionReleaseAgentResult { released: false };
         let report_sequence = params.seq.map(protocol::ReportSequence::get);
-        let resolved = match self.inner.profiles.resolve_agent(&params.agent) {
+        let resolved = match self
+            .resolve_session_agent(&params.session_id, &params.agent)
+            .await
+        {
             Ok(resolved) => resolved,
             Err(err) => {
                 debug!(

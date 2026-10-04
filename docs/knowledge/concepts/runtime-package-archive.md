@@ -223,3 +223,7 @@ and is reported by the host (package-pinned sessions are then incompatible).
   The session's recovery binding also records whether its input safety contract
   (safe-text validation, no automated input while blocked) applies, so an
   adopted session whose package no longer verifies keeps those protections.
+  Agent reports and releases from a pinned session, and the process matchers
+  and detector rules of its observed agent, resolve against the definition the
+  session was launched from (kept on the session entry), not the registry's
+  current selection.

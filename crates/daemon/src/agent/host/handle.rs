@@ -422,6 +422,26 @@ impl RuntimeHost {
         }
     }
 
+    /// The verified definition of the package `pin` froze, or `None` for a
+    /// built-in or unpinned runtime and for a package that cannot be resolved
+    /// from its digest now.
+    #[must_use]
+    pub fn pinned_package_definition(
+        &self,
+        reference: &RuntimeRef,
+        pin: &LaunchPin,
+    ) -> Option<Arc<RuntimeDefinition>> {
+        let packaged = matches!(
+            pin.binding().map(|binding| &binding.provenance),
+            Some(BindingProvenance::Package { .. })
+        );
+        if packaged {
+            self.definition_for_pin(reference, pin).ok()
+        } else {
+            None
+        }
+    }
+
     fn snapshot(&self) -> Arc<HostState> {
         Arc::clone(&self.state.read().unwrap_or_else(PoisonError::into_inner))
     }

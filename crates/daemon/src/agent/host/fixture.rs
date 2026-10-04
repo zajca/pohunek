@@ -143,27 +143,48 @@ region = "whole_recent"
 any = [{ contains = "ready" }]
 "#;
 
-/// Installs the Pi-shaped fixture as an enabled, selected package into the
-/// plugin root `plugins_dir` and returns a host that serves it with its
-/// archive digest.
+/// Detection manifest of the second fixture version: the first manifest plus a
+/// rule over another region, so the two versions are told apart by their
+/// required regions.
+pub(crate) const PACKAGED_DETECT_MANIFEST_V2: &str = r#"[[rules]]
+id = "idle_prompt"
+state = "idle"
+priority = 100
+region = "whole_recent"
+any = [{ contains = "ready" }]
+
+[[rules]]
+id = "title_blocked"
+state = "blocked"
+priority = 300
+region = "osc_title"
+any = [{ contains = "blocked" }]
+"#;
+
+/// Installs the Pi-shaped fixture at `version` with the detection manifest
+/// `detect` as an enabled package of `plugins_dir`, selected when `select`,
+/// and returns its archive digest.
 ///
 /// # Panics
 ///
-/// Panics when the fixture cannot be installed or loaded, which would be a
-/// defect of the fixture.
-pub(crate) fn installed_pi_host(
+/// Panics when the fixture cannot be installed, which would be a defect of the
+/// fixture.
+pub(crate) fn install_pi_version(
     plugins_dir: &Path,
     program: &Path,
-) -> (RuntimeHost, PackageDigest) {
+    version: &str,
+    detect: &str,
+    select: bool,
+) -> PackageDigest {
     use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
     use package::{build_archive, read_archive, ArchiveEntry, Limits};
 
-    use super::package::{PackageSource, PackageStore};
-
-    let document = pi_shaped_document(program, PI_SHAPED_NO_CHECK).replace(
-        "detect_manifest = \"any\"",
-        "detect_manifest = \"detect.toml\"",
-    );
+    let document = pi_shaped_document(program, PI_SHAPED_NO_CHECK)
+        .replace(
+            "detect_manifest = \"any\"",
+            "detect_manifest = \"detect.toml\"",
+        )
+        .replace("version = \"1.0.0\"", &format!("version = \"{version}\""));
     let entries = [
         ArchiveEntry {
             path: "runtime.toml".to_owned(),
@@ -172,7 +193,7 @@ pub(crate) fn installed_pi_host(
         },
         ArchiveEntry {
             path: "detect.toml".to_owned(),
-            contents: PACKAGED_DETECT_MANIFEST.as_bytes().to_vec(),
+            contents: detect.as_bytes().to_vec(),
             executable: false,
         },
     ];
@@ -188,14 +209,38 @@ pub(crate) fn installed_pi_host(
             expected: &digest,
             identity: protocol::PackageIdentity {
                 id: protocol::PackageId::parse("acme.runtime.pi").expect("package id"),
-                version: protocol::PackageVersion::parse("1.0.0").expect("package version"),
+                version: protocol::PackageVersion::parse(version).expect("package version"),
             },
             source: InstallSource::ExplicitDigest,
             enabled: true,
-            select: true,
+            select,
             installed_at_unix_seconds: 1_700_000_000,
         })
         .expect("the fixture package installs");
+    digest
+}
+
+/// Installs the Pi-shaped fixture as an enabled, selected package into the
+/// plugin root `plugins_dir` and returns a host that serves it with its
+/// archive digest.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot be installed or loaded, which would be a
+/// defect of the fixture.
+pub(crate) fn installed_pi_host(
+    plugins_dir: &Path,
+    program: &Path,
+) -> (RuntimeHost, PackageDigest) {
+    use super::package::{PackageSource, PackageStore};
+
+    let digest = install_pi_version(
+        plugins_dir,
+        program,
+        "1.0.0",
+        PACKAGED_DETECT_MANIFEST,
+        true,
+    );
     let host = RuntimeHost::with_packages(
         BuiltinSource::new("/bin/sh"),
         PackageSource::new(PackageStore::open(plugins_dir).expect("the store opens")),
