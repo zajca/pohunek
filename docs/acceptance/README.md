@@ -147,19 +147,19 @@ Session object:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `session_id`, `agent`, `agent_base` | string | From the before snapshot. |
-| `before`, `after` | object | `present`, `session_state`, `runtime_state`, `runtime_id`, `loss_reason`, `root_pid` (the agent child), `worker_generation`, `worker_state`, `worker_pid`. |
+| `before`, `after` | object | `present`, `session_state`, `runtime_state`, `worker_instance_id`, `loss_reason`, `root_pid` (the agent child), `worker_generation`, `worker_state`, `worker_pid`. |
 | `liveness_probe` | object / null | Survival phases, shell sessions only: `attempted`, `passed`. |
 | `old_generation` | object | Lost phases: `label`, `launchctl_print_status`, and `worker_processes` (matching `ps` lines, expected empty). |
 | `recovery_expected` | boolean | Lost phases: the session had native resume and a captured native reference before the action. |
 | `recovery_available` | boolean | Lost phases: `session.resume` would accept the session after the action. |
-| `recovery` | object / null | Lost phases, when expected: `attempted`, `exit_status`, and the resulting `runtime_state`, `runtime_id`, `worker_generation`. |
+| `recovery` | object / null | Lost phases, when expected: `attempted`, `exit_status`, and the resulting `runtime_state`, `worker_instance_id`, `worker_generation`. |
 | `checks` | array | Session checks (below). |
 | `passed` | boolean | Every session check passed. |
 
 Every check is `{"name": string, "passed": boolean, "detail": string}`.
 Session checks are `present_before`, `present_after`, and
 `one_worker_job_before`. Survival phases add `runtime_live_after`,
-`same_runtime_id`, `same_worker_generation`, `same_worker_pid`,
+`same_worker_instance_id`, `same_worker_generation`, `same_worker_pid`,
 `same_child_pid`, and, for shells, `pty_accepts_input_and_prints`. Lost phases
 add `runtime_lost`, `loss_reason` (exactly `runtime_lost`),
 `no_worker_job_after` (no job of any generation, so no resurrection and no

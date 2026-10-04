@@ -20,9 +20,9 @@ export type SessionRuntime = {
    */
   worker_id?: string;
   /**
-   * PTY generation identity, when one is known.
+   * Worker instance identity, when one is known.
    */
-  runtime_id?: string;
+  worker_instance_id?: string;
   /**
    * Timestamp at which this runtime generation started.
    */

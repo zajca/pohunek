@@ -19,9 +19,9 @@ export type SessionReportNativeIdParams = {
    */
   session_id: SessionId;
   /**
-   * Runtime identity that received the report.
+   * Worker instance that received the report.
    */
-  runtime_id: string;
+  worker_instance_id: string;
   /**
    * Agent profile name reporting its native session id.
    */

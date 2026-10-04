@@ -17,9 +17,9 @@ export type SessionNativeRecoveredEvent = {
   /**
    * Runtime generation replaced by the explicit recovery, when known.
    */
-  previous_runtime_id?: string;
+  previous_worker_instance_id?: string;
   /**
    * Newly-created runtime generation, when the active backend exposes one.
    */
-  runtime_id?: string;
+  worker_instance_id?: string;
 };

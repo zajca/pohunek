@@ -13,21 +13,26 @@ since: 0.3.3
 Use this runbook after replacing an installed Pohunek binary from a component
 release archive or rebuilding it from source.
 
-## Current public protocol v3 boundary
+## Current public protocol v4 boundary
 
-The current release supports only protocol `3..=3` and cannot communicate with
-protocol-v2 peers. Before replacing any component, inventory every CLI,
-SDK, custom client, and local or NetBird-reachable daemon that must
+The current release supports only protocol `4..=4` and cannot communicate with
+protocol-v3 or older peers: a mismatched range returns `daemon/version_mismatch`
+before any method runs. Before replacing any component, inventory every CLI,
+SDK, custom client, managed hook and local or NetBird-reachable daemon that must
 talk to another peer. Drain cross-host automation, upgrade that complete set in
 one maintenance window, and then verify every host with `pohunek health --json`
 and `pohunek host inspect <host> --json`. The response must advertise protocol
-range `3..=3` for this release.
+range `4..=4` for this release.
 
-There is no v2 compatibility shim. Do not downgrade one peer independently: it
-will be isolated from v3 peers, and protocol-v3 overlay state is not a v2
-rollback mechanism. Restore the coordinated v3 component set instead. The
-historical v2 release introduced range negotiation from integer-v1; that
-history does not widen the current supported range.
+Protocol v4 spells the worker instance identifier `worker_instance_id` where
+v3 spelled it `runtime_id`. There is no compatibility shim. Do not downgrade one
+peer independently: it will be isolated from v4 peers. Restore the coordinated
+v4 component set instead. Managed Codex and Claude hook assets carry
+`POHUNEK_INTEGRATION_VERSION=9`; after the upgrade run
+`pohunek integration doctor` and reinstall every asset it reports as outdated,
+because an older hook still sends the old key and its native-identity reports
+are rejected. Earlier protocol transitions (integer-v1 to range negotiation,
+the v3 overlay-routing change) do not widen the supported range.
 
 1. Download the component archive for the binary being updated: CLI (`pohunek`),
    daemon (`pohunekd`, `pohunek-sessiond`, and the `pohunek` CLI that installs
@@ -170,7 +175,7 @@ health returns:
 1. Compare `pohunek service status --json` before and after the upgrade for an
    important live session: its `workers` entry keeps the same `generation` and
    `pid`, and `versions` still lists the old version as referenced.
-2. Inspect that session and confirm the same `worker_id` and `runtime_id`.
+2. Inspect that session and confirm the same `worker_id` and `worker_instance_id`.
 3. Treat `runtime.state=incompatible`, `conflict`, or `lost` as a diagnostic
    state. Do not restart or kill the worker merely to make the status disappear.
 4. If concurrent reconciliation or lifecycle work returns

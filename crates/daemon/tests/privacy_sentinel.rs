@@ -862,7 +862,7 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
     let worker_instance_id = created
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.runtime_id.as_deref())
+        .and_then(|runtime| runtime.worker_instance_id.as_deref())
         .expect("created managed session exposes its runtime id");
     let report_req = Request::make(
         "privacy-sentinel-report-native-id",

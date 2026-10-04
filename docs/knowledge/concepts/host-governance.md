@@ -9,7 +9,7 @@ intents: [setup, debug, help]
 
 # Host Identity and Local Governance
 
-Protocol v3 ships a host-local foundation for stable identity and governance.
+Protocol v4 ships a host-local foundation for stable identity and governance.
 It does not ship a relay connection, relay-local mode, team UI, share API, or a
 public enrollment, owner-transfer, or recovery command. The accepted optional
 team-relay design remains future work; use only current owner paths until the
@@ -25,7 +25,7 @@ pohunek host governance inspect <host> --json
 ```
 
 The command uses the same owner-only Unix or direct configured-overlay route as
-other v3 calls. It is safe to use through the Rust client, the generated
+other v4 calls. It is safe to use through the Rust client, the generated
 TypeScript method map, or an owner-path WebSocket transport.
 It does not grant a relay or browser any new authority.
 
@@ -88,7 +88,7 @@ private-storage, consistency, approval-key, and quarantine checks. A warning or
 failure is a reason to inspect the daemon's typed result and owner-private state
 through normal recovery procedures; do not edit state files, key material, or
 lock files by hand. A governance failure must not be replaced with a fabricated
-last-known owner or revision. Protocol v3 has no public governance recovery or
+last-known owner or revision. Protocol v4 has no public governance recovery or
 mutation command.
 
 Exact signed projection evidence can restore only a

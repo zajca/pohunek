@@ -151,7 +151,7 @@ def session_snapshot(session: Optional[Dict[str, Any]], worker: Optional[Dict[st
         "present": session is not None,
         "session_state": session.get("state") if session else None,
         "runtime_state": runtime_field(session, "state"),
-        "runtime_id": runtime_field(session, "runtime_id"),
+        "worker_instance_id": runtime_field(session, "worker_instance_id"),
         "loss_reason": runtime_field(session, "loss_reason"),
         "root_pid": session.get("pid") if session else None,
         "worker_generation": worker.get("generation") if worker else None,
@@ -363,11 +363,11 @@ def evaluate_survival(
     """Check that one session kept the same worker, PTY, and child."""
     checks.append(check("runtime_live_after", runtime_field(after, "state") == "live",
                         "runtime {}".format(runtime_field(after, "state"))))
-    runtime_before = runtime_field(before, "runtime_id")
+    runtime_before = runtime_field(before, "worker_instance_id")
     checks.append(
         check(
-            "same_runtime_id",
-            runtime_before is not None and runtime_before == runtime_field(after, "runtime_id"),
+            "same_worker_instance_id",
+            runtime_before is not None and runtime_before == runtime_field(after, "worker_instance_id"),
         )
     )
     generation_before = before_worker.get("generation") if before_worker else None
@@ -476,13 +476,13 @@ def evaluate_loss(
         "attempted": exit_status is not None,
         "exit_status": int(exit_status) if exit_status and exit_status.lstrip("-").isdigit() else None,
         "runtime_state": runtime_field(recovered, "state"),
-        "runtime_id": runtime_field(recovered, "runtime_id"),
+        "worker_instance_id": runtime_field(recovered, "worker_instance_id"),
         "worker_generation": new_generation,
     }
     recovery_ok = (
         exit_status == "0"
         and runtime_field(recovered, "state") == "live"
-        and runtime_field(recovered, "runtime_id") not in (None, runtime_field(before, "runtime_id"))
+        and runtime_field(recovered, "worker_instance_id") not in (None, runtime_field(before, "worker_instance_id"))
         and new_generation is not None
         and new_generation != generation
     )

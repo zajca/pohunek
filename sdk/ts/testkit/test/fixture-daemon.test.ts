@@ -134,7 +134,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(result.accepted).toBe(true);
       expect(result.activity).toBe("idle");
       expect(result.activity_source).toBe("report");
-      expect(result.runtime?.runtime_id).toBe(`runtime-${created.id}`);
+      expect(result.runtime?.worker_instance_id).toBe(`runtime-${created.id}`);
       expect(result.activity_epoch?.startsWith("d-testkit-")).toBe(true);
       expect(result.activity_revision).toBe("1");
       await client.close();
@@ -375,7 +375,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(hermes.capabilities).toEqual({ resume: true, fork: false });
       expect(await client.call("session.report_native_id", {
         session_id: hermes.id,
-        runtime_id: `runtime-${hermes.id}`,
+        worker_instance_id: `runtime-${hermes.id}`,
         agent: "hermes",
         pid: hermes.pid,
         pid_start_identity: "fixture-start-identity",
@@ -673,11 +673,11 @@ describe("@pohunek/testkit fixture daemon", () => {
 
       const screen = await client.sessionScreen({ session_id: session.id });
       expect(screen.visible_lines).toEqual(["retained"]);
-      expect(screen.runtime_id).toBe("runtime-observe-2");
+      expect(screen.worker_instance_id).toBe("runtime-observe-2");
 
       const output = await client.sessionOutput({
         session_id: session.id,
-        runtime: { runtime_id: screen.runtime_id, runtime_generation: screen.runtime_generation },
+        runtime: { worker_instance_id: screen.worker_instance_id, runtime_generation: screen.runtime_generation },
         after_offset: "2",
         max_bytes: 128,
       });
@@ -686,13 +686,13 @@ describe("@pohunek/testkit fixture daemon", () => {
 
       const waited = await client.sessionWait({
         session_id: session.id,
-        runtime: { runtime_id: "stale-runtime", runtime_generation: "1" },
+        runtime: { worker_instance_id: "stale-runtime", runtime_generation: "1" },
         timeout_ms: 50,
       });
       expect(waited.reason).toBe("runtime_changed");
 
       const runtime = {
-        runtime_id: screen.runtime_id,
+        worker_instance_id: screen.worker_instance_id,
         runtime_generation: screen.runtime_generation,
       };
       const invalidOutputCases: readonly SessionOutputParams[] = [
@@ -719,15 +719,15 @@ describe("@pohunek/testkit fixture daemon", () => {
         { session_id: session.id, runtime, after_terminal_watermark: U64_OVERFLOW_WIRE, timeout_ms: 1 },
         { session_id: session.id, runtime, after_output_offset: U64_OVERFLOW_WIRE, timeout_ms: 1 },
         { session_id: session.id, runtime: {
-          runtime_id: runtime.runtime_id,
+          worker_instance_id: runtime.worker_instance_id,
           runtime_generation: U64_OVERFLOW_WIRE,
         }, timeout_ms: 1 },
         { session_id: session.id, runtime: {
-          runtime_id: "r".repeat(129),
+          worker_instance_id: "r".repeat(129),
           runtime_generation: "1",
         }, timeout_ms: 1 },
         { session_id: session.id, runtime: {
-          runtime_id: "runtime\u0000control",
+          worker_instance_id: "runtime\u0000control",
           runtime_generation: "1",
         }, timeout_ms: 1 },
       ];
@@ -783,7 +783,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       const largeGenerationWait = await client.sessionWait({
         session_id: session.id,
         runtime: {
-          runtime_id: runtime.runtime_id,
+          worker_instance_id: runtime.worker_instance_id,
           runtime_generation: ABOVE_MAX_SAFE_U64,
         },
         timeout_ms: 1,
@@ -791,7 +791,7 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(largeGenerationWait.reason).toBe("runtime_changed");
       const maxLengthRuntimeWait = await client.sessionWait({
         session_id: session.id,
-        runtime: { runtime_id: "r".repeat(128), runtime_generation: "1" },
+        runtime: { worker_instance_id: "r".repeat(128), runtime_generation: "1" },
         timeout_ms: 1,
       });
       expect(maxLengthRuntimeWait.reason).toBe("runtime_changed");
@@ -800,7 +800,7 @@ describe("@pohunek/testkit fixture daemon", () => {
         session.id,
         new TextEncoder().encode("wide"),
         BigInt(ABOVE_MAX_SAFE_U64),
-        runtime.runtime_id,
+        runtime.worker_instance_id,
       );
       const largeOutput = await client.sessionOutput({
         session_id: session.id,

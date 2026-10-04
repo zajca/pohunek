@@ -236,7 +236,7 @@ mod tests {
             state: RuntimeState::Live,
             runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: Some("worker-1".to_owned()),
-            runtime_id: Some("runtime-1".to_owned()),
+            worker_instance_id: Some("runtime-1".to_owned()),
             started_at: None,
             last_connected_at: None,
             loss_reason: None,

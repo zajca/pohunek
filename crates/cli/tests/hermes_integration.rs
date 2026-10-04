@@ -135,7 +135,10 @@ esac"#,
     let policy_cli = fixture.root.join("policy-pohunek");
     write_executable(
         &policy_cli,
-        r#"printf '%s\n' '{"cli_version":"fixture","protocol":{"minimum":3,"maximum":3},"ok":{}}'"#,
+        &format!(
+            r#"printf '%s\n' '{{"cli_version":"fixture","protocol":{{"minimum":{version},"maximum":{version}}},"ok":{{}}}}'"#,
+            version = protocol::PROTOCOL_VERSION.get()
+        ),
     );
 
     let hermes = hermes_bin.to_str().expect("Hermes UTF-8 path");

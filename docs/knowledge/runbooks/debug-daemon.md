@@ -73,7 +73,7 @@ Use this runbook when commands report that the daemon is unreachable or unhealth
    host and inspect the specific session with `pohunek session inspect <target>`.
 8. If the daemon restarted, do not infer session exit from the closed control or
    attach socket. Check the session's `runtime.state`, `worker_id`, and
-   `runtime_id`, then use the
+   `worker_instance_id`, then use the
    [session runtime runbook](debug-session-runtime.md) for `reconnecting`,
    `lost`, `conflict`, or `incompatible`.
 9. If `pohunek session new` or `session fork` fails with

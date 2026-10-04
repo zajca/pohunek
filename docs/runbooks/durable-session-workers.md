@@ -43,7 +43,7 @@ pohunek session inspect s-42 --json
 pohunek service status --json
 ```
 
-Record `runtime.worker_id`, `runtime.runtime_id`, the session root `pid`, and
+Record `runtime.worker_id`, `runtime.worker_instance_id`, the session root `pid`, and
 the session's `workers` entry (`generation` and `pid`). Restart only the control
 plane. On Linux:
 
@@ -165,7 +165,7 @@ Do not:
 - kill a worker to clear `conflict` or `incompatible`;
 - interpret daemon disconnection as child exit;
 - invoke `session.resume` for a live or reconnecting runtime;
-- edit `worker_id` or `runtime_id` in metadata by hand.
+- edit `worker_id` or the persisted `runtime_id` in metadata by hand.
 
 After preserving diagnostic evidence, `pohunek session rm <id>` can remove a
 `lost`, `conflict`, `reconnecting`, or `incompatible` session. A `lost` runtime

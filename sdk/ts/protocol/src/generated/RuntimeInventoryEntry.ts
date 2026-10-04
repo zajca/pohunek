@@ -19,9 +19,9 @@ export type RuntimeInventoryEntry = {
    */
   worker_id?: string;
   /**
-   * Current PTY generation identity, when present.
+   * Current worker instance identity, when present.
    */
-  runtime_id?: string;
+  worker_instance_id?: string;
   /**
    * Fail-closed discovery classification.
    */

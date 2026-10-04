@@ -10,9 +10,9 @@ Start here:
   flow.
 - [Optional team relay](concepts/team-relay.md) records the implemented reduced
   relay foundation and the deferred multi-team design, clearly separated from
-  shipped protocol v3.
+  shipped protocol v4.
 - [Host identity and local governance](concepts/host-governance.md) describes
-  the shipped stable host ID, safe v3 inspection result, and owner-private
+  the shipped stable host ID, safe v4 inspection result, and owner-private
   governance persistence boundary.
 - [Sessions](concepts/sessions.md), [projects](concepts/projects.md),
   [worktrees](concepts/worktrees.md), and

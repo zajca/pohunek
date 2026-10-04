@@ -3012,7 +3012,7 @@ mod tests {
     /// State-hook requests expected from a successful release callback.
     const STATE_RELEASE_REQUEST_COUNT: usize = 1;
     /// Integration asset version expected after bounded in-memory state hooks ship.
-    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=8";
+    const STATE_ASSET_VERSION_HEADER: &str = "# POHUNEK_INTEGRATION_VERSION=9";
     /// Writable inheritable ACL used to prove mode bits alone are insufficient on macOS.
     #[cfg(target_os = "macos")]
     const WRITABLE_INHERITABLE_ACL: &str = "everyone allow read,write,execute,delete,append,readattr,writeattr,readextattr,writeextattr,readsecurity,file_inherit,directory_inherit";
@@ -4158,7 +4158,7 @@ mod tests {
                 })
             );
             assert_eq!(native["params"]["session_id"], json!("session-123"));
-            assert_eq!(native["params"]["runtime_id"], json!("runtime-123"));
+            assert_eq!(native["params"]["worker_instance_id"], json!("runtime-123"));
             assert_eq!(native["params"]["agent"], json!(agent));
             assert_eq!(native["params"]["pid"], json!(std::process::id()));
             assert!(native["params"]["pid_start_identity"].as_str().is_some());

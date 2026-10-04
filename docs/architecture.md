@@ -47,11 +47,11 @@ The following invariants span both domains:
 
 | Area | Status | Owner |
 |---|---|---|
-| Standalone Unix-socket owner operation | Shipped in public protocol v3 | Existing daemon, CLI, and SDK |
-| Direct configured-overlay operation, including NetBird | Shipped in public protocol v3 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
+| Standalone Unix-socket owner operation | Shipped in public protocol v4 | Existing daemon, CLI, and SDK |
+| Direct configured-overlay operation, including NetBird | Shipped in public protocol v4 | Existing daemon and clients; generic overlay work completed in [#69](https://github.com/zajca/pohunek/issues/69) |
 | Shared Linux/macOS platform, secure path, and portable filesystem contracts with native Darwin CI | Shipped foundation; Linux backends are active, while complete macOS host/client support remains deferred | [#95](https://github.com/zajca/pohunek/issues/95)-[#96](https://github.com/zajca/pohunek/issues/96); remaining delivery [#97](https://github.com/zajca/pohunek/issues/97)-[#105](https://github.com/zajca/pohunek/issues/105) |
 | Local/direct-overlay browser client transport | External client in `zajca/pohunek-work`; the SDK ships the `WsTransport` client and a loopback test relay | Team web mode is separate work in [#86](https://github.com/zajca/pohunek/issues/86) |
-| Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v3 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
+| Stable host identity, one exact principal-or-team owner, checked revisions, local lifecycle, and safe v4 inspection | Shipped host-local foundation; no relay API or mutation surface | [#81](https://github.com/zajca/pohunek/issues/81) |
 | Rust relay foundation: PostgreSQL, lease fencing, recovery quarantine, protected initial Owner/service-account provisioning, generic OIDC, HTTPS auth/account/credential operations, provider-neutral account linking, and native credential CLI | Implemented reduced foundation; no host link, routing, attach, or team administration API | [#85](https://github.com/zajca/pohunek/issues/85) and [#107](https://github.com/zajca/pohunek/issues/107); follow-up [#108](https://github.com/zajca/pohunek/issues/108), [#92](https://github.com/zajca/pohunek/issues/92), and [#86](https://github.com/zajca/pohunek/issues/86) |
 | Verified Keycloak-brokered social identity and bounded external eligibility | Accepted, not implemented; blocks completion of transport enrollment | [#92](https://github.com/zajca/pohunek/issues/92) |
 | Host-initiated userspace WireGuard link | Accepted, not implemented; transport completion follows #92 | [#72](https://github.com/zajca/pohunek/issues/72) |
@@ -184,7 +184,7 @@ public inspect response.
 The local record also has the primitives for exact owner-transfer proposals and
 signed outcomes. They bind the host, relay, current and target owner, revisions,
 proposal identity, nonce, expiry, suspension intent, and approval-key reference.
-They are durable local contract data, not public relay operations: protocol v3
+They are durable local contract data, not public relay operations: protocol v4
 exports neither proposal/outcome material nor a mutation method.
 
 Host state is separate from session metadata under the owner's XDG state tree:
@@ -398,10 +398,10 @@ error rather than falling back to unsafe defaults.
 ## Durable Session Workers
 
 Every live logical session has one opaque `worker_id` and one worker instance id
-(public field `runtime_id`; `WorkerInstanceId` in the Rust crates). The private
-worker control wire, data-frame headers, hook messages, the worker journal and
-the persisted runtime record spell the worker instance id `runtime_id`, so a
-live durable worker keeps talking to a newer daemon. The environment marker is
+(public field `worker_instance_id`; `WorkerInstanceId` in the Rust crates). The
+private worker control wire, data-frame headers, hook messages, the worker
+journal and the persisted runtime record spell the worker instance id
+`runtime_id`, so a live durable worker keeps talking to a newer daemon. The environment marker is
 `POHUNEK_WORKER_INSTANCE_ID`; `POHUNEK_RUNTIME_ID` is accepted as a read-only
 alternate spelling of it by the process inspectors, the sweep and the state
 hooks, and no worker writes it or passes an inherited value to its children. A
@@ -470,7 +470,7 @@ fresh interactive input.
 
 ## Transport and Control Protocol
 
-Public protocol v3 currently exposes one logical owner protocol over two
+Public protocol v4 currently exposes one logical owner protocol over two
 transport classes:
 
 - **Local:** Unix domain socket at `<runtime-root>/daemon.sock`. A valid explicit
@@ -508,7 +508,7 @@ The accepted relay path is a coordinated public protocol v4 cutover owned by
 the host opens a TCP control link and serves typed NDJSON requests from the
 enrolled relay; separate host-initiated TCP streams carry attach bytes. The v4
 connection origin is derived from the accepted listener/link and cannot be
-selected in request JSON. There is no v3 relay-path compatibility shim. Direct
+selected in request JSON. There is no v4 relay-path compatibility shim. Direct
 Unix and overlay owner contexts remain relay-independent.
 
 ## Attach Streaming
@@ -1041,7 +1041,7 @@ terminal screens remain bounded in worker memory.
 
 ### Shipped owner-path trust domain
 
-The shipped v3 threat model is one operator on their own machines and configured
+The shipped v4 threat model is one operator on their own machines and configured
 private overlays. It has no application-level user authorization. The controls
 that remain are cheap, free-by-default, or inherited:
 

@@ -740,7 +740,7 @@ mod tests {
             state,
             runtime_generation: RuntimeGeneration::new(1),
             worker_id: Some("w-1".to_owned()),
-            runtime_id: Some("r-1".to_owned()),
+            worker_instance_id: Some("r-1".to_owned()),
             started_at: None,
             last_connected_at,
             loss_reason: (state == RuntimeState::Lost).then(|| "worker_unavailable".to_owned()),

@@ -19,7 +19,7 @@ Start with public, non-destructive inspection:
 1. Run `pohunek health --json` and wait for the replacement daemon to become
    ready. Readiness follows worker discovery and reconciliation.
 2. Run `pohunek session inspect <target> --json`.
-3. Record `runtime.state`, `runtime.worker_id`, `runtime.runtime_id`,
+3. Record `runtime.state`, `runtime.worker_id`, `runtime.worker_instance_id`,
    decimal-string `runtime.runtime_generation`, `runtime.last_connected_at`,
    and `runtime.loss_reason`.
 4. On the session's host, run `pohunek service status --json`. Each entry in
@@ -167,7 +167,7 @@ On macOS, the standard launchctl command
 restarts the agent; it is not exercised by Pohunek's tests. The namespace `<ns>` is the `namespace` field of
 `pohunek service status --json`.
 
-After health returns, the same `worker_id`, `runtime_id`, worker generation
+After health returns, the same `worker_id`, `worker_instance_id`, worker generation
 and PID, and agent child PID demonstrate reconnection. A new runtime id means explicit
 recovery or a defect; it is not normal daemon restart behavior.
 
@@ -209,7 +209,7 @@ truthful `source_used: "visible"` fallback and inspect `alternate_screen` before
 interpreting the tail as ordinary main-screen history. ANSI reads are reserved
 and fail with `session_read_ansi_unavailable`.
 
-Carry the returned `runtime_id`, `runtime_generation`, and `next_offset` into a
+Carry the returned `worker_instance_id`, `runtime_generation`, and `next_offset` into a
 continued output read or `session wait`. `session_runtime_changed` means the
 cursor belongs to an older PTY generation; restart from a fresh screen/tail.
 `session_terminal_unavailable` means the managed worker cannot currently serve

@@ -1862,7 +1862,7 @@ mod tests {
     async fn dedicated_waiting_output_carries_the_connection_origin() {
         let result = serde_json::json!({
             "session_id": "s-target",
-            "runtime_id": "runtime-1",
+            "worker_instance_id": "runtime-1",
             "runtime_generation": "1",
             "history_start_offset": "0",
             "start_offset": "0",
@@ -1947,7 +1947,7 @@ mod tests {
             "activity": "idle",
             "activity_source": "report",
             "runtime": {
-                "runtime_id": "runtime-1",
+                "worker_instance_id": "runtime-1",
                 "runtime_generation": "1"
             },
             "activity_epoch": "d-epoch-1",
@@ -1987,7 +1987,7 @@ mod tests {
             "activity": "idle",
             "activity_source": "report",
             "runtime": {
-                "runtime_id": "runtime-1",
+                "worker_instance_id": "runtime-1",
                 "runtime_generation": "1"
             },
             "activity_epoch": "d-epoch-1",
@@ -2152,7 +2152,7 @@ mod tests {
             "activity": "idle",
             "activity_source": "report",
             "runtime": {
-                "runtime_id": "runtime-1",
+                "worker_instance_id": "runtime-1",
                 "runtime_generation": "1"
             },
             "activity_revision": "2"

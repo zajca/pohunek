@@ -31,7 +31,7 @@ Local launches can bootstrap or verify the daemon before starting a session.
 Remote launches preserve the existing remote session safety model and require a
 knowledge bundle materialized on the host that runs the agent.
 
-All shipped clients use the same public protocol v3. Each request advertises an
+All shipped clients use the same public protocol v4. Each request advertises an
 inclusive `minimum`/`maximum` version range; the first response selects the
 highest overlap for that connection. The old integer-v1 request envelope is not
 accepted. Waiting observation calls open dedicated connections so they do not
@@ -103,7 +103,7 @@ the next login reports those sessions `lost` without restarting them.
 
 ## Owner paths and the accepted relay direction
 
-Current protocol-v3 operation is owner-only. Local clients connect to the Unix
+Current protocol-v4 operation is owner-only. Local clients connect to the Unix
 socket, direct remote clients use a configured overlay such as NetBird, and
 external clients such as a browser control center can map one WebSocket to one
 daemon connection through their own relay. Each host daemon remains

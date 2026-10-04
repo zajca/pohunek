@@ -439,7 +439,7 @@ async fn managed_observation_returns_runtime_bound_screen_output_and_wait() {
     assert_eq!(wait.reason, SessionWaitReason::StateMatched);
 
     let stale_runtime = SessionRuntimeIdentity::new(
-        screen.runtime.runtime_id(),
+        screen.runtime.worker_instance_id(),
         RuntimeGeneration::new(screen.runtime.runtime_generation().get() + 1),
     )
     .expect("stale runtime identity");
@@ -502,7 +502,7 @@ async fn managed_output_remains_available_until_descendant_pty_eof() {
     let live_runtime = created.runtime.as_ref().expect("live runtime");
     let runtime = SessionRuntimeIdentity::new(
         live_runtime
-            .runtime_id
+            .worker_instance_id
             .clone()
             .expect("live runtime identifier"),
         live_runtime.runtime_generation,
@@ -693,7 +693,7 @@ async fn session_wait_wakes_for_metadata_and_state_and_returns_timeout() {
         .as_ref()
         .and_then(|runtime| {
             Some(SessionRuntimeIdentity::new(
-                runtime.runtime_id.as_deref()?,
+                runtime.worker_instance_id.as_deref()?,
                 runtime.runtime_generation,
             ))
         })
@@ -771,7 +771,7 @@ async fn composite_wait_short_circuits_ended_lost_and_disappeared_runtimes() {
         ended
             .runtime
             .as_ref()
-            .and_then(|runtime| runtime.runtime_id.as_deref())
+            .and_then(|runtime| runtime.worker_instance_id.as_deref())
             .expect("ended runtime id"),
         ended
             .runtime
@@ -792,7 +792,7 @@ async fn composite_wait_short_circuits_ended_lost_and_disappeared_runtimes() {
             created
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.runtime_id.as_deref())
+                .and_then(|runtime| runtime.worker_instance_id.as_deref())
                 .expect("live runtime id"),
             created
                 .runtime
@@ -5027,7 +5027,7 @@ async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
         let entry = sessions.get_mut(&created.id).expect("session entry");
         let original = entry.info.runtime.clone();
         let runtime = entry.info.runtime.as_mut().expect("runtime projection");
-        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.worker_instance_id = Some("runtime-replacement".to_owned());
         runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
         original
     };
@@ -7411,7 +7411,7 @@ async fn failed_stop_intent_rollback_does_not_overwrite_replacement_runtime() {
         .runtime
         .as_mut()
         .expect("runtime metadata")
-        .runtime_id = Some("replacement-runtime".to_owned());
+        .worker_instance_id = Some("replacement-runtime".to_owned());
     drop(sessions);
 
     registry
@@ -7437,7 +7437,7 @@ async fn failed_stop_intent_rollback_does_not_overwrite_replacement_runtime() {
         .runtime
         .as_mut()
         .expect("runtime metadata")
-        .runtime_id = Some(original_runtime.worker_instance_id);
+        .worker_instance_id = Some(original_runtime.worker_instance_id);
     drop(sessions);
     let _ = registry.stop(&created.id).await;
 }
@@ -7650,7 +7650,7 @@ async fn session_input_wait_rejects_replaced_runtime() {
         let mut sessions = registry.inner.sessions.lock().await;
         let entry = sessions.get_mut(&created.id).expect("session entry");
         let runtime = entry.info.runtime.as_mut().expect("managed runtime");
-        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.worker_instance_id = Some("runtime-replacement".to_owned());
         runtime.runtime_generation =
             protocol::RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
         entry.info.clone()
@@ -9100,7 +9100,7 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
         let mut sessions = registry.inner.sessions.lock().await;
         let entry = sessions.get_mut(&created.id).expect("live session entry");
         let runtime = entry.info.runtime.as_mut().expect("runtime info");
-        runtime.runtime_id = Some("runtime-replacement".to_owned());
+        runtime.worker_instance_id = Some("runtime-replacement".to_owned());
         runtime.runtime_generation = RuntimeGeneration::new(runtime.runtime_generation.get() + 1);
         entry.active_agent = Some(ActiveAgentReport {
             source: "replacement-claim".to_owned(),
@@ -9129,7 +9129,7 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
         inspected
             .runtime
             .as_ref()
-            .and_then(|runtime| runtime.runtime_id.as_deref()),
+            .and_then(|runtime| runtime.worker_instance_id.as_deref()),
         Some("runtime-replacement")
     );
     let () = {
@@ -10166,7 +10166,7 @@ fn assert_previous_runtime_cannot_overwrite(
         .as_mut()
         .expect("runtime projection");
     runtime.runtime_generation = RuntimeGeneration::new(next_generation);
-    runtime.runtime_id = Some("runtime-next".to_owned());
+    runtime.worker_instance_id = Some("runtime-next".to_owned());
     next_runtime.runtime.worker_instance_id = Some("runtime-next".to_owned());
     next_runtime.native_identity_ordering = None;
     next_runtime.info.cols = 144;
@@ -10192,7 +10192,7 @@ fn assert_previous_runtime_cannot_overwrite(
         runtime.runtime_generation,
         RuntimeGeneration::new(next_generation)
     );
-    assert_eq!(runtime.runtime_id.as_deref(), Some("runtime-next"));
+    assert_eq!(runtime.worker_instance_id.as_deref(), Some("runtime-next"));
     assert_eq!(
         persisted.runtime.worker_instance_id.as_deref(),
         Some("runtime-next")
@@ -10267,7 +10267,7 @@ async fn concurrent_equal_generation_commits_publish_only_the_durable_winner() {
         .runtime
         .as_mut()
         .expect("preparing runtime")
-        .runtime_id = None;
+        .worker_instance_id = None;
     preparing.runtime.worker_instance_id = None;
     let store = crate::store::Store::new(store_path);
     assert_eq!(
@@ -10424,7 +10424,7 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
             .runtime
             .as_mut()
             .expect("runtime info")
-            .runtime_id = Some("runtime-old".to_owned());
+            .worker_instance_id = Some("runtime-old".to_owned());
         (worker.clone(), original)
     };
     let expected = {
@@ -10448,7 +10448,7 @@ async fn reconnect_rejects_a_replacement_worker_before_mutating_registry() {
             .await
             .expect("inspect unchanged entry")
             .runtime
-            .and_then(|runtime| runtime.runtime_id),
+            .and_then(|runtime| runtime.worker_instance_id),
         Some("runtime-old".to_owned())
     );
     assert_no_runtime_event(&mut events).await;
@@ -11028,7 +11028,7 @@ fn runtime_commit_candidate_for_generation(
     let runtime = entry.info.runtime.as_mut().expect("candidate runtime");
     runtime.state = RuntimeState::Live;
     runtime.runtime_generation = RuntimeGeneration::new(generation);
-    runtime.runtime_id = Some(worker_instance_id.to_owned());
+    runtime.worker_instance_id = Some(worker_instance_id.to_owned());
     entry.runtime = RuntimeHandle::Unavailable(RuntimeState::Live);
     entry.last_native_report = None;
     entry
@@ -11044,7 +11044,7 @@ async fn commit_runtime_candidate(
         .info
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.runtime_id.clone())
+        .and_then(|runtime| runtime.worker_instance_id.clone())
         .expect("candidate runtime id");
     let info = entry.info.clone();
     barrier.wait().await;
@@ -11067,7 +11067,9 @@ async fn assert_runtime_commit_winner(
         .find(|record| record.session_id == id.0)
         .expect("durable winner record");
     assert_eq!(
-        memory.runtime.and_then(|runtime| runtime.runtime_id),
+        memory
+            .runtime
+            .and_then(|runtime| runtime.worker_instance_id),
         Some(winner.to_owned())
     );
     assert_eq!(durable.runtime.worker_instance_id.as_deref(), Some(winner));
@@ -11240,7 +11242,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
     let first = registry
         .report_native_id(claim(
             created.id.clone(),
-            coordinates.runtime_id(),
+            coordinates.worker_instance_id(),
             coordinates.pid_start_identity(),
             100,
             &valid_expiry,
@@ -11252,7 +11254,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
     for rejected in [
         claim(
             created.id.clone(),
-            coordinates.runtime_id(),
+            coordinates.worker_instance_id(),
             coordinates.pid_start_identity(),
             100,
             &valid_expiry,
@@ -11260,7 +11262,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
         ),
         claim(
             created.id.clone(),
-            coordinates.runtime_id(),
+            coordinates.worker_instance_id(),
             coordinates.pid_start_identity(),
             99,
             &valid_expiry,
@@ -11276,7 +11278,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
         ),
         claim(
             created.id.clone(),
-            coordinates.runtime_id(),
+            coordinates.worker_instance_id(),
             ProcessStartIdentity::new(coordinates.pid_start_identity().get() + 1),
             101,
             &valid_expiry,
@@ -11284,7 +11286,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
         ),
         claim(
             created.id.clone(),
-            coordinates.runtime_id(),
+            coordinates.worker_instance_id(),
             coordinates.pid_start_identity(),
             101,
             "2000-01-01T00:00:00Z",
@@ -11292,7 +11294,7 @@ async fn report_native_id_rejects_stale_expired_and_mismatched_claims() {
         ),
         claim(
             SessionId("s-other".to_owned()),
-            coordinates.runtime_id(),
+            coordinates.worker_instance_id(),
             coordinates.pid_start_identity(),
             101,
             &valid_expiry,
@@ -11669,7 +11671,7 @@ async fn non_resumable_claude_profile_has_neither_resume_nor_fork() {
     let worker_instance_id = created
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.runtime_id.clone())
+        .and_then(|runtime| runtime.worker_instance_id.clone())
         .expect("live runtime id");
 
     let result = registry
@@ -12110,7 +12112,7 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         state: RuntimeState::Lost,
         runtime_generation: protocol::RuntimeGeneration::new(1),
         worker_id: Some("worker-before-recovery".to_owned()),
-        runtime_id: Some("runtime-before-recovery".to_owned()),
+        worker_instance_id: Some("runtime-before-recovery".to_owned()),
         started_at: Some(original_created_at.clone()),
         last_connected_at: None,
         loss_reason: Some("test_runtime_lost".to_owned()),
@@ -12164,19 +12166,19 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         serde_json::from_value(event.payload().clone()).expect("recovery event payload");
     assert_eq!(recovered_event.session.id, created.id);
     assert_eq!(
-        recovered_event.previous_runtime_id.as_deref(),
+        recovered_event.previous_worker_instance_id.as_deref(),
         Some("runtime-before-recovery")
     );
     // The durable-worker backend always mints a fresh runtime generation on
     // `initialize`, including for explicit native recovery, so the recovered
     // event must carry a *new* id distinct from the replaced generation.
     assert_ne!(
-        recovered_event.runtime_id.as_deref(),
+        recovered_event.worker_instance_id.as_deref(),
         Some("runtime-before-recovery"),
         "native recovery must mint a new worker runtime, not reuse the previous one"
     );
     assert!(
-        recovered_event.runtime_id.is_some(),
+        recovered_event.worker_instance_id.is_some(),
         "native recovery must mint a fresh durable-worker runtime id"
     );
 
@@ -12697,7 +12699,7 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
             state,
             runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: Some("worker-live".to_owned()),
-            runtime_id: Some("runtime-live".to_owned()),
+            worker_instance_id: Some("runtime-live".to_owned()),
             started_at: None,
             last_connected_at: None,
             loss_reason: None,
@@ -12728,7 +12730,7 @@ async fn native_recovered_event_carries_previous_and_new_worker_instance_ids() {
         state: RuntimeState::Live,
         runtime_generation: protocol::RuntimeGeneration::new(1),
         worker_id: Some("worker-new".to_owned()),
-        runtime_id: Some("runtime-new".to_owned()),
+        worker_instance_id: Some("runtime-new".to_owned()),
         started_at: Some(session.created_at.clone()),
         last_connected_at: Some(session.updated_at.clone()),
         loss_reason: None,
@@ -12742,8 +12744,11 @@ async fn native_recovered_event_carries_previous_and_new_worker_instance_ids() {
     let payload: SessionNativeRecoveredEvent =
         serde_json::from_value(event.payload().clone()).expect("recovery payload");
     assert_eq!(payload.session.id, session.id);
-    assert_eq!(payload.previous_runtime_id.as_deref(), Some("runtime-old"));
-    assert_eq!(payload.runtime_id.as_deref(), Some("runtime-new"));
+    assert_eq!(
+        payload.previous_worker_instance_id.as_deref(),
+        Some("runtime-old")
+    );
+    assert_eq!(payload.worker_instance_id.as_deref(), Some("runtime-new"));
 
     let _ = registry.stop(&session.id).await;
 }

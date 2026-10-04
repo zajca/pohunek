@@ -670,7 +670,11 @@ fn record_activity_evidence(
         if runtime.state != RuntimeState::Live {
             return None;
         }
-        SessionRuntimeIdentity::new(runtime.runtime_id.clone()?, runtime.runtime_generation).ok()
+        SessionRuntimeIdentity::new(
+            runtime.worker_instance_id.clone()?,
+            runtime.runtime_generation,
+        )
+        .ok()
     })?;
     let evidence = ActivityEvidence {
         activity,
@@ -793,7 +797,7 @@ impl RuntimeWatchIdentity {
         let runtime = info.runtime.as_ref()?;
         Some(Self {
             worker_id: runtime.worker_id.clone()?,
-            worker_instance_id: runtime.runtime_id.clone()?,
+            worker_instance_id: runtime.worker_instance_id.clone()?,
             generation: runtime.runtime_generation,
         })
     }
@@ -801,7 +805,7 @@ impl RuntimeWatchIdentity {
     fn matches(&self, entry: &SessionEntry) -> bool {
         entry.info.runtime.as_ref().is_some_and(|runtime| {
             runtime.worker_id.as_deref() == Some(self.worker_id.as_str())
-                && runtime.runtime_id.as_deref() == Some(self.worker_instance_id.as_str())
+                && runtime.worker_instance_id.as_deref() == Some(self.worker_instance_id.as_str())
                 && runtime.runtime_generation == self.generation
         })
     }
@@ -1132,7 +1136,7 @@ impl SessionRegistry {
             |runtime| RuntimeRecord {
                 state: runtime.state,
                 worker_id: runtime.worker_id.clone(),
-                worker_instance_id: runtime.runtime_id.clone(),
+                worker_instance_id: runtime.worker_instance_id.clone(),
                 service_id: None,
                 generation: None,
                 executable: None,
@@ -2233,7 +2237,7 @@ impl SessionRegistry {
             && worker_snapshot
                 .worker_instance_id
                 .as_ref()
-                .is_some_and(|runtime| runtime.as_str() == params.runtime_id());
+                .is_some_and(|runtime| runtime.as_str() == params.worker_instance_id());
         let process_matches = worker_snapshot
             .child_process
             .as_ref()
@@ -2275,15 +2279,15 @@ impl SessionRegistry {
                 .info
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.runtime_id.as_deref())
-                == Some(params.runtime_id());
+                .and_then(|runtime| runtime.worker_instance_id.as_deref())
+                == Some(params.worker_instance_id());
             if is_terminal(entry.info.state) || !current_runtime_matches {
                 return not_recorded;
             }
             let incoming_sequence = params.sequence().get();
             if !native_report_is_current(
                 entry.last_native_report.as_ref(),
-                params.runtime_id(),
+                params.worker_instance_id(),
                 incoming_sequence,
             ) {
                 debug!(session_id = %session_id.0, "stale native-id report; ignoring");
@@ -2293,7 +2297,7 @@ impl SessionRegistry {
             let previous_native_id = entry.info.native_session_id.clone();
             let previous_native_path = entry.info.native_session_path.clone();
             entry.last_native_report = Some(NativeIdentityReport {
-                worker_instance_id: params.runtime_id().to_owned(),
+                worker_instance_id: params.worker_instance_id().to_owned(),
                 pid: params.pid(),
                 pid_start_identity: params.pid_start_identity().get(),
                 sequence: incoming_sequence,
@@ -2324,7 +2328,7 @@ impl SessionRegistry {
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(&session_id) {
                 let accepted = NativeIdentityReport {
-                    worker_instance_id: params.runtime_id().to_owned(),
+                    worker_instance_id: params.worker_instance_id().to_owned(),
                     pid: params.pid(),
                     pid_start_identity: params.pid_start_identity().get(),
                     sequence: params.sequence().get(),
@@ -3199,7 +3203,7 @@ impl SessionRegistry {
                     .info
                     .runtime
                     .as_ref()
-                    .and_then(|runtime| runtime.runtime_id.clone()),
+                    .and_then(|runtime| runtime.worker_instance_id.clone()),
             )
         };
         let released = self
@@ -3731,7 +3735,7 @@ impl SessionRegistry {
             if let Some(runtime) = candidate.info.runtime.as_mut() {
                 runtime.state = RuntimeState::Live;
                 runtime.worker_id = Some(worker_id);
-                runtime.runtime_id = Some(worker_instance_id);
+                runtime.worker_instance_id = Some(worker_instance_id);
                 runtime.last_connected_at = Some(timestamp_now());
                 runtime.loss_reason = None;
             }
@@ -4267,13 +4271,13 @@ impl SessionRegistry {
         let worker_instance_id = info
             .runtime
             .as_ref()
-            .and_then(|runtime| runtime.runtime_id.clone());
+            .and_then(|runtime| runtime.worker_instance_id.clone());
         let event = crate::events::event(
             event::SESSION_NATIVE_RECOVERED,
             event_payload(SessionNativeRecoveredEvent {
                 session: info.clone(),
-                previous_runtime_id: previous_worker_instance_id,
-                runtime_id: worker_instance_id,
+                previous_worker_instance_id,
+                worker_instance_id,
             }),
         );
         let _ = self.inner.events.send(event);
@@ -4648,7 +4652,7 @@ fn create_intent_record(
             state: RuntimeState::Starting,
             runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: None,
-            runtime_id: None,
+            worker_instance_id: None,
             started_at: None,
             last_connected_at: None,
             loss_reason: None,

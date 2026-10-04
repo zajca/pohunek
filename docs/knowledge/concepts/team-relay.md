@@ -15,7 +15,7 @@ service-account provisioning, generic OIDC browser and device login, bounded
 HTTPS account and credential lifecycle, provider-neutral account linking, and a
 native HTTPS/keyring CLI. It has no host link, team client or WebUI, routing,
 attach path, host enrollment, or complete team-administration API. Current
-Pohunek releases otherwise use public protocol v3 through an owner-only Unix
+Pohunek releases otherwise use public protocol v4 through an owner-only Unix
 socket or a direct configured overlay such as NetBird. A browser transport
 that bridges WebSockets to a daemon is an external client concern, not the team
 relay described here.
@@ -51,7 +51,7 @@ rows; it never creates a second credential or emits another secret.
 The shipped #81 host-local foundation is deliberately narrower. It persists a
 stable opaque host identity, one exact principal-or-team owner, at most one
 local enrollment record, checked revisions, quarantine state, and local
-transfer coordinates. Protocol v3 exposes only safe read-only inspection of
+transfer coordinates. Protocol v4 exposes only safe read-only inspection of
 that state. It does not connect to a relay, run OIDC, create a WireGuard key,
 publish a relay API, or provide a team UI.
 
@@ -165,7 +165,7 @@ Padding, connectivity, MTU, rekey, NAT, idle, buffer, timer, privilege, and
 exact-version claims remain evidence to verify, not shipped capabilities or test
 results. RFC §10 assigns the contract and #72 owns implementation. Protocol v4
 will reuse typed NDJSON operations and separate raw attach streams; there is no
-v3 compatibility shim for that relay path.
+v4 compatibility shim for that relay path.
 
 ## Ownership and sharing
 
@@ -266,4 +266,4 @@ then transport [#72](https://github.com/zajca/pohunek/issues/72), protocol v4
 [#87](https://github.com/zajca/pohunek/issues/87), then provider delivery
 [#73](https://github.com/zajca/pohunek/issues/73) and workload isolation
 [#88](https://github.com/zajca/pohunek/issues/88). Until those issues land,
-`docs/public-api.md` is authoritative for shipped v3 behavior.
+`docs/public-api.md` is authoritative for shipped v4 behavior.

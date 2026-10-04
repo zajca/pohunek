@@ -389,10 +389,10 @@ function isRuntimeIdentity(value: unknown): boolean {
     return false;
   }
   const runtime = value as Record<string, unknown>;
-  return typeof runtime["runtime_id"] === "string"
-    && runtime["runtime_id"].length > 0
-    && UTF8_ENCODER.encode(runtime["runtime_id"]).byteLength <= MAX_WORKER_INSTANCE_ID_BYTES
-    && !/\p{Cc}/u.test(runtime["runtime_id"])
+  return typeof runtime["worker_instance_id"] === "string"
+    && runtime["worker_instance_id"].length > 0
+    && UTF8_ENCODER.encode(runtime["worker_instance_id"]).byteLength <= MAX_WORKER_INSTANCE_ID_BYTES
+    && !/\p{Cc}/u.test(runtime["worker_instance_id"])
     && isCanonicalDecimal(runtime["runtime_generation"]);
 }
 

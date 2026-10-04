@@ -444,7 +444,7 @@ def _has_live_runtime(session: dict[str, Any]) -> bool:
     runtime = session.get("runtime")
     if not isinstance(runtime, dict) or runtime.get("state") != "live":
         return False
-    worker_instance_id = runtime.get("runtime_id")
+    worker_instance_id = runtime.get("worker_instance_id")
     generation = runtime.get("runtime_generation")
     if not isinstance(worker_instance_id, str) or not worker_instance_id:
         return False

@@ -2,7 +2,7 @@
 
 This is a historical M1-to-M3 migration record. At that time, M3 did not change
 the then-current public protocol v2; it added a local, profile-owned Hermes
-plugin lifecycle to the CLI. Current releases use protocol v3 and follow the
+plugin lifecycle to the CLI. Current releases use protocol v4 and follow the
 [current update runbook](../knowledge/runbooks/update-after-release.md).
 
 ## Upgrade order

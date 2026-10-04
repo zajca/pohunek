@@ -474,7 +474,7 @@ describe("Client request/response", () => {
     const screen = {
       session_id: "s-test-1",
       worker_id: "worker-test-1",
-      runtime_id: "runtime-test-1",
+      worker_instance_id: "runtime-test-1",
       runtime_generation: "1",
       watermark: "2",
       dimensions: { cols: 80, rows: 24 },
@@ -484,7 +484,7 @@ describe("Client request/response", () => {
     } as const;
     const output = {
       session_id: "s-test-1",
-      runtime_id: "runtime-test-1",
+      worker_instance_id: "runtime-test-1",
       runtime_generation: "1",
       history_start_offset: "0",
       start_offset: "0",
@@ -528,7 +528,7 @@ describe("Client request/response", () => {
     const screen = {
       session_id: "s-target",
       worker_id: "worker-target",
-      runtime_id: "runtime-target",
+      worker_instance_id: "runtime-target",
       runtime_generation: "1",
       watermark: "2",
       dimensions: { cols: 80, rows: 24 },
@@ -538,7 +538,7 @@ describe("Client request/response", () => {
     } as const;
     const output = {
       session_id: "s-target",
-      runtime_id: "runtime-target",
+      worker_instance_id: "runtime-target",
       runtime_generation: "1",
       history_start_offset: "0",
       start_offset: "0",
@@ -558,7 +558,7 @@ describe("Client request/response", () => {
       accepted: true,
       activity: "idle",
       activity_source: "report",
-      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
       activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
@@ -580,7 +580,7 @@ describe("Client request/response", () => {
       });
       await client.sessionOutput({
         session_id: "s-target",
-        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
         after_offset: "0",
         max_bytes: 128,
         wait_ms: 25,
@@ -608,7 +608,7 @@ describe("Client request/response", () => {
       accepted: true,
       activity: "idle",
       activity_source: "screen",
-      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
       activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
@@ -661,7 +661,7 @@ describe("Client request/response", () => {
       accepted: true,
       activity: "idle",
       activity_source: "report",
-      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
       activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
@@ -772,7 +772,7 @@ describe("Client request/response", () => {
       accepted: true,
       activity: "idle",
       activity_source: "report",
-      runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+      runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
       activity_epoch: "d-epoch-1",
       activity_revision: "2",
     } as const;
@@ -831,14 +831,14 @@ describe("Client request/response", () => {
         accepted: true,
         activity: "idle",
         activity_source: "report",
-        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
         activity_revision: "2",
       },
       {
         accepted: true,
         activity: "idle",
         activity_source: "unknown",
-        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
         activity_epoch: "d-epoch-1",
         activity_revision: "2",
       },
@@ -846,7 +846,7 @@ describe("Client request/response", () => {
         accepted: true,
         activity: "idle",
         activity_source: "report",
-        runtime: { runtime_id: "runtime-target", runtime_generation: "1" },
+        runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
         activity_epoch: "d-epoch-1",
         activity_revision: "18446744073709551616",
       },
@@ -854,7 +854,7 @@ describe("Client request/response", () => {
         accepted: true,
         activity: "idle",
         activity_source: "report",
-        runtime: { runtime_id: "r".repeat(129), runtime_generation: "1" },
+        runtime: { worker_instance_id: "r".repeat(129), runtime_generation: "1" },
         activity_epoch: "d-epoch-1",
         activity_revision: "2",
       },
@@ -862,7 +862,7 @@ describe("Client request/response", () => {
         accepted: true,
         activity: "idle",
         activity_source: "report",
-        runtime: { runtime_id: "ž".repeat(65), runtime_generation: "1" },
+        runtime: { worker_instance_id: "ž".repeat(65), runtime_generation: "1" },
         activity_epoch: "d-epoch-1",
         activity_revision: "2",
       },
@@ -870,7 +870,7 @@ describe("Client request/response", () => {
         accepted: true,
         activity: "idle",
         activity_source: "report",
-        runtime: { runtime_id: "runtime\u0000control", runtime_generation: "1" },
+        runtime: { worker_instance_id: "runtime\u0000control", runtime_generation: "1" },
         activity_epoch: "d-epoch-1",
         activity_revision: "2",
       },

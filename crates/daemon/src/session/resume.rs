@@ -181,7 +181,7 @@ impl SessionRegistry {
                         .info
                         .runtime
                         .as_ref()
-                        .and_then(|runtime| runtime.runtime_id.clone()),
+                        .and_then(|runtime| runtime.worker_instance_id.clone()),
                     previous_job: entry.job.clone(),
                     previous_runtime_generation: entry
                         .info

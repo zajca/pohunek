@@ -155,7 +155,7 @@ interface SocketContext {
 }
 
 interface FixtureObservation {
-  runtime_id: string;
+  worker_instance_id: string;
   runtime_generation: bigint;
   worker_id: string;
   history_start_offset: bigint;
@@ -349,7 +349,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       activity,
       source,
       runtime: {
-        runtime_id: observation.runtime_id,
+        worker_instance_id: observation.worker_instance_id,
         runtime_generation: observation.runtime_generation.toString(),
       },
       activity_epoch: this.activityEpoch,
@@ -359,7 +359,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       activity,
       source,
       runtime: {
-        runtime_id: observation.runtime_id,
+        worker_instance_id: observation.worker_instance_id,
         runtime_generation: observation.runtime_generation.toString(),
       },
       revision,
@@ -388,7 +388,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       session_id: sessionId,
       subagent: cloneValue(subagent),
       runtime: {
-        runtime_id: observation.runtime_id,
+        worker_instance_id: observation.worker_instance_id,
         runtime_generation: observation.runtime_generation.toString(),
       },
     });
@@ -434,7 +434,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const session = this.requireSession(sessionId);
     const current = this.observation(sessionId);
     const nextGeneration = incrementU64(current.runtime_generation, "fixture runtime generation");
-    const nextWorkerInstanceId = workerInstanceId ?? `${current.runtime_id}-replacement`;
+    const nextWorkerInstanceId = workerInstanceId ?? `${current.worker_instance_id}-replacement`;
     const nextWorkerId = `${current.worker_id}-replacement`;
     if (!isBoundedWorkerInstanceId(nextWorkerInstanceId)) {
       throw new Error("fixture replacement runtime id must be a bounded control-free identifier");
@@ -443,7 +443,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
       state: "live",
       runtime_generation: nextGeneration.toString(),
       worker_id: nextWorkerId,
-      runtime_id: nextWorkerInstanceId,
+      worker_instance_id: nextWorkerInstanceId,
       started_at: timestamp(),
       last_connected_at: timestamp(),
     };
@@ -451,7 +451,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     session.state_source = "process";
     session.updated_at = timestamp();
     this.observations.set(sessionId, {
-      runtime_id: nextWorkerInstanceId,
+      worker_instance_id: nextWorkerInstanceId,
       runtime_generation: nextGeneration,
       worker_id: nextWorkerId,
       history_start_offset: 0n,
@@ -498,7 +498,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const current = this.observation(sessionId);
     this.observations.set(sessionId, {
       ...current,
-      runtime_id: workerInstanceId ?? current.runtime_id,
+      worker_instance_id: workerInstanceId ?? current.worker_instance_id,
       history_start_offset: parsedHistoryStart,
       output: copyBytes(bytes),
       watermark: incrementU64(current.watermark, "fixture terminal watermark"),
@@ -872,7 +872,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (
       params === undefined
       || typeof params.session_id !== "string"
-      || typeof params.runtime_id !== "string"
+      || typeof params.worker_instance_id !== "string"
       || typeof params.agent !== "string"
       || !isPositiveInteger(params.pid)
       || typeof params.pid_start_identity !== "string"
@@ -1129,7 +1129,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     const result = {
       session_id: session.id,
       worker_id: observation.worker_id,
-      runtime_id: observation.runtime_id,
+      worker_instance_id: observation.worker_instance_id,
       runtime_generation: observation.runtime_generation.toString(),
       watermark: observation.watermark.toString(),
       dimensions: { cols: session.cols, rows: session.rows },
@@ -1194,7 +1194,7 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     );
     const result: SessionOutputResult = {
       session_id: session.id,
-      runtime_id: observation.runtime_id,
+      worker_instance_id: observation.worker_instance_id,
       runtime_generation: observation.runtime_generation.toString(),
       history_start_offset: historyStart.toString(),
       start_offset: start.toString(),
@@ -1629,12 +1629,12 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
     if (runtimeGeneration === undefined) {
       throw new Error("fixture session runtime generation must be an unsigned u64");
     }
-    const workerInstanceId = session.runtime?.runtime_id ?? `runtime-${sessionId}`;
+    const workerInstanceId = session.runtime?.worker_instance_id ?? `runtime-${sessionId}`;
     if (!isBoundedWorkerInstanceId(workerInstanceId)) {
       throw new Error("fixture session runtime id must be a bounded control-free identifier");
     }
     const observation: FixtureObservation = {
-      runtime_id: workerInstanceId,
+      worker_instance_id: workerInstanceId,
       runtime_generation: runtimeGeneration,
       worker_id: session.runtime?.worker_id ?? `worker-${sessionId}`,
       history_start_offset: 0n,
@@ -2327,14 +2327,14 @@ function sameRuntime(
   runtime: SessionRuntimeIdentity,
   observation: FixtureObservation,
 ): boolean {
-  return runtime.runtime_id === observation.runtime_id
+  return runtime.worker_instance_id === observation.worker_instance_id
     && parseDecimalU64(runtime.runtime_generation) === observation.runtime_generation;
 }
 
 function isRuntimeIdentity(value: unknown): value is SessionRuntimeIdentity {
   return isRecord(value)
-    && hasOnlyKeys(value, ["runtime_id", "runtime_generation"])
-    && isBoundedWorkerInstanceId(value["runtime_id"])
+    && hasOnlyKeys(value, ["worker_instance_id", "runtime_generation"])
+    && isBoundedWorkerInstanceId(value["worker_instance_id"])
     && parseDecimalU64(value["runtime_generation"]) !== undefined;
 }
 

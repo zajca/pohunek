@@ -47,9 +47,9 @@ export type SessionScreenResult = {
    */
   visible_lines: Array<string>;
   /**
-   * PTY runtime identifier.
+   * Worker instance identifier.
    */
-  runtime_id: string;
+  worker_instance_id: string;
   /**
    * Monotonic logical-session generation for this runtime.
    */
