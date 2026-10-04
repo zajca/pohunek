@@ -174,28 +174,24 @@ impl HostConfig {
 
 /// Returns whether a runtime can be selected for a new session.
 ///
-/// Hermes requires positive version-policy confirmation. Legacy profiles that
-/// predate `agent_base` remain selectable when available, while a future
-/// unknown compiled base fails closed.
+/// A runtime is launchable when the host reports it available and its version
+/// policy does not refuse it: `supported == Some(false)` means the daemon found
+/// the executable but will not launch it, while `None` means the runtime has no
+/// version policy. A runtime with a policy always reports `Some(_)` once it is
+/// available, so no runtime id is special-cased here. A future unknown compiled
+/// base fails closed.
 #[must_use]
 pub fn runtime_is_launchable(runtime: &AgentRuntime) -> bool {
-    if !runtime.available {
-        return false;
-    }
-
-    match runtime.agent_base.as_ref() {
-        Some(AgentKind::Hermes) => runtime.supported == Some(true),
-        Some(AgentKind::Unknown(_)) => false,
-        None if runtime.agent == "hermes" => runtime.supported == Some(true),
-        Some(_) | None => true,
-    }
+    runtime.available
+        && runtime.supported != Some(false)
+        && !matches!(runtime.agent_base.as_ref(), Some(AgentKind::Unknown(_)))
 }
 
 /// Returns whether a launchable runtime can host the assistant.
 ///
 /// Shell-backed profiles are excluded even when their profile name is not the
-/// built-in `shell` name. Legacy custom profiles without `agent_base` retain
-/// the name-based behavior used before the field existed.
+/// built-in `shell` name. Profiles without `agent_base` are excluded only by
+/// the built-in `shell` name.
 #[must_use]
 pub fn runtime_is_assistant_capable(runtime: &AgentRuntime) -> bool {
     runtime.agent != "shell"

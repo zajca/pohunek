@@ -133,6 +133,11 @@ impl RuntimeRegistry {
             .ok_or_else(|| ProtocolError::runtime_not_installed(runtime_id))
     }
 
+    /// Iterates every registered definition, ordered by runtime id.
+    pub fn definitions(&self) -> impl Iterator<Item = &Arc<RuntimeDefinition>> {
+        self.definitions.values()
+    }
+
     /// Lists every registered runtime, ordered by id.
     #[must_use]
     pub fn inventory(&self) -> Vec<InventoryEntry> {

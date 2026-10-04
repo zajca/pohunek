@@ -429,7 +429,13 @@ attach-capable session supports every observation method. Its `runtimes` entries
 are live host-local probes: `agent` is the selected profile or base name and
 optional `agent_base` identifies the compiled adapter behind it. Optional
 `version` and `supported` are a provider policy, not generic availability:
-their absence means that no version policy applies. For Hermes, `available:
+their absence means that no version policy applies. The daemon builds the
+inventory from its runtime registry: a runtime whose definition names a
+version-probe parser reports a policy, and a present runtime with a policy
+always reports `supported` as `true` or `false`. Clients derive launchability
+from the entry alone: `available` and `supported != false`; an entry with no
+`supported` has no policy, and no runtime name or `agent_base` is special-cased.
+An unavailable runtime with a policy omits both fields. For Hermes, `available:
 false` omits both fields, while an installed unparseable or non-`0.20.0`
 executable reports `supported: false`. The daemon independently enforces the
 same policy immediately before every Hermes launch or recovery rather than
