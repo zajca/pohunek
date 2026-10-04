@@ -178,8 +178,12 @@ impl From<NativeArgs> for Vec<NativeArg> {
 /// declares the reference kind. The spec is frozen into persisted session
 /// snapshots so recovery uses the launch-time shape even after the host
 /// profile changes.
+///
+/// Deserialization runs the same invariants as [`NativeSessionLaunch::with_assigned`],
+/// so a stored spec that pairs an assignment with a non-id reference kind does
+/// not load.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "StoredNativeSessionLaunch")]
 pub struct NativeSessionLaunch {
     reference_kind: SessionRefKind,
     resume_args: NativeArgs,
@@ -190,6 +194,30 @@ pub struct NativeSessionLaunch {
     /// none, and this keeps the persisted binding small.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     assigned: Option<Box<AssignedReference>>,
+}
+
+/// Plain stored form of a [`NativeSessionLaunch`], validated on conversion.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredNativeSessionLaunch {
+    reference_kind: SessionRefKind,
+    resume_args: NativeArgs,
+    #[serde(default)]
+    fork_args: Option<NativeArgs>,
+    #[serde(default)]
+    assigned: Option<Box<AssignedReference>>,
+}
+
+impl TryFrom<StoredNativeSessionLaunch> for NativeSessionLaunch {
+    type Error = NativeLaunchError;
+
+    fn try_from(stored: StoredNativeSessionLaunch) -> Result<Self, Self::Error> {
+        let spec = Self::new(stored.reference_kind, stored.resume_args, stored.fork_args);
+        match stored.assigned {
+            Some(assigned) => spec.with_assigned(*assigned),
+            None => Ok(spec),
+        }
+    }
 }
 
 impl NativeSessionLaunch {
@@ -503,5 +531,17 @@ mod tests {
         );
         let plain = serde_json::to_string(&launch(None)).expect("encode");
         assert!(!plain.contains("assigned"));
+    }
+
+    #[test]
+    fn a_stored_spec_pairing_an_assignment_with_a_path_kind_does_not_decode() {
+        let corrupt = r#"{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}"#;
+        serde_json::from_str::<NativeSessionLaunch>(corrupt)
+            .expect_err("an assignment needs an id reference kind");
+        let valid = corrupt.replace("\"path\"", "\"id\"");
+        assert!(serde_json::from_str::<NativeSessionLaunch>(&valid)
+            .expect("an id spec with an assignment decodes")
+            .assigned()
+            .is_some());
     }
 }

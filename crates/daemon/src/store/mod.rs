@@ -1870,6 +1870,23 @@ mod tests {
     }
 
     #[test]
+    fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
+        let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
+        let corrupt = concat!(
+            r#"{"kind":"resume","session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
+            r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
+            r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
+            "\n"
+        );
+        write_private(store.path(), corrupt);
+        assert!(
+            store.load_resume().expect("load").is_empty(),
+            "an assignment on a path-kind spec must not load as a binding"
+        );
+    }
+
+    #[test]
     fn resume_line_with_removed_mode_fields_loads_as_non_recoverable() {
         let store = Store::new(temp_store_path("resume-removed-fields"));
         let old = concat!(
