@@ -920,8 +920,8 @@ pub struct TerminalCursor {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "SessionRuntimeIdentity.ts"))]
 pub struct SessionRuntimeIdentity {
-    /// PTY runtime identifier.
-    runtime_id: String,
+    /// Worker instance identifier.
+    worker_instance_id: String,
     /// Monotonic logical-session generation for this runtime.
     runtime_generation: RuntimeGeneration,
 }
@@ -934,11 +934,12 @@ impl<'de> Deserialize<'de> for SessionRuntimeIdentity {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct WireIdentity {
-            runtime_id: String,
+            worker_instance_id: String,
             runtime_generation: RuntimeGeneration,
         }
         let wire = WireIdentity::deserialize(deserializer)?;
-        Self::new(wire.runtime_id, wire.runtime_generation).map_err(serde::de::Error::custom)
+        Self::new(wire.worker_instance_id, wire.runtime_generation)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -950,21 +951,25 @@ impl SessionRuntimeIdentity {
     /// Returns [`ObservationParamsError::InvalidIdentifier`] for an empty or
     /// control-bearing runtime identifier.
     pub fn new(
-        runtime_id: impl Into<String>,
+        worker_instance_id: impl Into<String>,
         runtime_generation: RuntimeGeneration,
     ) -> Result<Self, ObservationParamsError> {
-        let runtime_id = runtime_id.into();
-        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_WORKER_INSTANCE_ID_BYTES)?;
+        let worker_instance_id = worker_instance_id.into();
+        validate_bounded_identifier(
+            &worker_instance_id,
+            "worker_instance_id",
+            MAX_WORKER_INSTANCE_ID_BYTES,
+        )?;
         Ok(Self {
-            runtime_id,
+            worker_instance_id,
             runtime_generation,
         })
     }
 
-    /// Returns the PTY runtime identifier.
+    /// Returns the worker instance identifier.
     #[must_use]
-    pub fn runtime_id(&self) -> &str {
-        &self.runtime_id
+    pub fn worker_instance_id(&self) -> &str {
+        &self.worker_instance_id
     }
 
     /// Returns the logical-session runtime generation.
@@ -1379,7 +1384,7 @@ impl<'de> Deserialize<'de> for SessionOutputResult {
         #[serde(deny_unknown_fields)]
         struct WireResult {
             session_id: SessionId,
-            runtime_id: String,
+            worker_instance_id: String,
             runtime_generation: RuntimeGeneration,
             history_start_offset: OutputOffset,
             start_offset: OutputOffset,
@@ -1393,7 +1398,7 @@ impl<'de> Deserialize<'de> for SessionOutputResult {
         }
 
         let wire = WireResult::deserialize(deserializer)?;
-        let runtime = SessionRuntimeIdentity::new(wire.runtime_id, wire.runtime_generation)
+        let runtime = SessionRuntimeIdentity::new(wire.worker_instance_id, wire.runtime_generation)
             .map_err(serde::de::Error::custom)?;
         Self::new(
             wire.session_id,
@@ -1664,8 +1669,8 @@ pub struct SessionWaitResult {
 pub struct SessionReportNativeIdParams {
     /// The pohunek session id the agent was launched under.
     session_id: SessionId,
-    /// Runtime identity that received the report.
-    runtime_id: String,
+    /// Worker instance that received the report.
+    worker_instance_id: String,
     /// Agent profile name reporting its native session id.
     agent: String,
     /// Reporting process identifier.
@@ -1697,7 +1702,7 @@ impl SessionReportNativeIdParams {
     )]
     pub fn new(
         session_id: SessionId,
-        runtime_id: impl Into<String>,
+        worker_instance_id: impl Into<String>,
         agent: impl Into<String>,
         pid: u32,
         pid_start_identity: ProcessStartIdentity,
@@ -1706,11 +1711,15 @@ impl SessionReportNativeIdParams {
         native_session_id: impl Into<String>,
         transcript_path: Option<String>,
     ) -> Result<Self, ObservationParamsError> {
-        let runtime_id = runtime_id.into();
+        let worker_instance_id = worker_instance_id.into();
         let agent = agent.into();
         let expires_at = expires_at.into();
         let native_session_id = native_session_id.into();
-        validate_bounded_identifier(&runtime_id, "runtime_id", MAX_WORKER_INSTANCE_ID_BYTES)?;
+        validate_bounded_identifier(
+            &worker_instance_id,
+            "worker_instance_id",
+            MAX_WORKER_INSTANCE_ID_BYTES,
+        )?;
         validate_identifier(&agent, "agent")?;
         validate_identifier(&native_session_id, "native_session_id")?;
         if pid == 0 {
@@ -1719,7 +1728,7 @@ impl SessionReportNativeIdParams {
         validate_timestamp(&expires_at, "expires_at")?;
         Ok(Self {
             session_id,
-            runtime_id,
+            worker_instance_id,
             agent,
             pid,
             pid_start_identity,
@@ -1736,10 +1745,10 @@ impl SessionReportNativeIdParams {
         &self.session_id
     }
 
-    /// Returns the exact PTY runtime identifier.
+    /// Returns the exact worker instance identifier.
     #[must_use]
-    pub fn runtime_id(&self) -> &str {
-        &self.runtime_id
+    pub fn worker_instance_id(&self) -> &str {
+        &self.worker_instance_id
     }
 
     /// Returns the reporting agent profile.
@@ -1794,7 +1803,7 @@ impl<'de> Deserialize<'de> for SessionReportNativeIdParams {
         #[serde(deny_unknown_fields)]
         struct WireParams {
             session_id: SessionId,
-            runtime_id: String,
+            worker_instance_id: String,
             agent: String,
             pid: u32,
             pid_start_identity: ProcessStartIdentity,
@@ -1807,7 +1816,7 @@ impl<'de> Deserialize<'de> for SessionReportNativeIdParams {
         let wire = WireParams::deserialize(deserializer)?;
         Self::new(
             wire.session_id,
-            wire.runtime_id,
+            wire.worker_instance_id,
             wire.agent,
             wire.pid,
             wire.pid_start_identity,
@@ -1824,7 +1833,7 @@ impl std::fmt::Debug for SessionReportNativeIdParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionReportNativeIdParams")
             .field("session_id", &self.session_id)
-            .field("runtime_id", &self.runtime_id)
+            .field("worker_instance_id", &self.worker_instance_id)
             .field("agent", &self.agent)
             .field("pid", &self.pid)
             .field("pid_start_identity", &self.pid_start_identity)
@@ -2050,10 +2059,10 @@ pub struct RuntimeInventoryEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub worker_id: Option<String>,
-    /// Current PTY generation identity, when present.
+    /// Current worker instance identity, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub runtime_id: Option<String>,
+    pub worker_instance_id: Option<String>,
     /// Fail-closed discovery classification.
     pub status: RuntimeInventoryStatus,
     /// Stable machine-readable explanation for non-managed entries.
@@ -2093,10 +2102,10 @@ pub struct SessionRuntime {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub worker_id: Option<String>,
-    /// PTY generation identity, when one is known.
+    /// Worker instance identity, when one is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub runtime_id: Option<String>,
+    pub worker_instance_id: Option<String>,
     /// Timestamp at which this runtime generation started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -2447,11 +2456,11 @@ pub struct SessionNativeRecoveredEvent {
     /// Runtime generation replaced by the explicit recovery, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub previous_runtime_id: Option<String>,
+    pub previous_worker_instance_id: Option<String>,
     /// Newly-created runtime generation, when the active backend exposes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub runtime_id: Option<String>,
+    pub worker_instance_id: Option<String>,
 }
 
 /// Payload for an `agent_state` event.
@@ -3159,12 +3168,12 @@ mod tests {
     fn native_recovered_event_round_trips_runtime_generations() {
         let payload = SessionNativeRecoveredEvent {
             session: session("s-1"),
-            previous_runtime_id: Some("runtime-old".to_owned()),
-            runtime_id: Some("runtime-new".to_owned()),
+            previous_worker_instance_id: Some("runtime-old".to_owned()),
+            worker_instance_id: Some("runtime-new".to_owned()),
         };
         let value = serde_json::to_value(&payload).expect("serialize recovery event");
-        assert_eq!(value["previous_runtime_id"], "runtime-old");
-        assert_eq!(value["runtime_id"], "runtime-new");
+        assert_eq!(value["previous_worker_instance_id"], "runtime-old");
+        assert_eq!(value["worker_instance_id"], "runtime-new");
         assert_eq!(
             serde_json::from_value::<SessionNativeRecoveredEvent>(value)
                 .expect("parse recovery event"),
@@ -3191,7 +3200,7 @@ mod tests {
             "activity": AgentActivity::Working,
             "source": StateSource::Report,
             "runtime": {
-                "runtime_id": "runtime-1",
+                "worker_instance_id": "runtime-1",
                 "runtime_generation": "2"
             },
             "activity_epoch": "d-epoch-1",

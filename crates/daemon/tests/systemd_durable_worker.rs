@@ -292,7 +292,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         .as_deref()
         .expect("recovered worker id");
     let recovered_worker_instance_id = recovered_runtime
-        .runtime_id
+        .worker_instance_id
         .as_deref()
         .expect("recovered runtime id");
     assert_eq!(recovered.id.0, fixture.session_id);
@@ -700,7 +700,7 @@ impl Fixture {
                 state: RuntimeState::Live,
                 runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: Some(worker_id.to_owned()),
-                runtime_id: Some(worker_instance_id.to_owned()),
+                worker_instance_id: Some(worker_instance_id.to_owned()),
                 started_at: Some(now.clone()),
                 last_connected_at: Some(now.clone()),
                 loss_reason: None,
@@ -970,7 +970,7 @@ fn assert_runtime(info: &SessionInfo, child_pid: u32, worker_id: &str, worker_in
         info.id.0
     );
     assert_eq!(
-        runtime.runtime_id.as_deref(),
+        runtime.worker_instance_id.as_deref(),
         Some(worker_instance_id),
         "session {} runtime ID",
         info.id.0

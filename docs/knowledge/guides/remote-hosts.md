@@ -9,7 +9,7 @@ intents: [setup, project, debug, help]
 
 # Remote Hosts
 
-This guide documents the current protocol-v3 owner path over configured
+This guide documents the current protocol-v4 owner path over configured
 overlays. The [optional team relay](../concepts/team-relay.md) has an
 implemented authentication and credential foundation, including native `pohunek
 relay` commands, but it provides no remote-host enrollment, routing, attach, or
@@ -62,7 +62,7 @@ notification create, update, and delete events as they arrive.
 A remote daemon outage does not imply that its sessions stopped. Per-session
 workers continue on that host, but clients cannot attach until the replacement
 daemon completes reconciliation and becomes ready. After reconnection, inspect
-`runtime.state`, `worker_id`, and `runtime_id`; `live` with the same runtime id
+`runtime.state`, `worker_id`, and `worker_instance_id`; `live` with the same runtime id
 is continuity, while `lost` means the remote PTY generation is gone.
 
 Policy and retention commands can also fan out with `--all-hosts`:
@@ -126,7 +126,7 @@ macOS-specific routing, bridging, or relay mode.
   capped exponential backoff, and resynchronize from a fresh snapshot. A
   request that failed while the host was unreachable is never replayed on the
   new connection, so a session is not created twice and committed input is not
-  sent again. After wake, compare `runtime_id` before and after: the same id
+  sent again. After wake, compare `worker_instance_id` before and after: the same id
   is continuity.
 - **Troubleshooting.** Run `netbird status` in the same shell. If the daemon
   logged `overlay CLI missing; listener disabled`, fix the CLI lookup above and

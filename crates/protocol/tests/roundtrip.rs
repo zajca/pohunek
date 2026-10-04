@@ -26,17 +26,18 @@ use protocol::{
     OwnerRevision, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
     ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
     QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
-    RuntimeRef, SessionAttachParams, SessionAttachResult, SessionCapabilities, SessionDetachParams,
-    SessionDetachResult, SessionDetectionParams, SessionDetectionResult, SessionForkParams,
-    SessionForkResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams, SessionOutputGap,
-    SessionOutputParams, SessionOutputResult, SessionReadFormat, SessionReadParams,
-    SessionReadResult, SessionReadSource, SessionReleaseAgentParams, SessionReleaseAgentResult,
-    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
-    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    RuntimeInventoryEntry, RuntimeRef, SessionAttachParams, SessionAttachResult,
+    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
+    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
+    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
+    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
+    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
+    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
     ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId, TerminalCursor,
     TerminalDimensions, TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate,
     TransferOutcomeId, TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES,
@@ -78,7 +79,7 @@ fn governance_id(prefix: &str) -> String {
 )]
 fn output_result(
     session_id: String,
-    runtime_id: String,
+    worker_instance_id: String,
     data_base64: String,
     history_start: u64,
     start: u64,
@@ -89,7 +90,7 @@ fn output_result(
 ) -> Result<SessionOutputResult, ObservationParamsError> {
     SessionOutputResult::new(
         SessionId(session_id),
-        SessionRuntimeIdentity::new(runtime_id, RuntimeGeneration::new(1))?,
+        SessionRuntimeIdentity::new(worker_instance_id, RuntimeGeneration::new(1))?,
         OutputOffset::new(history_start),
         OutputOffset::new(start),
         OutputOffset::new(next),
@@ -1457,7 +1458,7 @@ fn session_input_result_json_shape_roundtrips() {
             "activity": "idle",
             "activity_source": "screen",
             "runtime": {
-                "runtime_id": "runtime-42",
+                "worker_instance_id": "runtime-42",
                 "runtime_generation": "3"
             },
             "activity_epoch": "d-epoch-1",
@@ -1581,7 +1582,7 @@ fn session_report_native_id_params_roundtrips_with_transcript_path() {
         value,
         json!({
             "session_id": "s-42",
-            "runtime_id": "runtime-42",
+            "worker_instance_id": "runtime-42",
             "agent": "claude",
             "pid": 4242,
             "pid_start_identity": "777",
@@ -1616,7 +1617,7 @@ fn session_report_native_id_params_omits_absent_transcript_path() {
         value,
         json!({
             "session_id": "s-7",
-            "runtime_id": "runtime-7",
+            "worker_instance_id": "runtime-7",
             "agent": "codex",
             "pid": 7007,
             "pid_start_identity": "700",
@@ -2253,7 +2254,7 @@ fn request_roundtrip() {
 #[test]
 fn request_missing_params_defaults_to_null() {
     // A parameterless method may omit `params` entirely on the wire.
-    let raw = r#"{"v":{"minimum":3,"maximum":3},"id":"req-1","method":"daemon.health"}"#;
+    let raw = r#"{"v":{"minimum":4,"maximum":4},"id":"req-1","method":"daemon.health"}"#;
     let req: Request = serde_json::from_str(raw).expect("deserialize");
     assert_eq!(req.method(), method::DAEMON_HEALTH);
     assert_eq!(req.params(), &Value::Null);
@@ -2332,7 +2333,7 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
             "activity": AgentActivity::Blocked,
             "source": StateSource::OscTitle,
             "runtime": {
-                "runtime_id": "runtime-42",
+                "worker_instance_id": "runtime-42",
                 "runtime_generation": "3"
             },
             "activity_epoch": "d-epoch-1",
@@ -2355,7 +2356,7 @@ fn agent_state_event_carries_activity_in_flattened_payload() {
             "activity": "blocked",
             "source": "osc_title",
             "runtime": {
-                "runtime_id": "runtime-42",
+                "worker_instance_id": "runtime-42",
                 "runtime_generation": "3"
             },
             "activity_epoch": "d-epoch-1",
@@ -2395,7 +2396,7 @@ fn event_with_id_roundtrip() {
 
 #[test]
 fn request_unknown_fields_are_rejected() {
-    let raw = r#"{"v":{"minimum":3,"maximum":3},"id":"req-1","method":"daemon.health","params":null,"future_field":true}"#;
+    let raw = r#"{"v":{"minimum":4,"maximum":4},"id":"req-1","method":"daemon.health","params":null,"future_field":true}"#;
     serde_json::from_str::<Request>(raw).expect_err("unknown request field must fail");
 }
 
@@ -2514,7 +2515,7 @@ fn version_mismatch_message_names_both_versions_and_recover_hint() {
 fn protocol_version_serializes_as_bare_integer() {
     // The `v` field must be a plain integer on the wire, not an object.
     let line = serde_json::to_string(&PROTOCOL_VERSION).expect("serialize");
-    assert_eq!(line, "3");
+    assert_eq!(line, "4");
 }
 
 #[test]
@@ -2840,7 +2841,7 @@ fn session_screen_contract_has_exact_wire_shape() {
     let expected = json!({
         "session_id": "s-42",
         "worker_id": "worker-1",
-        "runtime_id": "runtime-1",
+        "worker_instance_id": "runtime-1",
         "runtime_generation": "2",
         "watermark": "9007199254740993",
         "dimensions": {"cols": 120, "rows": 40},
@@ -2886,7 +2887,7 @@ fn session_output_contract_covers_tail_cursor_gap_and_validation() {
     let cursor_json = json!({
         "session_id": "s-42",
         "runtime": {
-            "runtime_id": "runtime-1",
+            "worker_instance_id": "runtime-1",
             "runtime_generation": "9007199254740993"
         },
         "after_offset": "9007199254740994",
@@ -2923,7 +2924,7 @@ fn session_output_contract_covers_tail_cursor_gap_and_validation() {
         value,
         json!({
             "session_id": "s-42",
-            "runtime_id": "runtime-1",
+            "worker_instance_id": "runtime-1",
             "runtime_generation": "9007199254740993",
             "history_start_offset": "20",
             "start_offset": "20",
@@ -2963,7 +2964,7 @@ fn session_output_params_reject_invalid_limits_and_cursor_shapes() {
         json!({"session_id":"s-42","max_bytes":1,"wait_ms":1}),
         json!({
             "session_id":"s-42",
-            "runtime":{"runtime_id":"runtime-1","runtime_generation":"1"},
+            "runtime":{"worker_instance_id":"runtime-1","runtime_generation":"1"},
             "after_offset":"0",
             "max_bytes":1,
             "wait_ms": MAX_SESSION_WAIT_MS + 1
@@ -3027,7 +3028,7 @@ fn session_read_contract_uses_decimal_revision_and_exact_wire_shape() {
     let expected = json!({
         "text": "one\ntwo",
         "source_used": "visible",
-        "runtime_id": "runtime-1",
+        "worker_instance_id": "runtime-1",
         "runtime_generation": "9007199254740993",
         "revision": "9007199254740994",
         "alternate_screen": false,
@@ -3178,14 +3179,14 @@ fn session_output_result_rejects_gap_flag_and_identifier_invariants() {
             false,
         ),
         Err(ObservationParamsError::IdentifierTooLong {
-            field: "runtime_id",
+            field: "worker_instance_id",
             ..
         })
     ));
 
     serde_json::from_value::<SessionOutputResult>(json!({
         "session_id": "s-42",
-        "runtime_id": "runtime-1",
+        "worker_instance_id": "runtime-1",
         "runtime_generation": "1",
         "history_start_offset": "0",
         "start_offset": "0",
@@ -3215,7 +3216,7 @@ fn session_wait_contract_covers_predicates_reasons_and_validation() {
     .expect("valid wait request");
     let expected = json!({
         "session_id": "s-42",
-        "runtime": {"runtime_id": "runtime-1", "runtime_generation": "2"},
+        "runtime": {"worker_instance_id": "runtime-1", "runtime_generation": "2"},
         "after_updated_at": "2026-08-04T10:00:00Z",
         "after_terminal_watermark": "7",
         "after_output_offset": "8",
@@ -3282,7 +3283,7 @@ fn session_wait_contract_covers_predicates_reasons_and_validation() {
 fn native_report_and_error_payloads_reject_unknown_or_invalid_fields() {
     let valid = json!({
         "session_id": "s-42",
-        "runtime_id": "runtime-42",
+        "worker_instance_id": "runtime-42",
         "agent": "codex",
         "pid": 42,
         "pid_start_identity": "7",
@@ -3309,7 +3310,7 @@ fn native_report_and_error_payloads_reject_unknown_or_invalid_fields() {
     }))
     .expect_err("unknown error payload field must fail");
     serde_json::from_value::<Response>(json!({
-        "v": 3,
+        "v": 4,
         "id": "req-1",
         "err": {"class":"runtime","code":"x","msg":"redacted"},
         "data_base64": "secret"
@@ -3439,7 +3440,7 @@ fn m1_observation_errors_are_stable_and_payload_free() {
     assert_eq!(
         serde_json::to_value(response).expect("serialize redacted error envelope"),
         json!({
-            "v": 3,
+            "v": 4,
             "id": "req-runtime-change",
             "err": {
                 "class": "runtime",
@@ -3771,7 +3772,7 @@ fn host_capabilities_ignores_unknown_fields_for_additive_evolution() {
     // A newer host may add capability fields; an older peer must still parse it.
     let raw = r#"{
         "daemon_version": "0.2.0",
-        "protocol_version": 3,
+        "protocol_version": 4,
         "supported_agents": ["shell"],
         "runtimes": [],
         "git_available": false,
@@ -5106,4 +5107,107 @@ fn session_remove_accepting_unconfirmed_is_an_additive_method_with_the_remove_sh
     assert_eq!(remove.params_ts, "SessionId");
     assert_eq!(accepting.params_ts, remove.params_ts);
     assert_eq!(accepting.output_ts, remove.output_ts);
+}
+
+#[test]
+fn protocol_version_four_rejects_a_version_three_peer() {
+    assert_eq!(PROTOCOL_VERSION.get(), 4);
+    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.minimum().get(), 4);
+    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.maximum().get(), 4);
+
+    let previous = ProtocolVersion::new(3).expect("valid version");
+    let old_client = ProtocolVersionRange::new(previous, previous).expect("ordered range");
+    let err = negotiate(old_client, SUPPORTED_PROTOCOL_VERSIONS)
+        .expect_err("a version 3 client has no overlap with version 4");
+    assert_eq!(err.class, ErrorClass::Daemon);
+    assert_eq!(err.code, "version_mismatch");
+    assert!(
+        err.msg.contains('3') && err.msg.contains('4'),
+        "the error names both ranges: {}",
+        err.msg
+    );
+    assert!(err.recover.is_some(), "mismatch should suggest a recovery");
+
+    let straddling = ProtocolVersionRange::new(previous, PROTOCOL_VERSION).expect("ordered range");
+    assert_eq!(
+        negotiate(straddling, SUPPORTED_PROTOCOL_VERSIONS).expect("ranges overlap"),
+        PROTOCOL_VERSION
+    );
+}
+
+#[test]
+fn strict_wire_types_reject_the_old_runtime_id_key() {
+    serde_json::from_value::<SessionRuntimeIdentity>(
+        json!({"runtime_id": "runtime-1", "runtime_generation": "1"}),
+    )
+    .expect_err("the old identity key must not be read");
+
+    let native_report = json!({
+        "session_id": "s-42",
+        "runtime_id": "runtime-42",
+        "agent": "codex",
+        "pid": 42,
+        "pid_start_identity": "7",
+        "sequence": "1",
+        "expires_at": "2026-08-04T10:00:00Z",
+        "native_session_id": "native-42"
+    });
+    serde_json::from_value::<SessionReportNativeIdParams>(native_report)
+        .expect_err("the old native report key must not be read");
+
+    let output = json!({
+        "session_id": "s-42",
+        "runtime_id": "runtime-1",
+        "runtime_generation": "1",
+        "history_start_offset": "0",
+        "start_offset": "0",
+        "next_offset": "0",
+        "runtime_end_offset": "0",
+        "data_base64": "",
+        "has_more": false,
+        "timed_out": false
+    });
+    serde_json::from_value::<SessionOutputResult>(output)
+        .expect_err("the old output result key must not be read");
+}
+
+#[test]
+fn worker_instance_fields_are_written_and_read_under_one_name() {
+    let runtime: SessionRuntime = serde_json::from_value(json!({
+        "state": "live",
+        "runtime_generation": "1",
+        "worker_instance_id": "runtime-1"
+    }))
+    .expect("new key parses");
+    assert_eq!(runtime.worker_instance_id.as_deref(), Some("runtime-1"));
+    let value = serde_json::to_value(&runtime).expect("serialize runtime");
+    assert_eq!(value["worker_instance_id"], "runtime-1");
+    assert!(value.get("runtime_id").is_none());
+
+    let stale: SessionRuntime = serde_json::from_value(json!({
+        "state": "live",
+        "runtime_generation": "1",
+        "runtime_id": "runtime-1"
+    }))
+    .expect("an unknown key is ignored on this open object");
+    assert_eq!(stale.worker_instance_id, None);
+
+    let entry: RuntimeInventoryEntry = serde_json::from_value(json!({
+        "runtime_slot": "slot-1",
+        "worker_instance_id": "runtime-1",
+        "status": "managed"
+    }))
+    .expect("new inventory key parses");
+    assert_eq!(entry.worker_instance_id.as_deref(), Some("runtime-1"));
+    let value = serde_json::to_value(&entry).expect("serialize inventory entry");
+    assert_eq!(value["worker_instance_id"], "runtime-1");
+    assert!(value.get("runtime_id").is_none());
+
+    let stale: RuntimeInventoryEntry = serde_json::from_value(json!({
+        "runtime_slot": "slot-1",
+        "runtime_id": "runtime-1",
+        "status": "managed"
+    }))
+    .expect("an unknown key is ignored on this open object");
+    assert_eq!(stale.worker_instance_id, None);
 }

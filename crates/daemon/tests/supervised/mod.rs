@@ -576,7 +576,7 @@ impl Installation {
             child: self.identity(info.pid).expect("PTY child is running"),
             tty: tty(info.pid),
             worker_id: runtime.worker_id.clone().expect("worker id"),
-            worker_instance_id: runtime.runtime_id.clone().expect("runtime id"),
+            worker_instance_id: runtime.worker_instance_id.clone().expect("runtime id"),
         }
     }
 
@@ -714,7 +714,7 @@ impl Installation {
                 state: runtime.state,
                 runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: runtime.worker_id.clone(),
-                runtime_id: runtime.worker_instance_id.clone(),
+                worker_instance_id: runtime.worker_instance_id.clone(),
                 started_at: Some(now.clone()),
                 last_connected_at: Some(now.clone()),
                 loss_reason: runtime.reason.clone(),

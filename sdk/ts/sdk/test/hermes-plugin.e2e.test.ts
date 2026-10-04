@@ -163,7 +163,7 @@ async function runHermesPluginScenario(daemon: PluginDaemonHarness): Promise<voi
   const result = parseFixtureResult(fixture.stdout);
   expect(result.ok).toBe(true);
   expect(result.logical_id_present).toBe(true);
-  expect(result.runtime_id_present).toBe(true);
+  expect(result.worker_instance_id_present).toBe(true);
   expect(result.tools_exercised).toBe(16);
   expect(result.origin_denials).toBe(8);
   expect(result.hermes_resume).toBe(true);
@@ -340,7 +340,7 @@ function requireIdentifier(value: unknown, label: string): string {
 interface FixtureResult {
   readonly ok: boolean;
   readonly logical_id_present: boolean;
-  readonly runtime_id_present: boolean;
+  readonly worker_instance_id_present: boolean;
   readonly tools_exercised: number;
   readonly origin_denials: number;
   readonly hermes_resume: boolean;
@@ -373,7 +373,7 @@ function parseFixtureResult(stdout: string): FixtureResult {
     !isRecord(parsed)
     || typeof parsed["ok"] !== "boolean"
     || typeof parsed["logical_id_present"] !== "boolean"
-    || typeof parsed["runtime_id_present"] !== "boolean"
+    || typeof parsed["worker_instance_id_present"] !== "boolean"
     || typeof parsed["tools_exercised"] !== "number"
     || typeof parsed["origin_denials"] !== "number"
     || typeof parsed["hermes_resume"] !== "boolean"
@@ -386,7 +386,7 @@ function parseFixtureResult(stdout: string): FixtureResult {
   return {
     ok: parsed["ok"],
     logical_id_present: parsed["logical_id_present"],
-    runtime_id_present: parsed["runtime_id_present"],
+    worker_instance_id_present: parsed["worker_instance_id_present"],
     tools_exercised: parsed["tools_exercised"],
     origin_denials: parsed["origin_denials"],
     hermes_resume: parsed["hermes_resume"],

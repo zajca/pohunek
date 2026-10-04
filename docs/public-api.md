@@ -15,11 +15,11 @@ Source of truth:
   `crates/assistant`
 - Daemon dispatch behavior: `crates/daemon/src/api`
 
-## Status: Shipped v3, Implemented Relay Foundation, and Deferred Relay Evolution
+## Status: Shipped v4, Implemented Relay Foundation, and Deferred Relay Evolution
 
-### Shipped now: protocol v3 owner paths
+### Shipped now: protocol v4 owner paths
 
-Protocol v3 is the implemented contract. Local clients connect through the
+Protocol v4 is the implemented contract. Local clients connect through the
 owner-only Unix socket, direct remote clients connect through a configured
 overlay such as NetBird, and browser clients can use a transparent WebSocket
 relay speaking the transport contract described below (the web control center,
@@ -28,16 +28,16 @@ the existing owner trust domain. Such a relay maps one WebSocket to one
 daemon connection; it is not a team service, authentication authority, state
 aggregator, or public `pohunek-relayd` implementation.
 
-Version 3 also ships host-local stable identity and safe governance inspection.
+Version 4 also ships host-local stable identity and safe governance inspection.
 It does not ship a relay connection, relay-local transport, enrollment or owner
 mutation RPC, team WebUI, share API, or public transfer API. Existing local,
 direct-overlay and owner-path browser relay paths remain owner-only
 and unchanged.
 
-### Implemented relay foundation outside protocol v3
+### Implemented relay foundation outside protocol v4
 
 `pohunek-relayd` is an independently configured HTTPS authority, backed by
-PostgreSQL. It is not a `pohunekd` protocol-v3 endpoint and it does not add a
+PostgreSQL. It is not a `pohunekd` protocol-v4 endpoint and it does not add a
 host link, routing, attach, or team WebUI. The implemented bounded surface
 includes liveness/readiness, generic OIDC browser Authorization Code with PKCE
 and device authorization, account and credential lifecycle, account linking, and
@@ -145,7 +145,7 @@ Failures use the relay's HTTP error contract with a stable `code`:
 ### Deferred optional team relay
 
 The [team relay RFC](design/team-relay-control-plane-rfc.md) defines the next
-extension. Its host-link and team API are not part of the shipped protocol-v3
+extension. Its host-link and team API are not part of the shipped protocol-v4
 contract. The extension keeps local Unix and direct overlay owner
 paths unchanged and adds a separate Rust `pohunek-relayd` authority. A host will
 initiate an authenticated userspace WireGuard tunnel and every control and
@@ -158,7 +158,7 @@ not add an API to this document before its owning issues ship. The coordinated
 protocol-v4 cutover in [#70](https://github.com/zajca/pohunek/issues/70) will
 add the authenticated host link, `HostShare` coordinates, immutable session
 origin, atomic host snapshots, and host-initiated attach streams. There will be
-no v3 relay compatibility shim and no change to the direct-owner trust domain.
+no v4 relay compatibility shim and no change to the direct-owner trust domain.
 The dependency path after the completed reduced [#85](https://github.com/zajca/pohunek/issues/85) is
 [#107](https://github.com/zajca/pohunek/issues/107) and
 [#108](https://github.com/zajca/pohunek/issues/108) →
@@ -176,8 +176,8 @@ the accepted team relay has shipped.
 
 ## Compatibility Model
 
-The current public protocol version is `3` (`PROTOCOL_VERSION`), and this build
-supports the inclusive range `3..=3` (`SUPPORTED_PROTOCOL_VERSIONS`). Requests
+The current public protocol version is `4` (`PROTOCOL_VERSION`), and this build
+supports the inclusive range `4..=4` (`SUPPORTED_PROTOCOL_VERSIONS`). Requests
 carry `v: {minimum, maximum}`. The first valid response selects the highest
 overlapping version as an integer `v`, and that selection is fixed for the
 lifetime of the connection. Subscription events use the same selected version.
@@ -191,8 +191,21 @@ be upgraded together; no v2 compatibility shim is provided.
 The former exact integer request envelope is deliberately rejected. The
 historical protocol-v2 transition was the one-time move from integer-v1 to
 range negotiation; it provided no v1 envelope or notification-policy shim.
-Current protocol-v3 components likewise require a coordinated upgrade from v2
-because this build supports only `3..=3`.
+The protocol-v3 transition likewise required a coordinated upgrade from v2.
+
+Protocol v4 renames the public worker instance identifier from `runtime_id` to
+`worker_instance_id` on `SessionRuntimeIdentity` (and therefore the flat
+`runtime_id` of the output, screen and read results and the `runtime` objects of
+their params), `SessionRuntime`, `RuntimeInventoryEntry`,
+`SessionReportNativeIdParams`, and `SessionNativeRecoveredEvent` (including
+`previous_runtime_id`, now `previous_worker_instance_id`). `RuntimeId` keeps its
+agent-runtime meaning. A v3 client that sends its range `3..=3` to a v4 daemon
+(or the reverse) receives `daemon/version_mismatch` before any method runs, so
+it never sees a renamed field; there is no `runtime_id` alias on the public wire.
+Every daemon, CLI, SDK, managed hook and Hermes plugin must be upgraded
+together. Managed hook assets carry `POHUNEK_INTEGRATION_VERSION=9`; an asset of
+an earlier version still sends the old key, so `integration.status` reports it
+`outdated` and `integration.doctor` as an asset finding until it is reinstalled.
 
 Clients should call `daemon.health` after opening a control connection to learn
 the daemon build version and protocol version, but `daemon.health` is not a
@@ -279,7 +292,7 @@ Bun-only implementation of it used by the SDK transport tests.
 ### Request
 
 ```json
-{"v":{"minimum":3,"maximum":3},"id":"req-7f3","method":"session.list","params":{}}
+{"v":{"minimum":4,"maximum":4},"id":"req-7f3","method":"session.list","params":{}}
 ```
 
 Fields:
@@ -324,14 +337,14 @@ authentication or a broader mutation policy.
 Successful response:
 
 ```json
-{"v":3,"id":"req-7f3","ok":{"status":"ok"}}
+{"v":4,"id":"req-7f3","ok":{"status":"ok"}}
 ```
 
 Error response:
 
 ```json
 {
-  "v": 3,
+  "v": 4,
   "id": "req-7f3",
   "err": {
     "class": "daemon",
@@ -351,7 +364,7 @@ Events are pushed only after a successful `subscribe` request. They are also
 newline-delimited JSON, one event per line:
 
 ```json
-{"v":3,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title"}
+{"v":4,"event":"agent_state","session_id":"s-42","activity":"blocked","source":"osc_title"}
 ```
 
 Event payload fields are flattened at the top level beside `v`, `event`, and the
@@ -581,7 +594,7 @@ Important fields:
   sessions and peers predating worker-backed sessions. `runtime_generation` is
   a canonical unsigned decimal JSON string, not a JSON number. `runtime.state` is
   `starting`, `live`, `reconnecting`, `terminal`, `lost`, `conflict`, or
-  `incompatible`; `worker_id` identifies the PTY owner and `runtime_id`
+  `incompatible`; `worker_id` identifies the PTY owner and `worker_instance_id`
   identifies the PTY generation. `started_at`, `last_connected_at`, and
   `loss_reason` are optional. Daemon reconnection preserves both identities;
   explicit native recovery changes them.
@@ -689,7 +702,7 @@ omitted):
 {
   "session_id": "s-42",
   "worker_id": "worker-1",
-  "runtime_id": "runtime-1",
+  "worker_instance_id": "runtime-1",
   "runtime_generation": "3",
   "watermark": "7",
   "dimensions": {"cols": 80, "rows": 24},
@@ -785,13 +798,13 @@ requires its exact runtime identity, and `wait_ms` requires a cursor:
 ```
 
 The initial-tail request deliberately has no runtime or offset. Persist the
-returned `runtime_id`, `runtime_generation`, and `next_offset` before issuing a
+returned `worker_instance_id`, `runtime_generation`, and `next_offset` before issuing a
 cursor-based read:
 
 ```json
 {
   "session_id": "s-42",
-  "runtime": {"runtime_id": "runtime-1", "runtime_generation": "3"},
+  "runtime": {"worker_instance_id": "runtime-1", "runtime_generation": "3"},
   "after_offset": "2",
   "max_bytes": 65536,
   "wait_ms": 5000
@@ -803,7 +816,7 @@ The result returns standard base64 and every cursor needed to continue:
 ```json
 {
   "session_id": "s-42",
-  "runtime_id": "runtime-1",
+  "worker_instance_id": "runtime-1",
   "runtime_generation": "3",
   "history_start_offset": "4",
   "start_offset": "4",
@@ -835,7 +848,7 @@ be empty:
 ```json
 {
   "session_id": "s-42",
-  "runtime": {"runtime_id": "runtime-1", "runtime_generation": "3"},
+  "runtime": {"worker_instance_id": "runtime-1", "runtime_generation": "3"},
   "after_updated_at": "2026-08-04T10:00:00Z",
   "after_terminal_watermark": "7",
   "after_output_offset": "8",
@@ -938,7 +951,7 @@ nothing else can shadow them:
 - `POHUNEK_SESSION_ID`
 - `POHUNEK_WORKER_ID`
 - `POHUNEK_WORKER_INSTANCE_ID` (identifies one worker instance, the PTY
-  generation that the public session runtime reports as `runtime_id`)
+  generation that the public session runtime reports as `worker_instance_id`)
 - `POHUNEK_WORKER_SOCKET_PATH`
 - `POHUNEK_WORKER_HOOK_PROTOCOL_VERSION` (private worker-hook protocol version)
 - `POHUNEK_SOCKET_PATH` for daemon-targeted notification delivery
@@ -1003,7 +1016,7 @@ When the worker-private native-identity claim cannot be delivered, shipped
 Codex and Claude hooks must retain the necessary local fallback to the public
 `session.report_native_id` method. The origin-session guard deliberately allows
 this lifecycle report to target its own session. Its
-strict params are `session_id`, `runtime_id`, `agent`, non-zero `pid`, decimal
+strict params are `session_id`, `worker_instance_id`, `agent`, non-zero `pid`, decimal
 string `pid_start_identity`, decimal string monotonic `sequence`, RFC 3339
 `expires_at`, `native_session_id`, and optional `transcript_path`. The daemon
 records only an unexpired claim for the current logical session/runtime whose
@@ -1017,7 +1030,7 @@ The claim lifetime is capped at 60 seconds from receipt.
 ```json
 {
   "session_id": "s-42",
-  "runtime_id": "runtime-42",
+  "worker_instance_id": "runtime-42",
   "agent": "codex",
   "pid": 4242,
   "pid_start_identity": "7",
@@ -1034,7 +1047,7 @@ The result is exactly `{"recorded":true}` or `{"recorded":false}`.
 `pid` is the OS process id for the active nested agent. When present, the daemon
 binds the active claim to that process and clears the claim when procwatch sees
 the process exit. The shipped integration state hooks use
-`POHUNEK_INTEGRATION_VERSION=8`, run their interpreter in isolated mode (`-I`,
+`POHUNEK_INTEGRATION_VERSION=9`, run their interpreter in isolated mode (`-I`,
 so the session working directory never shadows the standard library), read the
 worker instance from `POHUNEK_WORKER_INSTANCE_ID` (falling back to
 `POHUNEK_RUNTIME_ID`), read
@@ -1439,7 +1452,7 @@ Canonical public codes currently emitted include:
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required` |
 
-Protocol v3 emits these runtime codes for provider-neutral agent and
+Protocol v4 emits these runtime codes for provider-neutral agent and
 observation behavior: `agent_kind_unsupported`,
 `agent_fork_unsupported`, `session_terminal_unavailable`,
 `session_has_no_managed_terminal`, `session_runtime_changed`,
@@ -1572,7 +1585,7 @@ and `recover` for unknown codes.
 ack:
 
 ```json
-{"v":3,"id":"sub-1","ok":{"subscribed":true}}
+{"v":4,"id":"sub-1","ok":{"subscribed":true}}
 ```
 
 The daemon then writes these events:
@@ -1587,7 +1600,7 @@ The daemon then writes these events:
 | `session_runtime_lost` | `{session: SessionInfo}` | The worker or host runtime is gone. The logical record remains visible and may support explicit recovery. |
 | `session_runtime_conflict` | `{session: SessionInfo}` | Runtime discovery found duplicate, mismatched, or otherwise ambiguous live identity. The daemon quarantines the conflict and does not kill a worker automatically. |
 | `session_runtime_discovered` | `{entry: RuntimeInventoryEntry}` | Startup reconciliation classified a discovered durable worker that is not a plainly managed runtime (orphaned, conflicting, incompatible, or identity-mismatched). Emitted once per non-managed discovery so operators can inspect quarantined runtimes. |
-| `session_native_recovered` | `{session: SessionInfo, previous_runtime_id?: string, runtime_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_runtime_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `runtime_id`. |
+| `session_native_recovered` | `{session: SessionInfo, previous_worker_instance_id?: string, worker_instance_id?: string}` | Explicit provider-native recovery created a new worker and runtime generation for the same logical session. `previous_worker_instance_id` can be absent for a one-time migrated legacy session; production worker recovery includes the new `worker_instance_id`. |
 | `agent_state` | `{session_id: SessionId, activity: AgentActivity, source: StateSource, runtime?: SessionRuntimeIdentity, activity_epoch?: string, revision?: ActivityRevision}` | Agent activity changed. `source` may be `report` when a hook report supplied explicit active-agent state. Current daemons emit `runtime`, `activity_epoch`, and decimal-string `revision`, making `(activity_epoch, runtime, revision)` exact reconnect-safe evidence rather than a hint to re-read only the latest snapshot; the fields remain additive for general v2 subscribers, while input-wait success requires them through `SessionInputResult`. |
 | `subagent_state` | `{session_id: SessionId, subagent: SubagentInfo, runtime?: SessionRuntimeIdentity}` | One provider-managed subagent changed. Current daemons emit `runtime`; clients ignore an event without a runtime identity or whose runtime id/generation does not match the session snapshot, then apply only a newer decimal-string `subagent.revision` for the same provider/id. `session.list` and `session.inspect` remain the reconnect seed through `SessionInfo.subagents`. |
 | `attach_opened` | `{session_id: SessionId, stream_id: string}` | A pending attach token was redeemed and a raw stream opened. |
@@ -1609,7 +1622,7 @@ reserve stderr for diagnostics. Success exits zero with:
 ```json
 {
   "cli_version": "0.x.y",
-  "protocol": {"minimum": 3, "maximum": 3},
+  "protocol": {"minimum": 4, "maximum": 4},
   "ok": {}
 }
 ```
@@ -1621,7 +1634,7 @@ mixed into stdout. Session output bytes are never logged; non-JSON
 preserves the exact `SessionOutputResult`.
 
 `pohunek host governance inspect <host> [--json]` is the CLI surface for the
-read-only v3 governance snapshot. Human output labels the stable `HostId`,
+read-only v4 governance snapshot. Human output labels the stable `HostId`,
 approval-key reference, never-enrolled absence, enrollment relay/status/revision,
 tagged principal-or-team owner and owner revision, and quarantine. `--json`
 emits only the public `HostGovernanceStatus` result through the normal CLI
@@ -1662,7 +1675,7 @@ payload carries the skill text and its lowercase-hex sha256 content hash:
 ```json
 {
   "cli_version": "0.x.y",
-  "protocol": {"minimum": 3, "maximum": 3},
+  "protocol": {"minimum": 4, "maximum": 4},
   "ok": {
     "skill": "<complete skill text>",
     "content_sha256": "<64 lowercase hex characters>"
@@ -1678,7 +1691,7 @@ and remote invocations print the same document.
 
 The Hermes operator plugin is a local CLI lifecycle, not a daemon public method.
 Historically, M3 did not bump the then-current public protocol v2 or add a
-Hermes-specific wire shape. Current builds use public protocol v3. The CLI
+Hermes-specific wire shape. Current builds use public protocol v4. The CLI
 embeds the plugin assets and generated skill, then installs them only into an
 explicitly selected Hermes profile or custom absolute home.
 
@@ -1760,7 +1773,7 @@ notification server is introduced.
 
 ## Attach Stream
 
-The attach byte stream is part of public protocol v3. It is not an implementation
+The attach byte stream is part of public protocol v4. It is not an implementation
 detail of the CLI.
 
 Sequence:

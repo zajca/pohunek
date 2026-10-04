@@ -120,7 +120,7 @@ class HookReporter:
         if self._safe_worker(private):
             return
         self._safe(self._send_public, "session.report_native_id", {
-            "session_id": self._session_id, "runtime_id": self._worker_instance_id, "agent": "hermes",
+            "session_id": self._session_id, "worker_instance_id": self._worker_instance_id, "agent": "hermes",
             "pid": self._pid, "pid_start_identity": str(self._start_identity), "sequence": str(sequence),
             "expires_at": expires, "native_session_id": native_id,
         })

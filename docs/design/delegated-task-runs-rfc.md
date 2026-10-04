@@ -203,7 +203,7 @@ response, up to settlement. A turn has a daemon-assigned `turn_id`
 milestone** recorded when the agent demonstrably takes the prompt up (section
 8.1):
 
-- `runtime_id`, `runtime_generation`;
+- `worker_instance_id`, `runtime_generation`;
 - the terminal watermark and output offset immediately before the input was
   written;
 - the provider turn reference, when the provider exposes one (section 9).
@@ -1441,7 +1441,7 @@ A settled turn's result is one document, bounded by `tasks.result_max_bytes`:
   ],
   "commands": [ { "command": "go test ./runner", "exit_status": 0 } ],
   "metrics": { "input_tokens": 43245, "cached_input_tokens": 1280, "output_tokens": 413, "cost": { "amount": "0.0067", "currency": "USD" } },
-  "session": { "session_id": "s-01...", "runtime_id": "runtime-1", "runtime_generation": "1" }
+  "session": { "session_id": "s-01...", "worker_instance_id": "runtime-1", "runtime_generation": "1" }
 }
 ```
 

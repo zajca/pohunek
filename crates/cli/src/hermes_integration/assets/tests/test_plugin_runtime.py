@@ -663,7 +663,7 @@ class ToolTests(unittest.TestCase):
     def test_output_decodes_base64_and_preserves_cursors(self) -> None:
         tools = Tools(policy(), None)
         runner = mock.Mock()
-        runner.run.return_value = {"session_id": "s", "runtime_id": "r", "runtime_generation": "1", "next_offset": "4", "gap": None, "data_base64": "aGn/"}
+        runner.run.return_value = {"session_id": "s", "worker_instance_id": "r", "runtime_generation": "1", "next_offset": "4", "gap": None, "data_base64": "aGn/"}
         tools._runner = runner
         result = json.loads(tools.handlers()["pohunek_session_output"]({"session": "s", "max_bytes": 16}))
         self.assertEqual(result["result"]["text"], "hi�")
@@ -709,8 +709,8 @@ class ToolTests(unittest.TestCase):
         tools = Tools(policy(), None)
         runner = mock.Mock()
         runner.run.side_effect = [
-            {"session_id": "s", "runtime_id": "r", "runtime_generation": maximum, "next_offset": maximum, "data_base64": ""},
-            {"session_id": "s", "runtime_id": "r", "runtime_generation": maximum, "next_offset": maximum, "data_base64": ""},
+            {"session_id": "s", "worker_instance_id": "r", "runtime_generation": maximum, "next_offset": maximum, "data_base64": ""},
+            {"session_id": "s", "worker_instance_id": "r", "runtime_generation": maximum, "next_offset": maximum, "data_base64": ""},
         ]
         tools._runner = runner
         first = json.loads(tools.handlers()["pohunek_session_output"]({"session": "s", "max_bytes": 16}))
@@ -783,7 +783,7 @@ class ToolTests(unittest.TestCase):
             "state": "running",
             "runtime": {
                 "state": "live",
-                "runtime_id": "r-1",
+                "worker_instance_id": "r-1",
                 "runtime_generation": "1",
             },
         }
@@ -825,7 +825,7 @@ class ToolTests(unittest.TestCase):
             "state": "running",
             "runtime": {
                 "state": "live",
-                "runtime_id": "r-1",
+                "worker_instance_id": "r-1",
                 "runtime_generation": "1",
             },
         }

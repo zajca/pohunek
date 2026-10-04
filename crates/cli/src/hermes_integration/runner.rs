@@ -1694,8 +1694,8 @@ mod tests {
         let policy_bytes = serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
             "pohunek_cli": cli,
-            "protocol_min": 3,
-            "protocol_max": 3,
+            "protocol_min": protocol::PROTOCOL_VERSION.get(),
+            "protocol_max": protocol::PROTOCOL_VERSION.get(),
             "access_mode": "full",
             "allowed_hosts": ["local"],
             "tool_timeout_ms": 1_000,
@@ -2202,8 +2202,8 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
                 "pohunek_cli": stage.policy.parent().expect("policy parent").parent().expect("fixture root").join("pohunek"),
-                "protocol_min": 3,
-                "protocol_max": 3,
+                "protocol_min": protocol::PROTOCOL_VERSION.get(),
+                "protocol_max": protocol::PROTOCOL_VERSION.get(),
                 "access_mode": "full",
                 "allowed_hosts": ["local"],
                 "tool_timeout_ms": 1_000,
@@ -2223,7 +2223,10 @@ mod tests {
             .join("pohunek");
         write_executable(
             &cli,
-            "printf '%s\\n' '{\"protocol\":{\"minimum\":3,\"maximum\":3},\"ok\":{}}'",
+            &format!(
+                "printf '%s\\n' '{{\"protocol\":{{\"minimum\":{version},\"maximum\":{version}}},\"ok\":{{}}}}'",
+                version = protocol::PROTOCOL_VERSION.get()
+            ),
         );
         fs::rename(&stage.plugin, stage.target.plugin_root()).expect("activate plugin fixture");
         fs::rename(&stage.policy, &final_policy).expect("activate policy fixture");

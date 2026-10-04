@@ -408,7 +408,10 @@ mod tests {
         create_private_directory(&config);
         let cli = write_executable(
             &root.join("pohunek"),
-            "printf '%s\\n' '{\"protocol\":{\"minimum\":3,\"maximum\":3},\"ok\":{}}'",
+            &format!(
+                "printf '%s\\n' '{{\"protocol\":{{\"minimum\":{version},\"maximum\":{version}}},\"ok\":{{}}}}'",
+                version = protocol::PROTOCOL_VERSION.get()
+            ),
         );
         let policy = config.join("policy.json");
         write_policy(&policy, &cli, access_mode);
@@ -500,8 +503,8 @@ mod tests {
         let document = serde_json::json!({
             "schema_version": 1,
             "pohunek_cli": cli,
-            "protocol_min": 3,
-            "protocol_max": 3,
+            "protocol_min": protocol::PROTOCOL_VERSION.get(),
+            "protocol_max": protocol::PROTOCOL_VERSION.get(),
             "access_mode": access_mode,
             "allowed_hosts": ["local"],
             "tool_timeout_ms": 1_000,

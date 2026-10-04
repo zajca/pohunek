@@ -108,9 +108,9 @@ def runtime_from(session: Any) -> tuple[str, str]:
     runtime = session.get("runtime")
     if not isinstance(runtime, dict):
         raise FixtureError("session runtime is missing")
-    runtime_id = require_string(runtime.get("runtime_id"), "runtime_id")
+    worker_instance_id = require_string(runtime.get("worker_instance_id"), "worker_instance_id")
     generation = canonical_u64(runtime.get("runtime_generation"), "runtime_generation")
-    return runtime_id, generation
+    return worker_instance_id, generation
 
 
 def lifecycle_diagnostic(session: Any) -> str:
@@ -144,12 +144,12 @@ def inspect_until_live(handlers: dict[str, Any], session_id: str) -> tuple[dict[
                     f"session is terminal while a live runtime is required ({lifecycle_diagnostic(session)})"
                 )
             try:
-                runtime_id, generation = runtime_from(session)
+                worker_instance_id, generation = runtime_from(session)
             except FixtureError:
                 time.sleep(_RETRY_DELAY_SECONDS)
                 continue
             if session.get("id") == session_id:
-                return session, runtime_id, generation
+                return session, worker_instance_id, generation
         time.sleep(_RETRY_DELAY_SECONDS)
     raise FixtureError("session did not expose a live runtime")
 
@@ -157,9 +157,9 @@ def inspect_until_live(handlers: dict[str, Any], session_id: str) -> tuple[dict[
 def inspect_until_native(handlers: dict[str, Any], session_id: str) -> tuple[dict[str, Any], str, str]:
     """Wait for the controlled worker-private Hermes identity report."""
     for _ in range(_MAX_RETRIES):
-        session, runtime_id, generation = inspect_until_live(handlers, session_id)
+        session, worker_instance_id, generation = inspect_until_live(handlers, session_id)
         if session.get("native_session_id") == _NATIVE_REFERENCE:
-            return session, runtime_id, generation
+            return session, worker_instance_id, generation
         time.sleep(_RETRY_DELAY_SECONDS)
     raise FixtureError("Hermes native identity was not recorded")
 
@@ -178,14 +178,14 @@ def inspect_until_terminal(handlers: dict[str, Any], session_id: str) -> dict[st
 
 
 def wait_for_screen_marker(
-    handlers: dict[str, Any], session_id: str, runtime_id: str, generation: str, marker: str,
+    handlers: dict[str, Any], session_id: str, worker_instance_id: str, generation: str, marker: str,
 ) -> None:
     """Wait until the worker has processed one controlled terminal marker."""
     for _ in range(_MAX_RETRIES):
         screen = invoke(handlers, "pohunek_session_screen", {"session": session_id})
         if not isinstance(screen, dict) or screen.get("session_id") != session_id:
             raise FixtureError("screen logical ID mismatch while waiting for output")
-        if screen.get("runtime_id") != runtime_id or screen.get("runtime_generation") != generation:
+        if screen.get("worker_instance_id") != worker_instance_id or screen.get("runtime_generation") != generation:
             raise FixtureError("screen runtime ID mismatch while waiting for output")
         text = screen.get("text")
         if isinstance(text, str) and marker in text:
@@ -202,11 +202,11 @@ def require_session_result(value: Any, session_id: str, field: str) -> dict[str,
     return value
 
 
-def require_output_shape(value: Any, session_id: str, runtime_id: str, generation: str) -> str:
+def require_output_shape(value: Any, session_id: str, worker_instance_id: str, generation: str) -> str:
     """Validate output cursors without retaining or returning terminal text."""
     if not isinstance(value, dict) or value.get("session_id") != session_id:
         raise FixtureError("output logical ID mismatch")
-    if value.get("runtime_id") != runtime_id or value.get("runtime_generation") != generation:
+    if value.get("worker_instance_id") != worker_instance_id or value.get("runtime_generation") != generation:
         raise FixtureError("output runtime ID mismatch")
     for field in ("history_start_offset", "start_offset", "next_offset", "runtime_end_offset"):
         canonical_u64(value.get(field), field)
@@ -216,15 +216,15 @@ def require_output_shape(value: Any, session_id: str, runtime_id: str, generatio
 
 
 def settle_output(
-    handlers: dict[str, Any], session_id: str, runtime_id: str, generation: str, cursor: str,
+    handlers: dict[str, Any], session_id: str, worker_instance_id: str, generation: str, cursor: str,
 ) -> str:
     """Advance past startup bytes and prove one bounded output no-change result."""
     for _ in range(20):
         settled = invoke(handlers, "pohunek_session_output", {
-            "session": session_id, "worker_instance_id": runtime_id, "runtime_generation": generation,
+            "session": session_id, "worker_instance_id": worker_instance_id, "runtime_generation": generation,
             "after_offset": cursor, "max_bytes": 4096, "wait_ms": 50,
         })
-        next_cursor = require_output_shape(settled, session_id, runtime_id, generation)
+        next_cursor = require_output_shape(settled, session_id, worker_instance_id, generation)
         if settled.get("timed_out") is True:
             if next_cursor != cursor or settled.get("text") != "":
                 raise FixtureError("timed-out output changed its cursor")
@@ -306,9 +306,9 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         raise FixtureError("start result is invalid")
     session_id = require_string(started.get("id"), "session_id")
     started_runtime, started_generation = runtime_from(started)
-    inspected, runtime_id, generation = inspect_until_live(handlers, session_id)
+    inspected, worker_instance_id, generation = inspect_until_live(handlers, session_id)
     require_session_result(inspected, session_id, "inspect")
-    if runtime_id != started_runtime or generation != started_generation:
+    if worker_instance_id != started_runtime or generation != started_generation:
         raise FixtureError("start and inspect runtime identities differ")
 
     sessions = invoke(handlers, "pohunek_sessions", {"filters": {"id": session_id}})
@@ -321,7 +321,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     screen = invoke(handlers, "pohunek_session_screen", {"session": session_id})
     if not isinstance(screen, dict) or screen.get("session_id") != session_id:
         raise FixtureError("screen logical ID mismatch")
-    if screen.get("runtime_id") != runtime_id or screen.get("runtime_generation") != generation:
+    if screen.get("worker_instance_id") != worker_instance_id or screen.get("runtime_generation") != generation:
         raise FixtureError("screen runtime ID mismatch")
     canonical_u64(screen.get("watermark"), "watermark")
     if screen.get("truncated") is not False or not isinstance(screen.get("text"), str):
@@ -332,20 +332,20 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_output",
         {
             "session": session_id,
-            "worker_instance_id": runtime_id,
+            "worker_instance_id": worker_instance_id,
             "runtime_generation": generation,
             "max_bytes": 4096,
         },
     )
-    cursor = require_output_shape(initial, session_id, runtime_id, generation)
-    cursor = settle_output(handlers, session_id, runtime_id, generation, cursor)
+    cursor = require_output_shape(initial, session_id, worker_instance_id, generation)
+    cursor = settle_output(handlers, session_id, worker_instance_id, generation, cursor)
 
     timed_out = invoke(
         handlers,
         "pohunek_session_wait",
         {
             "session": session_id,
-            "worker_instance_id": runtime_id,
+            "worker_instance_id": worker_instance_id,
             "runtime_generation": generation,
             "after_output_offset": cursor,
             "timeout_ms": 25,
@@ -359,7 +359,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_wait",
         {
             "session": session_id,
-            "worker_instance_id": runtime_id,
+            "worker_instance_id": worker_instance_id,
             "runtime_generation": generation,
             "after_output_offset": cursor,
             "timeout_ms": 2_000,
@@ -372,13 +372,13 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_output",
         {
             "session": session_id,
-            "worker_instance_id": runtime_id,
+            "worker_instance_id": worker_instance_id,
             "runtime_generation": generation,
             "after_offset": cursor,
             "max_bytes": 4096,
         },
     )
-    cursor = require_output_shape(incremental, session_id, runtime_id, generation)
+    cursor = require_output_shape(incremental, session_id, worker_instance_id, generation)
     if _MARKER not in incremental.get("text", ""):
         raise FixtureError("incremental output did not contain the controlled marker")
 
@@ -392,7 +392,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "host": args.remote_host, "session": session_id, "input": f"printf '{_REMOTE_MARKER}\\n'\n",
     })
     remote_wait = invoke(handlers, "pohunek_session_wait", {
-        "host": args.remote_host, "session": session_id, "worker_instance_id": runtime_id,
+        "host": args.remote_host, "session": session_id, "worker_instance_id": worker_instance_id,
         "runtime_generation": generation, "after_output_offset": cursor, "timeout_ms": 2_000,
     })
     require_wait(remote_wait, session_id, "output_advanced")
@@ -408,12 +408,12 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     )
     invoke(handlers, "pohunek_session_send", {"session": session_id, "input": gap_command})
     wait_for_screen_marker(
-        handlers, session_id, runtime_id, generation, _GAP_COMPLETE_MARKER,
+        handlers, session_id, worker_instance_id, generation, _GAP_COMPLETE_MARKER,
     )
     gap_page = None
     for _ in range(_MAX_RETRIES):
         candidate = invoke(handlers, "pohunek_session_output", {
-            "session": session_id, "worker_instance_id": runtime_id, "runtime_generation": generation,
+            "session": session_id, "worker_instance_id": worker_instance_id, "runtime_generation": generation,
             "after_offset": "0", "max_bytes": 262_144,
         })
         if isinstance(candidate, dict) and isinstance(candidate.get("gap"), dict):
@@ -422,16 +422,16 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         time.sleep(_RETRY_DELAY_SECONDS)
     if gap_page is None:
         raise FixtureError("bounded output history did not expose a deterministic gap")
-    gap_cursor = require_output_shape(gap_page, session_id, runtime_id, generation)
+    gap_cursor = require_output_shape(gap_page, session_id, worker_instance_id, generation)
     gap = gap_page["gap"]
     if canonical_u64(gap.get("start_offset"), "gap.start") != "0":
         raise FixtureError("gap did not begin at the requested cursor")
     canonical_u64(gap.get("end_offset"), "gap.end")
     recovered = invoke(handlers, "pohunek_session_output", {
-        "session": session_id, "worker_instance_id": runtime_id, "runtime_generation": generation,
+        "session": session_id, "worker_instance_id": worker_instance_id, "runtime_generation": generation,
         "after_offset": gap_cursor, "max_bytes": 4096,
     })
-    require_output_shape(recovered, session_id, runtime_id, generation)
+    require_output_shape(recovered, session_id, worker_instance_id, generation)
     if recovered.get("start_offset") != gap_cursor or recovered.get("gap") is not None:
         raise FixtureError("gap recovery did not continue from the returned cursor")
     invoke(handlers, "pohunek_session_send", {"session": session_id, "input": "\n"})
@@ -442,7 +442,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     renamed, current_runtime, current_generation = inspect_until_live(handlers, session_id)
     if renamed.get("name") != "hermes-plugin-renamed":
         raise FixtureError("rename did not persist")
-    if current_runtime != runtime_id or current_generation != generation:
+    if current_runtime != worker_instance_id or current_generation != generation:
         raise FixtureError("unexpected runtime change during mutation")
 
     diff = invoke(handlers, "pohunek_session_diff", {"session": session_id})
@@ -501,7 +501,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     return {
         "ok": True,
         "logical_id_present": True,
-        "runtime_id_present": True,
+        "worker_instance_id_present": True,
         "tools_exercised": 16,
         "origin_denials": 8,
         "hermes_resume": True,

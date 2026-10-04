@@ -83,7 +83,7 @@ const PLUGIN_RUNTIME_CHECKS: usize = 1;
 /// Four CLI states plus one real production-plugin registration check.
 const PRODUCTION_PLUGIN_CHECKS: usize = 5;
 /// The current Pohunek CLI protocol required by the generated plugin policy.
-const EXPECTED_POHUNEK_PROTOCOL: u32 = 3;
+const EXPECTED_POHUNEK_PROTOCOL: u32 = protocol::PROTOCOL_VERSION.get();
 /// A normal executable search remains well below this abuse-resistant bound.
 const MAX_EXECUTABLE_PATH_ENTRIES: usize = 64;
 const PLUGIN_RUNTIME_MARKERS: [&str; 3] = [
@@ -5195,7 +5195,10 @@ PY
                         doctor: Option<serde_json::Value>| {
             serde_json::json!({
                 "cli_version": "controlled",
-                "protocol": {"minimum": 3, "maximum": 3},
+                "protocol": {
+                    "minimum": protocol::PROTOCOL_VERSION.get(),
+                    "maximum": protocol::PROTOCOL_VERSION.get()
+                },
                 "ok": {
                     "action": action,
                     "target_kind": "profile",

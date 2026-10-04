@@ -650,6 +650,57 @@ fn doctor_flags_a_stale_hook_that_reads_only_the_old_environment_name() {
     }
 }
 
+/// The shipped state hook rewritten to report the worker instance to the
+/// daemon under the `runtime_id` key of the previous public protocol.
+fn state_asset_reporting_runtime_id(asset: &str) -> String {
+    let shipped =
+        "\"session_id\": session_id,\n            \"worker_instance_id\": worker_instance_id,";
+    assert!(asset.contains(shipped));
+    asset.replace(
+        shipped,
+        "\"session_id\": session_id,\n            \"runtime_id\": worker_instance_id,",
+    )
+}
+
+/// A hook that sends the pre-protocol-4 report key is rejected by the
+/// daemon's strict parameters, so the doctor reports it for reinstall
+/// whether or not its version marker was kept.
+#[test]
+fn doctor_flags_a_stale_hook_that_reports_the_old_wire_key() {
+    let stale_version = format!("VERSION={}", protocol::EXPECTED_INTEGRATION_VERSION - 1);
+    let variants = [
+        (
+            "same version marker",
+            state_asset_reporting_runtime_id(CLAUDE_HOOK_ASSET),
+        ),
+        (
+            "previous version marker",
+            state_asset_reporting_runtime_id(CLAUDE_HOOK_ASSET)
+                .replace(&expected_version_marker(), &stale_version),
+        ),
+    ];
+    for (name, content) in variants {
+        let dir = fresh_claude();
+        write_file(dir.join("hooks").join(STATE_HOOK_INSTALL_NAME), content);
+
+        let status = explicit_status(&dir, RuntimeRef::claude());
+        let doctor = diagnose(status.clone(), &[]);
+
+        assert_eq!(status.state, IntegrationInstallState::Outdated, "{name}");
+        assert_eq!(
+            status.recovery,
+            protocol::IntegrationRecovery::Reinstall,
+            "{name}"
+        );
+        assert!(!doctor.ok, "{name}");
+        assert_eq!(
+            find(&doctor.findings, Code::AssetModified).severity,
+            Severity::Error,
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn doctor_maps_every_claude_drift_cause_to_its_finding() {
     type Mutation = fn(&Path);

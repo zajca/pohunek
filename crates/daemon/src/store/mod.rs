@@ -1165,7 +1165,8 @@ impl Store {
         let mut sessions = Vec::new();
         for line in content.lines().filter(|line| !line.trim().is_empty()) {
             match serde_json::from_str::<Record>(line) {
-                Ok(Record::Session(record)) if record_agents_are_persistable(&record) => {
+                Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
+                    mirror_worker_instance_id(&mut record);
                     sessions.push(*record);
                 }
                 Ok(Record::Resume(binding)) if kind_is_persistable(&binding.agent_base) => {
@@ -1427,6 +1428,22 @@ fn preserve_nonempty_native_identity(existing: &SessionRecord, replacement: &mut
     }
 }
 
+/// Fills the snapshot's worker instance id from the record's runtime, which
+/// is the persisted authority for it.
+///
+/// `info.runtime` is serialized with the public field name, while the runtime
+/// record keeps the key `runtime_id` so stored sessions stay readable by the
+/// supervision paths that compare the two.
+fn mirror_worker_instance_id(record: &mut SessionRecord) {
+    if let Some(runtime) = record.info.runtime.as_mut() {
+        if runtime.worker_instance_id.is_none() {
+            runtime
+                .worker_instance_id
+                .clone_from(&record.runtime.worker_instance_id);
+        }
+    }
+}
+
 fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord) -> bool {
     let (Some(current), Some(candidate)) = (
         existing.info.runtime.as_ref(),
@@ -1445,12 +1462,12 @@ fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord)
         .runtime
         .worker_instance_id
         .as_deref()
-        .or(current.runtime_id.as_deref());
+        .or(current.worker_instance_id.as_deref());
     let candidate_id = replacement
         .runtime
         .worker_instance_id
         .as_deref()
-        .or(candidate.runtime_id.as_deref());
+        .or(candidate.worker_instance_id.as_deref());
     current_id.is_some() && candidate_id != current_id
 }
 
@@ -1584,6 +1601,45 @@ mod tests {
         assert_eq!(
             transaction.previous_worker_instance_id.as_deref(),
             Some("instance-0")
+        );
+    }
+
+    /// A stored session snapshot whose runtime object carries no worker
+    /// instance id still reports it, taken from the record's runtime.
+    #[test]
+    fn loaded_session_snapshots_mirror_the_runtime_record_worker_instance_id() {
+        let path = temp_store_path("session-snapshot-mirror");
+        let store = Store::new(path.clone());
+        let record: super::SessionRecord = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "session_id": "s-1",
+            "desired_state": "running",
+            "info": {
+                "id": "s-1",
+                "capabilities": {"resume": false, "fork": false},
+                "agent": "claude",
+                "agent_base": "claude",
+                "cwd": "/workspace",
+                "pid": 1,
+                "runtime": {"state": "live", "runtime_generation": "1", "worker_id": "w-1"},
+                "cols": 80,
+                "rows": 24,
+                "state": "running",
+                "state_source": "process",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            },
+            "runtime": {"state": "live", "worker_id": "w-1", "runtime_id": "instance-1"}
+        }))
+        .expect("decode session record");
+        store.record_session(&record).expect("record session");
+
+        let loaded = store.load_sessions().expect("load sessions");
+        let runtime = loaded[0].info.runtime.as_ref().expect("snapshot runtime");
+        assert_eq!(runtime.worker_instance_id.as_deref(), Some("instance-1"));
+        assert_eq!(
+            loaded[0].runtime.worker_instance_id.as_deref(),
+            Some("instance-1")
         );
     }
 

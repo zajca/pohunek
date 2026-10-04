@@ -452,7 +452,7 @@ port is retained.
 | `pohunek session input <target> <text>` | Inject a prompt with agent-correct framing; use `--stdin` for non-argv input. |
 | `pohunek session screen <target>` | Read the current rendered terminal; `--json` preserves runtime identity, watermark, geometry, cursor, and visible lines. |
 | `pohunek session detection <target>` | Preview the active detection manifest regions; `--json` also lists every supported region kind. |
-| `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `runtime_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
+| `pohunek session output <target>` | Read a newest retained tail or continue with `--worker-instance-id` (the session's `worker_instance_id`), `--runtime-generation`, and `--after-offset`; `--wait-ms` performs a bounded wait. |
 | `pohunek session wait <target>` | Long-poll up to 8000 ms for explicit state, activity, metadata, terminal, output, or runtime predicates. |
 | `pohunek session fork <target>` | Fork an agent conversation into a new session when that session advertises fork capability (currently Claude Code). |
 | `pohunek session diff <target> [--base <ref>]` | Unified diff of the session's worktree vs its base. |

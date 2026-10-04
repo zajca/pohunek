@@ -751,6 +751,37 @@ async fn version_mismatch_over_tcp_is_rejected_with_the_daemon_version() {
 }
 
 #[tokio::test]
+async fn a_protocol_three_client_is_rejected_with_the_typed_version_error() {
+    // A client still speaking the previous public protocol (`runtime_id`
+    // spelling) gets the typed mismatch error and the daemon's own version
+    // before any method runs, never a payload it could misread.
+    let (addr, _socket, shutdown, handle) =
+        spawn_dual_servers("remote-protocol-three-client", "0.0.0", shell_config()).await;
+
+    let mut client = connect_tcp(addr).await;
+    let previous = PROTOCOL_VERSION.get() - 1;
+    assert_eq!(previous, 3);
+    let request: ProtocolRequest = serde_json::from_value(serde_json::json!({
+        "v": {"minimum": previous, "maximum": previous},
+        "id": "old-client",
+        "method": method::SESSION_LIST,
+        "params": {}
+    }))
+    .expect("valid previous-version request range");
+
+    let response = exchange(&mut client, &request).await;
+    assert_eq!(response.version(), PROTOCOL_VERSION);
+    let err = response
+        .into_result()
+        .expect_err("a protocol 3 client must be rejected");
+    assert_eq!(err.code, "version_mismatch");
+    assert!(err.recover.is_some(), "the error carries a recovery hint");
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn bind_rejects_non_netbird_address() {
     // A loopback address is never a NetBird address; bind must fail closed BEFORE
     // opening any socket. Deterministic without a NetBird interface present.

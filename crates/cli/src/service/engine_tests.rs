@@ -489,7 +489,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
             state: RuntimeState::Live,
             runtime_generation: RuntimeGeneration::new(1),
             worker_id: Some("w-1".to_owned()),
-            runtime_id: None,
+            worker_instance_id: None,
             started_at: None,
             last_connected_at: None,
             loss_reason: None,

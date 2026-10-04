@@ -28,7 +28,7 @@ expose scrollback or soft-wrap metadata; `alternate_screen` remains truthful.
 `pohunek session output <target> --json` for a bounded newest retained tail,
 and `pohunek session wait <target> ... --timeout-ms <1..8000> --json` for one
 bounded state/activity/terminal/output change. Continue output with the exact
-`runtime_id`, decimal-string `runtime_generation`, and `next_offset` returned by
+`worker_instance_id`, decimal-string `runtime_generation`, and `next_offset` returned by
 the previous result. A retained-history `gap` means older requested bytes were
 evicted; a runtime change means discard old cursors and restart from a fresh
 screen or tail. Waiting calls use dedicated connections, and their timeout is
@@ -272,7 +272,7 @@ kept when detection still finds a repository.
 Every managed `SessionInfo` has a `runtime` object distinct from its agent
 `state` and `activity`. Runtime state is one of `starting`, `live`,
 `reconnecting`, `terminal`, `lost`, `conflict`, or `incompatible`. `worker_id`
-identifies the PTY owner and `runtime_id` identifies one PTY generation. A
+identifies the PTY owner and `worker_instance_id` identifies one PTY generation. A
 daemon restart preserves both ids. Explicit native recovery preserves the
 logical session id but changes the worker and runtime ids.
 

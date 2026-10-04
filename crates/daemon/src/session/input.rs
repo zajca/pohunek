@@ -556,7 +556,7 @@ fn input_runtime_identity(
         return Err(unavailable_runtime_error(session_id, runtime.state));
     }
     let worker_instance_id = runtime
-        .runtime_id
+        .worker_instance_id
         .clone()
         .ok_or_else(ProtocolError::session_terminal_unavailable)?;
     SessionRuntimeIdentity::new(worker_instance_id, runtime.runtime_generation)

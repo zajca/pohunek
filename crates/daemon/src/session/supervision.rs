@@ -1234,7 +1234,7 @@ fn stale_orphan(id: &ServiceId) -> RuntimeInventoryEntry {
         runtime_slot: id.to_string(),
         claimed_session_id: None,
         worker_id: None,
-        runtime_id: None,
+        worker_instance_id: None,
         status: RuntimeInventoryStatus::Orphaned,
         reason: Some(STALE_GENERATION.to_owned()),
     }

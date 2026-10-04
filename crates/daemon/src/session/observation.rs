@@ -325,7 +325,7 @@ impl SessionRegistry {
             .clone()
             .ok_or_else(ProtocolError::session_terminal_unavailable)?;
         let worker_instance_id = runtime
-            .runtime_id
+            .worker_instance_id
             .clone()
             .ok_or_else(ProtocolError::session_terminal_unavailable)?;
         let runtime_generation = runtime.runtime_generation;
@@ -353,7 +353,7 @@ impl SessionRegistry {
             return Err(ProtocolError::session_runtime_changed());
         };
         if runtime.worker_id.as_deref() != Some(observed.worker_id.as_str())
-            || runtime.runtime_id.as_deref() != Some(observed.worker_instance_id.as_str())
+            || runtime.worker_instance_id.as_deref() != Some(observed.worker_instance_id.as_str())
             || runtime.runtime_generation != observed.runtime_generation
         {
             return Err(ProtocolError::session_runtime_changed());
@@ -371,7 +371,11 @@ impl SessionRegistry {
         let runtime = info.runtime.as_ref().and_then(|runtime| {
             (runtime.state == protocol::RuntimeState::Live)
                 .then(|| {
-                    runtime_identity(runtime.runtime_id.clone()?, runtime.runtime_generation).ok()
+                    runtime_identity(
+                        runtime.worker_instance_id.clone()?,
+                        runtime.runtime_generation,
+                    )
+                    .ok()
                 })
                 .flatten()
         });

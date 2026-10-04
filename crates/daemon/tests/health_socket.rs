@@ -1349,7 +1349,7 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
         "session uses a real worker process"
     );
     assert!(
-        runtime.runtime_id.is_some(),
+        runtime.worker_instance_id.is_some(),
         "session reports a worker runtime"
     );
 
@@ -3450,7 +3450,7 @@ async fn worktree_session_persists_recovery_and_worktree_metadata() {
     let worker_instance_id = created
         .runtime
         .as_ref()
-        .and_then(|runtime| runtime.runtime_id.as_deref())
+        .and_then(|runtime| runtime.worker_instance_id.as_deref())
         .expect("created worktree session exposes its runtime id");
     let report_req = Request::make(
         "wt-resume-report-native-id",

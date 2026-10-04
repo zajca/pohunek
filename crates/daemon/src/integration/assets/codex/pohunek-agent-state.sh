@@ -3,7 +3,7 @@
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
 # POHUNEK_INTEGRATION_ID=codex
-# POHUNEK_INTEGRATION_VERSION=8
+# POHUNEK_INTEGRATION_VERSION=9
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
 # native session id for direct-session resume, and journal sanitized child state.
@@ -281,7 +281,7 @@ if worker_instance_id and agent_pid is not None:
     if start_identity is not None:
         native_id_params = {
             "session_id": session_id,
-            "runtime_id": worker_instance_id,
+            "worker_instance_id": worker_instance_id,
             "agent": agent,
             "pid": agent_pid,
             "pid_start_identity": str(start_identity),

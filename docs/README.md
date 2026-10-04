@@ -10,7 +10,7 @@ This directory turns the product idea into implementation-oriented planning.
 
 ## Committed Direction (summary)
 
-The shipped protocol v3 product is an **owner-operated personal multi-host
+The shipped protocol v4 product is an **owner-operated personal multi-host
 tool**: durable coding-agent sessions across the owner's machines locally or on
 a NetBird (WireGuard) network. The accepted, not-yet-implemented
 [team relay RFC](design/team-relay-control-plane-rfc.md) adds an optional public
@@ -29,7 +29,7 @@ multi-team control plane without replacing either owner path.
 - Control protocol: newline-delimited JSON over a Unix socket (local) and a TCP
   listener bound to the NetBird interface (remote). Attach uses a **separate
   raw-byte connection** per PTY.
-- Protocol v3 has no multi-user authorization; socket permissions and NetBird
+- Protocol v4 has no multi-user authorization; socket permissions and NetBird
   are its owner trust boundary. The planned relay owns principals, service
   accounts, teams, roles, and session ACLs, while `pohunekd` enforces only the
   enrolled relay and host-approved `HostShare` ceilings.

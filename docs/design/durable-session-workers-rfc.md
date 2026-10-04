@@ -1410,7 +1410,7 @@ The public `SessionInfo` gains an additive `runtime` object:
 runtime.state =
   starting | live | reconnecting | terminal | lost | conflict | incompatible
 runtime.worker_id
-runtime.runtime_id
+runtime.worker_instance_id
 runtime.started_at
 runtime.last_connected_at
 runtime.loss_reason

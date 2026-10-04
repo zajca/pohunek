@@ -426,7 +426,7 @@ async fn input_wait_without_timeout_uses_dedicated_connection_and_headroom() {
                 "activity": "idle",
                 "activity_source": "screen",
                 "runtime": {
-                    "runtime_id": "runtime-1",
+                    "worker_instance_id": "runtime-1",
                     "runtime_generation": "1"
                 },
                 "activity_epoch": "d-epoch-1",

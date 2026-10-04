@@ -463,7 +463,7 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
         protocol::method::SESSION_SCREEN => json!({
             "session_id": SESSION_ID,
             "worker_id": "worker-fixture-1",
-            "runtime_id": "runtime-fixture-1",
+            "worker_instance_id": "runtime-fixture-1",
             "runtime_generation": "3",
             "watermark": "7",
             "dimensions": {"cols": 80, "rows": 24},
@@ -478,7 +478,7 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
                 let end = output.len().to_string();
                 json!({
                     "session_id": SESSION_ID,
-                    "runtime_id": "runtime-fixture-1",
+                    "worker_instance_id": "runtime-fixture-1",
                     "runtime_generation": "3",
                     "history_start_offset": "0",
                     "start_offset": "0",
@@ -491,7 +491,7 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
             } else {
                 json!({
                     "session_id": SESSION_ID,
-                    "runtime_id": "runtime-fixture-1",
+                    "worker_instance_id": "runtime-fixture-1",
                     "runtime_generation": "3",
                     "history_start_offset": "4",
                     "start_offset": "4",
@@ -524,7 +524,7 @@ fn fixture_response(request: &Request, scenario: Scenario) -> Response {
                 "runtime_slot": "slot-fixture-1",
                 "claimed_session_id": SESSION_ID,
                 "worker_id": "worker-fixture-1",
-                "runtime_id": "runtime-fixture-1",
+                "worker_instance_id": "runtime-fixture-1",
                 "status": "managed"
             }]
         }),

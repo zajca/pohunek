@@ -146,7 +146,7 @@ lifecycle, provider-neutral account linking, and a native HTTPS/keyring CLI. Do
 not invent host-link, routing, attach, team-administration,
 provider-verification, or team browser commands, configuration keys, protocol
 fields, or recovery steps.
-Current protocol-v3 local, overlay, and Bun browser paths remain one owner trust
+Current protocol-v4 local, overlay, and Bun browser paths remain one owner trust
 domain and remain supported alongside the foundation. The relay has no local
 mode. Owner and team browser surfaces must not exchange credentials, state, or
 silently fall back between their explicit origins and API adapters.

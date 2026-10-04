@@ -54,7 +54,7 @@ and runtime id.
 
 8. Create a disposable shell session and verify that restarting the daemon job
    (`systemctl --user restart pohunek-<ns>-daemon.service` on Linux) preserves
-   its `worker_id`, `runtime_id`, root child PID, and the worker generation and
+   its `worker_id`, `worker_instance_id`, root child PID, and the worker generation and
    PID reported by `pohunek service status --json`.
 
 The installer runs `pohunek service install` (or `pohunek service upgrade` for

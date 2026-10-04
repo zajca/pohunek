@@ -364,13 +364,16 @@ impl SessionRegistry {
             self.persist_resume_binding(id).await;
             self.emit(event::SESSION_UPDATED, &updated.1);
             let runtime = updated.1.runtime.as_ref().and_then(|runtime| {
-                runtime.runtime_id.as_ref().and_then(|worker_instance_id| {
-                    SessionRuntimeIdentity::new(
-                        worker_instance_id.clone(),
-                        runtime.runtime_generation,
-                    )
-                    .ok()
-                })
+                runtime
+                    .worker_instance_id
+                    .as_ref()
+                    .and_then(|worker_instance_id| {
+                        SessionRuntimeIdentity::new(
+                            worker_instance_id.clone(),
+                            runtime.runtime_generation,
+                        )
+                        .ok()
+                    })
             });
             for subagent in updated.2 {
                 let event = crate::events::event(
@@ -1132,7 +1135,7 @@ impl SessionRegistry {
                     runtime_slot: session_id.to_owned(),
                     claimed_session_id: Some(session_id.to_owned()),
                     worker_id: Some(snapshot.worker_id.to_string()),
-                    runtime_id: snapshot
+                    worker_instance_id: snapshot
                         .worker_instance_id
                         .as_ref()
                         .map(ToString::to_string),
@@ -1939,7 +1942,7 @@ impl SessionRegistry {
             state: RuntimeState::Terminal,
             runtime_generation,
             worker_id: Some(evidence.worker_id),
-            runtime_id: evidence.worker_instance_id,
+            worker_instance_id: evidence.worker_instance_id,
             started_at: record
                 .info
                 .runtime
@@ -2201,7 +2204,7 @@ impl SessionRegistry {
                 runtime_slot: candidate.slot.clone(),
                 claimed_session_id: Some(claimed.clone()),
                 worker_id: Some(candidate.snapshot.worker_id.to_string()),
-                runtime_id: candidate
+                worker_instance_id: candidate
                     .snapshot
                     .worker_instance_id
                     .as_ref()
@@ -2418,7 +2421,7 @@ impl SessionRegistry {
             state: RuntimeState::Live,
             runtime_generation,
             worker_id: Some(snapshot.worker_id.to_string()),
-            runtime_id: worker_instance_id.clone(),
+            worker_instance_id: worker_instance_id.clone(),
             started_at: record
                 .info
                 .runtime
@@ -2584,7 +2587,7 @@ impl SessionRegistry {
             state,
             runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: record.runtime.worker_id.clone(),
-            runtime_id: record.runtime.worker_instance_id.clone(),
+            worker_instance_id: record.runtime.worker_instance_id.clone(),
             started_at: None,
             last_connected_at: None,
             loss_reason: Some(reason.to_owned()),
@@ -2707,7 +2710,7 @@ impl SessionRegistry {
                         state: RuntimeState::Terminal,
                         runtime_generation: protocol::RuntimeGeneration::new(1),
                         worker_id: terminal.runtime.worker_id.clone(),
-                        runtime_id: terminal.runtime.worker_instance_id.clone(),
+                        worker_instance_id: terminal.runtime.worker_instance_id.clone(),
                         started_at: None,
                         last_connected_at: None,
                         loss_reason: None,
@@ -3061,7 +3064,7 @@ pub(super) fn worker_metadata_record_is_current(
         && record.info.state == SessionState::Running
         && runtime.state == RuntimeState::Live
         && runtime.worker_id.as_deref() == Some(worker_id)
-        && runtime.runtime_id.as_deref() == worker_instance_id
+        && runtime.worker_instance_id.as_deref() == worker_instance_id
         && record.runtime.state == RuntimeState::Live
         && record.runtime.worker_id.as_deref() == Some(worker_id)
         && record.runtime.worker_instance_id.as_deref() == worker_instance_id
@@ -3425,7 +3428,7 @@ fn unmigrated_legacy_bindings(bindings: &[ResumeBinding]) -> Vec<RuntimeInventor
             runtime_slot: binding.session_id.clone(),
             claimed_session_id: Some(binding.session_id.clone()),
             worker_id: None,
-            runtime_id: None,
+            worker_instance_id: None,
             status: RuntimeInventoryStatus::Orphaned,
             reason: Some(MIGRATION_MANIFEST_MISSING.to_owned()),
         })
@@ -3578,7 +3581,7 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
             state: runtime_state,
             runtime_generation: protocol::RuntimeGeneration::new(1),
             worker_id: None,
-            runtime_id: None,
+            worker_instance_id: None,
             started_at: None,
             last_connected_at: None,
             loss_reason: live.then(|| "legacy_runtime_not_transferable".to_owned()),
@@ -3926,7 +3929,7 @@ fn discovery_failure_entry(slot: String, error: &WorkerError) -> RuntimeInventor
         runtime_slot: slot,
         claimed_session_id: None,
         worker_id: None,
-        runtime_id: None,
+        worker_instance_id: None,
         status,
         reason: Some(reason.to_owned()),
     }
@@ -4744,7 +4747,7 @@ while os.getppid() == parent:
         record.info.pid = child_pid;
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
         info_runtime.worker_id = Some(worker_id.to_owned());
-        info_runtime.runtime_id = Some(worker_instance_id.to_string());
+        info_runtime.worker_instance_id = Some(worker_instance_id.to_string());
         record.runtime.worker_id = Some(worker_id.to_owned());
         record.runtime.worker_instance_id = Some(worker_instance_id.to_string());
         let recovery = record.recovery.as_mut().expect("recovery binding");
@@ -4999,7 +5002,7 @@ while os.getppid() == parent:
         record.info.native_session_id = Some("native-before-drain".to_owned());
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
         info_runtime.worker_id = Some(worker_id.to_owned());
-        info_runtime.runtime_id = Some(worker_instance_id.to_string());
+        info_runtime.worker_instance_id = Some(worker_instance_id.to_string());
         record.runtime.worker_id = Some(worker_id.to_owned());
         record.runtime.worker_instance_id = Some(worker_instance_id.to_string());
         record.native_identity_ordering = Some(NativeIdentityOrdering {
@@ -5241,7 +5244,7 @@ while os.getppid() == parent:
                 state: RuntimeState::Live,
                 runtime_generation: protocol::RuntimeGeneration::new(1),
                 worker_id: Some(worker_id.to_owned()),
-                runtime_id: Some(worker_instance_id.to_string()),
+                worker_instance_id: Some(worker_instance_id.to_string()),
                 started_at: Some(created_at.clone()),
                 last_connected_at: Some(created_at.clone()),
                 loss_reason: None,
@@ -5322,7 +5325,7 @@ while os.getppid() == parent:
                         state: RuntimeState::Starting,
                         runtime_generation: protocol::RuntimeGeneration::new(1),
                         worker_id: None,
-                        runtime_id: None,
+                        worker_instance_id: None,
                         started_at: None,
                         last_connected_at: None,
                         loss_reason: None,
@@ -5372,7 +5375,7 @@ while os.getppid() == parent:
             adopted
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.runtime_id.as_deref()),
+                .and_then(|runtime| runtime.worker_instance_id.as_deref()),
             Some(worker_instance_id.as_str())
         );
         assert_eq!(
@@ -5591,7 +5594,7 @@ while os.getppid() == parent:
         };
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
         info_runtime.worker_id = Some(worker_id.to_owned());
-        info_runtime.runtime_id = Some(worker_instance_id.to_string());
+        info_runtime.worker_instance_id = Some(worker_instance_id.to_string());
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
         recovery.agent = "hermes".to_owned();
@@ -5635,7 +5638,7 @@ while os.getppid() == parent:
             adopted
                 .runtime
                 .as_ref()
-                .and_then(|runtime| runtime.runtime_id.as_deref()),
+                .and_then(|runtime| runtime.worker_instance_id.as_deref()),
             Some(worker_instance_id.as_str())
         );
         assert_eq!(
@@ -6459,7 +6462,12 @@ while os.getppid() == parent:
         record.runtime.worker_id = Some(worker_id.to_owned());
         record.runtime.worker_instance_id = None;
         record.info.runtime.as_mut().expect("runtime").worker_id = Some(worker_id.to_owned());
-        record.info.runtime.as_mut().expect("runtime").runtime_id = None;
+        record
+            .info
+            .runtime
+            .as_mut()
+            .expect("runtime")
+            .worker_instance_id = None;
         record.recovery.as_mut().expect("recovery").session_id = id.to_owned();
         bind_test_generation(&mut record);
         Store::new(root.join("data/metadata.jsonl"))
@@ -6483,8 +6491,12 @@ while os.getppid() == parent:
         record.info.agent = "shell".to_owned();
         record.info.agent_base = RuntimeRef::shell();
         record.info.runtime.as_mut().expect("runtime").worker_id = Some(worker_id.to_owned());
-        record.info.runtime.as_mut().expect("runtime").runtime_id =
-            Some(worker_instance_id.to_owned());
+        record
+            .info
+            .runtime
+            .as_mut()
+            .expect("runtime")
+            .worker_instance_id = Some(worker_instance_id.to_owned());
         record.runtime.worker_id = Some(worker_id.to_owned());
         record.runtime.worker_instance_id = Some(worker_instance_id.to_owned());
         record.desired_state = desired_state;
@@ -6557,7 +6569,7 @@ while os.getppid() == parent:
                     state: RuntimeState::Live,
                     runtime_generation: protocol::RuntimeGeneration::new(1),
                     worker_id: Some("worker-identity".to_owned()),
-                    runtime_id: Some("runtime-identity".to_owned()),
+                    worker_instance_id: Some("runtime-identity".to_owned()),
                     started_at: Some(created_at.clone()),
                     last_connected_at: Some(created_at.clone()),
                     loss_reason: None,
@@ -6760,7 +6772,7 @@ while os.getppid() == parent:
             .runtime
             .as_mut()
             .expect("runtime info")
-            .runtime_id = Some("runtime-journal".to_owned());
+            .worker_instance_id = Some("runtime-journal".to_owned());
         normalized.info.state = SessionState::Done;
         normalized.runtime.state = RuntimeState::Terminal;
         assert_eq!(
@@ -6779,7 +6791,7 @@ while os.getppid() == parent:
             committed
                 .info
                 .runtime
-                .and_then(|runtime| runtime.runtime_id),
+                .and_then(|runtime| runtime.worker_instance_id),
             Some("runtime-journal".to_owned())
         );
     }
@@ -7753,7 +7765,7 @@ while os.getppid() == parent:
             record.runtime.worker_instance_id = worker_instance_id.map(ToOwned::to_owned);
             let runtime = record.info.runtime.as_mut().expect("runtime");
             runtime.worker_id = Some(worker_id);
-            runtime.runtime_id = worker_instance_id.map(ToOwned::to_owned);
+            runtime.worker_instance_id = worker_instance_id.map(ToOwned::to_owned);
             record.recovery.as_mut().expect("recovery").session_id = session_id.to_owned();
             bind_test_generation(&mut record);
             Store::new(root.join("data/metadata.jsonl"))
@@ -8816,7 +8828,7 @@ while os.getppid() == parent:
             std::fs::rename(&hidden, &socket).expect("restore the worker socket");
             let runtime = wait_state(&fixture.registry, "s-319", RuntimeState::Live).await;
             assert_eq!(
-                runtime.runtime_id.as_deref(),
+                runtime.worker_instance_id.as_deref(),
                 Some(worker_instance_id.as_str())
             );
             assert!(
@@ -11121,7 +11133,7 @@ while os.getppid() == parent:
                 let worker_instance_id = created
                     .runtime
                     .as_ref()
-                    .and_then(|runtime| runtime.runtime_id.clone())
+                    .and_then(|runtime| runtime.worker_instance_id.clone())
                     .expect("created runtime id");
                 self.registry
                     .sweep_lost_runtime(&created.id.0, &worker_instance_id, None)
@@ -11205,7 +11217,7 @@ while os.getppid() == parent:
             // The fixture's PTY tree ignores hangup; reap it explicitly.
             let worker_instance_id = created
                 .runtime
-                .and_then(|runtime| runtime.runtime_id)
+                .and_then(|runtime| runtime.worker_instance_id)
                 .expect("created runtime id");
             fixture
                 .registry
