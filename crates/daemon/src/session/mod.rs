@@ -339,6 +339,9 @@ pub struct SessionRegistryConfig {
     /// disables host profiles (a bare `shell`/`codex`/`claude` still resolves).
     /// Part C: a profile extends a base kind with program/args/env/input-rules.
     pub agents_dir: Option<PathBuf>,
+    /// Application state directory whose host-state subdirectory holds the
+    /// secret that keys profile revisions. `None` makes revisions unavailable.
+    pub host_state_dir: Option<PathBuf>,
     /// Minimum interval between per-session "PTY output lag" WARN logs. The first
     /// lag in each window logs immediately; further lags are folded into one
     /// summary WARN when the window elapses, so a runaway session cannot flood the
@@ -399,6 +402,7 @@ impl Default for SessionRegistryConfig {
             log_dir: None,
             config_dir: None,
             agents_dir: None,
+            host_state_dir: None,
             detector_lag_warn_interval: DEFAULT_DETECTOR_LAG_WARN_INTERVAL,
             procwatch_poll: DEFAULT_PROCWATCH_POLL,
             active_agent_claim_ttl: DEFAULT_ACTIVE_AGENT_CLAIM_TTL,
@@ -1305,7 +1309,8 @@ impl SessionRegistry {
             config.shell_command.program(),
             config.shell_command.args().to_vec(),
         );
-        let profiles = ProfileRegistry::with_runtimes(config.agents_dir.clone(), runtimes);
+        let profiles = ProfileRegistry::with_runtimes(config.agents_dir.clone(), runtimes)
+            .with_revision_state_dir(config.host_state_dir.clone());
         let retention = retention::RetentionState::new(config.retention_policy_path.clone());
         let registry = Self {
             inner: Arc::new(SessionRegistryInner {
@@ -1769,7 +1774,10 @@ impl SessionRegistry {
         validate_new_params(&params)?;
         // Resolve and validate the runtime before allocating a logical id or
         // resolving a target: target resolution may bind a git worktree.
-        let resolved = self.inner.profiles.resolve_agent(&params.agent)?;
+        let resolved = host::LaunchSource::OwnerLocal {
+            name: params.agent.clone(),
+        }
+        .resolve(&self.inner.profiles)?;
         let validated_program =
             host::validate_launch_runtime(&resolved.definition, resolved.program())?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's

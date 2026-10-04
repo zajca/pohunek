@@ -626,6 +626,19 @@ binding records the runtime identity (`LaunchBinding`) the session was
 launched with; a binding written without one may only resume through a
 built-in runtime.
 
+A launch resolves its agent through a launch source. The owner-local source
+accepts a host profile name or an installed runtime id. A relay-selected launch
+(connected by the `HostShare` work of #82; no relay caller exists yet) resolves
+only a locally approved host profile by name and approved revision. It cannot
+name a runtime id, package, program or argv: a bare runtime id is rejected with
+`runtime/agent_profile_not_found`, and a profile whose file, detection
+manifest, base-runtime launch binding or effective program and arguments
+changed after approval is rejected with `runtime/agent_profile_revision_stale`.
+A revision is a keyed MAC (host-local secret), 64 lowercase hex digits, so it
+reveals nothing about profile `[env]` values. A malformed revision is
+`runtime/agent_profile_revision_invalid`; an unreadable host key is
+`runtime/agent_profile_revision_unavailable` (no unkeyed fallback).
+
 Agent runtime identities use three Rust types over the same string namespace.
 `RuntimeId` is always valid: lowercase ASCII alphanumerics plus `.`, `_` and
 `-`, 1 to 64 bytes, no leading `.` or `-`, no `..`; deserialization rejects
@@ -1427,7 +1440,9 @@ id resolves to no enabled runtime: a host profile whose `base` names an
 uninstalled runtime, and resume, fork or mutation of a session whose runtime is
 not installed or no longer matches its recorded launch binding. A bare
 `session.new` agent name that is neither a profile nor an installed runtime
-stays `agent_profile_not_found`.
+stays `agent_profile_not_found`. `agent_profile_revision_stale`,
+`agent_profile_revision_invalid` and `agent_profile_revision_unavailable` are emitted only by the relay-selected launch
+source (see above), which no wire method reaches yet.
 Observation request errors intentionally carry no terminal
 payload or current-runtime payload; refresh `session.inspect` or restart
 observation from a fresh screen/tail when recovery requires new coordinates.
