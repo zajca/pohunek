@@ -30,6 +30,19 @@ import type {
   NotificationRetentionResult,
   NotificationUpdateParams,
   NotificationUpdateResult,
+  PackageChangeResult,
+  PackageDoctorParams,
+  PackageDoctorResult,
+  PackageInspectParams,
+  PackageInspectResult,
+  PackageInstallParams,
+  PackageInstallResult,
+  PackageLinkParams,
+  PackageListResult,
+  PackageSelectParams,
+  PackageSetEnabledParams,
+  PackageUninstallParams,
+  PackageUninstallResult,
   ProjectActionParams,
   ProjectActionResult,
   ProjectActionsParams,
@@ -111,6 +124,14 @@ export interface Methods {
   "notification.policy.set": { params: NotificationPolicyParams; output: NotificationPolicyResult };
   "notification.retention.prune": { params: NotificationRetentionParams; output: NotificationRetentionResult };
   "notification.update": { params: NotificationUpdateParams; output: NotificationUpdateResult };
+  "package.doctor": { params: PackageDoctorParams; output: PackageDoctorResult };
+  "package.inspect": { params: PackageInspectParams; output: PackageInspectResult };
+  "package.install": { params: PackageInstallParams; output: PackageInstallResult };
+  "package.link": { params: PackageLinkParams; output: PackageInstallResult };
+  "package.list": { params: null; output: PackageListResult };
+  "package.select": { params: PackageSelectParams; output: PackageChangeResult };
+  "package.set_enabled": { params: PackageSetEnabledParams; output: PackageChangeResult };
+  "package.uninstall": { params: PackageUninstallParams; output: PackageUninstallResult };
   "project.action": { params: ProjectActionParams; output: ProjectActionResult };
   "project.actions": { params: ProjectActionsParams; output: ProjectActionsResult };
   "project.add": { params: ProjectAddParams; output: ProjectInfo };
