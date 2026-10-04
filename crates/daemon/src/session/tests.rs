@@ -12,16 +12,16 @@ use time::OffsetDateTime;
 
 use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
 use protocol::{
-    method, AgentActivity, AgentKind, CwdSource, DetectionRegionKind, DetectionRegionPreview,
-    ErrorClass, Event, ForkCwdMode, OutputOffset, PackageId, PackageIdentity, PackageVersion,
+    method, AgentActivity, CwdSource, DetectionRegionKind, DetectionRegionPreview, ErrorClass,
+    Event, ForkCwdMode, OutputOffset, PackageId, PackageIdentity, PackageVersion,
     ProcessStartIdentity, ProjectSource, ReportSequence, Request, Response, RuntimeGeneration,
-    RuntimeId, RuntimeState, SessionAttachParams, SessionDetectionParams, SessionForkParams,
-    SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams, SessionOutputParams,
-    SessionReadFormat, SessionReadParams, SessionReadSource, SessionReleaseAgentParams,
-    SessionReportAgentParams, SessionReportNativeIdParams, SessionRetentionPolicy, SessionRuntime,
-    SessionRuntimeIdentity, SessionState, SessionWaitParams, SessionWaitReason, StateSource,
-    SubagentInfo, SubagentLifecycle, SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES,
-    MAX_REQUEST_ID_BYTES,
+    RuntimeId, RuntimeRef, RuntimeState, SessionAttachParams, SessionDetectionParams,
+    SessionForkParams, SessionId, SessionInfo, SessionNativeRecoveredEvent, SessionNewParams,
+    SessionOutputParams, SessionReadFormat, SessionReadParams, SessionReadSource,
+    SessionReleaseAgentParams, SessionReportAgentParams, SessionReportNativeIdParams,
+    SessionRetentionPolicy, SessionRuntime, SessionRuntimeIdentity, SessionState,
+    SessionWaitParams, SessionWaitReason, StateSource, SubagentInfo, SubagentLifecycle,
+    SubagentRevision, TerminalWatermark, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
 };
 
 use crate::agent::host::{
@@ -193,7 +193,7 @@ fn params() -> SessionNewParams {
 fn running_subagent(id: &str, revision: u64) -> SubagentInfo {
     SubagentInfo {
         id: id.to_owned(),
-        provider: AgentKind::Codex,
+        provider: RuntimeRef::codex(),
         parent_id: None,
         agent_type: Some("worker".to_owned()),
         lifecycle: SubagentLifecycle::Running,
@@ -1225,7 +1225,7 @@ async fn mutations_fail_closed_for_a_session_whose_agent_kind_is_not_launchable(
             .get_mut(&created.id)
             .expect("registered session")
             .info
-            .agent_base = AgentKind::Unknown(kind.to_owned());
+            .agent_base = RuntimeRef::from_wire(kind);
 
         let error = registry
             .stop(&created.id)
@@ -1250,7 +1250,7 @@ async fn mutations_fail_closed_for_a_session_whose_agent_kind_is_not_launchable(
         .get_mut(&created.id)
         .expect("registered session")
         .info
-        .agent_base = AgentKind::Shell;
+        .agent_base = RuntimeRef::shell();
     let _ = registry.stop(&created.id).await;
 }
 
@@ -1267,7 +1267,7 @@ async fn a_launched_session_freezes_the_launch_binding_of_its_runtime() {
         .inner
         .profiles
         .runtimes()
-        .resolve_kind(&AgentKind::Shell)
+        .resolve_ref(&RuntimeRef::shell())
         .expect("shell resolves")
         .binding()
         .clone();
@@ -1292,7 +1292,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
     };
 
     let registry = SessionRegistry::default();
-    let binding = |agent_base: AgentKind, launch_binding: LaunchPin| crate::store::ResumeBinding {
+    let binding = |agent_base: RuntimeRef, launch_binding: LaunchPin| crate::store::ResumeBinding {
         session_id: "s-pin".to_owned(),
         name: None,
         agent: agent_base.as_wire().to_owned(),
@@ -1327,28 +1327,28 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
     let cases = [
         // Not installed, with and without a recorded pin.
         (
-            AgentKind::Unknown("acme".to_owned()),
+            RuntimeRef::from_wire("acme"),
             LaunchPin::Unpinned,
             "runtime_not_installed",
         ),
         (
-            AgentKind::Unknown("acme".to_owned()),
+            RuntimeRef::from_wire("acme"),
             package_pin.clone(),
             "runtime_not_installed",
         ),
         // Outside the runtime-id grammar.
         (
-            AgentKind::Unknown("Acme Agent".to_owned()),
+            RuntimeRef::from_wire("Acme Agent"),
             LaunchPin::Unpinned,
             "agent_kind_unsupported",
         ),
         // Resolves, but a package pin cannot be served by the built-in.
-        (AgentKind::Claude, package_pin, "runtime_not_installed"),
+        (RuntimeRef::claude(), package_pin, "runtime_not_installed"),
         // Resolves and the pin matches (unpinned lines resume through a
         // built-in); the binding is then refused only for lacking a native
         // launch spec, which is checked after the runtime.
         (
-            AgentKind::Claude,
+            RuntimeRef::claude(),
             LaunchPin::Unpinned,
             "agent_not_resumable",
         ),
@@ -2107,7 +2107,7 @@ async fn foreground_member_matches_pgid_without_crossing_groups() {
         let selected = registry.inspect(&created.id).await.expect("inspect");
 
         assert_eq!(selected.active_agent.as_deref(), Some("claude"));
-        assert_eq!(selected.active_agent_base, Some(AgentKind::Claude));
+        assert_eq!(selected.active_agent_base, Some(RuntimeRef::claude()));
         assert_eq!(selected.active_agent_pid, Some(410));
     }
 
@@ -2178,7 +2178,7 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
         .subscribe();
 
     assert_eq!(replaced.active_agent.as_deref(), Some("claude"));
-    assert_eq!(replaced.active_agent_base, Some(AgentKind::Claude));
+    assert_eq!(replaced.active_agent_base, Some(RuntimeRef::claude()));
     assert_eq!(replaced.active_agent_pid, Some(500));
     assert_eq!(replaced.active_agent_session_id, None);
     assert_eq!(replaced.active_agent_session_path, None);
@@ -2186,7 +2186,7 @@ async fn foreground_replacement_replaces_hook_identity_and_detector() {
     assert_eq!(replaced.state_source, StateSource::Process);
     assert_eq!(
         replacement_detector.borrow().config.detection,
-        DetectorConfig::for_agent(&RuntimeHost::default(), &AgentKind::Claude).detection
+        DetectorConfig::for_agent(&RuntimeHost::default(), &RuntimeRef::claude()).detection
     );
 
     let _ = registry.stop(&created.id).await;
@@ -5079,7 +5079,7 @@ fn delayed_submit_input_frame_splits_text_and_submit() {
 
 #[test]
 fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
-    let rules = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     let writes = super::build_input_writes("first line\nsecond line", rules)
         .expect("Hermes multiline safe text");
 
@@ -5092,7 +5092,7 @@ fn hermes_multiline_input_is_one_bracketed_paste_then_separate_submit() {
 
 #[test]
 fn hermes_input_rejects_terminal_controls_without_mutating_text() {
-    let rules = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     for unsafe_text in [
         "prompt\u{1b}[201~\rsubmit",
         "prompt\0suffix",
@@ -5113,7 +5113,7 @@ fn hermes_input_rejects_terminal_controls_without_mutating_text() {
 
 #[test]
 fn hermes_input_enforces_shared_byte_ceiling() {
-    let rules = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     let at_limit = "x".repeat(protocol::MAX_SESSION_INPUT_BYTES);
     super::build_input_writes(&at_limit, rules).expect("Hermes input at the ceiling is accepted");
 
@@ -5125,7 +5125,7 @@ fn hermes_input_enforces_shared_byte_ceiling() {
 
 #[test]
 fn codex_input_control_behavior_is_unchanged() {
-    let rules = builtin_input_rules(&AgentKind::Codex, &SessionRegistryConfig::default());
+    let rules = builtin_input_rules(&RuntimeRef::codex(), &SessionRegistryConfig::default());
     let text = "prompt\u{1b}[201~\rsubmit";
     let writes = super::build_input_writes(text, rules).expect("Codex remains unrestricted");
 
@@ -5137,7 +5137,7 @@ fn codex_input_control_behavior_is_unchanged() {
 
 #[test]
 fn hermes_programmatic_input_fails_closed_while_blocked() {
-    let hermes = builtin_input_rules(&AgentKind::Hermes, &SessionRegistryConfig::default());
+    let hermes = builtin_input_rules(&RuntimeRef::hermes(), &SessionRegistryConfig::default());
     let error = hermes
         .validate_activity(Some(AgentActivity::Blocked))
         .expect_err("Hermes input must be denied while approval is visible");
@@ -5147,7 +5147,7 @@ fn hermes_programmatic_input_fails_closed_while_blocked() {
     hermes
         .validate_activity(Some(AgentActivity::Idle))
         .expect("Hermes input is allowed after approval clears");
-    let codex = builtin_input_rules(&AgentKind::Codex, &SessionRegistryConfig::default());
+    let codex = builtin_input_rules(&RuntimeRef::codex(), &SessionRegistryConfig::default());
     codex
         .validate_activity(Some(AgentActivity::Blocked))
         .expect("Codex blocked-input behavior remains unchanged");
@@ -8094,10 +8094,10 @@ fn hook_env_injected_for_every_agent_kind_with_socket() {
     let id = SessionId("s-7".to_owned());
 
     for agent in [
-        AgentKind::Shell,
-        AgentKind::Codex,
-        AgentKind::Claude,
-        AgentKind::Hermes,
+        RuntimeRef::shell(),
+        RuntimeRef::codex(),
+        RuntimeRef::claude(),
+        RuntimeRef::hermes(),
     ] {
         let env = registry.hook_env(agent, &id);
         let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
@@ -8118,9 +8118,9 @@ fn hook_env_injected_for_every_agent_kind_with_socket() {
 fn hook_env_absent_without_configured_socket() {
     let registry = SessionRegistry::default();
     let id = SessionId("s-1".to_owned());
-    assert!(registry.hook_env(AgentKind::Shell, &id).is_empty());
-    assert!(registry.hook_env(AgentKind::Claude, &id).is_empty());
-    assert!(registry.hook_env(AgentKind::Codex, &id).is_empty());
+    assert!(registry.hook_env(RuntimeRef::shell(), &id).is_empty());
+    assert!(registry.hook_env(RuntimeRef::claude(), &id).is_empty());
+    assert!(registry.hook_env(RuntimeRef::codex(), &id).is_empty());
 }
 
 #[test]
@@ -8136,7 +8136,11 @@ fn session_pty_env_marks_session_id_for_every_agent_kind() {
     // daemon id keeps self-feeding attach detection scoped to this daemon
     // instance, and POHUNEK_SESSION_ID must not be duplicated on top of the
     // hook env that already carries it.
-    for agent in [AgentKind::Shell, AgentKind::Codex, AgentKind::Claude] {
+    for agent in [
+        RuntimeRef::shell(),
+        RuntimeRef::codex(),
+        RuntimeRef::claude(),
+    ] {
         let env = registry.session_pty_env(agent.clone(), &id);
         let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
         let session_ids: Vec<&str> = env
@@ -8207,9 +8211,9 @@ async fn report_agent_on_shell_session_sets_active_agent_without_changing_launch
 
     let inspected = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(inspected.agent, "shell");
-    assert_eq!(inspected.agent_base, AgentKind::Shell);
+    assert_eq!(inspected.agent_base, RuntimeRef::shell());
     assert_eq!(inspected.active_agent.as_deref(), Some("codex"));
-    assert_eq!(inspected.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(inspected.active_agent_base, Some(RuntimeRef::codex()));
     assert_eq!(
         inspected.active_agent_session_id.as_deref(),
         Some("codex-native")
@@ -8937,7 +8941,7 @@ async fn procwatch_retires_root_authority_before_reused_pid_can_drive_state() {
             activity_reported: false,
         });
         entry.info.active_agent = Some("shell".to_owned());
-        entry.info.active_agent_base = Some(AgentKind::Shell);
+        entry.info.active_agent_base = Some(RuntimeRef::shell());
         entry.info.active_agent_pid = Some(created.pid);
         (
             Arc::clone(&entry.procwatch_rescan),
@@ -8991,7 +8995,7 @@ async fn procwatch_retires_a_zombie_root_with_its_exact_generation() {
             activity_reported: false,
         });
         entry.info.active_agent = Some("shell".to_owned());
-        entry.info.active_agent_base = Some(AgentKind::Shell);
+        entry.info.active_agent_base = Some(RuntimeRef::shell());
         entry.info.active_agent_pid = Some(root.pid);
     };
     inspector.set_not_running(root);
@@ -9061,7 +9065,7 @@ async fn procwatch_discards_cwd_when_focus_generation_changes_inside_bracket() {
             activity_reported: false,
         });
         entry.info.active_agent = Some("codex".to_owned());
-        entry.info.active_agent_base = Some(AgentKind::Codex);
+        entry.info.active_agent_base = Some(RuntimeRef::codex());
         entry.info.active_agent_pid = Some(agent.pid);
     };
     inspector.change_identity_after_cwd(
@@ -9108,7 +9112,7 @@ async fn stale_procwatch_retirement_cannot_clear_replacement_runtime() {
             activity_reported: false,
         });
         entry.info.active_agent = Some("codex".to_owned());
-        entry.info.active_agent_base = Some(AgentKind::Codex);
+        entry.info.active_agent_base = Some(RuntimeRef::codex());
         entry.info.active_agent_pid = Some(PID_REUSE_AGENT_PID);
     };
 
@@ -9197,7 +9201,7 @@ async fn report_release_matrix_agent(registry: &SessionRegistry, created: &Sessi
 
     let inspected = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(inspected.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
-    assert_eq!(inspected.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(inspected.active_agent_base, Some(RuntimeRef::codex()));
     assert_eq!(inspected.active_agent_pid, Some(RELEASE_MATRIX_AGENT_PID));
     assert_eq!(
         inspected.active_agent_session_id.as_deref(),
@@ -9232,7 +9236,7 @@ async fn direct_agent_root_pid_hook_claim_survives_procwatch_reconciles() {
             .await;
         let inspected = registry.inspect(&created.id).await.expect("inspect");
         assert_eq!(inspected.active_agent.as_deref(), Some(CODEX_HOOK_AGENT));
-        assert_eq!(inspected.active_agent_base, Some(AgentKind::Codex));
+        assert_eq!(inspected.active_agent_base, Some(RuntimeRef::codex()));
         assert_eq!(inspected.active_agent_pid, Some(created.pid));
         assert_eq!(
             inspected.active_agent_session_id.as_deref(),
@@ -9316,7 +9320,7 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
             .iter()
             .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
             .expect("observed codex pid");
-        assert_eq!(observed.agent_base, AgentKind::Codex);
+        assert_eq!(observed.agent_base, RuntimeRef::codex());
         observed.first_seen
     };
 
@@ -9340,7 +9344,7 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
             .iter()
             .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
             .expect("observed reused pid");
-        assert_eq!(observed.agent_base, AgentKind::Claude);
+        assert_eq!(observed.agent_base, RuntimeRef::claude());
         assert_eq!(observed.start_identity, u64::from(PID_REUSE_AGENT_PID) + 1);
         assert_eq!(observed.pgid, PID_REUSE_AGENT_PID + 10);
         assert_eq!(observed.first_seen, second_scan);
@@ -9864,7 +9868,7 @@ async fn procwatch_auto_report_releases_immediately_on_sigkill_style_exit() {
         .await;
     let active = registry.inspect(&created.id).await.expect("inspect");
     assert_eq!(active.active_agent.as_deref(), Some("codex"));
-    assert_eq!(active.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(active.active_agent_base, Some(RuntimeRef::codex()));
     assert_eq!(active.active_agent_pid, Some(100));
 
     inspector.set_descendants(created.pid, Vec::new());
@@ -9973,7 +9977,7 @@ async fn procwatch_rebinds_restart_to_new_observed_pid() {
     let rebound = registry.inspect(&created.id).await.expect("inspect");
 
     assert_eq!(rebound.active_agent.as_deref(), Some("codex"));
-    assert_eq!(rebound.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(rebound.active_agent_base, Some(RuntimeRef::codex()));
     assert_eq!(rebound.active_agent_pid, Some(200));
     assert_eq!(rebound.active_agent_session_id, None);
     let _ = registry.stop(&created.id).await;
@@ -11876,7 +11880,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         session_id: "s-noresume".to_owned(),
         name: None,
         agent: "noresume".to_owned(),
-        agent_base: AgentKind::Codex,
+        agent_base: RuntimeRef::codex(),
         cwd: temp_dir("noresume-binding-cwd"),
         cols: 80,
         rows: 24,
@@ -12352,7 +12356,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         session_id: "s-hermes-policy".to_owned(),
         name: None,
         agent: "hermes".to_owned(),
-        agent_base: AgentKind::Hermes,
+        agent_base: RuntimeRef::hermes(),
         cwd: dir.clone(),
         cols: 80,
         rows: 24,
@@ -12859,7 +12863,7 @@ async fn resume_binding_restores_metadata_from_store() {
             session_id: "s-42".to_owned(),
             name: None,
             agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: temp_dir("resume-metadata-cwd"),
             cols: 80,
             rows: 24,
@@ -13263,7 +13267,7 @@ async fn report_native_id_ignores_unknown_invalid_and_terminal() {
 }
 
 /// Input rules of a built-in runtime resolved through a default host.
-fn builtin_input_rules(agent: &AgentKind, config: &SessionRegistryConfig) -> InputRules {
+fn builtin_input_rules(agent: &RuntimeRef, config: &SessionRegistryConfig) -> InputRules {
     super::input_rules_for_agent(&RuntimeHost::default(), agent, config)
 }
 
@@ -13280,7 +13284,7 @@ fn claude_input_rules_use_configured_submit_delay() {
         ..SessionRegistryConfig::default()
     };
 
-    let rules = builtin_input_rules(&AgentKind::Claude, &config);
+    let rules = builtin_input_rules(&RuntimeRef::claude(), &config);
 
     assert!(!rules.bracketed_paste);
     assert_eq!(rules.submit_delay, Duration::from_millis(75));
@@ -13318,9 +13322,9 @@ fn only_a_host_shell_runtime_is_not_an_agent_launch_root() {
         ..SessionRegistryConfig::default()
     });
 
-    assert!(!registry.launch_root_is_agent(&AgentKind::Shell));
-    assert!(registry.launch_root_is_agent(&AgentKind::Claude));
-    assert!(registry.launch_root_is_agent(&AgentKind::Unknown("acme".to_owned())));
+    assert!(!registry.launch_root_is_agent(&RuntimeRef::shell()));
+    assert!(registry.launch_root_is_agent(&RuntimeRef::claude()));
+    assert!(registry.launch_root_is_agent(&RuntimeRef::from_wire("acme")));
 }
 
 #[test]
@@ -13353,7 +13357,7 @@ fn submit_delay_override_is_ignored_unless_the_definition_allows_it() {
     };
 
     let acme = super::input::input_rules_for_definition(&acme_definition(false, false), &config);
-    let codex = builtin_input_rules(&AgentKind::Codex, &config);
+    let codex = builtin_input_rules(&RuntimeRef::codex(), &config);
 
     assert_eq!(acme.submit_delay, Duration::from_millis(150));
     assert_eq!(codex.submit_delay, Duration::from_millis(150));
@@ -13363,7 +13367,7 @@ fn submit_delay_override_is_ignored_unless_the_definition_allows_it() {
 fn submit_delay_without_an_override_is_the_descriptor_value() {
     let config = SessionRegistryConfig::default();
 
-    let rules = builtin_input_rules(&AgentKind::Claude, &config);
+    let rules = builtin_input_rules(&RuntimeRef::claude(), &config);
     let other_runtime_override = SessionRegistryConfig {
         submit_delay_overrides: submit_delay_override("acme", Duration::ZERO),
         ..SessionRegistryConfig::default()
@@ -13371,7 +13375,7 @@ fn submit_delay_without_an_override_is_the_descriptor_value() {
 
     assert_eq!(rules.submit_delay, Duration::from_millis(150));
     assert_eq!(
-        builtin_input_rules(&AgentKind::Claude, &other_runtime_override).submit_delay,
+        builtin_input_rules(&RuntimeRef::claude(), &other_runtime_override).submit_delay,
         Duration::from_millis(150)
     );
 }
@@ -13380,7 +13384,7 @@ fn submit_delay_without_an_override_is_the_descriptor_value() {
 fn initial_prompt_is_a_launch_argument_only_when_the_definition_says_so() {
     let resolved = |prompt_arg| ResolvedAgent {
         name: "acme".to_owned(),
-        base: AgentKind::Unknown("acme".to_owned()),
+        base: RuntimeId::parse("acme").expect("valid runtime id"),
         definition: Arc::new(acme_definition(false, prompt_arg)),
         profile: None,
     };

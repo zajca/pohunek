@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use pohunek_client::{Client, ClientOptions, OriginSource};
-use protocol::{AgentKind, AgentRuntime};
+use protocol::{AgentRuntime, RuntimeRef};
 use serde::{Deserialize, Serialize};
 
 use crate::AssistantError;
@@ -178,13 +178,13 @@ impl HostConfig {
 /// policy does not refuse it: `supported == Some(false)` means the daemon found
 /// the executable but will not launch it, while `None` means the runtime has no
 /// version policy. A runtime with a policy always reports `Some(_)` once it is
-/// available, so no runtime id is special-cased here. A future unknown compiled
-/// base fails closed.
+/// available, so no runtime id is special-cased here. A base reported as a
+/// historical label (outside the runtime-id grammar) fails closed.
 #[must_use]
 pub fn runtime_is_launchable(runtime: &AgentRuntime) -> bool {
     runtime.available
         && runtime.supported != Some(false)
-        && !matches!(runtime.agent_base.as_ref(), Some(AgentKind::Unknown(_)))
+        && !matches!(runtime.agent_base.as_ref(), Some(RuntimeRef::Historical(_)))
 }
 
 /// Returns whether a launchable runtime can host the assistant.
@@ -195,7 +195,7 @@ pub fn runtime_is_launchable(runtime: &AgentRuntime) -> bool {
 #[must_use]
 pub fn runtime_is_assistant_capable(runtime: &AgentRuntime) -> bool {
     runtime.agent != "shell"
-        && runtime.agent_base.as_ref() != Some(&AgentKind::Shell)
+        && runtime.agent_base.as_ref() != Some(&RuntimeRef::shell())
         && runtime_is_launchable(runtime)
 }
 

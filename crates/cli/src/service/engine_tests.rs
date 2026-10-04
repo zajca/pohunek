@@ -19,7 +19,7 @@ use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, Servi
 use pohunek_session_worker::RuntimePhase;
 use pohunek_test_support::wait::wait_until;
 use protocol::{
-    AgentKind, DaemonHealthResult, RuntimeGeneration, SessionCapabilities, SessionId,
+    DaemonHealthResult, RuntimeGeneration, RuntimeRef, SessionCapabilities, SessionId,
     SessionRuntime, StateSource,
 };
 
@@ -457,7 +457,7 @@ fn session(id: &str, name: Option<&str>) -> SessionInfo {
         external: Some(false),
         capabilities: SessionCapabilities::default(),
         agent: "shell".to_owned(),
-        agent_base: AgentKind::Shell,
+        agent_base: RuntimeRef::shell(),
         cwd: PathBuf::from("/work"),
         cwd_source: None,
         pid: 1,

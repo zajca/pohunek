@@ -16,8 +16,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use protocol::{
-    AgentKind, AgentRuntime, HostCapabilities, ProtocolError, RuntimeId, RuntimeRef,
-    PROTOCOL_VERSION,
+    AgentRuntime, HostCapabilities, ProtocolError, RuntimeId, RuntimeRef, PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 
@@ -82,22 +81,12 @@ impl VersionProbe {
     }
 }
 
-/// Resolves the definition a compiled base kind launches, when one is registered.
+/// Resolves the definition a base runtime launches, when one is registered.
 fn definition_for_base<'a>(
     registry: &'a RuntimeRegistry,
-    base: &AgentKind,
+    base: &RuntimeId,
 ) -> Option<&'a Arc<RuntimeDefinition>> {
-    let runtime_id = base.as_runtime_ref();
-    let RuntimeRef::Id(runtime_id) = &runtime_id else {
-        return None;
-    };
-    registry.resolve(runtime_id).ok()
-}
-
-/// Wire `agent_base` of a registered runtime: the compiled kind sharing its id.
-fn agent_base_of(runtime_id: &RuntimeId) -> AgentKind {
-    serde_json::from_value(serde_json::Value::String(runtime_id.as_str().to_owned()))
-        .unwrap_or_else(|_| AgentKind::Unknown(runtime_id.to_string()))
+    registry.resolve(base).ok()
 }
 
 /// Position of a runtime id in the reported inventory: the reserved built-ins
@@ -142,7 +131,7 @@ fn host_capabilities_for(
     let mut runtimes = Vec::with_capacity(definitions.len());
     for definition in definitions {
         let agent = definition.runtime_id().as_str();
-        let agent_base = agent_base_of(definition.runtime_id());
+        let agent_base = RuntimeRef::from(definition.runtime_id().clone());
         runtimes.push(match definition.program() {
             // A host-shell runtime needs no named binary on PATH.
             LaunchProgram::HostShell(_) => AgentRuntime {
@@ -167,20 +156,20 @@ fn host_capabilities_for(
         let runtime = match (definition, agent.profile.as_ref()) {
             (Some(definition), Some(profile)) => probe_definition(
                 &agent.name,
-                agent.base.clone(),
+                RuntimeRef::from(agent.base.clone()),
                 definition,
                 &profile.program,
             ),
             (Some(definition), None) => probe_definition(
                 &agent.name,
-                agent.base.clone(),
+                RuntimeRef::from(agent.base.clone()),
                 definition,
                 definition.program().as_str(),
             ),
             // A base without a registered runtime has nothing to launch.
             (None, _) => AgentRuntime {
                 agent: agent.name.clone(),
-                agent_base: Some(agent.base.clone()),
+                agent_base: Some(RuntimeRef::from(agent.base.clone())),
                 available: false,
                 path: None,
                 version: None,
@@ -211,7 +200,7 @@ fn host_capabilities_for(
 /// Probe `program` for `definition`, honouring its version-probe parser.
 fn probe_definition(
     agent: &str,
-    agent_base: AgentKind,
+    agent_base: RuntimeRef,
     definition: &RuntimeDefinition,
     program: &str,
 ) -> AgentRuntime {
@@ -226,7 +215,7 @@ fn probe_definition(
 /// `available` is true exactly when the program resolves to an **executable** on
 /// `PATH` (the launch-path check, [`which_executable`]); the resolved path is
 /// reported when found.
-fn probe_runtime(agent: &str, agent_base: AgentKind, binary: &str) -> AgentRuntime {
+fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRuntime {
     match which_executable(binary) {
         Some(path) => AgentRuntime {
             agent: agent.to_owned(),
@@ -255,7 +244,7 @@ fn probe_runtime(agent: &str, agent_base: AgentKind, binary: &str) -> AgentRunti
 /// parser id this daemon does not compile in.
 fn probe_versioned_runtime(
     agent: &str,
-    agent_base: AgentKind,
+    agent_base: RuntimeRef,
     binary: &str,
     parser: &HandlerId,
 ) -> AgentRuntime {
@@ -294,11 +283,14 @@ fn probe_versioned_runtime(
 /// never enter the error.
 #[cfg(test)]
 pub(crate) fn validate_launch_runtime(
-    base: &AgentKind,
+    base: &RuntimeRef,
     binary: &str,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
     let host = crate::agent::host::RuntimeHost::default();
-    match definition_for_base(host.registry(), base) {
+    match base
+        .id()
+        .and_then(|id| definition_for_base(host.registry(), id))
+    {
         Some(definition) => validate_definition_launch(definition, binary),
         None => Ok(None),
     }
@@ -757,7 +749,7 @@ mod tests {
             shell.path.is_none(),
             "shell runtime carries no resolved path"
         );
-        assert_eq!(shell.agent_base, Some(AgentKind::Shell));
+        assert_eq!(shell.agent_base, Some(RuntimeRef::shell()));
     }
 
     #[test]
@@ -796,7 +788,7 @@ mod tests {
         // The availability invariant holds for profile programs too.
         assert_eq!(runtime.available, runtime.path.is_some());
         assert!(runtime.available, "/bin/sh resolves as executable");
-        assert_eq!(runtime.agent_base, Some(AgentKind::Claude));
+        assert_eq!(runtime.agent_base, Some(RuntimeRef::claude()));
     }
 
     #[test]
@@ -819,7 +811,7 @@ mod tests {
     }
 
     fn probe_hermes_for_test(binary: &str) -> AgentRuntime {
-        probe_versioned_runtime("hermes", AgentKind::Hermes, binary, &hermes_parser())
+        probe_versioned_runtime("hermes", RuntimeRef::hermes(), binary, &hermes_parser())
     }
 
     /// Registry whose shell runtime launches a fixed program, so the
@@ -849,7 +841,7 @@ mod tests {
                 .resolve(&RuntimeId::parse("shell").expect("id"))
                 .expect("shell registered");
             assert_eq!(shell_def.program().as_str(), "/bin/sh");
-            assert!(definition_for_base(&registry, &AgentKind::Hermes).is_some());
+            assert!(definition_for_base(&registry, &RuntimeId::hermes()).is_some());
         }
         let valid = BuiltinSource::from_login_shell(Some("/usr/bin/zsh".to_owned()));
         let registry = RuntimeRegistry::from_sources(&[&valid]).expect("registry");
@@ -866,7 +858,7 @@ mod tests {
         assert_eq!(order, RESERVED_RUNTIME_IDS);
         assert_eq!(caps.supported_agents, RESERVED_RUNTIME_IDS);
 
-        let bases: Vec<AgentKind> = caps
+        let bases: Vec<RuntimeRef> = caps
             .runtimes
             .iter()
             .map(|r| r.agent_base.clone().expect("base reported"))
@@ -874,10 +866,10 @@ mod tests {
         assert_eq!(
             bases,
             [
-                AgentKind::Shell,
-                AgentKind::Codex,
-                AgentKind::Claude,
-                AgentKind::Hermes
+                RuntimeRef::shell(),
+                RuntimeRef::codex(),
+                RuntimeRef::claude(),
+                RuntimeRef::hermes()
             ]
         );
         // Only the runtime with a version-probe parser reports a policy.
@@ -922,7 +914,7 @@ mod tests {
 
         let runtime = probe_versioned_runtime(
             "custom",
-            AgentKind::Hermes,
+            RuntimeRef::hermes(),
             &program.display().to_string(),
             &parser,
         );
@@ -951,7 +943,7 @@ mod tests {
             .iter()
             .find(|runtime| runtime.agent == "hermes-review")
             .expect("profile runtime reported");
-        assert_eq!(runtime.agent_base, Some(AgentKind::Hermes));
+        assert_eq!(runtime.agent_base, Some(RuntimeRef::hermes()));
         assert_eq!(runtime.version.as_deref(), Some("0.21.0"));
         assert_eq!(runtime.supported, Some(false));
     }
@@ -967,7 +959,7 @@ mod tests {
         );
         let supported = probe_hermes_for_test(&hermes.display().to_string());
         assert!(supported.available);
-        assert_eq!(supported.agent_base, Some(AgentKind::Hermes));
+        assert_eq!(supported.agent_base, Some(RuntimeRef::hermes()));
         assert_eq!(supported.version.as_deref(), Some("0.20.0"));
         assert_eq!(supported.supported, Some(true));
 
@@ -985,7 +977,7 @@ mod tests {
 
         let missing = probe_hermes_for_test(&dir.join("missing").display().to_string());
         assert!(!missing.available);
-        assert_eq!(missing.agent_base, Some(AgentKind::Hermes));
+        assert_eq!(missing.agent_base, Some(RuntimeRef::hermes()));
         assert_eq!(missing.path, None);
         assert_eq!(missing.version, None);
         assert_eq!(missing.supported, None);
@@ -998,7 +990,7 @@ mod tests {
         let binary = hermes.display().to_string();
 
         write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
-        let validated = validate_launch_runtime(&AgentKind::Hermes, &binary)
+        let validated = validate_launch_runtime(&RuntimeRef::hermes(), &binary)
             .expect("pinned Hermes runtime")
             .expect("Hermes has a validated program");
         assert_eq!(
@@ -1011,7 +1003,7 @@ mod tests {
             ("unexpected output", "unexpected output"),
         ] {
             write_test_executable(&hermes, &format!("#!/bin/sh\necho '{output}'\n"));
-            let error = validate_launch_runtime(&AgentKind::Hermes, &binary)
+            let error = validate_launch_runtime(&RuntimeRef::hermes(), &binary)
                 .expect_err("incompatible Hermes runtime");
             assert_eq!(error.code, "agent_runtime_unsupported");
             assert!(!error.msg.contains(forbidden));
@@ -1019,13 +1011,13 @@ mod tests {
         }
 
         let missing = dir.join("missing").display().to_string();
-        let error = validate_launch_runtime(&AgentKind::Hermes, &missing)
+        let error = validate_launch_runtime(&RuntimeRef::hermes(), &missing)
             .expect_err("missing Hermes runtime");
         assert_eq!(error.code, "agent_runtime_unsupported");
         assert!(!error.msg.contains(&missing));
 
         assert_eq!(
-            validate_launch_runtime(&AgentKind::Claude, &missing)
+            validate_launch_runtime(&RuntimeRef::claude(), &missing)
                 .expect("non-Hermes behavior remains deferred to launch"),
             None
         );
@@ -1417,7 +1409,7 @@ mod tests {
             .find(|runtime| runtime.agent == "hermes-work")
             .expect("Hermes profile runtime");
         assert!(!runtime.available);
-        assert_eq!(runtime.agent_base, Some(AgentKind::Hermes));
+        assert_eq!(runtime.agent_base, Some(RuntimeRef::hermes()));
         assert_eq!(runtime.supported, None);
     }
 

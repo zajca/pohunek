@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{AgentKind, ErrorClass, ProtocolError, RuntimeId};
+use protocol::{ErrorClass, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
@@ -180,7 +180,7 @@ pub(crate) struct ResolvedAgent {
     /// The resolved agent name (a profile name, or a bare base-kind name).
     pub name: String,
     /// The base kind this resolves to (drives detection/resume/handshake env).
-    pub base: AgentKind,
+    pub base: RuntimeId,
     /// The definition of the base runtime.
     pub definition: Arc<RuntimeDefinition>,
     /// Host-profile overrides; `None` for a bare base kind.
@@ -334,7 +334,7 @@ impl ProfileRegistry {
         {
             return Ok(ResolvedAgent {
                 name: name.to_owned(),
-                base: AgentKind::from_wire(definition.runtime_id().as_str()),
+                base: definition.runtime_id().clone(),
                 definition: Arc::clone(definition),
                 profile: None,
             });
@@ -464,7 +464,6 @@ fn load_profile(
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
     let definition = Arc::clone(runtimes.resolve_id(&base_id)?);
-    let base = AgentKind::from_wire(base_id.as_str());
     // A runtime without native resume (the shell) cannot have a profile claim one.
     if definition.native().is_none()
         && raw
@@ -512,7 +511,7 @@ fn load_profile(
     )?;
     Ok(ResolvedAgent {
         name: name.to_owned(),
-        base,
+        base: base_id,
         definition,
         profile: Some(ResolvedProfile {
             program,
@@ -693,10 +692,10 @@ mod tests {
     fn bare_base_kinds_resolve_without_a_profile() {
         let reg = ProfileRegistry::new(None);
         for (name, base) in [
-            ("shell", AgentKind::Shell),
-            ("codex", AgentKind::Codex),
-            ("claude", AgentKind::Claude),
-            ("hermes", AgentKind::Hermes),
+            ("shell", RuntimeId::shell()),
+            ("codex", RuntimeId::codex()),
+            ("claude", RuntimeId::claude()),
+            ("hermes", RuntimeId::hermes()),
         ] {
             let resolved = reg.resolve_agent(name).expect("base kind resolves");
             assert_eq!(resolved.base, base);
@@ -744,7 +743,7 @@ mod tests {
         .expect("write profile");
         let reg = ProfileRegistry::new(Some(dir.clone()));
         let resolved = reg.resolve_agent("claude-sonnet").expect("resolves");
-        assert_eq!(resolved.base, AgentKind::Claude);
+        assert_eq!(resolved.base, RuntimeId::claude());
         assert_eq!(resolved.name, "claude-sonnet");
         let profile = resolved.profile.expect("has overrides");
         assert_eq!(profile.program, "claude");
@@ -791,7 +790,7 @@ mod tests {
             .resolve_agent("hermes-work")
             .expect("Hermes profile resolves");
 
-        assert_eq!(resolved.base, AgentKind::Hermes);
+        assert_eq!(resolved.base, RuntimeId::hermes());
         let profile = resolved.profile.expect("profile overrides");
         assert_eq!(profile.program, "hermes-wrapper");
         assert_eq!(profile.args, vec!["-p", "work", "chat"]);
@@ -802,7 +801,7 @@ mod tests {
         assert!(!input_rules.allows_while_blocked());
         assert_eq!(
             profile.native,
-            crate::agent::builtin_native_launch(&AgentKind::Hermes)
+            crate::agent::builtin_native_launch(&protocol::RuntimeId::hermes())
         );
         assert!(!profile.native.expect("Hermes recovers").supports_fork());
     }
@@ -906,9 +905,9 @@ mod tests {
         write_profile(&dir, "h", "base = \"hermes\"\n");
 
         for (name, base) in [
-            ("c", AgentKind::Claude),
-            ("x", AgentKind::Codex),
-            ("h", AgentKind::Hermes),
+            ("c", RuntimeId::claude()),
+            ("x", RuntimeId::codex()),
+            ("h", RuntimeId::hermes()),
         ] {
             let agent = ProfileRegistry::new(Some(dir.clone()))
                 .resolve_agent(name)
@@ -987,7 +986,7 @@ mod tests {
         );
         assert_eq!(
             resolve(&dir, "with-fork").expect("resolves").native,
-            crate::agent::builtin_native_launch(&AgentKind::Claude)
+            crate::agent::builtin_native_launch(&protocol::RuntimeId::claude())
         );
         let no_fork = resolve(&dir, "no-fork")
             .expect("resolves")

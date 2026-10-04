@@ -10,11 +10,11 @@ use pohunek_worker_protocol::{
 
 use super::{
     build_pty_command, debug, detect_at, event, host, mpsc, plan_initial_input_delivery,
-    runtime_error, timestamp_now, warn, watch, AgentKind, Arc, CancellationToken, CwdSource,
-    DesiredState, DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs,
-    DetectorScope, InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch,
-    Notify, Ordering, PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding,
-    ResumeSnapshot, RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeState, RuntimeWatchIdentity,
+    runtime_error, timestamp_now, warn, watch, Arc, CancellationToken, CwdSource, DesiredState,
+    DetectedProject, DetectorConfig, DetectorConfigUpdate, DetectorInputs, DetectorScope,
+    InputRules, LaunchCommand, LaunchOpts, Manifest, Mutex, NativeSessionLaunch, Notify, Ordering,
+    PathBuf, ProjectRecord, ProtocolError, ResolvedAgent, ResumeBinding, ResumeSnapshot,
+    RuntimeHandle, RuntimeHost, RuntimeRecord, RuntimeRef, RuntimeState, RuntimeWatchIdentity,
     SessionEntry, SessionId, SessionInfo, SessionNewParams, SessionRecord, SessionRefKind,
     SessionRegistry, SessionRuntime, SessionState, SessionTransaction, SessionWarning, StateSource,
     TransactionKind, Worker, WorktreeRequest, DEFAULT_WORKER_SUBSCRIBER_BYTES,
@@ -51,7 +51,7 @@ pub(super) struct PtySessionSpec {
     /// Resolved agent NAME (a host-profile name, or a bare base-kind name).
     pub(super) agent: String,
     /// Resolved base kind backing the agent (detection/resume/handshake env).
-    pub(super) agent_base: AgentKind,
+    pub(super) agent_base: RuntimeRef,
     /// Input-framing rules for this session (base-kind defaults, profile-overridden).
     pub(super) input_rules: InputRules,
     /// Frozen structural relaunch snapshot (C.4): launch program/args + the resolved
@@ -988,7 +988,7 @@ impl SessionRegistry {
         generation: &Generation,
         id: &SessionId,
         agent: &str,
-        agent_base: AgentKind,
+        agent_base: RuntimeRef,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
@@ -1024,7 +1024,7 @@ impl SessionRegistry {
         worker: Worker,
         id: &SessionId,
         agent: &str,
-        agent_base: AgentKind,
+        agent_base: RuntimeRef,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,

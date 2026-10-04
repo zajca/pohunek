@@ -299,6 +299,36 @@ fn validate_digest(value: &str) -> Result<(), BindingFieldError> {
 impl RuntimeId {
     /// Wire value of the shell runtime, the only runtime without a package.
     pub const SHELL: &'static str = "shell";
+    /// Wire value of the official Codex runtime.
+    pub const CODEX: &'static str = "codex";
+    /// Wire value of the official Claude Code runtime.
+    pub const CLAUDE: &'static str = "claude";
+    /// Wire value of the official Hermes Agent runtime.
+    pub const HERMES: &'static str = "hermes";
+
+    /// The shell runtime identity.
+    #[must_use]
+    pub fn shell() -> Self {
+        Self::from_trusted(Self::SHELL)
+    }
+
+    /// The official Codex runtime identity.
+    #[must_use]
+    pub fn codex() -> Self {
+        Self::from_trusted(Self::CODEX)
+    }
+
+    /// The official Claude Code runtime identity.
+    #[must_use]
+    pub fn claude() -> Self {
+        Self::from_trusted(Self::CLAUDE)
+    }
+
+    /// The official Hermes Agent runtime identity.
+    #[must_use]
+    pub fn hermes() -> Self {
+        Self::from_trusted(Self::HERMES)
+    }
 
     /// Wraps a literal the crate itself guarantees valid (covered by tests).
     pub(crate) fn from_trusted(value: &'static str) -> Self {
@@ -368,6 +398,39 @@ impl RuntimeRef {
             |_error| Self::Historical(HistoricalRuntime(value.to_owned())),
             Self::Id,
         )
+    }
+
+    /// The shell runtime reference.
+    #[must_use]
+    pub fn shell() -> Self {
+        Self::Id(RuntimeId::shell())
+    }
+
+    /// The official Codex runtime reference.
+    #[must_use]
+    pub fn codex() -> Self {
+        Self::Id(RuntimeId::codex())
+    }
+
+    /// The official Claude Code runtime reference.
+    #[must_use]
+    pub fn claude() -> Self {
+        Self::Id(RuntimeId::claude())
+    }
+
+    /// The official Hermes Agent runtime reference.
+    #[must_use]
+    pub fn hermes() -> Self {
+        Self::Id(RuntimeId::hermes())
+    }
+
+    /// Returns the valid runtime identity, or `None` for a historical label.
+    #[must_use]
+    pub fn id(&self) -> Option<&RuntimeId> {
+        match self {
+            Self::Id(id) => Some(id),
+            Self::Historical(_) => None,
+        }
     }
 
     /// Returns the wire value.
@@ -679,23 +742,28 @@ mod tests {
     }
 
     #[test]
-    fn agent_kind_maps_to_runtime_refs_without_launching_unknown_values() {
-        use crate::AgentKind;
-
-        for kind in [
-            AgentKind::Shell,
-            AgentKind::Codex,
-            AgentKind::Claude,
-            AgentKind::Hermes,
+    fn official_constructors_match_their_wire_constants() {
+        for (id, wire) in [
+            (RuntimeId::shell(), RuntimeId::SHELL),
+            (RuntimeId::codex(), RuntimeId::CODEX),
+            (RuntimeId::claude(), RuntimeId::CLAUDE),
+            (RuntimeId::hermes(), RuntimeId::HERMES),
         ] {
-            let reference = kind.as_runtime_ref();
-            assert_eq!(reference.as_wire(), kind.as_wire());
-            assert_eq!(
-                reference.launchable().expect("built-in is launchable"),
-                &RuntimeId::parse(kind.as_wire()).expect("valid id")
-            );
+            assert_eq!(id, RuntimeId::parse(wire).expect("official id is valid"));
+            let reference = RuntimeRef::from(id.clone());
+            assert_eq!(reference.as_wire(), wire);
+            assert_eq!(reference.id(), Some(&id));
+            assert_eq!(reference.launchable().expect("official id launches"), &id);
         }
-        let unknown = AgentKind::Unknown("future-agent".to_owned()).as_runtime_ref();
+        assert_eq!(RuntimeRef::shell().as_wire(), "shell");
+        assert_eq!(RuntimeRef::codex().as_wire(), "codex");
+        assert_eq!(RuntimeRef::claude().as_wire(), "claude");
+        assert_eq!(RuntimeRef::hermes().as_wire(), "hermes");
+    }
+
+    #[test]
+    fn wire_values_classify_without_launching_historical_labels() {
+        let unknown = RuntimeRef::from_wire("future-agent");
         assert_eq!(
             unknown,
             RuntimeRef::Id(RuntimeId::parse("future-agent").unwrap())
@@ -713,13 +781,17 @@ mod tests {
             "future-agent"
         );
 
-        let invalid = AgentKind::Unknown("Not Valid".to_owned()).as_runtime_ref();
-        assert_eq!(invalid, RuntimeRef::from_wire("Not Valid"));
+        let invalid = RuntimeRef::from_wire("Not Valid");
         assert!(matches!(invalid, RuntimeRef::Historical(_)));
+        assert_eq!(invalid.id(), None);
         let json = serde_json::to_string(&invalid).expect("serialize");
         assert_eq!(
             serde_json::from_str::<RuntimeRef>(&json).expect("roundtrip"),
             invalid
+        );
+        assert_eq!(
+            invalid.launchable().expect_err("historical").code,
+            "agent_kind_unsupported"
         );
     }
 

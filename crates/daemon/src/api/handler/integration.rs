@@ -25,8 +25,10 @@ pub(super) async fn handle_integration_uninstall(request: &Request) -> Response 
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    run_integration_uninstall_blocking(request, move || crate::integration::uninstall(params.agent))
-        .await
+    run_integration_uninstall_blocking(request, move || {
+        crate::integration::uninstall(&params.agent)
+    })
+    .await
 }
 
 pub(super) async fn handle_integration_doctor(request: &Request) -> Response {

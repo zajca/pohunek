@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use protocol::{
-    AgentKind, BindingProvenance, PackageDigest, PackageId, PackageIdentity, PackageVersion,
-    RuntimeId,
+    BindingProvenance, PackageDigest, PackageId, PackageIdentity, PackageVersion, RuntimeId,
+    RuntimeRef,
 };
 
 use super::{
@@ -121,7 +121,7 @@ impl RuntimeSource for FixedSource {
 /// Expected launch facts of one built-in runtime, written out literally so the
 /// descriptors are pinned to the behavior the daemon shipped with.
 struct Expected {
-    kind: AgentKind,
+    kind: RuntimeRef,
     program: &'static str,
     args: &'static [&'static str],
     input: InputRules,
@@ -135,7 +135,7 @@ fn builtin_definitions_match_the_compiled_behavior() {
     let delay = Duration::from_millis(150);
     let expected = [
         Expected {
-            kind: AgentKind::Shell,
+            kind: RuntimeRef::shell(),
             program: "/bin/sh",
             args: &[],
             input: InputRules::unrestricted(false, Duration::ZERO),
@@ -144,7 +144,7 @@ fn builtin_definitions_match_the_compiled_behavior() {
             manifest: generic_shell_manifest,
         },
         Expected {
-            kind: AgentKind::Codex,
+            kind: RuntimeRef::codex(),
             program: "codex",
             args: &[],
             input: InputRules::unrestricted(true, delay),
@@ -153,7 +153,7 @@ fn builtin_definitions_match_the_compiled_behavior() {
             manifest: codex_manifest,
         },
         Expected {
-            kind: AgentKind::Claude,
+            kind: RuntimeRef::claude(),
             program: "claude",
             args: &[],
             input: InputRules::unrestricted(false, delay),
@@ -162,7 +162,7 @@ fn builtin_definitions_match_the_compiled_behavior() {
             manifest: claude_manifest,
         },
         Expected {
-            kind: AgentKind::Hermes,
+            kind: RuntimeRef::hermes(),
             program: "hermes",
             args: &["chat"],
             input: InputRules::hermes(true, delay),
@@ -934,23 +934,23 @@ fn builtin_definition(name: &str) -> Arc<RuntimeDefinition> {
 fn the_host_answers_unlaunchable_kinds_with_stable_distinct_errors() {
     let host = RuntimeHost::from_host_environment();
     for kind in [
-        AgentKind::Shell,
-        AgentKind::Codex,
-        AgentKind::Claude,
-        AgentKind::Hermes,
+        RuntimeRef::shell(),
+        RuntimeRef::codex(),
+        RuntimeRef::claude(),
+        RuntimeRef::hermes(),
     ] {
-        host.resolve_kind(&kind).expect("built-in kind resolves");
+        host.resolve_ref(&kind).expect("built-in kind resolves");
     }
     // A valid runtime id nothing backs is not installed; a value outside the
     // grammar is presentation-only.
     let uninstalled = host
-        .resolve_kind(&AgentKind::Unknown("acme".to_owned()))
+        .resolve_ref(&RuntimeRef::from_wire("acme"))
         .expect_err("uninstalled runtime");
     assert_eq!(uninstalled.code, "runtime_not_installed");
     assert!(uninstalled.msg.contains("acme"));
     for historical in ["Acme Agent", "", "a/b"] {
         let error = host
-            .resolve_kind(&AgentKind::Unknown(historical.to_owned()))
+            .resolve_ref(&RuntimeRef::from_wire(historical))
             .expect_err("historical value");
         assert_eq!(error.code, "agent_kind_unsupported", "{historical:?}");
         assert!(!error.msg.contains(historical) || historical.is_empty());

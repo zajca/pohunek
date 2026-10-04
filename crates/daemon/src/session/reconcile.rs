@@ -12,9 +12,9 @@ use pohunek_platform::{
 };
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{
-    AgentActivity, AgentKind, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
-    SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision, SubagentStateEvent,
-    UnconfirmedProcess,
+    AgentActivity, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
+    RuntimeRef, SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision,
+    SubagentStateEvent, UnconfirmedProcess,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2858,8 +2858,7 @@ fn map_worker_subagents(
         .iter()
         .map(|subagent| {
             let provider = match subagent.provider.as_str() {
-                "codex" => AgentKind::Codex,
-                "claude" => AgentKind::Claude,
+                RuntimeId::CODEX | RuntimeId::CLAUDE => RuntimeRef::from_wire(&subagent.provider),
                 _ => return Err("subagent_provider_invalid"),
             };
             let lifecycle = match subagent.phase {
@@ -3317,12 +3316,11 @@ fn apply_worker_launch_identity(
     Ok(())
 }
 
-fn parse_provider(provider: &str) -> Option<protocol::AgentKind> {
+fn parse_provider(provider: &str) -> Option<protocol::RuntimeRef> {
     match provider {
-        "shell" => Some(protocol::AgentKind::Shell),
-        "codex" => Some(protocol::AgentKind::Codex),
-        "claude" => Some(protocol::AgentKind::Claude),
-        "hermes" => Some(protocol::AgentKind::Hermes),
+        RuntimeId::SHELL | RuntimeId::CODEX | RuntimeId::CLAUDE | RuntimeId::HERMES => {
+            Some(RuntimeRef::from_wire(provider))
+        }
         _ => None,
     }
 }
@@ -3546,11 +3544,11 @@ fn import_legacy_manifest(store: &crate::store::Store) -> Result<LegacyManifest,
         .map(|session| session.id.0.as_str())
         .collect();
     if manifest.sessions.iter().any(|session| {
-        !session.agent_base.is_known()
+        session.agent_base.launchable().is_err()
             || session
                 .active_agent_base
                 .as_ref()
-                .is_some_and(|active| !active.is_known())
+                .is_some_and(|active| active.launchable().is_err())
     }) {
         return Err(runtime_error(
             "migration_import_failed",
@@ -3991,9 +3989,10 @@ mod tests {
         WorkerInstanceId,
     };
     use protocol::{
-        AgentActivity, AgentKind, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
-        RuntimeInventoryStatus, RuntimeState, SessionForkParams, SessionId, SessionInfo,
-        SessionNewParams, SessionReportNativeIdParams, SessionRuntime, SessionState, StateSource,
+        AgentActivity, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
+        RuntimeInventoryStatus, RuntimeRef, RuntimeState, SessionForkParams, SessionId,
+        SessionInfo, SessionNewParams, SessionReportNativeIdParams, SessionRuntime, SessionState,
+        StateSource,
     };
     use sha2::{Digest, Sha256};
     use time::format_description::well_known::Rfc3339;
@@ -4343,7 +4342,7 @@ while os.getppid() == parent:
             Some("native-launch")
         );
         assert_eq!(record.info.active_agent.as_deref(), Some("claude"));
-        assert_eq!(record.info.active_agent_base, Some(AgentKind::Claude));
+        assert_eq!(record.info.active_agent_base, Some(RuntimeRef::claude()));
         assert_eq!(record.info.active_agent_pid, Some(60));
         assert_eq!(
             record.info.active_agent_session_id.as_deref(),
@@ -4614,21 +4613,21 @@ while os.getppid() == parent:
         for (provider, agent_base, kind, launch_reference, nested_reference) in [
             (
                 "codex",
-                AgentKind::Codex,
+                RuntimeRef::codex(),
                 SessionRefKind::Id,
                 "codex-launch",
                 "codex-nested",
             ),
             (
                 "claude",
-                AgentKind::Claude,
+                RuntimeRef::claude(),
                 SessionRefKind::Path,
                 "/work/claude-launch.jsonl",
                 "/work/claude-nested.jsonl",
             ),
             (
                 "hermes",
-                AgentKind::Hermes,
+                RuntimeRef::hermes(),
                 SessionRefKind::Id,
                 "hermes-launch",
                 "hermes-nested",
@@ -4740,7 +4739,7 @@ while os.getppid() == parent:
         record.session_id = session_id.to_owned();
         record.info.id = SessionId(session_id.to_owned());
         record.info.agent = "shell".to_owned();
-        record.info.agent_base = AgentKind::Shell;
+        record.info.agent_base = RuntimeRef::shell();
         record.info.cwd = root.clone();
         record.info.pid = child_pid;
         let info_runtime = record.info.runtime.as_mut().expect("runtime info");
@@ -4751,7 +4750,7 @@ while os.getppid() == parent:
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
         recovery.agent = "shell".to_owned();
-        recovery.agent_base = AgentKind::Shell;
+        recovery.agent_base = RuntimeRef::shell();
         recovery.cwd = root.clone();
         recovery.program = "/bin/sh".to_owned();
         recovery.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
@@ -4990,11 +4989,11 @@ while os.getppid() == parent:
         record.session_id = session_id.to_owned();
         record.info.id = SessionId(session_id.to_owned());
         record.info.agent = "shell".to_owned();
-        record.info.agent_base = AgentKind::Shell;
+        record.info.agent_base = RuntimeRef::shell();
         record.info.cwd = root.clone();
         record.info.pid = child_pid;
         record.info.active_agent = Some("codex".to_owned());
-        record.info.active_agent_base = Some(AgentKind::Codex);
+        record.info.active_agent_base = Some(RuntimeRef::codex());
         record.info.active_agent_pid = Some(child_pid);
         record.info.active_agent_session_id = Some("native-before-drain".to_owned());
         record.info.native_session_id = Some("native-before-drain".to_owned());
@@ -5012,7 +5011,7 @@ while os.getppid() == parent:
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
         recovery.agent = "shell".to_owned();
-        recovery.agent_base = AgentKind::Shell;
+        recovery.agent_base = RuntimeRef::shell();
         recovery.cwd = root.clone();
         recovery.program = "/bin/sh".to_owned();
         recovery.args = vec!["-c".to_owned(), "draining fixture".to_owned()];
@@ -5234,7 +5233,7 @@ while os.getppid() == parent:
             external: Some(false),
             name: Some("restart continuity".to_owned()),
             agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: root.clone(),
             cwd_source: Some(CwdSource::Launch),
             pid: child_pid,
@@ -5254,7 +5253,7 @@ while os.getppid() == parent:
             activity: None,
             subagents: Vec::new(),
             active_agent: Some("claude".to_owned()),
-            active_agent_base: Some(AgentKind::Claude),
+            active_agent_base: Some(RuntimeRef::claude()),
             active_agent_pid: Some(released_pid),
             active_agent_session_id: Some("nested-before-release".to_owned()),
             active_agent_session_path: None,
@@ -5282,7 +5281,7 @@ while os.getppid() == parent:
             session_id: session_id.to_owned(),
             name: Some("restart continuity".to_owned()),
             agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: root.clone(),
             cols: 80,
             rows: 24,
@@ -5583,7 +5582,7 @@ while os.getppid() == parent:
         record.session_id = session_id.to_owned();
         record.info.id = SessionId(session_id.to_owned());
         record.info.agent = "hermes".to_owned();
-        record.info.agent_base = AgentKind::Hermes;
+        record.info.agent_base = RuntimeRef::hermes();
         record.info.cwd = root.clone();
         record.info.pid = child_pid;
         record.info.capabilities = protocol::SessionCapabilities {
@@ -5596,7 +5595,7 @@ while os.getppid() == parent:
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
         recovery.agent = "hermes".to_owned();
-        recovery.agent_base = AgentKind::Hermes;
+        recovery.agent_base = RuntimeRef::hermes();
         recovery.cwd = root.clone();
         recovery.program = "hermes".to_owned();
         recovery.args = vec!["chat".to_owned()];
@@ -5630,7 +5629,7 @@ while os.getppid() == parent:
             .expect("inspect adopted Hermes session");
         assert_eq!(adopted.id, SessionId(session_id.to_owned()));
         assert_eq!(adopted.agent, "hermes");
-        assert_eq!(adopted.agent_base, AgentKind::Hermes);
+        assert_eq!(adopted.agent_base, RuntimeRef::hermes());
         assert_eq!(adopted.pid, child_pid);
         assert_eq!(
             adopted
@@ -6482,7 +6481,7 @@ while os.getppid() == parent:
         record.info.id = SessionId(id.to_owned());
         record.info.pid = child_pid;
         record.info.agent = "shell".to_owned();
-        record.info.agent_base = AgentKind::Shell;
+        record.info.agent_base = RuntimeRef::shell();
         record.info.runtime.as_mut().expect("runtime").worker_id = Some(worker_id.to_owned());
         record.info.runtime.as_mut().expect("runtime").runtime_id =
             Some(worker_instance_id.to_owned());
@@ -6506,7 +6505,7 @@ while os.getppid() == parent:
         let recovery = record.recovery.as_mut().expect("recovery");
         recovery.session_id = id.to_owned();
         recovery.agent = "shell".to_owned();
-        recovery.agent_base = AgentKind::Shell;
+        recovery.agent_base = RuntimeRef::shell();
         recovery.program = "/bin/sh".to_owned();
         recovery.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
         bind_test_generation(&mut record);
@@ -6550,7 +6549,7 @@ while os.getppid() == parent:
                 external: Some(false),
                 name: None,
                 agent: "codex".to_owned(),
-                agent_base: AgentKind::Codex,
+                agent_base: RuntimeRef::codex(),
                 cwd: PathBuf::from("/repo"),
                 cwd_source: Some(CwdSource::Launch),
                 pid: 50,
@@ -6596,7 +6595,7 @@ while os.getppid() == parent:
                 session_id: "s-identity".to_owned(),
                 name: None,
                 agent: "codex".to_owned(),
-                agent_base: AgentKind::Codex,
+                agent_base: RuntimeRef::codex(),
                 cwd: PathBuf::from("/repo"),
                 cols: 80,
                 rows: 24,
@@ -6791,11 +6790,11 @@ while os.getppid() == parent:
         let store_path = root.join("data/metadata.jsonl");
         let mut record = identity_record();
         record.info.agent = "deleted-profile".to_owned();
-        record.info.agent_base = AgentKind::Claude;
+        record.info.agent_base = RuntimeRef::claude();
         record.info.native_session_id = Some("native-before-restart".to_owned());
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.agent = "deleted-profile".to_owned();
-        recovery.agent_base = AgentKind::Claude;
+        recovery.agent_base = RuntimeRef::claude();
         recovery.native_session_id = Some("native-before-restart".to_owned());
         recovery.program = "/bin/sh".to_owned();
         recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
@@ -6833,11 +6832,11 @@ while os.getppid() == parent:
         let store_path = root.join("data/metadata.jsonl");
         let mut record = identity_record();
         record.info.agent = "claude".to_owned();
-        record.info.agent_base = AgentKind::Claude;
+        record.info.agent_base = RuntimeRef::claude();
         record.info.native_session_id = Some("legacy-native".to_owned());
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.agent = "claude".to_owned();
-        recovery.agent_base = AgentKind::Claude;
+        recovery.agent_base = RuntimeRef::claude();
         recovery.native_session_id = Some("legacy-native".to_owned());
         recovery.program = "claude".to_owned();
         recovery.native_launch = Some(test_native_launch(SessionRefKind::Id, false));
@@ -6970,7 +6969,7 @@ while os.getppid() == parent:
 
         assert_eq!(mapped.len(), 2);
         assert_eq!(mapped[0].id, "child-1");
-        assert_eq!(mapped[0].provider, AgentKind::Claude);
+        assert_eq!(mapped[0].provider, RuntimeRef::claude());
         assert_eq!(mapped[0].activity, Some(AgentActivity::Working));
         assert_eq!(mapped[0].revision, protocol::SubagentRevision::new(7));
     }
@@ -6986,7 +6985,7 @@ while os.getppid() == parent:
             external: Some(false),
             name: None,
             agent: "shell".to_owned(),
-            agent_base: AgentKind::Shell,
+            agent_base: RuntimeRef::shell(),
             cwd: PathBuf::from("/repo"),
             cwd_source: Some(CwdSource::Launch),
             pid: 0,
@@ -7076,7 +7075,7 @@ while os.getppid() == parent:
             session_id: "s-recoverable".to_owned(),
             name: Some("recoverable".to_owned()),
             agent: "codex".to_owned(),
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             cwd: PathBuf::from("/repo"),
             cols: 80,
             rows: 24,
@@ -7218,6 +7217,49 @@ while os.getppid() == parent:
     }
 
     #[test]
+    fn import_legacy_manifest_rejects_a_base_outside_the_runtime_id_grammar() {
+        let root = temp_root();
+        let data_dir = root.join("data");
+        create_private_dir(&data_dir);
+        let store_path = data_dir.join("metadata.jsonl");
+        let store = Store::new(store_path.clone());
+
+        let mut session = manifest_session_info("s-historical", SessionState::Done);
+        session.agent_base = RuntimeRef::from_wire("Future Agent");
+        let store_sha256 = store_fingerprint(&store_path);
+        let manifest = legacy_manifest_json(&store_sha256, false, &[session], &[]);
+        write_legacy_manifest(&data_dir, &manifest);
+
+        let error =
+            import_legacy_manifest(&store).expect_err("a historical agent base must fail closed");
+        assert_eq!(error.code, "migration_import_failed");
+        assert!(
+            store.load_sessions().expect("load sessions").is_empty(),
+            "store must not be mutated when the manifest names an unlaunchable base"
+        );
+    }
+
+    #[test]
+    fn import_legacy_manifest_keeps_a_grammar_valid_uninstalled_base() {
+        let root = temp_root();
+        let data_dir = root.join("data");
+        create_private_dir(&data_dir);
+        let store_path = data_dir.join("metadata.jsonl");
+        let store = Store::new(store_path.clone());
+
+        let mut session = manifest_session_info("s-acme", SessionState::Done);
+        session.agent_base = RuntimeRef::from_wire("acme");
+        let store_sha256 = store_fingerprint(&store_path);
+        let manifest = legacy_manifest_json(&store_sha256, false, &[session], &[]);
+        write_legacy_manifest(&data_dir, &manifest);
+
+        import_legacy_manifest(&store).expect("a valid but uninstalled runtime id imports");
+        let loaded = store.load_sessions().expect("load sessions");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].info.agent_base, RuntimeRef::from_wire("acme"));
+    }
+
+    #[test]
     fn import_legacy_manifest_live_loss_not_accepted_fails_closed() {
         let root = temp_root();
         let data_dir = root.join("data");
@@ -7351,7 +7393,7 @@ while os.getppid() == parent:
             session_id: session_id.to_owned(),
             name: None,
             agent: "codex".to_owned(),
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             cwd: PathBuf::from("/repo"),
             cols: 80,
             rows: 24,
@@ -7453,7 +7495,7 @@ while os.getppid() == parent:
         let store_path = data_dir.join("metadata.jsonl");
         let store = Store::new(store_path.clone());
         let mut record = identity_record();
-        let kind = AgentKind::Unknown("acme".to_owned());
+        let kind = RuntimeRef::from_wire("acme");
         record.info.agent = "acme".to_owned();
         record.info.agent_base = kind.clone();
         let recovery = record.recovery.as_mut().expect("recovery binding");

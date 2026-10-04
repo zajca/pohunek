@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use protocol::{AgentKind, SessionId, SessionInfo};
+use protocol::{RuntimeRef, SessionId, SessionInfo};
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::MissedTickBehavior;
@@ -156,7 +156,7 @@ pub(crate) enum ExternalSessionChange {
 /// Transcript root watched for one provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranscriptRoot {
-    agent_base: AgentKind,
+    agent_base: RuntimeRef,
     path: PathBuf,
 }
 
@@ -171,7 +171,7 @@ pub(crate) struct ExternalObserverConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranscriptCandidate {
     /// Agent kind inferred from the transcript tree.
-    pub(crate) agent_base: AgentKind,
+    pub(crate) agent_base: RuntimeRef,
     /// Native provider session id, when present.
     pub(crate) native_session_id: Option<String>,
     /// Native transcript path.
@@ -397,7 +397,7 @@ impl ExternalObserverConfig {
             CLAUDE_TRANSCRIPT_SUBDIR,
         ) {
             roots.push(TranscriptRoot {
-                agent_base: AgentKind::Claude,
+                agent_base: RuntimeRef::claude(),
                 path,
             });
         }
@@ -405,7 +405,7 @@ impl ExternalObserverConfig {
             provider_root(CODEX_HOME_ENV, CODEX_HOME_RELATIVE, CODEX_TRANSCRIPT_SUBDIR)
         {
             roots.push(TranscriptRoot {
-                agent_base: AgentKind::Codex,
+                agent_base: RuntimeRef::codex(),
                 path,
             });
         }
@@ -452,7 +452,7 @@ impl TranscriptIndex {
     /// a directory, or below a parent replaced by a file) drops its candidate; the
     /// existence check is repeated under the lock so a transcript recreated
     /// meanwhile is kept.
-    pub(crate) fn upsert_path(&self, agent_base: AgentKind, path: &Path) -> io::Result<bool> {
+    pub(crate) fn upsert_path(&self, agent_base: RuntimeRef, path: &Path) -> io::Result<bool> {
         let gone = transcript_is_gone(path);
         let signature = if gone {
             None
@@ -497,7 +497,7 @@ impl TranscriptIndex {
     /// Finds the best transcript candidate for `fact` and `cwd`.
     pub(crate) fn best_match(
         &self,
-        agent_base: &AgentKind,
+        agent_base: &RuntimeRef,
         cwd: &Path,
         fact: &ProcessFact,
     ) -> Option<TranscriptCandidate> {
@@ -802,7 +802,7 @@ struct IndexSink {
 impl TranscriptSink for IndexSink {
     fn upsert(
         &self,
-        agent_base: AgentKind,
+        agent_base: RuntimeRef,
         path: PathBuf,
     ) -> impl Future<Output = io::Result<bool>> + Send {
         let index = self.index.clone();
@@ -908,7 +908,10 @@ fn transcript_matches_process(
     cwd_matches || native_matches
 }
 
-fn parse_transcript(agent_base: AgentKind, path: &Path) -> io::Result<Option<TranscriptCandidate>> {
+fn parse_transcript(
+    agent_base: RuntimeRef,
+    path: &Path,
+) -> io::Result<Option<TranscriptCandidate>> {
     let file = match File::open(path) {
         Ok(file) => file,
         Err(err) if is_absent_error(&err) => return Ok(None),
@@ -1026,7 +1029,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use protocol::AgentKind;
+    use protocol::RuntimeRef;
 
     use super::{parse_transcript, TRANSCRIPT_SCAN_BYTE_LIMIT};
 
@@ -1047,7 +1050,7 @@ mod tests {
         let (result_tx, result_rx) = mpsc::channel();
         let parser_path = fifo.clone();
         let parser = thread::spawn(move || {
-            let result = parse_transcript(AgentKind::Claude, &parser_path);
+            let result = parse_transcript(RuntimeRef::claude(), &parser_path);
             let _ = result_tx.send(result);
         });
 
@@ -1108,7 +1111,7 @@ mod observer_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use protocol::AgentKind;
+    use protocol::RuntimeRef;
 
     use super::watch::{TranscriptWatch, WatcherUnavailable};
     use super::{start_transcript_index, ExternalObserverConfig, ExternalSessions, TranscriptRoot};
@@ -1200,7 +1203,7 @@ mod observer_tests {
     async fn the_observer_reports_its_watcher_and_still_scans_and_sweeps() {
         let (root, transcript) = transcript_root();
         let roots = vec![TranscriptRoot {
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             path: root.path().to_path_buf(),
         }];
         let sessions = ExternalSessions::new();
@@ -1236,7 +1239,7 @@ mod scan_tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use protocol::AgentKind;
+    use protocol::RuntimeRef;
     use tokio_util::sync::CancellationToken;
 
     use super::watch::RootScan;
@@ -1255,7 +1258,7 @@ mod scan_tests {
 
     fn root(path: &Path) -> TranscriptRoot {
         TranscriptRoot {
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             path: path.to_path_buf(),
         }
     }
@@ -1530,7 +1533,7 @@ mod scan_tests {
         let outer = root(dir.path());
         let inner_path = dir.path().join("codex");
         let inner = TranscriptRoot {
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             path: inner_path.clone(),
         };
         let outer_file = dir.path().join("p/c.jsonl");
@@ -1612,7 +1615,7 @@ mod scan_tests {
         std::os::unix::fs::symlink(claude_dir.join("codex"), &link).expect("symlink");
         let claude = root(&claude_dir);
         let codex = TranscriptRoot {
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             path: link.clone(),
         };
         let both = [claude.clone(), codex.clone()];
@@ -1639,7 +1642,7 @@ mod scan_tests {
             .expect("index")
             .get(&link.join("x/s.jsonl"))
             .map(|candidate| candidate.agent_base.clone());
-        assert_eq!(agent, Some(AgentKind::Codex));
+        assert_eq!(agent, Some(RuntimeRef::codex()));
     }
 
     #[test]
@@ -1652,7 +1655,7 @@ mod scan_tests {
         let roots = [
             root(&claude_dir),
             TranscriptRoot {
-                agent_base: AgentKind::Codex,
+                agent_base: RuntimeRef::codex(),
                 path: link.clone(),
             },
         ];
@@ -1663,12 +1666,12 @@ mod scan_tests {
 
         assert_eq!(
             owner(&claude_dir.join("codex/x/s.jsonl")),
-            Some(AgentKind::Codex)
+            Some(RuntimeRef::codex())
         );
-        assert_eq!(owner(&link.join("x/s.jsonl")), Some(AgentKind::Codex));
+        assert_eq!(owner(&link.join("x/s.jsonl")), Some(RuntimeRef::codex()));
         assert_eq!(
             owner(&claude_dir.join("p/c.jsonl")),
-            Some(AgentKind::Claude)
+            Some(RuntimeRef::claude())
         );
     }
 }

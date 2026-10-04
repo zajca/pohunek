@@ -205,7 +205,7 @@ are additive; older daemons return `daemon/method_not_found` for unknown
 methods. Optional fields retain their documented omission behavior. Envelope,
 observation, native-report, capability, and notification-policy objects are
 strict and reject unknown fields, so changing their accepted shape requires the
-appropriate negotiated-version treatment. `AgentKind` and provider-policy map
+appropriate negotiated-version treatment. `RuntimeRef` values and provider-policy map
 keys are deliberately open value namespaces, not open object shapes.
 
 Non-additive wire changes require a protocol version bump. Examples: changing a
@@ -427,7 +427,7 @@ daemon method in this API version. It returns `daemon/method_not_found`.
 must check the relevant flag instead of assuming that a reachable daemon or an
 attach-capable session supports every observation method. Its `runtimes` entries
 are live host-local probes: `agent` is the selected profile or base name and
-optional `agent_base` identifies the compiled adapter behind it. Optional
+optional `agent_base` is the `RuntimeRef` of the runtime behind it. Optional
 `version` and `supported` are a provider policy, not generic availability:
 their absence means that no version policy applies. The daemon builds the
 inventory from its runtime registry: a runtime whose definition names a
@@ -446,8 +446,8 @@ the exact absolute path is then passed to the worker without a second PATH
 lookup. The single-operator trust boundary still permits the same owner to
 replace that canonical file between probe and exec; eliminating that residual
 would require an fd-based execution contract. An absent `agent_base` is compatible with legacy custom
-profile inventory, but a present unknown base is presentation-only and not
-launchable.
+profile inventory, but a present historical label (a value outside the runtime-id
+grammar) is presentation-only and not launchable.
 
 ### Daemon Runtime Configuration
 
@@ -545,13 +545,14 @@ Important fields:
 - `name`: optional owner-set display name; absent means the session is shown by
   its id. Set at `session.new` and changed via `session.rename`.
 - `agent`: profile name.
-- `agent_base`: `shell`, `codex`, `claude`, or `hermes`; unknown wire values
-  remain presentation-only.
+- `agent_base`: the `RuntimeRef` of the runtime backing the session, for
+  example `shell`, `codex`, `claude`, or `hermes`; a historical label outside
+  the runtime-id grammar remains presentation-only.
 - `active_agent`: optional runtime agent profile currently active inside the
   session. Present for nested agents reported through hooks or inferred from
   process facts.
-- `active_agent_base`: optional runtime base kind (`shell`, `codex`, `claude`,
-  or `hermes`) for `active_agent`.
+- `active_agent_base`: optional `RuntimeRef` of the runtime backing
+  `active_agent`.
 - `active_agent_pid`: optional process id backing `active_agent`. When present,
   the daemon validates it with kernel process-start identity and auto-releases
   the active agent if that exact process exits. Foreground reconciliation uses
@@ -612,7 +613,9 @@ Important fields:
 - `created_at`, `updated_at`: RFC3339 timestamps.
 - `exit_code`: optional process exit code.
 
-`AgentKind` wire values are forward-compatible for presentation. An unknown
+`RuntimeRef` wire values (`agent_base`, `active_agent_base`, the subagent
+`provider`, the inventory `agent_base`, the integration `agent` and the
+notification `agent_kind`) are forward-compatible for presentation. An unknown
 string round-trips through Rust and TypeScript clients as a neutral value.
 Agent-targeted mutation, resume and fork resolve the value through the daemon's
 runtime registry: a value outside the runtime-id grammar is rejected with
@@ -639,7 +642,12 @@ reveals nothing about profile `[env]` values. A malformed revision is
 `runtime/agent_profile_revision_invalid`; an unreadable host key is
 `runtime/agent_profile_revision_unavailable` (no unkeyed fallback).
 
-Agent runtime identities use three Rust types over the same string namespace.
+Agent runtime identities use two Rust types over the same string namespace.
+The fields listed above (`agent_base`, `active_agent_base`, the subagent
+`provider`, the inventory `agent_base`, the integration `agent` and the
+notification `agent_kind`) are `RuntimeRef` values, so their TypeScript type is
+the `RuntimeRef` string alias and their wire form is a bare string; the daemon
+validates them against the registry before a mutation.
 `RuntimeId` is always valid: lowercase ASCII alphanumerics plus `.`, `_` and
 `-`, 1 to 64 bytes, no leading `.` or `-`, no `..`; deserialization rejects
 anything else. `RuntimeRef` is lenient: any string deserializes, a
@@ -1093,7 +1101,8 @@ Important fields:
   rejected.
 - `session_id`: optional linked session id. It is shape-validated when supplied
   by `notification.create` and may point to a session that no longer exists.
-- `agent_kind`, `project_id`: optional display and filtering context.
+- `agent_kind`, `project_id`: optional display and filtering context;
+  `agent_kind` is a `RuntimeRef`.
 - `source_id`: optional producer-specific id used for idempotence within one
   source namespace.
 - `dedupe_key`: optional source-independent id for one logical event. Session

@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use protocol::{
-    method, AgentKind, ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult,
+    method, ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult,
     IntegrationFindingSeverity, IntegrationInstallParams, IntegrationInstallResult,
     IntegrationInstallState, IntegrationStatusParams, IntegrationStatusResult,
     IntegrationUninstallParams, IntegrationUninstallResult, IntegrationUninstallState,
-    ProtocolError,
+    ProtocolError, RuntimeRef,
 };
 use serde::Serialize;
 
@@ -59,12 +59,12 @@ pub(crate) enum HookAgentArg {
     Codex,
 }
 
-impl From<HookAgentArg> for AgentKind {
+impl From<HookAgentArg> for RuntimeRef {
     fn from(value: HookAgentArg) -> Self {
         match value {
-            HookAgentArg::Claude => AgentKind::Claude,
-            HookAgentArg::Codex => AgentKind::Codex,
-            HookAgentArg::Hermes => AgentKind::Hermes,
+            HookAgentArg::Claude => RuntimeRef::claude(),
+            HookAgentArg::Codex => RuntimeRef::codex(),
+            HookAgentArg::Hermes => RuntimeRef::hermes(),
         }
     }
 }
@@ -611,7 +611,7 @@ fn agent_name(agent: HookAgentArg) -> &'static str {
     }
 }
 
-fn agent_label(agent: &AgentKind) -> &str {
+fn agent_label(agent: &RuntimeRef) -> &str {
     agent.as_wire()
 }
 
@@ -890,8 +890,8 @@ mod status_tests {
     use super::{installed_version_label, render_status_human};
     use crate::target::LOCAL_HOST;
     use protocol::{
-        AgentKind, IntegrationAgentStatus, IntegrationInstallState, IntegrationRecovery,
-        IntegrationStatusResult,
+        IntegrationAgentStatus, IntegrationInstallState, IntegrationRecovery,
+        IntegrationStatusResult, RuntimeRef,
     };
 
     #[test]
@@ -899,7 +899,7 @@ mod status_tests {
         let result = IntegrationStatusResult {
             agents: vec![
                 IntegrationAgentStatus {
-                    agent: AgentKind::Claude,
+                    agent: RuntimeRef::claude(),
                     available: true,
                     expected_asset_paths: vec![
                         "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
@@ -917,7 +917,7 @@ mod status_tests {
                     warnings: Vec::new(),
                 },
                 IntegrationAgentStatus {
-                    agent: AgentKind::Codex,
+                    agent: RuntimeRef::codex(),
                     available: true,
                     expected_asset_paths: vec![
                         "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
@@ -962,7 +962,7 @@ mod status_tests {
     fn configuration_recovery_never_recommends_reinstall() {
         let result = IntegrationStatusResult {
             agents: vec![IntegrationAgentStatus {
-                agent: AgentKind::Codex,
+                agent: RuntimeRef::codex(),
                 available: true,
                 expected_asset_paths: Vec::new(),
                 present_asset_paths: Vec::new(),
@@ -987,7 +987,7 @@ mod status_tests {
     fn remote_status_qualifies_install_commands_with_the_daemon_host() {
         let result = IntegrationStatusResult {
             agents: vec![IntegrationAgentStatus {
-                agent: AgentKind::Codex,
+                agent: RuntimeRef::codex(),
                 available: true,
                 expected_asset_paths: Vec::new(),
                 present_asset_paths: Vec::new(),
@@ -1031,7 +1031,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use clap::ValueEnum as _;
-    use protocol::{AgentKind, IntegrationInstallReport, IntegrationInstallResult};
+    use protocol::{IntegrationInstallReport, IntegrationInstallResult, RuntimeRef};
 
     use super::{
         agent_name, lifecycle_from_doctor, render_doctor_human, render_install_human,
@@ -1094,9 +1094,9 @@ mod tests {
 
     #[test]
     fn hook_agent_arg_maps_to_agent_kind() {
-        assert_eq!(AgentKind::from(HookAgentArg::Claude), AgentKind::Claude);
-        assert_eq!(AgentKind::from(HookAgentArg::Codex), AgentKind::Codex);
-        assert_eq!(AgentKind::from(HookAgentArg::Hermes), AgentKind::Hermes);
+        assert_eq!(RuntimeRef::from(HookAgentArg::Claude), RuntimeRef::claude());
+        assert_eq!(RuntimeRef::from(HookAgentArg::Codex), RuntimeRef::codex());
+        assert_eq!(RuntimeRef::from(HookAgentArg::Hermes), RuntimeRef::hermes());
         assert_eq!(agent_name(HookAgentArg::Hermes), "hermes");
         assert_eq!(
             AccessModeArg::ReadOnly
@@ -1112,13 +1112,13 @@ mod tests {
         let result = IntegrationInstallResult {
             installed: vec![
                 IntegrationInstallReport {
-                    agent: AgentKind::Claude,
+                    agent: RuntimeRef::claude(),
                     hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                     config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
                     cleanup_incomplete: vec![],
                 },
                 IntegrationInstallReport {
-                    agent: AgentKind::Codex,
+                    agent: RuntimeRef::codex(),
                     hook_path: "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
                     config_paths: vec![
                         "/home/u/.codex/hooks.json".to_owned(),
@@ -1215,7 +1215,7 @@ mod tests {
     fn renders_install_result_as_json_that_deserializes() {
         let result = IntegrationInstallResult {
             installed: vec![IntegrationInstallReport {
-                agent: AgentKind::Claude,
+                agent: RuntimeRef::claude(),
                 hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
                 cleanup_incomplete: vec![],
@@ -1515,7 +1515,7 @@ mod tests {
         let result = IntegrationUninstallResult {
             uninstalled: vec![
                 IntegrationUninstallReport {
-                    agent: AgentKind::Claude,
+                    agent: RuntimeRef::claude(),
                     state: IntegrationUninstallState::Removed,
                     removed_paths: vec!["/c/hooks/state.sh".to_owned()],
                     updated_paths: vec!["/c/settings.json".to_owned()],
@@ -1523,7 +1523,7 @@ mod tests {
                     cleanup_incomplete: vec![],
                 },
                 IntegrationUninstallReport {
-                    agent: AgentKind::Codex,
+                    agent: RuntimeRef::codex(),
                     state: IntegrationUninstallState::NotInstalled,
                     removed_paths: vec![],
                     updated_paths: vec![],
@@ -1548,7 +1548,7 @@ mod tests {
         };
 
         let status = IntegrationAgentStatus {
-            agent: AgentKind::Codex,
+            agent: RuntimeRef::codex(),
             available: true,
             expected_asset_paths: vec![],
             present_asset_paths: vec![],
@@ -1562,7 +1562,7 @@ mod tests {
         let result = IntegrationDoctorResult {
             ok: false,
             agents: vec![IntegrationAgentDoctor {
-                agent: AgentKind::Codex,
+                agent: RuntimeRef::codex(),
                 ok: false,
                 status: Some(status),
                 findings: vec![

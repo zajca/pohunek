@@ -252,9 +252,9 @@ fn render_governance_human(host: &str, status: &HostGovernanceStatus) -> String 
 #[cfg(test)]
 mod tests {
     use protocol::{
-        AgentKind, AgentRuntime, ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision,
-        EnrollmentStatus, HostId, OwnerRevision, PrincipalId, ProtocolVersion, QuarantineReason,
-        RelayId, TeamId,
+        AgentRuntime, ApprovalKeyReference, EnrollmentInfo, EnrollmentRevision, EnrollmentStatus,
+        HostId, OwnerRevision, PrincipalId, ProtocolVersion, QuarantineReason, RelayId, RuntimeRef,
+        TeamId,
     };
 
     use super::*;
@@ -276,7 +276,7 @@ mod tests {
             runtimes: vec![
                 AgentRuntime {
                     agent: "shell".to_owned(),
-                    agent_base: Some(AgentKind::Shell),
+                    agent_base: Some(RuntimeRef::shell()),
                     available: true,
                     path: None,
                     version: None,
@@ -284,7 +284,7 @@ mod tests {
                 },
                 AgentRuntime {
                     agent: "claude".to_owned(),
-                    agent_base: Some(AgentKind::Claude),
+                    agent_base: Some(RuntimeRef::claude()),
                     available: true,
                     path: Some("/usr/bin/claude".to_owned()),
                     version: None,
@@ -292,7 +292,7 @@ mod tests {
                 },
                 AgentRuntime {
                     agent: "hermes".to_owned(),
-                    agent_base: Some(AgentKind::Hermes),
+                    agent_base: Some(RuntimeRef::hermes()),
                     available: true,
                     path: Some("/usr/bin/hermes".to_owned()),
                     version: Some("0.20.0".to_owned()),

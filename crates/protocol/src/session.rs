@@ -7,133 +7,16 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     envelope::StateSource, ActivityRevision, OutputOffset, ProcessStartIdentity, ProtocolError,
-    ReportSequence, RuntimeGeneration, RuntimeId, RuntimeRef, SubagentRevision, TerminalWatermark,
+    ReportSequence, RuntimeGeneration, RuntimeRef, SubagentRevision, TerminalWatermark,
     MAX_SESSION_ID_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_WAIT_MS,
     MAX_WORKER_INSTANCE_ID_BYTES,
 };
-
-/// The kind of agent backing a session.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[cfg_attr(feature = "ts", ts(export, export_to = "AgentKind.ts"))]
-#[cfg_attr(feature = "ts", ts(type = "string"))]
-pub enum AgentKind {
-    /// A plain shell session.
-    Shell,
-    /// A Codex CLI agent session.
-    Codex,
-    /// A Claude Code agent session.
-    Claude,
-    /// A Hermes Agent interactive terminal session.
-    Hermes,
-    /// A future wire value rendered neutrally by an older peer.
-    Unknown(String),
-}
-
-impl AgentKind {
-    /// Returns the stable wire value.
-    #[must_use]
-    pub fn as_wire(&self) -> &str {
-        match self {
-            Self::Shell => "shell",
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Hermes => "hermes",
-            Self::Unknown(value) => value,
-        }
-    }
-
-    /// Classifies a wire value: the built-in kinds by name, anything else as
-    /// [`Self::Unknown`].
-    #[must_use]
-    pub fn from_wire(value: &str) -> Self {
-        match value {
-            "shell" => Self::Shell,
-            "codex" => Self::Codex,
-            "claude" => Self::Claude,
-            "hermes" => Self::Hermes,
-            other => Self::Unknown(other.to_owned()),
-        }
-    }
-
-    /// Returns this kind as a runtime reference.
-    ///
-    /// Built-in kinds map to their [`RuntimeId`]. An unknown value is
-    /// classified by the runtime-id grammar like any wire string, so it
-    /// round-trips unchanged; whether it can be launched is decided by the
-    /// registry, not by this conversion.
-    #[must_use]
-    pub fn as_runtime_ref(&self) -> RuntimeRef {
-        match self {
-            Self::Shell => RuntimeRef::Id(RuntimeId::from_trusted("shell")),
-            Self::Codex => RuntimeRef::Id(RuntimeId::from_trusted("codex")),
-            Self::Claude => RuntimeRef::Id(RuntimeId::from_trusted("claude")),
-            Self::Hermes => RuntimeRef::Id(RuntimeId::from_trusted("hermes")),
-            Self::Unknown(value) => RuntimeRef::from_wire(value),
-        }
-    }
-
-    /// Returns whether this is a known, supported agent kind.
-    #[must_use]
-    pub const fn is_known(&self) -> bool {
-        !matches!(self, Self::Unknown(_))
-    }
-
-    /// Rejects presentation-only agent kinds before a mutation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stable `agent_kind_unsupported` protocol error for an unknown
-    /// value. Call this from every agent-targeted public mutation.
-    pub fn validate_mutation(&self) -> Result<(), ProtocolError> {
-        if self.is_known() {
-            Ok(())
-        } else {
-            Err(ProtocolError::agent_kind_unsupported(self.as_wire()))
-        }
-    }
-
-    /// Rejects presentation-only agent kinds before durable persistence.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same stable error as [`Self::validate_mutation`]. Keeping a
-    /// dedicated entry point makes durable stores auditable without treating an
-    /// unknown display value as a valid launch or recovery configuration.
-    pub fn validate_persistence(&self) -> Result<(), ProtocolError> {
-        self.validate_mutation()
-    }
-}
-
-impl std::fmt::Display for AgentKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_wire())
-    }
-}
-
-impl Serialize for AgentKind {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_wire())
-    }
-}
-
-impl<'de> Deserialize<'de> for AgentKind {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Ok(Self::from_wire(&String::deserialize(deserializer)?))
-    }
-}
 
 /// Current detected agent activity within a running session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,7 +62,7 @@ pub struct SubagentInfo {
     #[cfg_attr(feature = "ts", ts(optional))]
     pub parent_id: Option<String>,
     /// Provider that owns this subagent.
-    pub provider: AgentKind,
+    pub provider: RuntimeRef,
     /// Provider-defined subagent type, when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -373,12 +256,12 @@ impl SessionListFilter {
             Self::Activity(activity) => session.activity == Some(*activity),
             Self::Agent(name) => {
                 session.agent == *name
-                    || base_kind_label(&session.agent_base) == name
+                    || session.agent_base.as_wire() == name
                     || session.active_agent.as_deref() == Some(name)
                     || session
                         .active_agent_base
                         .as_ref()
-                        .is_some_and(|base| base_kind_label(base) == name)
+                        .is_some_and(|base| base.as_wire() == name)
             }
             Self::Id(id) => session.id.0 == *id,
             Self::Project(reference) => {
@@ -386,16 +269,6 @@ impl SessionListFilter {
                     || session.project_label.as_deref() == Some(reference)
             }
         }
-    }
-}
-
-fn base_kind_label(agent: &AgentKind) -> &str {
-    match agent {
-        AgentKind::Shell => "shell",
-        AgentKind::Codex => "codex",
-        AgentKind::Claude => "claude",
-        AgentKind::Hermes => "hermes",
-        AgentKind::Unknown(value) => value,
     }
 }
 
@@ -2368,8 +2241,9 @@ pub struct SessionInfo {
     pub name: Option<String>,
     /// Agent profile name backing the session.
     pub agent: String,
-    /// Resolved base kind backing the session.
-    pub agent_base: AgentKind,
+    /// Runtime identity backing the session. A grammar-invalid historical label
+    /// stays displayable but is never launchable.
+    pub agent_base: RuntimeRef,
     /// Current working directory for the session.
     pub cwd: PathBuf,
     /// Source that last set [`Self::cwd`].
@@ -2407,10 +2281,10 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub active_agent: Option<String>,
-    /// Resolved base kind for [`Self::active_agent`].
+    /// Runtime identity for [`Self::active_agent`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub active_agent_base: Option<AgentKind>,
+    pub active_agent_base: Option<RuntimeRef>,
     /// OS pid backing [`Self::active_agent`], when process facts have bound it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -3066,27 +2940,6 @@ pub struct SessionDiffResult {
 mod tests {
     use super::*;
 
-    #[test]
-    fn agent_kind_from_wire_names_built_ins_and_keeps_everything_else() {
-        for (wire, kind) in [
-            ("shell", AgentKind::Shell),
-            ("codex", AgentKind::Codex),
-            ("claude", AgentKind::Claude),
-            ("hermes", AgentKind::Hermes),
-        ] {
-            assert_eq!(AgentKind::from_wire(wire), kind);
-            assert_eq!(kind.as_wire(), wire);
-        }
-        for other in ["acme", "Codex", ""] {
-            assert_eq!(
-                AgentKind::from_wire(other),
-                AgentKind::Unknown(other.to_owned())
-            );
-        }
-        let decoded: AgentKind = serde_json::from_str("\"claude\"").expect("deserialize");
-        assert_eq!(decoded, AgentKind::Claude);
-    }
-
     /// A `running`, `claude`, `working` session with the given id, for filter
     /// matching tests. This is the predicate the daemon actually runs
     /// (`handle_session_list`), so it is pinned directly here, not only through
@@ -3098,7 +2951,7 @@ mod tests {
             capabilities: SessionCapabilities::default(),
             name: None,
             agent: "claude".to_owned(),
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             cwd: PathBuf::from("/workspace"),
             cwd_source: Some(CwdSource::Launch),
             pid: 4242,
@@ -3193,7 +3046,7 @@ mod tests {
     fn agent_filter_matches_profile_name_or_base_kind() {
         let mut s = session("s-42");
         s.agent = "claude-sonnet".to_owned();
-        s.agent_base = AgentKind::Claude;
+        s.agent_base = RuntimeRef::claude();
 
         assert!(SessionListFilter::Agent("claude-sonnet".to_owned()).matches(&s));
         assert!(SessionListFilter::Agent("claude".to_owned()).matches(&s));
@@ -3204,9 +3057,9 @@ mod tests {
     fn agent_filter_matches_active_profile_name_or_base_kind() {
         let mut s = session("s-42");
         s.agent = "shell".to_owned();
-        s.agent_base = AgentKind::Shell;
+        s.agent_base = RuntimeRef::shell();
         s.active_agent = Some("codex-gpt-5".to_owned());
-        s.active_agent_base = Some(AgentKind::Codex);
+        s.active_agent_base = Some(RuntimeRef::codex());
 
         assert!(SessionListFilter::Agent("shell".to_owned()).matches(&s));
         assert!(SessionListFilter::Agent("codex-gpt-5".to_owned()).matches(&s));

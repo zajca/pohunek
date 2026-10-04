@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use pohunek_paths::{PathEnv, Platform};
 use protocol::{
-    AgentKind, ErrorClass, IntegrationDoctorParams, IntegrationFindingCode as Code,
+    ErrorClass, IntegrationDoctorParams, IntegrationFindingCode as Code,
     IntegrationFindingSeverity as Severity, IntegrationInstallState, IntegrationUninstallReport,
-    IntegrationUninstallState, ProtocolError,
+    IntegrationUninstallState, ProtocolError, RuntimeRef,
 };
 use serde_json::{json, Value};
 
@@ -113,7 +113,7 @@ fn claude_uninstall_after_install_restores_user_settings_and_is_idempotent() {
     assert!(!dir.join("hooks").join(STATE_HOOK_INSTALL_NAME).exists());
     assert!(!dir.join("hooks").join(NOTIFY_HOOK_INSTALL_NAME).exists());
     assert_eq!(
-        explicit_status(&dir, AgentKind::Claude).state,
+        explicit_status(&dir, RuntimeRef::claude()).state,
         IntegrationInstallState::NotInstalled
     );
 
@@ -161,7 +161,7 @@ fn codex_uninstall_after_install_keeps_user_hooks_and_drops_only_managed_trust()
         "the user-visible feature flag is not the uninstaller's to change"
     );
     assert_eq!(
-        explicit_status(&dir, AgentKind::Codex).state,
+        explicit_status(&dir, RuntimeRef::codex()).state,
         IntegrationInstallState::NotInstalled
     );
     let settled = content_snapshot(&dir);
@@ -308,14 +308,14 @@ fn uninstall_without_an_install_or_config_dir_changes_nothing() {
 }
 
 /// Step names an uninstall of a fresh install runs, in order.
-fn removal_steps(agent: &AgentKind) -> Vec<String> {
+fn removal_steps(agent: &RuntimeRef) -> Vec<String> {
     let dir = scoped_dir("rm-steps");
     let mut seen = Vec::new();
     let mut gate = |_index: usize, name: &str| {
         seen.push(name.to_owned());
         Ok(())
     };
-    if *agent == AgentKind::Claude {
+    if *agent == RuntimeRef::claude() {
         install_claude(&dir).expect("install");
         uninstall_claude_gated(&dir, &mut gate).map(|_report| ())
     } else {
@@ -329,7 +329,7 @@ fn removal_steps(agent: &AgentKind) -> Vec<String> {
 #[test]
 fn removal_edits_registration_before_deleting_scripts() {
     assert_eq!(
-        removal_steps(&AgentKind::Claude),
+        removal_steps(&RuntimeRef::claude()),
         [
             "settings.json",
             STATE_HOOK_INSTALL_NAME,
@@ -337,7 +337,7 @@ fn removal_edits_registration_before_deleting_scripts() {
         ]
     );
     assert_eq!(
-        removal_steps(&AgentKind::Codex),
+        removal_steps(&RuntimeRef::codex()),
         [
             "hooks.json",
             "config.toml",
@@ -349,10 +349,10 @@ fn removal_edits_registration_before_deleting_scripts() {
 
 #[test]
 fn injected_failure_at_every_removal_step_restores_the_installed_tree() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         for fail_at in 0..removal_steps(&agent).len() {
             let dir = scoped_dir("rm-rollback");
-            if agent == AgentKind::Claude {
+            if agent == RuntimeRef::claude() {
                 write_json(&dir.join("settings.json"), &user_settings());
                 install_claude(&dir).expect("install");
             } else {
@@ -368,7 +368,7 @@ fn injected_failure_at_every_removal_step_restores_the_installed_tree() {
                 }
             };
 
-            let error = if agent == AgentKind::Claude {
+            let error = if agent == RuntimeRef::claude() {
                 uninstall_claude_gated(&dir, &mut gate).map(|_report| ())
             } else {
                 uninstall_codex_gated(&dir, &mut gate).map(|_report| ())
@@ -465,7 +465,7 @@ fn profiles_are_removed_independently() {
 
     assert_eq!(content_snapshot(&b), b_before);
     assert_eq!(
-        explicit_status(&b, AgentKind::Claude).state,
+        explicit_status(&b, RuntimeRef::claude()).state,
         IntegrationInstallState::Current
     );
 }
@@ -478,13 +478,13 @@ fn explicit_agent_selection_and_unsupported_agents() {
     install_codex(&codex).expect("install Codex");
     let codex_before = content_snapshot(&codex);
 
-    let result = with_config_dirs(&claude, &codex, || super::uninstall(AgentKind::Claude))
+    let result = with_config_dirs(&claude, &codex, || super::uninstall(&RuntimeRef::claude()))
         .expect("uninstall Claude only");
     assert_eq!(result.uninstalled.len(), 1);
-    assert_eq!(result.uninstalled[0].agent, AgentKind::Claude);
+    assert_eq!(result.uninstalled[0].agent, RuntimeRef::claude());
     assert_eq!(content_snapshot(&codex), codex_before);
 
-    let codex_result = with_config_dirs(&claude, &codex, || super::uninstall(AgentKind::Codex))
+    let codex_result = with_config_dirs(&claude, &codex, || super::uninstall(&RuntimeRef::codex()))
         .expect("uninstall Codex");
     assert_eq!(codex_result.uninstalled.len(), 1);
     assert_eq!(
@@ -492,11 +492,11 @@ fn explicit_agent_selection_and_unsupported_agents() {
         IntegrationUninstallState::Removed
     );
 
-    for agent in [AgentKind::Shell, AgentKind::Hermes] {
-        let error = super::uninstall(agent).expect_err("unsupported agent");
+    for agent in [RuntimeRef::shell(), RuntimeRef::hermes()] {
+        let error = super::uninstall(&agent).expect_err("unsupported agent");
         assert_eq!(error.code, "agent_not_installable");
     }
-    let unknown = super::uninstall(AgentKind::Unknown("pi".to_owned())).expect_err("unknown agent");
+    let unknown = super::uninstall(&RuntimeRef::from_wire("pi")).expect_err("unknown agent");
     assert_eq!(unknown.code, "agent_kind_unsupported");
 }
 
@@ -628,7 +628,7 @@ fn doctor_flags_a_stale_hook_that_reads_only_the_old_environment_name() {
         let dir = fresh_claude();
         write_file(dir.join("hooks").join(STATE_HOOK_INSTALL_NAME), content);
 
-        let status = explicit_status(&dir, AgentKind::Claude);
+        let status = explicit_status(&dir, RuntimeRef::claude());
         let doctor = diagnose(status.clone(), &[]);
 
         assert_eq!(status.state, IntegrationInstallState::Outdated, "{name}");
@@ -729,7 +729,7 @@ fn doctor_maps_every_claude_drift_cause_to_its_finding() {
         let dir = fresh_claude();
         mutate(&dir);
 
-        let doctor = diagnose(explicit_status(&dir, AgentKind::Claude), &[]);
+        let doctor = diagnose(explicit_status(&dir, RuntimeRef::claude()), &[]);
 
         assert!(!doctor.ok, "{name}");
         let finding = find(&doctor.findings, expected);
@@ -790,7 +790,7 @@ fn doctor_maps_every_codex_drift_cause_to_its_finding() {
         let dir = fresh_codex();
         mutate(&dir);
 
-        let doctor = diagnose(explicit_status(&dir, AgentKind::Codex), &[]);
+        let doctor = diagnose(explicit_status(&dir, RuntimeRef::codex()), &[]);
 
         assert!(!doctor.ok, "{name}");
         let finding = find(&doctor.findings, expected);
@@ -810,7 +810,7 @@ fn doctor_reports_config_root_failures_and_an_unresolvable_root() {
     let file = root.join("file");
     fs::write(&file, "").expect("write file");
 
-    let doctor = diagnose(explicit_status(&file, AgentKind::Codex), &[]);
+    let doctor = diagnose(explicit_status(&file, RuntimeRef::codex()), &[]);
 
     assert!(!doctor.ok);
     assert_eq!(
@@ -829,7 +829,7 @@ fn doctor_reports_config_root_failures_and_an_unresolvable_root() {
 fn doctor_distinguishes_an_absent_optional_agent_from_absent_hooks_and_a_healthy_install() {
     let root = scoped_dir("doctor-optional");
     let absent = diagnose(
-        explicit_status(&root.join("missing"), AgentKind::Claude),
+        explicit_status(&root.join("missing"), RuntimeRef::claude()),
         &[],
     );
     assert!(absent.ok);
@@ -843,7 +843,7 @@ fn doctor_distinguishes_an_absent_optional_agent_from_absent_hooks_and_a_healthy
         search_dirs: vec![],
         macos_stub: None,
     });
-    let hooks_absent = diagnose(explicit_status(&bare, AgentKind::Codex), &runtime_error);
+    let hooks_absent = diagnose(explicit_status(&bare, RuntimeRef::codex()), &runtime_error);
     assert!(
         hooks_absent.ok,
         "runtime findings do not apply to an absent install"
@@ -852,12 +852,12 @@ fn doctor_distinguishes_an_absent_optional_agent_from_absent_hooks_and_a_healthy
     assert_eq!(hooks_absent.findings[0].code, Code::HooksNotInstalled);
     assert_eq!(hooks_absent.findings[0].severity, Severity::Info);
 
-    let healthy = diagnose(explicit_status(&fresh_codex(), AgentKind::Codex), &[]);
+    let healthy = diagnose(explicit_status(&fresh_codex(), RuntimeRef::codex()), &[]);
     assert!(healthy.ok);
     assert!(healthy.findings.is_empty(), "{:?}", healthy.findings);
 
     let missing_runtime = diagnose(
-        explicit_status(&fresh_claude(), AgentKind::Claude),
+        explicit_status(&fresh_claude(), RuntimeRef::claude()),
         &runtime_error,
     );
     assert!(
@@ -1024,7 +1024,7 @@ fn doctor_selects_agents_and_rejects_unsupported_ones() {
     let only_claude = with_config_dirs(&claude, &codex, || {
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Claude),
+                agent: Some(RuntimeRef::claude()),
             },
             &[],
             &[],
@@ -1040,7 +1040,7 @@ fn doctor_selects_agents_and_rejects_unsupported_ones() {
     .expect("doctor both");
     assert_eq!(both.agents.len(), 2);
 
-    for agent in [AgentKind::Shell, AgentKind::Hermes] {
+    for agent in [RuntimeRef::shell(), RuntimeRef::hermes()] {
         let error = doctor_with(IntegrationDoctorParams { agent: Some(agent) }, &[], &[])
             .expect_err("unsupported");
         assert_eq!(error.code, "agent_not_installable");
@@ -1048,7 +1048,7 @@ fn doctor_selects_agents_and_rejects_unsupported_ones() {
     assert_eq!(
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Unknown("pi".to_owned())),
+                agent: Some(RuntimeRef::from_wire("pi")),
             },
             &[],
             &[],
@@ -1076,9 +1076,9 @@ fn doctor_public_entry_point_runs_against_the_process_environment() {
 
 #[test]
 fn an_oversized_owned_script_is_preserved_by_uninstall_and_survives_a_failed_removal() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("rm-oversized");
-        let script = if agent == AgentKind::Claude {
+        let script = if agent == RuntimeRef::claude() {
             install_claude(&dir).expect("install");
             dir.join("hooks").join(STATE_HOOK_INSTALL_NAME)
         } else {
@@ -1095,7 +1095,7 @@ fn an_oversized_owned_script_is_preserved_by_uninstall_and_survives_a_failed_rem
                 Ok(())
             }
         };
-        let error = if agent == AgentKind::Claude {
+        let error = if agent == RuntimeRef::claude() {
             uninstall_claude_gated(&dir, &mut gate).map(|_report| ())
         } else {
             uninstall_codex_gated(&dir, &mut gate).map(|_report| ())
@@ -1108,7 +1108,7 @@ fn an_oversized_owned_script_is_preserved_by_uninstall_and_survives_a_failed_rem
             "{agent:?}: rollback is exact"
         );
 
-        let report = if agent == AgentKind::Claude {
+        let report = if agent == RuntimeRef::claude() {
             uninstall_claude(&dir)
         } else {
             uninstall_codex(&dir)
@@ -1230,9 +1230,9 @@ fn a_provider_file_swapped_after_the_check_is_a_collision_not_a_clobber() {
 
 #[test]
 fn a_mode_only_change_between_load_and_commit_is_a_collision() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("rm-mode-only");
-        let registration = if agent == AgentKind::Claude {
+        let registration = if agent == RuntimeRef::claude() {
             install_claude(&dir).expect("install");
             dir.join("settings.json")
         } else {
@@ -1252,7 +1252,7 @@ fn a_mode_only_change_between_load_and_commit_is_a_collision() {
             Ok(())
         };
 
-        let error = if agent == AgentKind::Claude {
+        let error = if agent == RuntimeRef::claude() {
             uninstall_claude_gated(&dir, &mut gate).map(|_report| ())
         } else {
             uninstall_codex_gated(&dir, &mut gate).map(|_report| ())
@@ -1316,7 +1316,7 @@ fn install_and_uninstall_keep_trust_records_of_the_users_own_hooks() {
 
     install_codex(&dir).expect("install keeps the user's record");
     assert_eq!(
-        explicit_status(&dir, AgentKind::Codex).state,
+        explicit_status(&dir, RuntimeRef::codex()).state,
         IntegrationInstallState::Current,
         "a user's trust record is not a stale managed key"
     );
@@ -1371,7 +1371,7 @@ fn dangling_link(root: &Path, name: &str) -> PathBuf {
 #[test]
 fn a_dangling_config_symlink_is_a_failure_for_status_doctor_install_and_uninstall() {
     let root = scoped_dir("rm-dangling");
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let link = dangling_link(&root, &format!("{}-link", agent.as_wire()));
         let status = explicit_status(&link, agent.clone());
         assert!(!status.available, "{agent:?}");
@@ -1396,7 +1396,7 @@ fn a_dangling_config_symlink_is_a_failure_for_status_doctor_install_and_uninstal
             Severity::Error
         );
 
-        let (install, uninstall) = if agent == AgentKind::Claude {
+        let (install, uninstall) = if agent == RuntimeRef::claude() {
             (
                 install_claude(&link).map(|_paths| ()),
                 uninstall_claude(&link).map(|_report| ()),
@@ -1442,13 +1442,11 @@ fn a_dangling_symlink_through_env_overrides_and_the_default_dir_is_a_failure() {
             .code,
         "integration_path_untrusted"
     );
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         assert_eq!(
-            with_config_dirs(&claude_link, &codex_link, || super::uninstall(
-                agent.clone()
-            ))
-            .expect_err("uninstall refuses")
-            .code,
+            with_config_dirs(&claude_link, &codex_link, || super::uninstall(&agent))
+                .expect_err("uninstall refuses")
+                .code,
             "integration_path_untrusted"
         );
     }
@@ -1615,7 +1613,7 @@ fn a_cleanup_that_cannot_delete_an_original_reports_it_and_never_undoes_the_inst
     );
     assert!(settings_before.contains("user-model"));
     assert_eq!(
-        explicit_status(&dir, AgentKind::Claude).state,
+        explicit_status(&dir, RuntimeRef::claude()).state,
         IntegrationInstallState::Current,
         "the new install is active"
     );
@@ -1640,7 +1638,7 @@ fn doctor_with_dirs(claude: &Path) -> protocol::IntegrationDoctorResult {
     with_config_dirs(claude, &codex, || {
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Claude),
+                agent: Some(RuntimeRef::claude()),
             },
             &[],
             &[],
@@ -1674,7 +1672,7 @@ fn a_cleanup_whose_directory_sync_fails_is_reported_truthfully() {
         "the originals are gone"
     );
     assert_eq!(
-        explicit_status(&dir, AgentKind::Claude).state,
+        explicit_status(&dir, RuntimeRef::claude()).state,
         IntegrationInstallState::Current
     );
 }
@@ -1685,9 +1683,9 @@ type UninstallFn = fn(&Path) -> Result<IntegrationUninstallReport, ProtocolError
 fn a_removal_cleanup_failure_is_reported_and_the_registration_edit_stays_committed() {
     use super::commit::CleanupFault;
 
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("cleanup-uninstall");
-        let (script, uninstall): (PathBuf, UninstallFn) = if agent == AgentKind::Claude {
+        let (script, uninstall): (PathBuf, UninstallFn) = if agent == RuntimeRef::claude() {
             install_claude(&dir).expect("install");
             (
                 dir.join("hooks").join(STATE_HOOK_INSTALL_NAME),
@@ -1721,7 +1719,7 @@ fn a_removal_cleanup_failure_is_reported_and_the_registration_edit_stays_committ
             body,
             "{agent:?}: no data lost"
         );
-        assert!(!read_json(&dir.join(if agent == AgentKind::Claude {
+        assert!(!read_json(&dir.join(if agent == RuntimeRef::claude() {
             "settings.json"
         } else {
             "hooks.json"
@@ -1764,7 +1762,7 @@ fn a_real_unlink_failure_during_cleanup_is_reported_not_raised() {
         "both script originals remain intact: {left:?}"
     );
     assert_eq!(
-        explicit_status(&dir, AgentKind::Claude).state,
+        explicit_status(&dir, RuntimeRef::claude()).state,
         IntegrationInstallState::Current
     );
 }
@@ -1807,8 +1805,8 @@ fn status_and_doctor_refuse_exactly_the_paths_install_and_uninstall_refuse() {
     let base = scoped_dir("rm-walk");
     let homes = refused_homes(&base);
     for (name, home) in &homes {
-        for agent in [AgentKind::Claude, AgentKind::Codex] {
-            let dir_name = if agent == AgentKind::Claude {
+        for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
+            let dir_name = if agent == RuntimeRef::claude() {
                 ".claude"
             } else {
                 ".codex"
@@ -1865,7 +1863,7 @@ fn status_and_doctor_refuse_exactly_the_paths_install_and_uninstall_refuse() {
                 });
                 assert_eq!(install, "integration_path_untrusted", "{context}: install");
                 let uninstall = run(&|| {
-                    super::uninstall(agent.clone())
+                    super::uninstall(&agent)
                         .expect_err("uninstall refuses")
                         .code
                 });
@@ -1882,9 +1880,9 @@ fn status_and_doctor_refuse_exactly_the_paths_install_and_uninstall_refuse() {
 
 #[test]
 fn a_swap_after_activation_is_never_deleted_by_the_rollback() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("rm-after-activation");
-        let script = if agent == AgentKind::Claude {
+        let script = if agent == RuntimeRef::claude() {
             install_claude(&dir).expect("seed install");
             dir.join("hooks").join(STATE_HOOK_INSTALL_NAME)
         } else {
@@ -1908,7 +1906,7 @@ fn a_swap_after_activation_is_never_deleted_by_the_rollback() {
             }
         };
 
-        let error = if agent == AgentKind::Claude {
+        let error = if agent == RuntimeRef::claude() {
             super::install_claude_gated(&dir, &mut gate).map(|_paths| ())
         } else {
             super::install_codex_gated(&dir, &mut gate).map(|_paths| ())
@@ -2053,10 +2051,10 @@ fn the_quarantine_scan_never_follows_a_symlinked_root_or_hooks_directory() {
     let link = base.join("root-link");
     symlink(&outside, &link).expect("symlink root");
     assert!(
-        super::doctor::quarantine_findings(&link, &AgentKind::Claude, 100).is_empty(),
+        super::doctor::quarantine_findings(&link, &RuntimeRef::claude(), 100).is_empty(),
         "a symlinked config root must not be scanned"
     );
-    let status = explicit_status(&link, AgentKind::Claude);
+    let status = explicit_status(&link, RuntimeRef::claude());
     assert!(diagnose(status, &[])
         .findings
         .iter()
@@ -2066,7 +2064,7 @@ fn the_quarantine_scan_never_follows_a_symlinked_root_or_hooks_directory() {
     let root = scoped_dir("doctor-scan-hooks");
     symlink(&outside, root.join("hooks")).expect("symlink hooks");
     assert!(
-        super::doctor::quarantine_findings(&root, &AgentKind::Claude, 100).is_empty(),
+        super::doctor::quarantine_findings(&root, &RuntimeRef::claude(), 100).is_empty(),
         "a symlinked hooks directory must not be scanned"
     );
 
@@ -2075,7 +2073,7 @@ fn the_quarantine_scan_never_follows_a_symlinked_root_or_hooks_directory() {
     fs::create_dir(real.join("hooks")).expect("create hooks");
     set_mode(&real.join("hooks"), 0o700);
     fs::write(real.join("hooks").join(QUARANTINE_NAME), "left").expect("plant leftover");
-    let findings = super::doctor::quarantine_findings(&real, &AgentKind::Claude, 100);
+    let findings = super::doctor::quarantine_findings(&real, &RuntimeRef::claude(), 100);
     assert_eq!(findings.len(), 1);
     assert!(findings[0].summary.contains(QUARANTINE_NAME));
 }
@@ -2091,7 +2089,7 @@ fn the_quarantine_scan_and_report_are_bounded() {
     }
 
     // The report lists a bounded number of paths and counts the rest.
-    let findings = super::doctor::quarantine_findings(&dir, &AgentKind::Codex, 1000);
+    let findings = super::doctor::quarantine_findings(&dir, &RuntimeRef::codex(), 1000);
     assert_eq!(findings.len(), 1);
     assert!(
         findings[0]
@@ -2112,7 +2110,7 @@ fn the_quarantine_scan_and_report_are_bounded() {
     for index in 0..12 {
         fs::write(crowded.join(format!("{QUARANTINE_NAME}-{index:02}")), "x").expect("plant");
     }
-    let cut = super::doctor::quarantine_findings(&crowded, &AgentKind::Codex, 5);
+    let cut = super::doctor::quarantine_findings(&crowded, &RuntimeRef::codex(), 5);
     assert_eq!(cut.len(), 2, "{cut:?}");
     let leftover = find(&cut, Code::DisplacedOriginalLeftBehind);
     assert!(
@@ -2139,7 +2137,7 @@ fn an_incomplete_quarantine_scan_is_always_an_error_finding() {
         if with_quarantine_name {
             fs::write(dir.join(format!("{QUARANTINE_NAME}-beyond")), "x").expect("plant");
         }
-        let findings = super::doctor::quarantine_findings(&dir, &AgentKind::Codex, 5);
+        let findings = super::doctor::quarantine_findings(&dir, &RuntimeRef::codex(), 5);
         let incomplete = find(&findings, Code::QuarantineScanIncomplete);
         assert_eq!(
             incomplete.severity,
@@ -2162,7 +2160,7 @@ fn doctor_is_not_ok_when_the_real_scan_bound_is_exceeded() {
     let result = with_config_dirs(&claude, &codex, || {
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Codex),
+                agent: Some(RuntimeRef::codex()),
             },
             &[],
             &[],
@@ -2182,7 +2180,7 @@ fn every_platform_quarantine_prefix_is_scanned() {
     for prefix in pohunek_platform::filesystem::QUARANTINE_NAME_PREFIXES {
         fs::write(dir.join(format!("{prefix}fixture")), "x").expect("plant");
     }
-    let findings = super::doctor::quarantine_findings(&dir, &AgentKind::Codex, 1000);
+    let findings = super::doctor::quarantine_findings(&dir, &RuntimeRef::codex(), 1000);
     let leftover = find(&findings, Code::DisplacedOriginalLeftBehind);
     assert!(
         leftover.summary.starts_with(&format!(
@@ -2254,20 +2252,20 @@ fn an_unchanged_codex_config_changed_after_load_is_a_collision_and_nothing_is_wr
 
 #[test]
 fn an_unchanged_registration_changed_after_load_blocks_an_uninstall() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         for verify_index in [0_usize, 1] {
             let dir = scoped_dir("verify-uninstall");
             // A registration file without any managed entry stays unchanged.
-            let (registration, uninstall): (PathBuf, UninstallGated) = if agent == AgentKind::Claude
-            {
-                install_claude(&dir).expect("install");
-                write_json(&dir.join("settings.json"), &user_settings());
-                (dir.join("settings.json"), uninstall_claude_gated)
-            } else {
-                install_codex(&dir).expect("install");
-                fs::write(dir.join("config.toml"), "model = \"m\"\n").expect("plain config");
-                (dir.join("config.toml"), uninstall_codex_gated)
-            };
+            let (registration, uninstall): (PathBuf, UninstallGated) =
+                if agent == RuntimeRef::claude() {
+                    install_claude(&dir).expect("install");
+                    write_json(&dir.join("settings.json"), &user_settings());
+                    (dir.join("settings.json"), uninstall_claude_gated)
+                } else {
+                    install_codex(&dir).expect("install");
+                    fs::write(dir.join("config.toml"), "model = \"m\"\n").expect("plain config");
+                    (dir.join("config.toml"), uninstall_codex_gated)
+                };
             let scripts_before: Vec<_> = content_snapshot(&dir)
                 .into_iter()
                 .filter(|(path, _mode, _content)| {
@@ -2368,7 +2366,7 @@ fn a_user_hook_after_the_managed_group_keeps_its_own_trust_through_reinstall_and
     let group = append_user_hook_with_trust(&dir, USER_AFTER_COMMAND);
     assert_eq!(group, 1, "the user hook follows the managed group");
     assert_eq!(
-        explicit_status(&dir, AgentKind::Codex).state,
+        explicit_status(&dir, RuntimeRef::codex()).state,
         IntegrationInstallState::Current
     );
 
@@ -2386,7 +2384,7 @@ fn a_user_hook_after_the_managed_group_keeps_its_own_trust_through_reinstall_and
         "the managed record is not overwriting the user's"
     );
     assert_eq!(
-        explicit_status(&dir, AgentKind::Codex).state,
+        explicit_status(&dir, RuntimeRef::codex()).state,
         IntegrationInstallState::Current
     );
     install_codex(&dir).expect("a second reinstall is stable");
@@ -2446,7 +2444,7 @@ fn a_user_hook_before_the_managed_group_keeps_its_trust_through_every_operation(
     assert_eq!(trust_of(&dir, 0).as_deref(), Some(user_hash.as_str()));
     assert_eq!(trust_of(&dir, 1), Some(managed_state_hash(&dir)));
     assert_eq!(
-        explicit_status(&dir, AgentKind::Codex).state,
+        explicit_status(&dir, RuntimeRef::codex()).state,
         IntegrationInstallState::Current
     );
     install_codex(&dir).expect("reinstall");
@@ -2611,13 +2609,13 @@ fn script_snapshot(dir: &Path) -> Vec<(PathBuf, u32, Vec<u8>)> {
 #[test]
 fn a_registration_changed_after_it_was_written_blocks_the_script_removal() {
     for (agent, registrations) in [
-        (AgentKind::Claude, vec!["settings.json"]),
-        (AgentKind::Codex, vec!["hooks.json", "config.toml"]),
+        (RuntimeRef::claude(), vec!["settings.json"]),
+        (RuntimeRef::codex(), vec!["hooks.json", "config.toml"]),
     ] {
         for registration in registrations {
             for change in CONCURRENT_CHANGES {
                 let dir = scoped_dir("rewrite-check-removal");
-                if agent == AgentKind::Claude {
+                if agent == RuntimeRef::claude() {
                     write_json(&dir.join("settings.json"), &user_settings());
                     install_claude(&dir).expect("install");
                 } else {
@@ -2635,7 +2633,7 @@ fn a_registration_changed_after_it_was_written_blocks_the_script_removal() {
                     }
                 });
 
-                let error = if agent == AgentKind::Claude {
+                let error = if agent == RuntimeRef::claude() {
                     uninstall_claude(&dir).map(|_report| ())
                 } else {
                     uninstall_codex(&dir).map(|_report| ())
@@ -2676,9 +2674,9 @@ fn a_registration_changed_after_it_was_written_blocks_the_script_removal() {
 
 #[test]
 fn a_registration_changed_just_before_the_end_restores_the_removed_scripts() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("rewrite-check-finalize");
-        let registration = if agent == AgentKind::Claude {
+        let registration = if agent == RuntimeRef::claude() {
             install_claude(&dir).expect("install");
             "settings.json"
         } else {
@@ -2696,7 +2694,7 @@ fn a_registration_changed_just_before_the_end_restores_the_removed_scripts() {
             }
         });
 
-        let error = if agent == AgentKind::Claude {
+        let error = if agent == RuntimeRef::claude() {
             uninstall_claude(&dir).map(|_report| ())
         } else {
             uninstall_codex(&dir).map(|_report| ())
@@ -2801,10 +2799,10 @@ fn edit_after_write_then_fail(
 #[test]
 fn an_install_rollback_keeps_a_file_edited_in_place_after_it_was_written() {
     // Install: a script is edited after it was written, then a later step fails.
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("rollback-verify-install");
         let (script, other, fail_at): (PathBuf, PathBuf, &'static str) =
-            if agent == AgentKind::Claude {
+            if agent == RuntimeRef::claude() {
                 install_claude(&dir).expect("seed");
                 (
                     dir.join("hooks").join(STATE_HOOK_INSTALL_NAME),
@@ -2827,7 +2825,7 @@ fn an_install_rollback_keeps_a_file_edited_in_place_after_it_was_written() {
             fail_at,
             CONCURRENT_SCRIPT,
             |gate| {
-                if agent == AgentKind::Claude {
+                if agent == RuntimeRef::claude() {
                     super::install_claude_gated(&dir, gate).map(|_paths| ())
                 } else {
                     super::install_codex_gated(&dir, gate).map(|_paths| ())
@@ -2853,10 +2851,10 @@ fn an_install_rollback_keeps_a_file_edited_in_place_after_it_was_written() {
 #[test]
 fn an_uninstall_rollback_keeps_a_file_edited_in_place_after_it_was_written() {
     // Uninstall: the rewritten registration is edited, then a later removal fails.
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("rollback-verify-uninstall");
         let (registration, registration_name, scripts): (PathBuf, &'static str, Vec<PathBuf>) =
-            if agent == AgentKind::Claude {
+            if agent == RuntimeRef::claude() {
                 install_claude(&dir).expect("install");
                 (
                     dir.join("settings.json"),
@@ -2888,7 +2886,7 @@ fn an_uninstall_rollback_keeps_a_file_edited_in_place_after_it_was_written() {
             NOTIFY_HOOK_INSTALL_NAME,
             "{\"edited\":\"by someone else\"}",
             |gate| {
-                if agent == AgentKind::Claude {
+                if agent == RuntimeRef::claude() {
                     uninstall_claude_gated(&dir, gate).map(|_report| ())
                 } else {
                     uninstall_codex_gated(&dir, gate).map(|_report| ())
@@ -2926,7 +2924,7 @@ fn doctor_does_not_conclude_anything_while_an_operation_holds_the_lock() {
     .expect("plant an in-flight parked file");
     let codex = scoped_dir("doctor-busy-codex");
     let params = IntegrationDoctorParams {
-        agent: Some(AgentKind::Claude),
+        agent: Some(RuntimeRef::claude()),
     };
 
     let holder = TrustedDir::open(&claude, "test root").expect("open");
@@ -2967,7 +2965,7 @@ fn the_doctor_lock_probe_never_creates_the_lock_file() {
     let result = with_config_dirs(&dir, &other, || {
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Claude),
+                agent: Some(RuntimeRef::claude()),
             },
             &[],
             &[],
@@ -3046,7 +3044,7 @@ fn an_unsafe_installer_lock_is_an_error_finding() {
         let result = with_config_dirs(&claude, &codex, || {
             doctor_with(
                 IntegrationDoctorParams {
-                    agent: Some(AgentKind::Claude),
+                    agent: Some(RuntimeRef::claude()),
                 },
                 &[],
                 &[],
@@ -3082,7 +3080,7 @@ fn the_doctor_holds_the_lock_for_its_whole_inspection() {
     let result = with_config_dirs(&claude, &codex, || {
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Claude),
+                agent: Some(RuntimeRef::claude()),
             },
             &[],
             &[],
@@ -3120,7 +3118,7 @@ fn an_operation_that_creates_the_lock_during_the_inspection_drops_the_conclusion
     let result = with_config_dirs(&claude, &codex, || {
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Claude),
+                agent: Some(RuntimeRef::claude()),
             },
             &[],
             &[],
@@ -3317,7 +3315,7 @@ fn unsafe_paths_in_a_not_installed_config_still_fail_the_doctor_and_the_install(
         let result = with_config_dirs(&claude, &codex, || {
             doctor_with(
                 IntegrationDoctorParams {
-                    agent: Some(AgentKind::Claude),
+                    agent: Some(RuntimeRef::claude()),
                 },
                 &[],
                 &[],
@@ -3349,7 +3347,7 @@ fn unsafe_paths_in_a_not_installed_config_still_fail_the_doctor_and_the_install(
     let result = with_config_dirs(&other, &codex, || {
         doctor_with(
             IntegrationDoctorParams {
-                agent: Some(AgentKind::Codex),
+                agent: Some(RuntimeRef::codex()),
             },
             &[],
             &[],
@@ -3368,16 +3366,16 @@ fn unsafe_paths_in_a_not_installed_config_still_fail_the_doctor_and_the_install(
 
 #[test]
 fn an_empty_safe_config_is_still_only_informational() {
-    for agent in [AgentKind::Claude, AgentKind::Codex] {
+    for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("not-installed-safe");
         let other = scoped_dir("not-installed-safe-other");
         let result = with_config_dirs(
-            if agent == AgentKind::Claude {
+            if agent == RuntimeRef::claude() {
                 &dir
             } else {
                 &other
             },
-            if agent == AgentKind::Codex {
+            if agent == RuntimeRef::codex() {
                 &dir
             } else {
                 &other

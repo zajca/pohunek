@@ -460,7 +460,7 @@ enum NotificationsAction {
         severity: Option<protocol::NotificationSeverity>,
         /// Filter by agent kind. Applied client-side.
         #[arg(long, value_parser = commands::notifications::parse_agent_kind)]
-        agent: Option<protocol::AgentKind>,
+        agent: Option<protocol::RuntimeRef>,
         /// Filter by notification producer provider.
         #[arg(long)]
         provider: Option<String>,

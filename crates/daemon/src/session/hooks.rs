@@ -1,9 +1,9 @@
 //! Session-layer lifecycle hooks and the agent-state hook dispatcher.
 
 use super::{
-    broadcast, event, is_terminal, mpsc, run_hook, warn, AgentActivity, AgentKind,
-    CancellationToken, Duration, Event, HashMap, HashSet, HookContext, HookEvent, JoinHandle,
-    PathBuf, SessionId, SessionRegistry, Value, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION,
+    broadcast, event, is_terminal, mpsc, run_hook, warn, AgentActivity, CancellationToken,
+    Duration, Event, HashMap, HashSet, HookContext, HookEvent, JoinHandle, PathBuf, RuntimeRef,
+    SessionId, SessionRegistry, Value, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION,
     ENV_SESSION_ID, ENV_SOCKET_PATH, EVENT_LOG_FLUSH_TIMEOUT, PROTOCOL_VERSION,
 };
 
@@ -128,7 +128,7 @@ impl SessionRegistry {
     /// Registries without a configured socket path get no hook env.
     pub(super) fn hook_env(
         &self,
-        _agent: AgentKind,
+        _agent: RuntimeRef,
         session_id: &SessionId,
     ) -> Vec<(String, String)> {
         match &self.inner.config.socket_path {
@@ -162,7 +162,7 @@ impl SessionRegistry {
     /// agents.
     pub(super) fn session_pty_env(
         &self,
-        agent: AgentKind,
+        agent: RuntimeRef,
         session_id: &SessionId,
     ) -> Vec<(String, String)> {
         let mut env = self.hook_env(agent, session_id);

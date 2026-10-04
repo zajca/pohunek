@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::AgentKind;
+use protocol::RuntimeRef;
 use tokio::sync::{watch, Notify};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::{sleep_until, Instant};
@@ -258,7 +258,7 @@ pub(super) trait TranscriptSink: Send + Sync + 'static {
     /// Parses one transcript and returns whether the index changed.
     fn upsert(
         &self,
-        agent_base: AgentKind,
+        agent_base: RuntimeRef,
         path: PathBuf,
     ) -> impl Future<Output = io::Result<bool>> + Send;
 
@@ -365,7 +365,7 @@ enum Phase {
 
 #[derive(Debug)]
 struct PathState {
-    agent_base: AgentKind,
+    agent_base: RuntimeRef,
     phase: Phase,
 }
 

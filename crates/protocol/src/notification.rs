@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::{AgentKind, SessionId};
+use crate::{session::SessionId, RuntimeRef};
 
 /// Opaque notification identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -172,7 +172,7 @@ pub struct NotificationRecord {
     /// Additive: an older daemon omits it, and an older client ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub agent_kind: Option<AgentKind>,
+    pub agent_kind: Option<RuntimeRef>,
     /// Producer-specific source id, when the producer provides one.
     ///
     /// Additive: an older daemon omits it, and an older client ignores it. This
@@ -255,7 +255,7 @@ pub struct NotificationCreateParams {
     /// Linked agent kind, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
-    pub agent_kind: Option<AgentKind>,
+    pub agent_kind: Option<RuntimeRef>,
     /// Producer-specific source id, when the producer provides one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]

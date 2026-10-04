@@ -740,13 +740,13 @@ async fn integration_status_sdk_helper_sends_typed_read_only_request() {
 
     let result = client
         .integration_status(protocol::IntegrationStatusParams {
-            agent: Some(protocol::AgentKind::Codex),
+            agent: Some(protocol::RuntimeRef::codex()),
         })
         .await
         .expect("integration status succeeds");
 
     assert_eq!(result.agents.len(), 1);
-    assert_eq!(result.agents[0].agent, protocol::AgentKind::Codex);
+    assert_eq!(result.agents[0].agent, protocol::RuntimeRef::codex());
     assert_eq!(
         result.agents[0].state,
         protocol::IntegrationInstallState::Current

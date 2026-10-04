@@ -3,7 +3,6 @@
 export type { ActionSummary } from "./ActionSummary";
 export type { ActivityRevision } from "./ActivityRevision";
 export type { AgentActivity } from "./AgentActivity";
-export type { AgentKind } from "./AgentKind";
 export type { AgentRuntime } from "./AgentRuntime";
 export type { AgentStateEvent } from "./AgentStateEvent";
 export type { ApprovalKeyReference } from "./ApprovalKeyReference";

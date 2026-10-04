@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use protocol::AgentKind;
+use protocol::RuntimeRef;
 use tokio::sync::{mpsc, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -118,7 +118,7 @@ impl WatchBackend for FakeBackend {
 #[derive(Default)]
 struct FakeSink {
     upserts: Mutex<Vec<PathBuf>>,
-    agents: Mutex<Vec<(AgentKind, PathBuf)>>,
+    agents: Mutex<Vec<(RuntimeRef, PathBuf)>>,
     /// What the filesystem holds, and what the last reconcile copied from it.
     disk: Mutex<BTreeSet<PathBuf>>,
     indexed: Mutex<BTreeSet<PathBuf>>,
@@ -134,7 +134,7 @@ struct FakeSink {
 }
 
 impl TranscriptSink for FakeSink {
-    async fn upsert(&self, agent_base: AgentKind, path: PathBuf) -> io::Result<bool> {
+    async fn upsert(&self, agent_base: RuntimeRef, path: PathBuf) -> io::Result<bool> {
         self.agents
             .lock()
             .expect("agents")
@@ -270,7 +270,7 @@ impl Harness {
 
 fn claude_root(path: &Path) -> TranscriptRoot {
     TranscriptRoot {
-        agent_base: AgentKind::Claude,
+        agent_base: RuntimeRef::claude(),
         path: path.to_path_buf(),
     }
 }
@@ -514,7 +514,7 @@ async fn a_hint_under_a_symlinked_nested_root_is_owned_by_the_nested_provider() 
     let roots = vec![
         claude_root(&claude_dir),
         TranscriptRoot {
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             path: link,
         },
     ];
@@ -540,8 +540,8 @@ async fn a_hint_under_a_symlinked_nested_root_is_owned_by_the_nested_provider() 
     assert_eq!(
         agents,
         vec![
-            (AgentKind::Codex, inside_claude_spelling),
-            (AgentKind::Claude, claude_dir.join("p/c.jsonl")),
+            (RuntimeRef::codex(), inside_claude_spelling),
+            (RuntimeRef::claude(), claude_dir.join("p/c.jsonl")),
         ]
     );
 }
@@ -727,11 +727,11 @@ async fn nested_roots_own_their_own_transcripts_and_duplicates_are_dropped() {
     let roots = vec![
         claude_root(&outer),
         TranscriptRoot {
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             path: inner.clone(),
         },
         TranscriptRoot {
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             path: outer.clone(),
         },
     ];
@@ -762,7 +762,7 @@ async fn nested_roots_own_their_own_transcripts_and_duplicates_are_dropped() {
     agents.sort_by(|left, right| left.1.cmp(&right.1));
     assert_eq!(
         agents,
-        vec![(AgentKind::Codex, codex), (AgentKind::Claude, claude)]
+        vec![(RuntimeRef::codex(), codex), (RuntimeRef::claude(), claude)]
     );
 }
 

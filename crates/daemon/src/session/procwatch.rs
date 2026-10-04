@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use protocol::{event, AgentKind, CwdSource, SessionInfo};
+use protocol::{event, CwdSource, RuntimeRef, SessionInfo};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
@@ -604,11 +604,11 @@ impl SessionRegistry {
     /// Whether a session launched as `agent_base` runs an agent as its root
     /// process; a host-shell runtime only hosts agents, and a kind without an
     /// installed definition is treated as an agent.
-    pub(super) fn launch_root_is_agent(&self, agent_base: &AgentKind) -> bool {
+    pub(super) fn launch_root_is_agent(&self, agent_base: &RuntimeRef) -> bool {
         self.inner
             .profiles
             .runtimes()
-            .resolve_kind(agent_base)
+            .resolve_ref(agent_base)
             .map_or(true, |definition| {
                 !matches!(definition.program(), LaunchProgram::HostShell(_))
             })
@@ -866,7 +866,7 @@ fn apply_observed_transition(
 
 fn first_observed_agent_for_base(
     entry: &SessionEntry,
-    agent_base: &AgentKind,
+    agent_base: &RuntimeRef,
 ) -> Option<ObservedAgent> {
     entry
         .observed_agents
@@ -876,7 +876,10 @@ fn first_observed_agent_for_base(
         .cloned()
 }
 
-fn single_observed_for_base(entry: &SessionEntry, agent_base: &AgentKind) -> Option<ObservedAgent> {
+fn single_observed_for_base(
+    entry: &SessionEntry,
+    agent_base: &RuntimeRef,
+) -> Option<ObservedAgent> {
     let mut matching = entry
         .observed_agents
         .iter()
@@ -889,7 +892,7 @@ fn observed_process_matches(
     entry: &SessionEntry,
     pid: Pid,
     start_identity: Option<u64>,
-    agent_base: &AgentKind,
+    agent_base: &RuntimeRef,
 ) -> bool {
     entry.observed_agents.iter().any(|observed| {
         observed.pid == pid

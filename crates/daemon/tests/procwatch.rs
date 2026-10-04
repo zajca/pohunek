@@ -23,7 +23,7 @@ use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{
-    event, AgentKind, CwdSource, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
+    event, CwdSource, RuntimeRef, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
     SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
@@ -355,7 +355,7 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
 
     let observed = wait_for_observed_pid(&registry, &created.id, child_pid).await;
     assert_eq!(observed.active_agent.as_deref(), Some("codex"));
-    assert_eq!(observed.active_agent_base, Some(AgentKind::Codex));
+    assert_eq!(observed.active_agent_base, Some(RuntimeRef::codex()));
 
     // Every poll keeps seeing the agent alive, so only the pidfd exit watch can
     // clear it.
@@ -479,7 +479,7 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
     assert_eq!(observed.id.0, format!("ext-{child_pid}"));
     assert_eq!(observed.external, Some(true));
     assert_eq!(observed.agent, "claude");
-    assert_eq!(observed.agent_base, AgentKind::Claude);
+    assert_eq!(observed.agent_base, RuntimeRef::claude());
     assert_eq!(observed.native_session_id.as_deref(), Some("native-ext"));
     assert_eq!(
         observed.native_session_path.as_deref(),

@@ -14,7 +14,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use protocol::AgentKind;
+use protocol::RuntimeRef;
 
 use super::watch::{TranscriptWatch, WatcherDegraded};
 use super::{
@@ -62,7 +62,7 @@ impl Live {
         prepare(base.path(), &root);
         let sessions = ExternalSessions::new();
         let roots = vec![TranscriptRoot {
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             path: root.clone(),
         }];
         let (index, handle) = start_transcript_index(&roots, &sessions).await;
@@ -446,11 +446,11 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
     let sessions = ExternalSessions::new();
     let roots = vec![
         TranscriptRoot {
-            agent_base: AgentKind::Claude,
+            agent_base: RuntimeRef::claude(),
             path: outer.clone(),
         },
         TranscriptRoot {
-            agent_base: AgentKind::Codex,
+            agent_base: RuntimeRef::codex(),
             path: inner.clone(),
         },
     ];
@@ -465,10 +465,13 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
             .map(|candidate| candidate.agent_base.clone())
     };
 
-    assert_eq!(agent_of(&outer.join("p/c.jsonl")), Some(AgentKind::Claude));
+    assert_eq!(
+        agent_of(&outer.join("p/c.jsonl")),
+        Some(RuntimeRef::claude())
+    );
     assert_eq!(
         agent_of(&inner.join("2026/x.jsonl")),
-        Some(AgentKind::Codex)
+        Some(RuntimeRef::codex())
     );
 
     let live = inner.join("2026/live.jsonl");
@@ -481,7 +484,7 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
     tokio::time::timeout(LIVE_TEST_TIMEOUT, wait)
         .await
         .expect("live transcript indexed");
-    assert_eq!(agent_of(&live), Some(AgentKind::Codex));
+    assert_eq!(agent_of(&live), Some(RuntimeRef::codex()));
     sessions.shutdown();
 }
 

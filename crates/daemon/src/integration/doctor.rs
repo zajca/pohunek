@@ -15,9 +15,10 @@ use std::path::PathBuf;
 use pohunek_paths::{BasePaths, PathEnv, Platform};
 use pohunek_platform::filesystem::{FileLock, FsError, LockKind, TrustedDir};
 use protocol::{
-    AgentKind, IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
+    IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
     IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
     IntegrationFindingSeverity, IntegrationInstallState, IntegrationRecovery, ProtocolError,
+    RuntimeId, RuntimeRef,
 };
 
 use super::{
@@ -427,7 +428,7 @@ fn quarantine_names(directory: &TrustedDir, limit: usize) -> (Vec<String>, bool)
 /// never read as a clean diagnosis.
 pub(super) fn quarantine_findings(
     dir: &std::path::Path,
-    agent: &AgentKind,
+    agent: &RuntimeRef,
     limit: usize,
 ) -> Vec<IntegrationFinding> {
     let Ok(root) = TrustedDir::open_absolute_owner_safe(dir, GROUP_OR_OTHER_WRITE_MASK) else {
@@ -436,7 +437,7 @@ pub(super) fn quarantine_findings(
     let mut left: Vec<PathBuf> = Vec::new();
     let (names, mut incomplete) = quarantine_names(&root, limit);
     left.extend(names.into_iter().map(|name| dir.join(name)));
-    if *agent == AgentKind::Claude {
+    if *agent == RuntimeRef::claude() {
         if let Ok(hooks) = root.open_child_owner_safe("hooks", GROUP_OR_OTHER_WRITE_MASK) {
             let (names, cut) = quarantine_names(&hooks, limit);
             incomplete |= cut;
@@ -512,7 +513,7 @@ fn probe_installer_lock(dir: &std::path::Path) -> LockProbe {
 
 /// The diagnosis reported when another operation holds the installer lock:
 /// nothing was read or scanned, and it never fails the doctor.
-fn operation_in_progress(agent: AgentKind) -> IntegrationAgentDoctor {
+fn operation_in_progress(agent: RuntimeRef) -> IntegrationAgentDoctor {
     IntegrationAgentDoctor {
         agent,
         ok: true,
@@ -541,7 +542,7 @@ fn unsafe_installer_lock(dir: &std::path::Path) -> IntegrationFinding {
 ///
 /// # Errors
 ///
-/// `agent_not_installable` for `AgentKind::Shell` and Hermes (Hermes has its
+/// `agent_not_installable` for the shell runtime and Hermes (Hermes has its
 /// own local doctor) and a typed error for an unknown agent kind.
 pub fn doctor(params: IntegrationDoctorParams) -> Result<IntegrationDoctorResult, ProtocolError> {
     doctor_with(
@@ -557,13 +558,15 @@ pub(super) fn doctor_with(
     python: &[IntegrationFinding],
     socket: &[IntegrationFinding],
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
-    let selected = match params.agent {
-        Some(AgentKind::Claude) => vec![StatusAgent::Claude],
-        Some(AgentKind::Codex) => vec![StatusAgent::Codex],
-        Some(AgentKind::Shell) => return Err(status_unsupported(&AgentKind::Shell)),
-        Some(AgentKind::Hermes) => return Err(status_unsupported(&AgentKind::Hermes)),
-        Some(AgentKind::Unknown(value)) => {
-            return Err(ProtocolError::agent_kind_unsupported(&value));
+    let IntegrationDoctorParams { agent } = params;
+    let selected = match agent.as_ref().map(RuntimeRef::as_wire) {
+        Some(RuntimeId::CLAUDE) => vec![StatusAgent::Claude],
+        Some(RuntimeId::CODEX) => vec![StatusAgent::Codex],
+        Some(unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES)) => {
+            return Err(status_unsupported(unsupported));
+        }
+        Some(other) => {
+            return Err(ProtocolError::agent_kind_unsupported(other));
         }
         None => vec![StatusAgent::Claude, StatusAgent::Codex],
     };
