@@ -768,6 +768,29 @@ fn fetched_commit_stays_referenced_until_the_worktree_is_created() {
 }
 
 #[test]
+fn annotated_tag_base_is_pinned_by_its_commit_and_its_ref_is_deleted() {
+    let upstream = init_repo("tag-upstream");
+    git_in(&upstream, &["tag", "-a", "v1.0.0", "-m", "release"]);
+    let commit = git_stdout(&upstream, &["rev-parse", "v1.0.0^{commit}"]);
+    let tag_object = git_stdout(&upstream, &["rev-parse", "v1.0.0"]);
+    assert_ne!(commit, tag_object, "an annotated tag has its own object");
+    let downstream = clone_of(&upstream, "tag-downstream");
+    git_in(&downstream, &["tag", "-d", "v1.0.0"]);
+
+    let fetched = super::fetch_origin(&downstream, "v1.0.0").expect("fetch the tag");
+    assert_eq!(fetched.commit, commit);
+    drop(fetched);
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+
+    let mgr = manager("tag");
+    let mut req = request("s-1", &downstream, "feat/x");
+    req.base_branch = Some("v1.0.0".to_owned());
+    let bound = mgr.bind(&req).expect("bind from a tag base");
+    assert_eq!(git_stdout(&bound.path, &["rev-parse", "HEAD"]), commit);
+    assert_eq!(leftover_fetch_refs(&downstream), "");
+}
+
+#[test]
 fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
     let upstream = init_repo("clobber-upstream");
     let downstream = clone_of(&upstream, "clobber-downstream");

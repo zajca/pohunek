@@ -142,11 +142,15 @@ struct BaseRef {
 ///
 /// The ref keeps the commit reachable (against `git gc`, concurrent maintenance
 /// or a pre-create hook) until the guard is dropped; dropping deletes the ref,
-/// but only while it still points at [`Self::commit`], so a ref this request did
+/// but only while it still points at [`Self::ref_oid`], so a ref this request did
 /// not create is never removed.
 #[derive(Debug)]
 struct FetchedBase {
+    /// Peeled commit the worktree starts from.
     commit: String,
+    /// Raw object id the ref holds; differs from `commit` when the fetched ref
+    /// is an annotated tag. This is the expected old value of the guarded delete.
+    ref_oid: String,
     repository: PathBuf,
     ref_name: String,
 }
@@ -155,7 +159,7 @@ impl Drop for FetchedBase {
     fn drop(&mut self) {
         if let Err(message) = git_run(
             &self.repository,
-            &["update-ref", "-d", &self.ref_name, &self.commit],
+            &["update-ref", "-d", &self.ref_name, &self.ref_oid],
         ) {
             warn!(
                 fetch_ref = %self.ref_name,
@@ -1324,11 +1328,15 @@ fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Fet
     run_command(cmd)?;
     // The fetch created the ref (it was absent above), so this request owns it
     // even when it does not resolve to a commit.
-    let commit = match git_capture(
-        repo,
-        &["rev-parse", "--verify", &format!("{fetch_ref}^{{commit}}")],
-    ) {
-        Ok(commit) => commit,
+    let resolved = git_capture(repo, &["rev-parse", "--verify", fetch_ref]).and_then(|ref_oid| {
+        git_capture(
+            repo,
+            &["rev-parse", "--verify", &format!("{fetch_ref}^{{commit}}")],
+        )
+        .map(|commit| (ref_oid, commit))
+    });
+    let (ref_oid, commit) = match resolved {
+        Ok(ids) => ids,
         Err(message) => {
             if let Err(delete) = git_run(repo, &["update-ref", "-d", fetch_ref]) {
                 warn!(fetch_ref, error = %delete, "could not delete the temporary fetch ref");
@@ -1338,6 +1346,7 @@ fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Fet
     };
     Ok(FetchedBase {
         commit,
+        ref_oid,
         repository: repo.to_path_buf(),
         ref_name: fetch_ref.to_owned(),
     })
