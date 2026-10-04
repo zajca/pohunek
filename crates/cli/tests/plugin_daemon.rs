@@ -38,7 +38,7 @@ use tokio::sync::oneshot;
 /// Mode of every private fixture directory.
 const PRIVATE_MODE: u32 = 0o700;
 
-/// Mode of a file the tests write.
+/// Mode of a profile file.
 const PROFILE_MODE: u32 = 0o600;
 
 /// Package id of the fixture archive.
@@ -124,6 +124,7 @@ struct Built {
 struct Harness {
     env: TestEnv,
     plugins: PathBuf,
+    agents: PathBuf,
     shutdown: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -194,6 +195,7 @@ impl Harness {
         Self {
             env,
             plugins,
+            agents,
             shutdown,
             task,
         }
@@ -283,6 +285,14 @@ impl Harness {
         fs::write(dir.join("runtime.toml"), runtime_document(version)).expect("write runtime");
         fs::write(dir.join("detect.toml"), DETECT_MANIFEST).expect("write detect manifest");
         dir
+    }
+
+    /// Writes `<config>/pohunek/agents/<name>.toml`.
+    fn profile(&self, name: &str, text: &str) -> PathBuf {
+        let path = self.agents.join(format!("{name}.toml"));
+        fs::write(&path, text).expect("write the profile");
+        fs::set_permissions(&path, fs::Permissions::from_mode(PROFILE_MODE)).expect("profile mode");
+        path
     }
 
     /// The directory holding the installed tree of `digest`.
@@ -656,6 +666,112 @@ async fn a_modified_root_fails_doctor_and_needs_remove_modified() {
 
     let after = harness.run(&["plugin", "doctor"]).await;
     assert!(after.status.success(), "{}", stderr_text(&after));
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn a_pinned_profile_blocks_uninstall_and_migrate_pins_the_new_digest() {
+    let harness = Harness::start().await;
+    let old = harness.archive("1.0.0");
+    let new = harness.archive("1.1.0");
+    install_enabled(&harness, &old).await;
+
+    let pinned = format!(
+        "base = \"{RUNTIME}\"\npackage = \"{PACKAGE_ID}\"\ndigest = \"{}\"\n",
+        old.digest
+    );
+    let path = harness.profile("p", &pinned);
+
+    let (code, refused) = harness
+        .json(&["plugin", "uninstall", PACKAGE_ID, "--yes"])
+        .await;
+    assert_eq!(code, 1, "{refused}");
+    assert_eq!(refused["err"]["code"], "package_referenced");
+    assert!(harness.registry().package(&old.digest).is_some());
+
+    // A newer version leaves the profile on the digest it pinned.
+    let (code, updated) = harness
+        .json(&[
+            "plugin",
+            "update",
+            PACKAGE_ID,
+            path_str(&new.path),
+            "--sha256",
+            new.digest.as_str(),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{updated}");
+    assert_eq!(fs::read_to_string(&path).expect("read"), pinned);
+    let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["ok"]["profiles"][0]["state"], "pinned");
+    assert_eq!(listed["ok"]["profiles"][0]["digest"], old.digest.as_str());
+
+    let (code, migrated) = harness
+        .json(&[
+            "plugin",
+            "profile",
+            "migrate",
+            "p",
+            "--digest",
+            &new.digest.as_str()[7..19],
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{migrated}");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        pinned.replace(old.digest.as_str(), new.digest.as_str())
+    );
+    let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["ok"]["profiles"][0]["state"], "pinned");
+    assert_eq!(listed["ok"]["profiles"][0]["digest"], new.digest.as_str());
+
+    // The daemon accepts the migrated profile for a fresh launch.
+    let (code, launched) = launch(&harness, "p").await;
+    assert_eq!(code, 0, "{launched}");
+
+    // The old version is no longer pinned and uninstalls.
+    let (code, removed) = harness
+        .json(&[
+            "plugin",
+            "uninstall",
+            PACKAGE_ID,
+            "--digest",
+            &old.digest.as_str()[7..19],
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{removed}");
+    assert!(harness.registry().package(&old.digest).is_none());
+
+    harness.stop().await;
+}
+
+#[tokio::test]
+async fn an_unpinned_profile_migrates_to_the_installed_package() {
+    let harness = Harness::start().await;
+    let built = harness.archive("1.0.0");
+    install_enabled(&harness, &built).await;
+    let path = harness.profile("work", &format!("base = \"{RUNTIME}\"\n"));
+
+    let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["ok"]["profiles"][0]["state"], "needs_migration");
+
+    let (code, migrated) = harness
+        .json(&["plugin", "profile", "migrate", "work", "--yes"])
+        .await;
+    assert_eq!(code, 0, "{migrated}");
+    assert_eq!(migrated["ok"]["status"], "migrated");
+    let text = fs::read_to_string(&path).expect("read the profile");
+    assert!(text.contains(built.digest.as_str()), "{text}");
+    let (code, listed) = harness.json(&["plugin", "profile", "list"]).await;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["ok"]["profiles"][0]["state"], "pinned");
 
     harness.stop().await;
 }
