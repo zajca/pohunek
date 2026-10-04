@@ -915,6 +915,8 @@ creates an isolated temporary profile/state, requires that executable rather
 than downloading it, and fails if install, status, doctor, or uninstall cannot
 prove the embedded plugin and generated skill.
 
+After a published stable release, `.github/workflows/notify-tap.yml` (a `workflow_run` of `Release`, the only workflow with a secret, `TAP_DISPATCH_PAT`) sends the Homebrew tap `zajca/homebrew-pohunek` a `pohunek-work-release` repository dispatch for the `pohunek` formula and the tag, and the tap bumps it; pre-releases are skipped. `scripts/tests/test_notify_tap_workflow.py` pins it.
+
 ## License
 
 [MIT](LICENSE). The embedded Pohunek Hermes plugin and generated skill are
