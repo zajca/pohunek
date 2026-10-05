@@ -364,6 +364,7 @@ fn fork_params(id: &SessionId) -> SessionForkParams {
         cwd_mode: ForkCwdMode::Same,
         cols: 80,
         rows: 24,
+        accept_profile_change: false,
     }
 }
 

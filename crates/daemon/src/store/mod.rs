@@ -2177,7 +2177,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2193,7 +2193,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2232,7 +2232,7 @@ mod tests {
     fn resume_provenance_defaults_to_reported_and_roundtrips_when_assigned() {
         let store = Store::new(temp_store_path("resume-provenance"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
             "\n"
         );
@@ -2267,7 +2267,7 @@ mod tests {
     fn profile_revision_is_absent_by_default_and_round_trips_as_hex() {
         let store = Store::new(temp_store_path("resume-profile-revision"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
             "\n"
         );
@@ -2303,7 +2303,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":4,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -2358,7 +2358,7 @@ mod tests {
         // than inferring current compiled provider behavior.
         let store = Store::new(temp_store_path("resume-legacy"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-old"}"#,
             "\n"
         );
@@ -2382,10 +2382,10 @@ mod tests {
     fn resume_legacy_line_without_agent_base_infers_base_kind_from_agent_name() {
         let store = Store::new(temp_store_path("resume-legacy-agent-base"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-codex","agent":"codex","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-codex","agent":"codex","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-codex"}"#,
             "\n",
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-claude","agent":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-claude","agent":"claude","#,
             r#""cwd":"/w","cols":100,"rows":30,"native_session_id":"native-claude"}"#,
             "\n"
         );
@@ -2422,7 +2422,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":3,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":4,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2463,7 +2463,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":3,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
+                r#"{"kind":"resume","schema_version":4,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
                 r#""cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2931,7 +2931,7 @@ mod tests {
         // still loads, defaulting project_id to None — the store's only
         // compatibility concession (serde default), not a guarantee.
         let legacy = concat!(
-            r#"{"kind":"worktree","schema_version":3,"session_id":"s-2","repository":"/r","branch":"feat/y","#,
+            r#"{"kind":"worktree","schema_version":4,"session_id":"s-2","repository":"/r","branch":"feat/y","#,
             r#""base_branch":"main","branch_slug":"feat-y","path":"/p","status":"active","#,
             r#""created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}"#,
             "\n"
