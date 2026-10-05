@@ -6,17 +6,18 @@
 //! are thin transport glue.
 
 use protocol::{
-    ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
+    ErrorClass, ProtocolError, Request, Response, SessionAttachParams, SessionDetachParams,
     SessionDetectionParams, SessionDiffParams, SessionForkParams, SessionForkResult, SessionId,
     SessionInputParams, SessionListParams, SessionNewParams, SessionNewResult, SessionOutputParams,
     SessionPolicyParams, SessionPolicyResult, SessionReadParams, SessionReleaseAgentParams,
     SessionRenameParams, SessionReportAgentParams, SessionReportNativeIdParams,
-    SessionResizeParams, SessionResumeResult, SessionRetentionParams, SessionScreenParams,
-    SessionSetMetadataParams, SessionWaitParams,
+    SessionResizeParams, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
+    SessionScreenParams, SessionSetMetadataParams, SessionWaitParams,
 };
 
 use super::util::{error_value, ok_value, ok_value_bounded, parse_optional_params, parse_params};
-use crate::session::{SessionRegistry, UnconfirmedCleanup};
+use super::{ControlTransport, DaemonState};
+use crate::session::{ProfileChange, SessionRegistry, UnconfirmedCleanup};
 
 pub(super) async fn handle_session_new(request: &Request, sessions: &SessionRegistry) -> Response {
     let params = match parse_params::<SessionNewParams>(request) {
@@ -87,26 +88,54 @@ pub(super) async fn handle_session_stop(request: &Request, sessions: &SessionReg
     }
 }
 
-pub(super) async fn handle_session_resume(
-    request: &Request,
-    sessions: &SessionRegistry,
-) -> Response {
-    let id = match parse_params::<SessionId>(request) {
-        Ok(id) => id,
+/// The owner's decision on a changed host profile, from the request's flag.
+///
+/// Accepting a changed profile relaunches the session with whatever the
+/// profile now holds (credentials included), so only the local owner socket
+/// may ask for it; a remote connection is refused before anything is resolved.
+fn profile_change(
+    state: &DaemonState,
+    accept_profile_change: bool,
+) -> Result<ProfileChange, ProtocolError> {
+    if accept_profile_change && state.transport != ControlTransport::Local {
+        return Err(ProtocolError::new(
+            ErrorClass::Daemon,
+            "agent_profile_change_local_only",
+            "accepting a changed agent profile is served on the local control socket only",
+            Some("run the command on the host that runs the daemon".to_owned()),
+        ));
+    }
+    Ok(ProfileChange::requested(accept_profile_change))
+}
+
+pub(super) async fn handle_session_resume(request: &Request, state: &DaemonState) -> Response {
+    let params = match parse_params::<SessionResumeParams>(request) {
+        Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    match sessions.resume(&id).await {
+    let change = match profile_change(state, params.accept_profile_change()) {
+        Ok(change) => change,
+        Err(err) => return error_value(request, err),
+    };
+    match state
+        .sessions
+        .resume_with(params.session_id(), change)
+        .await
+    {
         Ok(session) => ok_value(request, &SessionResumeResult { session }),
         Err(err) => error_value(request, err),
     }
 }
 
-pub(super) async fn handle_session_fork(request: &Request, sessions: &SessionRegistry) -> Response {
+pub(super) async fn handle_session_fork(request: &Request, state: &DaemonState) -> Response {
     let params = match parse_params::<SessionForkParams>(request) {
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    match sessions.fork(params).await {
+    if let Err(err) = profile_change(state, params.accept_profile_change) {
+        return error_value(request, err);
+    }
+    match state.sessions.fork(params).await {
         Ok(session) => ok_value(
             request,
             &SessionForkResult {

@@ -778,8 +778,13 @@ host-local secret (`profile-revision.key` in the owner-private host-state
 directory, created on first use) over those inputs, so a different login shell
 changes it, a revision never lets a holder confirm a guessed `[env]` value, and
 it is stable across daemon restarts. A missing or unreadable key fails closed
-with `agent_profile_revision_unavailable`; there is no unkeyed fallback, and
-owner-local launches never need the key. Connecting a relay-origin
+with `agent_profile_revision_unavailable`; there is no unkeyed fallback. A
+profile-backed `session.new` freezes the revision into the session's resume
+binding, so it needs the key; a launch of a bare runtime never does.
+`session.resume` and `session.fork` resolve the profile once, compare its
+current revision with the frozen one and refuse an edited, legacy or missing
+profile with `agent_profile_changed` or `agent_profile_missing` unless the
+local owner accepts the change. Connecting a relay-origin
 `session.new` to `RelayProfile` depends on the locally approved `HostShare` of
 [#82](https://github.com/zajca/pohunek/issues/82); until then the relay
 variant is covered at the resolution seam only.

@@ -17,6 +17,21 @@
   profiles page starts the subscription-switching guide, the public API, CLI,
   runtime packages and secrets pages describe the surface.
 
+## Unreleased (2026-10-05, frozen profile revision)
+
+- A session launched from a host profile freezes the profile's keyed revision
+  into its resume binding (store schema 3, optional `profile_revision`).
+  `session.resume` and `session.fork` resolve the profile once and relaunch only
+  while the revision matches: an edited profile or a legacy session fails with
+  `agent_profile_changed`, a missing one with `agent_profile_missing`, and an
+  unreadable key with `agent_profile_revision_unavailable`. The owner's
+  `accept_profile_change` (`--accept-profile-change`) relaunches under the
+  current profile and re-freezes it; `session.resume` still accepts a bare
+  session id, and the decision is honored on the local control socket only
+  (`agent_profile_change_local_only`). The profile environment now travels in a
+  redacting `LaunchEnv` carrier. The public API, CLI, architecture, secrets and
+  agent profile docs describe the behavior.
+
 ## Unreleased (2026-10-05, hook schema gaps)
 
 - A hook schema now declares the subagent sequence rule next to the subagent

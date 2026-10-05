@@ -23,10 +23,10 @@ use protocol::{
     SessionListFilter, SessionListParams, SessionNewParams, SessionOutputParams,
     SessionPolicyParams, SessionReadFormat, SessionReadParams, SessionReadResult,
     SessionReadSource, SessionRemoveResult, SessionRenameParams, SessionResizeParams,
-    SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult, SessionRuntimeIdentity,
-    SessionScreenParams, SessionSetMetadataParams, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle, TerminalWatermark,
-    MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
+    SessionResumeParams, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionResult,
+    SessionRuntimeIdentity, SessionScreenParams, SessionSetMetadataParams, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWarningKind, StateSource, SubagentLifecycle,
+    TerminalWatermark, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES,
 };
 
 use crate::client::Client;
@@ -634,6 +634,7 @@ pub(crate) async fn run_fork(
     paths: &Paths,
     target: &Target,
     name: Option<String>,
+    accept_profile_change: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let mut client = Client::connect(host, paths).await?;
@@ -641,6 +642,7 @@ pub(crate) async fn run_fork(
         .call::<method::SessionFork>(fork_params(
             target,
             name,
+            accept_profile_change,
             DEFAULT_FORK_COLS,
             DEFAULT_FORK_ROWS,
         ))
@@ -1029,12 +1031,13 @@ pub(crate) async fn run_resume(
     host: &str,
     paths: &Paths,
     target: &Target,
+    accept_profile_change: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let client = Client::connect(host, paths).await?;
     let result = client
         .into_sdk()
-        .session_resume(SessionId(target.session_id.clone()))
+        .session_resume_with(resume_params(target, accept_profile_change))
         .await?;
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -1497,24 +1500,39 @@ fn build_remove_request(
     request_with_params(method, &SessionId(target.session_id.clone()))
 }
 
-fn fork_params(target: &Target, name: Option<String>, cols: u16, rows: u16) -> SessionForkParams {
+fn fork_params(
+    target: &Target,
+    name: Option<String>,
+    accept_profile_change: bool,
+    cols: u16,
+    rows: u16,
+) -> SessionForkParams {
     SessionForkParams {
         session_id: SessionId(target.session_id.clone()),
         name,
         cwd_mode: ForkCwdMode::Same,
         cols,
         rows,
+        accept_profile_change,
     }
+}
+
+fn resume_params(target: &Target, accept_profile_change: bool) -> SessionResumeParams {
+    SessionResumeParams::new(SessionId(target.session_id.clone()), accept_profile_change)
 }
 
 #[cfg(test)]
 fn build_fork_request(
     target: &Target,
     name: Option<String>,
+    accept_profile_change: bool,
     cols: u16,
     rows: u16,
 ) -> Result<Request, CliError> {
-    request_with_params(method::SESSION_FORK, &fork_params(target, name, cols, rows))
+    request_with_params(
+        method::SESSION_FORK,
+        &fork_params(target, name, accept_profile_change, cols, rows),
+    )
 }
 
 fn input_params(
@@ -3578,7 +3596,7 @@ mod tests {
     fn build_fork_request_targets_session_fork_method() {
         let target: Target = "host-a/s-42".parse().expect("target");
 
-        let request = build_fork_request(&target, Some("forked review".to_owned()), 100, 30)
+        let request = build_fork_request(&target, Some("forked review".to_owned()), false, 100, 30)
             .expect("build fork request");
 
         assert_request(
@@ -3591,6 +3609,40 @@ mod tests {
                 "cols": 100,
                 "rows": 30
             }),
+        );
+    }
+
+    #[test]
+    fn build_fork_request_carries_the_profile_override_only_when_asked() {
+        let target: Target = "s-42".parse().expect("target");
+
+        let request = build_fork_request(&target, None, true, 100, 30).expect("build fork request");
+
+        assert_request(
+            &request,
+            method::SESSION_FORK,
+            serde_json::json!({
+                "session_id": "s-42",
+                "cwd_mode": "same",
+                "cols": 100,
+                "rows": 30,
+                "accept_profile_change": true
+            }),
+        );
+    }
+
+    #[test]
+    fn resume_params_keep_the_bare_id_shape_unless_the_override_is_asked() {
+        let target: Target = "s-42".parse().expect("target");
+
+        assert_eq!(
+            serde_json::to_value(resume_params(&target, false)).expect("serialize"),
+            serde_json::json!("s-42"),
+            "an older daemon only understands the bare id"
+        );
+        assert_eq!(
+            serde_json::to_value(resume_params(&target, true)).expect("serialize"),
+            serde_json::json!({"session_id": "s-42", "accept_profile_change": true})
         );
     }
 

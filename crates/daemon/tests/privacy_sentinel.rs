@@ -783,6 +783,9 @@ async fn worker_backed_session_never_persists_secrets_or_terminal_bytes() {
         store_path: Some(store_path.clone()),
         event_log_dir: Some(events_dir.clone()),
         agents_dir: Some(agents_dir.clone()),
+        // A profile-backed session freezes a keyed revision, so the host needs
+        // its revision key directory.
+        host_state_dir: Some(root.join("host-state")),
         ..SessionRegistryConfig::default()
     };
     let (shutdown, handle, worker_home) =

@@ -14,10 +14,12 @@ use protocol::{AgentActivity, ErrorClass, ProtocolError};
 use serde::{Deserialize, Serialize};
 
 pub mod host;
+mod launch_env;
 mod native_launch;
 mod native_reference;
 mod profile;
 
+pub use launch_env::LaunchEnv;
 pub use native_launch::{
     NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
 };
@@ -100,8 +102,9 @@ pub struct LaunchOpts {
     pub cols: u16,
     /// Initial terminal height in rows.
     pub rows: u16,
-    /// Extra environment variables for the child process.
-    pub env_extra: Vec<(String, String)>,
+    /// Extra environment variables for the child process; secret-bearing, so
+    /// its `Debug` form is redacted.
+    pub env_extra: LaunchEnv,
     /// Exact provider executable already resolved and validated for this launch.
     pub(crate) validated_program: Option<ValidatedLaunchProgram>,
 }
@@ -113,8 +116,9 @@ pub struct LaunchCommand {
     pub program: String,
     /// Program arguments.
     pub args: Vec<String>,
-    /// Extra environment variables to add or override for the child process.
-    pub env: Vec<(String, String)>,
+    /// Extra environment variables to add or override for the child process;
+    /// secret-bearing, so its `Debug` form is redacted.
+    pub env: LaunchEnv,
     /// Working directory.
     pub cwd: PathBuf,
     /// Initial terminal width in columns.
@@ -510,7 +514,7 @@ mod tests {
             cwd: cwd.as_ref().to_path_buf(),
             cols: 120,
             rows: 40,
-            env_extra: vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())],
+            env_extra: vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())].into(),
             validated_program: None,
         }
     }

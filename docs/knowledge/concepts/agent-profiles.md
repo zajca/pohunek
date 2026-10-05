@@ -117,6 +117,34 @@ reveals no environment value, and an unreadable key fails closed with
 caller exists yet; it depends on the locally approved host share of
 [#82](https://github.com/zajca/pohunek/issues/82).
 
+## Resuming and forking a profile-backed session
+
+A session launched from a host profile freezes the profile's keyed revision
+into its resume binding when it is created. Resume and fork resolve the profile
+once, compare its current revision with the frozen one, and relaunch under that
+single resolution only while they match:
+
+- an edited profile (its text, `[env]`, detection manifest, runtime binding,
+  program or arguments) fails with `agent_profile_changed`;
+- a legacy session that never froze a revision fails with the same code;
+- a profile that no longer resolves fails with `agent_profile_missing`;
+- a host that cannot read its revision key fails closed with
+  `agent_profile_revision_unavailable`, for `session.new` of a profile-backed
+  session too. A session without a profile needs no key and is never compared.
+
+This is what keeps a switch of account from taking effect silently: editing a
+profile's `[env]` (for example the config home of a second subscription) makes
+every existing session of that profile refuse to resume until the owner decides.
+`pohunek session resume <id> --accept-profile-change` (and `session fork`) is
+that decision. It relaunches under the current profile's env and detection
+manifest and freezes its revision, so the next resume needs no flag. The launch
+shape frozen at creation (program, arguments, resume spec, runtime pin) stays
+as it was, and a deleted profile is refused even with the flag. The decision is
+honored only on the local control socket; a remote caller gets
+`agent_profile_change_local_only`. `plugin profile migrate` and
+`package.bind_profile` rewrite the profile text, so existing sessions of that
+profile need the flag once. Profile values never appear in these errors.
+
 ## Native recovery spec
 
 A native-session launch spec states how an agent CLI resumes and optionally

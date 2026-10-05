@@ -338,8 +338,8 @@ async fn handle_negotiated(
         }
         method::SESSION_INSPECT => session::handle_session_inspect(request, &state.sessions).await,
         method::SESSION_STOP => session::handle_session_stop(request, &state.sessions).await,
-        method::SESSION_RESUME => session::handle_session_resume(request, &state.sessions).await,
-        method::SESSION_FORK => session::handle_session_fork(request, &state.sessions).await,
+        method::SESSION_RESUME => session::handle_session_resume(request, state).await,
+        method::SESSION_FORK => session::handle_session_fork(request, state).await,
         method::SESSION_REMOVE => session::handle_session_remove(request, &state.sessions).await,
         method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED => {
             session::handle_session_remove_accepting_unconfirmed(request, &state.sessions).await
@@ -453,7 +453,6 @@ fn mutation_target(request: &Request) -> Option<&str> {
     let direct = matches!(
         request.method(),
         method::SESSION_STOP
-            | method::SESSION_RESUME
             | method::SESSION_REMOVE
             | method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
     );
@@ -465,13 +464,19 @@ fn mutation_target(request: &Request) -> Option<&str> {
             | method::SESSION_RENAME
             | method::SESSION_INPUT
     );
-    if direct {
-        request.params().as_str()
-    } else if nested {
+    let nested_session_id = || {
         request
             .params()
             .get("session_id")
             .and_then(serde_json::Value::as_str)
+    };
+    if direct {
+        request.params().as_str()
+    } else if nested {
+        nested_session_id()
+    } else if request.method() == method::SESSION_RESUME {
+        // A bare id, or the object form that adds the profile-change decision.
+        request.params().as_str().or_else(nested_session_id)
     } else {
         None
     }
@@ -605,6 +610,10 @@ mod tests {
         let mutations = [
             (method::SESSION_STOP, serde_json::json!(target)),
             (method::SESSION_RESUME, serde_json::json!(target)),
+            (
+                method::SESSION_RESUME,
+                serde_json::json!({"session_id": target, "accept_profile_change": true}),
+            ),
             (method::SESSION_REMOVE, serde_json::json!(target)),
             (
                 method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
@@ -785,6 +794,7 @@ mod tests {
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         };
         let request = request(
             "fork-unsupported",

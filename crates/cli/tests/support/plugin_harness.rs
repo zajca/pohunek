@@ -141,6 +141,9 @@ impl Harness {
             socket_path: Some(socket.clone()),
             plugins_dir: Some(plugins.clone()),
             agents_dir: Some(agents.clone()),
+            // A profile-backed launch freezes a keyed revision, which needs the
+            // host's revision key directory.
+            host_state_dir: Some(env.root().join("host-state")),
             worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
             worker_state_root: Some(environment.state_home.join("pohunek/workers")),
             supervision: Some(

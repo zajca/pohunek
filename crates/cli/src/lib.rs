@@ -1162,6 +1162,11 @@ enum SessionAction {
         /// Owner-set display name for the forked session.
         #[arg(long)]
         name: Option<String>,
+        /// Fork under the session's current host profile although the profile
+        /// changed since the session was launched. Honored by the local daemon
+        /// only.
+        #[arg(long)]
+        accept_profile_change: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -1282,6 +1287,11 @@ enum SessionAction {
     /// Resume a stopped logical session.
     Resume {
         target: Target,
+        /// Relaunch under the session's current host profile although the
+        /// profile changed since the session was launched. Honored by the
+        /// local daemon only.
+        #[arg(long)]
+        accept_profile_change: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1854,10 +1864,23 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
                     commands::session::run_stop(&host, &paths, &target, json).await?;
                 }
-                SessionAction::Fork { target, name, json } => {
+                SessionAction::Fork {
+                    target,
+                    name,
+                    accept_profile_change,
+                    json,
+                } => {
                     let host = effective_host(&global_host, Some(&target));
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
-                    commands::session::run_fork(&host, &paths, &target, name, json).await?;
+                    commands::session::run_fork(
+                        &host,
+                        &paths,
+                        &target,
+                        name,
+                        accept_profile_change,
+                        json,
+                    )
+                    .await?;
                 }
                 SessionAction::Rm {
                     target,
@@ -1989,10 +2012,21 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     )
                     .await?;
                 }
-                SessionAction::Resume { target, json } => {
+                SessionAction::Resume {
+                    target,
+                    accept_profile_change,
+                    json,
+                } => {
                     let host = effective_host(&global_host, Some(&target));
                     let target = commands::session::resolve_target(&host, &paths, &target).await?;
-                    commands::session::run_resume(&host, &paths, &target, json).await?;
+                    commands::session::run_resume(
+                        &host,
+                        &paths,
+                        &target,
+                        accept_profile_change,
+                        json,
+                    )
+                    .await?;
                 }
                 SessionAction::Resize {
                     target,
@@ -3442,11 +3476,87 @@ mod tests {
 
         match cli.command {
             Commands::Session {
-                action: SessionAction::Fork { target, name, json },
+                action:
+                    SessionAction::Fork {
+                        target,
+                        name,
+                        accept_profile_change,
+                        json,
+                    },
             } => {
                 assert_eq!(target.session_id, "s-42");
                 assert_eq!(target.host.as_deref(), Some("host-a"));
                 assert_eq!(name.as_deref(), Some("forked review"));
+                assert!(!accept_profile_change, "the override is opt-in");
+                assert!(json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_fork_accept_profile_change_flag() {
+        let cli = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "fork",
+            "s-42",
+            "--accept-profile-change",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Session {
+                action:
+                    SessionAction::Fork {
+                        accept_profile_change,
+                        ..
+                    },
+            } => assert!(accept_profile_change),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_session_resume_with_and_without_the_profile_override() {
+        let plain =
+            Cli::try_parse_from(["pohunek", "session", "resume", "s-42"]).expect("parse plain");
+        match plain.command {
+            Commands::Session {
+                action:
+                    SessionAction::Resume {
+                        target,
+                        accept_profile_change,
+                        json,
+                    },
+            } => {
+                assert_eq!(target.session_id, "s-42");
+                assert!(!accept_profile_change, "the override is opt-in");
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        let accepted = Cli::try_parse_from([
+            "pohunek",
+            "session",
+            "resume",
+            "host-a/s-42",
+            "--accept-profile-change",
+            "--json",
+        ])
+        .expect("parse override");
+        match accepted.command {
+            Commands::Session {
+                action:
+                    SessionAction::Resume {
+                        target,
+                        accept_profile_change,
+                        json,
+                    },
+            } => {
+                assert_eq!(target.host.as_deref(), Some("host-a"));
+                assert!(accept_profile_change);
                 assert!(json);
             }
             other => panic!("unexpected command: {other:?}"),

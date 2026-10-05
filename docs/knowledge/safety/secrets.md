@@ -17,6 +17,13 @@ Profile `[env]` entries are secret-bearing even when their names look harmless.
 Do not copy profile environment keys or values into prompts, snapshots,
 documentation, logs, commits, or issue text.
 
+Inside the daemon the profile environment travels in the `LaunchEnv` carrier,
+whose `Debug` form prints only an entry count, and in `ResolvedProfile`,
+`LaunchOpts` and `LaunchCommand`, which embed it; a stray `{:?}` of any of them
+cannot print a name or a value. The store keeps only the keyed revision (a MAC)
+of the profile a session launched under, never its env, and error messages of
+the profile-change refusals name the agent and session, never a profile value.
+
 The assistant snapshot is allowlist-built. It may include filenames, existence
 status, parse status, selected action names, structured command output, and
 warnings. It must not collect process environment variables, profile env values,

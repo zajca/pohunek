@@ -348,6 +348,51 @@ fn protocol_3_requests_upgrade_to_what_the_current_types_decode() {
 }
 
 #[test]
+fn session_resume_keeps_its_protocol_3_bare_id_and_gains_an_object_form() {
+    use protocol::{SessionId, SessionResumeParams};
+
+    // The protocol 3 request is a bare id; the adapter leaves it as it is and
+    // the current type decodes it, so an old client keeps resuming.
+    let bare = request_params(v3(), method::SESSION_RESUME, json!("s-42")).expect("upgrade");
+    assert_eq!(bare, json!("s-42"));
+    let decoded: SessionResumeParams = serde_json::from_value(bare).expect("decode bare id");
+    assert_eq!(decoded.session_id(), &SessionId("s-42".to_owned()));
+    assert!(!decoded.accept_profile_change());
+
+    // The object form is additive: it is the same method on both versions.
+    let object = json!({"session_id": "s-42", "accept_profile_change": true});
+    for version in [v3(), PROTOCOL_VERSION] {
+        let upgraded = request_params(version, method::SESSION_RESUME, object.clone())
+            .expect("the object form passes through unchanged");
+        assert_eq!(upgraded, object);
+        let decoded: SessionResumeParams = serde_json::from_value(upgraded).expect("decode");
+        assert!(decoded.accept_profile_change());
+    }
+
+    // A current client that does not ask for the override keeps sending the
+    // shape every daemon of the window understands.
+    assert_eq!(
+        serde_json::to_value(SessionResumeParams::new(
+            SessionId("s-42".to_owned()),
+            false
+        ))
+        .expect("serialize"),
+        json!("s-42")
+    );
+}
+
+#[test]
+fn session_fork_gains_an_optional_override_that_protocol_3_requests_never_carry() {
+    use protocol::SessionForkParams;
+
+    let golden = json!({"session_id": "s-42", "cols": 80, "rows": 24});
+    let upgraded = request_params(v3(), method::SESSION_FORK, golden.clone()).expect("upgrade");
+    assert_eq!(upgraded, golden);
+    let decoded: SessionForkParams = serde_json::from_value(upgraded).expect("decode");
+    assert!(!decoded.accept_profile_change);
+}
+
+#[test]
 fn current_results_downgrade_to_the_protocol_3_golden() {
     let table = method_table();
     let mut renamed = 0;

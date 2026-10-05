@@ -6541,6 +6541,7 @@ while os.getppid() == parent:
             native_launch: Some(test_native_launch(SessionRefKind::Id, true)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            profile_revision: None,
             native_launch_unresolved: false,
         };
         store
@@ -6729,6 +6730,7 @@ while os.getppid() == parent:
                 cwd_mode: ForkCwdMode::Same,
                 cols: 100,
                 rows: 30,
+                accept_profile_change: false,
             })
             .await
             .expect("fork adopted session from preserved native binding");
@@ -7896,6 +7898,7 @@ while os.getppid() == parent:
                 native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
                 launch_binding: crate::agent::host::LaunchPin::Unpinned,
                 native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+                profile_revision: None,
                 native_launch_unresolved: false,
             }),
             runtime: RuntimeRecord {
@@ -8107,6 +8110,7 @@ while os.getppid() == parent:
                 cwd_mode: ForkCwdMode::Same,
                 cols: 80,
                 rows: 24,
+                accept_profile_change: false,
             })
             .await
             .expect_err("frozen fork disable survives profile deletion and restart");
@@ -8173,6 +8177,7 @@ while os.getppid() == parent:
                 cwd_mode: ForkCwdMode::Same,
                 cols: 80,
                 rows: 24,
+                accept_profile_change: false,
             })
             .await
             .expect_err("legacy binding must not infer current Claude fork support");
@@ -8934,6 +8939,7 @@ handler = "codex-hook-v1"
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            profile_revision: None,
             native_launch_unresolved: false,
         };
         store
@@ -9254,6 +9260,7 @@ handler = "codex-hook-v1"
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            profile_revision: None,
             native_launch_unresolved: false,
         }
     }
@@ -9437,6 +9444,7 @@ handler = "codex-hook-v1"
                 cwd_mode: ForkCwdMode::default(),
                 cols: 80,
                 rows: 24,
+                accept_profile_change: false,
             })
             .await
             .expect_err("a fork is refused as well");

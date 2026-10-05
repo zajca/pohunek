@@ -14,7 +14,7 @@
 //! depends on the locally approved `HostShare` of issue #82; until then the
 //! relay variant is exercised at this seam only.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -193,12 +193,8 @@ impl RevisionKeys {
 
     /// The revision of a profile with launch inputs `inputs`.
     ///
-    /// Minting a revision is the owner's approval step; its caller arrives
-    /// with the locally approved `HostShare` (#82).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the approval caller arrives with #82")
-    )]
+    /// Freezes the profile into a session at creation and approves it for a
+    /// relay launch.
     pub(crate) fn revision(
         &self,
         inputs: &ProfileInputs,
@@ -222,9 +218,23 @@ impl RevisionKeys {
 /// [`ProfileInputs`], bound to this host's revision key.
 ///
 /// Any edit to the inputs yields a different revision. Without the host key a
-/// revision reveals nothing about `[env]` values.
+/// revision reveals nothing about `[env]` values, so it may be stored and
+/// serialized as its 64-digit lowercase hex form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileRevision([u8; REVISION_BYTES]);
+
+impl serde::Serialize for ProfileRevision {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ProfileRevision {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(|error| serde::de::Error::custom(error.msg))
+    }
+}
 
 impl ProfileRevision {
     /// Parses the textual form of a revision.
@@ -371,6 +381,30 @@ mod tests {
             .expect_err("must be rejected")
             .code
             .clone()
+    }
+
+    #[test]
+    fn a_revision_round_trips_through_json_as_its_hex_form() {
+        let (agents, state) = (scoped("revision-json"), scoped("revision-json-state"));
+        write_profile(&agents, "wrapped", "base = \"shell\"\n");
+        let profiles = registry(&agents, &state);
+        let revision = revision_of(&profiles, "wrapped");
+
+        let json = serde_json::to_value(&revision).expect("serialize");
+        assert_eq!(json, serde_json::Value::String(revision.to_string()));
+        let back: ProfileRevision = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back, revision);
+        for malformed in [
+            "",
+            "abc",
+            &"G".repeat(64),
+            &revision.to_string().to_uppercase(),
+        ] {
+            assert!(
+                serde_json::from_value::<ProfileRevision>(serde_json::json!(malformed)).is_err(),
+                "{malformed}"
+            );
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use pohunek_daemon::store::STORE_SCHEMA_VERSION;
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{bin_exe, worker_binary};
@@ -93,7 +94,8 @@ async fn a_store_newer_than_the_daemon_fails_startup_and_is_left_untouched() {
     assert!(!output.status.success(), "startup must fail closed");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("schema version 99") && stderr.contains("schema version 2"),
+        stderr.contains("schema version 99")
+            && stderr.contains(&format!("schema version {STORE_SCHEMA_VERSION}")),
         "the error names both versions: {stderr}"
     );
     assert_eq!(
@@ -124,7 +126,7 @@ async fn an_older_store_is_migrated_with_a_backup_before_the_daemon_serves() {
     assert_eq!(migrated.lines().count(), 4);
     for line in migrated.lines() {
         let record: serde_json::Value = serde_json::from_str(line).expect("store line is json");
-        assert_eq!(record["schema_version"], 2, "{line}");
+        assert_eq!(record["schema_version"], STORE_SCHEMA_VERSION, "{line}");
     }
 
     daemon.kill().await.expect("stop daemon");

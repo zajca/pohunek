@@ -33,10 +33,10 @@ use crate::{
     SessionReadResult, SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
     SessionRenameParams, SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionRetentionParams, SessionRetentionResult,
-    SessionScreenParams, SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult,
-    SessionStopResult, SessionWaitParams, SessionWaitResult, WorktreeRemoveParams,
-    WorktreeRemoveResult,
+    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionParams,
+    SessionRetentionResult, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionStopResult, SessionWaitParams, SessionWaitResult,
+    WorktreeRemoveParams, WorktreeRemoveResult,
 };
 
 /// A typed control-protocol method contract.
@@ -197,9 +197,9 @@ method_table!(
     SessionResume,
     SESSION_RESUME,
     "session.resume",
-    SessionId,
+    SessionResumeParams,
     SessionResumeResult,
-    "SessionId",
+    "SessionResumeParams",
     "SessionResumeResult";
 
     /// Fork a native agent conversation into a new pohunek session.
