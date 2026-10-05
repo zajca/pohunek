@@ -17,7 +17,7 @@
 //! fail the scan until the entry is updated. `regenerate_allow_list` (ignored)
 //! prints the entries of the current tree.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -312,15 +312,6 @@ const ALLOW_LIST: &[Entry] = &[
 ]),
         Owner::Packages,
         "default per-provider notification policy",
-    ),
-    (
-        "crates/daemon/src/session/reconcile.rs",
-        Approved::Lines(&[
-    "RuntimeId::CODEX | RuntimeId::CLAUDE => RuntimeRef::from_wire(&subagent.provider),",
-    "RuntimeId::SHELL | RuntimeId::CODEX | RuntimeId::CLAUDE | RuntimeId::HERMES => {",
-]),
-        Owner::Packages,
-        "worker provider strings mapped to agent kinds until the AgentKind to RuntimeRef swap and the built-in packages land",
     ),
 ];
 

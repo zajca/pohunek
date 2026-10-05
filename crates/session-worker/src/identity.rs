@@ -48,7 +48,7 @@
 //!
 //! [`crate::LeaseOwner`]: crate::LeaseOwner
 
-// Rust guideline compliant 2026-09-22
+// Rust guideline compliant 2026-10-05
 
 use pohunek_platform::peer;
 use pohunek_platform::process::{
@@ -80,8 +80,14 @@ pub enum RejectReason {
     ReportedProcessInvalid,
     /// The redeeming peer is not the process that acquired the lease.
     LeaseOwnerMismatch,
-    /// The claim names a provider the worker does not accept identity from.
+    /// The claim names a provider the session's hook schema does not admit.
     ProviderNotAllowed,
+    /// The session's hook schema does not admit this operation, or the
+    /// session has no hook schema.
+    ActionNotAllowed,
+    /// The native reference kind is outside the schema's reference shape, or
+    /// the kind and the reference are not reported together.
+    NativeReferenceInvalid,
     /// The claim names a runtime generation this worker is not serving.
     RuntimeMismatch,
     /// The runtime is not running, so it has no identity to change.
@@ -110,6 +116,8 @@ impl RejectReason {
             Self::ReportedProcessInvalid => "reported_process_invalid",
             Self::LeaseOwnerMismatch => "lease_owner_mismatch",
             Self::ProviderNotAllowed => "provider_not_allowed",
+            Self::ActionNotAllowed => "action_not_allowed",
+            Self::NativeReferenceInvalid => "native_reference_invalid",
             Self::RuntimeMismatch => "runtime_mismatch",
             Self::PhaseNotRunning => "phase_not_running",
             Self::ClaimExpired => "claim_expired",
@@ -301,11 +309,14 @@ mod tests {
             RejectReason::ReportedProcessInvalid,
             RejectReason::LeaseOwnerMismatch,
             RejectReason::ProviderNotAllowed,
+            RejectReason::ActionNotAllowed,
+            RejectReason::NativeReferenceInvalid,
             RejectReason::RuntimeMismatch,
             RejectReason::PhaseNotRunning,
             RejectReason::ClaimExpired,
             RejectReason::SequenceStale,
             RejectReason::SubagentClaimInvalid,
+            RejectReason::NotificationInvalid,
         ]
         .map(RejectReason::code);
         let unique = codes.iter().collect::<std::collections::BTreeSet<_>>();

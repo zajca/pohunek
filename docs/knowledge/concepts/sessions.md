@@ -221,6 +221,19 @@ backed by a live process and age out when unbound. `active_agent`,
 filtering, and detector behavior; they do not change the launch `agent` /
 `agent_base`.
 
+Which hook reports a session accepts is decided by the hook schema of its
+runtime: the descriptor names an integration handler and a hook schema, and
+core keeps the schemas as a closed compiled set. The daemon passes the schema
+id to the worker at initialization, the worker journals it, and both the
+worker (when a hook reports) and the daemon (when it imports worker state)
+check the provider, the action, the native-reference kind, the nested-agent
+rule, and the subagent fields against it, on top of the process, ancestry,
+sequence, and expiry checks every schema shares. Codex, Claude, and the shell
+use the schema with subagents, Hermes the identity-only schema, and a runtime
+without an integration, such as Pi, has none and accepts no hook report. A
+worker built before schema delivery journals no schema, so the daemon validates
+its state with the schema of the session's pinned runtime.
+
 Current Claude and Codex integrations separately observe provider-managed
 subagents. Their `SubagentStart` and `SubagentStop` hooks report only lifecycle
 metadata to the PTY-owning worker: provider, child id, optional parent id, and

@@ -1,6 +1,6 @@
 //! Serves the private daemon-worker Unix protocol.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-05
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -22,15 +22,16 @@ use pohunek_platform::process::{
 };
 use pohunek_worker_protocol as protocol;
 use protocol::{
-    ActiveIdentityClaim, AttachStart, Capability, CloseReason, ControlCode, ControlError,
-    ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse, ControlWriter,
-    Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus, FrameError,
-    FrameHeader, FrameKind, Initialize, InspectSnapshot, LeaseChallenge, LeaseId, OutputGap,
-    ProcessIdentity as WireProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
-    RequestKind, ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId,
-    StreamMode, SubagentPhase as WireSubagentPhase, SubagentSnapshot,
-    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
-    WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
+    ActiveIdentityClaim, AncestryMatcher, AttachStart, Capability, CloseReason, ControlCode,
+    ControlError, ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse,
+    ControlWriter, Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus,
+    FrameError, FrameHeader, FrameKind, HookAction, HookSchema, Initialize, InspectSnapshot,
+    LeaseChallenge, LeaseId, OutputGap, ProcessIdentity as WireProcessIdentity,
+    ReleasedIdentityClaim, ReportedLaunchIdentity, RequestKind, ResponseKind,
+    RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode, SubagentField,
+    SubagentPhase as WireSubagentPhase, SubagentSnapshot, TerminalSnapshot as WireTerminalSnapshot,
+    TransactionId, Version, WorkerId, WorkerInstanceId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION,
+    SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -524,6 +525,9 @@ struct State {
     pty: Option<PtyOwner>,
     initialize_transaction: Option<TransactionId>,
     launch_agent_base: Option<String>,
+    /// Hook schema the daemon resolved for this runtime; no hook report is
+    /// admitted without one.
+    hook_schema: Option<&'static HookSchema>,
     /// Public protocol version the daemon selected for this runtime's hooks.
     public_protocol_version: Option<u32>,
     stop_grace: Duration,
@@ -541,6 +545,7 @@ impl State {
             pty: None,
             initialize_transaction: None,
             launch_agent_base: None,
+            hook_schema: None,
             public_protocol_version: None,
             stop_grace: crate::config::DEFAULT_STOP_GRACE,
             terminal_retention: Duration::from_hours(24),
@@ -1062,6 +1067,25 @@ async fn inspect_request(
     })
 }
 
+/// Resolves the hook schema `initialize` names against the compiled registry.
+fn resolve_hook_schema(
+    initialize: &Initialize,
+) -> Result<Option<&'static HookSchema>, ControlError> {
+    initialize
+        .hook_schema
+        .as_deref()
+        .map(|id| {
+            protocol::hook_schema(id).ok_or_else(|| {
+                control_error_message(
+                    ControlCode::InvalidRequest,
+                    "initialize names a hook schema this worker does not provide",
+                    false,
+                )
+            })
+        })
+        .transpose()
+}
+
 async fn initialize_request(
     shared: &Arc<Shared>,
     connection: &Connection,
@@ -1078,6 +1102,7 @@ async fn initialize_request(
     initialize
         .check_version(selected)
         .map_err(|error| control_error(ControlCode::InvalidRequest, error, false))?;
+    let hook_schema = resolve_hook_schema(&initialize)?;
 
     {
         let state = shared.state.lock().await;
@@ -1145,6 +1170,7 @@ async fn initialize_request(
         command,
         &effective_config,
         initialize.launch.agent_base,
+        hook_schema,
         initialize.public_protocol_version,
         &initialize.dimensions,
     )
@@ -1171,6 +1197,7 @@ async fn spawn_running(
     command: Command,
     config: &WorkerConfig,
     agent_base: String,
+    hook_schema: Option<&'static HookSchema>,
     public_protocol_version: u32,
     dimensions: &Dimensions,
 ) -> Result<(PtyOwner, WireProcessIdentity), ControlError> {
@@ -1182,7 +1209,9 @@ async fn spawn_running(
         state.stop_grace = config.stop_grace;
         state.terminal_retention = config.terminal_retention;
         state.launch_agent_base = Some(agent_base);
+        state.hook_schema = hook_schema;
         state.public_protocol_version = Some(public_protocol_version);
+        state.journal.hook_schema = hook_schema.map(|schema| schema.id.to_owned());
         state.journal.phase = JournalPhase::Live;
         state.journal.child = Some(journal_identity(pty.identity()));
         state.journal.pty_created_at = Some(timestamp());
@@ -1746,6 +1775,7 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
                 finished_at_ms: subagent.finished_at_ms,
             })
             .collect(),
+        hook_schema: state.journal.hook_schema.clone(),
     })
 }
 
@@ -3053,18 +3083,34 @@ where
         } => {
             let mut state = shared.state.lock().await;
             let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+            let admitted = admit_hook(
+                state.hook_schema,
+                HookAction::IdentityReport,
+                &provider,
+                state.launch_agent_base.as_deref(),
+            );
             let inadmissible = hook_claim_admissible(
-                known_identity_provider(&provider),
+                admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
             )
+            .or_else(|| (!valid_identity_expiry(&expires_at)).then_some(RejectReason::ClaimExpired))
             .or_else(|| {
-                (!valid_identity_expiry(&expires_at)).then_some(RejectReason::ClaimExpired)
+                admitted
+                    .is_ok_and(|schema| {
+                        !native_reference_admitted(
+                            schema,
+                            reference_kind.as_deref(),
+                            native_reference.as_deref(),
+                        )
+                    })
+                    .then_some(RejectReason::NativeReferenceInvalid)
             });
             if let Some(reason) = inadmissible {
                 reject_identity(&shared, "identity_report", reason, peer);
                 (false, false, current_runtime, false)
             } else {
+                let ancestry = admitted_ancestry(admitted)?;
                 let pty = state.pty.as_ref().ok_or_else(|| {
                     WorkerError::Protocol("runtime is not initialized".to_owned())
                 })?;
@@ -3073,6 +3119,7 @@ where
                     &shared,
                     "identity_report",
                     peer,
+                    ancestry,
                     pid,
                     start_identity,
                     root_identity.pid,
@@ -3159,8 +3206,14 @@ where
         } => {
             let mut state = shared.state.lock().await;
             let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+            let admitted = admit_hook(
+                state.hook_schema,
+                HookAction::IdentityRelease,
+                &provider,
+                state.launch_agent_base.as_deref(),
+            );
             let inadmissible = hook_claim_admissible(
-                known_identity_provider(&provider),
+                admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 true,
             );
@@ -3168,6 +3221,7 @@ where
                 reject_identity(&shared, "identity_release", reason, peer);
                 (false, false, current_runtime, false)
             } else {
+                let ancestry = admitted_ancestry(admitted)?;
                 let pty = state.pty.as_ref().ok_or_else(|| {
                     WorkerError::Protocol("runtime is not initialized".to_owned())
                 })?;
@@ -3175,6 +3229,7 @@ where
                     &shared,
                     "identity_release",
                     peer,
+                    ancestry,
                     pid,
                     start_identity,
                     pty.identity().pid,
@@ -3229,13 +3284,25 @@ where
             let occurred_at_ms = unix_ms();
             let mut state = shared.state.lock().await;
             let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+            let admitted = admit_hook(
+                state.hook_schema,
+                HookAction::SubagentStart,
+                &provider,
+                state.launch_agent_base.as_deref(),
+            );
             let inadmissible = hook_claim_admissible(
-                known_subagent_provider(&provider),
+                admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
             )
             .or_else(|| {
-                let text_valid = valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                let fields_admitted = admitted.is_ok_and(|schema| {
+                    (parent_id.is_none() || schema.admits_subagent_field(SubagentField::ParentId))
+                        && (agent_type.is_none()
+                            || schema.admits_subagent_field(SubagentField::AgentType))
+                });
+                let text_valid = fields_admitted
+                    && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
                     && parent_id
                         .as_deref()
                         .is_none_or(|value| valid_subagent_text(value, MAX_SUBAGENT_ID_BYTES))
@@ -3248,15 +3315,18 @@ where
                 reject_identity(&shared, "subagent_start", reason, peer);
             }
             let valid = inadmissible.is_none();
-            let process_valid = state.pty.as_ref().is_some_and(|pty| {
-                hook_claim_valid(
-                    &shared,
-                    "subagent_start",
-                    peer,
-                    pid,
-                    start_identity,
-                    pty.identity().pid,
-                )
+            let process_valid = admitted.is_ok_and(|schema| {
+                state.pty.as_ref().is_some_and(|pty| {
+                    hook_claim_valid(
+                        &shared,
+                        "subagent_start",
+                        peer,
+                        schema.ancestry,
+                        pid,
+                        start_identity,
+                        pty.identity().pid,
+                    )
+                })
             });
             if !valid || !process_valid {
                 (false, false, current_runtime, false)
@@ -3291,13 +3361,23 @@ where
             let occurred_at_ms = unix_ms();
             let mut state = shared.state.lock().await;
             let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+            let admitted = admit_hook(
+                state.hook_schema,
+                HookAction::SubagentStop,
+                &provider,
+                state.launch_agent_base.as_deref(),
+            );
             let inadmissible = hook_claim_admissible(
-                known_subagent_provider(&provider),
+                admitted.as_ref().err().copied(),
                 current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                 state.phase == WireRuntimePhase::Running,
             )
             .or_else(|| {
-                let text_valid = valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
+                let outcome_admitted = outcome.is_none()
+                    || admitted
+                        .is_ok_and(|schema| schema.admits_subagent_field(SubagentField::Outcome));
+                let text_valid = outcome_admitted
+                    && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
                     && outcome.is_none_or(|phase| phase != JournalSubagentPhase::Running);
                 (!text_valid).then_some(RejectReason::SubagentClaimInvalid)
             });
@@ -3305,15 +3385,18 @@ where
                 reject_identity(&shared, "subagent_stop", reason, peer);
             }
             let valid = inadmissible.is_none();
-            let process_valid = state.pty.as_ref().is_some_and(|pty| {
-                hook_claim_valid(
-                    &shared,
-                    "subagent_stop",
-                    peer,
-                    pid,
-                    start_identity,
-                    pty.identity().pid,
-                )
+            let process_valid = admitted.is_ok_and(|schema| {
+                state.pty.as_ref().is_some_and(|pty| {
+                    hook_claim_valid(
+                        &shared,
+                        "subagent_stop",
+                        peer,
+                        schema.ancestry,
+                        pid,
+                        start_identity,
+                        pty.identity().pid,
+                    )
+                })
             });
             if !valid || !process_valid {
                 (false, false, current_runtime, false)
@@ -3346,23 +3429,32 @@ where
             let line = {
                 let state = shared.state.lock().await;
                 let current_runtime = state.worker_instance_id.as_ref().map(ToString::to_string);
+                let admitted = admit_hook(
+                    state.hook_schema,
+                    HookAction::Notification,
+                    &provider,
+                    state.launch_agent_base.as_deref(),
+                );
                 let inadmissible = hook_claim_admissible(
-                    known_identity_provider(&provider),
+                    admitted.as_ref().err().copied(),
                     current_runtime.as_deref() == Some(worker_instance_id.as_str()),
                     state.phase == WireRuntimePhase::Running,
                 );
                 if let Some(reason) = inadmissible {
                     reject_identity(&shared, "notification_create", reason, peer);
                     None
-                } else if !state.pty.as_ref().is_some_and(|pty| {
-                    hook_claim_valid(
-                        &shared,
-                        "notification_create",
-                        peer,
-                        pid,
-                        start_identity,
-                        pty.identity().pid,
-                    )
+                } else if !admitted.is_ok_and(|schema| {
+                    state.pty.as_ref().is_some_and(|pty| {
+                        hook_claim_valid(
+                            &shared,
+                            "notification_create",
+                            peer,
+                            schema.ancestry,
+                            pid,
+                            start_identity,
+                            pty.identity().pid,
+                        )
+                    })
                 }) {
                     None
                 } else {
@@ -3428,8 +3520,62 @@ where
         .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 
-fn known_identity_provider(provider: &str) -> bool {
-    matches!(provider, "shell" | "codex" | "claude" | "hermes")
+/// Checks one hook operation against the session's hook schema.
+///
+/// Returns the schema when it admits `action` from `provider`, otherwise the
+/// reason: a session without a schema, or a schema without the action,
+/// admits nothing, and a provider outside the schema's provider set for the
+/// action is refused.
+fn admit_hook(
+    schema: Option<&'static HookSchema>,
+    action: HookAction,
+    provider: &str,
+    launch_runtime: Option<&str>,
+) -> Result<&'static HookSchema, RejectReason> {
+    let schema = schema
+        .filter(|schema| schema.allows(action))
+        .ok_or(RejectReason::ActionNotAllowed)?;
+    let provider_admitted = match action {
+        HookAction::SubagentStart | HookAction::SubagentStop => {
+            schema.admits_subagent_provider(provider)
+        }
+        HookAction::IdentityReport | HookAction::IdentityRelease | HookAction::Notification => {
+            schema.admits_identity_provider(provider, launch_runtime)
+        }
+    };
+    if provider_admitted {
+        Ok(schema)
+    } else {
+        Err(RejectReason::ProviderNotAllowed)
+    }
+}
+
+/// Whether a reported native reference has the shape `schema` admits: both
+/// parts absent, or both present with an admitted kind.
+fn native_reference_admitted(
+    schema: &HookSchema,
+    reference_kind: Option<&str>,
+    native_reference: Option<&str>,
+) -> bool {
+    match (reference_kind, native_reference) {
+        (None, None) => true,
+        (Some(kind), Some(_)) => schema.admits_reference_kind(kind),
+        _ => false,
+    }
+}
+
+/// The ancestry rule of an admitted hook operation.
+///
+/// # Errors
+///
+/// Returns a protocol error when the operation was not admitted, which the
+/// callers rule out before asking.
+fn admitted_ancestry(
+    admitted: Result<&'static HookSchema, RejectReason>,
+) -> Result<AncestryMatcher, WorkerError> {
+    admitted
+        .map(|schema| schema.ancestry)
+        .map_err(|reason| WorkerError::Protocol(format!("hook claim was not admitted: {reason}")))
 }
 
 fn verify_launch_claim(claim: &PendingLaunchClaim) -> Result<bool, WorkerError> {
@@ -3514,10 +3660,6 @@ fn event_visible_to_connection(event: &protocol::ControlEvent, connection: &Conn
         || connection
             .capabilities
             .contains(&Capability::SubagentObservation)
-}
-
-fn known_subagent_provider(provider: &str) -> bool {
-    matches!(provider, "codex" | "claude")
 }
 
 fn valid_subagent_text(value: &str, max_bytes: usize) -> bool {
@@ -3675,8 +3817,17 @@ fn valid_identity_expiry(value: &str) -> bool {
     expires_at > now && expires_at <= max_expiry
 }
 
-fn validate_hook_process(pid: u32, start_identity: u64, root_pid: u32) -> Result<(), WorkerError> {
-    if process_start(pid)? != start_identity || !is_descendant(pid, root_pid)? {
+fn validate_hook_process(
+    ancestry: AncestryMatcher,
+    pid: u32,
+    start_identity: u64,
+    root_pid: u32,
+) -> Result<(), WorkerError> {
+    let related = process_start(pid)? == start_identity
+        && match ancestry {
+            AncestryMatcher::ManagedPtyDescendant => is_descendant(pid, root_pid)?,
+        };
+    if !related {
         return Err(WorkerError::Protocol(
             "identity hook process is outside the managed PTY tree".to_owned(),
         ));
@@ -3769,17 +3920,16 @@ fn authorize_data_frame(
 
 /// Returns why a hook claim is inadmissible before its process is inspected.
 ///
-/// Provider, runtime generation, and runtime phase are the rules every hook
-/// variant shares. Reporting them as distinct codes is what lets an operator
-/// tell a stale hook from a rejected one; before this they were indistinguishable
-/// from a hook that never ran.
+/// The schema verdict, runtime generation, and runtime phase are the rules
+/// every hook variant shares. Reporting them as distinct codes is what lets
+/// an operator tell a stale hook from a rejected one.
 fn hook_claim_admissible(
-    provider_known: bool,
+    schema_rejection: Option<RejectReason>,
     runtime_matches: bool,
     phase_running: bool,
 ) -> Option<RejectReason> {
-    if !provider_known {
-        return Some(RejectReason::ProviderNotAllowed);
+    if let Some(reason) = schema_rejection {
+        return Some(reason);
     }
     if !runtime_matches {
         return Some(RejectReason::RuntimeMismatch);
@@ -3799,6 +3949,7 @@ fn hook_claim_valid(
     shared: &Shared,
     operation: &'static str,
     peer: &PeerContext,
+    ancestry: AncestryMatcher,
     pid: u32,
     start_identity: u64,
     root_pid: u32,
@@ -3807,7 +3958,7 @@ fn hook_claim_valid(
         reject_identity(shared, operation, reason, peer);
         return false;
     }
-    if validate_hook_process(pid, start_identity, root_pid).is_err() {
+    if validate_hook_process(ancestry, pid, start_identity, root_pid).is_err() {
         reject_identity(
             shared,
             operation,
@@ -4542,8 +4693,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        authorize_control_request, await_observation_page, capabilities, control_input_id,
-        event_visible_to_connection, identity_sequence_is_fresh, known_identity_provider,
+        admit_hook, authorize_control_request, await_observation_page, capabilities,
+        control_input_id, event_visible_to_connection, identity_sequence_is_fresh,
         mark_running_subagents_lost, observation_timed_out, random_value, redeem_data_grant,
         serve_stream_data, signal_number, start_subagent, stop_subagent, valid_identity_expiry,
         validate_attach_write_id, validate_data_start, validate_observation_request,
@@ -4556,13 +4707,14 @@ mod tests {
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
         ControlResponse, Cursor, DataToken, Dimensions, EventKind, ExitStatus, FrameHeader,
-        FrameKind, LeaseId, RequestId, ResponseKind, StreamId, StreamMode, Version,
+        FrameKind, HookAction, LeaseId, RequestId, ResponseKind, StreamId, StreamMode, Version,
         WorkerInstanceId, WriteId, CURRENT_VERSION, MAX_DATA_PAYLOAD_BYTES, PREVIOUS_VERSION,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
+    use crate::identity::RejectReason;
     use crate::journal::SubagentPhase;
     use crate::{ChildIdentity, JournalRecord, ReleasedIdentity};
 
@@ -4682,6 +4834,7 @@ mod tests {
             state.phase = super::WireRuntimePhase::Running;
             state.worker_instance_id = Some(WorkerInstanceId::new("runtime-claim").unwrap());
             state.launch_agent_base = Some("claude".into());
+            state.hook_schema = protocol::hook_schema("identity-subagent-v1");
             state.pty = Some(pty.clone());
             state.journal.phase = super::JournalPhase::Live;
             state.journal.worker_instance_id = Some("runtime-claim".into());
@@ -4785,6 +4938,255 @@ mod tests {
             .await
             .unwrap();
         drop(server);
+    }
+
+    /// Sends one hook claim for the fixture's own process and returns whether
+    /// the worker accepted it.
+    async fn send_hook(
+        server: &super::Server,
+        pty: &crate::PtyOwner,
+        mut claim: serde_json::Value,
+    ) -> bool {
+        let object = claim.as_object_mut().expect("claim object");
+        object.insert("runtime_id".into(), "runtime-claim".into());
+        object.insert("pid".into(), pty.identity().pid.into());
+        object.insert(
+            "start_identity".into(),
+            pty.identity().start_identity.parse::<u64>().unwrap().into(),
+        );
+        let mut bytes = Vec::new();
+        super::serve_identity_hook_with_probe(
+            std::sync::Arc::clone(&server.shared),
+            &mut super::ControlWriter::new(&mut bytes),
+            claim,
+            &subject_peer(pty),
+            |_| Ok(true),
+        )
+        .await
+        .expect("hook answers");
+        let response: serde_json::Value = serde_json::from_slice(&bytes).expect("hook response");
+        response["ok"].as_bool().expect("ok flag")
+    }
+
+    fn expiry() -> String {
+        (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    }
+
+    fn subagent_start_claim(sequence: u64, agent_type: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "type": "subagent_start", "provider": "codex", "sequence": sequence,
+            "subagent_id": format!("child-{sequence}"), "parent_id": null,
+            "agent_type": agent_type,
+        })
+    }
+
+    #[tokio::test]
+    async fn identity_reports_are_admitted_for_every_provider_of_the_identity_schema() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema = protocol::hook_schema("identity-v1");
+        for (sequence, provider) in (1_u64..).zip(["shell", "codex", "claude", "hermes"]) {
+            let claim = serde_json::json!({
+                "type": "identity_report", "provider": provider, "sequence": sequence,
+                "expires_at": expiry(), "reference_kind": "id", "native_reference": "ref",
+            });
+            assert!(send_hook(&server, &pty, claim).await, "{provider}");
+        }
+        let unknown = serde_json::json!({
+            "type": "identity_report", "provider": "pi", "sequence": 9,
+            "expires_at": expiry(), "reference_kind": null, "native_reference": null,
+        });
+        assert!(!send_hook(&server, &pty, unknown).await);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_schema_without_subagents_refuses_subagent_claims() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema = protocol::hook_schema("identity-v1");
+        assert!(!send_hook(&server, &pty, subagent_start_claim(1, None)).await);
+        assert!(server
+            .shared
+            .state
+            .lock()
+            .await
+            .journal
+            .subagents
+            .is_empty());
+
+        server.shared.state.lock().await.hook_schema =
+            protocol::hook_schema("identity-subagent-v1");
+        assert!(send_hook(&server, &pty, subagent_start_claim(2, Some("Explore"))).await);
+        assert_eq!(server.shared.state.lock().await.journal.subagents.len(), 1);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_runtime_without_a_schema_admits_no_hook_claim() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema = None;
+        let before = server.shared.state.lock().await.journal.clone();
+        let identity = launch_report(&pty, 1, "ref");
+        assert!(!send_hook(&server, &pty, identity).await);
+        assert!(!send_hook(&server, &pty, subagent_start_claim(2, None)).await);
+        assert_eq!(server.shared.state.lock().await.journal, before);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_reference_shape_follows_the_schema() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        for (sequence, kind, reference) in [
+            (1_u64, Some("uri"), Some("ref")),
+            (2, Some("id"), None),
+            (3, None, Some("ref")),
+        ] {
+            let claim = serde_json::json!({
+                "type": "identity_report", "provider": "claude", "sequence": sequence,
+                "expires_at": expiry(), "reference_kind": kind, "native_reference": reference,
+            });
+            assert!(
+                !send_hook(&server, &pty, claim).await,
+                "{kind:?}/{reference:?}"
+            );
+        }
+        assert!(server
+            .shared
+            .state
+            .lock()
+            .await
+            .journal
+            .active_identity
+            .is_none());
+        let accepted = serde_json::json!({
+            "type": "identity_report", "provider": "claude", "sequence": 4,
+            "expires_at": expiry(), "reference_kind": "path", "native_reference": "/x",
+        });
+        assert!(send_hook(&server, &pty, accepted).await);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn subagent_claim_fields_follow_the_schema() {
+        static NO_TYPE: protocol::HookSchema = protocol::HookSchema {
+            id: "no-agent-type-test",
+            handlers: &[],
+            identity_providers: &["claude"],
+            subagent_providers: &["codex"],
+            actions: &[HookAction::SubagentStart],
+            reference_kinds: &[],
+            ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
+            nested_active: true,
+            subagent_fields: &[protocol::SubagentField::ParentId],
+        };
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema = Some(&NO_TYPE);
+        assert!(!send_hook(&server, &pty, subagent_start_claim(1, Some("Explore"))).await);
+        assert!(send_hook(&server, &pty, subagent_start_claim(2, None)).await);
+        let stop = serde_json::json!({
+            "type": "subagent_stop", "provider": "codex", "sequence": 3,
+            "subagent_id": "child-2", "outcome": "completed",
+        });
+        assert!(
+            !send_hook(&server, &pty, stop).await,
+            "stop is not an admitted action"
+        );
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    /// Opens the controller connection `initialize_request` requires.
+    fn controller_connection(server: &super::Server) -> (Connection, LeaseId) {
+        let owner = crate::LeaseOwner {
+            daemon_id: "daemon-initialize".to_owned(),
+            peer_pid: std::process::id(),
+            peer_start_identity: "7400".to_owned(),
+        };
+        let lease_id = LeaseId::new("lease-initialize").expect("lease id");
+        server
+            .shared
+            .lease
+            .acquire(owner.clone(), lease_id.as_str().to_owned())
+            .expect("acquire lease");
+        let mut connection = Connection::new(std::sync::Arc::new(owner_peer(&owner)));
+        connection.owner = Some(owner);
+        connection.lease_id = Some(lease_id.clone());
+        connection.selected_version = Some(CURRENT_VERSION);
+        (connection, lease_id)
+    }
+
+    #[tokio::test]
+    async fn initialize_journals_the_delivered_hook_schema() {
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let mut initialize =
+            environment_initialize(Some(base_environment(&[("PATH", "/usr/bin:/bin")])), &[]);
+        initialize.executable = std::path::PathBuf::from("/bin/sh");
+        initialize.arguments = vec!["-c".to_owned(), "read -r line".to_owned()];
+        initialize.hook_schema = Some("identity-subagent-v1".to_owned());
+        let (connection, lease_id) = controller_connection(&server);
+
+        super::initialize_request(&server.shared, &connection, &lease_id, initialize)
+            .await
+            .expect("initialize runtime");
+
+        let state = server.shared.state.lock().await;
+        assert_eq!(
+            state.hook_schema.map(|schema| schema.id),
+            Some("identity-subagent-v1")
+        );
+        let persisted = server.shared.journal.load().expect("load journal");
+        assert_eq!(
+            persisted.hook_schema.as_deref(),
+            Some("identity-subagent-v1")
+        );
+        let snapshot = super::inspect_snapshot(&server.shared, &state)
+            .await
+            .expect("inspect");
+        assert_eq!(
+            snapshot.hook_schema.as_deref(),
+            Some("identity-subagent-v1")
+        );
+        if let Some(pty) = state.pty.clone() {
+            drop(state);
+            pty.stop("test-cleanup", server.shared.config.stop_grace)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn initialize_without_a_schema_journals_none_and_refuses_an_unknown_one() {
+        let directory = pohunek_test_support::tempdir().expect("fixture directory");
+        let server = environment_fixture(directory.path(), "abcd2345")
+            .await
+            .expect("bind worker");
+        let mut unknown =
+            environment_initialize(Some(base_environment(&[("PATH", "/usr/bin:/bin")])), &[]);
+        unknown.hook_schema = Some("identity-v9".to_owned());
+        let (connection, lease_id) = controller_connection(&server);
+
+        let error = super::initialize_request(&server.shared, &connection, &lease_id, unknown)
+            .await
+            .expect_err("an unknown schema id is refused");
+
+        assert_eq!(error.code, ControlCode::InvalidRequest);
+        let state = server.shared.state.lock().await;
+        assert_eq!(state.phase, super::WireRuntimePhase::Uninitialized);
+        assert!(state.pty.is_none());
+        assert!(state.journal.hook_schema.is_none());
     }
 
     /// A peer that no longer exists leaves the journal untouched.
@@ -4914,19 +5316,90 @@ mod tests {
 
     #[test]
     fn identity_provider_allowlist_is_exact() {
+        let schema = protocol::hook_schema("identity-subagent-v1");
         for provider in ["shell", "codex", "claude", "hermes"] {
             assert!(
-                known_identity_provider(provider),
+                admit_hook(schema, HookAction::IdentityReport, provider, Some("codex")).is_ok(),
                 "{provider} must be accepted"
             );
         }
 
         for provider in ["", "Hermes", "HERMES", "hermes ", "unknown"] {
-            assert!(
-                !known_identity_provider(provider),
+            assert_eq!(
+                admit_hook(schema, HookAction::IdentityReport, provider, Some("codex")).err(),
+                Some(RejectReason::ProviderNotAllowed),
                 "{provider:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn hook_admission_follows_the_schema_per_action() {
+        let identity = protocol::hook_schema("identity-v1");
+        let subagent = protocol::hook_schema("identity-subagent-v1");
+        for action in [HookAction::SubagentStart, HookAction::SubagentStop] {
+            assert_eq!(
+                admit_hook(identity, action, "codex", Some("hermes")).err(),
+                Some(RejectReason::ActionNotAllowed),
+                "a schema without subagents refuses {action}"
+            );
+            for provider in ["codex", "claude"] {
+                admit_hook(subagent, action, provider, Some("shell"))
+                    .expect("a subagent provider is admitted");
+            }
+            for provider in ["shell", "hermes", ""] {
+                assert_eq!(
+                    admit_hook(subagent, action, provider, Some("shell")).err(),
+                    Some(RejectReason::ProviderNotAllowed),
+                    "{provider:?} is not a subagent provider"
+                );
+            }
+        }
+        for action in [
+            HookAction::IdentityReport,
+            HookAction::IdentityRelease,
+            HookAction::SubagentStart,
+            HookAction::SubagentStop,
+            HookAction::Notification,
+        ] {
+            assert_eq!(
+                admit_hook(None, action, "codex", Some("codex")).err(),
+                Some(RejectReason::ActionNotAllowed),
+                "a runtime without a schema admits no {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_switching_disabled_pins_identity_reports_to_the_launch_runtime() {
+        static PINNED: protocol::HookSchema = protocol::HookSchema {
+            id: "pinned-test",
+            handlers: &[],
+            identity_providers: &["hermes", "codex"],
+            subagent_providers: &[],
+            actions: &[HookAction::IdentityReport],
+            reference_kinds: &[],
+            ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
+            nested_active: false,
+            subagent_fields: &[],
+        };
+        admit_hook(
+            Some(&PINNED),
+            HookAction::IdentityReport,
+            "hermes",
+            Some("hermes"),
+        )
+        .expect("the launch runtime itself is admitted");
+        assert_eq!(
+            admit_hook(
+                Some(&PINNED),
+                HookAction::IdentityReport,
+                "codex",
+                Some("hermes")
+            )
+            .err(),
+            Some(RejectReason::ProviderNotAllowed)
+        );
     }
 
     #[test]
@@ -6678,6 +7151,7 @@ mod tests {
             stop_policy: protocol::StopPolicy::new(500).expect("stop policy"),
             hook_protocol_version: Version::new(1).expect("hook version"),
             public_protocol_version: 7,
+            hook_schema: None,
         }
     }
 

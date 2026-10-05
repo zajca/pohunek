@@ -1,6 +1,6 @@
 //! Persists the worker-owned runtime journal atomically.
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-10-05
 
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
@@ -330,6 +330,10 @@ pub struct JournalRecord {
     /// Active subagents plus bounded recent terminal history.
     #[serde(default)]
     pub subagents: Vec<SubagentRecord>,
+    /// Id of the hook schema the worker validates reports with, delivered at
+    /// initialization. Absent when the runtime has no integration.
+    #[serde(default)]
+    pub hook_schema: Option<String>,
     /// Next raw-output byte offset.
     pub next_output_offset: u64,
     /// Whether a daemon durably imported terminal state.
@@ -363,6 +367,7 @@ impl Debug for JournalRecord {
             .field("active_identity_release", &self.active_identity_release)
             .field("subagent_revision", &self.subagent_revision)
             .field("subagents", &self.subagents)
+            .field("hook_schema", &self.hook_schema)
             .field("next_output_offset", &self.next_output_offset)
             .field("terminal_acknowledged", &self.terminal_acknowledged)
             .field("updated_at", &self.updated_at)
@@ -410,6 +415,7 @@ impl JournalRecord {
             active_identity_release: None,
             subagent_revision: 0,
             subagents: Vec::new(),
+            hook_schema: None,
             next_output_offset: 0,
             terminal_acknowledged: false,
             updated_at,
@@ -724,6 +730,27 @@ mod tests {
             serde_json::from_value::<JournalRecord>(json).expect("deserialize journal"),
             record
         );
+    }
+
+    /// The hook schema id is persisted, and a journal written before the field
+    /// existed still loads as "no schema delivered".
+    #[test]
+    fn journal_persists_the_hook_schema_and_reads_a_journal_without_it() {
+        let mut record = record("native-reference");
+        record.hook_schema = Some("identity-subagent-v1".to_owned());
+        let mut json = serde_json::to_value(&record).expect("serialize journal");
+
+        assert_eq!(json["hook_schema"], "identity-subagent-v1");
+        assert_eq!(
+            serde_json::from_value::<JournalRecord>(json.clone()).expect("round trip"),
+            record
+        );
+
+        json.as_object_mut()
+            .expect("journal object")
+            .remove("hook_schema");
+        let older = serde_json::from_value::<JournalRecord>(json).expect("older layout");
+        assert_eq!(older.hook_schema, None);
     }
 
     #[test]

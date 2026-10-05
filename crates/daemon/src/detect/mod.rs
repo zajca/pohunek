@@ -1484,7 +1484,7 @@ mod tests {
                 prompt_arg: false,
                 version_probe_parser: None,
                 version_probe_policy: None,
-                integration_handler: None,
+                integration: None,
             })
             .expect("valid definition")])
         }

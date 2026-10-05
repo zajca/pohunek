@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pohunek_worker_protocol::HookSchema;
 use protocol::{
     BindingFieldError, BindingProvenance, DescriptorDigest, LaunchBinding, PackageDigest,
     PackageId, PackageIdentity, PackageVersion, RuntimeId, RuntimeIdError,
@@ -145,6 +146,10 @@ pub enum DefinitionInvariant {
     /// A non-shell built-in runtime must name the package it stands for.
     #[error("a built-in runtime other than the shell requires a package identity")]
     BuiltinRequiresPackage,
+    /// Only the shell runtime may declare a hook schema without an
+    /// integration handler.
+    #[error("only the shell runtime may declare a hook schema without an integration handler")]
+    HookSchemaRequiresHandler,
 }
 
 /// The program a definition launches.
@@ -223,6 +228,67 @@ impl HandlerId {
     }
 }
 
+/// A runtime's lifecycle-hook integration: the compiled handler that owns its
+/// upstream assets, if any, and the core-owned hook schema its reports follow.
+///
+/// A definition only names both; the schema contents live in the compiled
+/// registry ([`pohunek_worker_protocol::hook_schema`]).
+#[derive(Debug, Clone)]
+pub struct Integration {
+    handler: Option<HandlerId>,
+    hook_schema: &'static HookSchema,
+}
+
+impl Integration {
+    /// Resolves `hook_schema` against the compiled registry and checks that
+    /// `handler`, when present, is a compiled handler that drives it.
+    ///
+    /// A runtime without a handler (the shell) names a schema directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DefinitionError::Field`] when the schema id is not in the
+    /// registry, the handler is not a compiled handler, or the handler does
+    /// not support the schema.
+    pub fn new(handler: Option<HandlerId>, hook_schema: &str) -> Result<Self, DefinitionError> {
+        let hook_schema =
+            pohunek_worker_protocol::hook_schema(hook_schema).ok_or(DefinitionError::Field {
+                field: "integration.hook_schema",
+                reason: "is not a hook schema this build provides",
+            })?;
+        if let Some(handler) = &handler {
+            if !pohunek_worker_protocol::is_known_hook_handler(handler.as_str()) {
+                return Err(DefinitionError::Field {
+                    field: "integration.handler",
+                    reason: "is not an integration handler this build provides",
+                });
+            }
+            if !hook_schema.supports_handler(handler.as_str()) {
+                return Err(DefinitionError::Field {
+                    field: "integration.hook_schema",
+                    reason: "is not supported by the integration handler",
+                });
+            }
+        }
+        Ok(Self {
+            handler,
+            hook_schema,
+        })
+    }
+
+    /// The compiled integration handler id, if the runtime has one.
+    #[must_use]
+    pub fn handler(&self) -> Option<&HandlerId> {
+        self.handler.as_ref()
+    }
+
+    /// The hook schema the runtime's reports follow.
+    #[must_use]
+    pub fn hook_schema(&self) -> &'static HookSchema {
+        self.hook_schema
+    }
+}
+
 /// Unvalidated inputs of a [`RuntimeDefinition`].
 #[derive(Debug, Clone)]
 pub struct DefinitionParts {
@@ -252,8 +318,8 @@ pub struct DefinitionParts {
     /// Probe arguments and supported release range; required by the
     /// data-driven parser and rejected for every other one.
     pub version_probe_policy: Option<VersionProbePolicy>,
-    /// Compiled integration handler, if the runtime has an integration.
-    pub integration_handler: Option<HandlerId>,
+    /// Lifecycle-hook integration, if the runtime has one.
+    pub integration: Option<Integration>,
 }
 
 /// A validated, immutable runtime definition.
@@ -270,7 +336,7 @@ pub struct RuntimeDefinition {
     prompt_arg: bool,
     version_probe_parser: Option<HandlerId>,
     version_probe_policy: Option<VersionProbePolicy>,
-    integration_handler: Option<HandlerId>,
+    integration: Option<Integration>,
 }
 
 impl RuntimeDefinition {
@@ -294,10 +360,11 @@ impl RuntimeDefinition {
             prompt_arg,
             version_probe_parser,
             version_probe_policy,
-            integration_handler,
+            integration,
         } = parts;
         validate_version_probe(version_probe_parser.as_ref(), version_probe_policy.as_ref())?;
         validate_identity_invariants(&runtime_id, &origin, &program)?;
+        validate_integration(integration.as_ref(), &origin)?;
         validate_label(&display_name, "runtime.name")?;
         validate_token(program.as_str(), "runtime.program")?;
         if let LaunchProgram::Fixed(program) = &program {
@@ -366,7 +433,7 @@ impl RuntimeDefinition {
             prompt_arg,
             version_probe_parser,
             version_probe_policy,
-            integration_handler,
+            integration,
         })
     }
 
@@ -455,9 +522,17 @@ impl RuntimeDefinition {
                 .map(RawVersionProbe::policy)
                 .transpose()?
                 .flatten(),
-            integration_handler: raw
+            integration: raw
                 .integration
-                .map(|integration| HandlerId::parse(&integration.handler, "integration.handler"))
+                .map(|integration| {
+                    Integration::new(
+                        Some(HandlerId::parse(
+                            &integration.handler,
+                            "integration.handler",
+                        )?),
+                        &integration.hook_schema,
+                    )
+                })
                 .transpose()?,
         })
     }
@@ -548,8 +623,31 @@ impl RuntimeDefinition {
     /// Compiled integration handler id, if any.
     #[must_use]
     pub fn integration_handler(&self) -> Option<&HandlerId> {
-        self.integration_handler.as_ref()
+        self.integration.as_ref().and_then(Integration::handler)
     }
+
+    /// The hook schema the runtime's lifecycle reports follow, or `None` for
+    /// a runtime without an integration, whose sessions admit no hook report.
+    #[must_use]
+    pub fn hook_schema(&self) -> Option<&'static HookSchema> {
+        self.integration.as_ref().map(Integration::hook_schema)
+    }
+}
+
+/// A hook schema without an integration handler is only valid for the shell,
+/// which has no package; every package runtime that declares an integration
+/// names its handler.
+fn validate_integration(
+    integration: Option<&Integration>,
+    origin: &DefinitionOrigin,
+) -> Result<(), DefinitionError> {
+    let handlerless = integration.is_some_and(|integration| integration.handler().is_none());
+    if handlerless && !matches!(origin, DefinitionOrigin::Builtin { package: None }) {
+        return Err(DefinitionError::Invariant(
+            DefinitionInvariant::HookSchemaRequiresHandler,
+        ));
+    }
+    Ok(())
 }
 
 /// A parser that takes a supported-version policy requires one, and every
@@ -864,6 +962,7 @@ struct RawNativeReference {
 #[serde(deny_unknown_fields)]
 struct RawIntegration {
     handler: String,
+    hook_schema: String,
 }
 
 impl RawDefinition {

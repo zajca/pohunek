@@ -699,6 +699,42 @@ session reference that resume and fork consume. The table is required.
 The built-in runtimes declare `shell` = `none` and `codex`, `claude`, `hermes`
 = `hook`, so their behavior is unchanged.
 
+### Hook schemas
+
+A runtime that reports lifecycle hooks (identity, release, notification,
+subagent) declares an integration in its descriptor. The package names only
+the compiled handler and the hook schema its reports follow; it never carries
+schema contents:
+
+```toml
+[integration]
+handler = "codex-hook-v1"
+hook_schema = "identity-subagent-v1"
+```
+
+Both keys are required. The schemas are a closed set compiled into core:
+`identity-v1` (identity report and release, notification) and
+`identity-subagent-v1` (the same plus subagent start and stop). Installing or
+parsing a descriptor refuses an unknown schema id, an unknown handler id, and a
+handler/schema pair the handler does not drive (`descriptor_invalid`). A
+runtime without `[integration]`, such as Pi, has no schema, so its sessions
+admit no hook report. The built-in `codex` and `claude` runtimes use
+`identity-subagent-v1`, `hermes` uses `identity-v1`, and the shell, which hosts
+Codex and Claude in the foreground, uses `identity-subagent-v1`.
+
+A schema declares the provider ids that may report, the admitted actions, the
+native-reference kinds (`id`, `path`), the process-ancestry matcher, whether a
+nested provider may become the active identity, and the optional subagent
+claim fields. Core keeps process ancestry, peer binding, sequence ordering,
+expiry, and self-target validation for every schema; a schema only chooses
+which of them applies and with which finite enumeration. The daemon sends the
+resolved schema id to the worker in `Initialize.hook_schema` (an additive
+optional field of the private worker protocol), the worker journals it as
+`hook_schema` and returns it in its inspect snapshot, and the daemon validates
+the imported identity, release, and subagent state with it. A worker that
+predates the field journals none; the daemon then validates its state with the
+schema its session's pinned runtime resolves to. No public wire shape changes.
+
 Rule for runtime packages without an integration handler: such a package gets
 terminal launch and activity detection. It gets resume and fork only when its
 agent CLI accepts a caller-chosen session id and the definition declares

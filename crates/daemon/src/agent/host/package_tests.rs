@@ -899,3 +899,67 @@ fn a_recovered_safe_text_runtime_keeps_its_input_safety_when_its_package_fails_v
     ));
     assert!(!open.to_standalone_rules().is_restricted());
 }
+
+/// The fixture descriptor of runtime `acme` with an `[integration]` table.
+fn integration_descriptor(integration: &str) -> String {
+    format!(
+        "{}\n[integration]\n{integration}\n",
+        descriptor("acme.agent", "1.0.0", "acme")
+    )
+}
+
+/// The rejection installing `descriptor` as an archive reports.
+fn install_rejection(descriptor: &str) -> Option<PackageRejection> {
+    let built = build(descriptor, "x", identity("acme.agent", "1.0.0"));
+    super::package::definition_from_archive(&entries(descriptor, "x"), &built.digest).err()
+}
+
+#[test]
+fn a_package_with_a_supported_handler_and_hook_schema_serves_its_schema() {
+    let plugins = Plugins::new();
+    let built = build(
+        &integration_descriptor(
+            "handler = \"claude-hook-v1\"\nhook_schema = \"identity-subagent-v1\"",
+        ),
+        "x",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &built, true, true);
+
+    let definition = plugins
+        .host()
+        .resolve_id(&runtime("acme"))
+        .expect("the package runtime is served");
+
+    assert_eq!(
+        definition.hook_schema().map(|schema| schema.id),
+        Some("identity-subagent-v1")
+    );
+}
+
+#[test]
+fn installing_a_package_with_an_unknown_or_mismatched_schema_is_refused() {
+    for (integration, field) in [
+        (
+            "handler = \"claude-hook-v1\"\nhook_schema = \"identity-v9\"",
+            "integration.hook_schema",
+        ),
+        (
+            "handler = \"claude-hook-v1\"\nhook_schema = \"identity-v1\"",
+            "integration.hook_schema",
+        ),
+        (
+            "handler = \"acme-hook-v1\"\nhook_schema = \"identity-v1\"",
+            "integration.handler",
+        ),
+    ] {
+        match install_rejection(&integration_descriptor(integration)) {
+            Some(PackageRejection::Descriptor(super::DefinitionError::Field {
+                field: refused,
+                ..
+            })) => assert_eq!(refused, field, "{integration}"),
+            other => panic!("expected a refused descriptor for {integration}, got {other:?}"),
+        }
+    }
+    assert!(install_rejection(&descriptor("acme.agent", "1.0.0", "acme")).is_none());
+}

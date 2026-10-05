@@ -4973,6 +4973,36 @@ fn agent_kind_label(agent: &RuntimeRef) -> &str {
     agent.as_wire()
 }
 
+impl SessionRegistry {
+    /// The hook schema of the runtime a session of `agent_base` launched with
+    /// `pin`, resolved through the runtime's integration.
+    ///
+    /// A runtime that cannot be resolved or has no integration yields `None`,
+    /// so the session admits no hook report.
+    pub(super) fn session_hook_schema(
+        &self,
+        agent_base: &RuntimeRef,
+        pin: &crate::agent::host::LaunchPin,
+    ) -> Option<&'static pohunek_worker_protocol::HookSchema> {
+        match self
+            .inner
+            .profiles
+            .runtimes()
+            .definition_for_pin(agent_base, pin)
+        {
+            Ok(definition) => definition.hook_schema(),
+            Err(error) => {
+                debug!(
+                    runtime = %agent_kind_label(agent_base),
+                    error = %error,
+                    "the session runtime has no resolvable hook schema"
+                );
+                None
+            }
+        }
+    }
+}
+
 fn detector_config_for_resolved_agent(resolved: &ResolvedAgent) -> DetectorConfig {
     match resolved
         .profile

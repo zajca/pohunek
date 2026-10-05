@@ -6407,6 +6407,113 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
 }
 
 #[tokio::test]
+async fn a_worker_without_a_journaled_schema_is_reprojected_with_the_runtime_schema() {
+    let store_path = temp_store_path("hook-schema-reprojection");
+    let worker_state_root = store_path
+        .parent()
+        .expect("store parent")
+        .join("worker-state");
+    let worker_runtime_root = crate::test_support::thread_scoped_dir("pw-schema-");
+    let hook_path = pohunek_test_support::manifest_dir()
+        .join("src/integration/assets/codex/pohunek-agent-state.sh");
+    let payload = serde_json::json!({
+        "session_id": "native-parent",
+        "turn_id": "turn-child",
+        "hook_event_name": "SubagentStart",
+        "agent_id": "child-reprojected",
+        "agent_type": "reviewer",
+    });
+    let command = format!(
+        "printf '%s' '{}' | sh '{}' subagent-start; sleep 30",
+        payload,
+        hook_path.display()
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", command.as_str()]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        worker_runtime_root: Some(worker_runtime_root.clone()),
+        worker_state_root: Some(worker_state_root.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    wait_until("the hook-reported subagent", || async {
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .subagents
+            .first()
+            .cloned()
+    })
+    .await;
+
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let journaled = worker.inspect().await.expect("inspect worker journal");
+    assert_eq!(
+        journaled.hook_schema.as_deref(),
+        Some("identity-subagent-v1"),
+        "the worker journals the schema the daemon delivered at initialize"
+    );
+    registry.begin_daemon_shutdown();
+    worker
+        .release_controller()
+        .await
+        .expect("release previous daemon controller");
+    let store = crate::store::Store::new(store_path.clone());
+    let mut record = store
+        .load_sessions()
+        .expect("load logical record")
+        .pop()
+        .expect("logical record");
+    record.info.subagents.clear();
+    store
+        .record_session(&record)
+        .expect("persist pre-observation daemon snapshot");
+    let socket_path = worker_runtime_root
+        .join(&created.id.0)
+        .join(pohunek_paths::WORKER_SOCKET_NAME);
+    let reconnected = Worker::connect_discovered(&socket_path, "replacement-daemon")
+        .await
+        .expect("reconnect worker");
+    let mut snapshot = reconnected
+        .inspect()
+        .await
+        .expect("inspect after reconnect");
+    // A worker built before schema delivery journals no schema.
+    snapshot.hook_schema = None;
+    wait_for_current_worker_metadata_record(&registry, &store, &created.id, &snapshot).await;
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "the daemon resolves the schema from the session's pinned runtime"
+    );
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .runtime = RuntimeHandle::Worker(reconnected);
+    let restored = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect restored");
+    assert_eq!(
+        restored
+            .subagents
+            .first()
+            .map(|subagent| subagent.id.as_str()),
+        Some("child-reprojected")
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn a_worker_connection_lost_during_daemon_shutdown_leaves_the_runtime_live() {
     let store_path = temp_store_path("shutdown-connection-loss");
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -13324,7 +13431,7 @@ fn acme_definition(submit_delay_configurable: bool, prompt_arg: bool) -> Runtime
         prompt_arg,
         version_probe_parser: None,
         version_probe_policy: None,
-        integration_handler: None,
+        integration: None,
     })
     .expect("valid definition")
 }

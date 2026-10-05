@@ -388,6 +388,8 @@ Daemon, sessions, integrations, and project state:
   validation.
 - `crates/worker-protocol/src/env.rs` — `BaseEnv`, the default environment
   allowlist, and the service-manager denylist.
+- `crates/worker-protocol/src/hook_schema.rs` — the closed registry of hook
+  schemas that worker and daemon validation read.
 - `crates/paths/fixtures/runtime-paths.json`
 - `crates/daemon/src/host_state/`
 - `crates/daemon/src/store/mod.rs`

@@ -17,7 +17,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-// Rust guideline compliant 2026-09-27
+// Rust guideline compliant 2026-10-05
 
 /// Prefix for daemon-generated, producer-scoped control input identifiers.
 const INPUT_WRITE_ID_PREFIX: &str = "input";
@@ -1384,6 +1384,7 @@ mod tests {
             .expect("stop policy"),
             hook_protocol_version: pohunek_worker_protocol::CURRENT_VERSION,
             public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+            hook_schema: None,
         }
     }
 
