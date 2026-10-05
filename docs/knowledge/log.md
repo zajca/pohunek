@@ -1,5 +1,14 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-06, trust anchor ACL policy)
+
+- The catalog trust anchor and the catalog signing key file are judged on macOS
+  extended ACLs as well as mode bits, through the shared
+  `pohunek_platform::filesystem::acl_grants_change` (anchor: no allow entry that
+  lets another principal change the file) and `acl_grants_access` (signing key:
+  deny-only ACLs only). An unreadable ACL fails closed. Documented in the
+  runtime catalog concept.
+
 ## Unreleased (2026-10-05, reporter templates)
 
 - The Codex reporter scripts are core-owned templates with `@POHUNEK_AGENT_ID@`
@@ -8,6 +17,20 @@
   character set. The installed bytes are unchanged, so trust hashes and
   installed integrations are unaffected. Documented in the runtime packages
   guide and the source map.
+
+## Unreleased (2026-10-05, catalog trust anchor)
+
+- The daemon reads its catalog trust anchor from `runtime-catalog-anchor.json`
+  beside its executable (public keys, windows, revoked key ids), with an
+  integrity policy on the file and its directories. A missing file keeps
+  `official_trust_unavailable`; a file or location that cannot be trusted gives
+  the new `official_trust_anchor_invalid` and a failing `catalog_trust_anchor`
+  doctor check, while the daemon keeps serving local trust. `cargo xtask catalog
+  build|sign|verify|anchor|public-key` builds, signs (with an owner-private key
+  file named by path) and verifies catalogs and writes anchor files. No key is
+  shipped or compiled in; custody and release staging stay with #150. Documented
+  in the runtime catalog concept, the runtime packages guide, the public API
+  reference and the source map.
 
 ## Unreleased (2026-10-05, line version probe)
 

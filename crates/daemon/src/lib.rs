@@ -28,6 +28,7 @@ pub mod paths;
 pub mod api;
 pub mod assistant;
 pub mod capabilities;
+pub mod catalog_anchor;
 pub mod discovery;
 pub mod doctor;
 

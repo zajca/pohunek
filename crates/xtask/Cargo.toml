@@ -11,9 +11,11 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+ed25519-dalek = { workspace = true }
 knowledge = { workspace = true }
 cli = { workspace = true }
 pohunek-package = { workspace = true }
+pohunek-platform = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-relay-protocol = { workspace = true }
 serde = { workspace = true }
@@ -27,11 +29,12 @@ pulldown-cmark = { workspace = true }
 nix = { workspace = true, features = ["process", "signal"] }
 portable-pty = { workspace = true }
 tempfile = { workspace = true }
+toml = { workspace = true }
 vt100 = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-toml = { workspace = true }
 pohunek-test-support = { workspace = true }
 
 [lints]

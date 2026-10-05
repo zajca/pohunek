@@ -277,7 +277,8 @@ and is reported by the host (package-pinned sessions are then incompatible).
   archive digest to equal the supplied digest and is never official, and a
   linked directory is never official, so both are refused for an alias; trust
   `catalog` fails closed with `official_trust_unavailable` on a host without a
-  trust anchor. Loading a recorded package re-checks that its record is
+  trust anchor and with `official_trust_anchor_invalid` on a host whose anchor
+  cannot be trusted. Loading a recorded package re-checks that its record is
   `official` before it may serve a reserved id.
 - `package.uninstall` is refused with `package_referenced` while a live, lost or
   resumable session or a host profile pins the digest. `remove_modified` removes

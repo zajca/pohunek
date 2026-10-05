@@ -164,7 +164,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | Crate | Role |
 |-------|------|
 | `crates/protocol` | Shared control-protocol envelopes + version negotiation. The wire contract. |
-| `crates/package`  | Canonical runtime package archive (deterministic `tar.zst` builder, strict reader, size limits, package digest), the signed runtime catalog verifier, descriptor-relative extraction into verified package roots with per-file re-verification, the owner-private registry store (with tampered-root removal and the persisted catalog high-water/revocation state), the directory archive builder used by `package build` and `plugin link`, and (in the daemon) the `PackageSource` that serves installed packages as runtimes. |
+| `crates/package`  | Canonical runtime package archive (deterministic `tar.zst` builder, strict reader, size limits, package digest), the signed runtime catalog verifier, the trust anchor file parser and catalog signing, descriptor-relative extraction into verified package roots with per-file re-verification, the owner-private registry store (with tampered-root removal and the persisted catalog high-water/revocation state), the directory archive builder used by `package build` and `plugin link`, and (in the daemon) the `PackageSource` that serves installed packages as runtimes. |
 | `crates/client`   | SDK client: typed errors, daemon transport, standalone configured-overlay discovery with bounded probing. |
 | `crates/assistant` | Assistant launch orchestration (agent selection, knowledge bundle, launch) and the host connection types (`HostConfig`, `ConnectionOptions`, `connect_client`) shared by the CLI and other clients. |
 | `crates/daemon`   | Host control plane (`pohunekd`): logical registry, worker reconciliation, public protocol, detection/hooks. |
@@ -182,7 +182,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/test-support` | Test-only fixture roots that are symlink-free and short enough for Unix sockets on Linux and macOS, the hermetic per-test `TestEnv`, readiness waits bounded by one hang-guard ceiling (`wait`), the binary-wide unwind-safe process-environment override (`process_env`), the paused-clock auto-advance inhibitor (`time`), and fixture writers (`fs`) that cannot cause `ETXTBSY`. |
 | `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
 | `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`; also the upgrade preflight report that the installer and the daemon exchange. |
-| `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
+| `crates/xtask`    | Workspace automation (docs, TypeScript generation, pinned Hermes compatibility evidence, runtime package archives, and the `catalog` release tooling that builds, signs with a caller-supplied key file and verifies the runtime catalog and its trust anchor). |
 | `sdk/ts/`         | TypeScript SDK packages in the Bun workspace: `protocol` (generated protocol types), `sdk` (runtime client and runtime-path resolver), and `testkit` (fixture daemon and loopback test relay). |
 
 Other top-level: `runtime-packages/` (source of the official runtime packages, one

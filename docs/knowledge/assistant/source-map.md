@@ -549,6 +549,13 @@ Signed runtime catalog:
 - `crates/package/src/canonical_json.rs` — strict JSON parsing and the canonical signed byte form.
 - `crates/package/tests/catalog.rs`
 - `crates/xtask/src/runtime_package.rs` — `cargo xtask package build|verify`.
+- `crates/package/src/anchor.rs` — the catalog trust anchor file format and its strict parser.
+- `crates/package/src/sign.rs` — catalog signing for release tooling.
+- `crates/daemon/src/catalog_anchor.rs` — reading the anchor beside the daemon executable and its file-safety policy.
+- `crates/daemon/src/doctor.rs` — the `catalog_trust_anchor` doctor check.
+- `crates/xtask/src/catalog.rs` — `cargo xtask catalog build|sign|verify|anchor|public-key`.
+- `crates/xtask/src/catalog_key.rs` — owner-private signing key file reader.
+- `crates/cli/tests/plugin_catalog_install.rs` — clean-environment official install through a real daemon with a test key.
 
 Hermes compatibility evidence:
 

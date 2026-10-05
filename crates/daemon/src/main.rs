@@ -42,6 +42,7 @@ use tracing::{debug, error, info, warn};
 
 use overlay::{ConfiguredTransport, OverlayId, OverlayRegistry};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo, OpenedListener, RemoteServer};
+use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::discovery::DiscoveryCache;
 use pohunek_daemon::events::{spawn_drain, EventLog};
 use pohunek_daemon::governance::HostGovernanceService;
@@ -280,9 +281,9 @@ async fn run() -> Result<(), DaemonError> {
         agents_dir: Some(paths.config_dir.join("agents")),
         host_state_dir: Some(paths.state_dir.clone()),
         plugins_dir: Some(paths.plugins_dir()),
-        // No catalog trust anchor ships yet, so catalog installs fail closed
-        // with `official_trust_unavailable`.
-        catalog_trust_anchor: None,
+        // The anchor file beside the executable authorizes catalog installs;
+        // an absent or untrusted one fails them closed.
+        catalog_trust: CatalogTrust::load_beside_executable(),
         observe_external_agents: env_bool(OBSERVE_EXTERNAL_AGENTS_ENV)?,
         worker_runtime_root: Some(paths.runtime_dir.join(WORKERS_SUBDIR)),
         worker_state_root: Some(paths.state_dir.join(WORKERS_SUBDIR)),

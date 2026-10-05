@@ -45,7 +45,14 @@ pub(super) async fn handle_daemon_doctor(
             );
         }
     };
-    match crate::doctor::report(&paths, governance, sessions.active_supervision()).await {
+    match crate::doctor::report(
+        &paths,
+        governance,
+        sessions.active_supervision(),
+        sessions.catalog_trust(),
+    )
+    .await
+    {
         Ok(report) => ok_value(request, &protocol::DaemonDoctorResult { report }),
         Err(_error) => error_value(
             request,

@@ -3186,16 +3186,14 @@ fn validate_fd_links(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn validate_private_acl(file: &File, path: &Path) -> FsResult<()> {
-    use std::os::fd::AsFd as _;
-
-    let acl = calcifer_macos_acl::read_acl(file.as_fd())
+    let grants = acl_grants_access(file)
         .map_err(|source| io_error("inspect trusted entry ACL", path, source))?;
-    if acl_is_deny_only(&acl) {
-        Ok(())
-    } else {
+    if grants {
         Err(FsError::UnsafeAcl {
             path: path.to_path_buf(),
         })
+    } else {
+        Ok(())
     }
 }
 
@@ -3208,6 +3206,7 @@ const ACL_FILE_CHANGE_PERMISSIONS: u32 =
 
 /// Whether an ACL entry of `file` grants anyone the right to change it.
 ///
+/// This is the check for a public file that others may read but not rewrite.
 /// Deny entries (and `everyone deny delete`) never grant access, and an allow
 /// entry for reading or executing is harmless; only an allow entry carrying a
 /// change permission counts. An unknown tag is treated as granting, fail
@@ -3218,7 +3217,7 @@ const ACL_FILE_CHANGE_PERMISSIONS: u32 =
 /// Returns the I/O error of an ACL query that failed for a reason other than
 /// an absent ACL.
 #[cfg(target_os = "macos")]
-pub(crate) fn acl_grants_change(file: &File) -> io::Result<bool> {
+pub fn acl_grants_change(file: &File) -> io::Result<bool> {
     use std::os::fd::AsFd as _;
 
     // Only a missing ACL (`ENOENT`, read as empty by the wrapper) means none;
@@ -3233,11 +3232,32 @@ pub(crate) fn acl_grants_change(file: &File) -> io::Result<bool> {
 
 /// Without ACLs no entry grants anything.
 #[cfg(not(target_os = "macos"))]
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "keeps the call site identical across supported Unix targets"
-)]
-pub(crate) fn acl_grants_change(_file: &File) -> io::Result<bool> {
+pub fn acl_grants_change(_file: &File) -> io::Result<bool> {
+    Ok(false)
+}
+
+/// Whether the ACL of `file` is anything other than a deny-only list.
+///
+/// This is the check for a private file: a deny-only ACL (macOS commonly puts
+/// `everyone deny delete` on home directories) cannot widen access beyond the
+/// mode bits, while any allow entry, unknown tag or ACL header flag counts as
+/// granting, fail closed.
+///
+/// # Errors
+///
+/// Returns the I/O error of an ACL query that failed for a reason other than
+/// an absent ACL; callers must treat it as unsafe.
+#[cfg(target_os = "macos")]
+pub fn acl_grants_access(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsFd as _;
+
+    let acl = calcifer_macos_acl::read_acl(file.as_fd())?;
+    Ok(!acl_is_deny_only(&acl))
+}
+
+/// Without ACLs no entry grants anything.
+#[cfg(not(target_os = "macos"))]
+pub fn acl_grants_access(_file: &File) -> io::Result<bool> {
     Ok(false)
 }
 
@@ -4749,6 +4769,37 @@ mod tests {
             .open_file("deny-only", FILE_MODE)
             .expect("a deny-only ACL grants nothing")
             .is_some());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn descriptor_acl_queries_separate_change_access_from_any_access() {
+        let temporary = pohunek_test_support::tempdir().expect("create macOS fixture root");
+        let cases = [
+            ("none", None, false, false),
+            ("deny-only", Some(DENY_ONLY_ACL), false, false),
+            ("read", Some("everyone allow read"), false, true),
+            ("write", Some("everyone allow write"), true, true),
+            ("writable", Some(WRITABLE_ACL), true, true),
+        ];
+        for (name, acl, changes, access) in cases {
+            let path = temporary.path().join(name);
+            write_private(&path, b"contents");
+            if let Some(acl) = acl {
+                add_acl(&path, acl);
+            }
+            let file = fs::File::open(&path).expect("open ACL fixture");
+            assert_eq!(
+                acl_grants_change(&file).expect("query ACL"),
+                changes,
+                "{name}"
+            );
+            assert_eq!(
+                acl_grants_access(&file).expect("query ACL"),
+                access,
+                "{name}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

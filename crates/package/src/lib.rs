@@ -11,6 +11,8 @@
 //!   form is rejected with a typed [`ArchiveError`] that never echoes archive
 //!   content.
 //! - [`PackageDigest`] (SHA-256 of the archive bytes) authenticates an archive.
+//! - [`parse_anchor`] reads the trust anchor file of a release bundle and
+//!   [`sign_catalog`] signs a catalog for release tooling.
 //! - [`verify_catalog`] authenticates the signed runtime catalog that
 //!   authorizes official packages by archive digest; [`LocalTrust`] is the
 //!   separate explicit-digest trust for third-party archives.
@@ -32,10 +34,11 @@
 //! `docs/knowledge/concepts/runtime-package-archive.md` and
 //! `docs/knowledge/concepts/runtime-catalog.md`.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 #![forbid(unsafe_code)]
 
+mod anchor;
 mod archive;
 mod canonical;
 mod canonical_json;
@@ -43,6 +46,7 @@ mod catalog;
 mod compression;
 mod error;
 mod limits;
+mod sign;
 
 // Extraction, verification and the registry need descriptor-relative
 // filesystem primitives.
@@ -63,6 +67,10 @@ pub mod registry;
 #[cfg(unix)]
 pub mod verify;
 
+pub use anchor::{
+    parse_anchor, AnchorFile, AnchorFileError, ANCHOR_FILE_NAME, ANCHOR_SCHEMA_VERSION,
+    MAX_ANCHOR_BYTES,
+};
 pub use archive::{
     build_archive, read_archive, read_archive_with_digest, ArchiveEntry, VerifiedArchive,
 };
@@ -81,3 +89,4 @@ pub use limits::{
     MAX_FILE_BYTES, MAX_PATH_BYTES, MAX_WINDOW_BYTES,
 };
 pub use protocol::PackageDigest;
+pub use sign::{catalog_document_bytes, sign_catalog};

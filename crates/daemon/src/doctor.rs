@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use hostcheck::{StandardCheckInputs, Supervision, WorkerCandidate, WorkerSource};
 use protocol::{DoctorCheck, DoctorReport, DoctorStatus, QuarantineReason};
 
+use crate::catalog_anchor::{AnchorFault, CatalogTrust};
 use crate::governance::{HostGovernanceDiagnostic, HostGovernanceService};
 use crate::session::ActiveSupervision;
 use crate::Paths;
@@ -28,11 +29,13 @@ pub struct DoctorReportError;
 /// Returns [`DoctorReportError`] when the bounded blocking host-check task fails.
 ///
 /// `supervision` is the worker supervision the daemon runs with, or `None`
-/// when it has none.
+/// when it has none. `catalog_trust` is what the daemon loaded to authorize
+/// official packages.
 pub(crate) async fn report(
     paths: &Paths,
     governance: &HostGovernanceService,
     supervision: Option<ActiveSupervision>,
+    catalog_trust: &CatalogTrust,
 ) -> Result<DoctorReport, DoctorReportError> {
     let paths = paths.clone();
     let mode = supervision_mode(supervision.as_ref());
@@ -45,6 +48,7 @@ pub(crate) async fn report(
             .await
             .map_err(|_error| DoctorReportError)?;
     checks.extend(governance_checks(governance.diagnose().await));
+    checks.push(catalog_trust_check(catalog_trust));
     Ok(DoctorReport::from_checks(checks))
 }
 
@@ -75,6 +79,36 @@ fn standard_checks(
         access_dirs: &[],
         supervision,
     })
+}
+
+/// Name of the check that reports the catalog trust anchor.
+const CATALOG_TRUST_CHECK: &str = "catalog_trust_anchor";
+
+/// The check for the anchor that authorizes official packages: an absent
+/// anchor is a warning (official packages cannot be installed, the daemon is
+/// otherwise unaffected) and an untrusted one a failure.
+fn catalog_trust_check(trust: &CatalogTrust) -> DoctorCheck {
+    match trust {
+        CatalogTrust::Loaded(_) => check(
+            CATALOG_TRUST_CHECK,
+            DoctorStatus::Ok,
+            "The catalog trust anchor is loaded; official packages can be authorized.",
+        ),
+        CatalogTrust::Absent => check(
+            CATALOG_TRUST_CHECK,
+            DoctorStatus::Warn,
+            "This installation ships no catalog trust anchor; official packages cannot be installed.",
+        ),
+        CatalogTrust::Invalid(fault) => check(
+            CATALOG_TRUST_CHECK,
+            DoctorStatus::Fail,
+            &invalid_anchor_detail(*fault),
+        ),
+    }
+}
+
+fn invalid_anchor_detail(fault: AnchorFault) -> String {
+    format!("{fault}; official packages are refused until the anchor file is fixed and the daemon restarts.")
 }
 
 fn governance_checks(diagnostic: HostGovernanceDiagnostic) -> [DoctorCheck; 6] {
@@ -228,7 +262,9 @@ mod tests {
         let paths = paths_at(&root);
 
         let service = crate::governance::HostGovernanceService::open_test();
-        let report = report(&paths, &service, None).await.expect("doctor report");
+        let report = report(&paths, &service, None, &CatalogTrust::Absent)
+            .await
+            .expect("doctor report");
 
         assert!(report
             .checks
@@ -258,6 +294,57 @@ mod tests {
                 "host_governance_quarantine",
             ]
         );
+    }
+
+    #[test]
+    fn the_catalog_trust_check_reports_each_state_with_its_severity() {
+        let loaded = package::parse_anchor(&{
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+            let root = package::RootKey::new(key.verifying_key().to_bytes(), 1, 2).expect("root");
+            package::AnchorFile::new(vec![root], Vec::new())
+                .expect("anchor")
+                .to_bytes()
+                .expect("bytes")
+        })
+        .expect("parse")
+        .into_parts();
+        let anchor = crate::session::HostTrustAnchor::new(loaded.0, loaded.1).expect("anchor");
+        let check = catalog_trust_check(&CatalogTrust::Loaded(anchor));
+        assert_eq!(
+            (check.name.as_str(), check.status),
+            (CATALOG_TRUST_CHECK, DoctorStatus::Ok)
+        );
+
+        let absent = catalog_trust_check(&CatalogTrust::Absent);
+        assert_eq!(absent.status, DoctorStatus::Warn);
+        assert!(absent.detail.contains("no catalog trust anchor"));
+
+        let invalid = catalog_trust_check(&CatalogTrust::Invalid(AnchorFault::UnsafeFile));
+        assert_eq!(invalid.status, DoctorStatus::Fail);
+        assert!(invalid.detail.contains("not safe"), "{}", invalid.detail);
+        assert!(!invalid.detail.contains('/'), "no path in the detail");
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_anchor_makes_the_report_fail() {
+        let root = temp_dir("untrusted-anchor");
+        let paths = paths_at(&root);
+        let service = crate::governance::HostGovernanceService::open_test();
+        let report = report(
+            &paths,
+            &service,
+            None,
+            &CatalogTrust::Invalid(AnchorFault::TooLarge),
+        )
+        .await
+        .expect("doctor report");
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == CATALOG_TRUST_CHECK)
+            .expect("the trust check is reported");
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert_eq!(report.overall, DoctorStatus::Fail);
     }
 
     #[test]
