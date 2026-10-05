@@ -134,11 +134,11 @@ struct FakeSink {
 }
 
 impl TranscriptSink for FakeSink {
-    async fn upsert(&self, agent_base: RuntimeRef, path: PathBuf) -> io::Result<bool> {
+    async fn upsert(&self, owner: TranscriptRoot, path: PathBuf) -> io::Result<bool> {
         self.agents
             .lock()
             .expect("agents")
-            .push((agent_base, path.clone()));
+            .push((owner.agent_base, path.clone()));
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
         self.upserts.lock().expect("upserts").push(path);

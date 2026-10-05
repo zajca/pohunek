@@ -531,7 +531,10 @@ async fn a_transcript_below_a_profile_home_publishes_no_path() {
         .best_match(&RuntimeRef::claude(), Path::new("/other"), &fact)
         .expect("the ambient transcript matches by cwd");
 
-    assert!(private.private, "a profile-derived transcript is private");
+    assert!(
+        private.is_private(),
+        "a profile-derived transcript is private"
+    );
     assert_eq!(private.publishable_path(), None);
     assert!(
         private
@@ -539,9 +542,99 @@ async fn a_transcript_below_a_profile_home_publishes_no_path() {
             .contains("zq-private-account-3c81"),
         "the internal provenance keeps the real path"
     );
-    assert!(!public.private);
+    assert!(!public.is_private());
     assert!(public
         .publishable_path()
         .is_some_and(|path| path.contains(".claude")));
     sessions.shutdown();
+}
+
+/// A process fact for `best_match`; only its command line is consulted.
+fn fact() -> crate::procwatch::ProcessFact {
+    crate::procwatch::ProcessFact {
+        pid: 4242,
+        pgid: 4242,
+        ppid: 1,
+        start_identity: crate::procwatch::StartIdentity::new(4242),
+        comm: "agent".to_owned(),
+        cmdline: vec!["agent".to_owned()],
+    }
+}
+
+fn plain_root(agent: &RuntimeRef, path: &Path, private: bool) -> TranscriptRoot {
+    TranscriptRoot {
+        agent_base: agent.clone(),
+        path: path.to_path_buf(),
+        private,
+    }
+}
+
+#[tokio::test]
+async fn a_candidate_whose_root_left_is_never_offered_while_the_scan_is_paused() {
+    use tokio_util::sync::CancellationToken;
+
+    let base = scoped_dir("pohunek-roots-handover");
+    let private_root = base.join("zq-private-account-9d27").join("projects");
+    let transcript = private_root.join("p/s.jsonl");
+    write_transcript(&transcript, "native");
+    let index = super::TranscriptIndex::default();
+    let roots = vec![plain_root(&RuntimeRef::claude(), &private_root, true)];
+    index.scan_roots(roots, CancellationToken::new()).await;
+    let offered = |index: &super::TranscriptIndex| {
+        index.best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+    };
+    let before = offered(&index).expect("the indexed candidate matches by cwd");
+    assert_eq!(before.publishable_path(), None);
+
+    // The scan has replaced its roots and has not pruned yet.
+    *index.roots.lock().expect("roots") = Vec::new();
+    assert!(offered(&index).is_none(), "no current owner, no candidate");
+
+    // The same directory is now a public root: the candidate was indexed as
+    // private and is not offered as public.
+    *index.roots.lock().expect("roots") =
+        vec![plain_root(&RuntimeRef::claude(), &private_root, false)];
+    assert!(
+        offered(&index).is_none(),
+        "the provenance no longer matches"
+    );
+}
+
+#[tokio::test]
+async fn a_nested_root_added_or_removed_reassigns_unchanged_transcripts() {
+    use tokio_util::sync::CancellationToken;
+
+    let base = scoped_dir("pohunek-roots-nested");
+    let outer = base.join("a").join("projects");
+    let inner = outer.join("sessions");
+    write_transcript(&inner.join("2026/x.jsonl"), "native");
+    let index = super::TranscriptIndex::default();
+    let claude_only = vec![plain_root(&RuntimeRef::claude(), &outer, false)];
+    let nested = vec![
+        plain_root(&RuntimeRef::claude(), &outer, false),
+        plain_root(&RuntimeRef::codex(), &inner, true),
+    ];
+    let owner_of = |index: &super::TranscriptIndex| {
+        let claude = index
+            .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+            .is_some();
+        let codex = index
+            .best_match(&RuntimeRef::codex(), Path::new("/work"), &fact())
+            .map(|candidate| candidate.is_private());
+        (claude, codex)
+    };
+
+    index
+        .scan_roots(claude_only.clone(), CancellationToken::new())
+        .await;
+    assert_eq!(owner_of(&index), (true, None));
+
+    // The transcript is not touched; only the roots change.
+    index.scan_roots(nested, CancellationToken::new()).await;
+    assert_eq!(owner_of(&index), (false, Some(true)));
+
+    index
+        .scan_roots(claude_only, CancellationToken::new())
+        .await;
+    assert_eq!(owner_of(&index), (true, None));
 }

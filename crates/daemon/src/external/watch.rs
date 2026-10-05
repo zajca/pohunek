@@ -24,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::RuntimeRef;
 use tokio::sync::{watch, Notify};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::{sleep_until, Instant};
@@ -32,7 +31,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::time::DelayQueue;
 use tracing::{debug, info, warn};
 
-use super::{canonical_roots, is_jsonl_path, owning_root, platform, TranscriptRoot};
+use super::{
+    canonical_roots, is_jsonl_path, owning_root, platform, TranscriptRoot, PRIVATE_PATH_LABEL,
+};
 
 /// Debounce applied to the first hint for a transcript path before it is parsed.
 ///
@@ -260,7 +261,7 @@ pub(super) trait TranscriptSink: Send + Sync + 'static {
     /// Parses one transcript and returns whether the index changed.
     fn upsert(
         &self,
-        agent_base: RuntimeRef,
+        owner: TranscriptRoot,
         path: PathBuf,
     ) -> impl Future<Output = io::Result<bool>> + Send;
 
@@ -383,7 +384,9 @@ enum Phase {
 
 #[derive(Debug)]
 struct PathState {
-    agent_base: RuntimeRef,
+    /// The root that owns the path in the current pass; the parse is made and
+    /// classified for it.
+    owner: TranscriptRoot,
     phase: Phase,
 }
 
@@ -576,9 +579,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
         if !is_jsonl_path(&path) {
             return;
         }
-        let Some(agent_base) =
-            owning_root(&self.roots, &self.canonical, &path).map(|root| root.agent_base.clone())
-        else {
+        let Some(owner) = owning_root(&self.roots, &self.canonical, &path).cloned() else {
             return;
         };
         if let Some(state) = self.paths.get_mut(&path) {
@@ -595,7 +596,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
         self.paths.insert(
             path,
             PathState {
-                agent_base,
+                owner,
                 phase: Phase::Queued,
             },
         );
@@ -610,11 +611,11 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
                 continue;
             };
             state.phase = Phase::InFlight { dirty: false };
-            let agent_base = state.agent_base.clone();
+            let owner = state.owner.clone();
             let sink = Arc::clone(&self.sink);
             let task_path = path.clone();
             let handle = self.parses.spawn(async move {
-                let result = sink.upsert(agent_base, task_path.clone()).await;
+                let result = sink.upsert(owner, task_path.clone()).await;
                 (task_path, result)
             });
             self.parse_paths.insert(handle.id(), path);
@@ -660,21 +661,28 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
     }
 
     /// Forgets every pending parse whose path lies below no current root, so a
-    /// root that left the configuration is never parsed again. Timer and queue
-    /// entries that outlive their path are skipped when they come due.
+    /// root that left the configuration is never parsed again, and hands the
+    /// others to the root that owns them now. Timer and queue entries that
+    /// outlive their path are skipped when they come due.
     fn drop_unowned_paths(&mut self) {
         let (roots, canonical) = (&self.roots, &self.canonical);
         self.paths
-            .retain(|path, _state| owning_root(roots, canonical, path).is_some());
+            .retain(|path, state| match owning_root(roots, canonical, path) {
+                Some(owner) => {
+                    state.owner.clone_from(owner);
+                    true
+                }
+                None => false,
+            });
     }
 
-    /// The path as a log line may show it: a path below a private root is
-    /// replaced by a label.
+    /// The path as a log line may show it, by the provenance of its pending
+    /// parse; a path no parse is pending for is shown by label.
     fn log_path(&self, path: &Path) -> String {
-        match owning_root(&self.roots, &self.canonical, path) {
-            Some(root) if root.private => root.log_path(),
-            _ => path.display().to_string(),
-        }
+        self.paths.get(path).map_or_else(
+            || PRIVATE_PATH_LABEL.to_owned(),
+            |state| state.owner.log_path_of(path),
+        )
     }
 
     /// Brings the next pass forward, spaced from the previous one.

@@ -158,12 +158,17 @@ pub(crate) struct TranscriptRoot {
 const PRIVATE_PATH_LABEL: &str = "<profile config home>";
 
 impl TranscriptRoot {
-    /// The path as a log line may show it.
+    /// The root's path as a log line may show it.
     fn log_path(&self) -> String {
+        self.log_path_of(&self.path)
+    }
+
+    /// `path`, a location below this root, as a log line may show it.
+    fn log_path_of(&self, path: &Path) -> String {
         if self.private {
             PRIVATE_PATH_LABEL.to_owned()
         } else {
-            self.path.display().to_string()
+            path.display().to_string()
         }
     }
 }
@@ -195,9 +200,11 @@ pub(crate) struct TranscriptCandidate {
     pub(crate) native_session_id: Option<String>,
     /// Native transcript path.
     pub(crate) native_session_path: String,
-    /// Whether the transcript lies below a profile-derived root, so its path
-    /// must not be published.
-    pub(crate) private: bool,
+    /// The root that owned the transcript when it was indexed. Whether the
+    /// path may be published, and which runtime the candidate belongs to, are
+    /// decided by this provenance and never re-derived from the roots of a
+    /// later pass.
+    owner: Arc<TranscriptRoot>,
     /// Working directory reported by the provider transcript.
     pub(crate) cwd: Option<PathBuf>,
     updated_at: SystemTime,
@@ -207,7 +214,13 @@ impl TranscriptCandidate {
     /// The transcript path a published session may carry: none for a transcript
     /// below a profile-derived root, whose directory is private.
     pub(crate) fn publishable_path(&self) -> Option<&str> {
-        (!self.private).then_some(self.native_session_path.as_str())
+        (!self.owner.private).then_some(self.native_session_path.as_str())
+    }
+
+    /// Whether the transcript was indexed below a profile-derived root.
+    #[cfg(test)]
+    pub(crate) fn is_private(&self) -> bool {
+        self.owner.private
     }
 }
 
@@ -215,14 +228,23 @@ impl TranscriptCandidate {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TranscriptIndex {
     inner: Arc<Mutex<HashMap<PathBuf, TranscriptCandidate>>>,
-    /// Signature of every transcript parsed, with or without a resulting
-    /// candidate, so an unchanged file is not parsed again by a scan.
-    parsed: Arc<Mutex<HashMap<PathBuf, FileSignature>>>,
-    /// The roots of the last scan and their canonical directories, which say
-    /// which candidates lie below a private root.
-    roots: Arc<Mutex<(Vec<TranscriptRoot>, Vec<PathBuf>)>>,
+    /// Signature and owner of every transcript parsed, with or without a
+    /// resulting candidate, so an unchanged file under an unchanged owner is
+    /// not parsed again by a scan.
+    parsed: Arc<Mutex<HashMap<PathBuf, ParsedEntry>>>,
+    /// The roots of the last scan: a candidate is only offered while the root
+    /// that indexed it is one of them.
+    roots: Arc<Mutex<Vec<TranscriptRoot>>>,
     #[cfg(test)]
     parses: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// What a scan remembers of a parsed transcript.
+#[derive(Debug, Clone)]
+struct ParsedEntry {
+    signature: FileSignature,
+    /// The root the transcript was parsed for.
+    owner: Arc<TranscriptRoot>,
 }
 
 /// Identity and state a transcript had when it was last parsed: size,
@@ -441,8 +463,11 @@ impl TranscriptIndex {
         let index = self.clone();
         let count = roots.len();
         match tokio::task::spawn_blocking(move || {
-            *index.roots.lock().unwrap_or_else(MutexError::into_inner) =
-                (roots.clone(), canonical_roots(&roots));
+            index
+                .roots
+                .lock()
+                .unwrap_or_else(MutexError::into_inner)
+                .clone_from(&roots);
             let scans = roots
                 .iter()
                 .map(|root| index.scan_root(root, &roots, SCAN_LIMITS, &cancel))
@@ -460,19 +485,22 @@ impl TranscriptIndex {
         }
     }
 
-    /// Drops every entry that lies below none of `roots`, so a root that left
-    /// the configuration takes its transcripts with it.
+    /// Drops every entry whose provenance is not the root that owns its path
+    /// now, so a root that left the configuration takes its transcripts with it
+    /// and a transcript whose owner changed is parsed again by the next scan.
     fn retain_owned(&self, roots: &[TranscriptRoot]) {
         let canonical = canonical_roots(roots);
-        let owned = |path: &Path| owning_root(roots, &canonical, path).is_some();
+        let owned_by = |path: &Path, owner: &TranscriptRoot| {
+            owning_root(roots, &canonical, path) == Some(owner)
+        };
         self.inner
             .lock()
             .unwrap_or_else(MutexError::into_inner)
-            .retain(|path, _candidate| owned(path));
+            .retain(|path, candidate| owned_by(path, &candidate.owner));
         self.parsed
             .lock()
             .unwrap_or_else(MutexError::into_inner)
-            .retain(|path, _signature| owned(path));
+            .retain(|path, entry| owned_by(path, &entry.owner));
     }
 
     /// Parses one transcript path and updates the candidate index.
@@ -481,7 +509,7 @@ impl TranscriptIndex {
     /// a directory, or below a parent replaced by a file) drops its candidate; the
     /// existence check is repeated under the lock so a transcript recreated
     /// meanwhile is kept.
-    pub(crate) fn upsert_path(&self, agent_base: RuntimeRef, path: &Path) -> io::Result<bool> {
+    pub(crate) fn upsert_path(&self, owner: &TranscriptRoot, path: &Path) -> io::Result<bool> {
         let gone = transcript_is_gone(path);
         let signature = if gone {
             None
@@ -494,8 +522,11 @@ impl TranscriptIndex {
             #[cfg(test)]
             self.parses
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            match parse_transcript(agent_base, path) {
-                Ok(candidate) => candidate,
+            match parse_transcript(owner.agent_base.clone(), path) {
+                Ok(candidate) => candidate.map(|candidate| TranscriptCandidate {
+                    owner: Arc::new(owner.clone()),
+                    ..candidate
+                }),
                 Err(_err) if transcript_is_gone(path) => None,
                 Err(err) => return Err(err),
             }
@@ -504,7 +535,13 @@ impl TranscriptIndex {
             let mut parsed = self.parsed.lock().unwrap_or_else(MutexError::into_inner);
             match signature {
                 Some(signature) => {
-                    parsed.insert(path.to_path_buf(), signature);
+                    parsed.insert(
+                        path.to_path_buf(),
+                        ParsedEntry {
+                            signature,
+                            owner: Arc::new(owner.clone()),
+                        },
+                    );
                 }
                 None => {
                     parsed.remove(path);
@@ -530,19 +567,19 @@ impl TranscriptIndex {
         cwd: &Path,
         fact: &ProcessFact,
     ) -> Option<TranscriptCandidate> {
-        let best = self
-            .inner
+        // One snapshot of the roots serves both the selection and the
+        // classification: a candidate whose indexing root is gone is ignored,
+        // and the privacy of the one chosen is the one it was indexed with.
+        let roots = self.roots.lock().unwrap_or_else(MutexError::into_inner);
+        self.inner
             .lock()
             .unwrap_or_else(MutexError::into_inner)
-            .iter()
-            .filter(|(_path, candidate)| &candidate.agent_base == agent_base)
-            .filter(|(_path, candidate)| transcript_matches_process(candidate, cwd, fact))
-            .max_by_key(|(_path, candidate)| candidate.updated_at)
-            .map(|(path, candidate)| (path.clone(), candidate.clone()));
-        let (path, mut candidate) = best?;
-        let roots = self.roots.lock().unwrap_or_else(MutexError::into_inner);
-        candidate.private = owning_root(&roots.0, &roots.1, &path).is_some_and(|root| root.private);
-        Some(candidate)
+            .values()
+            .filter(|candidate| &candidate.agent_base == agent_base)
+            .filter(|candidate| roots.contains(&candidate.owner))
+            .filter(|candidate| transcript_matches_process(candidate, cwd, fact))
+            .max_by_key(|candidate| candidate.updated_at)
+            .cloned()
     }
 
     /// Scans one root and, when the pass covered it completely, drops the entries
@@ -682,13 +719,13 @@ impl TranscriptIndex {
                     directories_left -= 1;
                     queue.push_back(path);
                 } else if is_jsonl_path(&path) {
-                    if !self.is_unchanged(&path) {
+                    if !self.is_unchanged(&path, root) {
                         if transcripts_left == 0 {
                             incomplete = true;
                             break 'walk;
                         }
                         transcripts_left -= 1;
-                        if let Err(err) = self.upsert_path(root.agent_base.clone(), &path) {
+                        if let Err(err) = self.upsert_path(root, &path) {
                             debug!(
                                 agent = ?root.agent_base,
                                 error = %err,
@@ -709,8 +746,9 @@ impl TranscriptIndex {
         (scan, visited)
     }
 
-    /// Whether `path` has the size and modification time it had when parsed.
-    fn is_unchanged(&self, path: &Path) -> bool {
+    /// Whether `path` has the size and modification time it had when it was
+    /// parsed for `owner`.
+    fn is_unchanged(&self, path: &Path, owner: &TranscriptRoot) -> bool {
         let Some(signature) = FileSignature::read(path) else {
             return false;
         };
@@ -718,7 +756,7 @@ impl TranscriptIndex {
             .lock()
             .unwrap_or_else(MutexError::into_inner)
             .get(path)
-            == Some(&signature)
+            .is_some_and(|entry| entry.signature == signature && *entry.owner == *owner)
     }
 }
 
@@ -836,12 +874,12 @@ struct IndexSink {
 impl TranscriptSink for IndexSink {
     fn upsert(
         &self,
-        agent_base: RuntimeRef,
+        owner: TranscriptRoot,
         path: PathBuf,
     ) -> impl Future<Output = io::Result<bool>> + Send {
         let index = self.index.clone();
         async move {
-            tokio::task::spawn_blocking(move || index.upsert_path(agent_base, &path))
+            tokio::task::spawn_blocking(move || index.upsert_path(&owner, &path))
                 .await
                 .map_err(io::Error::other)?
         }
@@ -1155,11 +1193,18 @@ fn parse_transcript(
     let updated_at = fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(UNIX_EPOCH);
+    let owner = Arc::new(TranscriptRoot {
+        agent_base: agent_base.clone(),
+        path: PathBuf::new(),
+        private: true,
+    });
     Ok(Some(TranscriptCandidate {
         agent_base,
         native_session_id,
         native_session_path,
-        private: false,
+        // Unattributed until a root claims it; a candidate nobody claimed is
+        // never published.
+        owner,
         cwd,
         updated_at,
     }))
