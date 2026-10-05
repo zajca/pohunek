@@ -750,17 +750,9 @@ fn apply_observed_refresh(
             .iter_mut()
             .find(|agent| agent.pid == observation.pid)
         {
-            let identity_changed = existing.start_identity != observation.start_identity;
-            let base_changed = existing.agent_base != observation.agent_base;
-            existing.pgid = observation.pgid;
-            existing.start_identity = observation.start_identity;
-            existing.cwd = observation.cwd;
-            existing.agent_base = observation.agent_base;
-            if identity_changed || base_changed {
-                existing.first_seen = observation.first_seen;
-            }
+            let identity = (observation.pid, observation.start_identity);
+            let identity_changed = existing.refresh_from(observation);
             if identity_changed {
-                let identity = (observation.pid, observation.start_identity);
                 if let Some(watch) = exit_watches.remove(&identity) {
                     to_spawn.push((identity, watch, entry.procwatch_cancel.clone()));
                 }

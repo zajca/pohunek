@@ -806,6 +806,23 @@ struct ObservedAgent {
     cwd: Option<PathBuf>,
 }
 
+impl ObservedAgent {
+    /// Replaces every per-process field with the ones of a fresh match of the
+    /// same pid, so no field describes the previous occupant of the pid.
+    /// `first_seen` is kept while the process identity and runtime are the
+    /// same. Returns whether the start identity changed.
+    fn refresh_from(&mut self, observation: Self) -> bool {
+        let identity_changed = self.start_identity != observation.start_identity;
+        let base_changed = self.agent_base != observation.agent_base;
+        let first_seen = self.first_seen;
+        *self = observation;
+        if !(identity_changed || base_changed) {
+            self.first_seen = first_seen;
+        }
+        identity_changed
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RuntimeExit {
     exit_code: Option<i32>,

@@ -9482,6 +9482,10 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
             .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
             .expect("observed codex pid");
         assert_eq!(observed.agent_base, RuntimeRef::codex());
+        assert_eq!(
+            format!("{:?}", observed.definition.0.manifest()),
+            format!("{:?}", crate::detect::codex_manifest())
+        );
         observed.first_seen
     };
 
@@ -9506,6 +9510,11 @@ async fn procwatch_refreshes_agent_base_when_pid_is_reused() {
             .find(|observed| observed.pid == PID_REUSE_AGENT_PID)
             .expect("observed reused pid");
         assert_eq!(observed.agent_base, RuntimeRef::claude());
+        assert_eq!(
+            format!("{:?}", observed.definition.0.manifest()),
+            format!("{:?}", crate::detect::claude_manifest()),
+            "the replacement is detected with its own manifest"
+        );
         assert_eq!(observed.start_identity, u64::from(PID_REUSE_AGENT_PID) + 1);
         assert_eq!(observed.pgid, PID_REUSE_AGENT_PID + 10);
         assert_eq!(observed.first_seen, second_scan);
