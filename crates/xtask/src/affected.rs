@@ -199,6 +199,12 @@ const RULES: &[Rule] = &[
         Effect::Packages(&["pohunek-daemon", "xtask"]),
         "Hermes compatibility lock embedded by the daemon; lock and goldens read by xtask",
     ),
+    reminding(
+        Pattern::Dir("crates/protocol/tests/fixtures/compat"),
+        Effect::Packages(&["pohunek-protocol", "pohunek-client"]),
+        &[Reminder::SdkGates],
+        "previous-release recordings read by pohunek-protocol's adapter tests, replayed by pohunek-client's previous_daemon test and by the SDK's compat tests",
+    ),
     rule(
         Pattern::Dir("compat/codex"),
         Effect::Packages(&["pohunek-daemon"]),
@@ -841,6 +847,8 @@ mod tests {
             package("pohunek-relay-client", "crates/relay-client"),
             package("pohunek-knowledge", "crates/knowledge"),
             package("pohunek-daemon", "crates/daemon"),
+            package("pohunek-protocol", "crates/protocol"),
+            package("pohunek-client", "crates/client"),
             package("pohunek-cli", "crates/cli"),
             package("xtask", "crates/xtask"),
             package("nested-fixture", "crates/xtask/tests/fixtures/nested"),

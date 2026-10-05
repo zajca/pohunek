@@ -17,9 +17,10 @@ release archive or rebuilding it from source.
 
 A daemon of the current release accepts public protocol `3..=4`: clients of the
 previous release (protocol 3) keep working against it, and a range outside that
-returns `daemon/version_mismatch` before any method runs. Clients of the current
-release speak only protocol `4..=4`, so upgrade every daemon before the clients
-that talk to it: a v4 client against a daemon that only speaks v3 is refused.
+returns `daemon/version_mismatch` before any method runs. The CLI and Rust client
+of the current release speak `3..=4`, so they also work against a daemon that only
+speaks v3, and so do TypeScript SDK clients (see "Mixed releases across hosts"
+below). A client and a daemon more than one release apart are refused.
 Before replacing any component, inventory every CLI, SDK, custom client, managed
 hook and local or NetBird-reachable daemon that must talk to another peer. Drain
 cross-host automation, upgrade the daemons first, and then verify every host with
@@ -30,8 +31,8 @@ current CLI).
 Protocol v4 spells the worker instance identifier `worker_instance_id` where
 v3 spelled it `runtime_id`. The daemon translates that spelling for protocol 3
 clients only; a v4 client or hook never sends it. Do not downgrade one peer
-independently: a v3 client is served by a v4 daemon, but a v4 client is refused by
-a v3 daemon. Managed Codex and Claude hook assets carry
+independently: a v3 client is served by a v4 daemon, a v4 CLI or
+SDK client works against a v3 daemon. Managed Codex and Claude hook assets carry
 `POHUNEK_INTEGRATION_VERSION=11`; after the upgrade run
 `pohunek integration doctor` and reinstall every asset it reports as outdated,
 because an older hook still sends the old key, which the daemon accepts only
@@ -45,6 +46,35 @@ instead of the `{minimum, maximum}` range, so the daemon drops their
 notifications until they are reinstalled. Earlier protocol transitions (integer-v1 to range negotiation,
 the v3 overlay-routing change) do not widen the supported range.
 
+## Mixed releases across hosts
+
+During a staggered multi-host upgrade a CLI of the current release may talk to a
+daemon of the previous release on another host over NetBird. Nothing has to be
+upgraded in one pass for that pair. The CLI and Rust client advertise the protocol
+window `3..=4`; the older daemon answers in protocol 3 and the client translates
+requests, results and subscription events through the same shape-only adapter the
+daemon uses, so `--json` output keeps the current shape. The command
+`pohunek host inspect <host> --json` reports `protocol_version` `3` for such a host, `pohunek host list`
+shows it as `reachable`, and multi-host commands include it.
+
+A method added in the current release does not exist on the older daemon. The
+client refuses it before sending anything, with
+`daemon/daemon_protocol_too_old`, whose message reads "host '<host>' runs
+protocol 3, but package.list needs protocol 4". The `recover` hint names the fix:
+upgrade the pohunek install on that host, then retry. Today the `package.*` methods are the only
+ones in this class; the rest of the public methods work across the pair.
+A payload the adapter cannot translate fails with
+`daemon/version_translation_failed` instead of being passed through; upgrade the
+host the same way.
+
+The TypeScript SDK (and so the web and desktop UIs built on it) behaves the same
+way: it advertises protocol `3..=4`, translates a protocol 3 daemon's payloads,
+and refuses a method new in the current release with the same typed
+`daemon_protocol_too_old` error (`ClientError.kind === "daemonProtocolTooOld"`,
+with `tooOld.host`, `tooOld.daemonVersion` and `tooOld.requiredVersion`). Only a
+peer two releases apart still has to be upgraded: the window is exactly one
+release wide and the client is refused with `daemon/version_mismatch`.
+
 ## Upgrade window and the metadata store
 
 The contract is that release N stays compatible with release N-1 for live
@@ -53,11 +83,10 @@ workers (private worker protocol versions `PREVIOUS_VERSION` and
 nothing else is shimmed. The current state differs for the last two. The worker
 journal reader accepts an explicit list of schemas, which today holds only the
 current one. The public protocol window is `3..=4`: protocol 3 clients and tooling keep
-working against a daemon of this release. The remaining gap is a new client
-against an old daemon
-([#527](https://github.com/zajca/pohunek/issues/527)), so upgrade the daemon on
-every host before the clients that talk to it, as the protocol v4 boundary above
-describes. The
+working against a daemon of this release, and the CLI and Rust client of this
+release work against a protocol 3 daemon, as do TypeScript SDK clients
+([#527](https://github.com/zajca/pohunek/issues/527)); a peer two releases
+apart is refused. The
 daemon's persisted state, `<data_dir>/metadata.jsonl`, does migrate from any
 older kept schema, so skipping releases is safe for it. Each release's notes name every schema or
 protocol constant that changed (`STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`,

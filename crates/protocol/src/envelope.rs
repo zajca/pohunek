@@ -99,12 +99,23 @@ impl Request {
 
     /// Replaces the advertised range with the exact `version`.
     ///
-    /// A daemon-backed probe uses it to speak the version of the connection it
-    /// answers for instead of the client's current version.
+    /// A client pins a request to the version its connection already selected
+    /// when it has translated the parameters into that version.
     #[must_use]
-    pub fn with_exact_version(mut self, version: ProtocolVersion) -> Self {
-        self.v = ProtocolVersionRange::new(version, version)
-            .expect("a protocol version is always a valid exact range");
+    pub fn with_exact_version(self, version: ProtocolVersion) -> Self {
+        self.with_version_range(
+            ProtocolVersionRange::new(version, version)
+                .expect("a protocol version is always a valid exact range"),
+        )
+    }
+
+    /// Replaces the advertised range with `range`.
+    ///
+    /// A daemon-backed probe uses it to offer the range of the client it
+    /// probes for instead of this build's client window.
+    #[must_use]
+    pub fn with_version_range(mut self, range: ProtocolVersionRange) -> Self {
+        self.v = range;
         self
     }
 

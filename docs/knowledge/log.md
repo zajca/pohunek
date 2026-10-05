@@ -64,6 +64,22 @@
   also states that the version probe runs under the launch `PATH`, profile
   override included.
 
+## Unreleased (2026-10-05, client-side protocol window)
+
+- The Rust client and the CLI advertise the protocol window `3..=4`
+  (`CLIENT_PROTOCOL_VERSIONS` is `SUPPORTED_PROTOCOL_VERSIONS`) and translate
+  through the `v3` adapter against a daemon of the previous release, so a
+  staggered multi-host upgrade no longer needs one pass for them. A method new
+  in the current protocol fails on the client with `daemon/daemon_protocol_too_old`
+  (host, daemon protocol, required protocol, upgrade hint); an untranslatable
+  payload fails with `daemon/version_translation_failed`. Discovery classifies
+  peers for the asking client's range. The TypeScript SDK advertises the same window
+  and carries a port of the adapter (`sdk/ts/sdk/src/compat.ts`) with a typed
+  `daemonProtocolTooOld` error; its key names and introduced-method list are
+  generated from the Rust adapter. The update runbook gains "Mixed releases
+  across hosts"; `public-api.md` and the architecture "Protocol window" section
+  describe the client side. The source map lists the client fixture test.
+
 ## Unreleased (2026-10-04, upgrade window and store schema)
 
 - The update runbook states the upgrade window (release N carries N-1 for live

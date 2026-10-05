@@ -409,10 +409,35 @@ fn handle_connection<S>(
 {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    if reader.read_line(&mut line).expect("read request") == 0 {
-        return;
-    }
-    let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
+    // A client whose first request depends on the daemon's protocol version
+    // sends `daemon.health` first. The fixture answers it like a daemon and keeps
+    // it out of the captured wire, which holds the method requests only.
+    let request: Request = loop {
+        line.clear();
+        if reader.read_line(&mut line).expect("read request") == 0 {
+            return;
+        }
+        let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
+        if request.method() != protocol::method::DAEMON_HEALTH {
+            break request;
+        }
+        let health = Response::ok(
+            PROTOCOL_VERSION,
+            request.id(),
+            json!({
+                "status": "ok",
+                "daemon_version": "fixture",
+                "protocol_version": PROTOCOL_VERSION.get()
+            }),
+        )
+        .expect("valid health response");
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            serde_json::to_string(&health).expect("serialize health response")
+        )
+        .expect("write health response");
+    };
     requests
         .lock()
         .expect("request capture lock")

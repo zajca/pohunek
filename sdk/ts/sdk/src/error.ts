@@ -23,6 +23,8 @@ export const ClientErrorCode = {
   Json: "json_error",
   InputWaitContract: "session_input_wait_contract_mismatch",
   VersionMismatch: "version_mismatch",
+  DaemonProtocolTooOld: "daemon_protocol_too_old",
+  VersionTranslationFailed: "version_translation_failed",
 } as const;
 
 export type ClientErrorKind =
@@ -36,7 +38,20 @@ export type ClientErrorKind =
   | "io"
   | "json"
   | "inputWaitContract"
-  | "versionMismatch";
+  | "versionMismatch"
+  | "daemonProtocolTooOld"
+  | "versionTranslation";
+
+/** Facts of a method that a daemon's older protocol version never defined. */
+export interface DaemonProtocolTooOldDetail {
+  /** Route of the remote host, or `undefined` for the local daemon. */
+  readonly host: string | undefined;
+  readonly method: string;
+  /** Protocol version the daemon negotiated for the connection. */
+  readonly daemonVersion: ProtocolVersion;
+  /** Protocol version that defines the method. */
+  readonly requiredVersion: ProtocolVersion;
+}
 
 export class ClientError extends Error {
   public override readonly name = "ClientError";
@@ -44,11 +59,20 @@ export class ClientError extends Error {
   public readonly errorClass: ErrorClass;
   public readonly code: string;
   public readonly source: unknown;
+  /** Set for `daemonProtocolTooOld` errors. */
+  public readonly tooOld: DaemonProtocolTooOldDetail | undefined;
 
   private readonly structured: ProtocolError;
 
-  private constructor(kind: ClientErrorKind, message: string, structured: ProtocolError, source?: unknown) {
+  private constructor(
+    kind: ClientErrorKind,
+    message: string,
+    structured: ProtocolError,
+    source?: unknown,
+    tooOld?: DaemonProtocolTooOldDetail,
+  ) {
     super(message);
+    this.tooOld = tooOld;
     this.kind = kind;
     this.errorClass = structured.class;
     this.code = structured.code;
@@ -193,6 +217,45 @@ export class ClientError extends Error {
     );
   }
 
+  /** A method the daemon's negotiated older protocol version never defined. */
+  public static daemonProtocolTooOld(detail: DaemonProtocolTooOldDetail): ClientError {
+    const target = daemonTarget(detail.host);
+    const msg = `${target} runs protocol ${detail.daemonVersion}, but \`${detail.method}\` needs protocol ${detail.requiredVersion}`;
+    return new ClientError(
+      "daemonProtocolTooOld",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.DaemonProtocolTooOld,
+        msg,
+        `upgrade pohunek on ${target} to a release that speaks protocol ${detail.requiredVersion}`,
+      ),
+      undefined,
+      { ...detail },
+    );
+  }
+
+  /** A payload that could not be translated for the daemon's older version. */
+  public static versionTranslation(
+    host: string | undefined,
+    daemonVersion: ProtocolVersion,
+    source: unknown,
+  ): ClientError {
+    const target = daemonTarget(host);
+    const msg = `a payload cannot be translated for ${target}, which runs protocol ${daemonVersion}`;
+    return new ClientError(
+      "versionTranslation",
+      msg,
+      protocolError(
+        ClientErrorClass.Daemon,
+        ClientErrorCode.VersionTranslationFailed,
+        msg,
+        `upgrade pohunek on ${target} so both sides speak the same protocol version`,
+      ),
+      source,
+    );
+  }
+
   public toProtocolError(): ProtocolError {
     return cloneProtocolError(this.structured);
   }
@@ -200,6 +263,10 @@ export class ClientError extends Error {
   public recoverHint(): string | undefined {
     return this.structured.recover;
   }
+}
+
+function daemonTarget(host: string | undefined): string {
+  return host === undefined ? "the local daemon" : `host '${host}'`;
 }
 
 function protocolError(

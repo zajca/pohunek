@@ -34,8 +34,9 @@ pub(super) fn handle_host_inspect(
 ///
 /// The daemon caches the shared discovery engine for a short TTL (see
 /// [`DiscoveryCache`]), so repeated calls return promptly; `force` bypasses
-/// that cache. Peers are probed and classified for the version negotiated with
-/// the asking connection, and cached per version. Discovery errors retain their typed protocol mapping rather than
+/// that cache. Peers are probed and classified for the range the asking client
+/// advertised (a client keeps its whole window on this method, see
+/// [`protocol::compat::RANGE_FORWARDING_METHODS`]), and cached per range. Discovery errors retain their typed protocol mapping rather than
 /// being represented as an empty peer list.
 pub(super) async fn handle_host_discover(
     request: &Request,
@@ -46,7 +47,7 @@ pub(super) async fn handle_host_discover(
         Err(err) => return error_value(request, err),
     };
     match discovery
-        .records(params.force, selected_version(request))
+        .records(params.force, request.version_range())
         .await
     {
         Ok(records) => ok_value(request, &records),

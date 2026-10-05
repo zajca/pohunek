@@ -15,13 +15,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use nix::fcntl::{Flock, FlockArg};
 use nix::unistd::Uid;
 
-use protocol::{HostRecord, PROTOCOL_VERSION};
+use protocol::{HostRecord, ProtocolVersionRange, CLIENT_PROTOCOL_VERSIONS};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CliError;
 
 /// Cache format revision; changing it invalidates incompatible derived data.
-const CACHE_SCHEMA: u32 = 2;
+const CACHE_SCHEMA: u32 = 3;
 /// Cache directory under the pohunek XDG cache root.
 const CACHE_SUBDIR: &str = "host-discovery";
 /// Completed cache filename.
@@ -41,7 +41,8 @@ const LOCK_RETRY: Duration = Duration::from_millis(50);
 struct Snapshot {
     schema: u32,
     fetched_unix_nanos: u128,
-    protocol_version: u32,
+    /// Protocol range the peers were probed and classified for.
+    protocol: ProtocolVersionRange,
     routes: Vec<RegistryRoute>,
     records: Vec<HostRecord>,
 }
@@ -113,7 +114,7 @@ where
     let snapshot = Snapshot {
         schema: CACHE_SCHEMA,
         fetched_unix_nanos: unix_nanos()?,
-        protocol_version: PROTOCOL_VERSION.get(),
+        protocol: options.protocol_range(),
         routes,
         records: records.clone(),
     };
@@ -141,7 +142,7 @@ fn load_fresh(dir: &Path, routes: &[RegistryRoute]) -> Result<Option<Snapshot>, 
     };
     let now = unix_nanos()?;
     let fresh = snapshot.schema == CACHE_SCHEMA
-        && snapshot.protocol_version == PROTOCOL_VERSION.get()
+        && snapshot.protocol == CLIENT_PROTOCOL_VERSIONS
         && snapshot.routes == routes
         && snapshot.fetched_unix_nanos <= now
         && now.saturating_sub(snapshot.fetched_unix_nanos)
@@ -292,7 +293,7 @@ mod tests {
         Snapshot {
             schema: CACHE_SCHEMA,
             fetched_unix_nanos,
-            protocol_version: PROTOCOL_VERSION.get(),
+            protocol: CLIENT_PROTOCOL_VERSIONS,
             routes: routes(port),
             records,
         }
@@ -367,7 +368,7 @@ mod tests {
             .expect("load")
             .is_none());
         let mut wrong_protocol = snapshot(18722, now, Vec::new());
-        wrong_protocol.protocol_version += 1;
+        wrong_protocol.protocol = protocol::CURRENT_PROTOCOL_VERSIONS;
         store_atomic(&dir, &wrong_protocol).expect("store");
         assert!(load_fresh(&dir, &routes(TEST_PORT))
             .expect("load")

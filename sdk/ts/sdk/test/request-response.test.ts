@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import {
   MAX_CONTROL_LINE_BYTES,
   MAX_SESSION_WAIT_MS,
+  MIN_PROTOCOL_VERSION,
   PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
   CLIENT_PROTOCOL_VERSIONS,
   type HostGovernanceStatus,
   type ProtocolError,
@@ -470,15 +472,17 @@ describe("Client request/response", () => {
     }
   });
 
-  test("a client offers only the current version and refuses a daemon that answers in an older one", async () => {
-    expect(CLIENT_PROTOCOL_VERSIONS).toEqual({ minimum: PROTOCOL_VERSION, maximum: PROTOCOL_VERSION });
+  test("a client offers the whole window and refuses a daemon that answers below it", async () => {
+    expect(CLIENT_PROTOCOL_VERSIONS).toEqual({ minimum: MIN_PROTOCOL_VERSION, maximum: PROTOCOL_VERSION });
+    expect(CLIENT_PROTOCOL_VERSIONS).toEqual(SUPPORTED_PROTOCOL_VERSIONS);
+    const below = MIN_PROTOCOL_VERSION - 1;
     const daemon = await startUnixDaemon([
       {
         kind: "reply",
         line: (requestLine) => JSON.stringify({
-          v: PROTOCOL_VERSION - 1,
+          v: below,
           id: requestIdFromLine(requestLine),
-          ok: { status: "ok", daemon_version: "0.0.0", protocol_version: PROTOCOL_VERSION - 1 },
+          ok: { status: "ok", daemon_version: "0.0.0", protocol_version: below },
         }),
       },
     ]);
@@ -489,7 +493,7 @@ describe("Client request/response", () => {
 
       expect(error.toProtocolError().code).toBe("version_mismatch");
       const sent = parseRequestLine(await daemon.nextRequest());
-      expect(sent["v"]).toEqual({ minimum: PROTOCOL_VERSION, maximum: PROTOCOL_VERSION });
+      expect(sent["v"]).toEqual(CLIENT_PROTOCOL_VERSIONS);
     } finally {
       await daemon.close();
     }

@@ -1,4 +1,8 @@
-//! Edge adapter for public protocol version 3.
+//! Edge adapter for public protocol version 3, in both directions.
+//!
+//! A daemon translates protocol 3 requests up and its own results and events
+//! down; a client does the inverse against a protocol 3 daemon. Both use the
+//! same sites below.
 //!
 //! Protocol 3 spelled the worker instance identity `runtime_id`; protocol 4
 //! spells it `worker_instance_id` (and `previous_runtime_id` as
@@ -39,6 +43,14 @@ const LEGACY_KEY: &str = "runtime_id";
 const CURRENT_PREVIOUS_KEY: &str = "previous_worker_instance_id";
 /// Spelling of the replaced worker instance key in protocol 3.
 const LEGACY_PREVIOUS_KEY: &str = "previous_runtime_id";
+/// Keys protocol 3 spelled differently, as `(protocol 3, current)`.
+///
+/// Published through [`super::renamed_keys`] so the TypeScript SDK generates its
+/// own mapping from the same data.
+pub(super) const RENAMED_KEYS: &[(&str, &str)] = &[
+    (LEGACY_KEY, CURRENT_KEY),
+    (LEGACY_PREVIOUS_KEY, CURRENT_PREVIOUS_KEY),
+];
 /// Object key holding a nested runtime identity or a session runtime.
 const RUNTIME_FIELD: &str = "runtime";
 
@@ -99,34 +111,76 @@ const SESSION_EVENTS: &[&str] = &[
 ];
 
 /// Translates protocol 3 request parameters into the current shape.
-pub(super) fn request_params(method: &str, mut params: Value) -> Result<Value, CompatError> {
+pub(super) fn request_params(method: &str, params: Value) -> Result<Value, CompatError> {
+    translate_request(method, params, Direction::ToCurrent)
+}
+
+/// Translates current request parameters into the protocol 3 shape.
+pub(super) fn downgrade_request_params(method: &str, params: Value) -> Result<Value, CompatError> {
+    translate_request(method, params, Direction::ToLegacy)
+}
+
+/// Translates a current success payload into the protocol 3 shape.
+pub(super) fn result(method: &str, result: Value) -> Result<Value, CompatError> {
+    translate_result(method, result, Direction::ToLegacy)
+}
+
+/// Translates a protocol 3 success payload into the current shape.
+pub(super) fn upgrade_result(method: &str, result: Value) -> Result<Value, CompatError> {
+    translate_result(method, result, Direction::ToCurrent)
+}
+
+/// Translates a current event payload into the protocol 3 shape.
+pub(super) fn event_payload(name: &str, payload: Value) -> Result<Option<Value>, CompatError> {
+    if !KNOWN_EVENTS.contains(&name) {
+        return Ok(None);
+    }
+    translate_event(name, payload, Direction::ToLegacy).map(Some)
+}
+
+/// Translates a protocol 3 event payload into the current shape.
+///
+/// An event name outside [`KNOWN_EVENTS`] passes through untouched: its payload
+/// carries no renamed key this adapter knows about.
+pub(super) fn upgrade_event_payload(name: &str, payload: Value) -> Result<Value, CompatError> {
+    translate_event(name, payload, Direction::ToCurrent)
+}
+
+fn translate_request(
+    method: &str,
+    mut params: Value,
+    direction: Direction,
+) -> Result<Value, CompatError> {
     reject_introduced(method)?;
     match method {
         method::SESSION_OUTPUT | method::SESSION_WAIT => {
-            nested_identity(&mut params, "params.runtime", Direction::ToCurrent)?;
+            nested_identity(&mut params, "params.runtime", direction)?;
         }
         method::SESSION_REPORT_NATIVE_ID => {
-            rename_in(&mut params, "params", Direction::ToCurrent)?;
+            rename_in(&mut params, "params", direction)?;
         }
         _ => {}
     }
     Ok(params)
 }
 
-/// Translates a current success payload into the protocol 3 shape.
-pub(super) fn result(method: &str, mut result: Value) -> Result<Value, CompatError> {
+fn translate_result(
+    method: &str,
+    mut result: Value,
+    direction: Direction,
+) -> Result<Value, CompatError> {
     reject_introduced(method)?;
     match method {
         method::SESSION_LIST => {
             if let Value::Array(sessions) = &mut result {
                 for session in sessions {
-                    session_info(session, "result[]")?;
+                    session_info(session, "result[]", direction)?;
                 }
             }
         }
         // `session.new` and `session.fork` flatten the session into the result.
         method::SESSION_INSPECT | method::SESSION_NEW | method::SESSION_FORK => {
-            session_info(&mut result, "result")?;
+            session_info(&mut result, "result", direction)?;
         }
         method::SESSION_RESUME
         | method::SESSION_RESIZE
@@ -134,19 +188,19 @@ pub(super) fn result(method: &str, mut result: Value) -> Result<Value, CompatErr
         | method::SESSION_RENAME
         | method::SESSION_WAIT => {
             if let Some(session) = field(&mut result, "session") {
-                session_info(session, "result.session")?;
+                session_info(session, "result.session", direction)?;
             }
         }
         method::SESSION_INPUT => {
-            nested_identity(&mut result, "result.runtime", Direction::ToLegacy)?;
+            nested_identity(&mut result, "result.runtime", direction)?;
         }
         method::SESSION_SCREEN | method::SESSION_READ | method::SESSION_OUTPUT => {
-            rename_in(&mut result, "result", Direction::ToLegacy)?;
+            rename_in(&mut result, "result", direction)?;
         }
         method::SESSION_RUNTIME_INVENTORY => {
             if let Some(Value::Array(entries)) = field(&mut result, "entries") {
                 for entry in entries {
-                    rename_in(entry, "result.entries[]", Direction::ToLegacy)?;
+                    rename_in(entry, "result.entries[]", direction)?;
                 }
             }
         }
@@ -155,37 +209,39 @@ pub(super) fn result(method: &str, mut result: Value) -> Result<Value, CompatErr
     Ok(result)
 }
 
-/// Translates a current event payload into the protocol 3 shape.
-pub(super) fn event_payload(name: &str, mut payload: Value) -> Result<Option<Value>, CompatError> {
-    if !KNOWN_EVENTS.contains(&name) {
-        return Ok(None);
-    }
+fn translate_event(
+    name: &str,
+    mut payload: Value,
+    direction: Direction,
+) -> Result<Value, CompatError> {
     match name {
         event::AGENT_STATE | event::SUBAGENT_STATE => {
-            nested_identity(&mut payload, "payload.runtime", Direction::ToLegacy)?;
+            nested_identity(&mut payload, "payload.runtime", direction)?;
         }
         event::SESSION_RUNTIME_DISCOVERED => {
             if let Some(entry) = field(&mut payload, "entry") {
-                rename_in(entry, "payload.entry", Direction::ToLegacy)?;
+                rename_in(entry, "payload.entry", direction)?;
             }
         }
         event::SESSION_NATIVE_RECOVERED => {
             if let Some(session) = field(&mut payload, "session") {
-                session_info(session, "payload.session")?;
+                session_info(session, "payload.session", direction)?;
             }
             if let Value::Object(object) = &mut payload {
-                rename_key(object, CURRENT_PREVIOUS_KEY, LEGACY_PREVIOUS_KEY, "payload")?;
-                rename_key(object, CURRENT_KEY, LEGACY_KEY, "payload")?;
+                let (previous_from, previous_to) = direction.previous_keys();
+                rename_key(object, previous_from, previous_to, "payload")?;
+                let (from, to) = direction.keys();
+                rename_key(object, from, to, "payload")?;
             }
         }
         _ if SESSION_EVENTS.contains(&name) => {
             if let Some(session) = field(&mut payload, "session") {
-                session_info(session, "payload.session")?;
+                session_info(session, "payload.session", direction)?;
             }
         }
         _ => {}
     }
-    Ok(Some(payload))
+    Ok(payload)
 }
 
 fn reject_introduced(method: &str) -> Result<(), CompatError> {
@@ -214,23 +270,37 @@ impl Direction {
             Self::ToLegacy => (CURRENT_KEY, LEGACY_KEY),
         }
     }
+
+    const fn previous_keys(self) -> (&'static str, &'static str) {
+        match self {
+            Self::ToCurrent => (LEGACY_PREVIOUS_KEY, CURRENT_PREVIOUS_KEY),
+            Self::ToLegacy => (CURRENT_PREVIOUS_KEY, LEGACY_PREVIOUS_KEY),
+        }
+    }
 }
 
-/// Translates a `SessionInfo`: its runtime identity and its warnings.
-fn session_info(session: &mut Value, site: &'static str) -> Result<(), CompatError> {
+/// Translates a `SessionInfo`: its runtime identity and, toward protocol 3,
+/// its warnings.
+fn session_info(
+    session: &mut Value,
+    site: &'static str,
+    direction: Direction,
+) -> Result<(), CompatError> {
     let Value::Object(object) = session else {
         return Ok(());
     };
     if let Some(runtime) = object.get_mut(RUNTIME_FIELD) {
-        rename_in(runtime, site, Direction::ToLegacy)?;
+        rename_in(runtime, site, direction)?;
     }
-    if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
-        warnings.retain(|warning| {
-            warning
-                .get("kind")
-                .and_then(Value::as_str)
-                .is_some_and(|kind| KNOWN_WARNING_KINDS.contains(&kind))
-        });
+    if matches!(direction, Direction::ToLegacy) {
+        if let Some(Value::Array(warnings)) = object.get_mut("warnings") {
+            warnings.retain(|warning| {
+                warning
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| KNOWN_WARNING_KINDS.contains(&kind))
+            });
+        }
     }
     Ok(())
 }
@@ -290,8 +360,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        event_payload, request_params, result, INTRODUCED_METHODS, KNOWN_EVENTS,
-        KNOWN_WARNING_KINDS,
+        downgrade_request_params, event_payload, request_params, result, upgrade_event_payload,
+        upgrade_result, INTRODUCED_METHODS, KNOWN_EVENTS, KNOWN_WARNING_KINDS,
     };
     use crate::{compat::CompatError, event, method};
 
@@ -585,5 +655,162 @@ mod tests {
             .filter(|name| !KNOWN_EVENTS.contains(name))
             .collect();
         assert_eq!(withheld, Vec::<&str>::new());
+    }
+
+    #[test]
+    fn request_downgrade_reaches_the_nested_identity_and_the_native_id_report() {
+        for method_name in [method::SESSION_OUTPUT, method::SESSION_WAIT] {
+            let downgraded = downgrade_request_params(
+                method_name,
+                json!({"session_id": "s-1", "runtime": {"worker_instance_id": "w-1", "runtime_generation": "1"}}),
+            )
+            .expect("adapter");
+            assert_eq!(
+                downgraded["runtime"],
+                json!({"runtime_id": "w-1", "runtime_generation": "1"}),
+                "{method_name}"
+            );
+        }
+        assert_eq!(
+            downgrade_request_params(
+                method::SESSION_REPORT_NATIVE_ID,
+                json!({"session_id": "s-1", "worker_instance_id": "w-1", "agent": "claude"}),
+            )
+            .expect("adapter"),
+            json!({"session_id": "s-1", "runtime_id": "w-1", "agent": "claude"})
+        );
+    }
+
+    #[test]
+    fn request_downgrade_never_walks_free_form_values() {
+        let params = json!({"session_id": "s-1", "metadata": {"worker_instance_id": "user-value"}});
+        assert_eq!(
+            downgrade_request_params(method::SESSION_SET_METADATA, params.clone())
+                .expect("adapter"),
+            params
+        );
+    }
+
+    #[test]
+    fn request_downgrade_refuses_a_request_that_already_has_the_protocol_3_spelling() {
+        let error = downgrade_request_params(
+            method::SESSION_REPORT_NATIVE_ID,
+            json!({"worker_instance_id": "w-1", "runtime_id": "w-0"}),
+        )
+        .expect_err("two identities in one request");
+        assert_eq!(
+            error,
+            CompatError::Conflict {
+                site: "params",
+                key: "runtime_id"
+            }
+        );
+    }
+
+    #[test]
+    fn result_upgrade_reaches_every_session_info_carrier() {
+        let legacy_session = || {
+            json!({
+                "id": "s-1",
+                "runtime": {"state": "live", "runtime_generation": "1", "runtime_id": "w-1"},
+                "warnings": [{"kind": "fetch", "message": "a"}]
+            })
+        };
+        for method_name in [
+            method::SESSION_RESUME,
+            method::SESSION_RESIZE,
+            method::SESSION_SET_METADATA,
+            method::SESSION_RENAME,
+            method::SESSION_WAIT,
+        ] {
+            let upgraded =
+                upgrade_result(method_name, json!({"session": legacy_session()})).expect("adapter");
+            assert_eq!(
+                upgraded["session"]["runtime"]["worker_instance_id"], "w-1",
+                "{method_name}"
+            );
+        }
+        for method_name in [
+            method::SESSION_INSPECT,
+            method::SESSION_NEW,
+            method::SESSION_FORK,
+        ] {
+            let upgraded = upgrade_result(method_name, legacy_session()).expect("adapter");
+            assert_eq!(
+                upgraded["runtime"]["worker_instance_id"], "w-1",
+                "{method_name}"
+            );
+            assert_eq!(
+                upgraded["warnings"][0]["kind"], "fetch",
+                "warnings are kept"
+            );
+        }
+        let listed =
+            upgrade_result(method::SESSION_LIST, json!([legacy_session()])).expect("adapter");
+        assert_eq!(listed[0]["runtime"]["worker_instance_id"], "w-1");
+        let input = upgrade_result(
+            method::SESSION_INPUT,
+            json!({"accepted": true, "runtime": {"runtime_id": "w-1", "runtime_generation": "2"}}),
+        )
+        .expect("adapter");
+        assert_eq!(input["runtime"]["worker_instance_id"], "w-1");
+        let inventory = upgrade_result(
+            method::SESSION_RUNTIME_INVENTORY,
+            json!({"entries": [{"runtime_slot": "a", "runtime_id": "w-1", "status": "managed"}]}),
+        )
+        .expect("adapter");
+        assert_eq!(inventory["entries"][0]["worker_instance_id"], "w-1");
+    }
+
+    #[test]
+    fn result_upgrade_refuses_a_method_the_protocol_never_defined() {
+        for name in INTRODUCED_METHODS {
+            assert_eq!(
+                upgrade_result(name, json!({})),
+                Err(CompatError::MethodNotDefined {
+                    method: (*name).to_owned()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn event_upgrade_reaches_every_carrier() {
+        let identity = json!({"runtime_id": "w-1", "runtime_generation": "1"});
+        for name in [event::AGENT_STATE, event::SUBAGENT_STATE] {
+            let payload =
+                upgrade_event_payload(name, json!({"runtime": identity.clone()})).expect("adapter");
+            assert_eq!(payload["runtime"]["worker_instance_id"], "w-1", "{name}");
+        }
+        for name in super::SESSION_EVENTS {
+            let payload = upgrade_event_payload(
+                name,
+                json!({"session": {"runtime": identity.clone(), "warnings": []}}),
+            )
+            .expect("adapter");
+            assert_eq!(
+                payload["session"]["runtime"]["worker_instance_id"], "w-1",
+                "{name}"
+            );
+        }
+        let discovered = upgrade_event_payload(
+            event::SESSION_RUNTIME_DISCOVERED,
+            json!({"entry": {"runtime_slot": "a", "runtime_id": "w-1", "status": "managed"}}),
+        )
+        .expect("adapter");
+        assert_eq!(discovered["entry"]["worker_instance_id"], "w-1");
+        let recovered = upgrade_event_payload(
+            event::SESSION_NATIVE_RECOVERED,
+            json!({
+                "session": {"runtime": identity, "warnings": []},
+                "previous_runtime_id": "w-0",
+                "runtime_id": "w-1"
+            }),
+        )
+        .expect("adapter");
+        assert_eq!(recovered["session"]["runtime"]["worker_instance_id"], "w-1");
+        assert_eq!(recovered["previous_worker_instance_id"], "w-0");
+        assert_eq!(recovered["worker_instance_id"], "w-1");
+        assert!(recovered.get("runtime_id").is_none());
     }
 }

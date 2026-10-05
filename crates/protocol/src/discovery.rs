@@ -26,12 +26,14 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "ts", ts(export, export_to = "HostClass.ts"))]
 #[serde(rename_all = "snake_case", tag = "classification")]
 pub enum HostClass {
-    /// A compatible daemon answered with our protocol version.
+    /// A compatible daemon answered with a protocol version inside the asking
+    /// client's range.
     ReachableDaemon {
         /// The daemon version the peer reported.
         daemon_version: String,
     },
-    /// A daemon answered but speaks a different protocol version.
+    /// A daemon answered but speaks a protocol version outside the asking
+    /// client's range.
     VersionMismatch {
         /// The protocol version the peer's daemon reported.
         daemon_protocol_version: u32,

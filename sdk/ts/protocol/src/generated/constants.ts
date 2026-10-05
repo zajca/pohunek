@@ -4,10 +4,31 @@ import type { AttachHeader } from "./index";
 
 export const PROTOCOL_VERSION = 4 as const;
 export const MIN_PROTOCOL_VERSION = 3 as const;
-/** Range a daemon of this release accepts; a client does not advertise it. */
+/** Range a daemon of this release accepts. */
 export const SUPPORTED_PROTOCOL_VERSIONS = { minimum: 3, maximum: 4 } as const;
-/** Range a client of this release advertises in every request. */
-export const CLIENT_PROTOCOL_VERSIONS = { minimum: 4, maximum: 4 } as const;
+/** Range a client of this release advertises in every request: the whole window. */
+export const CLIENT_PROTOCOL_VERSIONS = { minimum: 3, maximum: 4 } as const;
+/** Methods the previous protocol version never defined; a client refuses them before sending to a daemon of that version. */
+export const PREVIOUS_VERSION_INTRODUCED_METHODS = [
+  "package.list",
+  "package.inspect",
+  "package.doctor",
+  "package.install",
+  "package.link",
+  "package.set_enabled",
+  "package.select",
+  "package.uninstall",
+  "package.bind_profile",
+] as const;
+/** Keys the previous protocol version spelled differently, as [previous, current]. */
+/** Methods whose handler forwards the asking client's range to other hosts; a client keeps advertising its whole window on them. */
+export const RANGE_FORWARDING_METHODS = [
+  "host.discover",
+] as const;
+export const PREVIOUS_VERSION_RENAMED_KEYS = [
+  ["runtime_id", "worker_instance_id"],
+  ["previous_runtime_id", "previous_worker_instance_id"],
+] as const;
 export const MAX_CONTROL_LINE_BYTES = 1048576 as const;
 export const MAX_WORKER_INSTANCE_ID_BYTES = 128 as const;
 export const MAX_SESSION_INPUT_BYTES = 262144 as const;

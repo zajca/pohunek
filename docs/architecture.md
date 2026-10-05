@@ -155,10 +155,10 @@ versioned SDKs. The Rust crates are pinned by git tag; the TypeScript SDK is
 pinned by release-tarball URL and integrity. The core crates a Rust client links
 (`client`, `protocol`, `paths`, `platform`, `prompt`, `knowledge`, `assistant`)
 are a pinned, not a stable, API: they stay pre-1.0 with no back-compat shims.
-External UIs pin the `PROTOCOL_VERSION` they were built against, because the
-TypeScript SDK handshake requires the version negotiated for its connection to
-equal its own; a daemon one release newer still serves them through the protocol
-window (see "Protocol versioning"). Methods only UI clients
+External UIs pin the `PROTOCOL_VERSION` they were built against; a daemon one
+release newer still serves them through the protocol window, and the SDK talks
+to a daemon one release older through its own adapter (see "Protocol
+versioning"). Methods only UI clients
 call (`host.discover`, `worktree.remove`) are still public obligations with
 server-side contract tests in core (`docs/public-api.md`, "External clients").
 Issue and PR providers (Linear, GitHub) are client concerns and never enter
@@ -511,12 +511,17 @@ The bounded N-1 rule that governs those later overlaps is the
 
 A daemon of release N negotiates `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION`
 (`SUPPORTED_PROTOCOL_VERSIONS`) with the minimum one below the maximum, so it
-serves release N-1's public protocol next to its own (today `3..=4`). Clients
-advertise only `CLIENT_PROTOCOL_VERSIONS`, exactly `PROTOCOL_VERSION`, because
-they carry no adapters: a current client against a daemon that only speaks the
-older version gets `daemon/version_mismatch` instead of a payload it would
-decode wrongly (new clients against an N-1 daemon on another host are
-[#527](https://github.com/zajca/pohunek/issues/527)).
+serves release N-1's public protocol next to its own (today `3..=4`). The Rust
+client and the CLI advertise the same window: `CLIENT_PROTOCOL_VERSIONS` is
+`SUPPORTED_PROTOCOL_VERSIONS`, so the window has one definition. A client of
+release N against a daemon that only speaks N-1 (a staggered multi-host
+upgrade over NetBird) therefore negotiates N-1 and translates through the same
+adapter the daemon uses, in the opposite direction. The TypeScript SDK
+advertises the same window (its constants are generated from the Rust ones) and
+carries a port of the adapter in `sdk/ts/sdk/src/compat.ts`. The port is checked
+against the same recorded fixtures and uses key names and the introduced-method
+list generated from the Rust adapter, so `cargo xtask ts check` catches drift
+([#527](https://github.com/zajca/pohunek/issues/527)).
 
 Core types describe only the current wire shape. `crates/protocol/src/compat/`
 holds one adapter module per older version in the window (`v3`). An adapter
@@ -527,7 +532,24 @@ warning kinds it never knew). The daemon applies it at two choke points:
 `handle_request` upgrades the request parameters and downgrades the response,
 and the subscription writer downgrades every event for its own connection,
 because the negotiated version is fixed for the connection's life. Handlers and
-the event bus only ever see the current shape. `daemon.health` and
+the event bus only ever see the current shape.
+
+The Rust client applies the inverse at its own choke points
+(`crates/client/src/transport.rs`). Once its connection has selected N-1 it
+downgrades each request (`compat::downgrade_request`, pinning the request to the
+selected version) and upgrades every success payload and subscription event
+(`compat::upgrade_result`, `compat::upgrade_event`), so callers, `--json` output
+and `Subscription::next_line` only ever carry the current shape. A fresh
+connection sends a request that means the same in both versions as it is and
+learns the version from the first response; a request whose translation depends
+on the version (it carries a worker identity, or the method is new in N) first
+sends `daemon.health` on the connection. A dedicated wait/output connection
+inherits the version its parent selected. A payload the adapter cannot
+translate, or a daemon that sends the current spelling under N-1, is refused
+with `daemon/version_translation_failed`. Discovery probes offer the asking
+client's range and classify a peer as reachable when it answers inside it, so
+`host list` and the multi-host fan-out include N-1 hosts for a client that can
+speak to them. `daemon.health` and
 `host.inspect` report the version negotiated for the asking connection, which is
 what an N-1 SDK handshake compares with its own version.
 
@@ -545,7 +567,10 @@ Two rules keep the window bounded:
   previous-release fixture and no older shape to translate to. It goes on the
   adapter's `INTRODUCED_METHODS` list (`crates/protocol/src/compat/v3.rs`), and a
   connection of the older version gets `method_not_found` for it; its results
-  are never translated or sent. An event added after the previous release is
+  are never translated or sent. A client of release N refuses such a method
+  before sending it to an N-1 daemon, with the typed
+  `daemon/daemon_protocol_too_old` error that names the host, the daemon's
+  protocol version and the required one. An event added after the previous release is
   withheld from older subscribers by the known-event list. The coverage tests
   stay strict: a method without a fixture that is not on the list fails them.
   The list is deleted with its adapter.
@@ -592,15 +617,17 @@ states the contract and then the current state.
   current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is listed; any other schema gets
   a typed reason and a WARN and is never used as generation evidence.
 - **Public-protocol clients.** The contract: a protocol change keeps the
-  previous version served through daemon-side adapters, so the advertised range
-  is `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the
-  maximum. An adapter translates shape only. A semantic change raises
+  previous version served through adapters, so the advertised range is
+  `MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION` with a minimum below the maximum.
+  An adapter translates shape only. A semantic change raises
   `MIN_PROTOCOL_VERSION` as well and is an announced break. The oldest adapter
-  is deleted on the next bump. The current state: the
-  daemon accepts `3..=4` through the `v3` adapter while clients advertise only
-  `4..=4`; a new client against an N-1 daemon is refused, so hosts still
-  upgrade in one pass for that direction
-  ([#527](https://github.com/zajca/pohunek/issues/527)). Mechanics, rules and
+  is deleted on the next bump. The current state: the daemon accepts `3..=4`
+  through the `v3` adapter, and the Rust client and CLI advertise the same
+  window and translate through that adapter against an N-1 daemon. A method new
+  in N is refused client-side with `daemon/daemon_protocol_too_old`. The
+  TypeScript SDK advertises the same window and translates through its port of
+  the adapter, so no direction of the N versus N-1 pair needs a one-pass
+  upgrade ([#527](https://github.com/zajca/pohunek/issues/527)). Mechanics, rules and
   fixtures are under "Protocol window and edge adapters" above.
 - **Persisted daemon state.** Migrates from any older kept schema (see below).
 

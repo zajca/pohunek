@@ -18,6 +18,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use protocol::compat::{introduced_methods, renamed_keys, RANGE_FORWARDING_METHODS};
 use protocol::{
     event, method, ActivityRevision, AgentActivity, AgentStateEvent, AttachEvent, CwdSource, Event,
     NotificationId, NotificationKind, NotificationKindPolicy, NotificationPolicy,
@@ -228,7 +229,7 @@ fn emit_methods(dir: &Path) -> Result<(), XtaskError> {
     let mut body = String::new();
     push_type_import(&mut body, &imports);
     body.push_str("export interface Methods {\n");
-    for spec in specs {
+    for spec in &specs {
         writeln!(
             body,
             "  \"{}\": {{ params: {}; output: {} }};",
@@ -236,9 +237,50 @@ fn emit_methods(dir: &Path) -> Result<(), XtaskError> {
         )
         .expect("writing to a String cannot fail");
     }
-    body.push_str("}\n");
+    body.push_str("}\n\n");
+    body.push_str("/** Every public method name of this release. */\n");
+    body.push_str("export const METHOD_NAMES = [\n");
+    for spec in &specs {
+        writeln!(body, "  \"{}\",", spec.name).expect("writing to a String cannot fail");
+    }
+    body.push_str("] as const satisfies readonly (keyof Methods)[];\n");
 
     write_generated_file(&dir.join("methods.ts"), &body)
+}
+
+/// Emits the tables a client without the Rust adapter needs for the previous version.
+fn emit_previous_version_tables(body: &mut String) {
+    writeln!(
+        body,
+        "/** Methods the previous protocol version never defined; a client refuses them before sending to a daemon of that version. */"
+    )
+    .expect("writing to a String cannot fail");
+    body.push_str("export const PREVIOUS_VERSION_INTRODUCED_METHODS = [\n");
+    for name in introduced_methods(MIN_PROTOCOL_VERSION) {
+        writeln!(body, "  \"{name}\",").expect("writing to a String cannot fail");
+    }
+    body.push_str("] as const;\n");
+    writeln!(
+        body,
+        "/** Keys the previous protocol version spelled differently, as [previous, current]. */"
+    )
+    .expect("writing to a String cannot fail");
+    writeln!(
+        body,
+        "/** Methods whose handler forwards the asking client's range to other hosts; a client keeps advertising its whole window on them. */"
+    )
+    .expect("writing to a String cannot fail");
+    body.push_str("export const RANGE_FORWARDING_METHODS = [\n");
+    for name in RANGE_FORWARDING_METHODS {
+        writeln!(body, "  \"{name}\",").expect("writing to a String cannot fail");
+    }
+    body.push_str("] as const;\n");
+    body.push_str("export const PREVIOUS_VERSION_RENAMED_KEYS = [\n");
+    for (previous, current) in renamed_keys(MIN_PROTOCOL_VERSION) {
+        writeln!(body, "  [\"{previous}\", \"{current}\"],")
+            .expect("writing to a String cannot fail");
+    }
+    body.push_str("] as const;\n");
 }
 
 fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
@@ -258,11 +300,8 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
         MIN_PROTOCOL_VERSION.get()
     )
     .expect("writing to a String cannot fail");
-    writeln!(
-        body,
-        "/** Range a daemon of this release accepts; a client does not advertise it. */"
-    )
-    .expect("writing to a String cannot fail");
+    writeln!(body, "/** Range a daemon of this release accepts. */")
+        .expect("writing to a String cannot fail");
     writeln!(
         body,
         "export const SUPPORTED_PROTOCOL_VERSIONS = {{ minimum: {}, maximum: {} }} as const;",
@@ -272,7 +311,7 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
     .expect("writing to a String cannot fail");
     writeln!(
         body,
-        "/** Range a client of this release advertises in every request. */"
+        "/** Range a client of this release advertises in every request: the whole window. */"
     )
     .expect("writing to a String cannot fail");
     writeln!(
@@ -282,6 +321,7 @@ fn emit_constants(dir: &Path) -> Result<(), XtaskError> {
         CLIENT_PROTOCOL_VERSIONS.maximum().get()
     )
     .expect("writing to a String cannot fail");
+    emit_previous_version_tables(&mut body);
     writeln!(
         body,
         "export const MAX_CONTROL_LINE_BYTES = {MAX_CONTROL_LINE_BYTES} as const;"

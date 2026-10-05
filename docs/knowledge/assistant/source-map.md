@@ -576,6 +576,11 @@ Protocol contracts and transport:
 - `crates/client/src/lib.rs`
 - `crates/client/src/notifications.rs`
 - `crates/client/src/transport.rs`
+- `crates/client/src/error.rs`
+- `crates/client/tests/previous_daemon.rs`
+- `sdk/ts/sdk/src/compat.ts`
+- `sdk/ts/sdk/test/previous-daemon.test.ts`
+- `sdk/ts/sdk/test/compat.test.ts`
 - `crates/paths/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/compat/mod.rs`

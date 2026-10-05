@@ -179,9 +179,10 @@ the accepted team relay has shipped.
 The current public protocol version is `4` (`PROTOCOL_VERSION`). A daemon of this
 build accepts the inclusive range `3..=4` (`SUPPORTED_PROTOCOL_VERSIONS`): its own
 version and the previous one, which it serves through shape-only edge adapters.
-Clients of this build advertise only `4..=4` (`CLIENT_PROTOCOL_VERSIONS`), so a new
-client against an older daemon is refused until
-[#527](https://github.com/zajca/pohunek/issues/527) lands.
+The Rust client, the CLI and the TypeScript SDK of this build advertise the same
+window (`CLIENT_PROTOCOL_VERSIONS` is `SUPPORTED_PROTOCOL_VERSIONS`), so they also
+talk to a daemon of the previous release
+([#527](https://github.com/zajca/pohunek/issues/527)).
 Requests carry `v: {minimum, maximum}`. The first valid response selects the
 highest overlapping version as an integer `v`, and that selection is fixed for the
 lifetime of the connection. Subscription events use the same selected version and
@@ -191,6 +192,29 @@ connection in `protocol_version`.
 
 A protocol 3 connection is answered `method_not_found` for any method added after
 protocol 3 (today the `package.*` methods), and never receives their results.
+
+A Rust client, CLI or TypeScript SDK client whose connection selected protocol 3 (a daemon of the previous
+release, typically on another host) translates in the opposite direction through the
+same adapter: it sends requests in the protocol 3 spelling (`runtime_id`, pinned to
+`v: {3,3}`) and hands its caller the current shape of every result and event, so
+`--json` output and `Subscription::next_line` never carry `runtime_id`. A request
+whose shape depends on the version first sends `daemon.health` on the connection,
+offering only the versions the request itself allows; a connection whose selected
+version lies outside the request's own range fails client-side before anything is
+sent (`daemon_protocol_too_old` below the range, `version_mismatch` above it).
+After a version is selected every request is pinned to it, except `host.discover`
+(`RANGE_FORWARDING_METHODS`): the daemon classifies peers for the range the request
+advertised, so the client keeps its whole window on it and a protocol 3 peer stays
+`reachable_daemon` however many requests the connection has already served. A
+method added after protocol 3 is refused before it is sent, with the typed
+`daemon/daemon_protocol_too_old` error. Its message names the host, the protocol the
+daemon runs and the protocol the method needs ("host 'netbird:build-2' runs protocol 3,
+but package.list needs protocol 4"); its `recover` hint says to upgrade pohunek on
+that host. A payload that cannot be translated is refused with
+`daemon/version_translation_failed`. A runtime reference that is not one of the
+protocol 3 agent kinds (`shell`, `codex`, `claude`, `hermes`) is not checked on the
+client: the protocol 3 daemon answers it with its own typed
+`agent_kind_unsupported`.
 
 The window is bounded. Adapters translate shape only (renames and moved fields,
 and withholding events and enum values the older version never defined). A
@@ -222,14 +246,15 @@ the protocol 3 adapter: the daemon accepts the `runtime_id` spelling in its
 requests (a request that already carries the v4 spelling is `bad_request`) and
 answers, and streams events, in the `runtime_id` spelling, withholding warning
 kinds and events v3 never defined (a v3 connection never receives a
-`native_recovery` session warning; v4 connections do). A v4 client against a daemon that only speaks
-v3 receives `daemon/version_mismatch` before any method runs. The window covers
+`native_recovery` session warning; v4 connections do). A client whose range does not overlap the window
+receives `daemon/version_mismatch` before any method runs; a client of this build
+negotiates v3 and translates as described above. The window covers
 the public daemon protocol only: the CLI's `--json` envelope reports `protocol`
 `4..=4` and its `--runtime-id` flags are now `--worker-instance-id`, so an
 installed v3 Hermes plugin whose policy pins `3..=3` is refused with
 `pohunek_cli_incompatible` until `pohunek integration install hermes` renews it,
-while its hook requests to the daemon keep working. Upgrade daemons before their
-clients; a v4 client needs a v4 daemon.
+while its hook requests to the daemon keep working. A client and a
+daemon more than one release apart are refused.
 Notification hooks deliver through the worker socket when
 `POHUNEK_WORKER_SOCKET_PATH` is set and fall back to the daemon socket otherwise;
 the worker's `notification_create` hook request is additive to the private
@@ -676,7 +701,10 @@ wire shapes are the exported `crates/protocol` structs.
 - `name` and `fqdn`: optional display selectors, never sufficient by themselves
   to bypass collision checks.
 - The flattened host class remains `candidate`, `reachable_daemon`,
-  `unreachable`, or `version_mismatch`.
+  `unreachable`, or `version_mismatch`. A peer is `reachable_daemon` when it
+  answers a health probe inside the protocol range the asking client advertised
+  (a current Rust client or CLI: `3..=4`), and `version_mismatch` when it answers
+  outside it. `host.discover` classifies for the range of the asking request.
 
 ### `HostGovernanceStatus`
 
@@ -1871,7 +1899,7 @@ Canonical public codes currently emitted include:
 | Class | Codes |
 |---|---|
 | `configuration` | `paths_unavailable`, `netbird_configuration_invalid`, `overlay_registry_invalid`, `invalid_discovery_options`, `agent_config_dir_invalid`, `integration_path_untrusted`, `integration_trust_conflict` |
-| `daemon` | `version_mismatch`, `version_adapter_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
+| `daemon` | `version_mismatch`, `version_adapter_failed`, `daemon_protocol_too_old`, `version_translation_failed`, `method_not_found`, `bad_request`, `daemon_unreachable`, `remote_daemon_unavailable`, `host_governance_unavailable`, `session_input_wait_contract_mismatch`, `projects_not_configured`, `serialize_failed`, `json_error`, `project_task_panicked`, `doctor_task_panicked`, `assistant_materialize_task_panicked`, `assistant_method_unsupported`, `attach_self_feedback`, `daemon_shutting_down` |
 | `transport` | `framing`, `host_unreachable`, `request_timeout` |
 | `discovery` | `<overlay>_cli_missing`, `<overlay>_state_unavailable`, `<overlay>_listener_address_missing`, `overlay_discovery_failed`, `overlay_peer_collision`, `overlay_host_ambiguous`, `overlay_host_unavailable`, `overlay_error`, `host_unknown`, `remote_discovery_failed` |
 | `runtime` | `agent_binary_missing`, `agent_profile_not_found`, `invalid_profile`, `agent_not_resumable`, `agent_native_reference_missing`, `not_resumable`, `invalid_session_ref`, `no_capable_agent`, `bundle_unavailable`, `assistant_bundle_mismatch`, `materialization_failed`, `agent_cannot_read_bundle`, `session_not_found`, `session_not_running`, `session_not_terminal`, `session_external_read_only`, `session_exit_timeout`, `session_runtime_commit_stale`, `session_runtime_conflict`, `session_runtime_reconnecting`, `runtime_supervision_unavailable`, `runtime_supervision_ambiguous`, `runtime_identity_mismatch`, `migration_manifest_missing`, `attach_not_found`, `attach_expired`, `worker_attach_stream_failed`, `worker_protocol_incompatible`, `worker_controller_busy`, `worker_identity_mismatch`, `worker_invalid_state`, `worker_invalid_request`, `worker_invalid_data_token`, `worker_write_outcome_unknown`, `worker_runtime_fault`, `client_file_descriptors_exhausted`, `system_file_descriptors_exhausted`, `pty_alloc_failed`, `spawn_failed`, `pty_error`, `io_error`, `project_store_error`, `project_detect_failed`, `not_a_git_repo`, `project_not_found`, `project_ambiguous`, `prompt_not_found`, `template_not_found`, `action_not_found`, `invalid_name`, `invalid_template`, `invalid_action`, `path_escape`, `config_read_failed`, `agent_not_installable`, `agent_config_dir_missing`, `integration_settings_invalid`, `integration_io_failed`, `worktree_store_error`, `worktree_path_conflict`, `invalid_base_branch`, `worktree_branch_in_use`, `worktree_add_failed`, `invalid_branch`, `invalid_branch_slug`, `notifications_not_configured`, `notification_task_panicked`, `notification_store_error`, `notification_not_found`, `invalid_notification_transition`, `invalid_notification_metadata`, `invalid_notification_session_id`, `invalid_notification_dedupe_key`, `notification_kind_disabled`, `invalid_notification_timestamp`, `invalid_notification_cursor`, `invalid_notification_policy`, `integration_install_in_progress`, `integration_destination_collision`, `integration_recovery_required`, `integration_update_incompatible` |
@@ -2274,9 +2302,9 @@ The web control center and the native desktop GUI live in
 clients of this protocol and the SDKs; nothing in them is private. They pin
 core by git tag (Rust crates) and by release-tarball URL and integrity (the
 TypeScript SDK), and pin the protocol version they were built against: the
-TypeScript SDK handshake requires the version negotiated for its connection to
-equal its own `PROTOCOL_VERSION`, which a daemon one release newer still
-satisfies by serving the previous version. Core crates beyond
+TypeScript SDK handshake accepts any version inside `CLIENT_PROTOCOL_VERSIONS`
+and translates an older daemon's payloads, and a daemon one release newer serves
+the previous version. Core crates beyond
 `pohunek-client` that a Rust client links are a pinned, not a stable, API with no
 back-compat shims. Three methods
 are public obligations whose callers are mostly those external UI clients, so
@@ -2405,10 +2433,15 @@ Request APIs:
 - `Client::integration_status(IntegrationStatusParams)`: reads the complete
   daemon-managed Codex/Claude install contract without mutation.
 - `Client::request(&Request) -> serde_json::Value`: sends one request and returns
-  the raw `ok` payload for low-level callers and framing tests.
+  the `ok` payload in the current shape for low-level callers and framing tests;
+  against a daemon of the previous protocol version it translates both ways, and
+  fails with `ClientError::DaemonProtocolTooOld` before sending a method that
+  version never defined.
 - `Client::subscribe(&Request) -> Subscription`: consumes the client connection
   after a subscribe ack.
-- `Subscription::next_line() -> Option<String>`: returns raw event JSON lines.
+- `Subscription::next_line() -> Option<String>`: returns event JSON lines in the
+  current shape; a connection that selected the previous protocol version
+  translates each event first.
 - `Subscription::next_event() -> Option<Event>`: decodes one event JSON line into
   the protocol event envelope.
 - `Client::create_notification(NotificationCreateParams)`: calls
@@ -2503,6 +2536,10 @@ Public exports:
 - `RawStream`: `ReadableStream<Uint8Array>` plus `WritableStream<Uint8Array>`
   attach duplex.
 - `ClientError`: structured SDK error with `toProtocolError()`.
+- `CompatError`, `downgradeRequestParams`, `upgradeResult`, and
+  `upgradeEventPayload`: the shape-only adapter between the current protocol and
+  the previous version that `Client` applies on a connection that negotiated the
+  previous version; also exported for low-level callers.
 - `ClientErrorClass`, `ClientErrorCode`, and `ClientErrorKind`: the SDK error
   taxonomy used by `ClientError`.
 - `Request`, `Response`, `OkResponse`, `ErrResponse`, and `Event`: hand-written
@@ -2604,7 +2641,12 @@ SDK error mapping:
 - Most SDK-originated errors map into the public protocol taxonomy through
   `ClientErrorClass` and `ClientErrorCode`: `daemon_unreachable`, `framing`,
   `host_unreachable`, `remote_daemon_unavailable`, `request_timeout`, `io_error`,
-  `json_error`, `session_input_wait_contract_mismatch`, and `version_mismatch`.
+  `json_error`, `session_input_wait_contract_mismatch`, `version_mismatch`,
+  `daemon_protocol_too_old` and `version_translation_failed`. The last two are the
+  window errors: `ClientError.kind` `daemonProtocolTooOld` carries
+  `tooOld.{host, method, daemonVersion, requiredVersion}` and is raised before a
+  method new in the current protocol is sent to a daemon that negotiated the
+  previous one.
   `host_governance_inspect_contract_mismatch` is the separate fixed, redacted
   SDK-originated governance-response validation error.
 - `ClientError.toProtocolError()` returns the structured `ProtocolError` for

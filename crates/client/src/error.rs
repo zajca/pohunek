@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use protocol::compat::CompatError;
 use protocol::{EnvelopeError, ErrorClass, ProtocolError, ProtocolVersion, ProtocolVersionRange};
 
 /// Errors raised by SDK client transport and remote-host discovery.
@@ -27,6 +28,44 @@ pub enum ClientError {
         expected: ProtocolVersionRange,
         /// Invalid version returned by the peer.
         received: ProtocolVersion,
+    },
+    /// The daemon negotiated an older protocol version that never defined the method.
+    ///
+    /// Raised before anything is sent: the method exists only in the client's
+    /// current protocol, so the daemon's host has to be upgraded first.
+    #[error(
+        "{}",
+        ProtocolError::daemon_protocol_too_old(
+            host.as_deref(),
+            method,
+            *daemon_version,
+            *required_version,
+        )
+        .msg
+    )]
+    DaemonProtocolTooOld {
+        /// Route of the remote host, or `None` for the local daemon.
+        host: Option<String>,
+        /// Method the older protocol version does not define.
+        method: String,
+        /// Protocol version the daemon negotiated for this connection.
+        daemon_version: ProtocolVersion,
+        /// Protocol version that defines the method.
+        required_version: ProtocolVersion,
+    },
+    /// A payload could not be translated for the older version the daemon negotiated.
+    #[error(
+        "{}",
+        ProtocolError::version_translation_failed(host.as_deref(), *daemon_version).msg
+    )]
+    VersionTranslation {
+        /// Route of the remote host, or `None` for the local daemon.
+        host: Option<String>,
+        /// Protocol version the daemon negotiated for this connection.
+        daemon_version: ProtocolVersion,
+        /// The adapter failure.
+        #[source]
+        source: CompatError,
     },
     /// The local daemon socket could not be reached.
     #[error("cannot reach the daemon at {socket}: {source}")]
@@ -195,6 +234,22 @@ impl ClientError {
             ClientError::ProtocolVersionMismatch { expected, received } => {
                 ProtocolError::version_mismatch(*expected, exact_version_range(*received))
             }
+            ClientError::DaemonProtocolTooOld {
+                host,
+                method,
+                daemon_version,
+                required_version,
+            } => ProtocolError::daemon_protocol_too_old(
+                host.as_deref(),
+                method,
+                *daemon_version,
+                *required_version,
+            ),
+            ClientError::VersionTranslation {
+                host,
+                daemon_version,
+                ..
+            } => ProtocolError::version_translation_failed(host.as_deref(), *daemon_version),
             ClientError::DaemonUnreachable { socket, source } => ProtocolError::new(
                 ErrorClass::Daemon,
                 "daemon_unreachable",

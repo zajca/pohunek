@@ -7,7 +7,9 @@ declare module "bun:test" {
     toBeNull(): void;
     toBeInstanceOf(expected: unknown): void;
     toBeGreaterThan(expected: number): void;
+    toBeGreaterThanOrEqual(expected: number): void;
     toStartWith(expected: string): void;
+    toThrow(expected?: unknown): void;
   }
 
   export interface Expect {
@@ -22,4 +24,5 @@ declare module "bun:test" {
   export const expect: Expect;
   export function describe(name: string, fn: () => void): void;
   export const test: Test;
+  export function afterEach(fn: () => void | Promise<void>): void;
 }

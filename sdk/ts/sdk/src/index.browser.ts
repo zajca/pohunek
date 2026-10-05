@@ -7,7 +7,9 @@ export {
 } from "./attach";
 export type { RawStream } from "./attach";
 export { ClientError, ClientErrorClass, ClientErrorCode } from "./error";
-export type { ClientErrorKind } from "./error";
+export type { ClientErrorKind, DaemonProtocolTooOldDetail } from "./error";
+export { CompatError, downgradeRequestParams, upgradeEventPayload, upgradeResult } from "./compat";
+export type { CompatFailure } from "./compat";
 export {
   decodeResponse,
   isErrResponse,
