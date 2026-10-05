@@ -1,5 +1,15 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-06, Codex package tests install the package)
+
+- The Codex package tests install the built archive through a signed catalog
+  with a throwaway key and trust anchor, so the real-Codex tests launch through
+  the installed package and its version probe, and an always-running test drives
+  that probe with unsupported and supported banners. The fixture kills every
+  process it started (worker, Codex, detached app-server) on success and on
+  failure. The guide and the package README state that the package is official
+  only through a signed catalog and that no release catalog or key exists.
+
 ## Unreleased (2026-10-05, Codex runtime package source)
 
 - Added the Codex runtime package guide and the package source

@@ -326,9 +326,11 @@ screens in `compat/codex/`) has the same shape in
 `crates/cli/tests/codex_package.rs`: always-running descriptor and manifest
 parity with the built-in Codex files, the supported range against the lock, and
 the manifest on real screens, plus `#[ignore]`d tests that drive a real `codex`
-with a loopback Responses stub and a fresh `CODEX_HOME`. The package cannot be
-installed until the official-alias claim for the reserved `codex` id lands, so
-those tests launch through the built-in descriptor. Run them with
+with a loopback Responses stub and a fresh `CODEX_HOME`. The daemon-backed
+tests install the built archive through a signed catalog with a throwaway key
+and trust anchor, so the real-Codex tests launch through the installed package
+and its version probe; the fixture kills every process it started, also when a
+test fails. Run them with
 `POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test codex_package --
 --include-ignored --test-threads 1`; the `codex-package` CI job installs the
 locked release from npm. Never point a manual run at `~/.codex`.

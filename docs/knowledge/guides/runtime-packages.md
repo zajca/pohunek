@@ -16,8 +16,8 @@ machine the daemon runs on. See the
 format and the [runtime catalog](../concepts/runtime-catalog.md) for official
 trust. The repository's own package, [Pi](pi-package.md), is installed this way.
 The [Codex package](codex-package.md) is the second official package source; it
-cannot be installed until the official-alias claim for the reserved `codex` id
-lands.
+serves the reserved `codex` id only through a signed catalog, and no release
+catalog or signing key exists yet.
 
 ```bash
 pohunek plugin list

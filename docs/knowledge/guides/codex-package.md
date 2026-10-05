@@ -107,8 +107,9 @@ classifies every one of them through the package manifest.
   (`active_agent_session_id`) and `native_session_id` stays empty: `session
   resume` is refused with `not_resumable`. A real-Codex test pins this
   (`a_real_codex_reports_hooks_from_its_app_server_child_so_resume_has_no_reference`).
-  The app-server also outlives the TUI when it is detached; the tests stop every
-  process whose executable lives under the fixture's Codex home.
+  The app-server also outlives the TUI when it is detached; the fixture's
+  process guard stops every process of the fixture, including after a failed
+  assertion.
 - **Process forms.** The helper process has kernel name `codex` too, so the
   matchers accept it. A `node …/codex.js` command line (the npm launcher) is not
   matched by the command-line pattern; the process forms of an npm install were
@@ -131,13 +132,30 @@ absence of egress), and the older folder-dialog wording the rule still names.
   manifests every captured frame, title and synthetic dialog), requires the
   supported range to equal `compat/codex/compatibility-lock.json`, reads the
   version banner, runs the title, screen and process rules, and asserts the
-  install refusal above.
-- Three `#[ignore]`d tests drive a real `codex` with a fresh `CODEX_HOME` and the
-  loopback Responses stub (`crates/cli/tests/support/responses_stub.rs`): the
-  banner against the probe template, launch and detection through the daemon
-  (read through the package manifest as well), and the approval prompt. They
-  launch through the built-in descriptor, which the parity tests prove equal to
-  the package, because the package cannot be installed yet. The hook trust comes
+  `--sha256` install refusal above.
+- The daemon-backed tests install the built archive through `pohunek plugin
+  install --catalog`, the way a host with a catalog trust anchor does: the test
+  process generates a throwaway signing key, gives the daemon an anchor that
+  trusts it (`crates/cli/tests/support/catalog_fixture.rs`), and signs a catalog
+  entry binding the package id, the runtime id `codex` and the archive digest.
+  The key never leaves the process and no real key or catalog is involved. The
+  package then serves `codex` with official trust, profiles carry its
+  `package`/`digest` pin, and a launch runs the package's version probe on the
+  executable the profile names. An always-running test drives that probe with
+  throwaway `codex` scripts: the older minor, the next minor, a pre-release, a
+  different banner wording and unreadable output are refused with
+  `agent_runtime_unsupported`, and the supported banner launches.
+- The fixture owns a process guard: on success and on unwind it kills every
+  process whose executable, working directory or environment value lies below
+  the fixture's root (the session worker, Codex and the detached app-server)
+  before the directories are removed. Two tests pin the guard, including a panic
+  after a detached process started.
+- Three `#[ignore]`d tests drive a real `codex` through the installed package
+  with a fresh `CODEX_HOME` and the loopback Responses stub
+  (`crates/cli/tests/support/responses_stub.rs`): the banner against the probe
+  template, launch and detection through the daemon (the inventory shows the
+  package's probe accepted the real release; screens and titles are read through
+  the package manifest as well), and the approval prompt. The hook trust comes
   from `pohunek integration install --agent codex --profile …`, which resolves
   the profile's `CODEX_HOME` so the real home is never touched. Run them with
   `POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test codex_package --

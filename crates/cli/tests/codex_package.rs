@@ -4,39 +4,55 @@
 //! the same path `plugin install` uses, compare it with the built-in Codex
 //! descriptor and detection manifest, and check it against the compatibility
 //! lock and the screens captured from a real Codex (`compat/codex/screens`).
-//! The real-Codex tests drive an actual `codex` binary; see their documentation
-//! for the opt-in.
+//! The daemon-backed tests install the built archive through `pohunek plugin
+//! install --catalog` against a throwaway signing key and trust anchor, so the
+//! package serves `codex` with official trust. The real-Codex tests additionally
+//! drive an actual `codex` binary; see their documentation for the opt-in.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-06
 
 #![cfg(unix)]
 
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use package::directory::build_directory_archive;
-use package::{read_archive, Limits, PackageDigest};
+use package::{read_archive, CatalogEntry, Limits, PackageDigest};
 use pohunek_daemon::agent::host::{
     definition_from_archive, BuiltinSource, HandlerId, LaunchProgram, ProbeVersion,
     RuntimeDefinition, RuntimeSource,
 };
 use pohunek_daemon::agent::{NativeReferenceStrategy, SessionRef};
+use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::detect::{
     ActivityTransition, DetectionConfig, Detector, DetectorConfig, Manifest,
 };
 use pohunek_daemon::procwatch::{ProcessFact, StartIdentity};
-use pohunek_test_support::wait::wait_until;
+use pohunek_daemon::session::HostTrustAnchor;
+use pohunek_test_support::fs::write_executable;
+use pohunek_test_support::wait::{poll_until, wait_until};
 use pohunek_test_support::workspace_root;
-use protocol::{AgentActivity, BindingProvenance, StateSource};
+use protocol::{
+    AgentActivity, BindingProvenance, PackageId, PackageVersion, RuntimeId, StateSource,
+};
 use serde_json::Value;
 
+#[path = "support/catalog_fixture.rs"]
+mod catalog_fixture;
 #[path = "support/plugin_harness.rs"]
 mod plugin_harness;
 #[path = "support/responses_stub.rs"]
 mod responses_stub;
 
+use catalog_fixture::{
+    catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, WINDOW_END, WINDOW_START,
+};
 use plugin_harness::{path_str, Harness};
 use responses_stub::ResponsesStub;
 
@@ -1052,17 +1068,116 @@ fn the_real_codex_banner_is_the_locked_release_the_probe_accepts() {
     assert!(policy.supports(version));
 }
 
+/// Terminates every process that belongs to one fixture.
+///
+/// A process belongs to the fixture when its executable, its working directory
+/// or the value of one of its environment variables lies below the fixture's
+/// root. That covers the session worker, Codex, and the detached `codex
+/// app-server` Codex starts below `<home>/packages`, which outlives the TUI.
+/// Dropping the guard reaps them, so an assertion failure or a timed-out wait
+/// leaves no process behind; it must be dropped before the directories it
+/// names are removed. The scan reads `/proc`, so it finds nothing elsewhere.
+struct ProcessGuard {
+    root: PathBuf,
+}
+
+impl ProcessGuard {
+    fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_owned(),
+        }
+    }
+
+    /// Whether `directory`, a `/proc/<pid>` entry, holds a process of the
+    /// fixture.
+    fn owns(&self, directory: &Path) -> bool {
+        let below_root = |link: &str| {
+            fs::read_link(directory.join(link)).is_ok_and(|path| path.starts_with(&self.root))
+        };
+        if below_root("exe") || below_root("cwd") {
+            return true;
+        }
+        fs::read(directory.join("environ")).is_ok_and(|bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter_map(|entry| {
+                    let separator = entry.iter().position(|byte| *byte == b'=')?;
+                    Some(&entry[separator + 1..])
+                })
+                .any(|value| Path::new(OsStr::from_bytes(value)).starts_with(&self.root))
+        })
+    }
+
+    /// The live processes of the fixture, never the test process itself. A
+    /// terminated process that is not yet reaped by its parent has no
+    /// executable and does not count.
+    fn members(&self) -> Vec<i32> {
+        let Ok(processes) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        let own = i32::try_from(std::process::id()).ok();
+        processes
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+                (Some(pid) != own && self.owns(&entry.path())).then_some(pid)
+            })
+            .collect()
+    }
+
+    /// Kills the fixture's processes until none is left.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a process survives until the hang guard of
+    /// [`pohunek_test_support::wait::poll_until`] elapses.
+    fn reap(&self) {
+        poll_until("the fixture processes to end", || {
+            let members = self.members();
+            for pid in &members {
+                // A process that exited since the scan is already gone.
+                let _ = kill(Pid::from_raw(*pid), Signal::SIGKILL);
+            }
+            members.is_empty().then_some(())
+        });
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        // A panic escaping a drop that runs during unwinding aborts the run.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reap())).is_err() {
+            eprintln!(
+                "fixture processes survived the cleanup below {}",
+                self.root.display()
+            );
+        }
+    }
+}
+
 /// A real daemon with a hermetic Codex configuration pointing at a loopback
-/// Responses stub.
+/// Responses stub, holding the official Codex package installed through a
+/// signed catalog.
 struct Fixture {
+    /// Declared first so the fixture's processes end before the harness removes
+    /// the directories they run in, on success and on unwind alike.
+    processes: ProcessGuard,
     harness: Harness,
     stub: ResponsesStub,
     codex_home: PathBuf,
+    /// Digest of the installed package archive.
+    digest: PackageDigest,
 }
 
 impl Fixture {
     async fn start() -> Self {
-        let harness = Harness::start().await;
+        let key = test_key();
+        let anchor =
+            HostTrustAnchor::new(vec![root_of(&key, WINDOW_START, WINDOW_END)], Vec::new())
+                .expect("the test trust anchor");
+        let harness = Harness::start_with_trust(CatalogTrust::Loaded(anchor)).await;
+        let processes = ProcessGuard::new(harness.env.root());
+        let digest = install_package(&harness, &key).await;
         let stub = ResponsesStub::start();
         let codex_home = harness.env.root().join("codex-home");
         fs::create_dir_all(&codex_home).expect("create the Codex home");
@@ -1078,18 +1193,31 @@ impl Fixture {
             ),
         )
         .expect("write config.toml");
-        harness.profile(
-            PROFILE,
-            &format!(
-                "base = \"codex\"\n\n[env]\nCODEX_HOME = \"{}\"\n",
-                path_str(&codex_home)
-            ),
-        );
-        Self {
+        let fixture = Self {
+            processes,
             harness,
             stub,
             codex_home,
-        }
+            digest,
+        };
+        fixture.write_profile(PROFILE, None);
+        fixture
+    }
+
+    /// Writes the profile `name`, pinned to the installed package and to the
+    /// fixture's Codex home. `program` replaces the runtime's `codex`.
+    fn write_profile(&self, name: &str, program: Option<&Path>) {
+        let program = program.map_or_else(String::new, |program| {
+            format!("program = \"{}\"\n", path_str(program))
+        });
+        self.harness.profile(
+            name,
+            &format!(
+                "base = \"codex\"\npackage = \"{PACKAGE_ID}\"\ndigest = \"{digest}\"\n{program}\n[env]\nCODEX_HOME = \"{home}\"\n",
+                digest = self.digest.as_str(),
+                home = path_str(&self.codex_home),
+            ),
+        );
     }
 
     /// Installs the hook integration into the fixture's Codex home through the
@@ -1125,21 +1253,59 @@ impl Fixture {
         );
     }
 
-    async fn new_session(&self, name: &str) -> Value {
+    /// The inventory entry `host inspect local` reports for `profile`.
+    async fn inventory_entry(&self, profile: &str) -> Value {
+        let (code, host) = self.harness.json(&["host", "inspect", "local"]).await;
+        assert_eq!(code, 0, "{host}");
+        host["ok"]["runtimes"]
+            .as_array()
+            .expect("runtimes")
+            .iter()
+            .find(|runtime| runtime["agent"] == profile)
+            .unwrap_or_else(|| panic!("the host lists {profile}: {host}"))
+            .clone()
+    }
+
+    /// The installed package is the official, selected source of `codex`, and
+    /// the daemon read the real executable's version through the package's
+    /// probe: a runtime without a probe reports no `supported` verdict.
+    async fn assert_package_serves_codex(&self) {
+        let (code, listed) = self.harness.json(&["plugin", "list"]).await;
+        assert_eq!(code, 0, "{listed}");
+        let packages = listed["ok"]["packages"].as_array().expect("packages");
+        assert_eq!(packages.len(), 1, "{listed}");
+        let package = &packages[0];
+        assert_eq!(package["package"]["id"], PACKAGE_ID, "{listed}");
+        assert_eq!(package["origin"], "official", "{listed}");
+        assert_eq!(package["enabled"], true, "{listed}");
+        assert_eq!(package["selected"], true, "{listed}");
+        assert_eq!(package["digest"], self.digest.as_str(), "{listed}");
+
+        let codex = self.inventory_entry(PROFILE).await;
+        assert_eq!(codex["available"], true, "{codex}");
+        assert_eq!(codex["supported"], true, "{codex}");
+        assert_eq!(codex["version"], locked_release(), "{codex}");
+    }
+
+    /// `session new` of `profile` in the fixture's working directory.
+    async fn launch(&self, profile: &str, name: &str) -> (i32, Value) {
         let cwd = self.harness.env.cwd().to_path_buf();
-        let (code, launched) = self
-            .harness
+        self.harness
             .json(&[
                 "session",
                 "new",
                 "--agent",
-                PROFILE,
+                profile,
                 "--cwd",
                 path_str(&cwd),
                 "--name",
                 name,
             ])
-            .await;
+            .await
+    }
+
+    async fn new_session(&self, name: &str) -> Value {
+        let (code, launched) = self.launch(PROFILE, name).await;
         assert_eq!(code, 0, "{launched}");
         launched["ok"].clone()
     }
@@ -1239,17 +1405,18 @@ impl Fixture {
         .await;
     }
 
-    /// Stops the daemon and the Codex app-server that outlives a TUI under the
-    /// fixture's Codex home, so no process survives the test.
+    /// Stops the daemon and every process of the fixture, so none survives the
+    /// test. The guard repeats this when a test fails before it gets here.
     async fn finish(self) {
         let Self {
+            processes,
             harness,
             stub,
-            codex_home,
+            ..
         } = self;
-        reap_app_servers(&codex_home);
+        processes.reap();
         harness.stop().await;
-        reap_app_servers(&codex_home);
+        processes.reap();
         assert!(
             !stub.saw_credential(),
             "no request to the stub carried an Authorization header"
@@ -1257,34 +1424,51 @@ impl Fixture {
     }
 }
 
-/// Codex starts a detached app-server below `<home>/packages` that survives
-/// the TUI; stop every process whose executable lives under `home`.
-fn reap_app_servers(home: &Path) {
-    let Ok(processes) = fs::read_dir("/proc") else {
-        return;
+/// Installs the built package archive through a catalog signed by `key`, the
+/// way a host with a catalog trust anchor installs an official package, and
+/// returns the archive digest.
+///
+/// The catalog authorizes the package id, the runtime id `codex` and the
+/// digest, which is what lets the package serve a reserved runtime id.
+async fn install_package(harness: &Harness, key: &ed25519_dalek::SigningKey) -> PackageDigest {
+    let (bytes, digest) = built_archive();
+    let archive = harness.env.root().join("codex.tar.zst");
+    fs::write(&archive, bytes).expect("write the archive");
+    let entry = CatalogEntry {
+        package_id: PackageId::parse(PACKAGE_ID).expect("package id"),
+        runtime_id: RuntimeId::parse("codex").expect("runtime id"),
+        version: PackageVersion::parse(PACKAGE_VERSION).expect("package version"),
+        digest: digest.clone(),
+        platforms: vec![host_platform()],
+        core: ANY_CORE.to_owned(),
     };
-    for entry in processes.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<i32>().ok())
-        else {
-            continue;
-        };
-        let Ok(executable) = fs::read_link(entry.path().join("exe")) else {
-            continue;
-        };
-        if executable.starts_with(home) {
-            // `kill(1)` keeps the test free of `unsafe` and of a libc dependency.
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
-        }
-    }
+    let catalog = harness.env.root().join("runtime-catalog.json");
+    fs::write(
+        &catalog,
+        signed(key, catalog_of(1, WINDOW_END, vec![entry])),
+    )
+    .expect("write the catalog");
+    let (code, installed) = harness
+        .json(&[
+            "plugin",
+            "install",
+            path_str(&archive),
+            "--catalog",
+            path_str(&catalog),
+            "--yes",
+        ])
+        .await;
+    assert_eq!(code, 0, "{installed}");
+    assert_eq!(installed["ok"]["status"], "installed", "{installed}");
+    let package = &installed["ok"]["package"];
+    assert_eq!(package["origin"], "official", "{installed}");
+    assert_eq!(package["digest"], digest.as_str(), "{installed}");
+    digest
 }
 
-/// The package manifest reads the live screen and title of a real session the
-/// way the daemon's built-in manifest did when it set the session's activity.
+/// The package manifest, read from the package directory, classifies the live
+/// screen and title of a real session as `expected`, the activity the daemon
+/// detected from the installed package.
 async fn assert_package_agrees(
     fixture: &Fixture,
     definition: &RuntimeDefinition,
@@ -1310,16 +1494,14 @@ async fn assert_package_agrees(
     );
 }
 
-/// Drives a real `codex` through the built-in Codex runtime with a fresh
+/// Drives a real `codex` through the installed official package with a fresh
 /// `CODEX_HOME`, a loopback Responses stub and hook trust written by pohunek's
 /// own integration install, and reads every live screen and title through the
 /// package manifest.
 ///
-/// The package cannot be installed into a daemon yet: the runtime id `codex`
-/// is reserved for the built-in until the official-alias claim lands, so this
-/// test launches through the built-in descriptor, which the parity tests above
-/// prove equal to the package, and checks the package's manifest and probe
-/// against what the real agent shows.
+/// The fixture installs the built archive through a signed catalog, so the
+/// launch resolves the profile's pin to the package and runs the package's
+/// version probe against the real executable before it starts.
 ///
 /// Needs a `codex` on `PATH` and `POHUNEK_CODEX_E2E=1`; the model is a
 /// loopback stub, so no provider or credential is involved, and the fixture's
@@ -1333,12 +1515,7 @@ async fn a_real_codex_session_launches_and_is_detected_through_package_facts() {
     let fixture = Fixture::start().await;
     fixture.install_integration().await;
 
-    // The package's probe template reads the real banner and accepts the release.
-    let policy = package.version_probe_policy().expect("a version probe");
-    let version = policy
-        .read_output(&real_codex_banner())
-        .expect("the package template reads the banner");
-    assert!(policy.supports(version));
+    fixture.assert_package_serves_codex().await;
 
     let launched = fixture.new_session("e2e").await;
     let id = launched["id"].as_str().expect("session id").to_owned();
@@ -1533,9 +1710,8 @@ async fn a_real_codex_approval_prompt_is_blocked_by_title_and_screen() {
     fixture.finish().await;
 }
 
-/// The package cannot be installed while `codex` is a reserved runtime id served
-/// by the built-in; the refusal is the boundary the real-Codex tests work
-/// around by launching through the built-in descriptor.
+/// `codex` is a reserved runtime id: an install trusted only by its digest is
+/// refused, so the package serves it through a signed catalog alone.
 #[tokio::test]
 async fn installing_the_package_is_refused_while_codex_is_a_reserved_builtin() {
     let harness = Harness::start().await;
@@ -1558,4 +1734,120 @@ async fn installing_the_package_is_refused_while_codex_is_a_reserved_builtin() {
         "{refused}"
     );
     harness.stop().await;
+}
+
+/// Writes an executable `codex` into a directory of its own below `root` that
+/// answers `--version` with `banner` and otherwise idles, and returns its path.
+fn write_fake_codex(root: &Path, directory: &str, banner: &str) -> PathBuf {
+    let path = root.join(directory).join("codex");
+    fs::create_dir_all(root.join(directory)).expect("create the fake codex directory");
+    write_executable(
+        &path,
+        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\nexec sleep 600\n"),
+    )
+    .expect("write the fake codex");
+    path
+}
+
+/// The version probe the package declares decides every launch of `codex`, on
+/// the executable the profile names: only the supported release starts.
+#[tokio::test]
+async fn the_package_version_probe_refuses_an_unsupported_codex_and_starts_the_supported_one() {
+    let fixture = Fixture::start().await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let release = locked_release();
+    let unsupported = [
+        "codex-cli 0.159.9".to_owned(),
+        "codex-cli 0.161.0".to_owned(),
+        format!("codex-cli {release}-rc.1"),
+        format!("codex {release}"),
+        "unreadable".to_owned(),
+    ];
+    for (index, banner) in unsupported.iter().enumerate() {
+        let profile = format!("fake-unsupported-{index}");
+        let program = write_fake_codex(&root, &profile, banner);
+        fixture.write_profile(&profile, Some(&program));
+
+        let entry = fixture.inventory_entry(&profile).await;
+        assert_eq!(entry["supported"], false, "{banner:?}: {entry}");
+        let (code, refused) = fixture.launch(&profile, "refused").await;
+        assert_eq!(code, 1, "{banner:?}: {refused}");
+        assert_eq!(
+            refused["err"]["code"], "agent_runtime_unsupported",
+            "{banner:?}: {refused}"
+        );
+    }
+
+    let banner = format!("codex-cli {release}");
+    let program = write_fake_codex(&root, "fake-supported", &banner);
+    fixture.write_profile("fake-supported", Some(&program));
+    let entry = fixture.inventory_entry("fake-supported").await;
+    assert_eq!(entry["supported"], true, "{entry}");
+    assert_eq!(entry["version"], release, "{entry}");
+    let (code, launched) = fixture.launch("fake-supported", "accepted").await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    assert_eq!(launched["ok"]["agent_base"], "codex");
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// Whether `pid` is a live process; a terminated one that its parent has not
+/// reaped yet is not.
+#[cfg(target_os = "linux")]
+fn is_alive(pid: i32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit(')').next().map(str::to_owned))
+        .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
+}
+
+/// Starts a detached `sleep` in `env`, the way Codex leaves its app-server
+/// behind, and returns its process id.
+#[cfg(target_os = "linux")]
+fn spawn_detached_sleeper(env: &pohunek_test_support::env::TestEnv) -> i32 {
+    let output = env
+        .command("/bin/sh")
+        .args(["-c", "sleep 600 </dev/null >/dev/null 2>&1 & echo $!"])
+        .output()
+        .expect("start the detached process");
+    String::from_utf8(output.stdout)
+        .expect("a UTF-8 process id")
+        .trim()
+        .parse()
+        .expect("a process id")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_process_guard_terminates_a_detached_process_when_the_test_unwinds() {
+    let env = pohunek_test_support::env::TestEnv::new().expect("create the environment");
+    let pid = std::cell::Cell::new(0);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = ProcessGuard::new(env.root());
+        pid.set(spawn_detached_sleeper(&env));
+        assert!(is_alive(pid.get()), "the detached process runs");
+        panic!("a failing assertion after the process started");
+    }));
+    assert!(outcome.is_err(), "the closure panicked");
+    assert!(
+        !is_alive(pid.get()),
+        "the guard terminated the detached process during the unwind"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_process_guard_leaves_a_process_of_another_environment_alone() {
+    let ours = pohunek_test_support::env::TestEnv::new().expect("create the environment");
+    let other = pohunek_test_support::env::TestEnv::new().expect("create the environment");
+    let foreign = spawn_detached_sleeper(&other);
+    let guard = ProcessGuard::new(ours.root());
+    guard.reap();
+    assert!(is_alive(foreign), "a process below another root survives");
+    ProcessGuard::new(other.root()).reap();
+    assert!(!is_alive(foreign));
 }

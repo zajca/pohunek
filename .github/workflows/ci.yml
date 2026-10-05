@@ -1367,12 +1367,11 @@ jobs:
   # always-on parity tests plus the real-Codex tests: a real `codex` with a
   # fresh CODEX_HOME, a loopback Responses stub, hook trust written by pohunek's
   # own integration install, and every live screen and title read through the
-  # package manifest. The runtime id `codex` is reserved for the built-in until
-  # the official-alias claim lands, so the real-Codex tests launch through the
-  # built-in descriptor that the parity tests prove equal to the package; this
-  # job moves to installing the package once that claim exists. The job has not
-  # run on a hosted runner yet: the bubblewrap sandbox and the Node of the
-  # runner image are the assumptions to check on its first run.
+  # package manifest. The tests install the built archive through a signed
+  # catalog with a throwaway key and trust anchor generated in the test process,
+  # so the launches go through the installed package and its version probe. The
+  # job has not run on a hosted runner yet: the bubblewrap sandbox and the Node
+  # of the runner image are the assumptions to check on its first run.
   codex-package:
     name: Codex runtime package (locked release, model-free)
     runs-on: ubuntu-latest

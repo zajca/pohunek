@@ -30,6 +30,6 @@ runtime-packages/<runtime>/
   integration handler it names is compiled core code that owns them.
 
 Packages: [`pi`](pi) (Pi coding agent 1.0.x; install steps in
-`docs/install.md`) and [`codex`](codex) (Codex 0.160.x; source and tests only,
-not installable until the official-alias claim for the reserved `codex` id lands;
-see `docs/knowledge/guides/codex-package.md`).
+`docs/install.md`) and [`codex`](codex) (Codex 0.160.x; serves the reserved
+`codex` id only through a signed catalog, and no release catalog or signing key
+exists yet; see `docs/knowledge/guides/codex-package.md`).

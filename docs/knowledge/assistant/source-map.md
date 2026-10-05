@@ -539,9 +539,10 @@ Runtime package archive format:
 - `runtime-packages/codex/detect.toml` — Codex detection manifest, equal to the built-in one.
 - `compat/codex/compatibility-lock.json` — pinned Codex release and supported range.
 - `compat/codex/screens/` — screens and terminal titles captured from a real Codex that the manifest test classifies.
-- `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the built-in) and the opt-in real-Codex tests.
+- `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the built-in), catalog-installed package launch and version-probe tests, and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
+- `crates/cli/tests/support/catalog_fixture.rs` — throwaway signing key, trust anchor and signed catalog helpers shared by the catalog install tests.
 - `crates/cli/tests/support/model_stub.rs` — loopback chat-completions stub used instead of a model provider.
 - `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`
