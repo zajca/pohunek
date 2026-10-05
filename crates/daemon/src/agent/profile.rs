@@ -10,19 +10,25 @@
 //!
 //! Resolution ([`ProfileRegistry::resolve_agent`]) is the 4-step chain: A.2.1
 //! charset guard → profile file → bare base kind → `agent_profile_not_found`.
+//!
+//! A profile whose base runtime is served by an installed package binds that
+//! package explicitly with the `package` and `digest` keys and resolves from
+//! exactly that digest; a profile over a built-in base carries neither key.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::{ErrorClass, ProtocolError, RuntimeId};
+use package::registry::RetainedDigests;
+use package::PackageDigest;
+use protocol::{ErrorClass, PackageId, ProtocolError, RuntimeId};
 use serde::Deserialize;
 use tracing::warn;
 
-use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost};
+use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy};
 use super::{InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind};
-use crate::detect::Manifest;
+use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
 use crate::project::config::validate_name;
 
 /// A parsed `agents/<name>.toml`. `deny_unknown_fields` keeps the surface tight so
@@ -32,6 +38,14 @@ use crate::project::config::validate_name;
 struct RawProfile {
     /// Base kind to extend: `shell` | `codex` | `claude` | `hermes`.
     base: String,
+    /// Package serving `base`; set together with `digest` exactly when a
+    /// package, not a built-in, serves the base runtime.
+    #[serde(default)]
+    package: Option<String>,
+    /// Archive digest (`sha256:<hex>`) of the package version the profile
+    /// launches from, whatever the registry selects now.
+    #[serde(default)]
+    digest: Option<String>,
     /// Launch program (PATH name or absolute path); defaults to the base program.
     #[serde(default)]
     program: Option<String>,
@@ -376,19 +390,9 @@ impl ProfileRegistry {
         let Some(dir) = &self.dir else {
             return Vec::new();
         };
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
         let mut resolved = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            match self.resolve_agent(stem) {
+        for (stem, _path) in profile_files(dir) {
+            match self.resolve_agent(&stem) {
                 Ok(agent) if agent.profile.is_some() => resolved.push(agent),
                 Ok(_) => {}
                 Err(err) => {
@@ -399,6 +403,262 @@ impl ProfileRegistry {
         resolved.sort_by(|a, b| a.name.cmp(&b.name));
         resolved
     }
+
+    /// The profiles that bind a package version the host cannot serve now:
+    /// the digest is not installed, or its root fails verification. They are
+    /// listed so `host.inspect` reports them unavailable instead of hiding
+    /// them. Sorted by name.
+    pub(crate) fn unavailable_pinned(&self) -> Vec<UnavailableProfile> {
+        let Some(dir) = &self.dir else {
+            return Vec::new();
+        };
+        let mut unavailable = Vec::new();
+        for (stem, path) in profile_files(dir) {
+            let Ok(Some(binding)) = read_binding(dir, &stem, &path) else {
+                continue;
+            };
+            let Some(base) = binding.base else {
+                continue;
+            };
+            let refused = matches!(
+                self.resolve_agent(&stem),
+                Err(ProtocolError { ref code, .. })
+                    if code == "runtime_not_installed" || code == "runtime_incompatible"
+            );
+            if refused {
+                unavailable.push(UnavailableProfile { name: stem, base });
+            }
+        }
+        unavailable.sort_by(|a, b| a.name.cmp(&b.name));
+        unavailable
+    }
+
+    /// Checks that the profile `name` with file text `content` would launch
+    /// from `definition`, through the same resolution a launch applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `invalid_profile` (or runtime) error a launch would return
+    /// for that text.
+    pub(crate) fn validate_candidate(
+        &self,
+        name: &str,
+        content: &str,
+        definition: &Arc<RuntimeDefinition>,
+    ) -> Result<(), ProtocolError> {
+        let dir = self
+            .dir
+            .as_deref()
+            .ok_or_else(|| invalid_profile(name, "the agents directory is not available"))?;
+        resolve_profile_text(name, content, dir, &self.runtimes, Some(definition)).map(|_agent| ())
+    }
+
+    /// The package digests that host profiles pin.
+    ///
+    /// Every `*.toml` of the agents directory is read through the same
+    /// containment and owner-security checks as a profile load, and only its
+    /// `package`/`digest` keys are parsed. A file that fails a check or does
+    /// not parse pins nothing and logs a warning, so one broken profile never
+    /// blocks the lifecycle of another package.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the agents directory holds more than
+    /// [`MAX_SCANNED_PROFILES`] entries or cannot be listed: the scan runs
+    /// under the package lifecycle authority, and an unbounded or unreadable
+    /// listing must refuse the change rather than be assumed to pin nothing.
+    pub(crate) fn pinned_digests(&self) -> std::io::Result<RetainedDigests> {
+        let mut pinned = RetainedDigests::new();
+        let Some(dir) = &self.dir else {
+            return Ok(pinned);
+        };
+        for (stem, path) in scanned_profile_files(dir)? {
+            match read_binding(dir, &stem, &path) {
+                Ok(Some(binding)) => pinned.insert(binding.digest),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(profile = %stem, error = %err, "agent profile pins no package digest");
+                }
+            }
+        }
+        Ok(pinned)
+    }
+}
+
+/// A host profile whose pinned package version cannot be served right now.
+#[derive(Debug, Clone)]
+pub(crate) struct UnavailableProfile {
+    /// The profile name.
+    pub name: String,
+    /// The base runtime the profile extends.
+    pub base: RuntimeId,
+}
+
+/// The profile files of `dir`: `(stem, path)` of every regular `*.toml` file.
+fn profile_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
+                return None;
+            }
+            let stem = path.file_stem().and_then(|stem| stem.to_str())?.to_owned();
+            Some((stem, path))
+        })
+        .collect()
+}
+
+/// Most directory entries the retention scan lists: 4096.
+///
+/// A host has a handful of profiles; the ceiling keeps the scan, which runs
+/// under the package lifecycle authority, from walking an arbitrarily large
+/// directory.
+const MAX_SCANNED_PROFILES: usize = 4096;
+
+/// The profile files of `dir` for the retention scan, listing at most
+/// [`MAX_SCANNED_PROFILES`] entries.
+fn scanned_profile_files(dir: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
+    let mut files = Vec::new();
+    let mut seen = 0_usize;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        seen += 1;
+        if seen > MAX_SCANNED_PROFILES {
+            return Err(std::io::Error::other(
+                "the agents directory holds too many entries to scan",
+            ));
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") || !path.is_file() {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+            files.push((stem.to_owned(), path));
+        }
+    }
+    Ok(files)
+}
+
+/// Largest profile file read, by a launch and by the retention scan alike: 1 MiB.
+///
+/// A profile is a few hundred bytes of launch settings; the ceiling is far
+/// above any real one. The retention scan runs under the package lifecycle
+/// authority, so a huge or endless file must not stall package mutations and
+/// fresh launches, and a launch applies the same bound so the two always
+/// agree on what a loadable profile is.
+pub(crate) const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
+
+/// Reads the text of the profile file `path` of profile `name`.
+///
+/// This is the one acceptance rule for a profile file, shared by profile
+/// loading and the retention scan so a profile that launches is always seen by
+/// retention. The path must resolve inside the agents tree (a symlink that
+/// stays inside is followed, one that escapes is refused), the file it resolves
+/// to must be owner-secure, be a regular file and fit [`MAX_PROFILE_BYTES`].
+/// The resolved file is opened without following a further link and without
+/// blocking on a fifo or device swapped in after the check.
+fn read_profile_text(dir: &Path, name: &str, path: &Path) -> Result<String, ProtocolError> {
+    // Containment first: a symlinked `<name>.toml` that escapes the tree must be
+    // rejected before its contents are read or exec'd (C.5).
+    assert_contained(dir, path, name)?;
+    if !file_is_owner_secure(path) {
+        return Err(invalid_profile(
+            name,
+            "profile file is not owner-secure (wrong owner or group/world-writable)",
+        ));
+    }
+    let resolved =
+        std::fs::canonicalize(path).map_err(|error| invalid_profile(name, &error.to_string()))?;
+    read_bounded_text(&resolved, MAX_PROFILE_BYTES).map_err(|failure| match failure {
+        BoundedRead::Io(error) => invalid_profile(name, &error.to_string()),
+        BoundedRead::NotRegular => invalid_profile(name, "profile file is not a regular file"),
+        BoundedRead::TooLarge => invalid_profile(name, "profile file is too large"),
+    })
+}
+
+/// Why a bounded read of a config file failed.
+#[derive(Debug)]
+enum BoundedRead {
+    /// The open or the read failed.
+    Io(std::io::Error),
+    /// The path is not a regular file.
+    NotRegular,
+    /// The file holds more than the bound.
+    TooLarge,
+}
+
+/// Reads the UTF-8 text of the file at `resolved`, at most `max_bytes`.
+///
+/// The one bounded reader of the profile layer, used for profile files and for
+/// the detection-manifest overrides they name; both are read under the package
+/// lifecycle authority when a rewrite is validated. The file is opened without
+/// following a final link and without blocking on a fifo or device, checked to
+/// be a regular file on the descriptor, and read through `take(max + 1)`, so
+/// an oversized or growing file is refused after at most `max + 1` bytes are
+/// buffered.
+fn read_bounded_text(resolved: &Path, max_bytes: u64) -> Result<String, BoundedRead> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(resolved)
+        .map_err(BoundedRead::Io)?;
+    if !file.metadata().map_err(BoundedRead::Io)?.is_file() {
+        return Err(BoundedRead::NotRegular);
+    }
+    let mut text = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(BoundedRead::Io)?;
+    if u64::try_from(text.len()).map_or(true, |read| read > max_bytes) {
+        return Err(BoundedRead::TooLarge);
+    }
+    Ok(text)
+}
+
+/// The package binding keys of one profile file, parsed without the rest of
+/// the profile.
+#[derive(Debug, Deserialize)]
+struct RawBinding {
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// A parsed package binding of a profile file.
+struct FileBinding {
+    base: Option<RuntimeId>,
+    digest: PackageDigest,
+}
+
+/// Read the package binding of `path`, under the containment and
+/// owner-security checks of a profile load. `Ok(None)` is a profile that
+/// pins nothing.
+fn read_binding(dir: &Path, name: &str, path: &Path) -> Result<Option<FileBinding>, ProtocolError> {
+    validate_name("agent", name)?;
+    let content = read_profile_text(dir, name, path)?;
+    let raw: RawBinding = toml::from_str(&content)
+        .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+    let Some(digest) = raw.digest else {
+        return Ok(None);
+    };
+    let digest = PackageDigest::parse(&digest)
+        .map_err(|_error| invalid_profile(name, "digest is not a valid package digest"))?;
+    Ok(Some(FileBinding {
+        base: raw.base.and_then(|base| RuntimeId::parse(&base).ok()),
+        digest,
+    }))
 }
 
 /// Whether `dir` is safe to load host config from: owned by the daemon's effective
@@ -475,24 +735,36 @@ fn load_profile(
     runtimes: &RuntimeHost,
     pinned: Option<&Arc<RuntimeDefinition>>,
 ) -> Result<ResolvedAgent, ProtocolError> {
-    // Containment first: a symlinked `<name>.toml` that escapes the tree must be
-    // rejected before its contents are read or exec'd (C.5).
-    assert_contained(dir, path, name)?;
-    if !file_is_owner_secure(path) {
-        return Err(invalid_profile(
-            name,
-            "profile file is not owner-secure (wrong owner or group/world-writable)",
-        ));
+    let content = read_profile_text(dir, name, path)?;
+    resolve_profile_text(name, &content, dir, runtimes, pinned)
+}
+
+/// Resolves the profile `name` whose file text is `content`.
+///
+/// This is everything a launch does with a profile after reading its file, so
+/// a candidate text validated through it (a rewrite about to be published) is
+/// accepted exactly when a launch would accept it. `pinned` supplies the
+/// definition of the base runtime when the caller already holds it.
+fn resolve_profile_text(
+    name: &str,
+    content: &str,
+    dir: &Path,
+    runtimes: &RuntimeHost,
+    pinned: Option<&Arc<RuntimeDefinition>>,
+) -> Result<ResolvedAgent, ProtocolError> {
+    if u64::try_from(content.len()).map_or(true, |length| length > MAX_PROFILE_BYTES) {
+        return Err(invalid_profile(name, "profile file is too large"));
     }
-    let content =
-        std::fs::read_to_string(path).map_err(|err| invalid_profile(name, &err.to_string()))?;
-    let raw: RawProfile = toml::from_str(&content)
-        .map_err(|err| invalid_profile(name, &toml_diagnostic(&content, &err)))?;
+    let raw: RawProfile = toml::from_str(content)
+        .map_err(|err| invalid_profile(name, &toml_diagnostic(content, &err)))?;
     let base_id = RuntimeId::parse(&raw.base)
         .map_err(|_error| invalid_profile(name, &format!("unknown base kind '{}'", raw.base)))?;
+    let pin = parse_package_pin(name, raw.package.as_deref(), raw.digest.as_deref())?;
+    // A session recovering from a pinned definition keeps it: the profile's own
+    // binding applies to fresh launches.
     let definition = match pinned {
         Some(definition) if *definition.runtime_id() == base_id => Arc::clone(definition),
-        _ => runtimes.resolve_id(&base_id)?,
+        _ => resolve_base(name, runtimes, &base_id, pin.as_ref())?,
     };
     // A runtime without native resume (the shell) cannot have a profile claim one.
     if definition.native().is_none()
@@ -533,7 +805,7 @@ fn load_profile(
     let binding_json = serde_json::to_vec(definition.binding())
         .map_err(|err| invalid_profile(name, &format!("launch binding: {err}")))?;
     let inputs = ProfileInputs::of(
-        &content,
+        content,
         manifest_source.as_ref().map(|source| source.text.as_str()),
         &binding_json,
         &program,
@@ -553,6 +825,68 @@ fn load_profile(
             inputs,
         }),
     })
+}
+
+/// The package binding of a profile: the package id and archive digest its
+/// base runtime is launched from.
+#[derive(Debug, Clone)]
+struct PackagePin {
+    package: PackageId,
+    digest: PackageDigest,
+}
+
+/// Parse the `package`/`digest` keys: both or neither.
+fn parse_package_pin(
+    name: &str,
+    package: Option<&str>,
+    digest: Option<&str>,
+) -> Result<Option<PackagePin>, ProtocolError> {
+    let (package, digest) = match (package, digest) {
+        (None, None) => return Ok(None),
+        (Some(package), Some(digest)) => (package, digest),
+        _ => {
+            return Err(invalid_profile(
+                name,
+                "package and digest must be set together",
+            ))
+        }
+    };
+    let package = PackageId::parse(package)
+        .map_err(|_error| invalid_profile(name, "package is not a valid package id"))?;
+    let digest = PackageDigest::parse(digest).map_err(|_error| {
+        invalid_profile(
+            name,
+            "digest must be sha256: followed by 64 lowercase hex digits",
+        )
+    })?;
+    Ok(Some(PackagePin { package, digest }))
+}
+
+/// Resolve the base runtime of a profile under its package binding.
+///
+/// A built-in base takes no binding. A package-served base requires one and is
+/// then resolved from exactly the bound digest; an unbound profile naming a
+/// package-served base is refused with the migration command.
+fn resolve_base(
+    name: &str,
+    runtimes: &RuntimeHost,
+    base: &RuntimeId,
+    pin: Option<&PackagePin>,
+) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+    match (pin, runtimes.served_by(base)) {
+        (Some(_), Some(ServedBy::Builtin)) => Err(invalid_profile(
+            name,
+            &format!("package and digest apply only to a package-served base, and '{base}' is built in"),
+        )),
+        (Some(pin), _) => runtimes.resolve_profile_pin(base, &pin.package, &pin.digest),
+        (None, Some(ServedBy::Package(package))) => Err(invalid_profile(
+            name,
+            &format!(
+                "base '{base}' is served by the installed package '{package}' and the profile does not pin it; run `pohunek plugin profile migrate {name}`"
+            ),
+        )),
+        (None, _) => runtimes.resolve_id(base),
+    }
 }
 
 /// Resolve a profile's effective native-session launch spec.
@@ -679,8 +1013,17 @@ fn resolve_manifest(
         ));
     }
     assert_contained(dir, &path, name)?;
-    let content = std::fs::read_to_string(&path)
+    let resolved = std::fs::canonicalize(&path)
         .map_err(|err| invalid_profile(name, &format!("manifest '{manifest_name}': {err}")))?;
+    let limit = u64::try_from(MAX_MANIFEST_SOURCE_BYTES).unwrap_or(u64::MAX);
+    let content = read_bounded_text(&resolved, limit).map_err(|failure| {
+        let reason = match failure {
+            BoundedRead::Io(err) => err.to_string(),
+            BoundedRead::NotRegular => "is not a regular file".to_owned(),
+            BoundedRead::TooLarge => "is too large".to_owned(),
+        };
+        invalid_profile(name, &format!("manifest '{manifest_name}': {reason}"))
+    })?;
     let manifest = Manifest::parse_str(&content)
         .map_err(|err| invalid_profile(name, &format!("manifest '{manifest_name}': {err}")))?;
     Ok(Some(ManifestSource {
@@ -719,6 +1062,12 @@ fn invalid_profile(name: &str, reason: &str) -> ProtocolError {
         None,
     )
 }
+
+mod bind;
+pub(crate) use bind::{apply_pin, parse_head, BindError, Pin};
+
+#[cfg(test)]
+mod pin_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1403,10 +1752,18 @@ mod tests {
         )
     }
 
+    /// A profile body on the Pi-shaped package base: its package binding, then `rest`.
+    fn pinned_pi(rest: &str) -> String {
+        format!(
+            "base = \"pi\"\n{}{rest}",
+            crate::agent::host::fixture::pi_shaped_profile_pin()
+        )
+    }
+
     #[test]
     fn a_profile_inherits_the_assignment_of_its_base_runtime() {
         let dir = tmp_agents_dir("assigned-inherit");
-        write_profile(&dir, "mine", "base = \"pi\"\nargs = [\"--x\"]\n");
+        write_profile(&dir, "mine", &pinned_pi("args = [\"--x\"]\n"));
         let agent = assigned_registry(&dir)
             .resolve_agent("mine")
             .expect("resolves");
@@ -1421,7 +1778,9 @@ mod tests {
         write_profile(
             &dir,
             "restated",
-            "base = \"pi\"\n[resume]\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n",
+            &pinned_pi(
+                "[resume]\nreference_kind = \"id\"\nargs = [\"--session\", \"{reference}\"]\n",
+            ),
         );
         let error = assigned_registry(&dir)
             .resolve_agent("restated")
@@ -1432,7 +1791,7 @@ mod tests {
     #[test]
     fn a_profile_may_switch_recovery_off_on_an_assigned_base() {
         let dir = tmp_agents_dir("assigned-off");
-        write_profile(&dir, "off", "base = \"pi\"\n[resume]\nresumable = false\n");
+        write_profile(&dir, "off", &pinned_pi("[resume]\nresumable = false\n"));
         let agent = assigned_registry(&dir)
             .resolve_agent("off")
             .expect("resolves");

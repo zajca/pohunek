@@ -68,6 +68,22 @@ impl Fixture {
             .expect("run pohunek binary")
     }
 
+    /// The host agent profile directory of the hermetic environment.
+    fn agents_dir(&self) -> PathBuf {
+        let dir = self.env.config_home().join("pohunek/agents");
+        fs::create_dir_all(&dir).expect("create the agents directory");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_MODE))
+            .expect("private agents directory");
+        dir
+    }
+
+    fn profile(&self, name: &str, text: &str, mode: u32) -> PathBuf {
+        let path = self.agents_dir().join(format!("{name}.toml"));
+        fs::write(&path, text).expect("write profile");
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("profile mode");
+        path
+    }
+
     fn file(&self, name: &str) -> PathBuf {
         let path = self.root.join(name);
         fs::write(&path, b"archive").expect("write archive");
@@ -235,6 +251,8 @@ fn remote_host_is_rejected_before_any_io_for_every_subcommand() {
         vec!["disable", "acme.pi"],
         vec!["uninstall", "acme.pi", "--yes"],
         vec!["doctor"],
+        vec!["profile", "list"],
+        vec!["profile", "migrate", "work", "--yes"],
     ];
     for case in cases {
         let mut plain = vec!["--host", "build-box", "plugin"];
@@ -678,4 +696,339 @@ fn doctor_exits_zero_when_clean() {
     assert!(output.status.success(), "{}", stderr_text(&output));
     assert!(String::from_utf8_lossy(&output.stdout).contains("No problems found"));
     drop(daemon.finish());
+}
+
+// ----- plugin profile ------------------------------------------------------
+
+/// A value that must never reach stdout, stderr or a JSON document.
+const SENTINEL: &str = "sk-sentinel-secret-9f3a";
+
+/// A profile with comments, a multi-line `[env]` secret and no pin.
+fn profile_text() -> String {
+    format!(
+        "# Work profile.\nbase = \"acme-pi\"\n# Flags.\nargs = [\"--mode\", \"rpc\"]\n\n\
+         [env]\n# Gateway credentials.\nAPI_TOKEN = \"{SENTINEL}\"\n\
+         MULTI = \"\"\"\nfirst {SENTINEL}\nsecond\n\"\"\"\n"
+    )
+}
+
+fn pinned_text(digest: &str) -> String {
+    profile_text().replacen(
+        "base = \"acme-pi\"\n",
+        &format!("base = \"acme-pi\"\npackage = \"acme.pi\"\ndigest = \"{digest}\"\n"),
+        1,
+    )
+}
+
+/// A daemon serving `acme-pi` through one selected package; `package.bind_profile`
+/// previews on a dry run and binds otherwise.
+fn daemon_serving_pi(method: &str, params: &Value) -> Value {
+    match method {
+        "package.list" => json!({
+            "generation": 2,
+            "packages": [package("acme.pi", "1.0.0", DIGEST_NEW, true)]
+        }),
+        "package.bind_profile" => bind_result(
+            if params["dry_run"] == true {
+                "preview"
+            } else {
+                "bound"
+            },
+            params,
+        ),
+        other => panic!("unexpected method {other}"),
+    }
+}
+
+/// A daemon whose profile already pins the selected package.
+fn daemon_with_pinned_profile(method: &str, params: &Value) -> Value {
+    match method {
+        "package.bind_profile" => {
+            let mut result = bind_result("unchanged", params);
+            result["previous"] = json!(DIGEST_NEW);
+            result["reloaded"] = json!(false);
+            result
+        }
+        other => panic!("unexpected method {other}"),
+    }
+}
+
+/// The `package.bind_profile` result for the profile named in `params`.
+fn bind_result(status: &str, params: &Value) -> Value {
+    json!({
+        "status": status,
+        "profile": params["profile"],
+        "base": "acme-pi",
+        "package": package("acme.pi", "1.0.0", DIGEST_NEW, true),
+        "runtime": runtime(),
+        "reloaded": status == "bound"
+    })
+}
+
+fn assert_no_secret(output: &Output) {
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        assert!(
+            !String::from_utf8_lossy(bytes).contains(SENTINEL),
+            "{stream} leaked the sentinel"
+        );
+    }
+}
+
+#[test]
+fn profile_list_reports_states_in_a_table_and_in_json() {
+    let fixture = Fixture::new();
+    fixture.profile("builtin", "base = \"shell\"\n", 0o600);
+    fixture.profile("fresh", &profile_text(), 0o600);
+    fixture.profile("pinned", &pinned_text(DIGEST_NEW), 0o600);
+    fixture.profile("gone", &pinned_text(DIGEST_OLD), 0o600);
+    fixture.profile(
+        "broken",
+        &format!("base = \"acme-pi\"\n[env]\nTOKEN = {SENTINEL}\n"),
+        0o600,
+    );
+    let daemon = fixture.serve(daemon_serving_pi);
+
+    let output = fixture.run(&["plugin", "profile", "list"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert_no_secret(&output);
+    let table = String::from_utf8_lossy(&output.stdout).into_owned();
+    for needle in [
+        "NAME",
+        "builtin",
+        "needs_migration",
+        "pinned",
+        "pin_not_installed",
+        "unreadable (line 3:",
+        "sha256:222222222222",
+    ] {
+        assert!(table.contains(needle), "missing {needle:?}: {table}");
+    }
+    assert!(
+        !table.contains(DIGEST_NEW),
+        "table must abbreviate: {table}"
+    );
+
+    let output = fixture.run(&["plugin", "profile", "list", "--json"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert_no_secret(&output);
+    let document = stdout_json(&output);
+    let profiles = document["ok"]["profiles"].as_array().expect("profiles");
+    let state_of = |name: &str| {
+        profiles
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .map(|entry| entry["state"].as_str().expect("state").to_owned())
+    };
+    assert_eq!(state_of("builtin").as_deref(), Some("builtin"));
+    assert_eq!(state_of("fresh").as_deref(), Some("needs_migration"));
+    assert_eq!(state_of("pinned").as_deref(), Some("pinned"));
+    assert_eq!(state_of("gone").as_deref(), Some("pin_not_installed"));
+    assert_eq!(state_of("broken").as_deref(), Some("unreadable"));
+    let pinned = profiles
+        .iter()
+        .find(|entry| entry["name"] == "pinned")
+        .expect("pinned entry");
+    assert_eq!(pinned["digest"], DIGEST_NEW, "JSON carries the full digest");
+    assert_eq!(pinned["package"], "acme.pi");
+    drop(daemon.finish());
+}
+
+#[test]
+fn profile_list_without_an_agents_directory_is_empty() {
+    let fixture = Fixture::new();
+    let daemon = fixture.serve(daemon_serving_pi);
+    let output = fixture.run(&["plugin", "profile", "list"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "No host agent profiles.\n"
+    );
+    drop(daemon.finish());
+}
+
+#[test]
+fn profile_migrate_without_yes_asks_the_daemon_for_a_preview_only() {
+    let fixture = Fixture::new();
+    let path = fixture.profile("work", &profile_text(), 0o600);
+    let daemon = fixture.serve(daemon_serving_pi);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_no_secret(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for needle in [
+        "work",
+        "acme-pi",
+        "acme.pi 1.0.0",
+        DIGEST_NEW,
+        "Current pin: none",
+    ] {
+        assert!(stdout.contains(needle), "missing {needle:?}: {stdout}");
+    }
+    assert!(stderr_text(&output).contains("needs your consent; nothing was changed"));
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_no_secret(&output);
+    assert_eq!(stdout_json(&output)["err"]["code"], "consent_required");
+
+    assert_eq!(fs::read_to_string(&path).expect("read"), profile_text());
+    let recorded = daemon.finish();
+    assert_eq!(
+        methods(&recorded),
+        ["package.bind_profile", "package.bind_profile"]
+    );
+    for (_, params) in &recorded {
+        assert_eq!(params["profile"], "work");
+        assert_eq!(params["dry_run"], true);
+        assert!(params.get("digest").is_none(), "{params}");
+    }
+}
+
+#[test]
+fn profile_migrate_with_yes_binds_through_the_daemon_and_never_writes_the_file() {
+    let fixture = Fixture::new();
+    let path = fixture.profile("work", &profile_text(), 0o600);
+    let daemon = fixture.serve(daemon_serving_pi);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--yes", "--json"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert_no_secret(&output);
+    let document = stdout_json(&output);
+    assert_eq!(document["ok"]["status"], "bound");
+    assert_eq!(document["ok"]["package"]["digest"], DIGEST_NEW);
+    assert_eq!(document["ok"]["profile"], "work");
+    assert_eq!(document["ok"]["base"], "acme-pi");
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--yes"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Pinned profile work to acme.pi"));
+
+    // The daemon owns the rewrite: the command leaves the file alone.
+    assert_eq!(fs::read_to_string(&path).expect("read"), profile_text());
+    let recorded = daemon.finish();
+    assert_eq!(
+        methods(&recorded),
+        [
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.bind_profile"
+        ]
+    );
+    // The consented call names the digest the preview announced.
+    for pair in recorded.chunks(2) {
+        assert_eq!(pair[0].1["dry_run"], true);
+        assert_eq!(pair[1].1["dry_run"], false);
+        assert_eq!(pair[1].1["digest"], DIGEST_NEW);
+        assert_eq!(pair[1].1["profile"], "work");
+    }
+}
+
+#[test]
+fn profile_migrate_reports_an_already_pinned_profile_without_consent() {
+    let fixture = Fixture::new();
+    fixture.profile("work", &pinned_text(DIGEST_NEW), 0o600);
+    let daemon = fixture.serve(daemon_with_pinned_profile);
+
+    let output = fixture.run(&["plugin", "profile", "migrate", "work"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("nothing changed"));
+    let output = fixture.run(&["plugin", "profile", "migrate", "work", "--json"]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    assert_eq!(stdout_json(&output)["ok"]["status"], "unchanged");
+
+    let recorded = daemon.finish();
+    assert_eq!(
+        methods(&recorded),
+        ["package.bind_profile", "package.bind_profile"]
+    );
+    assert!(recorded.iter().all(|(_, params)| params["dry_run"] == true));
+}
+
+#[test]
+fn profile_migrate_passes_a_full_digest_and_resolves_a_prefix_through_the_package_list() {
+    let fixture = Fixture::new();
+    fixture.profile("work", &profile_text(), 0o600);
+    let daemon = fixture.serve(daemon_serving_pi);
+
+    let output = fixture.run(&[
+        "plugin", "profile", "migrate", "work", "--digest", DIGEST_NEW, "--yes",
+    ]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+    let output = fixture.run(&[
+        "plugin",
+        "profile",
+        "migrate",
+        "work",
+        "--digest",
+        "222222222222",
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", stderr_text(&output));
+
+    // A prefix of a digest that is not installed never reaches the daemon's
+    // bind.
+    let output = fixture.run(&[
+        "plugin",
+        "profile",
+        "migrate",
+        "work",
+        "--digest",
+        "111111111111",
+        "--yes",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stdout_json(&output)["err"]["code"],
+        "profile_target_invalid"
+    );
+
+    let recorded = daemon.finish();
+    assert_eq!(
+        methods(&recorded),
+        [
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.list",
+            "package.bind_profile",
+            "package.bind_profile",
+            "package.list",
+        ]
+    );
+    assert_eq!(recorded[0].1["digest"], DIGEST_NEW);
+    assert_eq!(recorded[3].1["digest"], DIGEST_NEW);
+}
+
+#[test]
+fn profile_migrate_rejects_invalid_names_before_any_io() {
+    let fixture = Fixture::new();
+    for name in ["../escape", ".hidden", "a/b", "-x", "a..b"] {
+        let output = fixture.run(&["plugin", "profile", "migrate", name, "--yes"]);
+        assert_eq!(output.status.code(), Some(2), "{name}");
+        assert!(!stderr_text(&output).contains("cannot reach"), "{name}");
+    }
+}
+
+#[test]
+fn profile_list_refuses_an_unsafe_agents_directory() {
+    let fixture = Fixture::new();
+    fixture.profile("work", &profile_text(), 0o600);
+    fs::set_permissions(fixture.agents_dir(), fs::Permissions::from_mode(0o770))
+        .expect("loosen directory");
+    let daemon = fixture.serve(daemon_serving_pi);
+    let output = fixture.run(&["plugin", "profile", "list", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_no_secret(&output);
+    assert_eq!(
+        stdout_json(&output)["err"]["code"],
+        "profile_directory_unusable"
+    );
+    drop(daemon.finish());
+    fs::set_permissions(
+        fixture.agents_dir(),
+        fs::Permissions::from_mode(PRIVATE_MODE),
+    )
+    .expect("restore directory");
 }

@@ -68,6 +68,10 @@ fn package_methods(digest: &PackageDigest) -> Vec<(&'static str, Value)> {
             method::PACKAGE_UNINSTALL,
             json!({ "digest": digest, "remove_modified": false }),
         ),
+        (
+            method::PACKAGE_BIND_PROFILE,
+            json!({ "profile": "work", "digest": digest, "dry_run": true }),
+        ),
     ]
 }
 
@@ -409,6 +413,16 @@ async fn the_lifecycle_runs_end_to_end_on_the_local_socket() {
     let doctor: PackageDoctorResult = call(&mut local, method::PACKAGE_DOCTOR, Value::Null).await;
     assert!(doctor.findings.is_empty());
 
+    // The host has no agents directory, so there is no profile to bind.
+    assert_eq!(
+        refusal(
+            &mut local,
+            method::PACKAGE_BIND_PROFILE,
+            json!({ "profile": "work", "dry_run": true })
+        )
+        .await,
+        "package_profile_not_found"
+    );
     assert_eq!(
         refusal(
             &mut local,

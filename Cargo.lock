@@ -2815,6 +2815,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
+ "toml_edit 0.22.27",
  "tracing",
  "uuid",
  "zeroize",

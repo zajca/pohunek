@@ -1,6 +1,6 @@
 //! `package.list`, `package.inspect`, `package.doctor`, `package.install`,
-//! `package.link`, `package.set_enabled`, `package.select` and
-//! `package.uninstall`: the runtime package lifecycle.
+//! `package.link`, `package.set_enabled`, `package.select`,
+//! `package.uninstall` and `package.bind_profile`: the runtime package lifecycle.
 //!
 //! The methods extend the owner's launch authority on the host, so they are
 //! served on the local control socket only. Each handler refuses a remote
@@ -9,9 +9,9 @@
 // Rust guideline compliant 2026-10-04
 
 use protocol::{
-    PackageDoctorParams, PackageErrorKind, PackageInspectParams, PackageInstallParams,
-    PackageLinkParams, PackageSelectParams, PackageSetEnabledParams, PackageUninstallParams,
-    ProtocolError, Request, Response,
+    PackageBindProfileParams, PackageDoctorParams, PackageErrorKind, PackageInspectParams,
+    PackageInstallParams, PackageLinkParams, PackageSelectParams, PackageSetEnabledParams,
+    PackageUninstallParams, ProtocolError, Request, Response,
 };
 
 use super::util::{error_value, ok_value, parse_optional_params, parse_params};
@@ -116,6 +116,19 @@ pub(super) async fn handle_package_uninstall(request: &Request, state: &DaemonSt
     }
 }
 
+pub(super) async fn handle_package_bind_profile(
+    request: &Request,
+    state: &DaemonState,
+) -> Response {
+    if let Err(response) = require_local(request, state) {
+        return response;
+    }
+    match parse_params::<PackageBindProfileParams>(request) {
+        Ok(params) => respond(request, state.sessions.package_bind_profile(params).await),
+        Err(error) => error_value(request, error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -127,7 +140,7 @@ mod tests {
     use crate::governance::HostGovernanceService;
     use crate::session::SessionRegistry;
 
-    const PACKAGE_METHODS: [&str; 8] = [
+    const PACKAGE_METHODS: [&str; 9] = [
         method::PACKAGE_LIST,
         method::PACKAGE_INSPECT,
         method::PACKAGE_DOCTOR,
@@ -136,6 +149,7 @@ mod tests {
         method::PACKAGE_SET_ENABLED,
         method::PACKAGE_SELECT,
         method::PACKAGE_UNINSTALL,
+        method::PACKAGE_BIND_PROFILE,
     ];
 
     async fn state() -> (DaemonState, tempfile::TempDir) {

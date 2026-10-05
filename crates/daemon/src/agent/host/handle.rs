@@ -13,7 +13,8 @@
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use package::registry::RegistryError as PackageRegistryError;
-use protocol::{BindingProvenance, LaunchBinding, ProtocolError, RuntimeId, RuntimeRef};
+use package::PackageDigest;
+use protocol::{BindingProvenance, LaunchBinding, PackageId, ProtocolError, RuntimeId, RuntimeRef};
 use tracing::warn;
 
 use super::builtin::BuiltinSource;
@@ -368,6 +369,44 @@ impl RuntimeHost {
             .load_pinned(runtime_id, package_digest, package)
             .map(Arc::new)
             .map_err(|reason| refuse(runtime_id, &reason))
+    }
+
+    /// Resolves the definition a host profile binding `package` at `digest`
+    /// launches from.
+    ///
+    /// The definition comes from exactly that digest, never from the
+    /// registry's current selection, so selecting or updating another version
+    /// does not change what the profile launches. Enablement is not checked
+    /// here: a fresh launch passes [`Self::verify_launchable`], while an
+    /// existing session of the profile keeps resolving. A host without a
+    /// package store serves its definitions as given, so the registry's
+    /// definition must carry the same package id and digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_not_installed` for a digest that is not installed and
+    /// `runtime_incompatible` for a digest of another package or runtime and
+    /// for a root that fails verification.
+    pub fn resolve_profile_pin(
+        &self,
+        runtime_id: &RuntimeId,
+        package: &PackageId,
+        digest: &PackageDigest,
+    ) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+        if let Some(store) = self.package_store() {
+            return store
+                .load_bound(runtime_id, digest, package)
+                .map(Arc::new)
+                .map_err(|reason| refuse(runtime_id, &reason));
+        }
+        let definition = self.resolve_id(runtime_id)?;
+        match &definition.binding().provenance {
+            BindingProvenance::Package {
+                package: served,
+                package_digest,
+            } if served.id == *package && package_digest == digest => Ok(definition),
+            _ => Err(ProtocolError::runtime_incompatible(runtime_id)),
+        }
     }
 
     /// Checks that a mutation of a live session launched with `pin` may

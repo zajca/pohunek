@@ -19,6 +19,10 @@ use parser::{
 
 // `MAX_MATCHER_BYTES` is only referenced by the test module (which sees it via
 // `use super::*`); `MAX_SOURCE_BYTES` is already in scope for `parse_str`.
+/// Largest manifest source the parser accepts, for readers that must bound a
+/// file before they hold it in memory.
+pub(crate) const MAX_MANIFEST_SOURCE_BYTES: usize = MAX_SOURCE_BYTES;
+
 #[cfg(test)]
 use parser::{MAX_MATCHERS, MAX_MATCHER_BYTES};
 

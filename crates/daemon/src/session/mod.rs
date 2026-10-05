@@ -72,6 +72,8 @@ mod observation;
 mod package_lifecycle;
 mod packages;
 mod procwatch;
+#[cfg(test)]
+mod profile_pin_tests;
 mod read;
 mod reconcile;
 mod resume;

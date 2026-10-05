@@ -266,6 +266,33 @@ impl ValueCompleter for DigestCompleter {
     }
 }
 
+/// Completes the `<NAME>` argument of `pohunek plugin profile migrate` with the
+/// profile files in the agents directory.
+///
+/// Lists names only, never file content, and does no daemon I/O.
+#[derive(Clone, Copy, Debug)]
+struct ProfileNameCompleter;
+
+impl ValueCompleter for ProfileNameCompleter {
+    fn complete(&self, current: &OsStr) -> Vec<CompletionCandidate> {
+        let Some(current) = current.to_str() else {
+            return Vec::new();
+        };
+        let Ok(paths) = Paths::resolve() else {
+            return Vec::new();
+        };
+        crate::commands::plugin_profile::profile_names(
+            &paths
+                .config_dir
+                .join(crate::commands::plugin_profile::AGENTS_DIR),
+        )
+        .into_iter()
+        .filter(|name| name.starts_with(current))
+        .map(CompletionCandidate::new)
+        .collect()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HostCompleter;
 
@@ -339,8 +366,11 @@ impl CompletionContext {
 fn plugin_package_from_words(words: &[OsString]) -> Option<String> {
     let start = words.iter().position(|word| word == "plugin")?;
     let mut rest = words[start + 1..].iter().filter_map(|word| word.to_str());
-    // The first word is the subcommand.
-    rest.next()?;
+    // The first word is the subcommand. `profile` takes profile names, not
+    // package ids, so no package narrows its digest candidates.
+    if rest.next()? == "profile" {
+        return None;
+    }
     while let Some(word) = rest.next() {
         if word == "--" {
             return None;
@@ -387,13 +417,17 @@ fn dynamic_command(context: CompletionContext) -> Command {
 }
 
 fn with_plugin_completers(command: Command, context: &CompletionContext) -> Command {
-    command.mut_args(|arg| match arg.get_id().as_str() {
-        "package" => arg.add(ArgValueCompleter::new(PackageCompleter)),
-        "digest" => arg.add(ArgValueCompleter::new(DigestCompleter {
-            package: context.plugin_package.clone(),
-        })),
-        _ => arg,
-    })
+    let nested = context.clone();
+    command
+        .mut_args(|arg| match arg.get_id().as_str() {
+            "package" => arg.add(ArgValueCompleter::new(PackageCompleter)),
+            "digest" => arg.add(ArgValueCompleter::new(DigestCompleter {
+                package: context.plugin_package.clone(),
+            })),
+            "name" => arg.add(ArgValueCompleter::new(ProfileNameCompleter)),
+            _ => arg,
+        })
+        .mut_subcommands(move |subcommand| with_plugin_completers(subcommand, &nested))
 }
 
 fn with_target_completer(command: Command, context: &CompletionContext) -> Command {
@@ -1108,6 +1142,8 @@ mod tests {
             let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
             for word in [
                 "plugin",
+                "profile",
+                "migrate",
                 "inspect",
                 "uninstall",
                 "no-enable",
@@ -1137,9 +1173,13 @@ mod tests {
                 "enable",
                 "disable",
                 "uninstall",
-                "doctor"
+                "doctor",
+                "profile"
             ]
         );
+        let profile = plugin.find_subcommand("profile").expect("profile command");
+        let profile_names: Vec<_> = profile.get_subcommands().map(Command::get_name).collect();
+        assert_eq!(profile_names, ["list", "migrate"]);
         for (subcommand, argument, hint) in [
             ("install", "archive", clap::ValueHint::FilePath),
             ("install", "catalog", clap::ValueHint::FilePath),
@@ -1181,6 +1221,25 @@ mod tests {
         }
         // inspect, update, select, enable, disable, uninstall, doctor.
         assert_eq!(package_arguments, 7);
+    }
+
+    /// `plugin profile migrate` completes its `NAME` from the agents directory
+    /// and its `--digest` from the installed digests.
+    #[test]
+    fn dynamic_command_marks_the_profile_migrate_arguments() {
+        let command = dynamic_command(CompletionContext::default());
+        let migrate = command
+            .find_subcommand("plugin")
+            .and_then(|plugin| plugin.find_subcommand("profile"))
+            .and_then(|profile| profile.find_subcommand("migrate"))
+            .expect("plugin profile migrate");
+        for id in ["name", "digest"] {
+            let arg = migrate
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .expect("migrate argument");
+            assert!(arg.get::<ArgValueCompleter>().is_some(), "{id}");
+        }
     }
 
     #[test]
@@ -1252,5 +1311,10 @@ mod tests {
             None
         );
         assert_eq!(package(&["pohunek", "session", "inspect", "s-1"]), None);
+        // A profile name is not a package id: it must not narrow the digests.
+        assert_eq!(
+            package(&["pohunek", "plugin", "profile", "migrate", "work", "--digest"]),
+            None
+        );
     }
 }

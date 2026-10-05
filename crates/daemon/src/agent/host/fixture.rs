@@ -22,8 +22,17 @@ pub(crate) const PI_SHAPED_ID: &str = "pi";
 /// Environment variable that names the fixture runtime's config home.
 pub(crate) const PI_SHAPED_HOME_ENV: &str = "PI_SHAPED_HOME";
 
-const PACKAGE_DIGEST: &str =
+/// Package id of the fixture.
+pub(crate) const PI_SHAPED_PACKAGE_ID: &str = "acme.runtime.pi";
+
+/// Archive digest [`pi_shaped_definition`] reports as its package digest.
+pub(crate) const PACKAGE_DIGEST: &str =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+/// The profile keys that bind a host profile to [`pi_shaped_host`]'s package.
+pub(crate) fn pi_shaped_profile_pin() -> String {
+    format!("package = \"{PI_SHAPED_PACKAGE_ID}\"\ndigest = \"{PACKAGE_DIGEST}\"\n")
+}
 
 /// `[native_reference.existence]` body that looks for the session file below
 /// [`PI_SHAPED_HOME_ENV`].
@@ -208,7 +217,7 @@ pub(crate) fn install_pi_version(
             archive: &bytes,
             expected: &digest,
             identity: protocol::PackageIdentity {
-                id: protocol::PackageId::parse("acme.runtime.pi").expect("package id"),
+                id: protocol::PackageId::parse(PI_SHAPED_PACKAGE_ID).expect("package id"),
                 version: protocol::PackageVersion::parse(version).expect("package version"),
             },
             source: InstallSource::ExplicitDigest,
@@ -218,6 +227,28 @@ pub(crate) fn install_pi_version(
         })
         .expect("the fixture package installs");
     digest
+}
+
+/// Installs the Pi-shaped fixture at `version` with the default detection
+/// manifest, selecting it when `select` is set, and returns its archive digest.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot be installed, which would be a defect of
+/// the fixture.
+pub(crate) fn install_pi_package(
+    plugins_dir: &Path,
+    program: &Path,
+    version: &str,
+    select: bool,
+) -> PackageDigest {
+    install_pi_version(
+        plugins_dir,
+        program,
+        version,
+        PACKAGED_DETECT_MANIFEST,
+        select,
+    )
 }
 
 /// Installs the Pi-shaped fixture as an enabled, selected package into the

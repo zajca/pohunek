@@ -17058,7 +17058,8 @@ async fn recovery_refuses_an_assigned_reference_whose_conversation_is_missing() 
         "assigned-existence",
         "pi-home",
         &format!(
-            "base = \"pi\"\nprogram = \"{}\"\n[env]\n{} = \"{}\"\n",
+            "base = \"pi\"\n{}program = \"{}\"\n[env]\n{} = \"{}\"\n",
+            crate::agent::host::fixture::pi_shaped_profile_pin(),
             script.display(),
             crate::agent::host::fixture::PI_SHAPED_HOME_ENV,
             home.display()
@@ -17335,7 +17336,8 @@ async fn a_profile_variable_wins_over_the_base_environment_for_recovery() {
         "assigned-env-profile",
         "pi-env",
         &format!(
-            "base = \"pi\"\nprogram = \"SCRIPT\"\n[env]\nXDG_CONFIG_HOME = \"{}\"\n",
+            "base = \"pi\"\n{}program = \"SCRIPT\"\n[env]\nXDG_CONFIG_HOME = \"{}\"\n",
+            crate::agent::host::fixture::pi_shaped_profile_pin(),
             profile_xdg.display()
         ),
     );
@@ -17880,7 +17882,11 @@ async fn recovery_keeps_an_unchanged_profile_after_its_package_is_disabled() {
     let agents_dir = temp_agents_dir_with(
         "packaged-profile-recovery",
         "pi-profile",
-        "base = \"pi\"\n\n[env]\nPROFILE_MARK = \"kept\"\n",
+        &format!(
+            "base = \"pi\"\npackage = \"{}\"\ndigest = \"{}\"\n\n[env]\nPROFILE_MARK = \"kept\"\n",
+            crate::agent::host::fixture::PI_SHAPED_PACKAGE_ID,
+            packaged.digest
+        ),
     );
     let store_path = temp_store_path("packaged-profile-recovery");
     let registry = packaged.registry_with_agents(&store_path, Some(agents_dir));

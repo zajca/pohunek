@@ -22,6 +22,7 @@ pub(crate) mod integration;
 pub(crate) mod migration;
 pub(crate) mod notifications;
 pub(crate) mod plugin;
+pub(crate) mod plugin_profile;
 pub(crate) mod project;
 pub(crate) mod prompt;
 pub(crate) mod relay;

@@ -26,6 +26,7 @@ use protocol::{
 };
 
 use crate::client::Client;
+use crate::commands::plugin_profile::{self, ProfileAction};
 use crate::commands::render_json;
 use crate::error::CliError;
 use crate::paths::Paths;
@@ -140,6 +141,16 @@ pub(crate) enum Action {
         #[arg(long)]
         json: bool,
     },
+
+    /// Inspect and migrate host agent profiles that run on a package.
+    ///
+    /// A profile whose base runtime is served by an installed package pins
+    /// that package by `package` and `digest`; it moves to another digest only
+    /// through `pohunek plugin profile migrate`.
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
 }
 
 impl Action {
@@ -152,6 +163,7 @@ impl Action {
             | Self::Enable { json, .. }
             | Self::Disable { json, .. }
             | Self::Doctor { json, .. } => *json,
+            Self::Profile { action } => action.wants_json(),
             Self::Install(args) => args.json,
             Self::Link(args) => args.json,
             Self::Update(args) => args.json,
@@ -269,7 +281,7 @@ pub(crate) enum DigestSelector {
 }
 
 impl DigestSelector {
-    fn matches(&self, digest: &PackageDigest) -> bool {
+    pub(super) fn matches(&self, digest: &PackageDigest) -> bool {
         match self {
             Self::Full(full) => full == digest,
             Self::Prefix(prefix) => digest
@@ -379,6 +391,22 @@ pub(crate) enum Error {
         /// The package id the archive declares.
         found: String,
     },
+
+    /// The agents directory is missing its safety properties or unreadable.
+    #[error("the agent profiles directory cannot be used: {detail}")]
+    ProfileDirectory {
+        /// What is wrong, without file content.
+        detail: String,
+    },
+
+    /// The migration target does not resolve to one usable package.
+    #[error("profile {name}: {detail}")]
+    ProfileTarget {
+        /// The profile name.
+        name: String,
+        /// Why no single target resolves.
+        detail: String,
+    },
 }
 
 impl Error {
@@ -391,6 +419,8 @@ impl Error {
             Self::NotInstalled { .. } | Self::NoMatchingVersion { .. } => "package_not_installed",
             Self::Ambiguous { .. } => "plugin_selector_ambiguous",
             Self::UpdateIdMismatch { .. } => "plugin_update_id_mismatch",
+            Self::ProfileDirectory { .. } => "profile_directory_unusable",
+            Self::ProfileTarget { .. } => "profile_target_invalid",
         }
     }
 
@@ -411,6 +441,12 @@ impl Error {
             Self::Ambiguous { .. } => "narrow the selection with --digest or --version",
             Self::UpdateIdMismatch { .. } => {
                 "name the package id the archive declares, or use `pohunek plugin install`"
+            }
+            Self::ProfileDirectory { .. } => {
+                "the agents directory must be owned by you and not group- or world-writable"
+            }
+            Self::ProfileTarget { .. } => {
+                "list installed packages with `pohunek plugin list` and pass --digest"
             }
         }
     }
@@ -566,6 +602,7 @@ pub(crate) async fn run(action: Action, host: &str) -> Result<ExitCode, CliError
             print_output(json, &result, || render_change("Disabled", &result))?;
         }
         Action::Uninstall(args) => run_uninstall(&args).await?,
+        Action::Profile { action } => plugin_profile::run(action).await?,
         Action::Doctor { package, json } => {
             let mut client = connect().await?;
             let result = client
@@ -663,7 +700,7 @@ async fn connect() -> Result<Client, CliError> {
     Client::connect(LOCAL_HOST, &paths).await
 }
 
-async fn list(client: &mut Client) -> Result<PackageListResult, CliError> {
+pub(super) async fn list(client: &mut Client) -> Result<PackageListResult, CliError> {
     client.call::<method::PackageList>(()).await
 }
 
@@ -850,7 +887,7 @@ async fn send_ingest(
 }
 
 /// Print `value` as the JSON envelope, or the human text `human` builds.
-fn print_output<T, F>(json: bool, value: &T, human: F) -> Result<(), CliError>
+pub(super) fn print_output<T, F>(json: bool, value: &T, human: F) -> Result<(), CliError>
 where
     T: serde::Serialize,
     F: FnOnce() -> String,
@@ -864,7 +901,7 @@ where
 }
 
 /// First hex characters of a digest, with the `sha256:` prefix.
-fn short_digest(digest: &PackageDigest) -> String {
+pub(super) fn short_digest(digest: &PackageDigest) -> String {
     let hex = digest
         .as_str()
         .strip_prefix(DIGEST_PREFIX)
@@ -876,7 +913,7 @@ fn short_digest(digest: &PackageDigest) -> String {
     format!("{DIGEST_PREFIX}{}", &hex[..end])
 }
 
-fn summary(id: &PackageId, version: &PackageVersion, digest: &PackageDigest) -> String {
+pub(super) fn summary(id: &PackageId, version: &PackageVersion, digest: &PackageDigest) -> String {
     format!("{id} {version} ({})", short_digest(digest))
 }
 
@@ -884,7 +921,7 @@ fn summary(id: &PackageId, version: &PackageVersion, digest: &PackageDigest) -> 
 ///
 /// Package descriptors are untrusted until the owner consents, so their text
 /// never reaches the terminal raw.
-fn sanitize(text: &str) -> String {
+pub(super) fn sanitize(text: &str) -> String {
     text.chars()
         .flat_map(|character| {
             if character.is_control() {
@@ -926,7 +963,7 @@ fn fault_label(fault: PackageFault) -> &'static str {
     }
 }
 
-fn state_label(info: &PackageInfo) -> String {
+pub(super) fn state_label(info: &PackageInfo) -> String {
     let mut parts = vec![if info.enabled { "enabled" } else { "disabled" }];
     if info.selected {
         parts.push("selected");
@@ -987,7 +1024,7 @@ fn render_list(result: &PackageListResult) -> String {
 }
 
 /// Render rows as a left-aligned table whose last column is unpadded.
-fn render_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> String {
+pub(super) fn render_table<const N: usize>(header: [&str; N], rows: &[[String; N]]) -> String {
     let mut widths = header.map(str::len);
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
@@ -1624,6 +1661,11 @@ mod tests {
             Error::UpdateIdMismatch {
                 expected: "a".into(),
                 found: "b".into(),
+            },
+            Error::ProfileDirectory { detail: "d".into() },
+            Error::ProfileTarget {
+                name: "n".into(),
+                detail: "d".into(),
             },
         ];
         for error in &errors {

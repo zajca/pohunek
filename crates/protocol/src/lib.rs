@@ -103,8 +103,9 @@ pub use notification::{
 };
 #[doc(inline)]
 pub use package::{
-    PackageChangeResult, PackageDoctorParams, PackageDoctorResult, PackageErrorKind, PackageFault,
-    PackageFinding, PackageFindingKind, PackageInfo, PackageInspectParams, PackageInspectResult,
+    PackageBindProfileParams, PackageBindProfileResult, PackageBindStatus, PackageChangeResult,
+    PackageDoctorParams, PackageDoctorResult, PackageErrorKind, PackageFault, PackageFinding,
+    PackageFindingKind, PackageInfo, PackageInspectParams, PackageInspectResult,
     PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
     PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
     PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,

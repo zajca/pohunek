@@ -404,6 +404,7 @@ async fn handle_negotiated(
         method::PACKAGE_SET_ENABLED => package::handle_package_set_enabled(request, state).await,
         method::PACKAGE_SELECT => package::handle_package_select(request, state).await,
         method::PACKAGE_UNINSTALL => package::handle_package_uninstall(request, state).await,
+        method::PACKAGE_BIND_PROFILE => package::handle_package_bind_profile(request, state).await,
         method::HOST_INSPECT => host::handle_host_inspect(request, &state.health, &state.sessions),
         method::HOST_GOVERNANCE_INSPECT => {
             governance::handle_host_governance_inspect(request, &state.governance).await
