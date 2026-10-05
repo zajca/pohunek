@@ -652,10 +652,11 @@ pub(super) fn input_rules_for_agent(
     agent: &RuntimeRef,
     config: &SessionRegistryConfig,
 ) -> InputRules {
-    host.resolve_ref(agent).map_or_else(
-        |_unresolved| crate::agent::input_rules_for_kind(host, agent),
-        |definition| input_rules_for_definition(&definition, config),
-    )
+    host.definition_for_pin(agent, &crate::agent::host::LaunchPin::Unpinned)
+        .map_or_else(
+            |_unresolved| crate::agent::input_rules_for_kind(host, agent),
+            |definition| input_rules_for_definition(&definition, config),
+        )
 }
 
 pub(super) fn build_input_writes(

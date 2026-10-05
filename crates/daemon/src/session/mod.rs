@@ -620,11 +620,12 @@ struct SessionEntry {
     detector_config: watch::Sender<DetectorConfigUpdate>,
     detector_preview: mpsc::Sender<DetectionPreviewRequest>,
     default_detector_config: DetectorConfig,
-    /// Definition of the installed package this session was launched from,
-    /// loaded and verified when its runtime was registered. Callbacks and
-    /// observation of the session's own runtime use it instead of whatever the
-    /// registry serves now. `None` for a built-in runtime or a package that
-    /// did not verify.
+    /// Definition this session was launched from: the verified installed
+    /// package, or the built-in runtime (also once an official package serves
+    /// its id). Callbacks and observation of the session's own runtime use it
+    /// instead of whatever the registry serves now. `None` for a runtime no
+    /// definition of its provenance backs and for a package that did not
+    /// verify.
     pinned: Option<Arc<RuntimeDefinition>>,
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,

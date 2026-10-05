@@ -413,3 +413,132 @@ async fn an_ordinary_package_keeps_serving_next_to_an_official_alias() {
     assert_eq!(fixture.serving(RUNTIME), Some(ordinary.digest));
     assert_eq!(fixture.serving(RuntimeId::HERMES), Some(package.digest));
 }
+
+/// Detection manifest of the official package: other process matchers and
+/// other rules than the built-in `codex`.
+const OFFICIAL_MANIFEST: &str = r#"[process]
+comm = ["^official-codex$"]
+cmdline = ['(^|/)official-codex($| )']
+
+[[rules]]
+id = "official_blocked"
+state = "blocked"
+priority = 1
+region = "whole_recent"
+contains = "official needs you"
+"#;
+
+fn fact(pid: crate::procwatch::Pid, comm: &str) -> crate::procwatch::ProcessFact {
+    crate::procwatch::ProcessFact {
+        pid,
+        pgid: pid,
+        ppid: 1,
+        start_identity: crate::procwatch::StartIdentity::new(u64::from(pid)),
+        comm: comm.to_owned(),
+        cmdline: vec![format!("/usr/bin/{comm}")],
+    }
+}
+
+#[tokio::test]
+async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() {
+    let key = signing_key("root");
+    let dir = temp_dir("alias-live");
+    let store_path = temp_store_path("alias-live");
+    let fixture = Fixture::with_anchor_and_store(
+        "alias-live-plugins",
+        anchor(&[&key], Vec::new()),
+        store_path,
+    );
+    fixture.write_profile(
+        PROFILE,
+        "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
+    );
+    let created = fixture
+        .registry
+        .create(protocol::SessionNewParams {
+            agent: PROFILE.to_owned(),
+            cwd: Some(dir),
+            ..params()
+        })
+        .await
+        .expect("a session of the built-in runtime");
+    let builtin_manifest = format!("{:?}", crate::detect::codex_manifest());
+
+    let package = Package::build_with_detect(
+        OFFICIAL_PACKAGE,
+        "1.0.0",
+        RuntimeId::CODEX,
+        INERT_PROGRAM,
+        OFFICIAL_MANIFEST,
+    );
+    install_official(&fixture, &package, RuntimeId::CODEX, 5).await;
+    assert_eq!(fixture.serving(RuntimeId::CODEX), Some(package.digest));
+
+    // The entry retains the built-in definition it was launched from.
+    let pinned = fixture
+        .registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(&created.id)
+        .and_then(|entry| entry.pinned.clone())
+        .expect("a built-in session retains its definition");
+    assert!(matches!(
+        pinned.binding().provenance,
+        protocol::BindingProvenance::Builtin { .. }
+    ));
+    assert_eq!(format!("{:?}", pinned.manifest()), builtin_manifest);
+
+    // Identity callbacks resolve against the built-in, not the package.
+    let resolved = fixture
+        .registry
+        .resolve_session_agent(&created.id, "codex")
+        .await
+        .expect("resolve the callback agent");
+    assert!(matches!(
+        resolved.definition.binding().provenance,
+        protocol::BindingProvenance::Builtin { .. }
+    ));
+    assert_eq!(
+        format!("{:?}", resolved.definition.manifest()),
+        builtin_manifest
+    );
+
+    // Process recognition uses the built-in matchers of the session, and the
+    // package's matchers only recognize processes the package describes.
+    let now = std::time::Instant::now();
+    let builtin_process = fixture.registry.observed_agents_from_facts(
+        &created.id,
+        vec![fact(4001, "codex")],
+        now,
+        Some(&pinned),
+    );
+    assert_eq!(
+        builtin_process.len(),
+        1,
+        "the built-in process is recognized"
+    );
+    let official_process = fixture.registry.observed_agents_from_facts(
+        &created.id,
+        vec![fact(4002, "official-codex")],
+        now,
+        Some(&pinned),
+    );
+    assert_eq!(
+        official_process.len(),
+        1,
+        "the package process is recognized by the registry"
+    );
+    let unretained = fixture.registry.observed_agents_from_facts(
+        &created.id,
+        vec![fact(4001, "codex")],
+        now,
+        None,
+    );
+    assert!(
+        unretained.is_empty(),
+        "without the retained definition the built-in process is lost"
+    );
+    let _ = fixture.registry.stop(&created.id).await;
+}

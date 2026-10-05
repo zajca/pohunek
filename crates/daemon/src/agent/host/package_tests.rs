@@ -777,6 +777,134 @@ fn a_built_in_pinned_session_fails_closed_to_launch_and_keeps_its_observation_af
         .expect("a live session of the built-in stays controllable");
 }
 
+/// The restricted input rules a built-in Hermes session persisted.
+fn stored_hermes_rules() -> crate::store::StoredInputRules {
+    crate::store::StoredInputRules {
+        bracketed_paste: true,
+        submit_delay_ms: 150,
+        restricted: true,
+    }
+}
+
+#[test]
+fn a_reload_after_the_snapshot_cannot_hand_a_built_in_session_the_package_definition() {
+    let plugins = Plugins::new();
+    let registry = plugins.registry();
+    let built = build(
+        &descriptor("pohunek.runtime.official", "1.0.0", "hermes"),
+        "official",
+        identity("pohunek.runtime.official", "1.0.0"),
+    );
+    install_from(&registry, &built, true, true, InstallSource::Official);
+    let host = plugins.host();
+    let builtin = RuntimeHost::from_host_environment()
+        .resolve_id(&runtime("hermes"))
+        .expect("built-in hermes");
+    let builtin_pin = LaunchPin::of(&builtin);
+    let hermes = RuntimeRef::from_wire("hermes");
+    // The package is disabled and the registry rebuilt after the decision's
+    // snapshot was taken.
+    let reloading = host.clone();
+    let digest = built.digest.clone();
+    let reloaded = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&reloaded);
+    host.set_snapshot_hook(move || {
+        registry.set_enabled(&digest, false).expect("disable");
+        reloading.reload().expect("reload");
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let observed = host
+        .definition_for_pin(&hermes, &builtin_pin)
+        .expect("observation");
+
+    assert_eq!(reloaded.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(matches!(
+        observed.binding().provenance,
+        BindingProvenance::Builtin { .. }
+    ));
+    let rules =
+        crate::agent::recovered_input_rules(&host, &hermes, &builtin_pin, stored_hermes_rules());
+    assert!(
+        rules.is_restricted(),
+        "the safety contract is the built-in's"
+    );
+    assert!(rules.validate_text("bad\u{1b}text").is_err());
+}
+
+#[test]
+fn a_reload_that_installs_the_package_after_the_snapshot_keeps_the_built_in() {
+    let plugins = Plugins::new();
+    let registry = plugins.registry();
+    let built = build(
+        &descriptor("pohunek.runtime.official", "1.0.0", "hermes"),
+        "official",
+        identity("pohunek.runtime.official", "1.0.0"),
+    );
+    let host = plugins.host();
+    let builtin_pin = LaunchPin::of(&host.resolve_id(&runtime("hermes")).expect("built-in"));
+    let reloading = host.clone();
+    host.set_snapshot_hook(move || {
+        install_from(&registry, &built, true, true, InstallSource::Official);
+        reloading.reload().expect("reload");
+    });
+
+    let observed = host
+        .definition_for_pin(&RuntimeRef::from_wire("hermes"), &builtin_pin)
+        .expect("observation");
+
+    assert!(matches!(
+        observed.binding().provenance,
+        BindingProvenance::Builtin { .. }
+    ));
+}
+
+#[test]
+fn a_session_retains_the_built_in_definition_it_was_launched_from() {
+    let plugins = Plugins::new();
+    let built = build(
+        &descriptor("pohunek.runtime.official", "1.0.0", "codex"),
+        "official",
+        identity("pohunek.runtime.official", "1.0.0"),
+    );
+    let codex = RuntimeRef::from_wire("codex");
+    let builtin_pin = LaunchPin::of(
+        &RuntimeHost::from_host_environment()
+            .resolve_id(&runtime("codex"))
+            .expect("built-in codex"),
+    );
+    let host = plugins.host();
+    let provenance_of = |host: &RuntimeHost, pin: &LaunchPin| {
+        host.pinned_definition(&codex, pin)
+            .map(|definition| definition.binding().provenance.clone())
+    };
+    assert!(matches!(
+        provenance_of(&host, &builtin_pin),
+        Some(BindingProvenance::Builtin { .. })
+    ));
+    install_from(
+        &plugins.registry(),
+        &built,
+        true,
+        true,
+        InstallSource::Official,
+    );
+    host.reload().expect("reload");
+
+    for pin in [&builtin_pin, &LaunchPin::Unpinned] {
+        assert!(matches!(
+            provenance_of(&host, pin),
+            Some(BindingProvenance::Builtin { .. })
+        ));
+    }
+    // An ordinary package-served id has no built-in to retain.
+    install(&plugins.registry(), &acme("1.0.0"), true, true);
+    host.reload().expect("reload");
+    assert!(host
+        .pinned_definition(&RuntimeRef::from_wire("acme"), &LaunchPin::Unpinned)
+        .is_none());
+}
+
 #[test]
 fn a_disabled_official_package_returns_the_alias_to_the_built_in() {
     let plugins = Plugins::new();

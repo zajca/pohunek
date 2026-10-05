@@ -826,7 +826,7 @@ impl SessionRegistry {
             .inner
             .profiles
             .runtimes()
-            .pinned_package_definition(&agent_base, &snapshot.launch_binding);
+            .pinned_definition(&agent_base, &snapshot.launch_binding);
         let default_detector_config = DetectorConfig::for_pinned(
             self.inner.profiles.runtimes(),
             &agent_base,

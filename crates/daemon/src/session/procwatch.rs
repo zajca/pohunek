@@ -360,7 +360,7 @@ impl SessionRegistry {
         }
     }
 
-    fn observed_agents_from_facts(
+    pub(super) fn observed_agents_from_facts(
         &self,
         id: &SessionId,
         facts: Vec<ProcessFact>,
