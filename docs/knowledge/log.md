@@ -8,6 +8,16 @@
   is adoptable. `worker_identity_unverified` remains only for a runtime whose
   definition cannot be read.
 
+## Unreleased (2026-10-05, config-home id and observer roots)
+
+- `host.inspect` runtime entries may carry `config_home_id`, an opaque keyed
+  identifier of the config home a launch of the entry gives its agent (bare
+  runtimes that declare `[config_home]` and each profile), so clients group
+  profiles by account without learning a path. External observation now watches
+  the transcript tree of every distinct config home of the host, re-read on every
+  pass, instead of one root per provider taken from the daemon's own environment.
+  The agent profiles, sessions and secrets pages and the public API describe it.
+
 ## Unreleased (2026-10-05, config homes)
 
 - A runtime descriptor may declare its config home in `[config_home]` (a

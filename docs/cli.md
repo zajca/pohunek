@@ -88,6 +88,11 @@ Remote session starts ask for confirmation (skip with `--yes`); project
 references resolve on the *target* host, so no filesystem path ever crosses
 the wire.
 
+The human `host inspect` table adds `config_home_id=...` to every runtime that
+declares a config home. Entries that show the same value launch against the same
+config directory (one account); the value is an opaque keyed digest and never a
+path.
+
 ### Shell completion
 
 Print a static script for manual loading, or install it in the shell's

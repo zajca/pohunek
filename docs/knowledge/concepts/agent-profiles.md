@@ -99,8 +99,25 @@ expanded). The pieces fit together like this:
   a profile value that is not an absolute path is refused instead of expanded.
   Reports show directories, never environment values.
 
-Resume freezing of the profile and the observer of external transcripts follow
-in later changes of the same work; this page grows with them.
+- **Grouping profiles by account.** `host.inspect` reports `config_home_id` on
+  every runtime entry whose runtime declares a config home (the bare runtime and
+  each profile). Entries with the same value launch against the same directory,
+  for example two profile names for one subscription, or a profile that names
+  the ambient home; entries with different values are different accounts. The
+  value is an opaque keyed digest of the directory: stable on one host, different
+  on another, and it carries no path or environment value. A client groups by it
+  and never tries to decode it. The entry is absent when the home cannot be
+  resolved or the host cannot key the digest.
+- **External observer.** With external observation enabled the daemon watches
+  the transcript tree (`projects` for Claude, `sessions` for Codex) of every
+  distinct config home of the host: each runtime's own home and the home of each
+  profile. The set is re-read on every pass, so a profile that is added, edited
+  or removed is followed without a restart, and a profile whose home does not
+  exist yet is skipped until it does. An external session is still matched by
+  agent base and not attributed to a profile.
+
+Resume freezing of the profile follows in a later change of the same work; this
+page grows with it.
 
 ## Launch sources
 

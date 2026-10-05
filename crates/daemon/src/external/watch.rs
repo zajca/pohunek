@@ -8,11 +8,13 @@
 //! fast path is only logged, because the next pass repairs it; a stream that
 //! silently stopped delivering costs latency, never correctness.
 //!
-//! Every pass re-resolves the configured roots (aliases, retargeted symlinks,
-//! nested roots), registers them with the backend, and scans them. Registration
-//! failures and incomplete scans are published as degraded states.
+//! Every pass asks the [`RootProvider`] for the roots to watch, so a root that
+//! appears or disappears between passes is followed without a restart, then
+//! re-resolves them (aliases, retargeted symlinks, nested roots), registers them
+//! with the backend, and scans them. Registration failures and incomplete scans
+//! are published as degraded states.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-05
 
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
@@ -270,6 +272,22 @@ pub(super) trait TranscriptSink: Send + Sync + 'static {
     fn index_changed(&self);
 }
 
+/// Where the roots of each reconciliation pass come from.
+pub(super) trait RootProvider: Send + Sync + 'static {
+    /// The roots to watch in the pass that is starting.
+    ///
+    /// Called at the start of every pass, so an implementation may do bounded
+    /// filesystem work and must answer from the current state of the host.
+    fn roots(&self) -> impl Future<Output = Vec<TranscriptRoot>> + Send;
+}
+
+/// A fixed set of roots.
+impl RootProvider for Vec<TranscriptRoot> {
+    fn roots(&self) -> impl Future<Output = Vec<TranscriptRoot>> + Send {
+        std::future::ready(self.clone())
+    }
+}
+
 /// Handle to a running transcript watcher.
 ///
 /// The observer only needs the watcher to run; health and on-demand passes are
@@ -371,10 +389,11 @@ struct PathState {
 
 type ParseDone = io::Result<bool>;
 
-struct Watcher<B, S> {
+struct Watcher<B, S, P> {
     /// Absent only while an offloaded operation owns it.
     backend: Option<B>,
-    configured: Vec<TranscriptRoot>,
+    /// Supplies the roots of every pass.
+    provider: P,
     /// The configured roots that survived alias resolution in the last pass.
     roots: Vec<TranscriptRoot>,
     /// The canonical directory of each entry of `roots`.
@@ -402,9 +421,9 @@ struct Watcher<B, S> {
 /// `open_error` carries the failure of opening the backend, in which case the
 /// runner starts unavailable and keeps trying to restart it while the passes
 /// continue.
-pub(super) async fn start<B, S>(
+pub(super) async fn start<B, S, P>(
     backend: B,
-    roots: Vec<TranscriptRoot>,
+    roots: P,
     sink: Arc<S>,
     shutdown: CancellationToken,
     open_error: Option<io::Error>,
@@ -412,13 +431,14 @@ pub(super) async fn start<B, S>(
 where
     B: WatchBackend,
     S: TranscriptSink,
+    P: RootProvider,
 {
     let (state_tx, state_rx) = watch::channel(TranscriptWatch::Active);
     let nudge = Arc::new(Notify::new());
     let now = Instant::now();
     let mut watcher = Watcher {
         backend: Some(backend),
-        configured: roots,
+        provider: roots,
         roots: Vec::new(),
         canonical: Vec::new(),
         sink,
@@ -451,7 +471,7 @@ where
     }
 }
 
-impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
+impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
     async fn run(mut self) {
         loop {
             tokio::select! {
@@ -697,14 +717,15 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
         }
     }
 
-    /// One reconciliation pass: resolve the configured roots, register them with
-    /// the backend when it is available, then scan them.
+    /// One reconciliation pass: ask the provider for the roots, resolve them,
+    /// register them with the backend when it is available, then scan them.
     ///
     /// Registration happens before the scan so a transcript created in between
     /// is seen by at least one of them. Nothing resolved here outlives the pass.
     async fn reconcile(&mut self) {
         self.drain_parses().await;
-        self.roots = resolve_roots(&self.configured);
+        let configured = self.provider.roots().await;
+        self.roots = resolve_roots(&configured);
         self.canonical = canonical_roots(&self.roots);
         self.health = vec![
             RootHealth {

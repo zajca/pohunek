@@ -443,6 +443,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/notify.rs`
 - `crates/daemon/src/external/mod.rs`
 - `crates/daemon/src/external/watch.rs`
+- `crates/daemon/src/external/launch_roots_tests.rs` — observer roots derived from the host's config homes.
 - `crates/daemon/src/external/inotify.rs`
 - `crates/daemon/src/external/fsevents.rs`
 - `crates/daemon/src/external/unsupported.rs`

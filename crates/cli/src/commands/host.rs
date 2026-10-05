@@ -187,9 +187,14 @@ fn render_capabilities_human(host: &str, caps: &HostCapabilities) -> String {
         let supported = rt
             .supported
             .map_or("-", |supported| if supported { "true" } else { "false" });
+        let home = rt
+            .config_home_id
+            .as_deref()
+            .map(|home| format!(" config_home_id={home}"))
+            .unwrap_or_default();
         let _ = writeln!(
             output,
-            "    {:<8} available={:<5} supported={supported:<5} version={version} path={path}",
+            "    {:<8} available={:<5} supported={supported:<5} version={version} path={path}{home}",
             rt.agent, rt.available,
         );
     }
@@ -281,6 +286,7 @@ mod tests {
                     path: None,
                     version: None,
                     supported: None,
+                    config_home_id: None,
                 },
                 AgentRuntime {
                     agent: "claude".to_owned(),
@@ -289,6 +295,7 @@ mod tests {
                     path: Some("/usr/bin/claude".to_owned()),
                     version: None,
                     supported: None,
+                    config_home_id: None,
                 },
                 AgentRuntime {
                     agent: "hermes".to_owned(),
@@ -297,6 +304,7 @@ mod tests {
                     path: Some("/usr/bin/hermes".to_owned()),
                     version: Some("0.20.0".to_owned()),
                     supported: Some(true),
+                    config_home_id: None,
                 },
             ],
             git_available: true,
@@ -313,6 +321,36 @@ mod tests {
         assert!(output.contains(
             "hermes   available=true  supported=true  version=0.20.0 path=/usr/bin/hermes"
         ));
+        assert!(
+            !output.contains("config_home_id"),
+            "an entry without an identifier prints none"
+        );
+    }
+
+    #[test]
+    fn capabilities_table_shows_the_config_home_id_when_reported() {
+        let caps = HostCapabilities {
+            daemon_version: "0.1.0".to_owned(),
+            protocol_version: ProtocolVersion::new(1).expect("valid protocol version"),
+            supported_agents: vec!["claude".to_owned()],
+            runtimes: vec![AgentRuntime {
+                agent: "claude".to_owned(),
+                agent_base: Some(RuntimeRef::claude()),
+                available: true,
+                path: Some("/usr/bin/claude".to_owned()),
+                version: None,
+                supported: None,
+                config_home_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+            }],
+            git_available: true,
+            worktree_supported: true,
+            terminal_read_supported: true,
+            output_read_supported: true,
+            session_wait_supported: true,
+        };
+        let output = render_capabilities_human("host-b", &caps);
+        assert!(output
+            .contains("path=/usr/bin/claude config_home_id=0123456789abcdef0123456789abcdef\n"));
     }
 
     fn id(prefix: &str) -> String {

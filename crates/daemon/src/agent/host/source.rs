@@ -16,7 +16,7 @@
 
 // Rust guideline compliant 2026-10-05
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -36,6 +36,17 @@ const INPUTS_DOMAIN: &[u8] = b"pohunek.agent-profile-inputs";
 
 /// Domain separator of the revision MAC.
 const REVISION_DOMAIN: &[u8] = b"pohunek.agent-profile-revision";
+
+/// Domain separator of the config-home identifier MAC; the same key under a
+/// different domain never yields a value usable as a profile revision.
+const CONFIG_HOME_ID_DOMAIN: &[u8] = b"pohunek.config-home-id";
+
+/// Bytes of a config-home identifier before hex encoding.
+///
+/// 128 bits keep accidental collisions between the few homes of one host
+/// negligible and keep the identifier short enough to read; the value is
+/// already unforgeable without the host key, so the full MAC adds nothing.
+const CONFIG_HOME_ID_BYTES: usize = 16;
 
 /// Name of the host-state record holding the revision MAC key.
 const REVISION_KEY_RECORD: &str = "profile-revision.key";
@@ -203,6 +214,27 @@ impl RevisionKeys {
         Ok(ProfileRevision(tag.into()))
     }
 
+    /// The opaque identifier of the config home at `home`: a keyed MAC of the
+    /// directory, truncated and hex encoded.
+    ///
+    /// The directory is guessable, so an unkeyed digest would let anyone holding
+    /// the identifier confirm a path offline; under the host key it reveals
+    /// nothing about the path and cannot be compared across hosts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `agent_profile_revision_unavailable` when the host's key cannot
+    /// be read or created.
+    pub(crate) fn config_home_id(&self, home: &Path) -> Result<String, ProtocolError> {
+        let key = self.key()?;
+        let mut mac =
+            RevisionMac::new_from_slice(key.0.as_ref()).map_err(|_error| revision_unavailable())?;
+        mac.update(CONFIG_HOME_ID_DOMAIN);
+        mac.update(home.as_os_str().as_encoded_bytes());
+        let tag = mac.finalize().into_bytes();
+        Ok(lower_hex(&tag[..CONFIG_HOME_ID_BYTES]))
+    }
+
     /// Whether `revision` is the current revision of a profile with `inputs`,
     /// compared in constant time.
     pub(crate) fn matches(
@@ -264,6 +296,15 @@ impl ProfileRevision {
         }
         Ok(Self(bytes))
     }
+}
+
+/// The lowercase hex text of `bytes`.
+fn lower_hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut text, byte| {
+        // Writing to a String cannot fail.
+        let _ = write!(text, "{byte:02x}");
+        text
+    })
 }
 
 fn hex_digit(byte: u8) -> Option<u8> {
@@ -698,5 +739,51 @@ mod tests {
             let error = ProfileRevision::parse(bad).expect_err("malformed revision");
             assert_eq!(error.code, "agent_profile_revision_invalid", "{bad}");
         }
+    }
+
+    /// A host-state directory the key record can live in.
+    fn private_state(tag: &str) -> crate::test_support::ScopedDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scoped(tag);
+        std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o700))
+            .expect("make the state directory owner-private");
+        dir
+    }
+
+    #[test]
+    fn config_home_ids_are_keyed_stable_and_path_sensitive() {
+        let state = private_state("home-id");
+        let keys = RevisionKeys::new(Some(state.to_path_buf()));
+        let home = Path::new("/srv/accounts/zq-distinct-home");
+
+        let id = keys.config_home_id(home).expect("key available");
+
+        assert_eq!(id.len(), CONFIG_HOME_ID_BYTES * 2);
+        assert!(id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert_eq!(id, keys.config_home_id(home).expect("second call"));
+        // A cold cache reads the same stored key, as after a restart.
+        let restarted = RevisionKeys::new(Some(state.to_path_buf()));
+        assert_eq!(id, restarted.config_home_id(home).expect("restarted"));
+        assert_ne!(
+            id,
+            keys.config_home_id(Path::new("/srv/accounts/zq-other-home"))
+                .expect("another home")
+        );
+        // An unkeyed digest of the path would let anyone confirm a guess.
+        let unkeyed = Sha256::digest(home.as_os_str().as_encoded_bytes());
+        assert_ne!(id, lower_hex(&unkeyed[..CONFIG_HOME_ID_BYTES]));
+        // Another host's key identifies the same directory differently.
+        let other = RevisionKeys::new(Some(private_state("home-id-other").to_path_buf()));
+        assert_ne!(id, other.config_home_id(home).expect("another host"));
+    }
+
+    #[test]
+    fn config_home_ids_without_a_key_are_a_typed_error() {
+        let error = RevisionKeys::new(None)
+            .config_home_id(Path::new("/srv/accounts/home"))
+            .expect_err("no state directory, no key");
+        assert_eq!(error.code, "agent_profile_revision_unavailable");
     }
 }

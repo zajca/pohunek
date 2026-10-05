@@ -5,9 +5,9 @@
 //! controls external processes; it only publishes read-only `SessionInfo`
 //! snapshots for UI and CLI visibility.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-05
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::future::Future;
@@ -17,15 +17,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use protocol::{RuntimeRef, SessionId, SessionInfo};
+use protocol::{ProtocolError, RuntimeRef, SessionId, SessionInfo};
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use watch::{RootScan, TranscriptSink, WatchBackend, WatcherHandle};
+use watch::{RootProvider, RootScan, TranscriptSink, WatchBackend, WatcherHandle};
 
+use crate::integration::{ConfigHomes, LaunchHome};
 use crate::procwatch::{Pid, ProcessFact, ProcessIdentity};
 use crate::session::SessionRegistry;
 
@@ -68,19 +69,9 @@ const TRANSCRIPT_SCAN_LINE_LIMIT: usize = 32;
 /// The file reader is capped before line splitting, bounding memory and I/O
 /// even if an initial transcript record has no newline.
 const TRANSCRIPT_SCAN_BYTE_LIMIT: usize = 64 * 1024;
-/// Claude config directory override.
-const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
-/// Codex home directory override.
-const CODEX_HOME_ENV: &str = "CODEX_HOME";
-/// Home directory environment variable used for provider defaults.
-const HOME_ENV: &str = "HOME";
-/// Claude's default config directory relative to `$HOME`.
-const CLAUDE_HOME_RELATIVE: &str = ".claude";
-/// Codex's default home directory relative to `$HOME`.
-const CODEX_HOME_RELATIVE: &str = ".codex";
-/// Claude transcript root below its config directory.
+/// Claude transcript root below its config home.
 const CLAUDE_TRANSCRIPT_SUBDIR: &str = "projects";
-/// Codex transcript root below its home directory.
+/// Codex transcript root below its config home.
 const CODEX_TRANSCRIPT_SUBDIR: &str = "sessions";
 /// JSONL transcript extension.
 const JSONL_EXTENSION: &str = "jsonl";
@@ -160,10 +151,21 @@ pub(crate) struct TranscriptRoot {
     path: PathBuf,
 }
 
+/// Where the observer takes its transcript roots from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ObservedRoots {
+    /// The config homes the host's launches give their agents: each runtime's
+    /// own home and the home of every host profile, re-read on every pass.
+    LaunchHomes,
+    /// A fixed set of roots.
+    #[cfg_attr(not(test), expect(dead_code, reason = "tests pin the roots"))]
+    Fixed(Vec<TranscriptRoot>),
+}
+
 /// Runtime observer configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalObserverConfig {
-    roots: Vec<TranscriptRoot>,
+    roots: ObservedRoots,
     sweep_interval: Duration,
 }
 
@@ -230,10 +232,14 @@ impl ExternalSessions {
         }
     }
 
-    /// Builds observer config from provider transcript environment.
+    /// Builds the observer config: transcript roots follow the host's config
+    /// homes, swept every `sweep_interval`.
     #[must_use]
     pub(crate) fn observer_config(sweep_interval: Duration) -> ExternalObserverConfig {
-        ExternalObserverConfig::from_env(sweep_interval)
+        ExternalObserverConfig {
+            roots: ObservedRoots::LaunchHomes,
+            sweep_interval,
+        }
     }
 
     /// Spawns the external observer task.
@@ -388,39 +394,12 @@ impl Default for ExternalSessions {
     }
 }
 
-impl ExternalObserverConfig {
-    fn from_env(sweep_interval: Duration) -> Self {
-        let mut roots = Vec::new();
-        if let Some(path) = provider_root(
-            CLAUDE_CONFIG_DIR_ENV,
-            CLAUDE_HOME_RELATIVE,
-            CLAUDE_TRANSCRIPT_SUBDIR,
-        ) {
-            roots.push(TranscriptRoot {
-                agent_base: RuntimeRef::claude(),
-                path,
-            });
-        }
-        if let Some(path) =
-            provider_root(CODEX_HOME_ENV, CODEX_HOME_RELATIVE, CODEX_TRANSCRIPT_SUBDIR)
-        {
-            roots.push(TranscriptRoot {
-                agent_base: RuntimeRef::codex(),
-                path,
-            });
-        }
-        Self {
-            roots,
-            sweep_interval,
-        }
-    }
-}
-
 impl TranscriptIndex {
     /// Reconciles the index with every configured root and returns one result
     /// per root, in order.
     ///
-    /// Transcripts that no longer exist are dropped from the index; transcripts
+    /// Transcripts that no longer exist are dropped from the index, and so is
+    /// every transcript below a root that is no longer configured; transcripts
     /// that cannot be read or were not reached within `SCAN_LIMITS` are kept. The
     /// scan runs on the blocking pool and stops early once `cancel` fires.
     pub(crate) async fn scan_roots(
@@ -431,10 +410,12 @@ impl TranscriptIndex {
         let index = self.clone();
         let count = roots.len();
         match tokio::task::spawn_blocking(move || {
-            roots
+            let scans = roots
                 .iter()
                 .map(|root| index.scan_root(root, &roots, SCAN_LIMITS, &cancel))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            index.retain_owned(&roots);
+            scans
         })
         .await
         {
@@ -444,6 +425,21 @@ impl TranscriptIndex {
                 vec![RootScan::Incomplete; count]
             }
         }
+    }
+
+    /// Drops every entry that lies below none of `roots`, so a root that left
+    /// the configuration takes its transcripts with it.
+    fn retain_owned(&self, roots: &[TranscriptRoot]) {
+        let canonical = canonical_roots(roots);
+        let owned = |path: &Path| owning_root(roots, &canonical, path).is_some();
+        self.inner
+            .lock()
+            .unwrap_or_else(MutexError::into_inner)
+            .retain(|path, _candidate| owned(path));
+        self.parsed
+            .lock()
+            .unwrap_or_else(MutexError::into_inner)
+            .retain(|path, _signature| owned(path));
     }
 
     /// Parses one transcript path and updates the candidate index.
@@ -829,7 +825,12 @@ async fn run_observer(
     sessions: ExternalSessions,
     config: ExternalObserverConfig,
 ) {
-    let (index, _watcher) = start_transcript_index(&config.roots, &sessions).await;
+    let (index, _watcher) = match &config.roots {
+        ObservedRoots::LaunchHomes => {
+            start_transcript_index_with(LaunchHomeRoots::new(registry.clone()), &sessions).await
+        }
+        ObservedRoots::Fixed(roots) => start_transcript_index(roots, &sessions).await,
+    };
 
     let mut tick = tokio::time::interval(config.sweep_interval);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -842,16 +843,23 @@ async fn run_observer(
     }
 }
 
-/// Starts transcript watching, reports its health, and indexes the transcripts
-/// that already exist.
+/// [`start_transcript_index_with`] over a fixed set of roots.
 async fn start_transcript_index(
     roots: &[TranscriptRoot],
     sessions: &ExternalSessions,
 ) -> (TranscriptIndex, WatcherHandle) {
+    start_transcript_index_with(roots.to_vec(), sessions).await
+}
+
+/// Starts transcript watching, reports its health, and indexes the transcripts
+/// that already exist.
+///
+/// `roots` is asked for the roots to watch at the start of every pass.
+async fn start_transcript_index_with(
+    roots: impl RootProvider,
+    sessions: &ExternalSessions,
+) -> (TranscriptIndex, WatcherHandle) {
     let index = TranscriptIndex::default();
-    if roots.is_empty() {
-        debug!("external observer has no transcript roots to watch");
-    }
     let sink = Arc::new(IndexSink {
         index: index.clone(),
         sessions: sessions.clone(),
@@ -865,15 +873,158 @@ async fn start_transcript_index(
         ),
         Err(error) => (ReopenableBackend { inner: None }, Some(error)),
     };
-    let watcher = watch::start(
-        backend,
-        roots.to_vec(),
-        sink,
-        sessions.shutdown_token(),
-        open_error,
-    )
-    .await;
+    let watcher = watch::start(backend, roots, sink, sessions.shutdown_token(), open_error).await;
     (index, watcher)
+}
+
+/// The transcript tree below a config home, for a runtime whose agent writes
+/// transcripts the observer reads.
+fn transcript_subdir(runtime: &RuntimeRef) -> Option<&'static str> {
+    if *runtime == RuntimeRef::claude() {
+        Some(CLAUDE_TRANSCRIPT_SUBDIR)
+    } else if *runtime == RuntimeRef::codex() {
+        Some(CODEX_TRANSCRIPT_SUBDIR)
+    } else {
+        None
+    }
+}
+
+/// Why a config home contributes no transcript root.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SkippedHome {
+    /// The profile that names the home; `None` for a runtime's own home.
+    profile: Option<String>,
+    /// The error code of the home that does not resolve, or `None` when it
+    /// resolves to a directory without a transcript tree.
+    code: Option<String>,
+}
+
+/// The transcript roots of `homes`, and the homes that contribute none.
+///
+/// A runtime's own home is always a root: a transcript tree created later is
+/// reached by the pass that finds it. A profile's home is a root only while its
+/// transcript tree exists, so a profile that was never used does not hold the
+/// watcher in a missing-root state. Homes that share a directory yield one
+/// root, kept for the first of them. The paths of a profile's home derive from
+/// its environment and never reach a log line.
+fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<SkippedHome>) {
+    let mut roots = Vec::new();
+    let mut skipped = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    for launch in homes {
+        let Some(subdir) = transcript_subdir(&launch.runtime) else {
+            continue;
+        };
+        let home = match launch.home {
+            Ok(home) => home,
+            Err(error) => {
+                skipped.insert(SkippedHome {
+                    profile: launch.profile,
+                    code: Some(error.code),
+                });
+                continue;
+            }
+        };
+        let path = home.dir.join(subdir);
+        if launch.profile.is_some() && !path.is_dir() {
+            skipped.insert(SkippedHome {
+                profile: launch.profile,
+                code: None,
+            });
+            continue;
+        }
+        if seen.insert(home.identity()) {
+            roots.push(TranscriptRoot {
+                agent_base: launch.runtime,
+                path,
+            });
+        }
+    }
+    (roots, skipped)
+}
+
+/// Where the provider gets the config homes of the current pass.
+type HomesSource = Arc<dyn Fn() -> Result<ConfigHomes, ProtocolError> + Send + Sync>;
+
+/// Production roots: the config homes of the host's launches, resolved against
+/// the host's profiles and launch environment on every pass.
+struct LaunchHomeRoots {
+    homes: HomesSource,
+    /// What the previous pass settled on.
+    state: Arc<Mutex<LaunchHomeState>>,
+}
+
+/// What [`LaunchHomeRoots`] remembers between passes.
+#[derive(Debug, Default)]
+struct LaunchHomeState {
+    /// The roots of the last pass that resolved, kept while a pass cannot
+    /// resolve so a transient failure never empties the watched set.
+    roots: Vec<TranscriptRoot>,
+    /// The homes that contributed no root in the previous pass, so a home that
+    /// stays unusable is logged once rather than on every pass.
+    reported: BTreeSet<SkippedHome>,
+}
+
+impl LaunchHomeRoots {
+    fn new(registry: SessionRegistry) -> Self {
+        Self::from_source(Arc::new(move || registry.integration_homes()))
+    }
+
+    fn from_source(homes: HomesSource) -> Self {
+        Self {
+            homes,
+            state: Arc::default(),
+        }
+    }
+}
+
+impl RootProvider for LaunchHomeRoots {
+    async fn roots(&self) -> Vec<TranscriptRoot> {
+        let source = Arc::clone(&self.homes);
+        let state = Arc::clone(&self.state);
+        let resolved = tokio::task::spawn_blocking(move || {
+            let mut state = state.lock().unwrap_or_else(MutexError::into_inner);
+            let homes = match source() {
+                Ok(homes) => homes,
+                Err(error) => {
+                    debug!(
+                        name: "external.transcript_roots.environment_unavailable",
+                        code = %error.code,
+                        "keeping the previous transcript roots: the launch environment cannot be built"
+                    );
+                    return state.roots.clone();
+                }
+            };
+            let (roots, skipped) = observed_roots(homes.launch_homes());
+            for home in skipped.difference(&state.reported) {
+                debug!(
+                    name: "external.transcript_roots.skipped",
+                    profile = home.profile.as_deref().unwrap_or("-"),
+                    code = home.code.as_deref().unwrap_or("transcripts_absent"),
+                    "config home contributes no transcript root"
+                );
+            }
+            state.reported = skipped;
+            state.roots.clone_from(&roots);
+            roots
+        })
+        .await;
+        match resolved {
+            Ok(roots) => roots,
+            Err(error) => {
+                warn!(
+                    name: "external.transcript_roots.panicked",
+                    error = %error,
+                    "resolving transcript roots panicked: {{error}}"
+                );
+                self.state
+                    .lock()
+                    .unwrap_or_else(MutexError::into_inner)
+                    .roots
+                    .clone()
+            }
+        }
+    }
 }
 
 fn external_info_matches(existing: &SessionInfo, incoming: &SessionInfo) -> bool {
@@ -990,32 +1141,6 @@ fn is_jsonl_path(path: &Path) -> bool {
     path.extension().and_then(OsStr::to_str) == Some(JSONL_EXTENSION)
 }
 
-fn provider_root(env_var: &str, home_relative: &str, transcript_subdir: &str) -> Option<PathBuf> {
-    if let Some(value) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
-        return Some(expand_tilde(PathBuf::from(value)).join(transcript_subdir));
-    }
-    std::env::var_os(HOME_ENV)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|home| home.join(home_relative).join(transcript_subdir))
-}
-
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    let Some(raw) = path.to_str() else {
-        return path;
-    };
-    let Some(home) = std::env::var_os(HOME_ENV).filter(|value| !value.is_empty()) else {
-        return path;
-    };
-    if raw == "~" {
-        return PathBuf::from(home);
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return PathBuf::from(home).join(rest);
-    }
-    path
-}
-
 type MutexError<T> = std::sync::PoisonError<T>;
 
 #[cfg(test)]
@@ -1102,6 +1227,8 @@ mod tests {
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod launch_roots_tests;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod live_tests;
 
 #[cfg(test)]
@@ -1114,7 +1241,10 @@ mod observer_tests {
     use protocol::RuntimeRef;
 
     use super::watch::{TranscriptWatch, WatcherUnavailable};
-    use super::{start_transcript_index, ExternalObserverConfig, ExternalSessions, TranscriptRoot};
+    use super::{
+        start_transcript_index, ExternalObserverConfig, ExternalSessions, ObservedRoots,
+        TranscriptRoot,
+    };
     use crate::procwatch::{
         Error, ExitWatch, HostInspector, OwnershipMarkers, Pid, ProcessFact, ProcessIdentity,
         ProcessInspector,
@@ -1222,7 +1352,7 @@ mod observer_tests {
         sessions.spawn_observer(
             registry,
             ExternalObserverConfig {
-                roots,
+                roots: ObservedRoots::Fixed(roots),
                 sweep_interval: SWEEP_INTERVAL,
             },
         );

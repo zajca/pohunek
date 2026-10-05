@@ -515,7 +515,30 @@ version-probe parser reports a policy, and a present runtime with a policy
 always reports `supported` as `true` or `false`. Clients derive launchability
 from the entry alone: `available` and `supported != false`; an entry with no
 `supported` has no policy, and no runtime name or `agent_base` is special-cased.
-An unavailable runtime with a policy omits both fields. For Hermes, `available:
+An unavailable runtime with a policy omits both fields.
+
+Optional `config_home_id` on a `runtimes` entry is an opaque, non-secret
+identifier of the config home a launch of that entry gives its agent, so a
+client can group the entries of one account without learning a path. It is
+reported for the bare runtimes that declare a `[config_home]` and for each host
+profile of such a runtime, resolved by the same rule as the integration
+lifecycle and the transcript observer (the declared variable from the launch
+base environment overridden by the profile's `[env]`, else the default below
+`HOME`). Two entries carry the same value exactly when their homes are one
+directory: the canonical path when the directory exists, else the lexically
+normalized path, so a symlinked alias shares the id and a home that is created
+later may change it. The value is 32 lowercase hex digits, a truncated HMAC of
+the directory under the host's `profile-revision.key` secret with its own
+domain, so it is stable across calls and daemon restarts of one host, differs
+between hosts, cannot be checked against a guessed path without the key and
+reveals neither the path nor any environment value. It is safe in a relay or
+remote `host.inspect` answer for that reason, and it is not comparable across
+hosts. The field is absent for a runtime without `[config_home]` (`shell`,
+`hermes`), an unavailable pinned profile, a home that cannot be resolved (a
+relative or non-UTF-8 value) and a host whose key cannot be read or created;
+`host.inspect` never fails because of it. The first call on a host with a state
+directory creates the key record if no relay approval has yet. A daemon that
+predates the field omits it. For Hermes, `available:
 false` omits both fields, while an installed unparseable or non-`0.20.0`
 executable reports `supported: false`. The daemon independently enforces the
 same policy immediately before every Hermes launch or recovery rather than
@@ -673,8 +696,19 @@ Errors use the error contract below. Every code has fixed message and
 true values are `1`, `true`, `yes`, and `on`; accepted false values are `0`,
 `false`, `no`, `off`, or an unset variable. When true, the daemon watches the
 operator's Claude and Codex transcript trees and same-user process table for
-agents started outside pohunek. The corresponding `SessionRegistryConfig`
-setting is `observe_external_agents`, default `false`.
+agents started outside pohunek. The transcript trees are the `projects` (Claude)
+and `sessions` (Codex) directories of every config home the host launches those
+agents with: each runtime's own home and the home of every host profile of it,
+resolved as a launch resolves it (see "Config home"). The set is re-read on every
+reconciliation pass, so a profile added, edited or removed is followed without a
+daemon restart, and homes that resolve to one canonical directory are watched
+once. A profile whose home does not resolve or has no transcript tree yet is
+skipped and logged once at `debug`; a transcript below a root that left the set
+leaves the index. An observed external session is still matched to a candidate by
+agent base alone, never attributed to a profile. The daemon's own process
+environment steers nothing unless the launch allowlist forwards the variable. The
+corresponding `SessionRegistryConfig` setting is `observe_external_agents`,
+default `false`.
 
 Observation limits are validated together when the session registry starts.
 Defaults are 783,240 raw output bytes, an 8,000 ms output wait, an 8,000 ms

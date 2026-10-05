@@ -521,8 +521,9 @@ exit.
 
 The observer also indexes provider transcripts so a newly started external agent
 is enriched without waiting for the next process sweep. It watches only the
-Claude (`projects`) and Codex (`sessions`) transcript roots, never their parents
-or `$HOME`. The transcript index is converged by a bounded reconciliation pass
+Claude (`projects`) and Codex (`sessions`) transcript roots of the config homes
+the host launches those agents with (each runtime's own home and the home of
+every host profile, re-read on every pass), never their parents or `$HOME`. The transcript index is converged by a bounded reconciliation pass
 that runs every 30 seconds, on a lost-event or directory-change hint, and after a
 watcher restart, whether or not the live watcher (inotify on Linux, FSEvents on
 macOS) is healthy. Each pass re-resolves the configured roots (symlinked or
@@ -537,7 +538,10 @@ silently stopped delivering therefore delays enrichment by at most one pass.
 Every pass is bounded to 100000 directory entries, 8192 directories and 20000
 transcript parses per root, and unchanged transcripts (same size and modification
 time) are not parsed again. A provider tree beyond these bounds is visibly
-degraded with `scan_incomplete`, never silently partial. Watcher health is logged
+degraded with `scan_incomplete`, never silently partial. The bounds apply to each
+root, so a host with several account homes spends them once per distinct home.
+A transcript below a root that left the set (a removed profile) leaves the index
+on the next pass. Watcher health is logged
 with stable machine-readable causes: `external_transcript_watcher_unavailable`
 (`inotify_open_failed`, `fsevents_open_failed`, `unsupported_target`,
 `watcher_backend_failed`) when no live watcher runs, and

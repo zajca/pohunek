@@ -38,4 +38,16 @@ export type AgentRuntime = {
    * unaccepted version, so clients treat `Some(false)` as not launchable.
    */
   supported?: boolean;
+  /**
+   * Opaque, non-secret identifier of the config home a launch of this entry
+   * gives its agent, for grouping entries that share an account.
+   *
+   * Two entries carry the same value exactly when their launches resolve to
+   * the same directory. The value is a keyed digest under a secret of the
+   * reporting host: it is stable on that host, differs between hosts, and
+   * reveals neither the path nor any environment value, so it is not
+   * comparable across hosts. Absent when the runtime declares no config home,
+   * the home cannot be resolved, or the host cannot key the digest.
+   */
+  config_home_id?: string;
 };

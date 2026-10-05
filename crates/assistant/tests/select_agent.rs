@@ -17,6 +17,7 @@ fn runtime(
         path: None,
         version: None,
         supported,
+        config_home_id: None,
     }
 }
 

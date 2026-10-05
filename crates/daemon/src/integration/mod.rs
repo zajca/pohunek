@@ -57,6 +57,7 @@ pub use homes::process_environment::{
     config_homes_for_tests, install_for, install_for_retained, status_for,
 };
 pub use homes::{ConfigHomes, HomeSelection};
+pub(crate) use homes::{Home, LaunchHome};
 #[cfg(all(test, unix))]
 pub use uninstall::uninstall;
 #[cfg(unix)]
