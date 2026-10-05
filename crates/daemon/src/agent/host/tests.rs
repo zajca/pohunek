@@ -591,6 +591,79 @@ fn reserved_ids_cannot_be_claimed_by_other_sources() {
 }
 
 #[test]
+fn an_official_source_takes_an_official_alias_over_from_the_built_in_in_any_order() {
+    let official = || FixedSource {
+        trust: SourceTrust::Official,
+        definitions: vec![package_definition("codex")],
+    };
+    let builtin = BuiltinSource::new("/bin/sh");
+    for sources in [
+        [&builtin as &dyn RuntimeSource, &official()],
+        [&official() as &dyn RuntimeSource, &builtin],
+    ] {
+        let registry = RuntimeRegistry::from_sources(&sources).expect("official takeover");
+        assert!(matches!(
+            registry
+                .resolve(&id("codex"))
+                .expect("codex")
+                .binding()
+                .provenance,
+            BindingProvenance::Package { .. }
+        ));
+        assert!(matches!(
+            registry
+                .shadowed_builtin(&id("codex"))
+                .expect("the replaced built-in is kept")
+                .binding()
+                .provenance,
+            BindingProvenance::Builtin { .. }
+        ));
+        for untouched in ["claude", "hermes", "shell"] {
+            assert!(matches!(
+                registry
+                    .resolve(&id(untouched))
+                    .expect("kept")
+                    .binding()
+                    .provenance,
+                BindingProvenance::Builtin { .. }
+            ));
+            assert!(registry.shadowed_builtin(&id(untouched)).is_none());
+        }
+        assert_eq!(registry.inventory().len(), 4);
+    }
+}
+
+#[test]
+fn an_official_source_never_doubles_an_id_or_replaces_a_package() {
+    let twice = FixedSource {
+        trust: SourceTrust::Official,
+        definitions: vec![package_definition("codex"), package_definition("codex")],
+    };
+    assert_eq!(
+        RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh"), &twice])
+            .expect_err("two packages for one alias"),
+        RegistryError::Duplicate {
+            runtime_id: id("codex")
+        }
+    );
+    let external = FixedSource {
+        trust: SourceTrust::External,
+        definitions: vec![package_definition("acme")],
+    };
+    let ordinary = FixedSource {
+        trust: SourceTrust::Official,
+        definitions: vec![package_definition("acme")],
+    };
+    assert_eq!(
+        RuntimeRegistry::from_sources(&[&external, &ordinary])
+            .expect_err("an official package cannot replace a package"),
+        RegistryError::Duplicate {
+            runtime_id: id("acme")
+        }
+    );
+}
+
+#[test]
 fn provenance_must_match_source_trust() {
     let builtin_definition = builtin_registry("/bin/sh")
         .resolve(&id("shell"))
@@ -1033,11 +1106,17 @@ fn a_pin_needs_the_same_runtime_from_the_same_origin() {
         check_pin(&pin, &codex).expect_err("another runtime").code,
         "runtime_not_installed"
     );
+    let takeover =
+        check_pin(&pin, &package_definition("claude")).expect_err("a package replacing a built-in");
+    assert_eq!(takeover.code, "runtime_served_by_package");
+    assert!(takeover
+        .recover
+        .is_some_and(|hint| hint.contains("uninstall")));
     assert_eq!(
-        check_pin(&pin, &package_definition("claude"))
-            .expect_err("a package replacing a built-in")
+        check_pin(&LaunchPin::Unpinned, &package_definition("claude"))
+            .expect_err("a package serving the id of an unpinned snapshot")
             .code,
-        "runtime_not_installed"
+        "runtime_served_by_package"
     );
 
     let package = package_definition("acme");

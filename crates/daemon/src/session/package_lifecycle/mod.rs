@@ -55,8 +55,8 @@ pub use self::trust::HostTrustAnchor;
 use super::packages::PackageUninstallError;
 use super::SessionRegistry;
 use crate::agent::host::{
-    decide_claim, definition_from_archive, is_reserved, Authority, ClaimRefusal, PackageRejection,
-    PackageReport, PackageStore, RuntimeDefinition, RuntimeHost,
+    decide_claim, definition_from_archive, is_reserved, may_serve_reserved, Authority,
+    ClaimRefusal, PackageRejection, PackageReport, PackageStore, RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
 use crate::integration::{ConfigHomes, RetainedSchemas};
@@ -639,7 +639,9 @@ fn inspect_record(
     let (runtime, fault, selection_blocked) =
         match context.store.read_definition(digest, record.identity()) {
             Ok(definition) => {
-                let fault = if is_reserved(definition.runtime_id()) {
+                let fault = if is_reserved(definition.runtime_id())
+                    && !may_serve_reserved(record, &definition)
+                {
                     fault_of(&PackageRejection::ReservedRuntimeId)
                 } else if report.rejected.iter().any(|rejected| {
                     &rejected.digest == digest
@@ -673,11 +675,6 @@ fn inspect_record(
 
 /// Applies the runtime-id claim rules to `definition` against the runtimes
 /// served right now.
-///
-/// The runtime registry reserves the shell and the official aliases for
-/// built-in runtimes and its loader refuses them for packages, so an id the
-/// policy would allow an official package is still a conflict while the
-/// registry reserves it.
 fn check_claim(
     runtimes: &RuntimeHost,
     definition: &RuntimeDefinition,
@@ -694,11 +691,7 @@ fn check_claim(
     .map_err(|refusal| match refusal {
         ClaimRefusal::NotClaimable => PackageErrorKind::RuntimeNotClaimable,
         ClaimRefusal::Conflict => PackageErrorKind::RuntimeConflict,
-    })?;
-    if is_reserved(runtime_id) {
-        return Err(PackageErrorKind::RuntimeConflict);
-    }
-    Ok(())
+    })
 }
 
 /// Proves that the installed package `digest` still loads and may serve its
@@ -1022,6 +1015,8 @@ fn commit_install(
 mod bind_tests;
 #[cfg(test)]
 mod catalog_tests;
+#[cfg(test)]
+mod official_alias_tests;
 #[cfg(test)]
 mod selection_tests;
 #[cfg(test)]

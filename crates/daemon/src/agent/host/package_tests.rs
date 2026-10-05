@@ -169,12 +169,28 @@ fn acme(version: &str) -> Built {
 }
 
 fn install(registry: &Registry, built: &Built, enabled: bool, select: bool) {
+    install_from(
+        registry,
+        built,
+        enabled,
+        select,
+        InstallSource::ExplicitDigest,
+    );
+}
+
+fn install_from(
+    registry: &Registry,
+    built: &Built,
+    enabled: bool,
+    select: bool,
+    source: InstallSource,
+) {
     registry
         .install(&InstallRequest {
             archive: &built.bytes,
             expected: &built.digest,
             identity: built.identity.clone(),
-            source: InstallSource::ExplicitDigest,
+            source,
             enabled,
             select,
             installed_at_unix_seconds: INSTALLED_AT,
@@ -663,6 +679,132 @@ fn a_package_cannot_claim_a_reserved_runtime_id() {
             .expect_err("reserved id");
         assert_eq!(code(&error), "runtime_incompatible");
     }
+}
+
+#[test]
+fn a_catalog_authorized_package_serves_an_official_alias_in_place_of_the_built_in() {
+    for alias in ["codex", "claude", "hermes"] {
+        let plugins = Plugins::new();
+        let built = build(
+            &descriptor("pohunek.runtime.official", "1.0.0", alias),
+            "official",
+            identity("pohunek.runtime.official", "1.0.0"),
+        );
+        install_from(
+            &plugins.registry(),
+            &built,
+            true,
+            true,
+            InstallSource::Official,
+        );
+
+        let host = plugins.host();
+
+        assert_eq!(
+            *host.package_report(),
+            super::PackageReport::default(),
+            "{alias}"
+        );
+        let definition = host.resolve_id(&runtime(alias)).expect("served");
+        assert_eq!(
+            definition.binding().provenance,
+            BindingProvenance::Package {
+                package: built.identity.clone(),
+                package_digest: built.digest.clone(),
+            },
+            "{alias}"
+        );
+        host.verify_launchable(&definition).expect("launchable");
+        let pinned = host
+            .resolve_pinned(&RuntimeRef::from_wire(alias), &pin_of(&built, alias))
+            .expect("a pin to the official package resolves");
+        assert_eq!(pinned.binding(), definition.binding());
+        assert!(host.registry().shadowed_builtin(&runtime(alias)).is_some());
+        for other in ["shell", "codex", "claude", "hermes"] {
+            if other != alias {
+                assert!(matches!(
+                    host.resolve_id(&runtime(other))
+                        .expect("built-in")
+                        .binding()
+                        .provenance,
+                    BindingProvenance::Builtin { .. }
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_built_in_pinned_session_fails_closed_to_launch_and_keeps_its_observation_after_a_takeover() {
+    let plugins = Plugins::new();
+    let builtin_pin = LaunchPin::of(
+        &RuntimeHost::from_host_environment()
+            .resolve_id(&runtime("codex"))
+            .expect("built-in codex"),
+    );
+    let built = build(
+        &descriptor("pohunek.runtime.official", "1.0.0", "codex"),
+        "official",
+        identity("pohunek.runtime.official", "1.0.0"),
+    );
+    install_from(
+        &plugins.registry(),
+        &built,
+        true,
+        true,
+        InstallSource::Official,
+    );
+    let host = plugins.host();
+    let codex = RuntimeRef::from_wire("codex");
+
+    let refused = host
+        .resolve_pinned(&codex, &builtin_pin)
+        .expect_err("a built-in snapshot is not served by the package");
+    assert_eq!(code(&refused), "runtime_served_by_package");
+    let unpinned = host
+        .resolve_pinned(&codex, &LaunchPin::Unpinned)
+        .expect_err("an unpinned snapshot is not served by the package");
+    assert_eq!(code(&unpinned), "runtime_served_by_package");
+
+    let observed = host
+        .definition_for_pin(&codex, &builtin_pin)
+        .expect("observation");
+    assert!(matches!(
+        observed.binding().provenance,
+        BindingProvenance::Builtin { .. }
+    ));
+    host.ensure_session_runtime(&codex, &builtin_pin)
+        .expect("a live session of the built-in stays controllable");
+}
+
+#[test]
+fn a_disabled_official_package_returns_the_alias_to_the_built_in() {
+    let plugins = Plugins::new();
+    let built = build(
+        &descriptor("pohunek.runtime.official", "1.0.0", "codex"),
+        "official",
+        identity("pohunek.runtime.official", "1.0.0"),
+    );
+    let registry = plugins.registry();
+    install_from(&registry, &built, true, true, InstallSource::Official);
+    let host = plugins.host();
+    registry
+        .set_enabled(&built.digest, false)
+        .expect("disable the package");
+
+    host.reload().expect("reload");
+
+    assert!(matches!(
+        host.resolve_id(&runtime("codex"))
+            .expect("built-in")
+            .binding()
+            .provenance,
+        BindingProvenance::Builtin { .. }
+    ));
+    assert!(host
+        .registry()
+        .shadowed_builtin(&runtime("codex"))
+        .is_none());
 }
 
 #[test]

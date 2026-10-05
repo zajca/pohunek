@@ -162,6 +162,16 @@ impl Fixture {
         Self::build(tag, Some(anchor), None)
     }
 
+    /// A fixture with a catalog trust anchor whose registry persists sessions
+    /// to `store_path`.
+    pub(super) fn with_anchor_and_store(
+        tag: &str,
+        anchor: HostTrustAnchor,
+        store_path: PathBuf,
+    ) -> Self {
+        Self::build(tag, Some(anchor), Some(store_path))
+    }
+
     /// A fixture whose registry persists sessions to `store_path`.
     pub(super) fn with_store(tag: &str, store_path: PathBuf) -> Self {
         Self::build(tag, None, Some(store_path))

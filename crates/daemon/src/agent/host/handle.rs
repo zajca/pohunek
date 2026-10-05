@@ -83,17 +83,18 @@ pub enum ReloadError {
     Registry(#[from] RegistryError),
 }
 
-/// Adapts the definitions a package load returned to a registry source.
+/// Adapts the definitions a package load returned to a registry source of the
+/// given trust.
 #[derive(Debug)]
-struct LoadedPackages(Vec<RuntimeDefinition>);
+struct LoadedPackages(SourceTrust, Vec<RuntimeDefinition>);
 
 impl RuntimeSource for LoadedPackages {
     fn trust(&self) -> SourceTrust {
-        SourceTrust::External
+        self.0
     }
 
     fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
-        Ok(self.0.clone())
+        Ok(self.1.clone())
     }
 }
 
@@ -451,7 +452,9 @@ impl RuntimeHost {
     ///
     /// A package pin resolves from exactly its digest, verified again, so a
     /// disabled package or another selected version never changes how a
-    /// session is observed. Every other pin resolves through the registry.
+    /// session is observed. Every other pin resolves through the registry,
+    /// except that a built-in or unpinned session of a runtime an official
+    /// package serves is observed with the shadowed built-in definition.
     ///
     /// # Errors
     ///
@@ -467,10 +470,21 @@ impl RuntimeHost {
             Some(BindingProvenance::Package { .. })
         );
         if packaged && self.package_store().is_some() {
-            self.resolve_pinned(reference, pin)
-        } else {
-            self.resolve_ref(reference)
+            return self.resolve_pinned(reference, pin);
         }
+        let current = self.resolve_ref(reference)?;
+        if matches!(
+            current.binding().provenance,
+            BindingProvenance::Package { .. }
+        ) {
+            // A session launched from the built-in runtime keeps being
+            // observed as the built-in after an official package took the id
+            // over.
+            if let Some(builtin) = self.registry().shadowed_builtin(current.runtime_id()) {
+                return Ok(Arc::clone(builtin));
+            }
+        }
+        Ok(current)
     }
 
     /// The verified definition of the package `pin` froze, or `None` for a
@@ -539,15 +553,17 @@ fn refuse(runtime_id: &RuntimeId, reason: &super::package::PackageRejection) -> 
 /// Builds one registry snapshot from the built-in runtimes and the packages
 /// installed now.
 fn build_state(packages: &Packages) -> Result<HostState, RegistryError> {
-    let (definitions, report) = match packages.source.load_report() {
+    let (definitions, official, report) = match packages.source.load_report() {
         Ok(load) => (
             load.definitions,
+            load.official,
             PackageReport {
                 rejected: load.rejected,
                 fault: None,
             },
         ),
         Err(fault) => (
+            Vec::new(),
             Vec::new(),
             PackageReport {
                 rejected: Vec::new(),
@@ -570,8 +586,11 @@ fn build_state(packages: &Packages) -> Result<HostState, RegistryError> {
             "the package registry cannot be read; serving built-in runtimes only"
         );
     }
-    let registry =
-        RuntimeRegistry::from_sources(&[&packages.builtin, &LoadedPackages(definitions)])?;
+    let registry = RuntimeRegistry::from_sources(&[
+        &packages.builtin,
+        &LoadedPackages(SourceTrust::External, definitions),
+        &LoadedPackages(SourceTrust::Official, official),
+    ])?;
     Ok(HostState {
         registry: Arc::new(registry),
         report: Arc::new(report),

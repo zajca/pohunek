@@ -11,6 +11,16 @@
   is unchanged. Documented in the public API reference, the agent profiles
   concept and the source map.
 
+## Unreleased (2026-10-05, official runtime aliases)
+
+- A catalog-authorized official package may serve `codex`, `claude` or `hermes`
+  in place of the built-in runtime; local, linked and explicit-digest packages
+  and the shell stay refused. Disabling or uninstalling the package returns the
+  alias to the built-in. A session launched from the built-in runtime is refused
+  resume and fork with the new `runtime/runtime_served_by_package` error while a
+  package serves its runtime, keeping its binding. The runtime packages guide,
+  runtime catalog and archive concepts and the public API describe it.
+
 ## Unreleased (2026-10-05, preflight hook schema)
 
 - The upgrade preflight resolves the hook schema of a worker whose journal

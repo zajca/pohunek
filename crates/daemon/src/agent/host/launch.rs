@@ -4,6 +4,7 @@
 use protocol::{BindingProvenance, LaunchBinding, ProtocolError};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use super::claim::is_reserved;
 use super::definition::RuntimeDefinition;
 use super::handle::RuntimeHost;
 use crate::agent::{build_pty_command, LaunchCommand, LaunchOpts, ValidatedLaunchProgram};
@@ -94,8 +95,9 @@ pub(crate) fn launch_command(
 ///
 /// # Errors
 ///
-/// Returns `runtime_not_installed` when the resolved definition cannot serve
-/// the pin.
+/// Returns `runtime_served_by_package` when a built-in or unpinned snapshot
+/// meets a package-served runtime, and `runtime_not_installed` for every other
+/// definition that cannot serve the pin.
 pub(crate) fn check_pin(
     pin: &LaunchPin,
     definition: &RuntimeDefinition,
@@ -109,7 +111,22 @@ pub(crate) fn check_pin(
         }
     };
     if allowed {
-        Ok(())
+        return Ok(());
+    }
+    let built_in_launch = match pin {
+        LaunchPin::Unpinned => true,
+        LaunchPin::Pinned(frozen) => {
+            frozen.runtime_id == current.runtime_id
+                && matches!(frozen.provenance, BindingProvenance::Builtin { .. })
+        }
+    };
+    if built_in_launch
+        && is_reserved(&current.runtime_id)
+        && matches!(current.provenance, BindingProvenance::Package { .. })
+    {
+        Err(ProtocolError::runtime_served_by_package(
+            &current.runtime_id,
+        ))
     } else {
         Err(ProtocolError::runtime_not_installed(&current.runtime_id))
     }
