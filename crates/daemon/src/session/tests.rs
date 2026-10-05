@@ -6298,8 +6298,7 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
         .expect("store parent")
         .join("worker-state");
     let worker_runtime_root = crate::test_support::thread_scoped_dir("pw-hook-");
-    let hook_path = pohunek_test_support::manifest_dir()
-        .join("src/integration/assets/codex/pohunek-agent-state.sh");
+    let hook_path = crate::integration::runnable_script("codex", "pohunek-agent-state.sh");
     let payload = serde_json::json!({
         "session_id": "native-parent",
         "turn_id": "turn-child",
@@ -6417,8 +6416,7 @@ async fn a_worker_without_a_journaled_schema_is_reprojected_with_the_runtime_sch
         .expect("store parent")
         .join("worker-state");
     let worker_runtime_root = crate::test_support::thread_scoped_dir("pw-schema-");
-    let hook_path = pohunek_test_support::manifest_dir()
-        .join("src/integration/assets/codex/pohunek-agent-state.sh");
+    let hook_path = crate::integration::runnable_script("codex", "pohunek-agent-state.sh");
     let payload = serde_json::json!({
         "session_id": "native-parent",
         "turn_id": "turn-child",
@@ -18727,6 +18725,10 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
 fn adapter_script(dir: &std::path::Path, public_only: bool) -> (PathBuf, PathBuf) {
     let assets = pohunek_test_support::manifest_dir().join("src/integration/assets");
     let a = assets.display();
+    let codex_state = crate::integration::runnable_script("codex", "pohunek-agent-state.sh");
+    let codex_state = codex_state.display();
+    let codex_notify = crate::integration::runnable_script("codex", "pohunek-agent-notify.sh");
+    let codex_notify = codex_notify.display();
     let done = dir.join("adapters.done");
     let script = dir.join("adapter-session");
     let hide = "env -u POHUNEK_WORKER_SOCKET_PATH";
@@ -18736,11 +18738,11 @@ fn adapter_script(dir: &std::path::Path, public_only: bool) -> (PathBuf, PathBuf
         &script,
         &format!(
             "#!/bin/sh\n\
-             printf '%s' '{{\"session_id\":\"native-codex\",\"transcript_path\":\"/t/codex.jsonl\"}}' | {first} sh '{a}/codex/pohunek-agent-state.sh' session\n\
+             printf '%s' '{{\"session_id\":\"native-codex\",\"transcript_path\":\"/t/codex.jsonl\"}}' | {first} sh '{codex_state}' session\n\
              printf '%s' '{{\"session_id\":\"native-claude\",\"transcript_path\":\"/t/claude.jsonl\"}}' | {first} sh '{a}/claude/pohunek-agent-state.sh' session\n\
-             printf '%s' '{{\"agent_id\":\"child-1\",\"agent_type\":\"explore\"}}' | {first} sh '{a}/codex/pohunek-agent-state.sh' subagent-start\n\
-             printf '%s' '{{\"session_id\":\"native-public\",\"transcript_path\":\"/t/public.jsonl\"}}' | {hide} sh '{a}/codex/pohunek-agent-state.sh' session\n\
-             printf '%s' '{{}}' | {first} sh '{a}/codex/pohunek-agent-notify.sh' stop\n\
+             printf '%s' '{{\"agent_id\":\"child-1\",\"agent_type\":\"explore\"}}' | {first} sh '{codex_state}' subagent-start\n\
+             printf '%s' '{{\"session_id\":\"native-public\",\"transcript_path\":\"/t/public.jsonl\"}}' | {hide} sh '{codex_state}' session\n\
+             printf '%s' '{{}}' | {first} sh '{codex_notify}' stop\n\
              printf '%s' '{{}}' | {hide} sh '{a}/claude/pohunek-agent-notify.sh' stop\n\
              command -v python3 > '{done}.python'\n\
              : > '{done}'\n\

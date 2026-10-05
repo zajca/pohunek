@@ -2,10 +2,10 @@
 # installed by pohunek
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
-# POHUNEK_INTEGRATION_ID=@POHUNEK_AGENT_ID@
+# POHUNEK_INTEGRATION_ID=codex
 # POHUNEK_INTEGRATION_VERSION=11
 #
-# @POHUNEK_AGENT_NAME@ lifecycle notification hook. Fire-and-forget: any missing handshake
+# Codex lifecycle notification hook. Fire-and-forget: any missing handshake
 # env, missing python3, invalid input, or socket failure is a silent no-op
 # (exit 0) so the hook can never break the agent.
 
@@ -29,7 +29,7 @@ agent_pid="$PPID"
 # size disrupt the agent process.
 MAX_HOOK_INPUT_BYTES=65536
 
-hook_input_file="$(mktemp "${TMPDIR:-/tmp}/pohunek-@POHUNEK_AGENT_ID@-notify.XXXXXX" 2>/dev/null)" || exit 0
+hook_input_file="$(mktemp "${TMPDIR:-/tmp}/pohunek-codex-notify.XXXXXX" 2>/dev/null)" || exit 0
 trap 'rm -f "$hook_input_file"' EXIT HUP INT TERM
 head -c "$MAX_HOOK_INPUT_BYTES" >"$hook_input_file" 2>/dev/null || true
 
@@ -43,7 +43,7 @@ import socket
 import sys
 import time
 
-AGENT = "@POHUNEK_AGENT_ID@"
+AGENT = "codex"
 MAX_HOOK_INPUT_CHARS = 65536
 MAX_SESSION_ID_BYTES = 512
 SAFE_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:@")
@@ -66,16 +66,16 @@ EVENTS = {
         "provider_event": "PermissionRequest",
         "kind": "approval_required",
         "severity": "action_required",
-        "title": "@POHUNEK_AGENT_NAME@ approval required",
-        "body": "@POHUNEK_AGENT_NAME@ is waiting for approval.",
+        "title": "Codex approval required",
+        "body": "Codex is waiting for approval.",
         "attention": True,
     },
     "stop": {
         "provider_event": "Stop",
         "kind": "turn_completed",
         "severity": "info",
-        "title": "@POHUNEK_AGENT_NAME@ turn completed",
-        "body": "@POHUNEK_AGENT_NAME@ completed an agent turn.",
+        "title": "Codex turn completed",
+        "body": "Codex completed an agent turn.",
         "attention": False,
     },
 }

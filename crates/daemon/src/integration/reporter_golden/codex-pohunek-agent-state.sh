@@ -2,7 +2,7 @@
 # installed by pohunek
 # managed by pohunek; reinstalling or updating the integration overwrites this file.
 # add custom hooks beside this file instead of editing it.
-# POHUNEK_INTEGRATION_ID=@POHUNEK_AGENT_ID@
+# POHUNEK_INTEGRATION_ID=codex
 # POHUNEK_INTEGRATION_VERSION=11
 #
 # Session and subagent lifecycle hook: report active-agent identity, capture the
@@ -39,7 +39,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-agent = "@POHUNEK_AGENT_ID@"
+agent = "codex"
 ACTION_SUBAGENT_START = "subagent-start"
 ACTION_SUBAGENT_STOP = "subagent-stop"
 TIMESTAMP_MS_FACTOR = 1000

@@ -331,14 +331,17 @@ fn the_embedded_scripts_accept_only_arguments_the_registration_table_maps() {
             vec!["release", "session", "subagent-start", "subagent-stop"],
         ),
         (
-            CODEX_HOOK_ASSET,
+            CODEX_HOOK_ASSET.as_str(),
             vec!["session", "subagent-start", "subagent-stop"],
         ),
         (
             CLAUDE_NOTIFY_HOOK_ASSET,
             vec!["notification", "stop", "stop_failure"],
         ),
-        (CODEX_NOTIFY_HOOK_ASSET, vec!["permission_request", "stop"]),
+        (
+            CODEX_NOTIFY_HOOK_ASSET.as_str(),
+            vec!["permission_request", "stop"],
+        ),
     ];
     for (asset, arguments) in expected {
         let mut accepted = script_accepted_arguments(asset).expect("a readable action table");
@@ -958,4 +961,58 @@ fn a_runtime_id_never_changes_the_not_installed_filter() {
             "runtime {id}"
         );
     }
+}
+
+#[test]
+fn the_codex_scripts_are_the_templates_rendered_from_the_descriptor_values() {
+    use super::reporter::ReporterIdentity;
+    use super::{
+        CODEX_HOOK_ASSET, CODEX_HOOK_TEMPLATE, CODEX_NOTIFY_HOOK_ASSET, CODEX_NOTIFY_HOOK_TEMPLATE,
+    };
+    let resolved = builtin(&RuntimeRef::codex());
+    let identity = ReporterIdentity::new(resolved.runtime_id.as_str(), &resolved.display_name)
+        .expect("the descriptor values are a valid identity");
+
+    assert_eq!(
+        identity.render(CODEX_HOOK_TEMPLATE).expect("render"),
+        *CODEX_HOOK_ASSET
+    );
+    assert_eq!(
+        identity.render(CODEX_NOTIFY_HOOK_TEMPLATE).expect("render"),
+        *CODEX_NOTIFY_HOOK_ASSET
+    );
+}
+
+#[test]
+fn installed_codex_scripts_are_the_rendered_bytes_and_an_unrendered_template_is_drift() {
+    use super::{CODEX_HOOK_ASSET, CODEX_HOOK_TEMPLATE};
+    let dir = scoped_dir("rendered-asset-drift");
+    let state_hook = install_current(&RuntimeRef::codex(), &dir);
+    assert_eq!(
+        fs::read_to_string(&state_hook).expect("read installed state hook"),
+        *CODEX_HOOK_ASSET
+    );
+    assert_ne!(*CODEX_HOOK_ASSET, CODEX_HOOK_TEMPLATE);
+
+    fs::write(&state_hook, CODEX_HOOK_TEMPLATE).expect("install the raw template");
+    let drifted = with_config_dirs(&dir, &dir, || {
+        status_for(
+            &builtin_host(),
+            IntegrationStatusParams {
+                agent: Some(RuntimeRef::codex()),
+                ..Default::default()
+            },
+        )
+    })
+    .expect("status")
+    .agents
+    .pop()
+    .expect("Codex report");
+    assert_eq!(drifted.state, IntegrationInstallState::Outdated);
+
+    install_current(&RuntimeRef::codex(), &dir);
+    assert_eq!(
+        fs::read_to_string(&state_hook).expect("read repaired state hook"),
+        *CODEX_HOOK_ASSET
+    );
 }

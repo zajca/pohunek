@@ -1,5 +1,14 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, reporter templates)
+
+- The Codex reporter scripts are core-owned templates with `@POHUNEK_AGENT_ID@`
+  and `@POHUNEK_AGENT_NAME@` placeholders, rendered from the runtime's id and
+  display name before staging. Rendering refuses a value outside the safe
+  character set. The installed bytes are unchanged, so trust hashes and
+  installed integrations are unaffected. Documented in the runtime packages
+  guide and the source map.
+
 ## Unreleased (2026-10-05, line version probe)
 
 - Runtime descriptors can declare `version_probe = { parser = "semver-line-v1",

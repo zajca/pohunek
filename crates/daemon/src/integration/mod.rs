@@ -16,11 +16,12 @@ use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use pohunek_worker_protocol::HookAction;
 use protocol::{
     ErrorClass, IntegrationAgentStatus, IntegrationInstallReport, IntegrationInstallState,
-    IntegrationRecovery, ProtocolError, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
+    IntegrationRecovery, ProtocolError, RuntimeId, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -39,6 +40,8 @@ mod doctor;
 mod handler;
 mod homes;
 mod provider_handlers;
+mod reporter;
+use reporter::ReporterIdentity;
 #[cfg(unix)]
 mod quarantine;
 #[cfg(unix)]
@@ -82,6 +85,30 @@ pub use protocol::{
     ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH,
 };
 
+/// Path of a runnable copy of `script` for `agent` under test.
+///
+/// The Codex scripts exist only as rendered text, so their bytes are written
+/// into a directory scoped to the calling test thread; the other agents' scripts
+/// are run from the source tree.
+#[cfg(test)]
+pub(crate) fn runnable_script(agent: &str, script: &str) -> PathBuf {
+    let source = pohunek_test_support::manifest_dir()
+        .join("src/integration/assets")
+        .join(agent)
+        .join(script);
+    if agent != RuntimeId::CODEX {
+        return source;
+    }
+    let body = match script {
+        STATE_HOOK_INSTALL_NAME => CODEX_HOOK_ASSET.as_str(),
+        NOTIFY_HOOK_INSTALL_NAME => CODEX_NOTIFY_HOOK_ASSET.as_str(),
+        other => panic!("no rendered Codex script named {other}"),
+    };
+    let path = crate::test_support::thread_scoped_dir("pohunek-rendered-script-").join(script);
+    fs::write(&path, body).expect("write the rendered script");
+    path
+}
+
 /// Installed active-agent state hook script file name (shared by both agents).
 const STATE_HOOK_INSTALL_NAME: &str = "pohunek-agent-state.sh";
 /// Installed notification hook script file name (shared by both agents).
@@ -92,10 +119,30 @@ const INTEGRATION_VERSION_PREFIX: &str = "# POHUNEK_INTEGRATION_VERSION=";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-state.sh");
 /// The Claude notification hook script, embedded at compile time.
 const CLAUDE_NOTIFY_HOOK_ASSET: &str = include_str!("assets/claude/pohunek-agent-notify.sh");
-/// The Codex hook script, embedded at compile time.
-const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-state.sh");
-/// The Codex notification hook script, embedded at compile time.
-const CODEX_NOTIFY_HOOK_ASSET: &str = include_str!("assets/codex/pohunek-agent-notify.sh");
+/// The state hook template, embedded at compile time.
+const CODEX_HOOK_TEMPLATE: &str = include_str!("assets/codex/pohunek-agent-state.sh");
+/// The notification hook template, embedded at compile time.
+const CODEX_NOTIFY_HOOK_TEMPLATE: &str = include_str!("assets/codex/pohunek-agent-notify.sh");
+/// Display name of the runtime the Codex handler's scripts are rendered for.
+const CODEX_REPORTER_NAME: &str = "Codex";
+/// The runtime values the Codex handler renders its templates with.
+static CODEX_REPORTER: LazyLock<ReporterIdentity> = LazyLock::new(|| {
+    ReporterIdentity::new(RuntimeId::CODEX, CODEX_REPORTER_NAME)
+        .expect("the Codex reporter identity is a valid constant")
+});
+/// The Codex hook script rendered for the Codex runtime; its bytes are what is
+/// installed and what drift is measured against.
+static CODEX_HOOK_ASSET: LazyLock<String> = LazyLock::new(|| {
+    CODEX_REPORTER
+        .render(CODEX_HOOK_TEMPLATE)
+        .expect("the Codex state template renders")
+});
+/// The Codex notification hook script rendered for the Codex runtime.
+static CODEX_NOTIFY_HOOK_ASSET: LazyLock<String> = LazyLock::new(|| {
+    CODEX_REPORTER
+        .render(CODEX_NOTIFY_HOOK_TEMPLATE)
+        .expect("the Codex notification template renders")
+});
 /// Sanitized payloads matching the upstream Codex subagent hook schema.
 #[cfg(test)]
 const CODEX_SUBAGENT_COMPATIBILITY_FIXTURE: &str =
@@ -350,8 +397,8 @@ fn agent_status_at(agent: StatusAgent, dir: &Path) -> IntegrationAgentStatus {
         StatusAgent::Codex => status_at(
             StatusAgent::Codex,
             dir,
-            CODEX_HOOK_ASSET,
-            CODEX_NOTIFY_HOOK_ASSET,
+            CODEX_HOOK_ASSET.as_str(),
+            CODEX_NOTIFY_HOOK_ASSET.as_str(),
         ),
     }
 }
@@ -2048,11 +2095,11 @@ fn stage_codex(codex_dir: &Path) -> Result<StagedCodex, ProtocolError> {
             &[
                 ManagedScript {
                     path: &hook_path,
-                    asset: CODEX_HOOK_ASSET,
+                    asset: CODEX_HOOK_ASSET.as_str(),
                 },
                 ManagedScript {
                     path: &notify_hook_path,
-                    asset: CODEX_NOTIFY_HOOK_ASSET,
+                    asset: CODEX_NOTIFY_HOOK_ASSET.as_str(),
                 },
             ],
         )?,
@@ -2115,7 +2162,7 @@ impl StagedCodex {
             name: STATE_HOOK_INSTALL_NAME,
             label: "Codex state hook",
             action: Action::Write {
-                body: CODEX_HOOK_ASSET,
+                body: CODEX_HOOK_ASSET.as_str(),
                 mode: MANAGED_HOOK_MODE,
             },
             expected: Expected::Any,
@@ -2125,7 +2172,7 @@ impl StagedCodex {
             name: NOTIFY_HOOK_INSTALL_NAME,
             label: "Codex notification hook",
             action: Action::Write {
-                body: CODEX_NOTIFY_HOOK_ASSET,
+                body: CODEX_NOTIFY_HOOK_ASSET.as_str(),
                 mode: MANAGED_HOOK_MODE,
             },
             expected: Expected::Any,
@@ -3332,10 +3379,7 @@ mod tests {
     }
 
     fn daemon_manifest_asset(agent: &str, script: &str) -> PathBuf {
-        pohunek_test_support::manifest_dir()
-            .join("src/integration/assets")
-            .join(agent)
-            .join(script)
+        super::runnable_script(agent, script)
     }
 
     fn notification_asset(agent: &str) -> PathBuf {
@@ -4226,7 +4270,10 @@ mod tests {
 
     #[test]
     fn assets_fire_active_agent_then_native_id_with_our_env_and_exit_zero_on_missing_env() {
-        for (agent, asset) in [("claude", CLAUDE_HOOK_ASSET), ("codex", CODEX_HOOK_ASSET)] {
+        for (agent, asset) in [
+            ("claude", CLAUDE_HOOK_ASSET),
+            ("codex", CODEX_HOOK_ASSET.as_str()),
+        ] {
             assert!(
                 asset.starts_with("#!/bin/sh"),
                 "hook must be a POSIX sh script"
@@ -4826,8 +4873,8 @@ mod tests {
         for (name, asset) in [
             ("Claude state", CLAUDE_HOOK_ASSET),
             ("Claude notification", CLAUDE_NOTIFY_HOOK_ASSET),
-            ("Codex state", CODEX_HOOK_ASSET),
-            ("Codex notification", CODEX_NOTIFY_HOOK_ASSET),
+            ("Codex state", CODEX_HOOK_ASSET.as_str()),
+            ("Codex notification", CODEX_NOTIFY_HOOK_ASSET.as_str()),
         ] {
             assert_eq!(
                 super::parse_integration_version(asset),
@@ -5433,8 +5480,8 @@ mod tests {
             let report = super::status_at(
                 super::StatusAgent::Codex,
                 &inspected,
-                CODEX_HOOK_ASSET,
-                CODEX_NOTIFY_HOOK_ASSET,
+                CODEX_HOOK_ASSET.as_str(),
+                CODEX_NOTIFY_HOOK_ASSET.as_str(),
             );
             sender.send(report).expect("send FIFO status report");
         });
@@ -5489,7 +5536,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&hook_path).expect("read replacement hook"),
-            CODEX_HOOK_ASSET
+            *CODEX_HOOK_ASSET
         );
     }
 
@@ -5616,7 +5663,7 @@ mod tests {
             );
             assert_eq!(
                 fs::read(&hook_path).expect("read repaired hook"),
-                include_bytes!("assets/codex/pohunek-agent-state.sh")
+                include_bytes!("reporter_golden/codex-pohunek-agent-state.sh")
             );
         }
     }

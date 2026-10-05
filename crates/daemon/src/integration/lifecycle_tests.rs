@@ -442,10 +442,13 @@ fn installed_assets_match_the_embedded_scripts_with_owner_only_write_modes() {
             claude.join("hooks").join(NOTIFY_HOOK_INSTALL_NAME),
             CLAUDE_NOTIFY_HOOK_ASSET,
         ),
-        (codex.join(STATE_HOOK_INSTALL_NAME), CODEX_HOOK_ASSET),
+        (
+            codex.join(STATE_HOOK_INSTALL_NAME),
+            CODEX_HOOK_ASSET.as_str(),
+        ),
         (
             codex.join(NOTIFY_HOOK_INSTALL_NAME),
-            CODEX_NOTIFY_HOOK_ASSET,
+            CODEX_NOTIFY_HOOK_ASSET.as_str(),
         ),
     ] {
         assert_eq!(fs::read_to_string(&path).expect("read asset"), expected);
@@ -797,8 +800,8 @@ fn hook_assets_hold_no_node_or_bun_executable_exceptions() {
     for asset in [
         CLAUDE_HOOK_ASSET,
         CLAUDE_NOTIFY_HOOK_ASSET,
-        CODEX_HOOK_ASSET,
-        CODEX_NOTIFY_HOOK_ASSET,
+        CODEX_HOOK_ASSET.as_str(),
+        CODEX_NOTIFY_HOOK_ASSET.as_str(),
     ] {
         for token in asset.split(|character: char| !character.is_ascii_alphanumeric()) {
             assert!(
