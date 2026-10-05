@@ -18,13 +18,12 @@ use protocol::{
     IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
     IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
     IntegrationFindingSeverity, IntegrationInstallState, IntegrationRecovery, ProtocolError,
-    RuntimeId, RuntimeRef,
+    RuntimeRef,
 };
 
-use super::{
-    claude_config_dir, codex_config_dir, reported_agent_status, status_unsupported, StatusAgent,
-    GROUP_OR_OTHER_WRITE_MASK, INSTALL_LOCK_MODE, INSTALL_LOCK_NAME,
-};
+use super::handler::{self, Resolved};
+use super::{GROUP_OR_OTHER_WRITE_MASK, INSTALL_LOCK_MODE, INSTALL_LOCK_NAME};
+use crate::agent::host::RuntimeHost;
 
 /// File name every hook looks up for its interpreter.
 const PYTHON_EXECUTABLE_NAME: &str = "python3";
@@ -336,11 +335,24 @@ fn expected_when_not_installed(warning: &str) -> bool {
 }
 
 /// Derives one agent's findings from its status and the shared runtime findings.
+#[cfg(test)]
 pub(super) fn diagnose(
     status: IntegrationAgentStatus,
     runtime: &[IntegrationFinding],
 ) -> IntegrationAgentDoctor {
     let label = status.agent.as_wire().to_owned();
+    diagnose_as(status, &label, runtime)
+}
+
+/// [`diagnose`] naming `label` in recovery commands and prose.
+///
+/// The warnings are classified exactly as the handler worded them, so the label
+/// never takes part in classification.
+pub(super) fn diagnose_as(
+    status: IntegrationAgentStatus,
+    label: &str,
+    runtime: &[IntegrationFinding],
+) -> IntegrationAgentDoctor {
     let mut findings = Vec::new();
     if status.state == IntegrationInstallState::NotInstalled {
         findings.push(if status.available {
@@ -367,12 +379,12 @@ pub(super) fn diagnose(
                     .warnings
                     .iter()
                     .filter(|warning| !expected_when_not_installed(warning))
-                    .map(|warning| classify_warning(warning, &label, status.recovery)),
+                    .map(|warning| classify_warning(warning, label, status.recovery)),
             );
         }
     } else {
         for warning in &status.warnings {
-            findings.push(classify_warning(warning, &label, status.recovery));
+            findings.push(classify_warning(warning, label, status.recovery));
         }
         if status.state == IntegrationInstallState::Outdated && findings.is_empty() {
             findings.push(error_finding(
@@ -392,6 +404,20 @@ pub(super) fn diagnose(
         status: Some(status),
         findings,
     }
+}
+
+/// Reports `diagnosis` for `runtime`, after its findings were classified.
+fn retarget_diagnosis(diagnosis: &mut IntegrationAgentDoctor, runtime: &RuntimeRef) {
+    let from = diagnosis.agent.as_wire().to_owned();
+    if let Some(status) = &mut diagnosis.status {
+        handler::retarget_status(status, runtime);
+    }
+    if from != runtime.as_wire() {
+        for finding in &mut diagnosis.findings {
+            finding.summary = handler::retarget_text(&finding.summary, &from, runtime.as_wire());
+        }
+    }
+    diagnosis.agent = runtime.clone();
 }
 
 /// Quarantine-prefixed names in `directory`, and whether the scan of it was
@@ -419,16 +445,17 @@ fn quarantine_names(directory: &TrustedDir, limit: usize) -> (Vec<String>, bool)
     (matching, truncated)
 }
 
-/// Quarantine entries left in `dir` (and its `hooks` child for Claude).
+/// Quarantine entries left in `dir` and in the `subdirs` the handler's asset
+/// set can also occupy.
 ///
 /// Only a config root that passes the installer's trusted walk is scanned, and
-/// so is only a `hooks` child that passes the same validation: a symlinked root
-/// or `hooks/` is a config-root or asset finding, never a place to list files.
+/// so is only a child that passes the same validation: a symlinked root or
+/// child is a config-root or asset finding, never a place to list files.
 /// An incomplete scan is its own error finding, so a bounded or failed scan can
 /// never read as a clean diagnosis.
-pub(super) fn quarantine_findings(
+pub(super) fn quarantine_findings_in(
     dir: &std::path::Path,
-    agent: &RuntimeRef,
+    subdirs: &[&str],
     limit: usize,
 ) -> Vec<IntegrationFinding> {
     let Ok(root) = TrustedDir::open_absolute_owner_safe(dir, GROUP_OR_OTHER_WRITE_MASK) else {
@@ -437,11 +464,11 @@ pub(super) fn quarantine_findings(
     let mut left: Vec<PathBuf> = Vec::new();
     let (names, mut incomplete) = quarantine_names(&root, limit);
     left.extend(names.into_iter().map(|name| dir.join(name)));
-    if *agent == RuntimeRef::claude() {
-        if let Ok(hooks) = root.open_child_owner_safe("hooks", GROUP_OR_OTHER_WRITE_MASK) {
-            let (names, cut) = quarantine_names(&hooks, limit);
+    for subdir in subdirs {
+        if let Ok(child) = root.open_child_owner_safe(subdir, GROUP_OR_OTHER_WRITE_MASK) {
+            let (names, cut) = quarantine_names(&child, limit);
             incomplete |= cut;
-            left.extend(names.into_iter().map(|name| dir.join("hooks").join(name)));
+            left.extend(names.into_iter().map(|name| dir.join(subdir).join(name)));
         }
     }
     let mut findings = Vec::new();
@@ -474,7 +501,7 @@ pub(super) fn quarantine_findings(
             format!(
                 "the quarantine scan could not cover every entry of the agent config directory (it stops after {limit} entries per directory, or the directory could not be listed), so leftover originals may exist that are not reported"
             ),
-            "list the agent config directory (and the Claude hooks directory) by hand for entries whose names start with `.pohunek-`, review each, and remove unrelated files so the scan can complete",
+            "list the agent config directory (and its managed subdirectories) by hand for entries whose names start with `.pohunek-`, review each, and remove unrelated files so the scan can complete",
         ));
     }
     findings
@@ -538,60 +565,95 @@ fn unsafe_installer_lock(dir: &std::path::Path) -> IntegrationFinding {
     )
 }
 
-/// Diagnose the selected agent(s) without changing anything.
+/// Diagnose the selected runtime(s) through their integration handlers
+/// without changing anything.
 ///
 /// # Errors
 ///
-/// `agent_not_installable` for the shell runtime and Hermes (Hermes has its
-/// own local doctor), and for any other installed runtime; the handler
-/// rejects historical and uninstalled runtimes before this runs.
-pub fn doctor(params: IntegrationDoctorParams) -> Result<IntegrationDoctorResult, ProtocolError> {
-    doctor_with(
+/// `agent_not_installable` for a runtime without a daemon-run handler (the
+/// shell, and Hermes, which has its own local doctor); the API handler rejects
+/// historical and uninstalled runtimes before this runs.
+pub fn doctor_for(
+    host: &RuntimeHost,
+    params: IntegrationDoctorParams,
+) -> Result<IntegrationDoctorResult, ProtocolError> {
+    doctor_for_with(
+        host,
         params,
         &python_findings(&PythonProbe::from_environment()),
         &socket_findings_for_process(),
     )
 }
 
-/// [`doctor`] with the runtime probes supplied by the caller.
+/// [`doctor_for`] against the built-in runtimes.
+#[cfg(test)]
+pub fn doctor(params: IntegrationDoctorParams) -> Result<IntegrationDoctorResult, ProtocolError> {
+    doctor_for(&crate::agent::host::fixture::builtin_host(), params)
+}
+
+/// [`doctor_for_with`] against the built-in runtimes.
+#[cfg(test)]
 pub(super) fn doctor_with(
     params: IntegrationDoctorParams,
     python: &[IntegrationFinding],
     socket: &[IntegrationFinding],
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
+    doctor_for_with(
+        &crate::agent::host::fixture::builtin_host(),
+        params,
+        python,
+        socket,
+    )
+}
+
+/// Quarantine entries left in `dir` by the handler `agent` resolves to in the
+/// built-in runtimes.
+#[cfg(test)]
+pub(super) fn quarantine_findings(
+    dir: &std::path::Path,
+    agent: &RuntimeRef,
+    limit: usize,
+) -> Vec<IntegrationFinding> {
+    let subdirs = handler::resolve(&crate::agent::host::fixture::builtin_host(), agent)
+        .map(|resolved| resolved.handler.quarantine_subdirs())
+        .unwrap_or_default();
+    quarantine_findings_in(dir, subdirs, limit)
+}
+
+/// [`doctor_for`] with the runtime probes supplied by the caller.
+pub(super) fn doctor_for_with(
+    host: &RuntimeHost,
+    params: IntegrationDoctorParams,
+    python: &[IntegrationFinding],
+    socket: &[IntegrationFinding],
+) -> Result<IntegrationDoctorResult, ProtocolError> {
     let IntegrationDoctorParams { agent } = params;
-    let selected = match agent.as_ref().map(RuntimeRef::as_wire) {
-        Some(RuntimeId::CLAUDE) => vec![StatusAgent::Claude],
-        Some(RuntimeId::CODEX) => vec![StatusAgent::Codex],
-        Some(unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES)) => {
-            return Err(status_unsupported(unsupported));
-        }
-        Some(other) => {
-            return Err(status_unsupported(other));
-        }
-        None => vec![StatusAgent::Claude, StatusAgent::Codex],
+    let selected: Vec<Resolved> = match agent {
+        Some(agent) => vec![handler::resolve(host, &agent)?],
+        None => handler::managed(host),
     };
     let runtime: Vec<IntegrationFinding> = python.iter().chain(socket).cloned().collect();
     let agents: Vec<IntegrationAgentDoctor> = selected
         .into_iter()
         .map(|agent| {
-            let config_dir = match agent {
-                StatusAgent::Claude => claude_config_dir(),
-                StatusAgent::Codex => codex_config_dir(),
-            }
-            .ok();
+            let config_dir = agent.handler.config_dir().ok();
             let probe = config_dir
                 .as_deref()
                 .map_or(LockProbe::Absent, probe_installer_lock);
             if matches!(probe, LockProbe::Busy) {
-                return operation_in_progress(agent.kind());
+                return operation_in_progress(agent.runtime.clone());
             }
-            super::commit::race_point("doctor.inspecting", agent.kind().as_wire());
-            let mut diagnosis = diagnose(reported_agent_status(agent), &runtime);
+            super::commit::race_point("doctor.inspecting", agent.runtime.as_wire());
+            let mut diagnosis = diagnose_as(
+                agent.handler.inspect_provider(),
+                agent.runtime.as_wire(),
+                &runtime,
+            );
+            retarget_diagnosis(&mut diagnosis, &agent.runtime);
             if let Some(dir) = &config_dir {
-                diagnosis.findings.extend(quarantine_findings(
+                diagnosis.findings.extend(quarantine_findings_in(
                     dir,
-                    &diagnosis.agent,
+                    agent.handler.quarantine_subdirs(),
                     MAX_SCANNED_QUARANTINE_ENTRIES,
                 ));
                 if matches!(probe, LockProbe::Unsafe) {
@@ -612,7 +674,7 @@ pub(super) fn doctor_with(
                     )
                 });
             if started_meanwhile {
-                return operation_in_progress(agent.kind());
+                return operation_in_progress(agent.runtime.clone());
             }
             drop(probe);
             diagnosis

@@ -12,7 +12,7 @@ use std::process::Output;
 use std::thread;
 
 use pohunek_test_support::env::TestEnv;
-use protocol::{Request, Response, PROTOCOL_VERSION};
+use protocol::{ErrorClass, ProtocolError, Request, Response, PROTOCOL_VERSION};
 use serde_json::{json, Value};
 
 /// Mode of every private fixture directory.
@@ -59,6 +59,27 @@ fn serve_once(socket: &Path, result: Value) -> thread::JoinHandle<(String, Value
         reader.read_line(&mut line).expect("read CLI request");
         let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
         let response = Response::ok(PROTOCOL_VERSION, request.id(), result).expect("response");
+        writeln!(
+            reader.get_mut(),
+            "{}",
+            serde_json::to_string(&response).expect("serialize response")
+        )
+        .expect("write response");
+        (request.method().to_owned(), request.params().clone())
+    })
+}
+
+/// Answers one request on the fixture socket with a typed error and returns
+/// the request's method and params.
+fn serve_error_once(socket: &Path, error: ProtocolError) -> thread::JoinHandle<(String, Value)> {
+    let listener = UnixListener::bind(socket).expect("bind fake daemon");
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept CLI request");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("read CLI request");
+        let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
+        let response = Response::err(PROTOCOL_VERSION, request.id(), error).expect("response");
         writeln!(
             reader.get_mut(),
             "{}",
@@ -229,4 +250,58 @@ fn parser_keeps_the_hermes_target_requirement_and_scopes_hermes_flags() {
         stdout_json(&update)["err"]["code"],
         "integration_action_unsupported"
     );
+}
+
+#[test]
+fn a_package_runtime_id_is_sent_to_the_daemon_as_the_selector() {
+    let status_result = json!({ "agents": [doctor_result(true)["agents"][0]["status"].clone()] });
+    for (action, result) in [("doctor", doctor_result(true)), ("status", status_result)] {
+        let fixture = Fixture::new("package-runtime");
+        let server = serve_once(&fixture.socket(), result);
+
+        let output = fixture.run(&["integration", action, "--agent", "acme", "--json"]);
+
+        assert_eq!(output.status.code(), Some(0), "{action}");
+        assert_eq!(
+            server.join().expect("fake daemon"),
+            (format!("integration.{action}"), json!({ "agent": "acme" })),
+            "{action}"
+        );
+    }
+}
+
+#[test]
+fn an_unknown_runtime_id_is_refused_by_the_daemon_with_its_typed_error() {
+    let fixture = Fixture::new("unknown-runtime");
+    let server = serve_error_once(
+        &fixture.socket(),
+        ProtocolError::new(
+            ErrorClass::Runtime,
+            "runtime_not_installed",
+            "runtime acme is not installed",
+            None,
+        ),
+    );
+
+    let output = fixture.run(&["integration", "uninstall", "--agent", "acme", "--json"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stdout_json(&output)["err"]["code"], "runtime_not_installed");
+    assert_eq!(
+        server.join().expect("fake daemon"),
+        (
+            "integration.uninstall".to_owned(),
+            json!({ "agent": "acme" })
+        )
+    );
+}
+
+#[test]
+fn a_value_outside_the_runtime_id_grammar_is_a_usage_error() {
+    let fixture = Fixture::new("bad-runtime");
+    for value in ["Not An Id", "a/b"] {
+        let output = fixture.run(&["integration", "doctor", "--agent", value, "--json"]);
+        assert_eq!(output.status.code(), Some(2), "{value}");
+        assert_eq!(stdout_json(&output)["err"]["code"], "cli_usage", "{value}");
+    }
 }

@@ -1,5 +1,18 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, integration handlers)
+
+- Integration install, status, doctor, and uninstall dispatch through the
+  compiled handler a runtime definition names (`integration.handler`) instead of
+  the runtime id. The runtime packages guide and the public API describe the
+  closed handler set, the staged update transaction (stage, compatibility
+  check, atomic activation, rollback to the exact prior tree), the
+  `integration_update_incompatible` error, and that `hermes-hook-v1` is
+  registered with its lifecycle in the CLI. The source map lists the handler
+  sources. `pohunek integration --agent` accepts any
+  runtime id (built-in names unchanged), and status and doctor recovery commands
+  name the runtime that was addressed.
+
 ## Unreleased (2026-10-05, hook schemas)
 
 - The hook schema is enforced on the public socket (`session.report_agent`,

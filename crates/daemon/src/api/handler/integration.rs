@@ -1,7 +1,7 @@
 //! `integration.install`, `integration.uninstall`, `integration.status`, and
 //! `integration.doctor` agent hook RPC handlers.
 
-// Rust guideline compliant 2026-08-31
+// Rust guideline compliant 2026-10-05
 
 use protocol::{
     IntegrationDoctorParams, IntegrationDoctorResult, IntegrationInstallParams,
@@ -36,8 +36,11 @@ pub(super) async fn handle_integration_install(
     if let Err(err) = check_agent(runtimes, params.agent.as_ref()) {
         return error_value(request, err);
     }
-    run_integration_install_blocking(request, move || crate::integration::install(params.agent))
-        .await
+    let runtimes = runtimes.clone();
+    run_integration_install_blocking(request, move || {
+        crate::integration::install_for(&runtimes, params.agent.as_ref())
+    })
+    .await
 }
 
 pub(super) async fn handle_integration_uninstall(
@@ -51,8 +54,9 @@ pub(super) async fn handle_integration_uninstall(
     if let Err(err) = check_agent(runtimes, Some(&params.agent)) {
         return error_value(request, err);
     }
+    let runtimes = runtimes.clone();
     run_integration_uninstall_blocking(request, move || {
-        crate::integration::uninstall(&params.agent)
+        crate::integration::uninstall_for(&runtimes, &params.agent)
     })
     .await
 }
@@ -68,7 +72,11 @@ pub(super) async fn handle_integration_doctor(
     if let Err(err) = check_agent(runtimes, params.agent.as_ref()) {
         return error_value(request, err);
     }
-    run_integration_doctor_blocking(request, move || crate::integration::doctor(params)).await
+    let runtimes = runtimes.clone();
+    run_integration_doctor_blocking(request, move || {
+        crate::integration::doctor_for(&runtimes, params)
+    })
+    .await
 }
 
 pub(super) async fn handle_integration_status(
@@ -82,7 +90,11 @@ pub(super) async fn handle_integration_status(
     if let Err(err) = check_agent(runtimes, params.agent.as_ref()) {
         return error_value(request, err);
     }
-    run_integration_status_blocking(request, move || crate::integration::status(params)).await
+    let runtimes = runtimes.clone();
+    run_integration_status_blocking(request, move || {
+        crate::integration::status_for(&runtimes, params)
+    })
+    .await
 }
 
 /// Run integration installation off the Tokio request task.

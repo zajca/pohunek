@@ -8,11 +8,13 @@
 //! any letter case; comments and test code (as classified by
 //! `xtask::test_code`) are not scanned.
 //!
-//! The names that remain are data or work owned by another issue. Each
+//! The names that remain are data, work owned by another issue, or the
+//! implementation of a compiled integration handler (which runtime uses a
+//! handler is decided by its descriptor, never by a name here). Each
 //! allow-list entry pins the exact trimmed text of every source line that still
 //! names an agent in one file (a SHA-256 over those lines for the large
 //! integration files owned wholesale by one issue) and states which issue
-//! removes them or why they are data. A new occurrence, a replaced line, a
+//! removes them or why they are data or handler code. A new occurrence, a replaced line, a
 //! change to a line that already names an agent, and a removed occurrence all
 //! fail the scan until the entry is updated. `regenerate_allow_list` (ignored)
 //! prints the entries of the current tree.
@@ -39,8 +41,11 @@ enum Owner {
     /// Compiled descriptor data that becomes package data when the built-in
     /// Codex, Claude and Hermes packages exist.
     Packages,
-    /// Integration handlers (#144).
-    Integration,
+    /// Compiled integration handler implementations. A handler is selected by
+    /// the id a runtime descriptor names; the Claude and Codex handlers still
+    /// own their provider ids, config paths and asset code, which is data of
+    /// the handler and not dispatch.
+    Handlers,
     /// Transcript parsing of external sessions (#487).
     Transcripts,
     /// Data tables that stay data: reserved ids and wire spellings.
@@ -51,7 +56,7 @@ impl Owner {
     fn issue(self) -> &'static str {
         match self {
             Self::Packages => "#145 #146 #147",
-            Self::Integration => "#144",
+            Self::Handlers => "handlers",
             Self::Transcripts => "#487",
             Self::Data => "data",
         }
@@ -206,28 +211,54 @@ const ALLOW_LIST: &[Entry] = &[
     (
         "crates/daemon/src/integration/doctor.rs",
         Approved::Lines(&[
-    "\"list the agent config directory (and the Claude hooks directory) by hand for entries whose names start with `.pohunek-`, review each, and remove unrelated files so the scan can complete\",",
     "\"point CLAUDE_CONFIG_DIR or CODEX_HOME at an existing absolute directory owned by the daemon user (use the canonical path when the current one goes through a symlink), then re-run the doctor\".to_owned(),",
     "(IntegrationFindingCode::CodexHooksFeatureDisabled, install)",
     "(IntegrationFindingCode::CodexTrustDrift, install)",
-    "None => vec![StatusAgent::Claude, StatusAgent::Codex],",
-    "Some(RuntimeId::CLAUDE) => vec![StatusAgent::Claude],",
-    "Some(RuntimeId::CODEX) => vec![StatusAgent::Codex],",
-    "Some(unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES)) => {",
-    "StatusAgent::Claude => claude_config_dir(),",
-    "StatusAgent::Codex => codex_config_dir(),",
-    "claude_config_dir, codex_config_dir, reported_agent_status, status_unsupported, StatusAgent,",
-    "if *agent == RuntimeRef::claude() {",
     "} else if warning.contains(\"Codex hooks feature is not enabled\") {",
 ]),
-        Owner::Integration,
-        "integration handlers",
+        Owner::Handlers,
+        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
     ),
     (
         "crates/daemon/src/integration/mod.rs",
-        Approved::Digest(225, "7d1f8749821ff9f43106db1764b52d4bf01aa67f4a704acd3e44d0d87d2cee79"),
-        Owner::Integration,
-        "integration handlers",
+        Approved::Digest(212, "fa8870da3a271535d3facc402e8807f0367ce64fa542e6e63152084a3e623f66"),
+        Owner::Handlers,
+        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
+    ),
+    (
+        "crates/daemon/src/integration/provider_handlers.rs",
+        Approved::Lines(&[
+    "\"claude-hook-v1\"",
+    "\"codex-hook-v1\"",
+    "AssetManifest, InstallPaths, StagedClaude, StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS,",
+    "CLAUDE_REPORTED_ACTIONS",
+    "CODEX_REPORTED_ACTIONS",
+    "CODEX_REPORTED_ACTIONS,",
+    "Handler::CliRun(&HERMES_HOOK),",
+    "Handler::Daemon(&ClaudeHook),",
+    "Handler::Daemon(&CodexHook),",
+    "Ok(Box::new(stage_claude(dir)?))",
+    "Ok(Box::new(stage_codex(dir)?))",
+    "actions: HERMES_REPORTED_ACTIONS,",
+    "claude_config_dir()",
+    "claude_config_dir, codex_config_dir, reported_agent_status, stage_claude, stage_codex,",
+    "codex_config_dir()",
+    "const HERMES_REPORTED_ACTIONS: &[HookAction] = &[",
+    "id: \"hermes-hook-v1\",",
+    "impl DaemonHandler for ClaudeHook {",
+    "impl DaemonHandler for CodexHook {",
+    "impl StagedUpdate for StagedClaude {",
+    "impl StagedUpdate for StagedCodex {",
+    "reported_agent_status(StatusAgent::Claude)",
+    "reported_agent_status(StatusAgent::Codex)",
+    "let mut report = super::uninstall::uninstall_claude(dir)?;",
+    "let mut report = super::uninstall::uninstall_codex(dir)?;",
+    "static HERMES_HOOK: CliRunHandler = CliRunHandler {",
+    "struct ClaudeHook;",
+    "struct CodexHook;",
+]),
+        Owner::Handlers,
+        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
     ),
     (
         "crates/daemon/src/integration/uninstall.rs",
@@ -238,16 +269,14 @@ const ALLOW_LIST: &[Entry] = &[
     "(STATE_HOOK_INSTALL_NAME, \"Claude state hook\"),",
     "(STATE_HOOK_INSTALL_NAME, \"Codex state hook\"),",
     ".map(|file| (\"settings.json\", \"Claude settings.json\", file))",
-    "RuntimeId::CLAUDE => uninstall_claude(&claude_config_dir()?)?,",
-    "RuntimeId::CODEX => uninstall_codex(&codex_config_dir()?)?,",
     "RuntimeRef::claude(),",
     "RuntimeRef::codex(),",
-    "apply_trust_moves, claude_config_dir, claude_notify_hook_commands, codex_config_dir,",
+    "apply_trust_moves, claude_notify_hook_commands, codex_managed_hooks,",
     "claude_dir,",
     "claude_dir: &Path,",
     "codex_dir,",
     "codex_dir: &Path,",
-    "codex_managed_hooks, codex_notify_hook_commands, config_dir_is_symlink, config_path_kind,",
+    "codex_notify_hook_commands, config_dir_is_symlink, config_path_kind, hook_command,",
     "const CLAUDE_OWNERSHIP_MARKER: &str = \"# POHUNEK_INTEGRATION_ID=claude\";",
     "const CODEX_OWNERSHIP_MARKER: &str = \"# POHUNEK_INTEGRATION_ID=codex\";",
     "fn strip_codex_trust(",
@@ -284,15 +313,14 @@ const ALLOW_LIST: &[Entry] = &[
     "return Ok(empty_report(RuntimeRef::claude()));",
     "return Ok(empty_report(RuntimeRef::codex()));",
     "strip_codex_trust(",
-    "toml_error_summary, trust_rekeys, validate_config_dir, CodexManagedHook, ConfigPath,",
     "unchanged.push((\"config.toml\", \"Codex config.toml\", file));",
     "unchanged.push((\"hooks.json\", \"Codex hooks.json\", file));",
     "uninstall_claude_gated(claude_dir, &mut |_index, _name| Ok(()))",
     "uninstall_codex_gated(codex_dir, &mut |_index, _name| Ok(()))",
-    "unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES) => {",
+    "validate_config_dir, CodexManagedHook, ConfigPath, LoadedFile, OwnedTrustHashes, TrustedDir,",
 ]),
-        Owner::Integration,
-        "integration handlers",
+        Owner::Handlers,
+        "compiled Claude and Codex handler implementations: they own their provider ids, paths and asset code",
     ),
     (
         "crates/daemon/src/notifications/mod.rs",
@@ -475,7 +503,7 @@ fn regenerate_allow_list() {
         let known = ALLOW_LIST.iter().find(|entry| entry.0 == path);
         let owner = known.map_or("Data", |entry| match entry.2 {
             Owner::Packages => "Packages",
-            Owner::Integration => "Integration",
+            Owner::Handlers => "Handlers",
             Owner::Transcripts => "Transcripts",
             Owner::Data => "Data",
         });
@@ -609,7 +637,7 @@ fn a_digest_entry_detects_a_replaced_or_changed_line() {
         vec![(
             PATH,
             Approved::Digest(count, digest),
-            Owner::Integration,
+            Owner::Handlers,
             "wholesale",
         )]
     };

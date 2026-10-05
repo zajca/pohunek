@@ -803,15 +803,15 @@ mod tests {
 
     #[test]
     fn clap_invalid_value_maps_to_cli_usage_and_round_trips() {
-        // A clap invalid-value error. `session new --agent` is a free string since
-        // Part C (resolved daemon-side), so use the still-enum `integration install
-        // --agent`, whose value_parser only accepts claude/codex.
+        // A clap invalid-value error. `session new --agent` is a free string
+        // (resolved daemon-side), so use `integration install --agent`, whose
+        // value_parser accepts the built-in names and any valid runtime id.
         let err = crate::Cli::try_parse_from([
             "pohunek",
             "integration",
             "install",
             "--agent",
-            "nonsense",
+            "Not An Id",
         ])
         .expect_err("invalid --agent value must fail to parse");
         let pe = clap_error_to_protocol_error(&err);
