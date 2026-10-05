@@ -6,8 +6,15 @@
 //! fixture. The adapter must agree with it on every fixture, and the current
 //! typed (strict) decode of the renamed fixture must reproduce it exactly, so a
 //! non-additive change to a current type shows up here as a failing fixture.
+//!
+//! A client of this build talking to a protocol 3 daemon runs the same adapter
+//! the other way round: the golden results and events are what that daemon
+//! sends, the golden requests are what it accepts.
 
-use protocol::compat::{event_payload, introduced_methods, request_params, result};
+use protocol::compat::{
+    downgrade_request_params, event_payload, introduced_methods, request_params, result,
+    upgrade_event_payload, upgrade_result,
+};
 use protocol::method::{self, Method};
 use protocol::{
     event, AgentStateEvent, AttachEvent, NotificationCreatedEvent, NotificationDeletedEvent,
@@ -502,4 +509,96 @@ fn a_session_warning_kind_protocol_3_never_knew_is_withheld_from_a_session_resul
         downgraded[0]["warnings"], listed["result"][0]["warnings"],
         "only the {known} kinds protocol 3 defined remain"
     );
+}
+
+#[test]
+fn current_requests_downgrade_to_the_protocol_3_golden() {
+    let mut renamed = 0;
+    for entry in &fixtures(REQUESTS, "requests.json").entries {
+        let name = entry_name(entry, "method");
+        let golden = &entry["params"];
+        let current = rename_keys_everywhere(golden);
+        let downgraded = downgrade_request_params(v3(), name, current.clone())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(&downgraded, golden, "{name}");
+        for (_, current_key) in RENAMED_KEYS {
+            assert!(
+                !contains_key(&downgraded, current_key),
+                "{name}: `{current_key}` leaked into a protocol 3 request"
+            );
+        }
+        if current != *golden {
+            renamed += 1;
+        }
+    }
+    assert!(
+        renamed >= 3,
+        "output, wait and native-id requests carry the identity"
+    );
+}
+
+#[test]
+fn protocol_3_results_upgrade_to_what_the_current_types_decode() {
+    let table = method_table();
+    let mut renamed = 0;
+    for entry in &fixtures(RESULTS, "results.json").entries {
+        let name = entry_name(entry, "method");
+        let golden = &entry["result"];
+        let upgraded = upgrade_result(v3(), name, golden.clone())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(upgraded, rename_keys_everywhere(golden), "{name}");
+        let (_, _, decode) = table
+            .iter()
+            .find(|(candidate, ..)| *candidate == name)
+            .expect("method table covers the fixture");
+        assert_eq!(
+            decode(&upgraded).unwrap_or_else(|error| panic!("{name}: {error}")),
+            upgraded,
+            "{name}: strict current decode must reproduce the upgraded result"
+        );
+        if upgraded != *golden {
+            renamed += 1;
+        }
+    }
+    assert!(
+        renamed >= 8,
+        "every session-bearing method carries the identity"
+    );
+}
+
+#[test]
+fn protocol_3_events_upgrade_to_what_the_current_types_decode() {
+    let table = event_table();
+    let mut renamed = 0;
+    for entry in &fixtures(EVENTS, "events.json").entries {
+        let name = entry_name(entry, "event");
+        let golden = &entry["payload"];
+        let upgraded = upgrade_event_payload(v3(), name, golden.clone())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(upgraded, rename_keys_everywhere(golden), "{name}");
+        let (_, decode) = table
+            .iter()
+            .find(|(candidate, _)| *candidate == name)
+            .expect("event table covers the fixture");
+        assert_eq!(
+            decode(&upgraded).unwrap_or_else(|error| panic!("{name}: {error}")),
+            upgraded,
+            "{name}: strict current decode must reproduce the upgraded event"
+        );
+        if upgraded != *golden {
+            renamed += 1;
+        }
+    }
+    assert!(renamed >= 9, "every identity-bearing event is renamed");
+}
+
+#[test]
+fn methods_added_after_protocol_3_are_refused_on_the_client_side_too() {
+    for name in introduced_methods(v3()) {
+        assert!(
+            downgrade_request_params(v3(), name, json!({})).is_err(),
+            "{name}"
+        );
+        assert!(upgrade_result(v3(), name, json!({})).is_err(), "{name}");
+    }
 }

@@ -12,8 +12,8 @@ use std::time::Duration;
 use futures::{stream, StreamExt as _};
 use overlay::{OverlayFailure, OverlayRegistry, RoutedPeer};
 use protocol::{
-    method, HostClass, HostRecord, ProtocolVersion, Request, Response, MAX_CONTROL_LINE_BYTES,
-    PROTOCOL_VERSION,
+    method, HostClass, HostRecord, ProtocolVersionRange, Request, Response,
+    CLIENT_PROTOCOL_VERSIONS, MAX_CONTROL_LINE_BYTES,
 };
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,7 +55,7 @@ pub struct DiscoveryOptions {
     concurrency: NonZeroUsize,
     deadline: Duration,
     origin_source: OriginSource,
-    protocol_version: ProtocolVersion,
+    protocol_range: ProtocolVersionRange,
 }
 
 impl DiscoveryOptions {
@@ -68,25 +68,25 @@ impl DiscoveryOptions {
                 .expect("default concurrency is non-zero"),
             deadline: DEFAULT_DISCOVERY_DEADLINE,
             origin_source: OriginSource::default(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_range: CLIENT_PROTOCOL_VERSIONS,
         }
     }
 
-    /// Return the exact protocol version probes speak and accept.
+    /// Return the protocol range probes offer and classification accepts.
     #[must_use]
-    pub fn protocol_version(&self) -> ProtocolVersion {
-        self.protocol_version
+    pub fn protocol_range(&self) -> ProtocolVersionRange {
+        self.protocol_range
     }
 
-    /// Probe and classify peers for one exact protocol version.
+    /// Probe and classify peers for one protocol range.
     ///
-    /// The default is the current version, which is what a standalone client
-    /// speaks. A daemon answering `host.discover` passes the version negotiated
-    /// for the asking connection, so the classification matches what that client
-    /// can actually talk to.
+    /// The default is the client window, which is what a standalone client
+    /// speaks. A daemon answering `host.discover` passes the range the asking
+    /// client advertised, so the classification matches what that client can
+    /// actually talk to: a peer is reachable when it answers inside the range.
     #[must_use]
-    pub fn with_protocol_version(mut self, version: ProtocolVersion) -> Self {
-        self.protocol_version = version;
+    pub fn with_protocol_range(mut self, range: ProtocolVersionRange) -> Self {
+        self.protocol_range = range;
         self
     }
 
@@ -313,9 +313,7 @@ async fn discover_peers(
                     .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
             });
             let class = match peer.addr {
-                Some(addr) => {
-                    classify(addr, probe_timeout, origin, options.protocol_version()).await
-                }
+                Some(addr) => classify(addr, probe_timeout, origin, options.protocol_range()).await,
                 None => HostClass::Candidate,
             };
             HostRecord {
@@ -340,10 +338,10 @@ async fn classify(
     addr: SocketAddr,
     timeout: Duration,
     origin: Option<&RequestOrigin>,
-    version: ProtocolVersion,
+    range: ProtocolVersionRange,
 ) -> HostClass {
-    match tokio::time::timeout(timeout, probe_health(addr, origin, version)).await {
-        Ok(Ok(response)) => classify_response(&response, version),
+    match tokio::time::timeout(timeout, probe_health(addr, origin, range)).await {
+        Ok(Ok(response)) => classify_response(&response, range),
         Ok(Err(_)) | Err(_) => HostClass::Unreachable,
     }
 }
@@ -351,7 +349,7 @@ async fn classify(
 async fn probe_health(
     addr: SocketAddr,
     origin: Option<&RequestOrigin>,
-    version: ProtocolVersion,
+    range: ProtocolVersionRange,
 ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
     let mut stream = TcpStream::connect(addr).await?;
     let request = Request::new(
@@ -359,7 +357,7 @@ async fn probe_health(
         method::DAEMON_HEALTH,
         Value::Null,
     )?
-    .with_exact_version(version);
+    .with_version_range(range);
     let request = match origin {
         Some(origin) => origin.apply(request)?,
         None => request,
@@ -397,9 +395,9 @@ async fn read_line(
     }
 }
 
-fn classify_response(response: &Response, version: ProtocolVersion) -> HostClass {
+fn classify_response(response: &Response, range: ProtocolVersionRange) -> HostClass {
     let daemon_protocol_version = response.version().get();
-    if response.version() != version {
+    if !range.contains(response.version()) {
         return HostClass::VersionMismatch {
             daemon_protocol_version,
         };
@@ -425,7 +423,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
-    use protocol::ProtocolVersionRange;
+    use protocol::{ProtocolVersion, CURRENT_PROTOCOL_VERSIONS, PROTOCOL_VERSION};
     use tokio::net::{TcpListener, TcpSocket};
     use tokio::sync::oneshot;
 
@@ -611,7 +609,7 @@ mod tests {
         )
         .expect("valid test response");
         assert_eq!(
-            classify_response(&response, PROTOCOL_VERSION),
+            classify_response(&response, CURRENT_PROTOCOL_VERSIONS),
             HostClass::VersionMismatch {
                 daemon_protocol_version: other
             }
@@ -653,8 +651,12 @@ mod tests {
         ProtocolVersion::new(value).expect("nonzero test version")
     }
 
+    fn exact(version: ProtocolVersion) -> ProtocolVersionRange {
+        ProtocolVersionRange::new(version, version).expect("exact range")
+    }
+
     #[tokio::test]
-    async fn probe_and_classification_follow_the_requested_version() {
+    async fn probe_and_classification_follow_the_requested_range() {
         let previous = protocol::MIN_PROTOCOL_VERSION;
         let reachable = HostClass::ReachableDaemon {
             daemon_version: "stub".to_owned(),
@@ -663,39 +665,91 @@ mod tests {
             daemon_protocol_version: daemon.get(),
         };
 
-        // A v3 requester: a v3-only daemon is reachable, a v4-only one is not.
+        // A previous-version requester: a v3-only daemon is reachable, a
+        // v4-only one is not.
         let v3_only = single_version_stub(previous).await;
         assert_eq!(
-            classify(v3_only, DEFAULT_PROBE_TIMEOUT, None, previous).await,
+            classify(v3_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await,
             reachable
         );
         let v4_only = single_version_stub(PROTOCOL_VERSION).await;
         assert_eq!(
-            classify(v4_only, DEFAULT_PROBE_TIMEOUT, None, previous).await,
+            classify(v4_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await,
             mismatch(PROTOCOL_VERSION)
         );
 
-        // A current requester sees the opposite.
+        // A current-only requester sees the opposite.
         let v3_only = single_version_stub(previous).await;
         assert_eq!(
-            classify(v3_only, DEFAULT_PROBE_TIMEOUT, None, PROTOCOL_VERSION).await,
+            classify(
+                v3_only,
+                DEFAULT_PROBE_TIMEOUT,
+                None,
+                CURRENT_PROTOCOL_VERSIONS
+            )
+            .await,
             mismatch(previous)
         );
         let v4_only = single_version_stub(PROTOCOL_VERSION).await;
         assert_eq!(
-            classify(v4_only, DEFAULT_PROBE_TIMEOUT, None, PROTOCOL_VERSION).await,
+            classify(
+                v4_only,
+                DEFAULT_PROBE_TIMEOUT,
+                None,
+                CURRENT_PROTOCOL_VERSIONS
+            )
+            .await,
+            reachable
+        );
+
+        // A requester that speaks the whole window reaches both.
+        let v3_only = single_version_stub(previous).await;
+        assert_eq!(
+            classify(
+                v3_only,
+                DEFAULT_PROBE_TIMEOUT,
+                None,
+                CLIENT_PROTOCOL_VERSIONS
+            )
+            .await,
+            reachable
+        );
+        let v4_only = single_version_stub(PROTOCOL_VERSION).await;
+        assert_eq!(
+            classify(
+                v4_only,
+                DEFAULT_PROBE_TIMEOUT,
+                None,
+                CLIENT_PROTOCOL_VERSIONS
+            )
+            .await,
             reachable
         );
     }
 
+    #[tokio::test]
+    async fn a_daemon_outside_the_requested_range_is_a_version_mismatch() {
+        let beyond = ProtocolVersion::new(PROTOCOL_VERSION.get() + 1).expect("nonzero version");
+        let stub = single_version_stub(beyond).await;
+        assert_eq!(
+            classify(stub, DEFAULT_PROBE_TIMEOUT, None, CLIENT_PROTOCOL_VERSIONS).await,
+            HostClass::VersionMismatch {
+                daemon_protocol_version: beyond.get()
+            }
+        );
+    }
+
     #[test]
-    fn default_options_probe_with_the_current_version() {
-        assert_eq!(DiscoveryOptions::new().protocol_version(), PROTOCOL_VERSION);
+    fn default_options_probe_with_the_client_window() {
+        assert_eq!(
+            DiscoveryOptions::new().protocol_range(),
+            CLIENT_PROTOCOL_VERSIONS
+        );
         assert_eq!(
             DiscoveryOptions::new()
-                .with_protocol_version(version(3))
-                .protocol_version(),
-            version(3)
+                .with_protocol_range(exact(version(3)))
+                .protocol_range(),
+            exact(version(3))
         );
     }
 
@@ -733,7 +787,7 @@ mod tests {
                 closed.addr,
                 Duration::from_millis(100),
                 None,
-                PROTOCOL_VERSION
+                CURRENT_PROTOCOL_VERSIONS
             )
             .await,
             HostClass::Unreachable
@@ -834,7 +888,7 @@ mod tests {
     async fn health_response_extracts_daemon_version() {
         let addr = health_echo_stub("1.2.3").await;
         assert_eq!(
-            classify(addr, DEFAULT_PROBE_TIMEOUT, None, PROTOCOL_VERSION).await,
+            classify(addr, DEFAULT_PROBE_TIMEOUT, None, CURRENT_PROTOCOL_VERSIONS).await,
             HostClass::ReachableDaemon {
                 daemon_version: "1.2.3".to_owned()
             }
@@ -851,7 +905,7 @@ mod tests {
         .expect("valid origin")
         .expect("complete origin");
 
-        let response = probe_health(addr, Some(&origin), PROTOCOL_VERSION)
+        let response = probe_health(addr, Some(&origin), CURRENT_PROTOCOL_VERSIONS)
             .await
             .expect("health response");
         let request = request_rx.await.expect("captured request");
@@ -872,7 +926,7 @@ mod tests {
         .into_bytes();
         let addr = health_stub(line, Duration::ZERO).await;
         assert_eq!(
-            classify(addr, DEFAULT_PROBE_TIMEOUT, None, PROTOCOL_VERSION).await,
+            classify(addr, DEFAULT_PROBE_TIMEOUT, None, CURRENT_PROTOCOL_VERSIONS).await,
             HostClass::Unreachable
         );
     }
@@ -881,19 +935,37 @@ mod tests {
     async fn malformed_oversized_and_timeout_responses_are_unreachable() {
         let malformed = health_stub(b"not-json\n".to_vec(), Duration::ZERO).await;
         assert_eq!(
-            classify(malformed, DEFAULT_PROBE_TIMEOUT, None, PROTOCOL_VERSION).await,
+            classify(
+                malformed,
+                DEFAULT_PROBE_TIMEOUT,
+                None,
+                CURRENT_PROTOCOL_VERSIONS
+            )
+            .await,
             HostClass::Unreachable
         );
 
         let oversized = health_stub(vec![b'x'; MAX_CONTROL_LINE_BYTES + 1], Duration::ZERO).await;
         assert_eq!(
-            classify(oversized, DEFAULT_PROBE_TIMEOUT, None, PROTOCOL_VERSION).await,
+            classify(
+                oversized,
+                DEFAULT_PROBE_TIMEOUT,
+                None,
+                CURRENT_PROTOCOL_VERSIONS
+            )
+            .await,
             HostClass::Unreachable
         );
 
         let slow = health_stub(Vec::new(), Duration::from_millis(100)).await;
         assert_eq!(
-            classify(slow, Duration::from_millis(10), None, PROTOCOL_VERSION).await,
+            classify(
+                slow,
+                Duration::from_millis(10),
+                None,
+                CURRENT_PROTOCOL_VERSIONS
+            )
+            .await,
             HostClass::Unreachable
         );
     }

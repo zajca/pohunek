@@ -1451,6 +1451,50 @@ async fn public_bind_serves_host_discover_with_supplied_registry() {
 }
 
 #[tokio::test]
+async fn host_discover_with_the_whole_window_is_served_on_a_connection_frozen_on_the_current_version(
+) {
+    let socket = temp_socket("host-discover-window-after-freeze");
+    let (shutdown, handle) = spawn_server(&socket, "9.9.9-test").await;
+    let mut client = connect(&socket).await;
+    let request = |id: &str, method: &str, params: Value, minimum: u32| -> protocol::Request {
+        serde_json::from_value(serde_json::json!({
+            "v": {"minimum": minimum, "maximum": PROTOCOL_VERSION.get()},
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .expect("valid request")
+    };
+
+    // The connection freezes on the current version with a pinned request.
+    let health = request(
+        "pinned",
+        method::DAEMON_HEALTH,
+        Value::Null,
+        PROTOCOL_VERSION.get(),
+    );
+    let ok = ok_payload(exchange(&mut client, &health).await);
+    assert_eq!(ok["protocol_version"], Value::from(PROTOCOL_VERSION.get()));
+
+    // A later discovery that advertises the whole window is still served, at the
+    // frozen version.
+    let discover = request(
+        "windowed",
+        method::HOST_DISCOVER,
+        serde_json::to_value(HostDiscoverParams { force: true }).expect("params"),
+        protocol::MIN_PROTOCOL_VERSION.get(),
+    );
+    let response = exchange(&mut client, &discover).await;
+    assert_eq!(response.version(), PROTOCOL_VERSION);
+    let records: Vec<HostRecord> =
+        serde_json::from_value(ok_payload(response)).expect("host records deserialize");
+    assert!(records.is_empty());
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn assistant_materialize_returns_readable_paths_over_socket() {
     let _env = XdgGuard::set_all("assistant-materialize-socket");
     let socket = temp_socket("assistant-materialize");

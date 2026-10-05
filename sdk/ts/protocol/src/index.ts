@@ -24,9 +24,13 @@ export {
   MAX_SESSION_WAIT_MS,
   MAX_WORKER_INSTANCE_ID_BYTES,
   MIN_PROTOCOL_VERSION,
+  PREVIOUS_VERSION_INTRODUCED_METHODS,
+  PREVIOUS_VERSION_RENAMED_KEYS,
+  RANGE_FORWARDING_METHODS,
   PROTOCOL_VERSION,
   SUPPORTED_PROTOCOL_VERSIONS,
 } from "./generated/constants";
 export type { AttachPrelude, EventName } from "./generated/constants";
 export type { ProtocolEvent } from "./generated/events";
 export type { Methods } from "./generated/methods";
+export { METHOD_NAMES } from "./generated/methods";

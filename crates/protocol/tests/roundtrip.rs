@@ -5115,8 +5115,7 @@ fn protocol_version_four_accepts_version_three_and_rejects_version_two() {
     assert_eq!(PROTOCOL_VERSION.get(), 4);
     assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.minimum().get(), 3);
     assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.maximum().get(), 4);
-    assert_eq!(CLIENT_PROTOCOL_VERSIONS.minimum().get(), 4);
-    assert_eq!(CLIENT_PROTOCOL_VERSIONS.maximum().get(), 4);
+    assert_eq!(CLIENT_PROTOCOL_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS);
 
     let previous = ProtocolVersion::new(3).expect("valid version");
     let previous_client = ProtocolVersionRange::new(previous, previous).expect("ordered range");

@@ -28,10 +28,13 @@ pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(4);
 /// cannot be adapted and raises this minimum to [`PROTOCOL_VERSION`].
 pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(PROTOCOL_VERSION.0 - 1);
 
-/// Inclusive public protocol range a daemon of this build negotiates with.
+/// Inclusive public protocol range of this build: the window.
 ///
-/// Daemon-side only. Clients advertise [`CLIENT_PROTOCOL_VERSIONS`] because
-/// they decode the current wire shape and nothing older.
+/// The one definition of the window. A daemon negotiates it with every client,
+/// and every client advertises it ([`CLIENT_PROTOCOL_VERSIONS`]). Both sides
+/// translate the previous version through the shape-only adapters in
+/// [`crate::compat`]: the daemon converts a previous-version peer's requests and
+/// results, a client converts them for a previous-version daemon.
 pub const SUPPORTED_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
     minimum: MIN_PROTOCOL_VERSION,
     maximum: PROTOCOL_VERSION,
@@ -39,11 +42,20 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRan
 
 /// Inclusive public protocol range a client of this build advertises.
 ///
-/// Clients (CLI, Rust client, TypeScript SDK, Hermes plugin policy) carry no
-/// adapters, so they offer exactly [`PROTOCOL_VERSION`]. A daemon that only
-/// speaks an older version answers `daemon/version_mismatch` instead of a
-/// payload the client would decode wrongly.
-pub const CLIENT_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
+/// Clients (CLI, Rust client) carry the same adapters as the daemon, so they
+/// offer the whole window. A daemon of the previous release answers in the
+/// previous version and the client translates it to the current shape; a
+/// method the previous version never defined fails on the client with
+/// `daemon/daemon_protocol_too_old` before anything is sent. The TypeScript SDK
+/// carries no adapter and offers [`CURRENT_PROTOCOL_VERSIONS`] only.
+pub const CLIENT_PROTOCOL_VERSIONS: ProtocolVersionRange = SUPPORTED_PROTOCOL_VERSIONS;
+
+/// The exact current version as a range.
+///
+/// Describes the shape a client hands to its callers: client adapters
+/// translate every older daemon payload to the current shape, so the CLI
+/// `--json` envelope and the Hermes policy range name exactly this version.
+pub const CURRENT_PROTOCOL_VERSIONS: ProtocolVersionRange = ProtocolVersionRange {
     minimum: PROTOCOL_VERSION,
     maximum: PROTOCOL_VERSION,
 };
@@ -107,7 +119,7 @@ impl std::fmt::Display for ProtocolVersion {
 }
 
 /// An inclusive public protocol version range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "ProtocolVersionRange.ts"))]
 pub struct ProtocolVersionRange {
@@ -209,7 +221,8 @@ pub fn negotiate(
 mod tests {
     use super::{
         negotiate, ProtocolVersion, ProtocolVersionRange, CLIENT_PROTOCOL_VERSIONS,
-        MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+        CURRENT_PROTOCOL_VERSIONS, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+        SUPPORTED_PROTOCOL_VERSIONS,
     };
 
     fn range(minimum: u32, maximum: u32) -> ProtocolVersionRange {
@@ -228,9 +241,16 @@ mod tests {
     }
 
     #[test]
-    fn clients_advertise_only_the_current_version() {
-        assert_eq!(CLIENT_PROTOCOL_VERSIONS.minimum(), PROTOCOL_VERSION);
+    fn clients_advertise_the_whole_window() {
+        assert_eq!(CLIENT_PROTOCOL_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS);
+        assert_eq!(CLIENT_PROTOCOL_VERSIONS.minimum(), MIN_PROTOCOL_VERSION);
         assert_eq!(CLIENT_PROTOCOL_VERSIONS.maximum(), PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn the_current_range_names_exactly_the_current_version() {
+        assert_eq!(CURRENT_PROTOCOL_VERSIONS.minimum(), PROTOCOL_VERSION);
+        assert_eq!(CURRENT_PROTOCOL_VERSIONS.maximum(), PROTOCOL_VERSION);
     }
 
     #[test]
@@ -259,10 +279,25 @@ mod tests {
     }
 
     #[test]
-    fn a_current_only_client_gets_a_mismatch_from_a_previous_only_daemon() {
+    fn a_client_selects_the_previous_version_from_a_previous_only_daemon() {
         let previous = MIN_PROTOCOL_VERSION.get();
-        let error = negotiate(CLIENT_PROTOCOL_VERSIONS, range(previous, previous))
-            .expect_err("a client without adapters must not accept the older shape");
+        let selected = negotiate(CLIENT_PROTOCOL_VERSIONS, range(previous, previous))
+            .expect("the client window includes the previous version");
+        assert_eq!(selected, MIN_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn a_client_selects_the_current_version_from_a_current_daemon() {
+        let selected = negotiate(CLIENT_PROTOCOL_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS)
+            .expect("identical windows overlap");
+        assert_eq!(selected, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn a_client_gets_a_mismatch_from_a_daemon_two_versions_back() {
+        let below = MIN_PROTOCOL_VERSION.get() - 1;
+        let error = negotiate(CLIENT_PROTOCOL_VERSIONS, range(below, below))
+            .expect_err("two versions back is outside the client window");
         assert_eq!(error.code, "version_mismatch");
     }
 }

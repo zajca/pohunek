@@ -38,14 +38,17 @@ rule. The current state of each place is stated separately.
   only the current `WORKER_JOURNAL_SCHEMA_VERSION` (4) is readable. Any other
   schema gets a typed reason and a WARN.
 - **Public-protocol clients.** Contract: a protocol change keeps the previous
-  version served through daemon-side adapters. An adapter translates shape
-  only. A semantic change raises `MIN_PROTOCOL_VERSION` too and is an announced
-  break; the oldest adapter is deleted on the next bump. State: the daemon
-  accepts `3..=4` (`MIN_PROTOCOL_VERSION` is `PROTOCOL_VERSION - 1`, adapter in
-  `crates/protocol/src/compat/v3.rs`) while clients advertise only `4..=4`
-  (`CLIENT_PROTOCOL_VERSIONS`). The remaining gap is a new client against an
-  N-1 daemon, so hosts still upgrade in one pass for that direction
-  ([#527](https://github.com/zajca/pohunek/issues/527)).
+  version served through adapters on both sides of the connection. An adapter
+  translates shape only. A semantic change raises `MIN_PROTOCOL_VERSION` too
+  and is an announced break; the oldest adapter is deleted on the next bump.
+  State: the daemon accepts `3..=4` (`MIN_PROTOCOL_VERSION` is
+  `PROTOCOL_VERSION - 1`, adapter in `crates/protocol/src/compat/v3.rs`) and the
+  Rust client, the CLI and the TypeScript SDK advertise the same window
+  (`CLIENT_PROTOCOL_VERSIONS` is `SUPPORTED_PROTOCOL_VERSIONS`), translating
+  through the same adapter (ported to TypeScript in `sdk/ts/sdk/src/compat.ts`,
+  tested against the same recordings) when the daemon answers in N-1. A method
+  new in N fails on the client with `daemon/daemon_protocol_too_old` before it
+  is sent ([#527](https://github.com/zajca/pohunek/issues/527)).
 - **Persisted daemon state.** Contract and state: `metadata.jsonl` migrates
   from any older kept schema, because skipping releases is normal with
   `update-pohunek`. A persisted shape change requires a schema bump and a
@@ -123,10 +126,10 @@ Hard constraints, decided on purpose — respect them in every change:
   `assistant`) are a pinned API, not a stable one: they stay pre-1.0 with no
   back-compat shims, and a client absorbs breaking changes when it bumps its
   pinned tag.
-- **UIs pin the core release they were built against.** A client advertises
-  exactly `CLIENT_PROTOCOL_VERSIONS` (the current `PROTOCOL_VERSION`) and the
-  TypeScript SDK handshake requires the daemon to report that version, so a
-  client newer than its daemon is refused (`daemon/version_mismatch`). A daemon
+- **UIs pin the core release they were built against.** A Rust or
+  TypeScript client advertises the window `CLIENT_PROTOCOL_VERSIONS` and reaches
+  an N-1 daemon through its adapter; a client two releases newer than its daemon
+  is refused (`daemon/version_mismatch`). A daemon
   of release N additionally serves the clients of release N-1 through the
   protocol window (`docs/architecture.md` "Protocol versioning"), which bounds
   how long a UI release trails a core update. A protocol surface that only UI

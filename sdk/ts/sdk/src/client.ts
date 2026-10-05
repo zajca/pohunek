@@ -3,6 +3,7 @@ import {
   MAX_WORKER_INSTANCE_ID_BYTES,
   PROTOCOL_VERSION,
   CLIENT_PROTOCOL_VERSIONS,
+  RANGE_FORWARDING_METHODS,
   type Methods,
   type ProtocolError,
   type ProtocolVersion,
@@ -18,6 +19,7 @@ import {
   type SessionWaitParams,
   type SessionWaitResult,
 } from "@pohunek/protocol";
+import { CompatError, downgradeRequestParams, requestIsVersionIndependent, upgradeResult } from "./compat";
 import { ClientError } from "./error";
 import { decodeResponse, type Request, type Response } from "./envelope";
 import { decodeHostGovernanceInspect } from "./governance";
@@ -144,50 +146,144 @@ export class Client {
     return this.callDedicated("session.wait", params, params.timeout_ms);
   }
 
+  /**
+   * Sends one request and returns the `ok` payload in the current shape.
+   *
+   * When the daemon negotiated the previous protocol version the request is
+   * translated into it before sending and the payload is translated back. A
+   * request whose translation depends on the version first sends `daemon.health`
+   * to learn it. A method the previous version never defined fails with a
+   * `daemonProtocolTooOld` error before anything is sent.
+   */
   public async request(req: Request): Promise<unknown> {
     this.ensureUsable();
-    const request = applyRequestOrigin(req, this.options.origin);
+    // The request is copied before the first await: the caller keeps ownership
+    // of its parameters and may change them once this call has returned a promise.
+    const request = snapshotRequest(applyRequestOrigin(req, this.options.origin));
+    return withTimeout(
+      this.negotiateAndExchange(request),
+      this.options.requestTimeoutMs,
+      () => {
+        this.poisoned = "previous request timed out; pending daemon response may be stale";
+        return ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs);
+      },
+    );
+  }
 
-    let line: string;
-    try {
-      const encoded = JSON.stringify(request);
-      if (encoded === undefined) {
-        throw new Error("request serialized to undefined");
+  private async negotiateAndExchange(request: Request): Promise<unknown> {
+    const prepared = await this.negotiatedRequest(request);
+    // The caller may have given up (timeout) or closed the client while the
+    // version probe was in flight. A request must never be written after that.
+    this.ensureUsable();
+    return this.exchange(prepared, stringifyRequest(prepared));
+  }
+
+  /**
+   * Translates `request` into the version this connection speaks.
+   *
+   * The version probe offers only the versions the request itself allows, and a
+   * selected version outside the request's own range is refused before anything
+   * is rewritten or sent.
+   */
+  private async negotiatedRequest(request: Request): Promise<Request> {
+    const allowed = request.v;
+    let version = this.selectedVersion;
+    if (version === undefined) {
+      if (requestIsVersionIndependent(request.method, request.params)) {
+        return request;
       }
-      line = encoded;
-    } catch (error: unknown) {
-      throw ClientError.json(error);
+      const probeRange = narrowToWindow(allowed);
+      if (probeRange === undefined) {
+        throw ClientError.protocol({
+          class: "daemon",
+          code: "version_mismatch",
+          msg: `client protocol range ${allowed.minimum}..=${allowed.maximum} does not overlap daemon protocol range ${CLIENT_PROTOCOL_VERSIONS.minimum}..=${CLIENT_PROTOCOL_VERSIONS.maximum}`,
+          recover: "upgrade the older side so the client and daemon support an overlapping protocol version",
+        });
+      }
+      version = await this.probeVersion(probeRange);
     }
-
+    if (version < allowed.minimum) {
+      throw ClientError.daemonProtocolTooOld({
+        host: this.remoteHost,
+        method: request.method,
+        daemonVersion: version,
+        requiredVersion: allowed.minimum,
+      });
+    }
+    if (version > allowed.maximum) {
+      throw ClientError.versionMismatch(allowed, version);
+    }
+    // The request carries exactly the version the reply will be read with, so a
+    // daemon that no longer speaks it refuses the request before executing.
+    if (version === PROTOCOL_VERSION) {
+      // A method that forwards the asking range keeps the client's whole window;
+      // it is read-only, so there is no side effect to refuse.
+      if ((RANGE_FORWARDING_METHODS as readonly string[]).includes(request.method)) {
+        return request;
+      }
+      return { ...request, v: { minimum: version, maximum: version } };
+    }
     try {
-      return await withTimeout(
-        this.exchange(request, line),
-        this.options.requestTimeoutMs,
-        () => {
-          this.poisoned = "previous request timed out; pending daemon response may be stale";
-          return ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs);
-        },
-      );
+      return {
+        ...request,
+        v: { minimum: version, maximum: version },
+        params: downgradeRequestParams(version, request.method, request.params),
+      };
     } catch (error: unknown) {
-      throw error;
+      throw this.translationError(error, version, request.method);
     }
+  }
+
+  /** Learns the daemon's version with a `daemon.health` exchange offering `range`. */
+  private async probeVersion(range: ProtocolVersionRange): Promise<ProtocolVersion> {
+    const probe = applyRequestOrigin(
+      {
+        v: range,
+        id: nextRequestId("daemon.health"),
+        method: "daemon.health",
+        params: null,
+      },
+      this.options.origin,
+    );
+    await this.exchange(probe, stringifyRequest(probe));
+    const version = this.selectedVersion;
+    if (version === undefined) {
+      throw ClientError.framing("daemon health response did not select a protocol version");
+    }
+    return version;
+  }
+
+  private translationError(error: unknown, version: ProtocolVersion, method: string): unknown {
+    if (!(error instanceof CompatError)) {
+      return error;
+    }
+    if (error.failure.kind === "methodNotDefined") {
+      return ClientError.daemonProtocolTooOld({
+        host: this.remoteHost,
+        method,
+        daemonVersion: version,
+        requiredVersion: PROTOCOL_VERSION,
+      });
+    }
+    return ClientError.versionTranslation(this.remoteHost, version, error);
   }
 
   public async handshake(): Promise<number> {
     const result = await this.call("daemon.health", null);
     const daemonVersion = result.protocol_version;
-    if (daemonVersion !== PROTOCOL_VERSION) {
-      throw ClientError.versionMismatch(PROTOCOL_VERSION, daemonVersion);
+    if (daemonVersion < CLIENT_PROTOCOL_VERSIONS.minimum || daemonVersion > CLIENT_PROTOCOL_VERSIONS.maximum) {
+      throw ClientError.versionMismatch(CLIENT_PROTOCOL_VERSIONS, daemonVersion);
     }
     return daemonVersion;
   }
 
   public async subscribe(request: Request): Promise<Subscription> {
     this.ensureUsable();
-    const prepared = applyRequestOrigin(request, this.options.origin);
+    const prepared = snapshotRequest(applyRequestOrigin(request, this.options.origin));
     try {
       await withTimeout(
-        this.exchange(prepared, stringifyRequest(prepared)),
+        this.negotiateAndExchange(prepared),
         this.options.requestTimeoutMs,
         () => ClientError.requestTimeout(this.remoteHost, this.options.requestTimeoutMs),
       );
@@ -250,7 +346,14 @@ export class Client {
     this.validateSelectedVersion(request.v, response.v);
 
     if ("ok" in response) {
-      return response.ok;
+      if (response.v === PROTOCOL_VERSION) {
+        return response.ok;
+      }
+      try {
+        return upgradeResult(response.v, request.method, response.ok);
+      } catch (error: unknown) {
+        throw this.translationError(error, response.v, request.method);
+      }
     }
     throw mapDaemonError(this.remoteHost, response.err);
   }
@@ -273,6 +376,9 @@ export class Client {
     params: Methods[K]["params"],
     wireTimeoutMs: number,
   ): Promise<Methods[K]["output"]> {
+    // Parameters and the inherited version are captured before the first await.
+    const snapshot = snapshotParams(params);
+    const inherited = this.selectedVersion;
     const requestTimeoutMs = Math.max(
       this.options.requestTimeoutMs,
       wireTimeoutMs + DEDICATED_REQUEST_HEADROOM_MS,
@@ -282,8 +388,10 @@ export class Client {
       { ...this.options, requestTimeoutMs },
       this.remoteHost,
     );
+    // The dedicated connection speaks the version this one already selected.
+    client.selectedVersion = inherited;
     try {
-      return await client.callDirect(method, params);
+      return await client.callDirect(method, snapshot);
     } finally {
       await client.close();
     }
@@ -323,6 +431,13 @@ export class Client {
       throw ClientError.json(error);
     }
   }
+}
+
+/** Narrows `allowed` to the client window; `undefined` when they do not overlap. */
+function narrowToWindow(allowed: ProtocolVersionRange): ProtocolVersionRange | undefined {
+  const minimum = Math.max(allowed.minimum, CLIENT_PROTOCOL_VERSIONS.minimum);
+  const maximum = Math.min(allowed.maximum, CLIENT_PROTOCOL_VERSIONS.maximum);
+  return minimum > maximum ? undefined : { minimum, maximum };
 }
 
 function isWaitingSessionInput(value: unknown): value is SessionInputParams & { wait: SessionInputWait } {
@@ -432,6 +547,22 @@ export function nextRequestId(method: string): string {
   const seq = nextSequence;
   nextSequence += 1;
   return `sdk-${method}-${RUN_TOKEN}-${seq}`;
+}
+
+/** Deep copy of the request exactly as it would be serialized. */
+function snapshotRequest(request: Request): Request {
+  return JSON.parse(stringifyRequest(request)) as Request;
+}
+
+function snapshotParams<T>(params: T): T {
+  if (params === undefined) {
+    return params;
+  }
+  try {
+    return JSON.parse(JSON.stringify(params)) as T;
+  } catch (error: unknown) {
+    throw ClientError.json(error);
+  }
 }
 
 function stringifyRequest(request: Request): string {

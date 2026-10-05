@@ -137,11 +137,23 @@ fn serve_connection(stream: UnixStream, reply: fn(&str, &Value) -> Value, record
     let mut line = String::new();
     while reader.read_line(&mut line).is_ok_and(|read| read > 0) {
         let request: Request = serde_json::from_str(line.trim_end()).expect("parse request");
-        let result = reply(request.method(), request.params());
-        recorded
-            .lock()
-            .expect("recorded requests")
-            .push((request.method().to_owned(), request.params().clone()));
+        // A method new in the current protocol is preceded by the client's
+        // `daemon.health` version probe. It is answered like a daemon would and
+        // kept out of the recorded requests, which hold the package methods only.
+        let result = if request.method() == "daemon.health" {
+            json!({
+                "status": "ok",
+                "daemon_version": "fixture",
+                "protocol_version": PROTOCOL_VERSION.get()
+            })
+        } else {
+            let result = reply(request.method(), request.params());
+            recorded
+                .lock()
+                .expect("recorded requests")
+                .push((request.method().to_owned(), request.params().clone()));
+            result
+        };
         let response = Response::ok(PROTOCOL_VERSION, request.id(), result).expect("response");
         writeln!(
             reader.get_mut(),

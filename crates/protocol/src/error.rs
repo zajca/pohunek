@@ -131,6 +131,49 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `daemon/daemon_protocol_too_old` error.
+    ///
+    /// A client refuses a method before sending it because the daemon it is
+    /// connected to negotiated a protocol version that never defined the
+    /// method. `host` is the route of a remote daemon, `None` for the local
+    /// daemon. Code is stable: `daemon_protocol_too_old`.
+    #[must_use]
+    pub fn daemon_protocol_too_old(
+        host: Option<&str>,
+        method: &str,
+        daemon: ProtocolVersion,
+        required: ProtocolVersion,
+    ) -> Self {
+        let target = daemon_target(host);
+        Self::new(
+            ErrorClass::Daemon,
+            "daemon_protocol_too_old",
+            format!("{target} runs protocol {daemon}, but `{method}` needs protocol {required}"),
+            Some(format!(
+                "upgrade pohunek on {target} to a release that speaks protocol {required}"
+            )),
+        )
+    }
+
+    /// The canonical `daemon/version_translation_failed` error.
+    ///
+    /// A client could not express a request in, or read a response of, the
+    /// older protocol version its daemon negotiated. The message names only the
+    /// target and the version, never the payload. Code is stable:
+    /// `version_translation_failed`.
+    #[must_use]
+    pub fn version_translation_failed(host: Option<&str>, daemon: ProtocolVersion) -> Self {
+        let target = daemon_target(host);
+        Self::new(
+            ErrorClass::Daemon,
+            "version_translation_failed",
+            format!("a payload cannot be translated for {target}, which runs protocol {daemon}"),
+            Some(format!(
+                "upgrade pohunek on {target} so both sides speak the same protocol version"
+            )),
+        )
+    }
+
     /// The canonical `daemon/agent_kind_unsupported` error.
     #[must_use]
     pub fn agent_kind_unsupported(agent: &str) -> Self {
@@ -1143,5 +1186,67 @@ impl ProtocolError {
             "a daemon-owned check process in the worktree cannot be confirmed gone",
             Some("inspect the occupying task with task.inspect; the worktree stays occupied until its check processes are gone"),
         )
+    }
+}
+
+/// Names the daemon an error is about: a remote host route or the local daemon.
+fn daemon_target(host: Option<&str>) -> String {
+    host.map_or_else(
+        || "the local daemon".to_owned(),
+        |host| format!("host '{host}'"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorClass, ProtocolError};
+    use crate::version::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+
+    #[test]
+    fn daemon_protocol_too_old_names_the_host_both_versions_and_the_method() {
+        let error = ProtocolError::daemon_protocol_too_old(
+            Some("netbird:build-2"),
+            "package.list",
+            MIN_PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        );
+        assert_eq!(error.class, ErrorClass::Daemon);
+        assert_eq!(error.code, "daemon_protocol_too_old");
+        assert_eq!(
+            error.msg,
+            format!(
+                "host 'netbird:build-2' runs protocol {MIN_PROTOCOL_VERSION}, but `package.list` needs protocol {PROTOCOL_VERSION}"
+            )
+        );
+        let recover = error.recover.expect("an upgrade hint");
+        assert!(recover.contains("netbird:build-2"), "{recover}");
+        assert!(recover.contains(&PROTOCOL_VERSION.to_string()), "{recover}");
+    }
+
+    #[test]
+    fn daemon_protocol_too_old_names_the_local_daemon_without_a_host() {
+        let error = ProtocolError::daemon_protocol_too_old(
+            None,
+            "package.list",
+            MIN_PROTOCOL_VERSION,
+            PROTOCOL_VERSION,
+        );
+        assert!(
+            error.msg.starts_with("the local daemon runs protocol"),
+            "{}",
+            error.msg
+        );
+    }
+
+    #[test]
+    fn version_translation_failed_names_only_the_target_and_the_version() {
+        let error = ProtocolError::version_translation_failed(
+            Some("netbird:build-2"),
+            MIN_PROTOCOL_VERSION,
+        );
+        assert_eq!(error.class, ErrorClass::Daemon);
+        assert_eq!(error.code, "version_translation_failed");
+        assert!(error.msg.contains("netbird:build-2"), "{}", error.msg);
+        assert!(error.recover.is_some());
     }
 }

@@ -151,7 +151,8 @@ pub use session::{
 #[doc(inline)]
 pub use version::{
     negotiate, ProtocolVersion, ProtocolVersionError, ProtocolVersionRange,
-    CLIENT_PROTOCOL_VERSIONS, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    CLIENT_PROTOCOL_VERSIONS, CURRENT_PROTOCOL_VERSIONS, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 
 /// Control-protocol event names.

@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt, StreamExt};
 use overlay::OverlayRegistry;
+use protocol::compat::{self, CompatError};
 use protocol::{
     AttachHeader, DoctorReport, Event, HostGovernanceStatus, Method, ProtocolError,
     ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
@@ -17,7 +18,7 @@ use protocol::{
     SessionOutputResult, SessionReadParams, SessionReadResult, SessionResizeParams,
     SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
     SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams, SessionWaitResult,
-    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES,
+    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -413,15 +414,108 @@ impl Client {
     }
 
     /// Send one framed control request and return the daemon's `ok` payload.
+    ///
+    /// The request carries the current protocol shape. When the daemon
+    /// negotiated the previous version, the request is translated into it
+    /// before sending and the payload is translated back, so the caller only
+    /// ever sees the current shape. A request whose translation depends on the
+    /// version first learns it with a `daemon.health` probe on this
+    /// connection. A method the previous version never defined fails with
+    /// [`ClientError::DaemonProtocolTooOld`] before anything is sent.
     pub async fn request(&mut self, request: &Request) -> Result<Value, ClientError> {
         let request = match &self.origin {
             Some(origin) => origin.apply(request.clone())?,
             None => request.clone(),
         };
+        let request = self.negotiated_request(request).await?;
+        self.send(&request).await
+    }
+
+    /// Exchange one already-translated request on this connection.
+    async fn send(&mut self, request: &Request) -> Result<Value, ClientError> {
         match &mut self.inner {
-            ClientInner::Local(conn) => conn.request(&request, &mut self.selected_version).await,
-            ClientInner::Remote(conn) => conn.request(&request, &mut self.selected_version).await,
+            ClientInner::Local(conn) => conn.request(request, &mut self.selected_version).await,
+            ClientInner::Remote(conn) => conn.request(request, &mut self.selected_version).await,
         }
+    }
+
+    /// Route of the remote host this client talks to, `None` for the local daemon.
+    fn remote_host(&self) -> Option<&str> {
+        match &self.endpoint {
+            Endpoint::Local(_) => None,
+            Endpoint::Remote { host, .. } => Some(host),
+        }
+    }
+
+    /// Translate `request` into the version this connection speaks.
+    ///
+    /// A connection that has not selected a version yet sends a request that
+    /// means the same in every version of the window as it is; any other
+    /// request waits for a `daemon.health` probe that selects the version. The
+    /// probe offers only the versions the request itself allows, and a selected
+    /// version outside the request's own range is refused before anything is
+    /// rewritten or sent.
+    async fn negotiated_request(&mut self, request: Request) -> Result<Request, ClientError> {
+        let allowed = request.version_range();
+        let version = match self.selected_version {
+            Some(version) => version,
+            None if compat::request_is_version_independent(request.method(), request.params()) => {
+                return Ok(request);
+            }
+            None => {
+                let probe_range = narrow_to_window(allowed).ok_or_else(|| {
+                    ClientError::Protocol(ProtocolError::version_mismatch(
+                        allowed,
+                        protocol::CLIENT_PROTOCOL_VERSIONS,
+                    ))
+                })?;
+                self.probe_version(probe_range).await?
+            }
+        };
+        if !allowed.contains(version) {
+            return Err(out_of_range_error(
+                self.remote_host(),
+                request.method(),
+                allowed,
+                version,
+            ));
+        }
+        // The request carries exactly the version the reply will be read with, so
+        // a daemon that no longer speaks it refuses the request before executing.
+        // A method that forwards the asking range keeps the client's whole window
+        // on the current version; it is read-only, so nothing needs refusing.
+        let pinned = if version == PROTOCOL_VERSION
+            && compat::RANGE_FORWARDING_METHODS.contains(&request.method())
+        {
+            request
+        } else {
+            request.with_exact_version(version)
+        };
+        compat::downgrade_request(pinned, version)
+            .map_err(|error| request_translation_error(self.remote_host(), version, error))
+    }
+
+    /// Learn the daemon's version with a `daemon.health` exchange offering `range`.
+    async fn probe_version(
+        &mut self,
+        range: ProtocolVersionRange,
+    ) -> Result<ProtocolVersion, ClientError> {
+        let probe = Request::new(
+            next_request_id(protocol::method::DAEMON_HEALTH),
+            protocol::method::DAEMON_HEALTH,
+            Value::Null,
+        )?
+        .with_version_range(range);
+        let probe = match &self.origin {
+            Some(origin) => origin.apply(probe)?,
+            None => probe,
+        };
+        self.send(&probe).await?;
+        self.selected_version.ok_or_else(|| {
+            ClientError::Framing(
+                "daemon health response did not select a protocol version".to_owned(),
+            )
+        })
     }
 
     /// Send one typed control-method request and decode its success payload.
@@ -623,7 +717,7 @@ impl Client {
                     inner: ClientInner::Local(Conn::new(stream, None, options)),
                     endpoint: Endpoint::Local(socket_path.clone()),
                     options,
-                    selected_version: None,
+                    selected_version: self.selected_version,
                     origin: self.origin.clone(),
                 })
             }
@@ -636,7 +730,7 @@ impl Client {
                         addr: *addr,
                     },
                     options,
-                    selected_version: None,
+                    selected_version: self.selected_version,
                     origin: self.origin.clone(),
                 })
             }
@@ -647,17 +741,17 @@ impl Client {
     ///
     /// The connection is consumed because a successful subscription turns the
     /// request/response channel into a one-way event stream.
-    pub async fn subscribe(self, request: &Request) -> Result<Subscription, ClientError> {
-        let Self {
-            inner,
-            mut selected_version,
-            origin,
-            ..
-        } = self;
-        let request = match origin {
+    pub async fn subscribe(mut self, request: &Request) -> Result<Subscription, ClientError> {
+        let request = match &self.origin {
             Some(origin) => origin.apply(request.clone())?,
             None => request.clone(),
         };
+        let request = self.negotiated_request(request).await?;
+        let Self {
+            inner,
+            mut selected_version,
+            ..
+        } = self;
         match inner {
             ClientInner::Local(mut conn) => {
                 let selected_version = conn.subscribe(&request, &mut selected_version).await?;
@@ -774,18 +868,23 @@ fn run_token() -> &'static str {
 
 impl Subscription {
     /// Return the next raw event JSON line, or `None` when the daemon closes.
+    ///
+    /// A connection that selected the previous protocol version yields each
+    /// event translated to the current shape and re-serialized, so a line is
+    /// always a current-shape event.
     pub async fn next_line(&mut self) -> Result<Option<String>, ClientError> {
         match &mut self.inner {
-            SubscriptionInner::Local(conn) => conn.next_line().await,
-            SubscriptionInner::Remote(conn) => conn.next_line().await,
+            SubscriptionInner::Local(conn) => conn.next_adapted_line(self.selected_version).await,
+            SubscriptionInner::Remote(conn) => conn.next_adapted_line(self.selected_version).await,
         }
     }
 
     /// Return the next decoded [`Event`], or `None` when the daemon closes.
     ///
     /// This is the typed counterpart to [`Self::next_line`]: it reads one line
-    /// and decodes it into a protocol [`Event`]. A malformed line surfaces as a
-    /// typed error, mapped by transport exactly like an unparseable reply.
+    /// and decodes it into a protocol [`Event`] in the current shape. A
+    /// malformed line surfaces as a typed error, mapped by transport exactly
+    /// like an unparseable reply.
     pub async fn next_event(&mut self) -> Result<Option<Event>, ClientError> {
         match &mut self.inner {
             SubscriptionInner::Local(conn) => conn.next_event(self.selected_version).await,
@@ -917,7 +1016,9 @@ where
                     selected_version,
                 )
                 .map_err(|error| map_version_validation_error(host, &error))?;
-                result.map_err(|err| map_daemon_error(host, err))
+                let value = result.map_err(|err| map_daemon_error(host, err))?;
+                compat::upgrade_result(response_version, request.method(), value)
+                    .map_err(|error| response_translation_error(host, response_version, error))
             }
         }
     }
@@ -937,9 +1038,34 @@ where
         let Some(line) = self.next_line().await? else {
             return Ok(None);
         };
+        self.decode_event(&line, selected_version).map(Some)
+    }
+
+    async fn next_adapted_line(
+        &mut self,
+        selected_version: ProtocolVersion,
+    ) -> Result<Option<String>, ClientError> {
+        let Some(line) = self.next_line().await? else {
+            return Ok(None);
+        };
+        if selected_version == PROTOCOL_VERSION {
+            return Ok(Some(line));
+        }
+        let event = self.decode_event(&line, selected_version)?;
+        Ok(Some(serde_json::to_string(&event)?))
+    }
+
+    /// Decode one event line of the connection's selected version into the
+    /// current shape.
+    fn decode_event(
+        &self,
+        line: &str,
+        selected_version: ProtocolVersion,
+    ) -> Result<Event, ClientError> {
         let host = self.remote_host.as_deref();
-        match serde_json::from_str::<Event>(&line) {
-            Ok(event) if event.version() == selected_version => Ok(Some(event)),
+        match serde_json::from_str::<Event>(line) {
+            Ok(event) if event.version() == selected_version => compat::upgrade_event(event)
+                .map_err(|error| response_translation_error(host, selected_version, error)),
             Ok(event) => Err(map_version_validation_error(
                 host,
                 &ClientError::ProtocolVersionMismatch {
@@ -970,6 +1096,81 @@ fn validate_selected_version(
 fn exact_version_range(version: ProtocolVersion) -> ProtocolVersionRange {
     ProtocolVersionRange::new(version, version)
         .expect("a protocol version is always a valid exact range")
+}
+
+/// Narrows `allowed` to the client window; `None` when they do not overlap.
+fn narrow_to_window(allowed: ProtocolVersionRange) -> Option<ProtocolVersionRange> {
+    ProtocolVersionRange::new(
+        allowed
+            .minimum()
+            .max(protocol::CLIENT_PROTOCOL_VERSIONS.minimum()),
+        allowed
+            .maximum()
+            .min(protocol::CLIENT_PROTOCOL_VERSIONS.maximum()),
+    )
+    .ok()
+}
+
+/// Refuses a request whose own version range excludes the connection's version.
+///
+/// A daemon older than the request's minimum cannot define what the request
+/// needs; a connection already frozen on a version newer than the request's
+/// maximum cannot speak it.
+fn out_of_range_error(
+    host: Option<&str>,
+    method: &str,
+    allowed: ProtocolVersionRange,
+    selected: ProtocolVersion,
+) -> ClientError {
+    if selected < allowed.minimum() {
+        ClientError::DaemonProtocolTooOld {
+            host: host.map(str::to_owned),
+            method: method.to_owned(),
+            daemon_version: selected,
+            required_version: allowed.minimum(),
+        }
+    } else {
+        map_version_validation_error(
+            host,
+            &ClientError::ProtocolVersionMismatch {
+                expected: allowed,
+                received: selected,
+            },
+        )
+    }
+}
+
+/// Maps an adapter failure on an outgoing request to its typed client error.
+///
+/// A method the negotiated version never defined needs the daemon's host
+/// upgraded; any other failure is a translation fault.
+fn request_translation_error(
+    host: Option<&str>,
+    version: ProtocolVersion,
+    error: CompatError,
+) -> ClientError {
+    match error {
+        CompatError::MethodNotDefined { method } => ClientError::DaemonProtocolTooOld {
+            host: host.map(str::to_owned),
+            method,
+            daemon_version: version,
+            required_version: PROTOCOL_VERSION,
+        },
+        other => response_translation_error(host, version, other),
+    }
+}
+
+/// Maps an adapter failure on a payload of the negotiated version.
+fn response_translation_error(
+    host: Option<&str>,
+    version: ProtocolVersion,
+    error: CompatError,
+) -> ClientError {
+    ClientError::VersionTranslation {
+        host: host.map(str::to_owned),
+        daemon_version: version,
+        source: error,
+    }
 }
 
 fn map_version_validation_error(remote_host: Option<&str>, error: &ClientError) -> ClientError {
@@ -1881,6 +2082,9 @@ mod tests {
         .await
         .expect("connect remote");
         client.origin = Some(test_request_origin());
+        // A connection that already selected the current version needs no probe
+        // before the runtime-bearing request.
+        client.selected_version = Some(PROTOCOL_VERSION);
         let runtime =
             protocol::SessionRuntimeIdentity::new("runtime-1", protocol::RuntimeGeneration::new(1))
                 .expect("valid runtime identity");
@@ -2389,6 +2593,55 @@ mod tests {
         assert_eq!(
             dedicated_request_timeout(Duration::from_secs(12), 5_000),
             Duration::from_secs(12)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_previous_only_request_on_a_current_connection_is_refused_before_sending() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind fixture daemon");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let mut stream = BufReader::new(stream);
+            let mut lines = Vec::new();
+            loop {
+                let mut line = String::new();
+                match stream.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return lines,
+                    Ok(_) => lines.push(line),
+                }
+            }
+        });
+        let mut client = Client::connect_trusted_tcp_addr_with_options(
+            "fixture-remote",
+            address,
+            no_origin_options(),
+        )
+        .await
+        .expect("connect remote");
+        // The connection froze on the current version with an earlier reply.
+        client.selected_version = Some(PROTOCOL_VERSION);
+        let previous = protocol::MIN_PROTOCOL_VERSION;
+        let request = Request::new("request-1", "session.list", serde_json::json!({}))
+            .expect("request")
+            .with_exact_version(previous);
+
+        let error = client
+            .request(&request)
+            .await
+            .expect_err("a previous-only request cannot use a current connection");
+        assert_eq!(
+            error.to_protocol_error().code,
+            "version_mismatch",
+            "{error:?}"
+        );
+        drop(client);
+        assert_eq!(
+            server.await.expect("fixture task"),
+            Vec::<String>::new(),
+            "nothing was written"
         );
     }
 
