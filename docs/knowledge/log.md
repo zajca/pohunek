@@ -3,10 +3,12 @@
 ## Unreleased (2026-10-05, Pi detection and probe PATH)
 
 - The Pi package guide describes detection as one bottom-anchored editor frame
-  (upper border, draft, lower border, footer) read for both states, lists the
-  busy indicators (`Working`, compaction, retry), says draft and transcript text
-  never decides, and states that the version probe runs under the launch `PATH`, profile override
-  included.
+  (upper border, draft, lower border, footer) read for both states, with busy
+  borders recognised at every terminal width (their closing rule can be one
+  column), the busy indicators (`Working`, compaction, retry), the 20-column
+  floor for idle, and the rule that draft and transcript text never decides. It
+  also states that the version probe runs under the launch `PATH`, profile
+  override included.
 
 ## Unreleased (2026-10-04, upgrade window and store schema)
 

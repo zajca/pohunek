@@ -290,9 +290,13 @@ fn screen_bytes(path: &str) -> Vec<u8> {
 }
 
 fn detector(definition: &RuntimeDefinition, now: Instant) -> Detector {
+    detector_with_columns(definition, now, 100)
+}
+
+fn detector_with_columns(definition: &RuntimeDefinition, now: Instant, columns: u16) -> Detector {
     Detector::new(
         24,
-        100,
+        columns,
         now,
         DetectorConfig {
             detection: DetectionConfig {
@@ -410,10 +414,20 @@ fn screen_rows(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The activity the manifest reads from `rows`, when the screen speaks at all.
+/// The activity the manifest reads from `rows` on a 100-column terminal, when
+/// the screen speaks at all.
 fn activity_of(definition: &RuntimeDefinition, rows: &[String]) -> Option<AgentActivity> {
+    activity_at(definition, rows, 100)
+}
+
+/// [`activity_of`] on a terminal `columns` wide.
+fn activity_at(
+    definition: &RuntimeDefinition,
+    rows: &[String],
+    columns: u16,
+) -> Option<AgentActivity> {
     let started = Instant::now();
-    let mut detector = detector(definition, started);
+    let mut detector = detector_with_columns(definition, started, columns);
     let mut bytes = b"\x1b[2J\x1b[H".to_vec();
     bytes.extend_from_slice(rows.join("\r\n").as_bytes());
     detector
@@ -423,39 +437,45 @@ fn activity_of(definition: &RuntimeDefinition, rows: &[String]) -> Option<AgentA
         .map(|transition| transition.activity)
 }
 
-/// Row indexes of the upper and lower border of a captured editor frame.
+/// Row indexes of the upper and lower border of a captured editor frame: the
+/// last two rows that start with a rule. Rules above them are transcript.
 fn frame_borders(rows: &[String]) -> (usize, usize) {
     let borders: Vec<usize> = rows
         .iter()
         .enumerate()
-        .filter(|(_, row)| row.starts_with("\u{2500}\u{2500}") && row.ends_with("\u{2500}\u{2500}"))
+        .filter(|(_, row)| row.starts_with("\u{2500}\u{2500}"))
         .map(|(index, _)| index)
         .collect();
-    assert_eq!(borders.len(), 2, "a captured frame has two borders");
-    (borders[0], borders[1])
+    assert!(borders.len() >= 2, "a captured frame has two borders");
+    (borders[borders.len() - 2], borders[borders.len() - 1])
 }
 
-/// Text that is not a border: it may look like one in part, but it never
-/// closes with a run of ten or more rules, so it is transcript or draft text
-/// wherever it appears.
-const HOSTILE_TEXT: [&str; 17] = [
+/// Text that is not a border wherever it appears: it may look like one in
+/// part, but it neither starts with a rule and a spinner nor is a plain rule.
+const HOSTILE_TEXT: [&str; 13] = [
     "\u{2500} example",
     "\u{2500}\u{2500} example",
     "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} example",
     "\u{2500}",
     "\u{2500}\u{2500}",
     "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-    "\u{2500}\u{2500} \u{2807} Working \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-    "\u{2500}\u{2500} \u{283c} Compacting context... (escape to cancel) \u{2500}\u{2500}",
-    "\u{2500}\u{2500} \u{2807} Retrying (1/3) in 1s... \u{2500}",
     "\u{2500}\u{2500}\u{2500}\u{2500} \u{2191} 5 more \u{2500}\u{2500}",
-    "\u{2500}\u{2500} \u{2807} Working",
     "\u{2807} Working",
     "Working",
     "Compacting context...",
     "\u{2191} 5 more",
     "x \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} \u{2191} 5 more",
     "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} \u{2807} Working ",
+];
+
+/// Lines that start like a busy border at any length. Inside the draft they
+/// are read as the frame's status border; above the frame they are transcript.
+const STATUS_LOOKALIKES: [&str; 5] = [
+    "\u{2500}\u{2500} \u{2807} Working \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+    "\u{2500}\u{2500} \u{283c} Compacting context... (escape to cancel) \u{2500}\u{2500}",
+    "\u{2500}\u{2500} \u{2807} Retrying (1/3) in 1s... \u{2500}",
+    "\u{2500}\u{2500} \u{2807} Working",
+    "\u{2500}\u{2500} \u{2807}",
 ];
 
 /// Complete forged borders. They are indistinguishable from the frame when
@@ -474,7 +494,175 @@ fn forged_borders() -> Vec<String> {
         ),
         format!("{} \u{2191} 5 more {}", rule(40), rule(40)),
         rule(100),
+        rule(20),
     ]
+}
+
+/// Replaces every transcript and draft row of `rows`, one at a time, with
+/// hostile text and returns how many substitutions kept the classification.
+fn sweep_hostile_rows(
+    definition: &RuntimeDefinition,
+    name: &str,
+    rows: &[String],
+    columns: u16,
+    expected: AgentActivity,
+) -> usize {
+    assert_eq!(
+        activity_at(definition, rows, columns),
+        Some(expected),
+        "{name} unmodified"
+    );
+    let (upper, lower) = frame_borders(rows);
+    let mut checked = 0;
+    for row in (0..lower).filter(|row| *row != upper) {
+        let mut hostile: Vec<String> = HOSTILE_TEXT.iter().map(|text| (*text).to_owned()).collect();
+        if row < upper {
+            hostile.extend(STATUS_LOOKALIKES.iter().map(|text| (*text).to_owned()));
+            hostile.extend(forged_borders());
+        }
+        for text in hostile {
+            let mut changed = rows.to_vec();
+            changed[row].clone_from(&text);
+            assert_eq!(
+                activity_at(definition, &changed, columns),
+                Some(expected),
+                "{name} row {row} replaced by {text:?}"
+            );
+            checked += 1;
+        }
+    }
+    checked
+}
+
+/// A captured screen of `compat/pi/screens/widths/`: its name, terminal width
+/// and the activity it means.
+struct WidthFixture {
+    name: String,
+    columns: u16,
+    rows: Vec<String>,
+    expected: AgentActivity,
+}
+
+/// Every screen rendered by the real Pi 1.0.2 at a given terminal width. The
+/// file name is `<state>_w<columns>.txt`; states starting `idle`, `scroll_idle`
+/// or `rule_idle` mean idle, every other state is Pi at work.
+fn width_fixtures() -> Vec<WidthFixture> {
+    let mut names: Vec<String> = fs::read_dir(workspace_root().join("compat/pi/screens/widths"))
+        .expect("read the width fixtures")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8 file name")
+        })
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let stem = name.strip_suffix(".txt").expect("a .txt fixture");
+            let (state, columns) = stem.rsplit_once("_w").expect("a `_w<columns>` suffix");
+            let idle = ["idle", "scroll_idle", "rule_idle"]
+                .iter()
+                .any(|prefix| state.starts_with(prefix));
+            WidthFixture {
+                columns: columns.parse().expect("a column count"),
+                rows: screen_rows(&format!("widths/{name}")),
+                expected: if idle {
+                    AgentActivity::Idle
+                } else {
+                    AgentActivity::Working
+                },
+                name,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn every_screen_rendered_at_every_terminal_width_is_classified_without_error() {
+    let definition = installed_definition();
+    let fixtures = width_fixtures();
+    let widths: std::collections::BTreeSet<u16> =
+        fixtures.iter().map(|fixture| fixture.columns).collect();
+    assert!(
+        widths.contains(&20) && widths.contains(&200) && widths.len() >= 15,
+        "the fixtures span the supported widths: {widths:?}"
+    );
+    let busy = fixtures
+        .iter()
+        .filter(|fixture| fixture.expected == AgentActivity::Working)
+        .count();
+    assert!(busy >= 60, "busy screens captured: {busy}");
+    for fixture in &fixtures {
+        assert_eq!(
+            activity_at(&definition, &fixture.rows, fixture.columns),
+            Some(fixture.expected),
+            "{}",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn a_busy_border_shortened_by_the_terminal_width_is_never_idle() {
+    let definition = installed_definition();
+    // Pi 1.0.2 closes a busy border with `width - status - 4` columns: one
+    // column for Retrying at 24 columns and Compacting at 36, two at 50.
+    let closing_rule = |fixture: &WidthFixture| {
+        let (upper, _) = frame_borders(&fixture.rows);
+        fixture.rows[upper]
+            .chars()
+            .rev()
+            .take_while(|ch| *ch == '\u{2500}')
+            .count()
+    };
+    let fixtures = width_fixtures();
+    let shortest = fixtures
+        .iter()
+        .filter(|fixture| fixture.expected == AgentActivity::Working)
+        .map(closing_rule)
+        .min()
+        .expect("busy fixtures exist");
+    assert_eq!(shortest, 1, "a captured busy border closes with one rule");
+    for fixture in fixtures
+        .iter()
+        .filter(|fixture| fixture.expected == AgentActivity::Working && closing_rule(fixture) < 10)
+    {
+        assert_ne!(
+            activity_at(&definition, &fixture.rows, fixture.columns),
+            Some(AgentActivity::Idle),
+            "{}",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn a_column_zero_rule_in_the_transcript_never_stands_in_for_the_upper_border() {
+    let definition = installed_definition();
+    let fixtures: Vec<WidthFixture> = width_fixtures()
+        .into_iter()
+        .filter(|fixture| fixture.name.starts_with("rule_"))
+        .collect();
+    assert!(fixtures.len() >= 9, "rule screens captured");
+    for fixture in &fixtures {
+        let (upper, _) = frame_borders(&fixture.rows);
+        assert!(
+            fixture.rows[..upper]
+                .iter()
+                .any(|row| !row.is_empty() && row.chars().all(|ch| ch == '\u{2500}')),
+            "{} has a rule above the editor",
+            fixture.name
+        );
+        assert_eq!(
+            activity_at(&definition, &fixture.rows, fixture.columns),
+            Some(fixture.expected),
+            "{}",
+            fixture.name
+        );
+    }
 }
 
 #[test]
@@ -482,33 +670,24 @@ fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification(
     let definition = installed_definition();
     let mut checked = 0_usize;
     for (screen, expected) in CAPTURED_SCREENS {
-        let rows = screen_rows(screen);
-        assert_eq!(
-            activity_of(&definition, &rows),
-            Some(expected),
-            "{screen} unmodified"
-        );
-        let (upper, lower) = frame_borders(&rows);
-        for row in (0..lower).filter(|row| *row != upper) {
-            let in_transcript = row < upper;
-            let mut hostile: Vec<String> =
-                HOSTILE_TEXT.iter().map(|text| (*text).to_owned()).collect();
-            if in_transcript {
-                hostile.extend(forged_borders());
-            }
-            for text in hostile {
-                let mut changed = rows.clone();
-                changed[row].clone_from(&text);
-                assert_eq!(
-                    activity_of(&definition, &changed),
-                    Some(expected),
-                    "{screen} row {row} replaced by {text:?}"
-                );
-                checked += 1;
-            }
-        }
+        checked += sweep_hostile_rows(&definition, screen, &screen_rows(screen), 100, expected);
     }
-    assert!(checked > 3000, "the sweep covers every row: {checked}");
+    // The narrowest terminal, one whose busy borders close with one rule, and
+    // the transcript-rule screens at 24 columns.
+    for fixture in width_fixtures().iter().filter(|fixture| {
+        fixture.columns == 20
+            || (fixture.columns == 36 && fixture.name.starts_with("compaction"))
+            || (fixture.columns == 24 && fixture.name.starts_with("rule_"))
+    }) {
+        checked += sweep_hostile_rows(
+            &definition,
+            &fixture.name,
+            &fixture.rows,
+            fixture.columns,
+            fixture.expected,
+        );
+    }
+    assert!(checked > 3500, "the sweep covers every row: {checked}");
 }
 
 #[test]

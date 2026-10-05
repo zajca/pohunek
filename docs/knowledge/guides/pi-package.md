@@ -56,19 +56,23 @@ so no catalog is needed.
   only after the first model reply.
 - Detection: both rules read the editor frame anchored at the bottom of the
   screen: an upper border, the draft, a plain lower border, then one to four
-  footer lines. A border is a full-width run of `─` with an optional label (a
-  `↑ N more` / `↓ N more` scroll marker, or in the upper border a braille
-  spinner with its message: `Working`, `Compacting context...`,
-  `Auto-compacting...`, `Retrying (n/m) in Ns...`). A status indicator in the
-  upper border means `working`; a plain upper border means `idle`. Draft and
-  transcript text never decides: a line that starts with `─` or merely looks
-  like a status line is text unless it closes with a run of ten or more `─`,
-  and a draft line that is a complete border cannot be told from the frame. The
-  idle, working, compaction, retry and multi-line draft screens in
-  `compat/pi/screens/` were captured from a real Pi. No blocked signal
-  (extension dialogs, login) and no overlay (model or session selector) was
-  exercised, so no `blocked` rule exists and an unrecognized screen keeps the
-  byte-activity fallback. Process matchers accept the kernel name `pi` (Pi retitles its
+  footer lines. A busy Pi writes `── `, a braille spinner and its message
+  (`Working`, `Compacting context...`, `Auto-compacting...`, `Retrying (n/m) in
+  Ns...`) into the upper border, cut to the terminal width, so its closing rule
+  can be a single `─`; the `── <spinner>` start alone marks a busy border at any
+  width, and it means `working`. A plain upper border (a rule of 20 or more `─`,
+  or a `↑ N more` / `↓ N more` marker between runs of four or more) means
+  `idle`. Terminals narrower than 20 columns are never read as idle. Draft and
+  transcript text never decides: a rule above the editor cannot stand in for the
+  upper border, a line that starts with `─` is text, and a draft line that
+  starts `── <spinner>` or is itself a complete plain border cannot be told from
+  the frame. The idle, busy, compaction, retry, scrolled-draft and
+  transcript-rule screens in `compat/pi/screens/` (widths 20 to 200 in
+  `widths/`) were rendered by a real Pi. No blocked signal (extension dialogs,
+  login) and no overlay (model or session selector) was exercised, so no
+  `blocked` rule exists, an unrecognized screen keeps the byte-activity
+  fallback, and a replacement editor or an extension that changes the spinner is
+  not recognised as busy. Process matchers accept the kernel name `pi` (Pi retitles its
   process shortly after start) and `node` running
   `…/coding-agent/dist/bundle/cli.js` for the first moments.
 
