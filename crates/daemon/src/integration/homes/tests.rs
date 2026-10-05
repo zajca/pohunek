@@ -914,3 +914,38 @@ async fn the_registry_resolves_homes_from_its_own_launch_environment() {
         "the registry's own allowlist decides what reaches the agent"
     );
 }
+
+#[test]
+fn an_unresolvable_path_never_takes_the_identity_of_an_existing_home() {
+    let rig = Rig::new(&[], &[]);
+    let real = rig.dir("accounts-work");
+    // `missing` does not exist, so this names no directory even though a
+    // lexical fold of `missing/..` would spell `accounts-work`.
+    let ghost = rig.root.join("missing").join("..").join("accounts-work");
+    fs::write(rig.root.join("agents/a-ghost.toml"), claude_profile(&ghost))
+        .expect("write the ghost profile");
+    fs::write(rig.root.join("agents/z-real.toml"), claude_profile(&real))
+        .expect("write the real profile");
+    fs::create_dir_all(rig.root.join("home/.claude")).expect("create the default home");
+
+    let targets = rig
+        .homes
+        .targets(Some(&claude()), &HomeSelection::All)
+        .expect("targets");
+    let dirs: Vec<_> = targets
+        .iter()
+        .filter_map(|target| target.dir().ok().map(Path::to_path_buf))
+        .collect();
+    assert!(
+        dirs.contains(&ghost),
+        "the unresolvable home stays a target"
+    );
+    assert!(dirs.contains(&real), "the valid home is not merged away");
+
+    install(&rig, Some(&claude()), &HomeSelection::All).expect("bulk install");
+
+    assert!(
+        state_hook(&real).is_file(),
+        "the valid home is installed by a bulk install"
+    );
+}

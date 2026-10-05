@@ -149,6 +149,23 @@ pub(crate) enum ExternalSessionChange {
 pub(crate) struct TranscriptRoot {
     agent_base: RuntimeRef,
     path: PathBuf,
+    /// Whether the directory derives from a host profile's environment. Such a
+    /// path never reaches a log line or a remote response.
+    private: bool,
+}
+
+/// What stands for a private root's path in log lines.
+const PRIVATE_PATH_LABEL: &str = "<profile config home>";
+
+impl TranscriptRoot {
+    /// The path as a log line may show it.
+    fn log_path(&self) -> String {
+        if self.private {
+            PRIVATE_PATH_LABEL.to_owned()
+        } else {
+            self.path.display().to_string()
+        }
+    }
 }
 
 /// Where the observer takes its transcript roots from.
@@ -178,9 +195,20 @@ pub(crate) struct TranscriptCandidate {
     pub(crate) native_session_id: Option<String>,
     /// Native transcript path.
     pub(crate) native_session_path: String,
+    /// Whether the transcript lies below a profile-derived root, so its path
+    /// must not be published.
+    pub(crate) private: bool,
     /// Working directory reported by the provider transcript.
     pub(crate) cwd: Option<PathBuf>,
     updated_at: SystemTime,
+}
+
+impl TranscriptCandidate {
+    /// The transcript path a published session may carry: none for a transcript
+    /// below a profile-derived root, whose directory is private.
+    pub(crate) fn publishable_path(&self) -> Option<&str> {
+        (!self.private).then_some(self.native_session_path.as_str())
+    }
 }
 
 /// Shared transcript candidate index.
@@ -190,6 +218,9 @@ pub(crate) struct TranscriptIndex {
     /// Signature of every transcript parsed, with or without a resulting
     /// candidate, so an unchanged file is not parsed again by a scan.
     parsed: Arc<Mutex<HashMap<PathBuf, FileSignature>>>,
+    /// The roots of the last scan and their canonical directories, which say
+    /// which candidates lie below a private root.
+    roots: Arc<Mutex<(Vec<TranscriptRoot>, Vec<PathBuf>)>>,
     #[cfg(test)]
     parses: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -410,6 +441,8 @@ impl TranscriptIndex {
         let index = self.clone();
         let count = roots.len();
         match tokio::task::spawn_blocking(move || {
+            *index.roots.lock().unwrap_or_else(MutexError::into_inner) =
+                (roots.clone(), canonical_roots(&roots));
             let scans = roots
                 .iter()
                 .map(|root| index.scan_root(root, &roots, SCAN_LIMITS, &cancel))
@@ -497,14 +530,19 @@ impl TranscriptIndex {
         cwd: &Path,
         fact: &ProcessFact,
     ) -> Option<TranscriptCandidate> {
-        self.inner
+        let best = self
+            .inner
             .lock()
             .unwrap_or_else(MutexError::into_inner)
-            .values()
-            .filter(|candidate| &candidate.agent_base == agent_base)
-            .filter(|candidate| transcript_matches_process(candidate, cwd, fact))
-            .max_by_key(|candidate| candidate.updated_at)
-            .cloned()
+            .iter()
+            .filter(|(_path, candidate)| &candidate.agent_base == agent_base)
+            .filter(|(_path, candidate)| transcript_matches_process(candidate, cwd, fact))
+            .max_by_key(|(_path, candidate)| candidate.updated_at)
+            .map(|(path, candidate)| (path.clone(), candidate.clone()));
+        let (path, mut candidate) = best?;
+        let roots = self.roots.lock().unwrap_or_else(MutexError::into_inner);
+        candidate.private = owning_root(&roots.0, &roots.1, &path).is_some_and(|root| root.private);
+        Some(candidate)
     }
 
     /// Scans one root and, when the pass covered it completely, drops the entries
@@ -926,17 +964,20 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
             }
         };
         let path = home.dir.join(subdir);
-        if launch.profile.is_some() && !path.is_dir() {
+        let private = launch.profile.is_some();
+        if private && !path.is_dir() {
             skipped.insert(SkippedHome {
                 profile: launch.profile,
                 code: None,
             });
             continue;
         }
-        if seen.insert(home.identity()) {
+        // Two runtimes may share one directory; each keeps its own tree.
+        if seen.insert((launch.runtime.as_wire().to_owned(), home.identity())) {
             roots.push(TranscriptRoot {
                 agent_base: launch.runtime,
                 path,
+                private,
             });
         }
     }
@@ -1118,6 +1159,7 @@ fn parse_transcript(
         agent_base,
         native_session_id,
         native_session_path,
+        private: false,
         cwd,
         updated_at,
     }))
@@ -1335,6 +1377,7 @@ mod observer_tests {
         let roots = vec![TranscriptRoot {
             agent_base: RuntimeRef::claude(),
             path: root.path().to_path_buf(),
+            private: false,
         }];
         let sessions = ExternalSessions::new();
 
@@ -1390,6 +1433,7 @@ mod scan_tests {
         TranscriptRoot {
             agent_base: RuntimeRef::claude(),
             path: path.to_path_buf(),
+            private: false,
         }
     }
 
@@ -1665,6 +1709,7 @@ mod scan_tests {
         let inner = TranscriptRoot {
             agent_base: RuntimeRef::codex(),
             path: inner_path.clone(),
+            private: false,
         };
         let outer_file = dir.path().join("p/c.jsonl");
         let inner_file = inner_path.join("x/s.jsonl");
@@ -1747,6 +1792,7 @@ mod scan_tests {
         let codex = TranscriptRoot {
             agent_base: RuntimeRef::codex(),
             path: link.clone(),
+            private: false,
         };
         let both = [claude.clone(), codex.clone()];
         let index = TranscriptIndex::default();
@@ -1787,6 +1833,7 @@ mod scan_tests {
             TranscriptRoot {
                 agent_base: RuntimeRef::codex(),
                 path: link.clone(),
+                private: false,
             },
         ];
         let canonical = super::canonical_roots(&roots);

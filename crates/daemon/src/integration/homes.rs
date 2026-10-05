@@ -327,7 +327,8 @@ impl Home {
     }
 
     /// What two homes must share to be the same directory: the canonical
-    /// directory when it exists, else the lexically normalized one.
+    /// directory when it exists, else the path with its `.` components
+    /// removed; an unresolved path with a `..` is never folded into another.
     pub(crate) fn identity(&self) -> PathBuf {
         self.canonical
             .clone()
@@ -418,24 +419,15 @@ fn merge_shared(targets: Vec<Target>) -> Vec<Target> {
     merged
 }
 
-/// `path` with every `.` removed and every `..` folded into the component
-/// before it, without touching the filesystem.
+/// `path` with every `.` component removed, without touching the filesystem.
 ///
-/// A `..` at the root stays at the root, as the kernel resolves it.
+/// A `..` stays: after a missing or symlinked component it does not name the
+/// lexical parent, so folding it could give two different directories one
+/// identity.
 fn lexically_normalized(path: &Path) -> PathBuf {
-    let mut normal = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normal.pop() && !path.has_root() {
-                    normal.push(Component::ParentDir);
-                }
-            }
-            other => normal.push(other),
-        }
-    }
-    normal
+    path.components()
+        .filter(|component| *component != Component::CurDir)
+        .collect()
 }
 
 /// `agent_config_home_undeclared`: the runtime's descriptor has no

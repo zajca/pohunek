@@ -64,6 +64,7 @@ impl Live {
         let roots = vec![TranscriptRoot {
             agent_base: RuntimeRef::claude(),
             path: root.clone(),
+            private: false,
         }];
         let (index, handle) = start_transcript_index(&roots, &sessions).await;
         Self {
@@ -448,10 +449,12 @@ async fn a_nested_root_keeps_its_own_agent_kind_in_scans_and_live_events() {
         TranscriptRoot {
             agent_base: RuntimeRef::claude(),
             path: outer.clone(),
+            private: false,
         },
         TranscriptRoot {
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
+            private: false,
         },
     ];
 

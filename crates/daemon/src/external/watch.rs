@@ -643,7 +643,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
             Some(Ok(false)) | None => {}
             Some(Err(error)) => {
                 debug!(
-                    path = %path.display(),
+                    path = %self.log_path(&path),
                     error = %error,
                     "failed to parse external transcript candidate"
                 );
@@ -656,6 +656,24 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
             self.timers.insert(path.clone(), TRANSCRIPT_WRITE_DEBOUNCE);
             state.phase = Phase::Queued;
             self.paths.insert(path, state);
+        }
+    }
+
+    /// Forgets every pending parse whose path lies below no current root, so a
+    /// root that left the configuration is never parsed again. Timer and queue
+    /// entries that outlive their path are skipped when they come due.
+    fn drop_unowned_paths(&mut self) {
+        let (roots, canonical) = (&self.roots, &self.canonical);
+        self.paths
+            .retain(|path, _state| owning_root(roots, canonical, path).is_some());
+    }
+
+    /// The path as a log line may show it: a path below a private root is
+    /// replaced by a label.
+    fn log_path(&self, path: &Path) -> String {
+        match owning_root(&self.roots, &self.canonical, path) {
+            Some(root) if root.private => root.log_path(),
+            _ => path.display().to_string(),
         }
     }
 
@@ -727,6 +745,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
         let configured = self.provider.roots().await;
         self.roots = resolve_roots(&configured);
         self.canonical = canonical_roots(&self.roots);
+        self.drop_unowned_paths();
         self.health = vec![
             RootHealth {
                 registration: Registration::Complete,
@@ -776,7 +795,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
             } => warn!(
                 name: "external.transcript_watcher.register.partial",
                 agent = ?root.agent_base,
-                root = %root.path.display(),
+                root = %root.log_path(),
                 failed_dirs = *failed_dirs,
                 error = %first_error,
                 "cannot watch {{failed_dirs}} directories below transcript root {{root}}: {{error}}; check directory permissions and the OS file watch limit"
@@ -784,7 +803,7 @@ impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
             RootRegistration::Failed(error) => warn!(
                 name: "external.transcript_watcher.register.failed",
                 agent = ?root.agent_base,
-                root = %root.path.display(),
+                root = %root.log_path(),
                 error = %error,
                 "cannot watch transcript root {{root}}: {{error}}; check directory permissions and the OS file watch limit"
             ),
@@ -870,7 +889,7 @@ pub(super) fn resolve_roots(configured: &[TranscriptRoot]) -> Vec<TranscriptRoot
         });
         if duplicate {
             debug!(
-                root = %root.path.display(),
+                root = %root.log_path(),
                 "ignoring transcript root that duplicates another configured root"
             );
         } else {

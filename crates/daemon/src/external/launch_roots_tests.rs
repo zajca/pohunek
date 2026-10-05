@@ -454,3 +454,94 @@ async fn a_profile_added_later_is_observed_and_a_removed_one_leaves_the_index() 
     assert!(transcript.is_file(), "the transcript itself is untouched");
     watched.sessions.shutdown();
 }
+
+#[test]
+fn two_runtimes_sharing_one_directory_each_keep_their_transcript_tree() {
+    let rig = Rig::new();
+    let shared = rig.root.join("shared-home");
+    fs::create_dir_all(shared.join("projects")).expect("Claude tree");
+    fs::create_dir_all(shared.join("sessions")).expect("Codex tree");
+    rig.claude_profile("claude-shared", &shared);
+    rig.profile("codex-shared", "codex", "CODEX_HOME", &shared);
+
+    let roots = pairs(&rig.roots());
+
+    assert!(roots.contains(&root(&RuntimeRef::claude(), shared.join("projects"))));
+    assert!(roots.contains(&root(&RuntimeRef::codex(), shared.join("sessions"))));
+}
+
+#[test]
+fn only_profile_derived_roots_are_private() {
+    let rig = Rig::new();
+    fs::create_dir_all(rig.home().join(".claude/projects")).expect("ambient tree");
+    let work = rig.used_home("work-home", "projects");
+    rig.claude_profile("work", &work);
+
+    let roots = rig.roots();
+    let private = |path: &Path| {
+        roots
+            .iter()
+            .find(|root| root.path == path)
+            .map(|root| root.private)
+    };
+
+    assert_eq!(private(&rig.home().join(".claude/projects")), Some(false));
+    assert_eq!(private(&work.join("projects")), Some(true));
+}
+
+#[tokio::test]
+async fn a_transcript_below_a_profile_home_publishes_no_path() {
+    use crate::procwatch::{ProcessFact, StartIdentity};
+
+    let rig = Rig::new();
+    let private_home = rig.used_home("zq-private-account-3c81", "projects");
+    rig.claude_profile("work", &private_home);
+    // The record names no transcript path, so the fallback is the file's own
+    // path, which lies below the private directory.
+    let transcript = private_home.join("projects/p/s.jsonl");
+    fs::create_dir_all(transcript.parent().expect("parent")).expect("project dir");
+    fs::write(
+        &transcript,
+        "{\"session_id\":\"native\",\"cwd\":\"/work\"}\n",
+    )
+    .expect("write");
+    let ambient = rig.home().join(".claude/projects/p/s.jsonl");
+    fs::create_dir_all(ambient.parent().expect("parent")).expect("ambient dir");
+    fs::write(
+        &ambient,
+        "{\"session_id\":\"ambient\",\"cwd\":\"/other\"}\n",
+    )
+    .expect("write");
+
+    let sessions = ExternalSessions::new();
+    let (index, _handle) = start_transcript_index_with(rig.provider(), &sessions).await;
+    let fact = ProcessFact {
+        pid: 4242,
+        pgid: 4242,
+        ppid: 1,
+        start_identity: StartIdentity::new(4242),
+        comm: "claude".to_owned(),
+        cmdline: vec!["claude".to_owned()],
+    };
+
+    let private = index
+        .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact)
+        .expect("the private transcript matches by cwd");
+    let public = index
+        .best_match(&RuntimeRef::claude(), Path::new("/other"), &fact)
+        .expect("the ambient transcript matches by cwd");
+
+    assert!(private.private, "a profile-derived transcript is private");
+    assert_eq!(private.publishable_path(), None);
+    assert!(
+        private
+            .native_session_path
+            .contains("zq-private-account-3c81"),
+        "the internal provenance keeps the real path"
+    );
+    assert!(!public.private);
+    assert!(public
+        .publishable_path()
+        .is_some_and(|path| path.contains(".claude")));
+    sessions.shutdown();
+}

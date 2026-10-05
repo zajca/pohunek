@@ -525,8 +525,9 @@ profile of such a runtime, resolved by the same rule as the integration
 lifecycle and the transcript observer (the declared variable from the launch
 base environment overridden by the profile's `[env]`, else the default below
 `HOME`). Two entries carry the same value exactly when their homes are one
-directory: the canonical path when the directory exists, else the lexically
-normalized path, so a symlinked alias shares the id and a home that is created
+directory: the canonical path when the directory exists, else the path with its
+`.` components removed (a path with `..` through a missing directory keeps its
+own identity), so a symlinked alias shares the id and a home that is created
 later may change it. The value is 32 lowercase hex digits, a truncated HMAC of
 the directory under the host's `profile-revision.key` secret with its own
 domain, so it is stable across calls and daemon restarts of one host, differs
@@ -705,7 +706,10 @@ daemon restart, and homes that resolve to one canonical directory are watched
 once. A profile whose home does not resolve or has no transcript tree yet is
 skipped and logged once at `debug`; a transcript below a root that left the set
 leaves the index. An observed external session is still matched to a candidate by
-agent base alone, never attributed to a profile. The daemon's own process
+agent base alone, never attributed to a profile. The directory of a profile-derived
+home is private: an external session matched to a transcript below one omits
+`native_session_path`, and the watcher's log lines name such a root by a label,
+not its path. The daemon's own process
 environment steers nothing unless the launch allowlist forwards the variable. The
 corresponding `SessionRegistryConfig` setting is `observe_external_agents`,
 default `false`.

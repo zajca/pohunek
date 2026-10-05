@@ -179,21 +179,24 @@ fn the_bare_runtime_and_a_profile_naming_its_home_share_the_id() {
 }
 
 #[test]
-fn a_home_that_does_not_exist_is_identified_by_its_normalized_path() {
+fn a_home_that_does_not_exist_is_identified_by_its_path_without_dot_components() {
     let rig = Rig::new();
     let plain = rig.root.join("not-created-yet");
-    let dotted = rig
-        .root
-        .join("elsewhere")
-        .join("..")
-        .join("not-created-yet");
+    let dotted = rig.root.join(".").join("not-created-yet");
+    // `missing` does not exist, so `missing/..` names no directory and must not
+    // take the identity of the existing `real-home`.
+    let real = rig.dir("real-home");
+    let unresolvable = rig.root.join("missing").join("..").join("real-home");
     rig.profile("plain", "claude", "CLAUDE_CONFIG_DIR", &plain);
     rig.profile("dotted", "claude", "CLAUDE_CONFIG_DIR", &dotted);
+    rig.profile("real", "claude", "CLAUDE_CONFIG_DIR", &real);
+    rig.profile("unresolvable", "claude", "CLAUDE_CONFIG_DIR", &unresolvable);
 
     let caps = rig.inspect(&rig.registry(Some(rig.state())));
 
     assert!(!plain.exists());
     assert_eq!(id_of(&caps, "plain"), id_of(&caps, "dotted"));
+    assert_ne!(id_of(&caps, "real"), id_of(&caps, "unresolvable"));
 }
 
 #[test]
