@@ -226,6 +226,16 @@
   and `cargo xtask package build|verify`. The source map lists the new
   `crates/package` files.
 
+## Unreleased (2026-10-05, reported references supersede assigned ones)
+
+- A validated report replaces an assigned native reference: the sessions page,
+  the public API reference and the runtime packages guide state that an
+  `assigned` runtime with an integration handler and hook schema follows
+  `/clear` and in-session resume, that the replacement sets the provenance to
+  `reported` in the session, its record and its resume binding, that resume and
+  fork then use the reported reference without the existence check, and that an
+  assigned value never replaces a reported one.
+
 ## Unreleased (2026-10-04, assigned native references)
 
 - Runtime definitions declare how core obtains the native session reference in

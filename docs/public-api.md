@@ -886,7 +886,9 @@ terminal launch and activity detection. It gets resume and fork only when its
 agent CLI accepts a caller-chosen session id and the definition declares
 `strategy = "assigned"`; with `hook` or `none` it is not resumable. A package
 cannot obtain a reference through `session.report_native_id`, because that
-method accepts only a report from the launch process itself.
+method accepts only a report from the launch process itself; an `assigned`
+runtime that declares an integration also takes reported references (see
+below).
 
 `assigned` takes, in addition to a supported `[resume]` with
 `reference_kind = "id"` (core can generate an id, not a path):
@@ -950,10 +952,27 @@ max_depth = 1                                    # directory levels below dir
 - A host profile on an `assigned` base inherits the assignment; one that
   restates `[resume]` is rejected with `invalid_profile`, and
   `resumable = false` switches recovery off (no reference is generated).
-- Not yet shipped: the handling of `/clear`-style conversation switches, where
-  a later `reported` reference supersedes an assigned one, with its fixture
-  tests, lands with the integration-report work (#144, #52). A package without
-  an integration cannot send a report.
+- A reported reference always supersedes an assigned one. An `assigned`
+  runtime that also declares an `[integration]` handler and hook schema may
+  report, and the report replaces the stored value and sets the provenance to
+  `reported` in the session, its durable record and its resume binding, so a
+  `/clear` or in-session resume inside the agent is followed instead of
+  leaving a stale id. Two reports reach the daemon. `session.report_native_id`
+  replaces the reference when it passes the usual process-identity, expiry and
+  sequence checks (a refused report leaves the assigned reference in place). The
+  worker's launch claim replaces it even when the value is equal, which only
+  confirms it, and the worker's active identity replaces it when it names the
+  runtime itself, is bound to the launch process (a nested process never
+  qualifies), carries the declared reference kind and is newer than the last
+  accepted report. A report older than the stored one, an expired or overlong
+  claim, or a claim from another runtime never replaces a reference, and
+  an assigned value never replaces a reported one: relaunches, daemon restarts
+  and rebinding start from the stored reported reference. Resume and fork then
+  launch with the reported reference. The existence check runs only for an
+  `assigned` reference, so a reported one is recovered unchecked, as the agent
+  vouched for it. A runtime that declares `hook` keeps its existing import
+  rules. A package without an integration cannot send a report, so its
+  reference stays `assigned`.
 - A forked session of an assigned reference still shows the frozen
   `capabilities.resume = true` but holds no reference, so `session.resume`
   answers `not_resumable` for it.

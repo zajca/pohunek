@@ -74,6 +74,10 @@ names one; it cannot carry schema contents, add actions, or relax validation.
 or handler id core does not provide, or whose handler does not drive the schema
 (`descriptor_invalid`), before anything is recorded. A package without
 `[integration]` (Pi) has no schema, and its sessions accept no hook report.
+A package whose reference is `assigned` and that also declares an integration can
+report its conversation: a validated report replaces the assigned reference and
+labels it `reported` (a `/clear` or in-session resume is followed), while a
+package without an integration keeps its `assigned` reference.
 
 The handler is compiled core code selected by the descriptor's
 `integration.handler`: `pohunek integration install`, `status`, `doctor`, and

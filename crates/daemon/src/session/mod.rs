@@ -1365,6 +1365,23 @@ impl SessionRegistry {
         )
     }
 
+    /// [`Self::new_with_runtimes`] over a caller-owned worker launcher, so a
+    /// second registry built over the same launcher, roots and store adopts the
+    /// first one's live workers like a restarted daemon.
+    #[cfg(test)]
+    pub(crate) fn new_with_runtimes_and_launcher(
+        config: SessionRegistryConfig,
+        runtimes: RuntimeHost,
+        launcher: Arc<dyn WorkerLauncher>,
+    ) -> Self {
+        Self::build(
+            config,
+            Some(launcher),
+            Arc::new(crate::procwatch::readable_host::ReadableHost::new()),
+            Some(runtimes),
+        )
+    }
+
     /// Creates a registry with explicit worker and process-observer backends.
     ///
     /// Integration tests use this surface with a separate-process worker

@@ -657,9 +657,18 @@ closed with `agent_native_reference_missing` instead of launching an agent into
 an empty conversation; a runtime that declares `check = "none"` is relaunched
 unchecked. Recovery never falls back to another runtime, the shell or
 "continue latest". A fork of an assigned reference holds no reference of its
-own and is not resumable. That a later validated report supersedes an assigned
-reference, with `/clear` switching covered by tests, ships with the
-integration-report work; the public API reference has the field-level contract.
+own and is not resumable. A later validated report always supersedes an
+assigned reference: an assigned runtime that declares an integration handler and
+hook schema may report, and the report replaces the stored value and its
+provenance (`reported`) in the session, its durable record and its resume
+binding, so `/clear` and in-session resume are followed and `session.resume` and
+`session.fork` launch with the reported conversation. The existence check runs
+only for a still-assigned reference. A report must pass the usual checks (the
+process-identity, sequence and expiry checks for `session.report_native_id`, the
+launch process and sequence for the worker's active identity), a stale or
+refused one leaves the stored reference alone, and an assigned value never
+replaces a reported one, also across a daemon restart. The public API reference
+has the field-level contract.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
 `session.fork` creates a new pohunek session id and PTY from the source session's
