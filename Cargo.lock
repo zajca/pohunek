@@ -5704,6 +5704,7 @@ dependencies = [
  "pohunek-cli",
  "pohunek-knowledge",
  "pohunek-package",
+ "pohunek-platform",
  "pohunek-protocol",
  "pohunek-relay-protocol",
  "pohunek-test-support",

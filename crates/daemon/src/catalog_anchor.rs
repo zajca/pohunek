@@ -12,8 +12,9 @@
 //! The file holds public keys only, so it is not owner-private. The policy is
 //! integrity: the executable's directory chain and the file must not be
 //! writable by anyone but the daemon's user or root, because whoever can
-//! rewrite the anchor can already replace the daemon. No environment variable
-//! or command-line option selects another file.
+//! rewrite the anchor can already replace the daemon. On macOS an extended ACL
+//! entry that lets another principal change the file counts as writable. No
+//! environment variable or command-line option selects another file.
 
 // Rust guideline compliant 2026-10-05
 
@@ -23,7 +24,7 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use package::{parse_anchor, AnchorFileError, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES};
-use pohunek_platform::filesystem::{FsError, TrustedDir};
+use pohunek_platform::filesystem::{acl_grants_change, FsError, TrustedDir};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -68,8 +69,9 @@ pub enum AnchorFault {
     #[error("the directory holding the trust anchor is not safe: it, or an ancestor, is owned or writable by another account")]
     UnsafeDirectory,
     /// The anchor file is a link, not a regular file, owned by another
-    /// account, writable by others or hard-linked.
-    #[error("the trust anchor file is not safe: it must be a regular file owned by the daemon user or root, not writable by group or others, with one link")]
+    /// account, writable by others (by mode or by an extended ACL) or
+    /// hard-linked.
+    #[error("the trust anchor file is not safe: it must be a regular file owned by the daemon user or root, not writable by group or others (by mode or ACL), with one link")]
     UnsafeFile,
     /// The anchor file is larger than [`MAX_ANCHOR_BYTES`].
     #[error("the trust anchor file is too large")]
@@ -143,12 +145,15 @@ fn read_anchor(directory: &Path, effective_uid: u32) -> Result<Option<Vec<u8>>, 
         return Ok(None);
     };
     let metadata = file.metadata().map_err(|_error| AnchorFault::Unreadable)?;
+    // An ACL that cannot be read is unknown, so the anchor is unreadable.
+    let acl_grants_change = acl_grants_change(&file).map_err(|_error| AnchorFault::Unreadable)?;
     check_file(
         &FileFacts {
             regular: metadata.is_file(),
             owner: metadata.uid(),
             mode: metadata.mode() & MODE_BITS,
             links: metadata.nlink(),
+            acl_grants_change,
         },
         effective_uid,
     )?;
@@ -188,12 +193,18 @@ struct FileFacts {
     owner: u32,
     mode: u32,
     links: u64,
+    /// An extended ACL entry lets some principal change the file.
+    acl_grants_change: bool,
 }
 
 /// Applies the anchor file policy to what was observed on the opened handle.
 fn check_file(facts: &FileFacts, effective_uid: u32) -> Result<(), AnchorFault> {
     let owner_is_trusted = facts.owner == effective_uid || facts.owner == ROOT_UID;
-    if facts.regular && owner_is_trusted && facts.mode & GROUP_OTHER_WRITE == 0 && facts.links == 1
+    if facts.regular
+        && owner_is_trusted
+        && facts.mode & GROUP_OTHER_WRITE == 0
+        && facts.links == 1
+        && !facts.acl_grants_change
     {
         Ok(())
     } else {
@@ -326,6 +337,55 @@ mod tests {
         }
     }
 
+    /// Adds `acl` to `path` with the native macOS `chmod +a`, from an empty
+    /// environment.
+    #[cfg(target_os = "macos")]
+    fn add_acl(path: &Path, acl: &str) {
+        let status = std::process::Command::new("/bin/chmod")
+            .env_clear()
+            .current_dir(path.parent().expect("an anchor file has a parent"))
+            .args(["+a", acl])
+            .arg(path)
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_acl_letting_another_principal_change_the_file_is_unsafe() {
+        for acl in [
+            "everyone allow write",
+            "everyone allow read,write,append,delete,writeattr,writesecurity",
+        ] {
+            let directory = scratch();
+            let path = write_anchor(directory.path(), &anchor_bytes(1), 0o644);
+            add_acl(&path, acl);
+            assert_eq!(
+                fault(load_from_directory(directory.path())),
+                AnchorFault::UnsafeFile,
+                "{acl}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_acl_that_only_denies_or_lets_others_read_is_accepted() {
+        for acl in ["everyone deny delete", "everyone allow read"] {
+            let directory = scratch();
+            let path = write_anchor(directory.path(), &anchor_bytes(1), 0o644);
+            add_acl(&path, acl);
+            assert!(
+                matches!(
+                    load_from_directory(directory.path()),
+                    CatalogTrust::Loaded(_)
+                ),
+                "{acl}"
+            );
+        }
+    }
+
     #[test]
     fn a_directory_writable_by_group_or_others_is_unsafe() {
         for mode in [0o775, 0o757, 0o777] {
@@ -427,6 +487,7 @@ mod tests {
             owner,
             mode,
             links,
+            acl_grants_change: false,
         };
         assert_eq!(check_file(&facts(USER, 0o644, 1, true), USER), Ok(()));
         assert_eq!(check_file(&facts(ROOT_UID, 0o644, 1, true), USER), Ok(()));
@@ -438,6 +499,10 @@ mod tests {
             facts(USER, 0o644, 2, true),
             facts(USER, 0o644, 0, true),
             facts(USER, 0o644, 1, false),
+            FileFacts {
+                acl_grants_change: true,
+                ..facts(USER, 0o644, 1, true)
+            },
         ] {
             assert_eq!(
                 check_file(&rejected, USER),

@@ -1,5 +1,14 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-06, trust anchor ACL policy)
+
+- The catalog trust anchor and the catalog signing key file are judged on macOS
+  extended ACLs as well as mode bits, through the shared
+  `pohunek_platform::filesystem::acl_grants_change` (anchor: no allow entry that
+  lets another principal change the file) and `acl_grants_access` (signing key:
+  deny-only ACLs only). An unreadable ACL fails closed. Documented in the
+  runtime catalog concept.
+
 ## Unreleased (2026-10-05, reporter templates)
 
 - The Codex reporter scripts are core-owned templates with `@POHUNEK_AGENT_ID@`

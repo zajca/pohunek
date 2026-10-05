@@ -15,6 +15,7 @@ ed25519-dalek = { workspace = true }
 knowledge = { workspace = true }
 cli = { workspace = true }
 pohunek-package = { workspace = true }
+pohunek-platform = { workspace = true }
 pohunek-protocol = { workspace = true }
 pohunek-relay-protocol = { workspace = true }
 serde = { workspace = true }

@@ -5,7 +5,8 @@
 //! a key from an argument or an environment variable, never prints or logs key
 //! material, and refuses a file another account could read or replace: the
 //! file must be a regular file owned by the invoking user, with no group or
-//! other permission bits, and one link, judged on the opened handle. The seed
+//! other permission bits, no macOS extended ACL beyond deny entries, and one
+//! link, judged on the opened handle. The seed
 //! lives in zeroizing buffers.
 //!
 //! A public key file holds the 64-hex public key and is read with the same
@@ -21,6 +22,7 @@ use std::path::Path;
 
 use ed25519_dalek::SigningKey;
 use nix::fcntl::OFlag;
+use pohunek_platform::filesystem::acl_grants_access;
 use zeroize::Zeroizing;
 
 use crate::XtaskError;
@@ -57,6 +59,8 @@ pub enum KeyFileFault {
         /// The permission bits found.
         mode: u32,
     },
+    /// An extended ACL entry grants some principal access to the file.
+    UnsafeAcl,
     /// The file has more than one hard link.
     HardLinked,
     /// The file is longer than a key file can be.
@@ -76,6 +80,9 @@ impl fmt::Display for KeyFileFault {
                 f,
                 "its mode {mode:04o} grants group or other access; run `chmod 600` on it"
             ),
+            Self::UnsafeAcl => {
+                f.write_str("an extended ACL entry grants access to it; remove it with `chmod -N`")
+            }
             Self::HardLinked => f.write_str("it has more than one hard link"),
             Self::TooLarge => f.write_str("it is too large for a key file"),
             Self::Malformed => f.write_str("it does not hold 64 lowercase hexadecimal characters"),
@@ -90,6 +97,8 @@ struct FileFacts {
     owner: u32,
     mode: u32,
     links: u64,
+    /// An extended ACL entry other than a deny entry is present.
+    acl_grants_access: bool,
 }
 
 /// Applies the secret key file policy.
@@ -102,6 +111,8 @@ fn check_secret(facts: &FileFacts, effective_uid: u32) -> Result<(), KeyFileFaul
         Err(KeyFileFault::UnsafePermissions {
             mode: facts.mode & GROUP_OTHER_ACCESS,
         })
+    } else if facts.acl_grants_access {
+        Err(KeyFileFault::UnsafeAcl)
     } else if facts.links != 1 {
         Err(KeyFileFault::HardLinked)
     } else {
@@ -178,12 +189,16 @@ pub(crate) fn read_signing_key(path: &Path) -> Result<SigningKey, XtaskError> {
     let metadata = file
         .metadata()
         .map_err(|_error| refuse(path, KeyFileFault::Unreadable))?;
+    // An ACL that cannot be read is unknown, so the key is refused as unreadable.
+    let acl_grants_access =
+        acl_grants_access(&file).map_err(|_error| refuse(path, KeyFileFault::Unreadable))?;
     check_secret(
         &FileFacts {
             regular: metadata.is_file(),
             owner: metadata.uid(),
             mode: metadata.mode() & MODE_BITS,
             links: metadata.nlink(),
+            acl_grants_access,
         },
         effective_uid,
     )
@@ -330,6 +345,45 @@ mod tests {
         assert_eq!(fault_of(read_signing_key(&path)), KeyFileFault::Malformed);
     }
 
+    /// Adds `acl` to `path` with the native macOS `chmod +a`, from an empty
+    /// environment.
+    #[cfg(target_os = "macos")]
+    fn add_acl(path: &Path, acl: &str) {
+        let status = std::process::Command::new("/bin/chmod")
+            .env_clear()
+            .current_dir(path.parent().expect("a key file has a parent"))
+            .args(["+a", acl])
+            .arg(path)
+            .status()
+            .expect("run native ACL fixture command");
+        assert!(status.success(), "native ACL fixture command must succeed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_acl_granting_access_to_a_private_key_file_is_refused() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        for acl in ["everyone allow read", "everyone allow read,write"] {
+            let path = key_file(dir.path(), SEED_HEX.as_bytes(), 0o600);
+            add_acl(&path, acl);
+            assert_eq!(
+                fault_of(read_signing_key(&path)),
+                KeyFileFault::UnsafeAcl,
+                "{acl}"
+            );
+            fs::remove_file(&path).expect("remove key");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_deny_only_macos_acl_on_a_private_key_file_is_accepted() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        let path = key_file(dir.path(), SEED_HEX.as_bytes(), 0o600);
+        add_acl(&path, "everyone deny delete");
+        read_signing_key(&path).expect("a deny-only ACL grants nothing");
+    }
+
     #[test]
     fn the_policy_admits_only_a_private_regular_single_link_file_of_the_caller() {
         let facts = |regular, owner, mode, links| FileFacts {
@@ -337,8 +391,19 @@ mod tests {
             owner,
             mode,
             links,
+            acl_grants_access: false,
         };
         assert_eq!(check_secret(&facts(true, USER, 0o600, 1), USER), Ok(()));
+        assert_eq!(
+            check_secret(
+                &FileFacts {
+                    acl_grants_access: true,
+                    ..facts(true, USER, 0o600, 1)
+                },
+                USER
+            ),
+            Err(KeyFileFault::UnsafeAcl)
+        );
         assert_eq!(
             check_secret(&facts(true, USER + 1, 0o600, 1), USER),
             Err(KeyFileFault::ForeignOwner)

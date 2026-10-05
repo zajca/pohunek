@@ -151,14 +151,18 @@ The daemon distinguishes three states, reported by `daemon.doctor` as the
   directory on the executable's path or the file is writable by another
   account or owned by one (only the daemon's user and root are accepted, and
   directories must not be group or world writable), the file is a symbolic
-  link, not a regular file, hard-linked, group or world writable, larger than
-  the limit, malformed, has a key id that does not match its key, an empty
+  link, not a regular file, hard-linked, group or world writable, carrying a
+  macOS extended ACL entry that lets another principal change it (an ACL that
+  cannot be read counts as unreadable), larger than the limit, malformed, has a key id that does not match its key, an empty
   validity window or repeated roots.
 - **Loaded**: the check is `ok`.
 
 The integrity bar equals the daemon binary's: whoever can rewrite the anchor
 can replace `pohunekd`. The file is public, so unlike the owner-private stores
-it may be `0644` or `0444`; only group or other write permission is refused.
+it may be `0644` or `0444`; only group or other write permission is refused,
+and on macOS an allow ACL entry carrying a write, delete, append, attribute,
+security or ownership permission counts as write permission (read-only allow
+entries and deny entries are accepted).
 The anchor is read at startup, so changing it requires a daemon restart.
 
 ## Release tooling
@@ -176,8 +180,9 @@ log or an output:
 - `catalog sign --catalog <file> --key-file <file> --key-id <hex> --output
   <file>` signs the body. The key file holds the 32-byte Ed25519 seed as 64
   lowercase hex characters; it must be a regular file owned by the caller with
-  no group or other permission bits, one link and no symlink, judged on the
-  opened handle, or the command refuses it. `--key-id` must equal the id
+  no group or other permission bits, one link and no symlink, and on macOS no
+  extended ACL beyond deny entries, judged on the opened handle, or the command
+  refuses it (an unreadable ACL is refused too). `--key-id` must equal the id
   derived from the key. The result is verified against an anchor of the
   signer's own key before it is written, so an expired catalog or an invalid
   entry is refused instead of emitted. Signatures are deterministic.
