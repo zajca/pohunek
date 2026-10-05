@@ -218,6 +218,12 @@ fn assert_upgrade_report(report: &Value, from: &str, to: &str) {
     );
 }
 
+/// Whether a failure from [`Cli::try_json`] is exactly the typed error
+/// `agent_profile_changed`.
+fn is_profile_change(failure: &str) -> bool {
+    failure.starts_with("typed error ") && failure.contains("/agent_profile_changed:")
+}
+
 /// Inputs and paths of one run.
 struct Run {
     home: PathBuf,
@@ -700,9 +706,8 @@ impl Upgrade {
         wait_screen(previous, id, "fake-agent ack input-from-previous-client");
     }
 
-    /// `stop` ends the adopted runtime; `resume` relaunches with the native id
-    /// kept across the upgrade, in a new worker from this build.
-    fn assert_stop_and_resume(&self, after: &Runtime) {
+    /// Stops the session and waits until its runtime has ended.
+    fn stop_and_wait(&self) {
         let (head, id) = (&self.head, &self.id);
         let stopped = head.json(&["session", "stop", id, "--json"]);
         assert_eq!(
@@ -713,7 +718,34 @@ impl Upgrade {
             runtime(&inspect(head, id)?)
                 .filter(|runtime| matches!(runtime.state.as_str(), "terminal" | "lost"))
         });
-        head.json(&["session", "resume", id, "--json"]);
+    }
+
+    /// `stop` ends the adopted runtime, then `resume` relaunches with the native
+    /// id kept across the upgrade, in a new worker from this build. A session
+    /// launched from a host profile by a release that does not freeze the
+    /// profile revision is refused by a plain `resume` with the typed error
+    /// `agent_profile_changed` and then resumed with `--accept-profile-change`;
+    /// a release that freezes it resumes plainly. Any other failure fails the
+    /// test. Either way the relaunch freezes the profile, so a later plain
+    /// `resume` works.
+    fn assert_stop_and_resume(&self, after: &Runtime) {
+        let (head, id) = (&self.head, &self.id);
+        self.stop_and_wait();
+        match head.try_json(&["session", "resume", id, "--json"]) {
+            Ok(_) => {}
+            Err(refused) => {
+                assert!(
+                    is_profile_change(&refused),
+                    "plain resume failed with something other than agent_profile_changed: {refused}"
+                );
+                assert_eq!(
+                    self.run.launches().len(),
+                    1,
+                    "the refused resume launched nothing"
+                );
+                head.json(&["session", "resume", id, "--accept-profile-change", "--json"]);
+            }
+        }
         let resumed = wait_live(head, id);
         assert!(
             resumed.generation > after.generation
@@ -735,6 +767,16 @@ impl Upgrade {
         assert_eq!(status["active_version"], self.head_version.as_str());
         wait_native_id(head, id, NATIVE_BEFORE);
         wait_notification(head, id, EVENT_AFTER_RESUME);
+
+        // The relaunch froze the profile revision.
+        self.stop_and_wait();
+        head.json(&["session", "resume", id, "--json"]);
+        let again = wait_live(head, id);
+        assert!(
+            again.generation > resumed.generation,
+            "the plain resume must start a new generation: {resumed:?} -> {again:?}"
+        );
+        assert_eq!(self.run.launches().len(), 3, "{:?}", self.run.launches());
     }
 }
 
@@ -847,6 +889,20 @@ mod tests {
         let mut report = parse_envelope(V0331_UPGRADE, true).expect("upgrade envelope");
         report["unchanged"] = Value::Bool(true);
         assert_upgrade_report(&report, "0.33.0", "0.33.1");
+    }
+
+    #[test]
+    fn only_the_typed_profile_change_error_is_recognized() {
+        let changed = r#"{"cli_version":"0.33.1","protocol":{"minimum":4,"maximum":4},
+            "err":{"class":"runtime","code":"agent_profile_changed","msg":"no recorded revision"}}"#;
+        let other = changed.replace("agent_profile_changed", "session_not_found");
+        let failure = parse_envelope(changed, false).expect_err("typed error");
+        assert!(is_profile_change(&failure), "{failure}");
+        let failure = parse_envelope(&other, false).expect_err("typed error");
+        assert!(!is_profile_change(&failure), "{failure}");
+        assert!(!is_profile_change(
+            "exit status: 1\nstdout: agent_profile_changed"
+        ));
     }
 
     #[test]
