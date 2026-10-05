@@ -72,12 +72,13 @@ pub use governance::{
 pub use integration::{
     IntegrationAgentDoctor, IntegrationAgentStatus, IntegrationDoctorParams,
     IntegrationDoctorResult, IntegrationFinding, IntegrationFindingCode,
-    IntegrationFindingSeverity, IntegrationInstallParams, IntegrationInstallReport,
-    IntegrationInstallResult, IntegrationInstallState, IntegrationRecovery,
-    IntegrationStatusParams, IntegrationStatusResult, IntegrationUninstallParams,
-    IntegrationUninstallReport, IntegrationUninstallResult, IntegrationUninstallState,
-    ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH, ENV_WORKER_ID,
-    ENV_WORKER_PROTOCOL_VERSION, ENV_WORKER_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION,
+    IntegrationFindingSeverity, IntegrationHome, IntegrationHomeFailure, IntegrationInstallParams,
+    IntegrationInstallReport, IntegrationInstallResult, IntegrationInstallState,
+    IntegrationRecovery, IntegrationStatusParams, IntegrationStatusResult,
+    IntegrationUninstallParams, IntegrationUninstallReport, IntegrationUninstallResult,
+    IntegrationUninstallState, ENV_DAEMON_ID, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
+    ENV_SOCKET_PATH, ENV_WORKER_ID, ENV_WORKER_PROTOCOL_VERSION, ENV_WORKER_SOCKET_PATH,
+    EXPECTED_INTEGRATION_VERSION,
 };
 #[doc(inline)]
 pub use limits::{

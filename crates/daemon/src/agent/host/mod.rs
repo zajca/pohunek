@@ -7,6 +7,7 @@
 
 mod builtin;
 mod claim;
+mod config_home;
 mod definition;
 #[cfg(test)]
 pub(crate) mod fixture;
@@ -19,6 +20,7 @@ mod version_probe;
 
 pub use builtin::BuiltinSource;
 pub use claim::{decide_claim, is_reserved, Authority, ClaimRefusal, ServedBy};
+pub use config_home::{ConfigHome, HomeError};
 pub use definition::{
     DefinitionError, DefinitionInvariant, DefinitionOrigin, DefinitionParts, HandlerId,
     Integration, LaunchProgram, RuntimeDefinition, MAX_ARG_BYTES, MAX_DEFINITION_BYTES,

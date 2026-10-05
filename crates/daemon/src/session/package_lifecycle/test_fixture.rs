@@ -69,7 +69,8 @@ impl Package {
         if let Some((handler, schema)) = integration {
             let _ = write!(
                 document,
-                "\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{schema}\"\n"
+                "\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{schema}\"\n{}",
+                crate::agent::host::fixture::config_home_table(handler),
             );
         }
         Self::from_entries(&files(document))

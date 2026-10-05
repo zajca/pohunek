@@ -16,23 +16,30 @@
 //! activating restores the exact prior tree before the error is returned. The
 //! active set stays untouched until activation succeeds, and a staged set that
 //! is dropped changes nothing.
+//!
+//! A handler never decides where its asset set lives. The config home comes
+//! from the runtime descriptor and the environment a launch would give the agent
+//! ([`ConfigHomes`]), so each home a runtime can launch with is its own
+//! transaction.
 
 // Rust guideline compliant 2026-10-05
 
 use std::collections::BTreeSet;
 use std::fmt::Debug;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pohunek_worker_protocol::{HookAction, HookSchema};
 use protocol::{
-    BindingProvenance, ErrorClass, IntegrationAgentStatus, IntegrationInstallReport,
-    IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
-    IntegrationUninstallReport, PackageId, ProtocolError, RuntimeRef,
+    BindingProvenance, ErrorClass, IntegrationAgentStatus, IntegrationHomeFailure,
+    IntegrationInstallReport, IntegrationInstallResult, IntegrationStatusParams,
+    IntegrationStatusResult, IntegrationUninstallReport, PackageId, ProtocolError, RuntimeId,
+    RuntimeRef,
 };
 
 use super::commit::StepGate;
+use super::homes::{ConfigHomes, HomeSelection, Target};
 use super::{config_dir_is_symlink, config_path_kind, report, ConfigPath, InstallPaths};
-use crate::agent::host::RuntimeHost;
+use crate::agent::host::{ConfigHome, RuntimeHost};
 
 /// Error code for an update whose asset set is not compatible with the active
 /// set or with the runtime's hook schema.
@@ -79,29 +86,27 @@ pub trait DaemonHandler: Send + Sync + Debug {
     /// Hook operations the handler's asset set reports.
     fn reported_actions(&self) -> &'static [HookAction];
 
-    /// Resolves the directory holding the handler's asset set.
-    ///
-    /// # Errors
-    ///
-    /// Returns the configuration error of an unresolvable directory.
-    fn config_dir(&self) -> Result<PathBuf, ProtocolError>;
-
     /// Child directories of the config directory that can hold installer
     /// quarantine entries.
     fn quarantine_subdirs(&self) -> &'static [&'static str];
 
-    /// Read-only status of the active set, worded for the provider the handler
-    /// manages and reported for that provider's own runtime.
+    /// Read-only status of the active set in the config directory `home`,
+    /// worded for the provider the handler manages and reported for that
+    /// provider's own runtime.
     ///
-    /// A failure to resolve the config directory degrades into a warning of
-    /// the report. The warnings are the diagnostic text diagnosis classifies, so
+    /// A `home` that could not be resolved degrades into a warning of the
+    /// report. The warnings are the diagnostic text diagnosis classifies, so
     /// they carry no id of the runtime a request addressed.
-    fn inspect_provider(&self) -> IntegrationAgentStatus;
+    fn inspect_provider(&self, home: Result<&Path, &ProtocolError>) -> IntegrationAgentStatus;
 
-    /// Read-only status of the active set, reported for `runtime`, with the
-    /// recovery commands in its warnings naming `runtime`.
-    fn inspect(&self, runtime: &RuntimeRef) -> IntegrationAgentStatus {
-        let mut status = self.inspect_provider();
+    /// Read-only status of the active set in `home`, reported for `runtime`,
+    /// with the recovery commands in its warnings naming `runtime`.
+    fn inspect(
+        &self,
+        runtime: &RuntimeRef,
+        home: Result<&Path, &ProtocolError>,
+    ) -> IntegrationAgentStatus {
+        let mut status = self.inspect_provider(home);
         retarget_status(&mut status, runtime);
         status
     }
@@ -274,6 +279,10 @@ pub(super) fn handlers() -> &'static [Handler] {
 /// with.
 const AGENT_FLAG: &str = "--agent";
 
+/// Command-line flag the recovery commands in diagnostic text select a host
+/// profile's config home with.
+const PROFILE_FLAG: &str = "--profile";
+
 /// Rewrites the recovery commands in `text` that select the runtime `from` to
 /// select `to`.
 ///
@@ -322,12 +331,18 @@ pub(super) fn not_installable(runtime: &str) -> ProtocolError {
 }
 
 /// A runtime resolved to the daemon-run handler its definition names.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Resolved {
     /// The runtime the request addressed; reports are issued for it.
     pub(super) runtime: RuntimeRef,
+    /// Identity of the runtime definition, which a host profile names as its
+    /// base.
+    pub(super) runtime_id: RuntimeId,
     /// Display name of the runtime, used in hints.
-    display_name: String,
+    pub(super) display_name: String,
+    /// Where the runtime's agent keeps its configuration, when its descriptor
+    /// declares it.
+    pub(super) config_home: Option<ConfigHome>,
     /// The handler the definition's `integration.handler` selects.
     pub(super) handler: &'static dyn DaemonHandler,
     /// The compiled hook schema the definition names.
@@ -346,7 +361,7 @@ pub(super) fn resolve(host: &RuntimeHost, agent: &RuntimeRef) -> Result<Resolved
     resolved(&definition, agent.clone()).ok_or_else(unsupported)
 }
 
-fn resolved(
+pub(super) fn resolved(
     definition: &crate::agent::host::RuntimeDefinition,
     runtime: RuntimeRef,
 ) -> Option<Resolved> {
@@ -356,19 +371,21 @@ fn resolved(
     };
     Some(Resolved {
         runtime,
+        runtime_id: definition.runtime_id().clone(),
         display_name: definition.display_name().to_owned(),
+        config_home: definition.config_home().cloned(),
         handler,
         schema: definition.hook_schema()?,
     })
 }
 
-/// Every daemon-run handler the host's runtimes name, once each.
+/// Every runtime of the host that names a daemon-run handler.
 ///
 /// Built-in runtimes are visited before package runtimes, each group in runtime
-/// id order, so a handler is attributed to the built-in runtime that names it.
+/// id order, so a config home shared by several runtimes is attributed to the
+/// built-in runtime that names it.
 pub(super) fn managed(host: &RuntimeHost) -> Vec<Resolved> {
     let registry = host.registry();
-    let mut seen = BTreeSet::new();
     let (builtin, packaged): (Vec<_>, Vec<_>) = registry.definitions().partition(|definition| {
         matches!(
             definition.binding().provenance,
@@ -384,7 +401,6 @@ pub(super) fn managed(host: &RuntimeHost) -> Vec<Resolved> {
                 RuntimeRef::from_wire(definition.runtime_id().as_str()),
             )
         })
-        .filter(|resolved| seen.insert(resolved.handler.id()))
         .collect()
 }
 
@@ -438,33 +454,110 @@ fn dir_present(dir: &Path) -> Result<bool, ProtocolError> {
     Ok(dir.is_dir())
 }
 
-fn install_one(
-    resolved: &Resolved,
+/// A gate run before each committed file of one home, told which home it is.
+pub(super) type HomeGate<'g> = &'g mut dyn FnMut(&Target, usize, &str) -> Result<(), ProtocolError>;
+
+/// Installs into the home of `target`.
+///
+/// With `skip_absent` a home whose directory does not exist yet is left alone
+/// and reported as `None`; without it the absence is the error of the update.
+fn install_target(
+    target: &Target,
     retained: &RetainedSchemas,
-) -> Result<IntegrationInstallReport, ProtocolError> {
-    let dir = resolved.handler.config_dir()?;
-    let paths = update(resolved, &dir, retained, &mut |_index, _name| Ok(()))?;
-    Ok(report(resolved.runtime.clone(), &paths))
+    skip_absent: bool,
+    gate: HomeGate<'_>,
+) -> Result<Option<IntegrationInstallReport>, ProtocolError> {
+    let dir = target.dir()?;
+    if skip_absent && !dir_present(dir)? {
+        return Ok(None);
+    }
+    let paths = update(&target.resolved, dir, retained, &mut |index, name| {
+        gate(target, index, name)
+    })?;
+    let mut installed = report(target.resolved.runtime.clone(), &paths);
+    installed.home.clone_from(&target.label);
+    Ok(Some(installed))
 }
 
-/// Updates the asset set of every daemon-run handler whose config dir exists.
-fn install_all_present(
-    host: &RuntimeHost,
+/// The failure record of one home.
+fn home_failure(target: &Target, error: ProtocolError) -> IntegrationHomeFailure {
+    IntegrationHomeFailure {
+        agent: target.resolved.runtime.clone(),
+        home: target.label.clone().unwrap_or_default(),
+        error,
+    }
+}
+
+/// Installs the hooks of the selected runtime(s) into the selected config
+/// homes through their handlers.
+///
+/// `Some(agent)`, or a profile selection, installs the handler its runtime
+/// definition names and fails fast if its config dir is absent. `None` installs
+/// every daemon-run handler whose config dir exists, and errors only if none
+/// are present. [`HomeSelection::All`] installs into every distinct home whose
+/// directory exists, as one transaction per home, and reports a failing home in
+/// the result while the others still run, so there is no atomicity across
+/// homes; it errors only if no home exists.
+///
+/// # Errors
+///
+/// `agent_not_installable` for a runtime without a daemon-run handler,
+/// `agent_config_dir_missing` when a requested (or, for `None` and
+/// [`HomeSelection::All`], every) config dir is absent,
+/// `integration_update_incompatible` when the new asset set is not compatible
+/// with the active one, with the runtime's hook schema, or with the schema of a
+/// retained package version, the typed errors of an unusable profile
+/// selection, or any underlying I/O / settings error. With
+/// [`HomeSelection::All`] only the selection errors are returned; a home's own
+/// failure is part of the result.
+pub fn install_in(
+    homes: &ConfigHomes,
+    agent: Option<&RuntimeRef>,
+    selection: &HomeSelection,
     retained: &RetainedSchemas,
-) -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
+) -> Result<IntegrationInstallResult, ProtocolError> {
+    install_in_gated(
+        homes,
+        agent,
+        selection,
+        retained,
+        &mut |_target, _index, _name| Ok(()),
+    )
+}
+
+/// [`install_in`] running `gate` before each committed file of each home.
+pub(super) fn install_in_gated(
+    homes: &ConfigHomes,
+    agent: Option<&RuntimeRef>,
+    selection: &HomeSelection,
+    retained: &RetainedSchemas,
+    gate: HomeGate<'_>,
+) -> Result<IntegrationInstallResult, ProtocolError> {
+    let targets = homes.targets(agent, selection)?;
+    let per_home = matches!(selection, HomeSelection::All);
+    let skip_absent =
+        per_home || (agent.is_none() && !matches!(selection, HomeSelection::Profile(_)));
     let mut installed = Vec::new();
+    let mut failed = Vec::new();
     let mut looked = Vec::new();
     let mut names = Vec::new();
-    for resolved in managed(host) {
-        let dir = resolved.handler.config_dir()?;
-        if dir_present(&dir)? {
-            let paths = update(&resolved, &dir, retained, &mut |_index, _name| Ok(()))?;
-            installed.push(report(resolved.runtime.clone(), &paths));
+    for target in &targets {
+        match install_target(target, retained, skip_absent, &mut *gate) {
+            Ok(Some(report)) => installed.push(report),
+            Ok(None) => {
+                let dir = target.dir()?.display().to_string();
+                if !looked.contains(&dir) {
+                    looked.push(dir);
+                }
+                if !names.contains(&target.resolved.display_name) {
+                    names.push(target.resolved.display_name.clone());
+                }
+            }
+            Err(error) if per_home => failed.push(home_failure(target, error)),
+            Err(error) => return Err(error),
         }
-        looked.push(dir.display().to_string());
-        names.push(resolved.display_name);
     }
-    if installed.is_empty() {
+    if installed.is_empty() && failed.is_empty() && skip_absent {
         return Err(ProtocolError::new(
             ErrorClass::Runtime,
             "agent_config_dir_missing",
@@ -475,72 +568,63 @@ fn install_all_present(
             Some(format!("install {} first", names.join(" or "))),
         ));
     }
-    Ok(installed)
+    Ok(IntegrationInstallResult { installed, failed })
 }
 
-/// Installs the hooks of the selected runtime(s) through their handlers.
-///
-/// `Some(agent)` installs the handler its runtime definition names and fails
-/// fast if its config dir is absent. `None` installs every daemon-run handler
-/// whose config dir exists, and errors only if none are present.
-///
-/// # Errors
-///
-/// `agent_not_installable` for a runtime without a daemon-run handler,
-/// `agent_config_dir_missing` when a requested (or, for `None`, every) config
-/// dir is absent, `integration_update_incompatible` when the new asset set is
-/// not compatible with the active one, with the runtime's hook schema, or with
-/// the schema of a retained package version, or any underlying I/O / settings
-/// error.
-pub fn install_for_retained(
-    host: &RuntimeHost,
-    agent: Option<&RuntimeRef>,
-    retained: &RetainedSchemas,
-) -> Result<IntegrationInstallResult, ProtocolError> {
-    let installed = match agent {
-        Some(agent) => vec![install_one(&resolve(host, agent)?, retained)?],
-        None => install_all_present(host, retained)?,
-    };
-    Ok(IntegrationInstallResult { installed })
-}
-
-/// [`install_for_retained`] with no retained package version, for hosts whose
-/// runtimes are all built in.
-///
-/// # Errors
-///
-/// The errors of [`install_for_retained`].
-#[cfg(test)]
-pub fn install_for(
-    host: &RuntimeHost,
-    agent: Option<&RuntimeRef>,
-) -> Result<IntegrationInstallResult, ProtocolError> {
-    install_for_retained(host, agent, &RetainedSchemas::default())
-}
-
-/// Inspects the managed hook files of the selected runtime(s) without writing
-/// anything.
+/// Inspects the managed hook files of the selected runtime(s) in the selected
+/// config homes without writing anything.
 ///
 /// Runtimes without a daemon-run handler are rejected so callers cannot
 /// mistake an empty report for "nothing is installed". Missing config
-/// directories are reported as unavailable rather than treated as errors.
+/// directories, and homes that cannot be resolved, are reported as unavailable
+/// rather than treated as errors.
 ///
 /// # Errors
 ///
-/// `agent_not_installable` for a runtime without a daemon-run handler.
-pub fn status_for(
-    host: &RuntimeHost,
+/// `agent_not_installable` for a runtime without a daemon-run handler, or the
+/// typed errors of an unusable profile selection.
+pub fn status_in(
+    homes: &ConfigHomes,
     params: IntegrationStatusParams,
 ) -> Result<IntegrationStatusResult, ProtocolError> {
-    let IntegrationStatusParams { agent } = params;
-    let selected = match agent {
-        Some(agent) => vec![resolve(host, &agent)?],
-        None => managed(host),
-    };
+    let IntegrationStatusParams {
+        agent,
+        profile,
+        all_profiles,
+    } = params;
+    let selection = HomeSelection::from_params(profile, all_profiles)?;
+    let targets = homes.targets(agent.as_ref(), &selection)?;
     Ok(IntegrationStatusResult {
-        agents: selected
-            .iter()
-            .map(|resolved| resolved.handler.inspect(&resolved.runtime))
-            .collect(),
+        agents: targets.iter().map(inspect_target).collect(),
     })
+}
+
+/// The read-only status of the home of `target`, with the recovery commands in
+/// its warnings addressing that home.
+fn inspect_target(target: &Target) -> IntegrationAgentStatus {
+    let mut status = target
+        .resolved
+        .handler
+        .inspect(&target.resolved.runtime, target.dir_ref());
+    scope_status(&mut status, target);
+    status.home.clone_from(&target.label);
+    status
+}
+
+/// Rewrites the recovery commands of `status` that select the runtime to also
+/// select the profile whose home `target` is.
+pub(super) fn scope_status(status: &mut IntegrationAgentStatus, target: &Target) {
+    if let Some(profile) = target.scope_profile() {
+        let runtime = target.resolved.runtime.as_wire();
+        for warning in &mut status.warnings {
+            *warning = scope_text(warning, runtime, profile);
+        }
+    }
+}
+
+/// Rewrites `--agent <runtime>` in `text` to `--agent <runtime> --profile
+/// <profile>`, so a recovery command addresses the home the text describes.
+pub(super) fn scope_text(text: &str, runtime: &str, profile: &str) -> String {
+    let flag = format!("{AGENT_FLAG} {runtime}");
+    text.replace(&flag, &format!("{flag} {PROFILE_FLAG} {profile}"))
 }

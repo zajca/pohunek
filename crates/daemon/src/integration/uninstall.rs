@@ -10,14 +10,14 @@
 use std::path::Path;
 
 use protocol::{
-    IntegrationUninstallReport, IntegrationUninstallResult, IntegrationUninstallState,
-    ProtocolError, RuntimeRef,
+    IntegrationHomeFailure, IntegrationUninstallReport, IntegrationUninstallResult,
+    IntegrationUninstallState, ProtocolError, RuntimeRef,
 };
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item};
 
 use super::commit::{self, Action, Committed, Expected, Operation, Outcome, Step, StepGate};
-use super::handler;
+use super::homes::{ConfigHomes, HomeSelection, Target};
 use super::{
     apply_trust_moves, claude_notify_hook_commands, codex_managed_hooks,
     codex_notify_hook_commands, config_dir_is_symlink, config_path_kind, hook_command,
@@ -27,7 +27,6 @@ use super::{
     HOOK_ACTION, HOOK_RELEASE_ACTION, NOTIFY_HOOK_INSTALL_NAME, STATE_HOOK_INSTALL_NAME,
     SUBAGENT_START_ACTION, SUBAGENT_STOP_ACTION,
 };
-use crate::agent::host::RuntimeHost;
 
 /// Marker line an installed Claude hook script carries.
 const CLAUDE_OWNERSHIP_MARKER: &str = "# POHUNEK_INTEGRATION_ID=claude";
@@ -35,35 +34,64 @@ const CLAUDE_OWNERSHIP_MARKER: &str = "# POHUNEK_INTEGRATION_ID=claude";
 /// Marker line an installed Codex hook script carries.
 const CODEX_OWNERSHIP_MARKER: &str = "# POHUNEK_INTEGRATION_ID=codex";
 
-/// Remove the managed hooks of one runtime through its integration handler.
+/// Remove the managed hooks of one runtime from the selected config homes
+/// through its integration handler.
 ///
 /// The runtime is always named: removal never widens to other runtimes, so a
 /// failure cannot leave one runtime removed and another unreported. A runtime
 /// whose config directory is absent, or that holds nothing the handler owns,
-/// is reported as `not_installed` and left unchanged.
+/// is reported as `not_installed` and left unchanged. [`HomeSelection::All`]
+/// runs one transaction per distinct home of the runtime and reports a failing
+/// home in the result while the others still run, so there is no atomicity
+/// across homes.
 ///
 /// # Errors
 ///
-/// `agent_not_installable` for a runtime without a daemon-run handler, a typed
-/// configuration error for an unresolvable or unsafe config path (including a
-/// symlink), the transaction errors of [`super::commit`], or any underlying I/O
-/// or settings error.
-pub fn uninstall_for(
-    host: &RuntimeHost,
+/// `agent_not_installable` for a runtime without a daemon-run handler, the
+/// typed errors of an unusable profile selection, a typed configuration error
+/// for an unresolvable or unsafe config path (including a symlink), the
+/// transaction errors of [`super::commit`], or any underlying I/O or settings
+/// error. With [`HomeSelection::All`] only the selection errors are returned.
+pub fn uninstall_in(
+    homes: &ConfigHomes,
     agent: &RuntimeRef,
+    selection: &HomeSelection,
 ) -> Result<IntegrationUninstallResult, ProtocolError> {
-    let resolved = handler::resolve(host, agent)?;
-    let dir = resolved.handler.config_dir()?;
-    let report = resolved.handler.uninstall(&resolved.runtime, &dir)?;
+    let per_home = matches!(selection, HomeSelection::All);
+    let mut uninstalled = Vec::new();
+    let mut failed = Vec::new();
+    for target in homes.targets(Some(agent), selection)? {
+        match uninstall_target(&target) {
+            Ok(report) => uninstalled.push(report),
+            Err(error) if per_home => failed.push(IntegrationHomeFailure {
+                agent: target.resolved.runtime.clone(),
+                home: target.label.clone().unwrap_or_default(),
+                error,
+            }),
+            Err(error) => return Err(error),
+        }
+    }
     Ok(IntegrationUninstallResult {
-        uninstalled: vec![report],
+        uninstalled,
+        failed,
     })
 }
 
-/// [`uninstall_for`] against the built-in runtimes.
+/// Removes the managed hooks from the home of `target`.
+fn uninstall_target(target: &Target) -> Result<IntegrationUninstallReport, ProtocolError> {
+    let dir = target.dir()?;
+    let mut report = target
+        .resolved
+        .handler
+        .uninstall(&target.resolved.runtime, dir)?;
+    report.home.clone_from(&target.label);
+    Ok(report)
+}
+
+/// [`uninstall_in`] against the built-in runtimes.
 #[cfg(test)]
 pub fn uninstall(agent: &RuntimeRef) -> Result<IntegrationUninstallResult, ProtocolError> {
-    uninstall_for(&crate::agent::host::fixture::builtin_host(), agent)
+    super::uninstall_for(&crate::agent::host::fixture::builtin_host(), agent)
 }
 
 /// Remove the managed Claude hooks from `claude_dir`.
@@ -92,6 +120,7 @@ fn empty_report(agent: RuntimeRef) -> IntegrationUninstallReport {
         updated_paths: Vec::new(),
         preserved_paths: Vec::new(),
         cleanup_incomplete: Vec::new(),
+        home: None,
     }
 }
 

@@ -305,3 +305,225 @@ fn a_value_outside_the_runtime_id_grammar_is_a_usage_error() {
         assert_eq!(stdout_json(&output)["err"]["code"], "cli_usage", "{value}");
     }
 }
+
+/// The `home` label of a report for the profile home `name`.
+fn profile_home(name: &str) -> Value {
+    json!({ "profiles": [name] })
+}
+
+#[test]
+fn install_sends_the_profile_selector_and_labels_the_home() {
+    let fixture = Fixture::new("install-profile");
+    let server = serve_once(
+        &fixture.socket(),
+        json!({ "installed": [{
+            "agent": "claude",
+            "hook_path": "/p/work/hooks/pohunek-agent-state.sh",
+            "config_paths": ["/p/work/settings.json"],
+            "cleanup_incomplete": [],
+            "home": profile_home("work")
+        }] }),
+    );
+
+    let output = fixture.run(&[
+        "integration",
+        "install",
+        "--agent",
+        "claude",
+        "--profile",
+        "work",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).expect("human output");
+    assert!(
+        text.contains("installed claude hook (profile work): /p/work/hooks/pohunek-agent-state.sh"),
+        "{text}"
+    );
+    assert_eq!(
+        server.join().expect("fake daemon"),
+        (
+            "integration.install".to_owned(),
+            json!({ "agent": "claude", "profile": "work" })
+        )
+    );
+}
+
+#[test]
+fn install_all_profiles_exits_non_zero_when_any_home_failed_and_names_it() {
+    let fixture = Fixture::new("install-all-failed");
+    let server = serve_once(
+        &fixture.socket(),
+        json!({
+            "installed": [{
+                "agent": "claude",
+                "hook_path": "/p/work/hooks/pohunek-agent-state.sh",
+                "config_paths": [],
+                "cleanup_incomplete": [],
+                "home": profile_home("work")
+            }],
+            "failed": [{
+                "agent": "claude",
+                "home": profile_home("personal"),
+                "error": {
+                    "class": "runtime",
+                    "code": "integration_settings_invalid",
+                    "msg": "settings.json is not valid JSON",
+                    "recover": "repair the file"
+                }
+            }]
+        }),
+    );
+
+    let output = fixture.run(&["integration", "install", "--all-profiles"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).expect("human output");
+    assert!(
+        text.contains("installed claude hook (profile work)"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "failed claude (profile personal): integration_settings_invalid: settings.json is not valid JSON"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("  fix: repair the file"), "{text}");
+    assert_eq!(
+        server.join().expect("fake daemon"),
+        (
+            "integration.install".to_owned(),
+            json!({ "all_profiles": true })
+        )
+    );
+}
+
+#[test]
+fn uninstall_all_profiles_exits_non_zero_when_any_home_failed() {
+    let fixture = Fixture::new("uninstall-all-failed");
+    let server = serve_once(
+        &fixture.socket(),
+        json!({
+            "uninstalled": [],
+            "failed": [{
+                "agent": "claude",
+                "home": { "bare": true },
+                "error": {
+                    "class": "configuration",
+                    "code": "agent_config_dir_is_symlink",
+                    "msg": "the config directory is a symlink"
+                }
+            }]
+        }),
+    );
+
+    let output = fixture.run(&[
+        "integration",
+        "uninstall",
+        "--agent",
+        "claude",
+        "--all-profiles",
+    ]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8(output.stdout).expect("human output");
+    assert!(
+        text.contains("failed claude (default): agent_config_dir_is_symlink"),
+        "{text}"
+    );
+    assert_eq!(
+        server.join().expect("fake daemon"),
+        (
+            "integration.uninstall".to_owned(),
+            json!({ "agent": "claude", "all_profiles": true })
+        )
+    );
+}
+
+#[test]
+fn status_and_doctor_send_the_selectors_and_render_the_home() {
+    let mut status = doctor_result(true)["agents"][0]["status"].clone();
+    status["home"] = profile_home("work");
+    let fixture = Fixture::new("status-profile");
+    let server = serve_once(&fixture.socket(), json!({ "agents": [status] }));
+
+    let output = fixture.run(&["integration", "status", "--profile", "work"]);
+
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("human output");
+    assert!(text.contains("  home: profile work"), "{text}");
+    assert!(
+        text.contains("run `pohunek integration install --agent claude --profile work`"),
+        "{text}"
+    );
+    assert_eq!(
+        server.join().expect("fake daemon"),
+        (
+            "integration.status".to_owned(),
+            json!({ "profile": "work" })
+        )
+    );
+
+    let mut result = doctor_result(true);
+    result["agents"][0]["home"] = profile_home("work");
+    let fixture = Fixture::new("doctor-all");
+    let server = serve_once(&fixture.socket(), result);
+
+    let output = fixture.run(&["integration", "doctor", "--all-profiles"]);
+
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).expect("human output");
+    assert!(text.contains("claude (profile work): ok"), "{text}");
+    assert_eq!(
+        server.join().expect("fake daemon"),
+        (
+            "integration.doctor".to_owned(),
+            json!({ "all_profiles": true })
+        )
+    );
+}
+
+#[test]
+fn the_home_selectors_exclude_each_other_and_the_hermes_selectors() {
+    let fixture = Fixture::new("selector-conflicts");
+    let both = fixture.run(&[
+        "integration",
+        "install",
+        "--profile",
+        "work",
+        "--all-profiles",
+        "--json",
+    ]);
+    assert_eq!(both.status.code(), Some(2));
+    assert_eq!(stdout_json(&both)["err"]["code"], "cli_usage");
+
+    for action in ["install", "status", "doctor", "uninstall"] {
+        for selector in [["--profile", "work"], ["--all-profiles", ""]] {
+            let mut arguments = vec![
+                "integration",
+                action,
+                "--agent",
+                "hermes",
+                "--hermes-profile",
+                "default",
+                "--json",
+                selector[0],
+            ];
+            if !selector[1].is_empty() {
+                arguments.push(selector[1]);
+            }
+            let output = fixture.run(&arguments);
+            assert_eq!(output.status.code(), Some(1), "{action} {selector:?}");
+            assert_eq!(
+                stdout_json(&output)["err"]["code"],
+                "integration_profile_not_for_hermes",
+                "{action} {selector:?}"
+            );
+        }
+    }
+}

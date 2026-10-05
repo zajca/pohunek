@@ -1,5 +1,22 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, config homes)
+
+- A runtime descriptor may declare its config home in `[config_home]` (a
+  variable name and a home-relative default); the built-in `claude` and `codex`
+  declare `CLAUDE_CONFIG_DIR` / `.claude` and `CODEX_HOME` / `.codex`, moved out
+  of code. One resolver gives the directory a launch would give the agent: the
+  variable from the daemon's base environment overridden by the profile's
+  `[env]`, else the default below `HOME`. A value that is not absolute is
+  refused, never expanded. The daemon's own process environment no longer steers
+  install or status, so they agree with the launched agent.
+- `integration.install`, `status`, `doctor` and `uninstall` accept `profile` and
+  `all_profiles` (local control socket only), report the `home` of each result,
+  run one transaction per distinct home and list a failing home in `failed`.
+  `pohunek integration` gains `--profile` and `--all-profiles`. The agent
+  profiles page starts the subscription-switching guide, the public API, CLI,
+  runtime packages and secrets pages describe the surface.
+
 ## Unreleased (2026-10-05, hook schema gaps)
 
 - A hook schema now declares the subagent sequence rule next to the subagent

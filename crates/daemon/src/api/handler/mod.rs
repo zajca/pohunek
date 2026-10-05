@@ -381,20 +381,13 @@ async fn handle_negotiated(
         }
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => {
-            integration::handle_integration_install(request, &state.sessions).await
+            integration::handle_integration_install(request, state).await
         }
-        method::INTEGRATION_STATUS => {
-            integration::handle_integration_status(request, state.sessions.profiles().runtimes())
-                .await
-        }
+        method::INTEGRATION_STATUS => integration::handle_integration_status(request, state).await,
         method::INTEGRATION_UNINSTALL => {
-            integration::handle_integration_uninstall(request, state.sessions.profiles().runtimes())
-                .await
+            integration::handle_integration_uninstall(request, state).await
         }
-        method::INTEGRATION_DOCTOR => {
-            integration::handle_integration_doctor(request, state.sessions.profiles().runtimes())
-                .await
-        }
+        method::INTEGRATION_DOCTOR => integration::handle_integration_doctor(request, state).await,
         method::PACKAGE_LIST => package::handle_package_list(request, state).await,
         method::PACKAGE_INSPECT => package::handle_package_inspect(request, state).await,
         method::PACKAGE_DOCTOR => package::handle_package_doctor(request, state).await,

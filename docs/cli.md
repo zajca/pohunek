@@ -58,9 +58,9 @@ port is retained.
 | `pohunek notifications list / watch` | Inspect or stream the durable inbox; `--all-hosts` fans out. |
 | `pohunek notifications read / ack / archive / delete` | Drive one record's lifecycle (`host/id` targets a specific host). |
 | `pohunek notifications policy / retention` | Per-kind/provider policy (including `hermes`), retention pruning (`--dry-run` / `--apply`). |
-| `pohunek integration install` | Install Codex/Claude hooks, or a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
-| `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host`, or one explicitly selected local Hermes target. |
-| `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
+| `pohunek integration install` | Install Codex/Claude hooks into the runtime's own config home, one host profile's home (`--profile NAME`) or every distinct home (`--all-profiles`), or install a selected Hermes profile's managed plugin with explicit access mode and host allowlist. |
+| `pohunek integration status` | Inspect daemon-managed Codex/Claude hooks on the effective `--host` (`--profile` and `--all-profiles` select profile config homes and are local-only), or one explicitly selected local Hermes target. |
+| `pohunek integration doctor / uninstall` | Diagnose or remove daemon-managed Codex/Claude hooks (`doctor` follows `--host`; `uninstall` targets the local daemon; both accept `--profile NAME` and `--all-profiles`, local-only), or, with `--agent hermes`, one explicitly selected local Hermes plugin target. |
 | `pohunek integration update --agent hermes` | Atomically refresh one explicitly selected local Hermes plugin target. |
 | `pohunek setup [config]` | Install the default `attach.conf` and prompt templates (a bare `setup` is `setup config`). |
 | `pohunek setup completions <bash\|zsh\|fish>` | Install completion in the shell's conventional user directory; add `--dynamic` to opt in to runtime candidates. |
@@ -274,6 +274,56 @@ uninstall`; `update` remains Hermes-only and returns a typed unsupported-action
 error for those agents. A
 remote status recovery hint names the daemon host where the local-only installer
 must run; `--host` never turns `integration install` into a remote mutation.
+
+### Codex and Claude config homes
+
+A Codex or Claude agent reads its settings and hook registration from a config
+home: the runtime's declared variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) as the
+launched agent sees it, else `~/.claude` / `~/.codex`. A host profile can point
+that variable somewhere else in its `[env]`, which is how one machine keeps
+separate subscriptions. The hooks must be installed into each home an agent can
+run with:
+
+```bash
+# The runtime's own home (no profile).
+pohunek integration install --agent claude
+
+# The config home a host profile launches with; the profile must extend the runtime.
+pohunek integration install --agent claude --profile work
+pohunek integration status --profile work --json
+pohunek integration doctor --agent claude --profile work
+
+# Every distinct home of the runtime: its own and each host profile's.
+pohunek integration install --agent claude --all-profiles
+pohunek integration uninstall --agent claude --all-profiles
+```
+
+`--profile` and `--all-profiles` are mutually exclusive, are refused together
+with the Hermes selectors (`--agent hermes`, `--hermes-profile`,
+`--hermes-home`), and are served by the local daemon only (`status` and
+`doctor` with a remote `--host` get `local_only_method`), because the reports
+name directories derived from the profile's environment. Without `--agent`,
+`--profile NAME` selects the profile's own runtime. A profile value that is not
+an absolute path (`~/x`) is refused, never expanded.
+
+The directory is resolved from the environment a launched agent sees, not from
+the daemon's own process environment: a `CLAUDE_CONFIG_DIR` or `CODEX_HOME` set
+only in the daemon's service environment does not steer `integration install`
+or `status`: they use `~/.claude` / `~/.codex`, and hooks installed in the
+directory that variable names are not reported. Add the variable to the daemon's environment
+allowlist so launched agents see it too, or move it into a host profile's
+environment and use `--profile`. A package runtime that names a daemon-run
+integration handler needs a `[config_home]` descriptor table; without one it is
+left out of bare `install`/`status`/`doctor` and `--agent` answers
+`agent_config_home_undeclared`.
+
+`--all-profiles` runs one transaction per distinct directory (profiles that
+resolve to the same canonical directory share one), skips homes whose directory
+does not exist and fails when none exists, labels every result with the
+profile(s) it stands for, and exits non-zero when any home failed. There is no
+atomicity across homes: a home that fails rolls back to its own prior tree and
+the others keep what they committed. A profile file that does not resolve is
+skipped, and the daemon logs a warning that names it.
 
 The plugin is a delegated-tool guardrail, not a sandbox against a same-user
 Hermes process with shell or file-write access. It repeats the daemon's exact

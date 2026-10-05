@@ -33,6 +33,16 @@ outcome, a nonce, a signature, a retired-enrollment record, or relay
 credentials. Treat all of those values and the owner-private host-state files
 as secret-bearing operational material even when their filenames are known.
 
+## Config homes derived from profile environments
+
+`pohunek integration install|status|doctor|uninstall` with `--profile` or
+`--all-profiles` act on directories a host profile's `[env]` names. Their
+reports carry paths and errors derived from those values, so the daemon serves
+the selectors on the local control socket only and refuses a remote connection
+before acting. Typed errors name the variable that supplied a refused value,
+never the value. A profile value that is not an absolute path is refused, not
+expanded against the daemon's home directory.
+
 ## Provider tokens
 
 The daemon and the CLI never hold Linear or GitHub provider tokens. Provider

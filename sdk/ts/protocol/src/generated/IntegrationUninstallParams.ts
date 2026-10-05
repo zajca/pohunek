@@ -14,4 +14,14 @@ export type IntegrationUninstallParams = {
    * Agent to remove the managed hooks for.
    */
   agent: RuntimeRef;
+  /**
+   * Remove from the config home the named host profile launches with.
+   * Local owner connections only.
+   */
+  profile?: string;
+  /**
+   * Remove from every distinct config home of the runtime, one transaction
+   * per home. Local owner connections only; exclusive with `profile`.
+   */
+  all_profiles?: boolean;
 };

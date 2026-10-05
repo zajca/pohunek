@@ -1,4 +1,4 @@
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 //! Native session reference strategies: how core obtains the reference a
 //! runtime recovers its conversation with.
@@ -375,26 +375,25 @@ impl FileExistence {
     }
 }
 
-/// An environment variable name: upper-case ASCII, digits and `_`, starting
-/// with a letter, and not in the namespace pohunek reserves.
-fn validate_env_name(name: &str) -> Result<(), ExistenceError> {
+/// Why `name` cannot be a declared environment variable name: upper-case ASCII,
+/// digits and `_`, starting with a letter, and not in the namespace pohunek
+/// reserves.
+pub(crate) fn env_name_problem(name: &str) -> Option<&'static str> {
     let mut bytes = name.bytes();
     let valid = name.len() <= MAX_EXISTENCE_TEXT_BYTES
         && bytes.next().is_some_and(|byte| byte.is_ascii_uppercase())
         && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
     if !valid {
-        return Err(ExistenceError::new(
-            "root_env",
-            "must be an upper-case environment variable name",
-        ));
+        return Some("must be an upper-case environment variable name");
     }
-    if name.starts_with(RESERVED_ENV_PREFIX) {
-        return Err(ExistenceError::new(
-            "root_env",
-            "cannot name a reserved POHUNEK_ variable",
-        ));
-    }
-    Ok(())
+    name.starts_with(RESERVED_ENV_PREFIX)
+        .then_some("cannot name a reserved POHUNEK_ variable")
+}
+
+fn validate_env_name(name: &str) -> Result<(), ExistenceError> {
+    env_name_problem(name).map_or(Ok(()), |reason| {
+        Err(ExistenceError::new("root_env", reason))
+    })
 }
 
 /// A name component: ASCII alphanumerics, `.`, `_` and `-`, never `.` or `..`.
@@ -407,16 +406,20 @@ fn is_plain_component(component: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-/// A relative `/`-separated path of plain components, so it cannot be
-/// absolute, climb out of its base, or carry a glob or shell metacharacter.
-fn validate_relative_path(path: &str, field: &'static str) -> Result<(), ExistenceError> {
+/// Whether `path` is a relative `/`-separated path of plain components, so it
+/// cannot be absolute, climb out of its base, or carry a glob or shell
+/// metacharacter.
+pub(crate) fn is_plain_relative_path(path: &str) -> bool {
     let components: Vec<&str> = path.split('/').collect();
-    let valid = path.len() <= MAX_EXISTENCE_TEXT_BYTES
+    path.len() <= MAX_EXISTENCE_TEXT_BYTES
         && components.len() <= MAX_EXISTENCE_PATH_COMPONENTS
         && components
             .iter()
-            .all(|component| is_plain_component(component));
-    if valid {
+            .all(|component| is_plain_component(component))
+}
+
+fn validate_relative_path(path: &str, field: &'static str) -> Result<(), ExistenceError> {
+    if is_plain_relative_path(path) {
         Ok(())
     } else {
         Err(ExistenceError::new(

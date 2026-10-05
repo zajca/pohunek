@@ -2,6 +2,7 @@
 
 import type { IntegrationAgentStatus } from "./IntegrationAgentStatus";
 import type { IntegrationFinding } from "./IntegrationFinding";
+import type { IntegrationHome } from "./IntegrationHome";
 import type { RuntimeRef } from "./RuntimeRef";
 
 /**
@@ -25,4 +26,9 @@ export type IntegrationAgentDoctor = {
    * Every observed cause, in a stable order.
    */
   findings: Array<IntegrationFinding>;
+  /**
+   * The config home the diagnosis describes; present only on a
+   * profile-aware request.
+   */
+  home?: IntegrationHome;
 };

@@ -44,6 +44,8 @@ export type { IntegrationDoctorResult } from "./IntegrationDoctorResult";
 export type { IntegrationFinding } from "./IntegrationFinding";
 export type { IntegrationFindingCode } from "./IntegrationFindingCode";
 export type { IntegrationFindingSeverity } from "./IntegrationFindingSeverity";
+export type { IntegrationHome } from "./IntegrationHome";
+export type { IntegrationHomeFailure } from "./IntegrationHomeFailure";
 export type { IntegrationInstallParams } from "./IntegrationInstallParams";
 export type { IntegrationInstallReport } from "./IntegrationInstallReport";
 export type { IntegrationInstallResult } from "./IntegrationInstallResult";

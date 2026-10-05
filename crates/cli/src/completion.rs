@@ -266,8 +266,12 @@ impl ValueCompleter for DigestCompleter {
     }
 }
 
-/// Completes the `<NAME>` argument of `pohunek plugin profile migrate` with the
-/// profile files in the agents directory.
+/// Id of the `--profile` argument of the `integration` lifecycle commands.
+const INTEGRATION_PROFILE_ARG: &str = "home_profile";
+
+/// Completes the `<NAME>` argument of `pohunek plugin profile migrate` and the
+/// `--profile` value of the `integration` commands with the profile files in
+/// the agents directory.
 ///
 /// Lists names only, never file content, and does no daemon I/O.
 #[derive(Clone, Copy, Debug)]
@@ -397,6 +401,17 @@ fn dynamic_command(context: CompletionContext) -> Command {
         .mut_subcommand("plugin", move |command| {
             command.mut_subcommands(move |subcommand| {
                 with_plugin_completers(subcommand, &plugin_context)
+            })
+        })
+        .mut_subcommand("integration", |command| {
+            command.mut_subcommands(|subcommand| {
+                subcommand.mut_args(|arg| {
+                    if arg.get_id() == INTEGRATION_PROFILE_ARG {
+                        arg.add(ArgValueCompleter::new(ProfileNameCompleter))
+                    } else {
+                        arg
+                    }
+                })
             })
         })
         .mut_subcommand("session", move |command| {
@@ -1222,6 +1237,32 @@ mod tests {
         }
         // inspect, update, select, enable, disable, uninstall, doctor.
         assert_eq!(package_arguments, 7);
+    }
+
+    /// The `--profile` value of every daemon-backed `integration` command
+    /// completes from the agents directory.
+    #[test]
+    fn dynamic_command_marks_the_integration_profile_argument() {
+        let command = dynamic_command(CompletionContext::default());
+        let integration = command
+            .find_subcommand("integration")
+            .expect("integration command");
+        for action in ["install", "status", "doctor", "uninstall"] {
+            let arg = integration
+                .find_subcommand(action)
+                .and_then(|subcommand| {
+                    subcommand
+                        .get_arguments()
+                        .find(|arg| arg.get_id() == INTEGRATION_PROFILE_ARG)
+                })
+                .unwrap_or_else(|| panic!("{action} --profile"));
+            assert!(arg.get::<ArgValueCompleter>().is_some(), "{action}");
+            assert_eq!(arg.get_long(), Some("profile"), "{action}");
+        }
+        let update = integration.find_subcommand("update").expect("update");
+        assert!(update
+            .get_arguments()
+            .all(|arg| arg.get_id() != INTEGRATION_PROFILE_ARG));
     }
 
     /// `plugin profile migrate` completes its `NAME` from the agents directory

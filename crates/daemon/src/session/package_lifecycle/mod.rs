@@ -59,7 +59,7 @@ use crate::agent::host::{
     PackageReport, PackageStore, RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
-use crate::integration::RetainedSchemas;
+use crate::integration::{ConfigHomes, RetainedSchemas};
 
 /// What a package method needs from the session registry.
 struct Context {
@@ -421,6 +421,43 @@ impl SessionRegistry {
             anchor: self.inner.config.catalog_trust_anchor.clone(),
             integrations: Mutex::default(),
         })
+    }
+
+    /// What resolves the config home a launch of a runtime gives its agent: the
+    /// host profiles and the base environment this registry hands every agent.
+    ///
+    /// A registry without a worker backend launches no agent; its base
+    /// environment is the default selection of the daemon's own.
+    ///
+    /// # Errors
+    ///
+    /// Returns `worker_initialize_invalid` when the configured allowlist or
+    /// the daemon's environment cannot form a base environment.
+    pub(crate) fn integration_homes(&self) -> Result<ConfigHomes, ProtocolError> {
+        let (allowlist, source) = match self.inner.config.supervision.as_ref() {
+            Some(supervision) => (
+                supervision.environment_allowlist.clone(),
+                supervision.environment_source.clone(),
+            ),
+            None => (
+                pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect(),
+                crate::runtime::EnvironmentSource::Process,
+            ),
+        };
+        let base = crate::runtime::environment::base_environment(&allowlist, &source).map_err(
+            |error| {
+                ProtocolError::new(
+                    protocol::ErrorClass::Runtime,
+                    "worker_initialize_invalid",
+                    error.to_string(),
+                    None,
+                )
+            },
+        )?;
+        Ok(ConfigHomes::new(self.inner.profiles.clone(), base))
     }
 
     /// Runs an integration update under the shared lifecycle guard with the

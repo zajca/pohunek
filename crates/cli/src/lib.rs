@@ -659,6 +659,8 @@ enum IntegrationAction {
         #[arg(long, value_parser = commands::integration::hook_agent_parser())]
         agent: Option<commands::integration::HookAgentArg>,
         #[command(flatten)]
+        home: HomeSelectionCliOptions,
+        #[command(flatten)]
         hermes: HermesCliOptions,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
@@ -669,6 +671,8 @@ enum IntegrationAction {
         /// Restrict status; Hermes requires an explicit local target.
         #[arg(long, value_parser = commands::integration::hook_agent_parser())]
         agent: Option<commands::integration::HookAgentArg>,
+        #[command(flatten)]
+        home: HomeSelectionCliOptions,
         #[command(flatten)]
         hermes: HermesStatusCliOptions,
         /// Emit machine-readable JSON instead of human text.
@@ -682,6 +686,8 @@ enum IntegrationAction {
         /// Without `--agent`, diagnoses Codex and Claude.
         #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: Option<commands::integration::HookAgentArg>,
+        #[command(flatten)]
+        home: HomeSelectionCliOptions,
         #[command(flatten)]
         hermes: HermesDoctorCliOptions,
         /// Emit machine-readable JSON instead of human text.
@@ -706,11 +712,46 @@ enum IntegrationAction {
         #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: commands::integration::HookAgentArg,
         #[command(flatten)]
+        home: HomeSelectionCliOptions,
+        #[command(flatten)]
         hermes: HermesUninstallCliOptions,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
     },
+}
+
+/// Which config home of a Codex or Claude runtime an integration command acts
+/// on; the default is the runtime's own home.
+///
+/// The Hermes plugin lives in a Hermes home chosen with `--hermes-profile` or
+/// `--hermes-home`, so these selectors are refused together with them.
+#[derive(Debug, Args)]
+struct HomeSelectionCliOptions {
+    /// Act on the config home this host profile launches with (the profile's
+    /// `[env]` config-home variable), instead of the runtime's own home. Local
+    /// daemon only; the profile must extend the selected runtime.
+    #[arg(
+        long = "profile",
+        id = "home_profile",
+        value_name = "NAME",
+        conflicts_with = "all_profiles"
+    )]
+    profile: Option<String>,
+    /// Act on every distinct config home of the selected runtime: its own and
+    /// each host profile's. One transaction per home with no atomicity across
+    /// homes; exits non-zero when any home fails. Local daemon only.
+    #[arg(long = "all-profiles")]
+    all_profiles: bool,
+}
+
+impl From<HomeSelectionCliOptions> for commands::integration::HomeSelectionArgs {
+    fn from(value: HomeSelectionCliOptions) -> Self {
+        Self {
+            profile: value.profile,
+            all_profiles: value.all_profiles,
+        }
+    }
 }
 
 /// Explicit local inputs for one Hermes operator-plugin lifecycle command.
@@ -2086,12 +2127,15 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
             match action {
                 IntegrationAction::Install {
                     agent,
+                    home,
                     hermes,
                     json,
                 } => {
+                    let home = commands::integration::HomeSelectionArgs::from(home);
                     let hermes = commands::integration::HermesOptions::from(hermes);
                     match agent {
                         Some(commands::integration::HookAgentArg::Hermes) => {
+                            home.refuse_for_hermes()?;
                             commands::integration::run_hermes(
                                 commands::integration::HermesAction::Install,
                                 &hermes,
@@ -2105,17 +2149,25 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                             // Codex and Claude hook installation remains a local daemon
                             // operation and retains its existing request and output shape.
                             let paths = Paths::resolve()?;
-                            commands::integration::run_install(&paths, agent, json).await?;
+                            let installed =
+                                commands::integration::run_install(&paths, agent, &home, json)
+                                    .await?;
+                            if !installed {
+                                return Ok(ExitCode::FAILURE);
+                            }
                         }
                     }
                 }
                 IntegrationAction::Status {
                     agent,
+                    home,
                     hermes,
                     json,
                 } => {
+                    let home = commands::integration::HomeSelectionArgs::from(home);
                     let hermes = commands::integration::HermesOptions::from(hermes);
                     if agent == Some(commands::integration::HookAgentArg::Hermes) {
+                        home.refuse_for_hermes()?;
                         return run_integration_hermes_action(
                             commands::integration::HermesAction::Status,
                             commands::integration::HookAgentArg::Hermes,
@@ -2128,16 +2180,19 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     }
                     let paths = Paths::resolve()?;
                     let host = effective_host(&global_host, None);
-                    commands::integration::run_status(&host, &paths, agent, json).await?;
+                    commands::integration::run_status(&host, &paths, agent, &home, json).await?;
                     return Ok(ExitCode::SUCCESS);
                 }
                 IntegrationAction::Doctor {
                     agent,
+                    home,
                     hermes,
                     json,
                 } => {
+                    let home = commands::integration::HomeSelectionArgs::from(home);
                     let hermes = commands::integration::HermesOptions::from(hermes);
                     if agent == Some(commands::integration::HookAgentArg::Hermes) {
+                        home.refuse_for_hermes()?;
                         return run_integration_hermes_action(
                             commands::integration::HermesAction::Doctor,
                             commands::integration::HookAgentArg::Hermes,
@@ -2151,7 +2206,8 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     let paths = Paths::resolve()?;
                     let host = effective_host(&global_host, None);
                     let healthy =
-                        commands::integration::run_doctor(&host, &paths, agent, json).await?;
+                        commands::integration::run_doctor(&host, &paths, agent, &home, json)
+                            .await?;
                     return Ok(if healthy {
                         ExitCode::SUCCESS
                     } else {
@@ -2172,11 +2228,14 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                 }
                 IntegrationAction::Uninstall {
                     agent,
+                    home,
                     hermes,
                     json,
                 } => {
+                    let home = commands::integration::HomeSelectionArgs::from(home);
                     let hermes = commands::integration::HermesOptions::from(hermes);
                     if agent == commands::integration::HookAgentArg::Hermes {
+                        home.refuse_for_hermes()?;
                         return run_integration_hermes_action(
                             commands::integration::HermesAction::Uninstall,
                             agent,
@@ -2190,7 +2249,11 @@ async fn run(cli: Cli) -> Result<ExitCode, CliError> {
                     // Removing hooks edits this machine's agent config dirs, so it
                     // is always a local daemon operation regardless of `--host`.
                     let paths = Paths::resolve()?;
-                    commands::integration::run_uninstall(&paths, agent, json).await?;
+                    let removed =
+                        commands::integration::run_uninstall(&paths, agent, &home, json).await?;
+                    if !removed {
+                        return Ok(ExitCode::FAILURE);
+                    }
                 }
             }
             Ok(ExitCode::SUCCESS)
@@ -2581,6 +2644,7 @@ mod tests {
                         agent: Some(commands::integration::HookAgentArg::Hermes),
                         hermes,
                         json,
+                        ..
                     },
             } => {
                 assert_eq!(hermes.hermes_profile.as_deref(), Some("default"));
@@ -2591,6 +2655,90 @@ mod tests {
                 assert_eq!(hermes.max_concurrency, Some(1));
                 assert!(json);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn integration_parses_the_home_selectors_on_every_daemon_backed_command() {
+        for action in ["install", "status", "doctor", "uninstall"] {
+            let agent = ["--agent", "claude"];
+            let profile = Cli::try_parse_from(
+                ["pohunek", "integration", action]
+                    .into_iter()
+                    .chain(agent)
+                    .chain(["--profile", "work"]),
+            )
+            .unwrap_or_else(|error| panic!("{action} --profile: {error}"));
+            let all = Cli::try_parse_from(
+                ["pohunek", "integration", action]
+                    .into_iter()
+                    .chain(agent)
+                    .chain(["--all-profiles"]),
+            )
+            .unwrap_or_else(|error| panic!("{action} --all-profiles: {error}"));
+            let selected = |cli: Cli| match cli.command {
+                Commands::Integration { action } => match action {
+                    IntegrationAction::Install { home, .. }
+                    | IntegrationAction::Status { home, .. }
+                    | IntegrationAction::Doctor { home, .. }
+                    | IntegrationAction::Uninstall { home, .. } => {
+                        commands::integration::HomeSelectionArgs::from(home)
+                    }
+                    other @ IntegrationAction::Update { .. } => panic!("unexpected {other:?}"),
+                },
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(
+                selected(profile),
+                commands::integration::HomeSelectionArgs {
+                    profile: Some("work".to_owned()),
+                    all_profiles: false,
+                },
+                "{action}"
+            );
+            assert_eq!(
+                selected(all),
+                commands::integration::HomeSelectionArgs {
+                    profile: None,
+                    all_profiles: true,
+                },
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn integration_home_selectors_are_exclusive_and_absent_by_default() {
+        let error = Cli::try_parse_from([
+            "pohunek",
+            "integration",
+            "install",
+            "--profile",
+            "work",
+            "--all-profiles",
+        ])
+        .expect_err("a profile and every profile cannot be combined");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(
+            Cli::try_parse_from([
+                "pohunek",
+                "integration",
+                "update",
+                "--agent",
+                "hermes",
+                "--profile",
+                "x"
+            ])
+            .is_err(),
+            "update has no home selector"
+        );
+        let cli = Cli::try_parse_from(["pohunek", "integration", "install"])
+            .expect("parse a bare install");
+        match cli.command {
+            Commands::Integration {
+                action: IntegrationAction::Install { home, .. },
+            } => assert!(!commands::integration::HomeSelectionArgs::from(home).is_selected()),
             other => panic!("unexpected command: {other:?}"),
         }
     }

@@ -38,3 +38,9 @@ strategy = "hook"
 [integration]
 handler = "claude-hook-v1"
 hook_schema = "identity-subagent-v1"
+
+# Where Claude keeps its settings and hook registration: the variable it reads
+# to relocate its home, else this directory below the user's home.
+[config_home]
+env = "CLAUDE_CONFIG_DIR"
+default = ".claude"

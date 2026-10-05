@@ -964,6 +964,99 @@ fn installing_a_package_with_an_unknown_or_mismatched_schema_is_refused() {
     assert!(install_rejection(&descriptor("acme.agent", "1.0.0", "acme")).is_none());
 }
 
+/// The fixture descriptor of runtime `acme` with a `[config_home]` table.
+fn config_home_descriptor(config_home: &str) -> String {
+    format!(
+        "{}\n[config_home]\n{config_home}\n",
+        descriptor("acme.agent", "1.0.0", "acme")
+    )
+}
+
+#[test]
+fn a_package_declares_its_config_home_and_the_registry_serves_it() {
+    let plugins = Plugins::new();
+    let built = build(
+        &config_home_descriptor("env = \"ACME_HOME\"\ndefault = \".config/acme\""),
+        "x",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &built, true, true);
+
+    let definition = plugins
+        .host()
+        .resolve_id(&runtime("acme"))
+        .expect("the package runtime is served");
+
+    let declared = definition.config_home().expect("a declared config home");
+    assert_eq!(declared.env(), "ACME_HOME");
+    assert_eq!(declared.default_relative(), ".config/acme");
+}
+
+#[test]
+fn a_package_without_a_config_home_declares_none() {
+    let plugins = Plugins::new();
+    let built = build(
+        &descriptor("acme.agent", "1.0.0", "acme"),
+        "x",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &built, true, true);
+
+    let definition = plugins
+        .host()
+        .resolve_id(&runtime("acme"))
+        .expect("the package runtime is served");
+
+    assert!(definition.config_home().is_none());
+}
+
+#[test]
+fn installing_a_package_with_an_unsafe_config_home_is_refused() {
+    for (config_home, field) in [
+        (
+            "env = \"acme_home\"\ndefault = \".acme\"",
+            "config_home.env",
+        ),
+        (
+            "env = \"POHUNEK_HOME\"\ndefault = \".acme\"",
+            "config_home.env",
+        ),
+        (
+            "env = \"ACME_HOME\"\ndefault = \"/etc/acme\"",
+            "config_home.default",
+        ),
+        (
+            "env = \"ACME_HOME\"\ndefault = \"../acme\"",
+            "config_home.default",
+        ),
+        (
+            "env = \"ACME_HOME\"\ndefault = \"~/acme\"",
+            "config_home.default",
+        ),
+    ] {
+        match install_rejection(&config_home_descriptor(config_home)) {
+            Some(PackageRejection::Descriptor(super::DefinitionError::Field {
+                field: refused,
+                ..
+            })) => assert_eq!(refused, field, "{config_home}"),
+            other => panic!("expected a refused descriptor for {config_home}, got {other:?}"),
+        }
+    }
+    for config_home in [
+        "env = \"ACME_HOME\"",
+        "default = \".acme\"",
+        "env = \"ACME_HOME\"\ndefault = \".acme\"\nextra = 1",
+    ] {
+        assert!(
+            matches!(
+                install_rejection(&config_home_descriptor(config_home)),
+                Some(PackageRejection::Descriptor(_))
+            ),
+            "{config_home}"
+        );
+    }
+}
+
 /// A descriptor in the format before `[integration] hook_schema` existed.
 fn pre_schema_descriptor(handler: Option<&str>) -> String {
     let base = descriptor("acme.agent", "1.0.0", "acme");

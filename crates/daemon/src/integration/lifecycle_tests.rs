@@ -603,6 +603,7 @@ fn an_unresolvable_config_root_is_a_failure_not_an_absent_agent() {
         || {
             super::status(IntegrationStatusParams {
                 agent: Some(RuntimeRef::claude()),
+                ..Default::default()
             })
         },
     )
@@ -852,7 +853,10 @@ fn provider_secrets_never_reach_install_status_or_error_output() {
     ];
     let (installed, statuses) = with_config_dirs_and(&claude, &codex, &provider_keys, || {
         let installed = super::install(None);
-        let statuses = super::status(IntegrationStatusParams { agent: None });
+        let statuses = super::status(IntegrationStatusParams {
+            agent: None,
+            ..Default::default()
+        });
         (installed, statuses)
     });
     outputs.push(format!("{:?}", installed.expect("install")));
