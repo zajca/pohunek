@@ -232,11 +232,32 @@ pub(crate) struct TranscriptIndex {
     /// resulting candidate, so an unchanged file under an unchanged owner is
     /// not parsed again by a scan.
     parsed: Arc<Mutex<HashMap<PathBuf, ParsedEntry>>>,
-    /// The roots of the last scan: a candidate is only offered while the root
-    /// that indexed it is one of them.
-    roots: Arc<Mutex<Vec<TranscriptRoot>>>,
+    /// The roots of the last scan, published before the scan prunes: a
+    /// candidate is only offered while this snapshot assigns its path to the
+    /// root that indexed it.
+    roots: Arc<Mutex<Arc<RootSnapshot>>>,
     #[cfg(test)]
     parses: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One generation of the configured roots and their canonical directories.
+#[derive(Debug, Default)]
+struct RootSnapshot {
+    roots: Vec<TranscriptRoot>,
+    canonical: Vec<PathBuf>,
+}
+
+impl RootSnapshot {
+    fn new(roots: Vec<TranscriptRoot>) -> Self {
+        let canonical = canonical_roots(&roots);
+        Self { roots, canonical }
+    }
+
+    /// Whether this generation assigns `path` to `owner`, the root that
+    /// indexed it: same root, runtime and privacy.
+    fn assigns(&self, path: &Path, owner: &TranscriptRoot) -> bool {
+        owning_root(&self.roots, &self.canonical, path) == Some(owner)
+    }
 }
 
 /// What a scan remembers of a parsed transcript.
@@ -463,11 +484,8 @@ impl TranscriptIndex {
         let index = self.clone();
         let count = roots.len();
         match tokio::task::spawn_blocking(move || {
-            index
-                .roots
-                .lock()
-                .unwrap_or_else(MutexError::into_inner)
-                .clone_from(&roots);
+            *index.roots.lock().unwrap_or_else(MutexError::into_inner) =
+                Arc::new(RootSnapshot::new(roots.clone()));
             let scans = roots
                 .iter()
                 .map(|root| index.scan_root(root, &roots, SCAN_LIMITS, &cancel))
@@ -567,19 +585,21 @@ impl TranscriptIndex {
         cwd: &Path,
         fact: &ProcessFact,
     ) -> Option<TranscriptCandidate> {
-        // One snapshot of the roots serves both the selection and the
-        // classification: a candidate whose indexing root is gone is ignored,
-        // and the privacy of the one chosen is the one it was indexed with.
-        let roots = self.roots.lock().unwrap_or_else(MutexError::into_inner);
+        // One generation of the roots serves the selection and the
+        // classification. A candidate counts only while that generation still
+        // assigns its path to the root that indexed it, so a scan that has
+        // published new roots but not yet pruned or reparsed never offers an
+        // old attribution or a path that is private now.
+        let roots = Arc::clone(&self.roots.lock().unwrap_or_else(MutexError::into_inner));
         self.inner
             .lock()
             .unwrap_or_else(MutexError::into_inner)
-            .values()
-            .filter(|candidate| &candidate.agent_base == agent_base)
-            .filter(|candidate| roots.contains(&candidate.owner))
-            .filter(|candidate| transcript_matches_process(candidate, cwd, fact))
-            .max_by_key(|candidate| candidate.updated_at)
-            .cloned()
+            .iter()
+            .filter(|(_path, candidate)| &candidate.agent_base == agent_base)
+            .filter(|(_path, candidate)| transcript_matches_process(candidate, cwd, fact))
+            .filter(|(path, candidate)| roots.assigns(path, &candidate.owner))
+            .max_by_key(|(_path, candidate)| candidate.updated_at)
+            .map(|(_path, candidate)| candidate.clone())
     }
 
     /// Scans one root and, when the pass covered it completely, drops the entries
@@ -1003,7 +1023,11 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
         };
         let path = home.dir.join(subdir);
         let private = launch.profile.is_some();
-        if private && !path.is_dir() {
+        // Only a tree that is genuinely absent is skipped. A tree that cannot
+        // be inspected (permissions, I/O, a symlink loop) stays a root, so its
+        // candidates stay indexed and the scan and the watcher report it as
+        // degraded instead of the profile silently dropping out.
+        if private && transcript_tree_is_absent(&path) {
             skipped.insert(SkippedHome {
                 profile: launch.profile,
                 code: None,
@@ -1020,6 +1044,15 @@ fn observed_roots(homes: Vec<LaunchHome>) -> (Vec<TranscriptRoot>, BTreeSet<Skip
         }
     }
     (roots, skipped)
+}
+
+/// Whether `path` is known not to be a directory: missing, or something else.
+/// An error that says nothing about existence is not absence.
+fn transcript_tree_is_absent(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => !metadata.is_dir(),
+        Err(error) => is_absent_error(&error),
+    }
 }
 
 /// Where the provider gets the config homes of the current pass.

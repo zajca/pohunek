@@ -704,7 +704,8 @@ resolved as a launch resolves it (see "Config home"). The set is re-read on ever
 reconciliation pass, so a profile added, edited or removed is followed without a
 daemon restart, and homes that resolve to one canonical directory are watched
 once. A profile whose home does not resolve or has no transcript tree yet is
-skipped and logged once at `debug`; a transcript below a root that left the set
+skipped and logged once at `debug`; a tree that cannot be inspected (permissions,
+I/O error) stays a root, keeps its indexed transcripts and degrades the watcher; a transcript below a root that left the set
 leaves the index. An observed external session is still matched to a candidate by
 agent base alone, never attributed to a profile. The directory of a profile-derived
 home is private: an external session matched to a transcript below one omits

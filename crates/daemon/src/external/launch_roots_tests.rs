@@ -587,13 +587,16 @@ async fn a_candidate_whose_root_left_is_never_offered_while_the_scan_is_paused()
     assert_eq!(before.publishable_path(), None);
 
     // The scan has replaced its roots and has not pruned yet.
-    *index.roots.lock().expect("roots") = Vec::new();
+    *index.roots.lock().expect("roots") = Arc::new(super::RootSnapshot::new(Vec::new()));
     assert!(offered(&index).is_none(), "no current owner, no candidate");
 
     // The same directory is now a public root: the candidate was indexed as
     // private and is not offered as public.
-    *index.roots.lock().expect("roots") =
-        vec![plain_root(&RuntimeRef::claude(), &private_root, false)];
+    *index.roots.lock().expect("roots") = Arc::new(super::RootSnapshot::new(vec![plain_root(
+        &RuntimeRef::claude(),
+        &private_root,
+        false,
+    )]));
     assert!(
         offered(&index).is_none(),
         "the provenance no longer matches"
@@ -637,4 +640,75 @@ async fn a_nested_root_added_or_removed_reassigns_unchanged_transcripts() {
         .scan_roots(claude_only, CancellationToken::new())
         .await;
     assert_eq!(owner_of(&index), (true, None));
+}
+
+#[tokio::test]
+async fn a_nested_private_root_published_before_the_prune_hides_the_old_attribution() {
+    use tokio_util::sync::CancellationToken;
+
+    let base = scoped_dir("pohunek-roots-nested-pause");
+    let outer = base.join("a").join("projects");
+    let inner = outer.join("zq-private-nested-4be1");
+    write_transcript(&inner.join("p/x.jsonl"), "native");
+    let index = super::TranscriptIndex::default();
+    let outer_only = vec![plain_root(&RuntimeRef::claude(), &outer, false)];
+    index.scan_roots(outer_only, CancellationToken::new()).await;
+    let public = index
+        .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+        .expect("indexed under the outer root");
+    assert!(public.publishable_path().is_some());
+
+    // The scan has published a nested private root and has not scanned yet.
+    *index.roots.lock().expect("roots") = Arc::new(super::RootSnapshot::new(vec![
+        plain_root(&RuntimeRef::claude(), &outer, false),
+        plain_root(&RuntimeRef::claude(), &inner, true),
+    ]));
+
+    assert!(
+        index
+            .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+            .is_none(),
+        "the old public attribution is not offered"
+    );
+}
+
+#[tokio::test]
+async fn an_inspection_error_keeps_a_profile_root_and_its_candidates() {
+    use tokio_util::sync::CancellationToken;
+
+    use super::watch::RootScan;
+
+    let rig = Rig::new();
+    let home = rig.root.join("loop-home");
+    fs::create_dir_all(&home).expect("home");
+    let tree = home.join("projects");
+    write_transcript(&tree.join("p/s.jsonl"), "native");
+    rig.claude_profile("looped", &home);
+    let index = super::TranscriptIndex::default();
+    index
+        .scan_roots(rig.roots(), CancellationToken::new())
+        .await;
+    assert!(index
+        .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+        .is_some());
+
+    // The tree can no longer be inspected: a symlink loop answers ELOOP, not
+    // NotFound.
+    fs::remove_dir_all(&tree).expect("remove the tree");
+    symlink("projects", &tree).expect("loop");
+    let roots = rig.roots();
+    assert!(
+        roots.iter().any(|root| root.path == tree),
+        "an uninspectable tree stays a root"
+    );
+    assert!(rig.skipped().is_empty());
+
+    let scans = index.scan_roots(roots, CancellationToken::new()).await;
+    assert!(scans.contains(&RootScan::Incomplete), "{scans:?}");
+    assert!(
+        index
+            .best_match(&RuntimeRef::claude(), Path::new("/work"), &fact())
+            .is_some(),
+        "the candidates survive an uninspectable pass"
+    );
 }
