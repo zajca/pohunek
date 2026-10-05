@@ -10,7 +10,10 @@ use pohunek_platform::{
     process::{BootIdentity, StartIdentity},
     supervisor::WorkerKey,
 };
-use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
+use pohunek_worker_protocol::{
+    AncestryMatcher, ControlCode, InspectSnapshot, PtyRelation, ReleasedIdentityClaim,
+    RuntimePhase, SubagentField,
+};
 use protocol::{
     AgentActivity, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
     RuntimeRef, SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision,
@@ -3420,8 +3423,10 @@ fn import_worker_subagents(snapshot: &InspectSnapshot) -> Result<Vec<SubagentInf
     )
 }
 
-/// Maps journaled subagents to public state, admitting only the providers the
-/// session's hook schema lets report subagents.
+/// Maps journaled subagents to public state, admitting only the providers,
+/// claim fields and outcomes the session's hook schema lets report subagents.
+///
+/// A schema that declares no subagent sequence rule admits no subagent record.
 fn map_worker_subagents(
     subagents: &[pohunek_worker_protocol::SubagentSnapshot],
     schema: Option<&pohunek_worker_protocol::HookSchema>,
@@ -3429,8 +3434,23 @@ fn map_worker_subagents(
     let mut mapped = subagents
         .iter()
         .map(|subagent| {
-            if !schema.is_some_and(|schema| schema.admits_subagent_provider(&subagent.provider)) {
-                return Err("subagent_provider_invalid");
+            let schema = schema
+                .filter(|schema| schema.admits_subagent_provider(&subagent.provider))
+                .ok_or("subagent_provider_invalid")?;
+            if !schema.admits_subagents() {
+                return Err("subagent_sequence_rule_missing");
+            }
+            if (subagent.parent_id.is_some()
+                && !schema.admits_subagent_field(SubagentField::ParentId))
+                || (subagent.agent_type.is_some()
+                    && !schema.admits_subagent_field(SubagentField::AgentType))
+                || (matches!(
+                    subagent.phase,
+                    pohunek_worker_protocol::SubagentPhase::Failed
+                        | pohunek_worker_protocol::SubagentPhase::Cancelled
+                ) && !schema.admits_subagent_field(SubagentField::Outcome))
+            {
+                return Err("subagent_field_invalid");
             }
             let provider = RuntimeRef::from_wire(&subagent.provider);
             let lifecycle = match subagent.phase {
@@ -3721,23 +3741,33 @@ fn validate_worker_identity_process_facts(
     if current_root.pid != root.pid || current_root.start_identity.get() != root.start_identity {
         return Err("identity_process_root_reused");
     }
-    let matches = |process: &pohunek_worker_protocol::ProcessIdentity| {
-        (process.pid == root.pid && process.start_identity == root.start_identity)
-            || descendants.iter().any(|fact| {
-                fact.pid == process.pid && fact.start_identity.get() == process.start_identity
-            })
+    let relation = |process: &pohunek_worker_protocol::ProcessIdentity| {
+        PtyRelation::from_in_tree(
+            (process.pid == root.pid && process.start_identity == root.start_identity)
+                || descendants.iter().any(|fact| {
+                    fact.pid == process.pid && fact.start_identity.get() == process.start_identity
+                }),
+        )
     };
+    // The launch identity is core-owned and always held to the core matcher.
+    // An active identity is held to its schema's matcher; a snapshot whose
+    // schema is absent or unknown is refused when its identities are applied,
+    // so the core matcher is the strictest one available here.
+    let active_matcher = reported_hook_schema(snapshot.hook_schema.as_deref())
+        .ok()
+        .flatten()
+        .map_or(AncestryMatcher::CORE, |schema| schema.ancestry);
     if snapshot
         .launch_identity
         .as_ref()
-        .is_some_and(|identity| !matches(&identity.process))
+        .is_some_and(|identity| !AncestryMatcher::CORE.admits(relation(&identity.process)))
     {
         return Err("launch_identity_process_invalid");
     }
     if snapshot
         .active_identity
         .as_ref()
-        .is_some_and(|identity| !matches(&identity.process))
+        .is_some_and(|identity| !active_matcher.admits(relation(&identity.process)))
     {
         return Err("active_identity_process_invalid");
     }
@@ -3786,6 +3816,23 @@ fn apply_worker_identities(
     record: &mut SessionRecord,
     snapshot: &pohunek_worker_protocol::InspectSnapshot,
 ) -> Result<WorkerIdentityProjection, &'static str> {
+    apply_worker_identities_with(
+        record,
+        snapshot,
+        reported_hook_schema(snapshot.hook_schema.as_deref()),
+    )
+}
+
+/// Projects the identities of `snapshot` under `schema`, the outcome of
+/// resolving the snapshot's hook schema id.
+///
+/// An unresolvable schema is an error only when the snapshot reports an
+/// active identity or a release that needs one.
+fn apply_worker_identities_with(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+    schema: Result<Option<&'static pohunek_worker_protocol::HookSchema>, &'static str>,
+) -> Result<WorkerIdentityProjection, &'static str> {
     if snapshot.active_identity.is_some() && snapshot.active_identity_release.is_some() {
         return Err("active_identity_state_ambiguous");
     }
@@ -3795,7 +3842,7 @@ fn apply_worker_identities(
         let Some(release) = snapshot.active_identity_release.clone() else {
             return Ok(WorkerIdentityProjection::unreported());
         };
-        let schema = reported_hook_schema(snapshot.hook_schema.as_deref())?;
+        let schema = schema?;
         let launch_runtime = super::agent_kind_label(&record.info.agent_base);
         if !schema.is_some_and(|schema| {
             schema.allows(pohunek_worker_protocol::HookAction::IdentityRelease)
@@ -3817,7 +3864,7 @@ fn apply_worker_identities(
     if !identity_claim_expiry_is_valid(&identity.expires_at) {
         return Err("active_identity_expired_or_overlong");
     }
-    let schema = reported_hook_schema(snapshot.hook_schema.as_deref())?
+    let schema = schema?
         .filter(|schema| schema.allows(pohunek_worker_protocol::HookAction::IdentityReport))
         .filter(|schema| {
             schema.admits_identity_provider(
@@ -4663,13 +4710,14 @@ mod tests {
         RuntimeOutcome as JournalRuntimeOutcome, RuntimePhase as JournalRuntimePhase, Server,
         ServerArgs, WorkerConfig,
     };
+    use pohunek_worker_protocol::AncestryMatcher;
     use pohunek_worker_protocol::{
         ActiveIdentityClaim, ControlCode, ControlError, ControlMessage, ControlReader,
         ControlResponse, ControlWriter, Dimensions, Initialize, InitializeLimits, InspectSnapshot,
         LaunchIdentity, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
         ResponseKind, RuntimePhase as WorkerRuntimePhase, SecretEnv, SessionId as WorkerSessionId,
-        StopPolicy, SubagentPhase, SubagentSnapshot, TransactionId, Version, WorkerId,
-        WorkerInstanceId,
+        StopPolicy, SubagentField, SubagentPhase, SubagentSnapshot, TransactionId, Version,
+        WorkerId, WorkerInstanceId,
     };
     use protocol::{
         AgentActivity, CwdSource, ForkCwdMode, ProcessStartIdentity, ReportSequence,
@@ -4685,8 +4733,9 @@ mod tests {
     use tokio::net::UnixStream;
 
     use super::{
-        import_legacy_manifest, import_worker_identities, import_worker_subagents,
-        merge_persisted_recovery, validate_worker_identity_process_facts, SessionRegistry,
+        apply_worker_identities_with, import_legacy_manifest, import_worker_identities,
+        import_worker_subagents, map_worker_subagents, merge_persisted_recovery,
+        validate_worker_identity_process_facts, SessionRegistry,
     };
     use crate::agent::{InputRules, NativeSessionLaunch, SessionRefKind};
     use crate::procwatch::readable_host::ReadableHost;
@@ -5313,6 +5362,52 @@ while os.getppid() == parent:
         });
         validate_worker_identity_process_facts(&released, &root, &[])
             .expect("validated release remains history after its process exits");
+    }
+
+    #[test]
+    fn identities_outside_the_pty_tree_are_refused_under_every_schema_resolution() {
+        let root = crate::procwatch::ProcessFact {
+            pid: 50,
+            pgid: 50,
+            ppid: 1,
+            start_identity: crate::procwatch::StartIdentity::new(500),
+            comm: "codex".to_owned(),
+            cmdline: vec!["codex".to_owned()],
+        };
+        // The active identity (pid 60) is outside the tree: the root has no
+        // descendants. The launch identity is the root itself.
+        for schema in [
+            Some("identity-subagent-v1"),
+            Some("identity-v1"),
+            Some("identity-v9"),
+            None,
+        ] {
+            let mut snapshot = identity_snapshot("native-launch");
+            snapshot.hook_schema = schema.map(str::to_owned);
+            assert_eq!(
+                validate_worker_identity_process_facts(&snapshot, &root, &[])
+                    .expect_err("an active identity outside the PTY tree"),
+                "active_identity_process_invalid",
+                "{schema:?}"
+            );
+            let mut launch = identity_snapshot("native-launch");
+            launch.hook_schema = schema.map(str::to_owned);
+            launch.active_identity = None;
+            launch
+                .launch_identity
+                .as_mut()
+                .expect("launch identity")
+                .process = ProcessIdentity {
+                pid: 61,
+                start_identity: 610,
+            };
+            assert_eq!(
+                validate_worker_identity_process_facts(&launch, &root, &[])
+                    .expect_err("a launch identity outside the PTY tree"),
+                "launch_identity_process_invalid",
+                "{schema:?}"
+            );
+        }
     }
 
     #[test]
@@ -8231,6 +8326,201 @@ handler = "codex-hook-v1"
         assert!(import_worker_subagents(&snapshot)
             .expect("an empty collection needs no schema")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_journaled_hook_schema_wins_over_the_schema_of_the_pinned_runtime() {
+        let (registry, pin) = pre_schema_package_registry();
+        let mut record = identity_record();
+        record.info.agent = "acme".to_owned();
+        record.info.agent_base = RuntimeRef::from_wire("acme");
+        record
+            .recovery
+            .as_mut()
+            .expect("recovery binding")
+            .launch_binding = pin;
+        let mut snapshot = identity_snapshot("launch-native");
+        snapshot.launch_identity = None;
+        snapshot.subagents.push(SubagentSnapshot {
+            id: "child".to_owned(),
+            parent_id: None,
+            provider: "codex".to_owned(),
+            agent_type: None,
+            phase: SubagentPhase::Running,
+            revision: 1,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: None,
+        });
+
+        snapshot.hook_schema = None;
+        assert_eq!(
+            registry
+                .effective_hook_schema_id(&record, &snapshot)
+                .as_deref(),
+            Some("identity-subagent-v1"),
+            "the pin's schema applies to a worker that journaled none"
+        );
+
+        snapshot.hook_schema = Some("identity-v1".to_owned());
+        let effective = registry.effective_hook_schema_id(&record, &snapshot);
+        assert_eq!(
+            effective.as_deref(),
+            Some("identity-v1"),
+            "the schema the worker journaled outranks the pinned one"
+        );
+        let projected = InspectSnapshot {
+            hook_schema: effective,
+            ..snapshot
+        };
+        assert_eq!(
+            import_worker_subagents(&projected)
+                .expect_err("the journaled identity schema has no subagent surface"),
+            "subagent_provider_invalid"
+        );
+    }
+
+    #[test]
+    fn subagent_claim_fields_and_outcomes_follow_the_snapshot_hook_schema() {
+        use pohunek_worker_protocol::{HookSchema, SubagentSequence};
+
+        static BASE: HookSchema = HookSchema {
+            id: "fields-test",
+            handlers: &[],
+            identity_providers: &[],
+            subagent_providers: &["codex"],
+            actions: &[
+                pohunek_worker_protocol::HookAction::SubagentStart,
+                pohunek_worker_protocol::HookAction::SubagentStop,
+            ],
+            reference_kinds: &[],
+            ancestry: AncestryMatcher::ManagedPtyDescendant,
+            nested_active: true,
+            subagent_fields: &[],
+            subagent_sequence: Some(SubagentSequence::StopAfterStart),
+        };
+        static WITH_FIELDS: HookSchema = HookSchema {
+            subagent_fields: &[SubagentField::ParentId, SubagentField::AgentType],
+            ..BASE
+        };
+        static WITH_OUTCOME: HookSchema = HookSchema {
+            subagent_fields: &[SubagentField::Outcome],
+            ..BASE
+        };
+        static UNORDERED: HookSchema = HookSchema {
+            subagent_sequence: None,
+            subagent_fields: &[
+                SubagentField::ParentId,
+                SubagentField::AgentType,
+                SubagentField::Outcome,
+            ],
+            ..BASE
+        };
+        let subagent = |parent: Option<&str>, kind: Option<&str>, phase: SubagentPhase| {
+            vec![SubagentSnapshot {
+                id: "child".to_owned(),
+                parent_id: parent.map(str::to_owned),
+                provider: "codex".to_owned(),
+                agent_type: kind.map(str::to_owned),
+                phase,
+                revision: 1,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                finished_at_ms: None,
+            }]
+        };
+        let plain = subagent(None, None, SubagentPhase::Completed);
+        let parented = subagent(Some("parent"), None, SubagentPhase::Running);
+        let typed = subagent(None, Some("Explore"), SubagentPhase::Running);
+        let failed = subagent(None, None, SubagentPhase::Failed);
+        let cancelled = subagent(None, None, SubagentPhase::Cancelled);
+        let lost = subagent(None, None, SubagentPhase::Lost);
+
+        for (claims, schema, expected) in [
+            (&plain, &BASE, Ok(())),
+            (&lost, &BASE, Ok(())),
+            (&parented, &BASE, Err("subagent_field_invalid")),
+            (&typed, &BASE, Err("subagent_field_invalid")),
+            (&failed, &BASE, Err("subagent_field_invalid")),
+            (&cancelled, &BASE, Err("subagent_field_invalid")),
+            (&parented, &WITH_FIELDS, Ok(())),
+            (&typed, &WITH_FIELDS, Ok(())),
+            (&failed, &WITH_FIELDS, Err("subagent_field_invalid")),
+            (&failed, &WITH_OUTCOME, Ok(())),
+            (&cancelled, &WITH_OUTCOME, Ok(())),
+            (&parented, &WITH_OUTCOME, Err("subagent_field_invalid")),
+            (&plain, &UNORDERED, Err("subagent_sequence_rule_missing")),
+            (&parented, &UNORDERED, Err("subagent_sequence_rule_missing")),
+        ] {
+            assert_eq!(
+                map_worker_subagents(claims, Some(schema)).map(|_mapped| ()),
+                expected,
+                "{} {claims:?}",
+                schema.id
+            );
+        }
+        let shipped = pohunek_worker_protocol::hook_schema("identity-subagent-v1");
+        for claims in [&plain, &parented, &typed, &failed, &cancelled, &lost] {
+            map_worker_subagents(claims, shipped).expect("the shipped schema admits every field");
+        }
+    }
+
+    #[test]
+    fn a_schema_without_nested_active_pins_snapshot_identities_to_the_launch_runtime() {
+        use pohunek_worker_protocol::{HookAction, HookSchema};
+
+        static PINNED: HookSchema = HookSchema {
+            id: "pinned-test",
+            handlers: &[],
+            identity_providers: &["codex", "claude"],
+            subagent_providers: &[],
+            actions: &[HookAction::IdentityReport, HookAction::IdentityRelease],
+            reference_kinds: &[
+                pohunek_worker_protocol::ReferenceKind::Id,
+                pohunek_worker_protocol::ReferenceKind::Path,
+            ],
+            ancestry: AncestryMatcher::ManagedPtyDescendant,
+            nested_active: false,
+            subagent_fields: &[],
+            subagent_sequence: None,
+        };
+        static NESTED: HookSchema = HookSchema {
+            nested_active: true,
+            ..PINNED
+        };
+
+        // The record launched as codex; the snapshot's active identity is claude.
+        let snapshot = identity_snapshot("launch-native");
+        assert_eq!(
+            apply_worker_identities_with(&mut identity_record(), &snapshot, Ok(Some(&PINNED)))
+                .expect_err("a nested provider is not the launch runtime"),
+            "active_identity_provider_invalid"
+        );
+        apply_worker_identities_with(&mut identity_record(), &snapshot, Ok(Some(&NESTED)))
+            .expect("the same claim is admitted when the schema enables nesting");
+
+        let mut own = identity_snapshot("launch-native");
+        own.active_identity
+            .as_mut()
+            .expect("active identity")
+            .provider = "codex".to_owned();
+        apply_worker_identities_with(&mut identity_record(), &own, Ok(Some(&PINNED)))
+            .expect("the launch runtime itself is always admitted");
+
+        let mut release = identity_snapshot("launch-native");
+        let active = release.active_identity.take().expect("active identity");
+        release.active_identity_release = Some(ReleasedIdentityClaim {
+            provider: active.provider,
+            process: active.process,
+            sequence: active.sequence + 1,
+        });
+        assert_eq!(
+            apply_worker_identities_with(&mut identity_record(), &release, Ok(Some(&PINNED)))
+                .expect_err("a nested provider cannot release"),
+            "active_identity_release_provider_invalid"
+        );
+        apply_worker_identities_with(&mut identity_record(), &release, Ok(Some(&NESTED)))
+            .expect("nesting admits the release");
     }
 
     /// A minimal legacy-manifest session snapshot, as `pohunek migration

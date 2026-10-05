@@ -26,12 +26,12 @@ use protocol::{
     ControlError, ControlEvent, ControlMessage, ControlReader, ControlRequest, ControlResponse,
     ControlWriter, Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus,
     FrameError, FrameHeader, FrameKind, HookAction, HookSchema, Initialize, InspectSnapshot,
-    LeaseChallenge, LeaseId, OutputGap, ProcessIdentity as WireProcessIdentity,
+    LeaseChallenge, LeaseId, OutputGap, ProcessIdentity as WireProcessIdentity, PtyRelation,
     ReleasedIdentityClaim, ReportedLaunchIdentity, RequestKind, ResponseKind,
     RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode, SubagentField,
-    SubagentPhase as WireSubagentPhase, SubagentSnapshot, TerminalSnapshot as WireTerminalSnapshot,
-    TransactionId, Version, WorkerId, WorkerInstanceId, WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION,
-    SUPPORTED_RANGE,
+    SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
+    TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
+    WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -3297,7 +3297,9 @@ where
             )
             .or_else(|| {
                 let fields_admitted = admitted.is_ok_and(|schema| {
-                    (parent_id.is_none() || schema.admits_subagent_field(SubagentField::ParentId))
+                    schema.admits_subagents()
+                        && (parent_id.is_none()
+                            || schema.admits_subagent_field(SubagentField::ParentId))
                         && (agent_type.is_none()
                             || schema.admits_subagent_field(SubagentField::AgentType))
                 });
@@ -3373,9 +3375,11 @@ where
                 state.phase == WireRuntimePhase::Running,
             )
             .or_else(|| {
-                let outcome_admitted = outcome.is_none()
-                    || admitted
-                        .is_ok_and(|schema| schema.admits_subagent_field(SubagentField::Outcome));
+                let outcome_admitted = admitted.is_ok_and(|schema| {
+                    schema.admits_subagents()
+                        && (outcome.is_none()
+                            || schema.admits_subagent_field(SubagentField::Outcome))
+                });
                 let text_valid = outcome_admitted
                     && valid_subagent_text(&subagent_id, MAX_SUBAGENT_ID_BYTES)
                     && outcome.is_none_or(|phase| phase != JournalSubagentPhase::Running);
@@ -3402,14 +3406,19 @@ where
                 (false, false, current_runtime, false)
             } else {
                 let mut journal = state.journal.clone();
-                let accepted = stop_subagent(
-                    &mut journal,
-                    &provider,
-                    &subagent_id,
-                    outcome.unwrap_or(JournalSubagentPhase::Completed),
-                    sequence,
-                    occurred_at_ms,
-                );
+                let accepted = admitted.is_ok_and(|schema| {
+                    schema.subagent_sequence.is_some_and(|rule| {
+                        stop_subagent(
+                            &mut journal,
+                            rule,
+                            &provider,
+                            &subagent_id,
+                            outcome.unwrap_or(JournalSubagentPhase::Completed),
+                            sequence,
+                            occurred_at_ms,
+                        )
+                    })
+                });
                 if accepted {
                     journal.updated_at = timestamp();
                     persist(shared.journal.clone(), journal.clone()).await?;
@@ -3691,8 +3700,10 @@ fn start_subagent(
     true
 }
 
+/// Records a subagent stop when `rule` orders it after the recorded claim.
 fn stop_subagent(
     journal: &mut JournalRecord,
+    rule: SubagentSequence,
     provider: &str,
     id: &str,
     phase: JournalSubagentPhase,
@@ -3705,7 +3716,7 @@ fn stop_subagent(
         .position(|item| item.provider == provider && item.id == id);
     if existing_index.is_some_and(|index| {
         journal.subagents[index].phase != JournalSubagentPhase::Running
-            || sequence <= journal.subagents[index].sequence
+            || !rule.admits_stop(Some(journal.subagents[index].sequence), sequence)
     }) {
         return false;
     }
@@ -3808,9 +3819,7 @@ fn validate_hook_process(
     root_pid: u32,
 ) -> Result<(), WorkerError> {
     let related = process_start(pid)? == start_identity
-        && match ancestry {
-            AncestryMatcher::ManagedPtyDescendant => is_descendant(pid, root_pid)?,
-        };
+        && ancestry.admits(PtyRelation::from_in_tree(is_descendant(pid, root_pid)?));
     if !related {
         return Err(WorkerError::Protocol(
             "identity hook process is outside the managed PTY tree".to_owned(),
@@ -5075,6 +5084,7 @@ mod tests {
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
             nested_active: true,
             subagent_fields: &[protocol::SubagentField::ParentId],
+            subagent_sequence: Some(protocol::SubagentSequence::StopAfterStart),
         };
         let (server, pty, _directory) = launch_claim_fixture().await;
         server.shared.state.lock().await.hook_schema = Some(&NO_TYPE);
@@ -5088,6 +5098,63 @@ mod tests {
             !send_hook(&server, &pty, stop).await,
             "stop is not an admitted action"
         );
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_schema_without_a_sequence_rule_admits_no_subagent_claim() {
+        static UNORDERED: protocol::HookSchema = protocol::HookSchema {
+            id: "unordered-test",
+            handlers: &[],
+            identity_providers: &["claude"],
+            subagent_providers: &["codex"],
+            actions: &[HookAction::SubagentStart, HookAction::SubagentStop],
+            reference_kinds: &[],
+            ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
+            nested_active: true,
+            subagent_fields: &[protocol::SubagentField::Outcome],
+            subagent_sequence: None,
+        };
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema = Some(&UNORDERED);
+        assert!(!send_hook(&server, &pty, subagent_start_claim(1, None)).await);
+        let stop = serde_json::json!({
+            "type": "subagent_stop", "provider": "codex", "sequence": 2,
+            "subagent_id": "child-1", "outcome": "completed",
+        });
+        assert!(!send_hook(&server, &pty, stop).await);
+        assert!(server
+            .shared
+            .state
+            .lock()
+            .await
+            .journal
+            .subagents
+            .is_empty());
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_subagent_stop_is_ordered_by_the_declared_sequence_rule() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema =
+            protocol::hook_schema("identity-subagent-v1");
+        let stop = |sequence: u64| {
+            serde_json::json!({
+                "type": "subagent_stop", "provider": "codex", "sequence": sequence,
+                "subagent_id": "child-5", "outcome": "completed",
+            })
+        };
+        assert!(send_hook(&server, &pty, subagent_start_claim(5, None)).await);
+        assert!(
+            !send_hook(&server, &pty, stop(5)).await,
+            "a stop that is not after its start is refused"
+        );
+        assert!(send_hook(&server, &pty, stop(6)).await);
         pty.stop("test-cleanup", server.shared.config.stop_grace)
             .await
             .unwrap();
@@ -5370,6 +5437,7 @@ mod tests {
             ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
             nested_active: false,
             subagent_fields: &[],
+            subagent_sequence: None,
         };
         admit_hook(
             Some(&PINNED),
@@ -5462,6 +5530,7 @@ mod tests {
         ));
         assert!(!stop_subagent(
             &mut journal,
+            protocol::SubagentSequence::StopAfterStart,
             "claude",
             "child-a",
             SubagentPhase::Completed,
@@ -5479,6 +5548,7 @@ mod tests {
         ));
         assert!(stop_subagent(
             &mut journal,
+            protocol::SubagentSequence::StopAfterStart,
             "claude",
             "child-a",
             SubagentPhase::Completed,
@@ -5495,6 +5565,7 @@ mod tests {
         let lost_revision = journal.subagents[1].revision;
         assert!(!stop_subagent(
             &mut journal,
+            protocol::SubagentSequence::StopAfterStart,
             "codex",
             "child-b",
             SubagentPhase::Completed,
@@ -5529,6 +5600,7 @@ mod tests {
 
         assert!(stop_subagent(
             &mut journal,
+            protocol::SubagentSequence::StopAfterStart,
             "codex",
             "child-a",
             SubagentPhase::Completed,

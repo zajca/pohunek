@@ -290,6 +290,152 @@ fn a_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active() {
     }
 }
 
+/// The operations of `actions` as sorted wire names, to compare as a set.
+fn action_names(actions: &[HookAction]) -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = actions.iter().map(|action| action.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+#[test]
+fn the_staged_registration_reports_exactly_the_declared_operations() {
+    for agent in agents() {
+        for configured in [false, true] {
+            let dir = scoped_dir("compat-derived");
+            if configured {
+                write_user_config(&agent, &dir);
+            }
+            let resolved = builtin(&agent);
+
+            let staged = resolved.handler.stage(&dir).expect("stage");
+
+            assert_eq!(
+                action_names(&staged.manifest().actions),
+                action_names(resolved.handler.reported_actions()),
+                "{agent:?} configured={configured}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_embedded_scripts_accept_only_arguments_the_registration_table_maps() {
+    use super::{
+        script_accepted_arguments, script_action, CLAUDE_HOOK_ASSET, CLAUDE_NOTIFY_HOOK_ASSET,
+        CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
+    };
+    let expected = [
+        (
+            CLAUDE_HOOK_ASSET,
+            vec!["release", "session", "subagent-start", "subagent-stop"],
+        ),
+        (
+            CODEX_HOOK_ASSET,
+            vec!["session", "subagent-start", "subagent-stop"],
+        ),
+        (
+            CLAUDE_NOTIFY_HOOK_ASSET,
+            vec!["notification", "stop", "stop_failure"],
+        ),
+        (CODEX_NOTIFY_HOOK_ASSET, vec!["permission_request", "stop"]),
+    ];
+    for (asset, arguments) in expected {
+        let mut accepted = script_accepted_arguments(asset).expect("a readable action table");
+        accepted.sort_unstable();
+        assert_eq!(accepted, arguments);
+        for argument in accepted {
+            assert!(script_action(argument).is_some(), "{argument}");
+        }
+    }
+}
+
+#[test]
+fn an_unreadable_action_table_is_not_an_empty_one() {
+    use super::script_accepted_arguments;
+    assert_eq!(script_accepted_arguments(""), None);
+    assert_eq!(script_accepted_arguments("action=$1\nexit 0\n"), None);
+    assert_eq!(
+        script_accepted_arguments("case \"$action\" in\n  *) exit 0 ;;\nesac\n"),
+        None
+    );
+    assert_eq!(
+        script_accepted_arguments("case \"$action\" in\n  a|b) ;;\n  *) exit 0 ;;\nesac\n"),
+        Some(vec!["a", "b"])
+    );
+}
+
+#[test]
+fn registered_actions_follow_the_registration_and_the_script_table() {
+    use super::{registered_actions, ManagedScript};
+    let path = Path::new("/cfg/state.sh");
+    let asset = "case \"$action\" in\n  session|release) ;;\n  *) exit 0 ;;\nesac\n";
+    let registration = |commands: &[&str]| {
+        serde_json::json!({
+            "hooks": {"Event": [{"hooks": commands
+                .iter()
+                .map(|command| serde_json::json!({"type": "command", "command": command}))
+                .collect::<Vec<_>>()}]}
+        })
+    };
+    let derive = |registration: &serde_json::Value, asset: &str| {
+        registered_actions(registration, &[ManagedScript { path, asset }])
+    };
+
+    assert_eq!(
+        derive(&registration(&["sh '/cfg/state.sh' session"]), asset).expect("derive"),
+        [HookAction::IdentityReport],
+        "an accepted argument that is not registered reports nothing"
+    );
+    assert_eq!(
+        derive(
+            &registration(&[
+                "sh '/cfg/state.sh' release",
+                "sh '/cfg/state.sh' session now"
+            ]),
+            asset
+        )
+        .expect("derive"),
+        [HookAction::IdentityRelease, HookAction::IdentityReport]
+    );
+    assert!(
+        derive(
+            &registration(&[
+                "sh '/cfg/state.sh' subagent-start",
+                "sh '/cfg/other.sh' session",
+                "echo sh '/cfg/state.sh' session",
+                "sh '/cfg/state.sh'",
+                "sh '/cfg/state.sh' bogus",
+            ]),
+            asset
+        )
+        .expect("derive")
+        .is_empty(),
+        "an argument the script ignores, another script, and a bare run report nothing"
+    );
+    let not_a_command = serde_json::json!({
+        "hooks": {"Event": [{"hooks": [{"type": "http", "command": "sh '/cfg/state.sh' session"}]}]}
+    });
+    assert!(derive(&not_a_command, asset).expect("derive").is_empty());
+    assert!(derive(&serde_json::json!({}), asset)
+        .expect("derive")
+        .is_empty());
+
+    let unmapped = "case \"$action\" in\n  bogus) ;;\nesac\n";
+    assert_eq!(
+        derive(&registration(&["sh '/cfg/state.sh' bogus"]), unmapped)
+            .expect_err("an accepted argument that maps to no operation")
+            .code,
+        "integration_asset_unreadable"
+    );
+    assert_eq!(
+        derive(&registration(&["sh '/cfg/state.sh' session"]), "exit 0\n")
+            .expect_err("a script without an action table")
+            .code,
+        "integration_asset_unreadable"
+    );
+}
+
 #[test]
 fn a_retained_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active() {
     let narrowed: &'static pohunek_worker_protocol::HookSchema =

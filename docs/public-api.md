@@ -756,17 +756,32 @@ Codex and Claude in the foreground, uses `identity-subagent-v1`.
 
 A schema declares the provider ids that may report, the admitted actions, the
 native-reference kinds (`id`, `path`), the process-ancestry matcher, whether a
-nested provider may become the active identity, and the optional subagent
-claim fields. Core keeps process ancestry, peer binding, sequence ordering,
+nested provider may become the active identity, the optional subagent claim
+fields (`parent_id`, `agent_type`, and the `outcome` of a stop), and the
+subagent sequence rule (a start is admitted once per subagent, a stop only
+when it is ordered after the recorded claim). A schema that admits subagent
+operations must declare the sequence rule; one without it admits no subagent
+record on either side. The worker applies the declared matcher, field set and
+sequence rule when a hook reports, and the daemon applies the matcher to the
+imported identities, the provider set, the field set and the outcomes (a
+failed or cancelled subagent needs the `outcome` field) to the imported
+subagents, and the nested-provider rule to identities and releases. The
+sequence order itself is checked by the worker only, because the inspect
+snapshot carries no claim sequence for subagents. Core keeps peer binding,
 expiry, and self-target validation for every schema; a schema only chooses
-which of them applies and with which finite enumeration. The daemon sends the
+which of the other rules applies and with which finite enumeration. The daemon
+sends the
 resolved schema id to the worker in `Initialize.hook_schema` (an additive
 optional field of the private worker protocol), the worker journals it as
 `hook_schema` and returns it in its inspect snapshot, and the daemon validates
-the imported identity, release, and subagent state with it. A worker that
-predates the field journals none; the daemon then validates its state with the
-schema its session's pinned runtime resolves to (for a package whose descriptor
-predates `hook_schema`, the schema its handler drives when exactly one does).
+the imported identity, release, and subagent state with it. A schema the
+worker journaled always outranks the one the session's pinned runtime resolves
+to. A worker that predates the field journals none; the daemon then validates
+its state with the schema its session's pinned runtime resolves to (for a
+package whose descriptor predates `hook_schema`, the schema its handler drives
+when exactly one does). A report from an asset set newer than a session's
+schema (a subagent hook reaching a session on `identity-v1`) is refused, and
+the reports of an older asset set stay admitted by a newer schema.
 
 The schema is also enforced on the public socket, the fallback the managed
 hooks use when the worker refuses a report. `session.report_agent`,
@@ -1680,7 +1695,9 @@ stages the new set against the active one without changing it, proves
 compatibility, activates atomically, and restores the exact prior tree when any
 step fails, so the active set stays in place until activation succeeds.
 Compatibility requires the runtime's hook schema to be driven by the handler and
-to admit every operation the new set reports, and every hook schema of the
+to admit every operation the new set reports, as derived from the staged
+registration (the commands that run the managed scripts, restricted to the
+arguments each embedded script accepts) and not from a declaration, and every hook schema of the
 package versions that live, lost or resumable sessions and host profile pins
 still reference for that handler to admit them too (an undeterminable retained
 version, whose handler is unknown, refuses an update of every handler's asset set); otherwise the update is refused

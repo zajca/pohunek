@@ -1,5 +1,15 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, hook schema gaps)
+
+- A hook schema now declares the subagent sequence rule next to the subagent
+  fields, and a schema without the rule admits no subagent record. The daemon
+  import applies the schema's ancestry matcher to identities and its field and
+  outcome set to subagents. The integration update check derives the operations
+  of the staged asset set from the staged registration and the embedded scripts'
+  action tables. The public API and the sessions and runtime packages guides
+  describe the rules.
+
 ## Unreleased (2026-10-05, compatibility-gated selection)
 
 - A package version whose integration (handler id and hook schema id, or none)
