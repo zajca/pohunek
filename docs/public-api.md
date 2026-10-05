@@ -1011,10 +1011,29 @@ declaration is rejected unless `args`, `min` and `below` are all present, `min`
 is below `below`, and each bound is exactly `MAJOR.MINOR.PATCH`. The
 `hermes-v1` parser takes none of these fields.
 
+`semver-line-v1` is the same data-driven parser for a runtime whose banner
+wraps the release in fixed text. It additionally requires `line`, a literal
+template `PREFIX{version}SUFFIX` with an optional trailing ` {annotation}`
+(`{version}` exactly once; 1 to 128 printable ASCII bytes; no other braces; no
+leading or trailing space; the prefix must not end in a digit or `.`, the
+suffix must not start with a digit, `.`, `-` or `+`; at least one literal
+character next to `{version}`). The official runtimes read as
+`codex-cli {version}` (`codex-cli 0.160.0`), `{version} (Claude Code)`
+(`2.1.289 (Claude Code)`) and `Hermes Agent v{version} {annotation}`
+(`Hermes Agent v0.20.0 (2026.8.3)`). The trimmed first output line (at most
+256 bytes) must match the whole template; later lines are ignored. The
+template is literal text, not a pattern, and is matched without backtracking.
+`line` is rejected unless the parser is `semver-line-v1` and is required by it;
+an invalid template is rejected when the package is validated, naming
+`runtime.version_probe.line`. Pre-release and build suffixes
+(`0.160.0-rc.1`) never match: a pre-release cannot be ordered against
+`[min, below)`, so such a runtime is unsupported.
+
 Before `session.new`, `session.resume` and `session.fork`, and for the `host.inspect` runtime inventory
 (`version`, `supported`), the daemon resolves the program once, runs it with the
 declared argv, and parses the trimmed first line of its standard output as one
-release (ASCII digits only, no leading zeros, no pre-release or build suffix).
+release (ASCII digits only, no leading zeros, no pre-release or build suffix;
+bare for `semver-v1`, inside the `line` template for `semver-line-v1`).
 Standard error is discarded. The probe runs with a cleared environment, a
 private `HOME`, XDG and temporary directories and a private working directory,
 a 2 second deadline and a 4 KiB output cap; only `PATH` is inherited from the

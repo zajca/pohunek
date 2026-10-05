@@ -41,7 +41,10 @@ pub use registry::{
 };
 pub use source::{LaunchSource, ProfileRevision};
 pub(crate) use source::{ProfileInputs, RevisionKeys};
-pub use version_probe::{ProbeVersion, VersionProbePolicy, MAX_PROBE_ARGS, SEMVER_PARSER_ID};
+pub use version_probe::{
+    LineTemplate, LineTemplateError, ProbeVersion, VersionProbePolicy, MAX_PROBE_ARGS,
+    SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
+};
 
 #[cfg(test)]
 mod package_tests;

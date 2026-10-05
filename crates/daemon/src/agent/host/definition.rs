@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::config_home::ConfigHome;
-use super::version_probe::{VersionProbePolicy, SEMVER_PARSER_ID};
+use super::version_probe::{VersionProbePolicy, SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID};
 use crate::agent::{
     AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
     NativeReferenceError, NativeReferenceStrategy, NativeSessionLaunch, ReferenceExistence,
@@ -679,23 +679,39 @@ fn validate_integration(
     Ok(())
 }
 
-/// A parser that takes a supported-version policy requires one, and every
-/// other parser must not carry one.
+/// A parser that takes a supported-version policy requires one whose output
+/// grammar it reads, and every other parser must not carry one.
 fn validate_version_probe(
     parser: Option<&HandlerId>,
     policy: Option<&VersionProbePolicy>,
 ) -> Result<(), DefinitionError> {
-    let data_driven = parser.is_some_and(|parser| parser.as_str() == SEMVER_PARSER_ID);
-    match (data_driven, policy.is_some()) {
-        (true, false) => Err(DefinitionError::Field {
+    let parser = parser.map(HandlerId::as_str);
+    let data_driven = matches!(parser, Some(SEMVER_PARSER_ID | SEMVER_LINE_PARSER_ID));
+    match (data_driven, policy) {
+        (true, None) => Err(DefinitionError::Field {
             field: "runtime.version_probe",
             reason: "this parser requires args, min and below",
         }),
-        (false, true) => Err(DefinitionError::Field {
+        (false, Some(_)) => Err(DefinitionError::Field {
             field: "runtime.version_probe",
-            reason: "args, min and below are only accepted by the semver-v1 parser",
+            reason:
+                "args, min and below are only accepted by the semver-v1 and semver-line-v1 parsers",
         }),
-        _ => Ok(()),
+        (true, Some(policy)) => {
+            let wants_line = parser == Some(SEMVER_LINE_PARSER_ID);
+            match (wants_line, policy.has_line_template()) {
+                (true, false) => Err(DefinitionError::Field {
+                    field: "runtime.version_probe.line",
+                    reason: "is required by the semver-line-v1 parser",
+                }),
+                (false, true) => Err(DefinitionError::Field {
+                    field: "runtime.version_probe.line",
+                    reason: "is only accepted by the semver-line-v1 parser",
+                }),
+                _ => Ok(()),
+            }
+        }
+        (false, None) => Ok(()),
     }
 }
 
@@ -918,6 +934,9 @@ struct RawVersionProbe {
     /// First unsupported release; the data-driven parser only.
     #[serde(default)]
     below: Option<String>,
+    /// Output template; the `semver-line-v1` parser only.
+    #[serde(default)]
+    line: Option<String>,
 }
 
 impl RawVersionProbe {
@@ -927,10 +946,14 @@ impl RawVersionProbe {
     /// here a partial declaration is already malformed.
     fn policy(&self) -> Result<Option<VersionProbePolicy>, DefinitionError> {
         match (&self.args, &self.min, &self.below) {
-            (None, None, None) => Ok(None),
-            (Some(args), Some(min), Some(below)) => {
-                VersionProbePolicy::new(args.clone(), min, below).map(Some)
+            (None, None, None) if self.line.is_none() => Ok(None),
+            (Some(args), Some(min), Some(below)) => match &self.line {
+                Some(line) => {
+                    VersionProbePolicy::with_line_template(args.clone(), min, below, line)
+                }
+                None => VersionProbePolicy::new(args.clone(), min, below),
             }
+            .map(Some),
             _ => Err(DefinitionError::Field {
                 field: "runtime.version_probe",
                 reason: "args, min and below are declared together",
