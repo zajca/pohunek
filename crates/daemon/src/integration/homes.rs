@@ -172,7 +172,7 @@ impl ConfigHomes {
         self.host().verify_launchable(&resolved_agent.definition)?;
         let resolved = handler::resolved(&resolved_agent.definition, RuntimeRef::from_wire(base))
             .ok_or_else(|| handler::not_installable(base))?;
-        Ok((resolved, profile.env.clone()))
+        Ok((resolved, profile.env.as_slice().to_vec()))
     }
 
     /// The host profiles that extend `runtime_id`, sorted by name.
