@@ -586,8 +586,76 @@ pub struct NativeIdentityOrdering {
     pub pid: u32,
     /// Kernel start identity that protects against pid reuse.
     pub pid_start_identity: u64,
-    /// Highest accepted monotonic sequence for this runtime.
+    /// Highest accepted `session.report_native_id` sequence for this runtime.
     pub sequence: u64,
+    /// Highest accepted worker identity-claim sequence for this runtime.
+    ///
+    /// The shipped adapters stamp worker claims and public reports from
+    /// different clocks, so each transport keeps its own high-water mark and
+    /// a sequence is only ever compared with the mark of its own transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_sequence: Option<u64>,
+}
+
+/// Path a provider-native identity report reached the daemon by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportTransport {
+    /// `session.report_native_id` on the daemon socket.
+    Public,
+    /// The worker's journaled identity claim, imported from its snapshot.
+    Worker,
+}
+
+impl NativeIdentityOrdering {
+    /// Whether a report of `transport` stamped `sequence` for runtime
+    /// generation `worker_instance_id` is newer than this key.
+    #[must_use]
+    pub fn admits(
+        &self,
+        worker_instance_id: &str,
+        transport: ReportTransport,
+        sequence: u64,
+    ) -> bool {
+        if self.worker_instance_id != worker_instance_id {
+            return true;
+        }
+        match transport {
+            ReportTransport::Public => sequence > self.sequence,
+            ReportTransport::Worker => self.worker_sequence.is_none_or(|mark| sequence > mark),
+        }
+    }
+
+    /// The key after accepting such a report: the high-water mark of its
+    /// transport advances, the other transport's mark is kept for the same
+    /// generation and starts empty for a new one.
+    #[must_use]
+    pub fn accepting(
+        current: Option<&Self>,
+        worker_instance_id: &str,
+        pid: u32,
+        pid_start_identity: u64,
+        transport: ReportTransport,
+        sequence: u64,
+    ) -> Self {
+        let kept = current.filter(|current| current.worker_instance_id == worker_instance_id);
+        let (public, worker) = kept.map_or((0, None), |kept| (kept.sequence, kept.worker_sequence));
+        let (public, worker) = match transport {
+            ReportTransport::Public => (sequence, worker),
+            ReportTransport::Worker => (public, Some(sequence)),
+        };
+        Self {
+            worker_instance_id: worker_instance_id.to_owned(),
+            pid,
+            pid_start_identity,
+            sequence: public,
+            worker_sequence: worker,
+        }
+    }
+
+    /// Whether `self` is ahead of `other` in at least one transport.
+    fn is_ahead_of(&self, other: &Self) -> bool {
+        self.sequence > other.sequence || self.worker_sequence > other.worker_sequence
+    }
 }
 
 /// Durable logical session authority.
@@ -1471,18 +1539,21 @@ pub(crate) fn preserve_newer_native_identity(
     }
     if let Some(candidate) = replacement
         .native_identity_ordering
-        .as_ref()
-        .filter(|candidate| {
-            candidate.worker_instance_id == ordering.worker_instance_id
-                && candidate.sequence >= ordering.sequence
-        })
+        .as_mut()
+        .filter(|candidate| candidate.worker_instance_id == ordering.worker_instance_id)
     {
-        if candidate.sequence > ordering.sequence {
+        if candidate.is_ahead_of(ordering) {
+            // The writer saw something newer; marks of the transport it did
+            // not advance still carry what the store already accepted.
+            candidate.sequence = candidate.sequence.max(ordering.sequence);
+            candidate.worker_sequence = candidate.worker_sequence.max(ordering.worker_sequence);
             return;
         }
-        replacement.native_identity_ordering = Some(ordering.clone());
-        preserve_nonempty_native_identity(existing, replacement);
-        return;
+        if !ordering.is_ahead_of(candidate) {
+            replacement.native_identity_ordering = Some(ordering.clone());
+            preserve_nonempty_native_identity(existing, replacement);
+            return;
+        }
     }
 
     replacement.native_identity_ordering = Some(ordering.clone());
@@ -1844,6 +1915,7 @@ mod tests {
             pid: 7,
             pid_start_identity: 9,
             sequence: 3,
+            worker_sequence: None,
         };
         let encoded = serde_json::to_value(&ordering).expect("encode ordering");
         assert_eq!(encoded["runtime_id"], "instance-1");

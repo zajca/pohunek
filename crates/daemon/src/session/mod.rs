@@ -52,8 +52,8 @@ use crate::project::{detect_at, ProjectManager};
 use crate::runtime::lifecycle::{Generation, LifecycleGuard, SessionLocks};
 use crate::runtime::{DimensionUpdate, SupervisionConfig, Worker, WorkerError, WorkerLauncher};
 use crate::store::{
-    DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
-    SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
+    DesiredState, ProjectRecord, ReportTransport, ResumeBinding, RuntimeRecord, SessionRecord,
+    SessionTransaction, SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
@@ -2512,6 +2512,7 @@ impl SessionRegistry {
                 entry.last_native_report.as_ref(),
                 params.worker_instance_id(),
                 incoming_sequence,
+                ReportTransport::Public,
             ) {
                 debug!(session_id = %session_id.0, "stale native-id report; ignoring");
                 return not_recorded;
@@ -2521,12 +2522,14 @@ impl SessionRegistry {
             let previous_native_path = entry.info.native_session_path.clone();
             let previous_provenance = entry.snapshot.reference_provenance;
             entry.snapshot.reference_provenance = NativeReferenceProvenance::Reported;
-            entry.last_native_report = Some(NativeIdentityReport {
-                worker_instance_id: params.worker_instance_id().to_owned(),
-                pid: params.pid(),
-                pid_start_identity: params.pid_start_identity().get(),
-                sequence: incoming_sequence,
-            });
+            entry.last_native_report = Some(NativeIdentityReport::accepting(
+                entry.last_native_report.as_ref(),
+                params.worker_instance_id(),
+                params.pid(),
+                params.pid_start_identity().get(),
+                ReportTransport::Public,
+                incoming_sequence,
+            ));
             // Store into the field chosen by kind, clearing the other so a session
             // resumes by exactly one mechanism (the persist literal copies both).
             match ref_kind {
@@ -2553,12 +2556,14 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, error = %error, "failed to persist native-id ordering; ignoring report");
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(&session_id) {
-                let accepted = NativeIdentityReport {
-                    worker_instance_id: params.worker_instance_id().to_owned(),
-                    pid: params.pid(),
-                    pid_start_identity: params.pid_start_identity().get(),
-                    sequence: params.sequence().get(),
-                };
+                let accepted = NativeIdentityReport::accepting(
+                    previous_ordering.as_ref(),
+                    params.worker_instance_id(),
+                    params.pid(),
+                    params.pid_start_identity().get(),
+                    ReportTransport::Public,
+                    params.sequence().get(),
+                );
                 if entry.last_native_report.as_ref() == Some(&accepted) {
                     entry.last_native_report = previous_ordering;
                     entry.info.native_session_id = previous_native_id;
@@ -5376,14 +5381,18 @@ fn report_seq_is_newer(current: Option<u64>, incoming: Option<u64>) -> bool {
     }
 }
 
+/// Whether a report of `transport` stamped `sequence` is newer than the last
+/// accepted one.
+///
+/// A sequence is only compared with the high-water mark of its own transport
+/// in its own runtime generation.
 fn native_report_is_current(
     current: Option<&NativeIdentityReport>,
     worker_instance_id: &str,
     sequence: u64,
+    transport: ReportTransport,
 ) -> bool {
-    current.is_none_or(|current| {
-        current.worker_instance_id != worker_instance_id || sequence > current.sequence
-    })
+    current.is_none_or(|current| current.admits(worker_instance_id, transport, sequence))
 }
 
 fn release_matches(
@@ -5697,11 +5706,18 @@ fn preserve_durable_transition_metadata(
             None => replacement.info.subagents.push(durable.clone()),
         }
     }
-    let _ = preserve_durable_launch_identity(
+    if preserve_durable_launch_identity(
         existing,
         &mut replacement.info,
         replacement.last_native_report.is_some(),
-    );
+    ) {
+        // The reference and its provenance are one fact: an unsequenced
+        // launch claim cannot be re-protected by an ordering key, so the
+        // durable provenance travels with the durable reference.
+        if let Some(recovery) = &existing.recovery {
+            replacement.snapshot.reference_provenance = recovery.native_reference_provenance;
+        }
+    }
     if policy == RuntimeMetadataPolicy::Terminal {
         terminalize_running_subagents(&mut replacement.info.subagents, current_time_millis());
     } else {

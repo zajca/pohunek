@@ -682,7 +682,7 @@ release-notes line for each one that changed.
 `metadata.jsonl` holds four record kinds: session, resume, worktree and project.
 Each line carries `schema_version`; a line without it is schema 1. The current
 value is `STORE_SCHEMA_VERSION` (`crates/daemon/src/store/schema.rs`, currently
-2), and `SessionRecord.info` embeds the protocol type `SessionInfo`, so a
+3), and `SessionRecord.info` embeds the protocol type `SessionInfo`, so a
 protocol field that reaches `info` is a persisted-shape change too.
 
 Startup order in `crates/daemon/src/main.rs`:

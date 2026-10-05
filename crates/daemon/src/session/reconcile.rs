@@ -4089,7 +4089,15 @@ fn apply_worker_identities_with(
     if snapshot.active_identity.is_some() && snapshot.active_identity_release.is_some() {
         return Err("active_identity_state_ambiguous");
     }
-    apply_worker_launch_identity(record, snapshot.launch_identity.as_ref())?;
+    let instance = snapshot
+        .worker_instance_id
+        .as_ref()
+        .map(ToString::to_string);
+    apply_worker_launch_identity(
+        record,
+        snapshot.launch_identity.as_ref(),
+        instance.as_deref(),
+    )?;
 
     let Some(identity) = &snapshot.active_identity else {
         let Some(release) = snapshot.active_identity_release.clone() else {
@@ -4170,6 +4178,7 @@ fn apply_worker_identities_with(
 fn apply_worker_launch_identity(
     record: &mut SessionRecord,
     identity: Option<&pohunek_worker_protocol::ReportedLaunchIdentity>,
+    worker_instance_id: Option<&str>,
 ) -> Result<(), &'static str> {
     let Some(identity) = identity else {
         return Ok(());
@@ -4225,21 +4234,27 @@ pub(super) fn apply_launch_identity(
     // A reported reference always supersedes an assigned one, whether or not
     // the values agree: the claim is bound to the launch process, the assigned
     // value never was.
-    if binding.native_reference_provenance != NativeReferenceProvenance::Assigned {
-        if differs
-            && binding
-                .native_launch
-                .as_ref()
-                .is_some_and(|launch| launch.assigned().is_some())
-            && record.native_identity_ordering.is_some()
-        {
-            // The worker keeps its first launch claim for good, so once a
-            // sequenced report has replaced it the claim is superseded
-            // history, not a conflict.
-            return Ok(());
-        }
-        if differs {
+    if binding.native_reference_provenance != NativeReferenceProvenance::Assigned && differs {
+        let assigned_runtime = binding
+            .native_launch
+            .as_ref()
+            .is_some_and(|launch| launch.assigned().is_some());
+        if !assigned_runtime {
             return Err("launch_identity_reference_mismatch");
+        }
+        // The worker keeps its first launch claim for good. A report this
+        // generation already accepted (a switch after the claim) makes the
+        // claim superseded history; a stored reference that predates the
+        // generation (a recovered conversation, a switch before the first
+        // report) is what the claim supersedes.
+        if record
+            .native_identity_ordering
+            .as_ref()
+            .is_some_and(|ordering| {
+                Some(ordering.worker_instance_id.as_str()) == worker_instance_id
+            })
+        {
+            return Ok(());
         }
     }
     binding.native_reference_provenance = NativeReferenceProvenance::Reported;
@@ -4286,7 +4301,13 @@ fn apply_active_native_reference(
         .is_none_or(|launch| launch.assigned().is_none())
         || binding.reference_kind() != Some(kind)
         || identity.provider != super::agent_kind_label(&record.info.agent_base)
-        || snapshot.child_process.as_ref() != Some(&identity.process)
+        || snapshot
+            .launch_identity
+            .as_ref()
+            .map_or(snapshot.child_process.as_ref(), |launch| {
+                Some(&launch.process)
+            })
+            != Some(&identity.process)
     {
         return;
     }
@@ -4301,6 +4322,7 @@ fn apply_active_native_reference(
         record.native_identity_ordering.as_ref(),
         &worker_instance_id,
         identity.sequence,
+        crate::store::ReportTransport::Worker,
     ) {
         return;
     }
@@ -4319,12 +4341,14 @@ fn apply_active_native_reference(
         }
     }
     binding.native_reference_provenance = NativeReferenceProvenance::Reported;
-    record.native_identity_ordering = Some(crate::store::NativeIdentityOrdering {
-        worker_instance_id,
-        pid: identity.process.pid,
-        pid_start_identity: identity.process.start_identity,
-        sequence: identity.sequence,
-    });
+    record.native_identity_ordering = Some(crate::store::NativeIdentityOrdering::accepting(
+        record.native_identity_ordering.as_ref(),
+        &worker_instance_id,
+        identity.process.pid,
+        identity.process.start_identity,
+        crate::store::ReportTransport::Worker,
+        identity.sequence,
+    ));
 }
 
 /// Prefix of the conflict reasons that say a record disagrees with its stored
@@ -6357,6 +6381,7 @@ while os.getppid() == parent:
             pid: child.pid,
             pid_start_identity: child.start_identity,
             sequence: 1,
+            worker_sequence: None,
         });
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
@@ -6668,6 +6693,7 @@ while os.getppid() == parent:
                     pid: child.pid,
                     pid_start_identity: child.start_identity,
                     sequence: 100,
+                    worker_sequence: None,
                 }),
                 info: SessionInfo {
                     pid: 0,
@@ -8027,6 +8053,7 @@ while os.getppid() == parent:
             pid: 50,
             pid_start_identity: 500,
             sequence: 2,
+            worker_sequence: None,
         });
         record.info.native_session_id = Some("native-newer".to_owned());
         let recovery = record.recovery.as_mut().expect("recovery binding");
@@ -8140,33 +8167,39 @@ while os.getppid() == parent:
     }
 
     #[test]
-    fn a_launch_claim_never_replaces_a_different_reported_reference_without_a_newer_report() {
-        let mut reported = assigned_record("first");
-        import_worker_identities(&mut reported, &switch_snapshot(Some("first"), None))
-            .expect("the first claim");
-        assert_eq!(
-            import_worker_identities(&mut reported, &switch_snapshot(Some("other"), None))
-                .expect_err("a reported reference stays immutable against a launch claim"),
-            "launch_identity_reference_mismatch"
-        );
-        assert_eq!(reported.info.native_session_id.as_deref(), Some("first"));
-
-        // A sequenced report that replaced the first claim makes the claim
-        // history, but only for a runtime whose reference core assigned.
-        reported.native_identity_ordering = Some(NativeIdentityOrdering {
-            worker_instance_id: "runtime-identity".to_owned(),
+    fn a_launch_claim_supersedes_a_reference_that_predates_its_generation_only() {
+        let ordered_in = |instance: &str| NativeIdentityOrdering {
+            worker_instance_id: instance.to_owned(),
             pid: 50,
             pid_start_identity: 500,
             sequence: 4,
-        });
-        import_worker_identities(&mut reported, &switch_snapshot(Some("other"), None))
-            .expect("a superseded launch claim is history");
-        assert_eq!(reported.info.native_session_id.as_deref(), Some("first"));
+            worker_sequence: None,
+        };
+
+        // A reported reference of an earlier generation (a recovered
+        // conversation) is what the new generation's first claim replaces.
+        let mut recovered = assigned_record("first");
+        import_worker_identities(&mut recovered, &switch_snapshot(Some("first"), None))
+            .expect("the first claim");
+        recovered.native_identity_ordering = Some(ordered_in("an-earlier-instance"));
+        import_worker_identities(&mut recovered, &switch_snapshot(Some("other"), None))
+            .expect("the claim of the new generation supersedes");
+        assert_eq!(recovered.info.native_session_id.as_deref(), Some("other"));
         assert_eq!(
-            provenance_of(&reported),
+            provenance_of(&recovered),
             NativeReferenceProvenance::Reported
         );
 
+        // A report this generation already accepted makes the claim history.
+        let mut reported = assigned_record("first");
+        import_worker_identities(&mut reported, &switch_snapshot(Some("first"), None))
+            .expect("the first claim");
+        reported.native_identity_ordering = Some(ordered_in("runtime-identity"));
+        import_worker_identities(&mut reported, &switch_snapshot(Some("other"), None))
+            .expect("a superseded launch claim is history");
+        assert_eq!(reported.info.native_session_id.as_deref(), Some("first"));
+
+        // A hook runtime keeps its immutable launch claim.
         let mut hooked = identity_record();
         hooked.info.native_session_id = Some("first".to_owned());
         hooked
@@ -8174,7 +8207,7 @@ while os.getppid() == parent:
             .as_mut()
             .expect("recovery binding")
             .native_session_id = Some("first".to_owned());
-        hooked.native_identity_ordering = reported.native_identity_ordering.clone();
+        hooked.native_identity_ordering = Some(ordered_in("runtime-identity"));
         assert_eq!(
             import_worker_identities(&mut hooked, &switch_snapshot(Some("other"), None))
                 .expect_err("a hook runtime keeps its immutable launch claim"),
@@ -8207,7 +8240,8 @@ while os.getppid() == parent:
                 worker_instance_id: "runtime-identity".to_owned(),
                 pid: 50,
                 pid_start_identity: 500,
-                sequence: 9,
+                sequence: 0,
+                worker_sequence: Some(9),
             })
         );
 
@@ -8232,6 +8266,70 @@ while os.getppid() == parent:
         let newer = switch_snapshot(Some("assigned-ref"), Some((50, 10, "newest-ref")));
         import_worker_identities(&mut record, &newer).expect("import a newer claim");
         assert_eq!(record.info.native_session_id.as_deref(), Some("newest-ref"));
+    }
+
+    #[test]
+    fn the_verified_launch_process_below_a_wrapper_is_the_process_whose_switches_count() {
+        // The worker designates the provider process below a wrapper; the
+        // wrapper stays the root child.
+        let wrapped = |active_pid: u32| {
+            let mut snapshot =
+                switch_snapshot(Some("assigned-ref"), Some((active_pid, 9, "cleared-ref")));
+            snapshot
+                .launch_identity
+                .as_mut()
+                .expect("launch claim")
+                .process = ProcessIdentity {
+                pid: 55,
+                start_identity: 550,
+            };
+            snapshot
+        };
+        let mut record = assigned_record("assigned-ref");
+        import_worker_identities(&mut record, &wrapped(55)).expect("import the switch");
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("cleared-ref")
+        );
+
+        for (name, pid) in [("the wrapper", 50), ("another nested agent", 60)] {
+            let mut record = assigned_record("assigned-ref");
+            import_worker_identities(&mut record, &wrapped(pid)).expect("import the claim");
+            assert_eq!(
+                record.info.native_session_id.as_deref(),
+                Some("assigned-ref"),
+                "{name} is not the verified launch process"
+            );
+        }
+    }
+
+    #[test]
+    fn report_sequences_are_compared_within_their_own_transport_only() {
+        use crate::store::ReportTransport::{Public, Worker};
+        let mut ordering = NativeIdentityOrdering::accepting(None, "gen", 1, 2, Worker, 5_000_000);
+        assert!(!ordering.admits("gen", Worker, 5_000_000));
+        assert!(ordering.admits("gen", Worker, 5_000_001));
+        assert!(
+            ordering.admits("gen", Public, 7),
+            "a public sequence is not older than a worker clock"
+        );
+        assert!(
+            ordering.admits("other-gen", Worker, 1),
+            "a new generation restarts"
+        );
+
+        ordering = NativeIdentityOrdering::accepting(Some(&ordering), "gen", 1, 2, Public, 7);
+        assert_eq!(
+            (ordering.sequence, ordering.worker_sequence),
+            (7, Some(5_000_000))
+        );
+        assert!(!ordering.admits("gen", Public, 7));
+        assert!(
+            !ordering.admits("gen", Worker, 5_000_000),
+            "an accepted public report keeps the worker mark: the old claim is not newer"
+        );
+        let fresh = NativeIdentityOrdering::accepting(Some(&ordering), "next", 1, 2, Public, 3);
+        assert_eq!((fresh.sequence, fresh.worker_sequence), (3, None));
     }
 
     #[test]
@@ -8319,6 +8417,7 @@ while os.getppid() == parent:
             pid: 50,
             pid_start_identity: 500,
             sequence: 7,
+            worker_sequence: None,
         });
         assert_eq!(
             store.record_session(&existing).expect("seed session"),
@@ -8365,6 +8464,7 @@ while os.getppid() == parent:
             pid: 50,
             pid_start_identity: 500,
             sequence: 7,
+            worker_sequence: None,
         });
         existing.info.native_session_id = Some("native-authoritative".to_owned());
         existing

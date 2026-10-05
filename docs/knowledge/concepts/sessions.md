@@ -667,7 +667,10 @@ only for a still-assigned reference. A report must pass the usual checks (the
 process-identity, sequence and expiry checks for `session.report_native_id`, the
 launch process and sequence for the worker's active identity), a stale or
 refused one leaves the stored reference alone, and an assigned value never
-replaces a reported one, also across a daemon restart. The public API reference
+replaces a reported one, also across a daemon restart. Sequences are compared per
+transport (worker claim or public report) and per runtime generation, so one
+clock never makes the other stale, and a recovered generation's first claim
+supersedes the reference it was relaunched with. The public API reference
 has the field-level contract.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 

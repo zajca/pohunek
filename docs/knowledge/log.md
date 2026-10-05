@@ -234,7 +234,10 @@
   `/clear` and in-session resume, that the replacement sets the provenance to
   `reported` in the session, its record and its resume binding, that resume and
   fork then use the reported reference without the existence check, and that an
-  assigned value never replaces a reported one.
+  assigned value never replaces a reported one. Report sequences are ordered
+  per transport (worker claim or public report) and per runtime generation, the
+  worker's verified launch process (not only the root child) is the process
+  whose conversation switches count, and the session store schema is 3.
 
 ## Unreleased (2026-10-04, assigned native references)
 

@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 3;
+pub const STORE_SCHEMA_VERSION: u32 = 4;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -63,6 +63,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         from: 2,
         apply: migrate_v2_to_v3,
     },
+    Migration {
+        from: 3,
+        apply: migrate_v3_to_v4,
+    },
 ];
 
 /// Schema the [`legacy_binding`] step upgrades from.
@@ -82,6 +86,13 @@ fn migrate_v1_to_v2(record: &mut Map<String, Value>) {
 /// revision, which is exactly how an older binding must read, so no record
 /// changes beyond the version stamp.
 fn migrate_v2_to_v3(_record: &mut Map<String, Value>) {}
+
+/// Schema 3 to 4: a native identity ordering key may carry the worker-claim
+/// high-water mark next to the public one.
+///
+/// A key written without the field has seen no worker claim, which is what
+/// every schema 3 key was, so no record needs rewriting.
+fn migrate_v3_to_v4(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

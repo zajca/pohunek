@@ -56,14 +56,24 @@ struct Rig {
 
 impl Rig {
     async fn new(tag: &str, existence: &'static str) -> Self {
-        Self::with_agents(tag, existence, None, RUNTIME).await
+        Self::with_agents(tag, existence, None, RUNTIME, false).await
     }
 
+    /// An agent started below a wrapper process, as launchers and shims do.
+    async fn wrapped(tag: &str, existence: &'static str) -> Self {
+        Self::with_agents(tag, existence, None, RUNTIME, true).await
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture builds the agent script, its roots and its registry"
+    )]
     async fn with_agents(
         tag: &str,
         existence: &'static str,
         agents_dir: Option<PathBuf>,
         agent: &str,
+        wrapped: bool,
     ) -> Self {
         let dir = temp_dir(tag);
         let marker = dir.join("argv.txt");
@@ -80,14 +90,14 @@ impl Rig {
         fs::copy("/bin/sh", &interpreter).expect("copy the shell");
         fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700))
             .expect("make the interpreter executable");
-        let script = dir.join("pi-switching");
+        let inner = dir.join("pi-switching");
         write_executable(
-            &script,
+            &inner,
             &format!(
                 "#!{interpreter}\n\
                  printf 'launch\\n' >> '{marker}'\n\
                  printf '%s\\n' \"$@\" >> '{marker}'\n\
-                 case \" $* \" in *\" {ASSIGNED_FLAG} \"*) ;; *) exec sleep 30 ;; esac\n\
+                 case \" $* \" in *\" {ASSIGNED_FLAG} \"*|*\" --session \"*) ;; *) exec sleep 30 ;; esac\n\
                  command -v python3 > '{python}' || true\n\
                  while read -r command argument < '{commands}'; do\n\
                  case \"$command\" in\n\
@@ -110,6 +120,22 @@ impl Rig {
                 nested = nested.display(),
             ),
         );
+        // The wrapper keeps the root; the worker designates the provider
+        // process below it as the launch process.
+        let script = if wrapped {
+            let shim = dir.join("pi-wrapper");
+            write_executable(
+                &shim,
+                &format!(
+                    "#!/bin/sh\n'{}' '{}' \"$@\"\n",
+                    interpreter.display(),
+                    inner.display()
+                ),
+            );
+            shim
+        } else {
+            inner
+        };
         let store_path = temp_store_path(tag);
         let mut config = SessionRegistryConfig {
             shell_command: hermetic_shell(),
@@ -757,6 +783,7 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
         crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
         Some(agents_dir),
         "pi-home",
+        false,
     )
     .await;
 
@@ -776,6 +803,7 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
         crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
         first.config.agents_dir.clone(),
         "pi-home",
+        false,
     )
     .await;
     let report = public_report(&second, "conversation-without-file", |_| {}).await;
@@ -793,4 +821,247 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
         "a profile recovers with its own args and the resume template"
     );
     second.finish(&second.registry).await;
+}
+
+#[tokio::test]
+async fn a_switch_before_the_first_report_after_a_resume_survives_a_restart() {
+    let mut rig = Rig::new(
+        "supersede-resume-switch",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.report(&rig.assigned).await;
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    rig.exit(&rig.registry).await;
+    rig.registry
+        .resume(rig.id())
+        .await
+        .expect("native recovery");
+    wait_for_file_contains(&rig.marker, "--session\n").await;
+
+    // The recovered process first reports another conversation: its launch
+    // claim differs from the reference the recovery relaunched with.
+    rig.report("conversation-after-resume").await;
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied,
+        "the new generation's claim supersedes the recovered reference"
+    );
+    rig.assert_held(
+        &rig.registry,
+        "conversation-after-resume",
+        NativeReferenceProvenance::Reported,
+    )
+    .await;
+
+    let restarted = rig.restart().await;
+    rig.assert_held(
+        &restarted,
+        "conversation-after-resume",
+        NativeReferenceProvenance::Reported,
+    )
+    .await;
+    assert_eq!(
+        rig.settle(&restarted).await,
+        WorkerMetadataApplyOutcome::Applied,
+        "a restart adopts the session instead of marking it in conflict"
+    );
+    let info = restarted.inspect(rig.id()).await.expect("inspect");
+    assert_ne!(
+        info.runtime.as_ref().map(|runtime| runtime.state),
+        Some(RuntimeState::Conflict)
+    );
+    rig.finish(&restarted).await;
+}
+
+#[tokio::test]
+async fn a_transition_that_captured_the_assigned_entry_keeps_the_reported_provenance() {
+    let rig = Rig::new(
+        "supersede-transition",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.report(&rig.assigned).await;
+    let mut snapshot = rig.snapshot(&rig.registry).await;
+    snapshot.active_identity = None;
+    assert_eq!(
+        rig.settle_with(&rig.registry, &snapshot).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    rig.assert_held(
+        &rig.registry,
+        &rig.assigned,
+        NativeReferenceProvenance::Reported,
+    )
+    .await;
+
+    // An exit transition built its candidate from the entry before the
+    // snapshot reached memory: the entry still says assigned while the
+    // durable record already says reported.
+    let (_worker, identity) = live_worker_and_identity(&rig.registry, rig.id()).await;
+    let mut sessions = rig.registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(rig.id()).expect("session entry");
+    entry.runtime_watch_cancel.cancel();
+    entry.snapshot.reference_provenance = NativeReferenceProvenance::Assigned;
+    drop(sessions);
+    // A concurrent live-state commit may make the transition retry.
+    wait_until("the exit transition to commit", || async {
+        rig.registry
+            .record_exit(
+                rig.id(),
+                RuntimeExit {
+                    exit_code: Some(0),
+                    success: true,
+                },
+                false,
+                Some(&identity),
+                None,
+            )
+            .await
+            .expect("record the exit")
+            .then_some(())
+    })
+    .await;
+
+    let memory = rig
+        .registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(rig.id())
+        .map(|entry| entry.snapshot.reference_provenance)
+        .expect("entry");
+    assert_eq!(memory, NativeReferenceProvenance::Reported);
+    assert_eq!(
+        rig.durable_record()
+            .recovery
+            .expect("durable recovery binding")
+            .native_reference_provenance,
+        NativeReferenceProvenance::Reported,
+        "the transition did not demote the committed provenance"
+    );
+}
+
+#[tokio::test]
+async fn a_switch_below_a_wrapper_is_followed_through_the_verified_launch_process() {
+    let rig = Rig::wrapped(
+        "supersede-wrapper",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.report(&rig.assigned).await;
+    let snapshot = rig.snapshot(&rig.registry).await;
+    let launch = snapshot.launch_identity.as_ref().expect("launch claim");
+    assert_ne!(
+        Some(launch.process),
+        snapshot.child_process,
+        "the provider process runs below the wrapper"
+    );
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+
+    rig.report("conversation-below-wrapper").await;
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    rig.assert_held(
+        &rig.registry,
+        "conversation-below-wrapper",
+        NativeReferenceProvenance::Reported,
+    )
+    .await;
+    rig.exit(&rig.registry).await;
+    rig.registry
+        .resume(rig.id())
+        .await
+        .expect("native recovery");
+    wait_for_file_contains(&rig.marker, "--session\n").await;
+    assert_eq!(
+        rig.launch_argv(1),
+        ["--model", "fast", "--session", "conversation-below-wrapper"]
+    );
+    rig.finish(&rig.registry).await;
+}
+
+#[tokio::test]
+async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
+    let rig = Rig::new(
+        "supersede-transports",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    let held = |reference: &'static str| {
+        rig.assert_held(
+            &rig.registry,
+            reference,
+            NativeReferenceProvenance::Reported,
+        )
+    };
+
+    // Public first, then the worker: the adapter's worker clock is far ahead
+    // of its public one, and neither blocks the other.
+    let public = public_report(&rig, "public-one", |_| {}).await;
+    assert!(rig.registry.report_native_id(public).await.recorded);
+    held("public-one").await;
+    rig.report("worker-two").await;
+    let old_claim = rig.snapshot(&rig.registry).await;
+    assert!(
+        old_claim.active_identity.is_some(),
+        "the worker journaled the claim"
+    );
+    assert_eq!(
+        rig.settle_with(&rig.registry, &old_claim).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    held("worker-two").await;
+
+    // The worker, then the public fallback with a smaller number.
+    let public = public_report(&rig, "public-three", |_| {}).await;
+    assert!(
+        rig.registry.report_native_id(public).await.recorded,
+        "a public report is not stale because the worker clock reads larger"
+    );
+    held("public-three").await;
+
+    // The worker's older claim is not newer than the public report it
+    // preceded, so importing it again leaves the newer conversation.
+    assert_eq!(
+        rig.settle_with(&rig.registry, &old_claim).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    held("public-three").await;
+
+    // Each clock still rejects its own stale numbers.
+    let accepted = rig
+        .registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(rig.id())
+        .and_then(|entry| entry.last_native_report.clone())
+        .expect("ordered report");
+    let stale = public_report(&rig, "public-stale", |report| {
+        report.sequence = accepted.sequence;
+    })
+    .await;
+    assert!(!rig.registry.report_native_id(stale).await.recorded);
+
+    rig.report("worker-four").await;
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    held("worker-four").await;
+    let public = public_report(&rig, "public-five", |_| {}).await;
+    assert!(rig.registry.report_native_id(public).await.recorded);
+    held("public-five").await;
+    rig.finish(&rig.registry).await;
 }

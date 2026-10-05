@@ -10148,7 +10148,8 @@ async fn report_native_id_records_binding_and_updates_info() {
         !native_report_is_current(
             Some(ordering),
             &ordering.worker_instance_id,
-            ordering.sequence - 1
+            ordering.sequence - 1,
+            crate::store::ReportTransport::Public,
         ),
         "a lower sequence must remain stale after the ordering key is reloaded"
     );
@@ -10919,6 +10920,7 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         pid: 4242,
         pid_start_identity: 777,
         sequence: 9,
+        worker_sequence: None,
     });
     let recovery = durable_before_exit
         .recovery
@@ -11204,6 +11206,7 @@ fn native_ordering_record(
         pid,
         pid_start_identity: 1,
         sequence,
+        worker_sequence: None,
     });
     record.info.native_session_id = Some(native.to_owned());
     record

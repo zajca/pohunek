@@ -963,8 +963,14 @@ max_depth = 1                                    # directory levels below dir
   worker's launch claim replaces it even when the value is equal, which only
   confirms it, and the worker's active identity replaces it when it names the
   runtime itself, is bound to the launch process (a nested process never
-  qualifies), carries the declared reference kind and is newer than the last
-  accepted report. A report older than the stored one, an expired or overlong
+  qualifies; below a wrapper process it is the provider process the worker
+  verified as the launch process), carries the declared reference kind and is
+  newer than the last worker claim accepted for the runtime generation. Sequences are compared only within one transport and one runtime generation
+  (the shipped adapters stamp worker claims and public reports from different
+  clocks), so a public report is never stale because of a worker claim or the
+  other way round, and a recovered or restarted generation starts fresh: its
+  first launch claim supersedes the reference it was relaunched with. A report
+  older than the stored one of its own transport, an expired or overlong
   claim, or a claim from another runtime never replaces a reference, and
   an assigned value never replaces a reported one: relaunches, daemon restarts
   and rebinding start from the stored reported reference. Resume and fork then
