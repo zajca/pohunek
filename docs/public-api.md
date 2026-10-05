@@ -968,7 +968,7 @@ max_depth = 1                                    # directory levels below dir
   switch made while the daemon was down is still read when it returns. The
   reference must name the runtime itself, never a nested process, carry the
   declared reference kind and be newer than the last worker report accepted for
-  the runtime generation. The journaled reference is trusted by its generation binding (the record's own worker instance and the verified launch process), never by whether that process or its wrapper is still alive; an exit, an explicit stop and a lost worker read the generation's final snapshot before they commit. A report of the launch process that arrives while the
+  the runtime generation. The journaled reference is trusted by its generation binding (the record's own worker instance and the verified launch process), never by whether that process or its wrapper is still alive; an exit, an explicit stop and a lost worker read the generation's final snapshot before they commit. A public report is ordered against the worker's journaled claim at acceptance: the daemon inspects the worker first, and the observed claim is older than the report whether or not it was imported yet (a worker that cannot be inspected makes the report retryable). A worker that crashed or is unreachable still hands over the reference of its own generation's journal when the session is classified, stopped or reconciled. A report of the launch process that arrives while the
   worker is still verifying it is kept and promoted with the claim, and a
   session whose runtime ended while the daemon was down imports the journaled
   reference too, when it belongs to the record's own worker instance and the

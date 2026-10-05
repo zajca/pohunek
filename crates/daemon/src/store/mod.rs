@@ -655,6 +655,33 @@ impl NativeIdentityOrdering {
         }
     }
 
+    /// The key after accepting a public report that the daemon ordered after
+    /// the worker claim it observed, numbered `observed_worker_sequence`.
+    ///
+    /// The worker mark rises to the observed claim, so that claim, imported
+    /// later, is older than the public report and never replaces it. The order
+    /// of the two transports is fixed here, at acceptance, not compared later.
+    #[must_use]
+    pub fn accepting_public(
+        current: Option<&Self>,
+        worker_instance_id: &str,
+        pid: u32,
+        pid_start_identity: u64,
+        sequence: u64,
+        observed_worker_sequence: Option<u64>,
+    ) -> Self {
+        let mut key = Self::accepting(
+            current,
+            worker_instance_id,
+            pid,
+            pid_start_identity,
+            ReportTransport::Public,
+            sequence,
+        );
+        key.worker_sequence = key.worker_sequence.max(observed_worker_sequence);
+        key
+    }
+
     /// A key that names a runtime generation and holds no report mark yet, so
     /// any real report of that generation is newer than it.
     #[must_use]

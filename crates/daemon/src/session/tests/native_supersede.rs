@@ -1327,9 +1327,16 @@ enum Step {
     /// A public report numbered 0, admitted only while no public report was
     /// accepted for the generation.
     PublicSequenceZero,
+    /// The agent journals a claim, a public report is accepted before the
+    /// daemon imports it, and the claim is imported afterwards. Acceptance
+    /// order decides: the public report stays.
+    ClaimThenPublicThenImport,
+    /// Like [`Step::ClaimThenPublicThenImport`], with the session ending
+    /// before the claim is imported, so its final import reads the claim.
+    ClaimThenPublicThenExit,
 }
 
-const STEPS: [Step; 13] = [
+const STEPS: [Step; 15] = [
     Step::Switch,
     Step::SwitchAfterLease,
     Step::PublicReport,
@@ -1343,6 +1350,8 @@ const STEPS: [Step; 13] = [
     Step::SwitchDownThenExit,
     Step::SwitchViaWatcher,
     Step::PublicSequenceZero,
+    Step::ClaimThenPublicThenImport,
+    Step::ClaimThenPublicThenExit,
 ];
 
 /// Deterministic generator of step histories: a 64-bit xorshift stream, so a
@@ -1512,9 +1521,16 @@ async fn run_history(seed: u64, history: &[Step]) {
                 latest = next;
             }
             Step::StalePublicReport => {
+                // The mark only orders reports of its own runtime generation.
+                let instance = rig
+                    .snapshot(&rig.registry)
+                    .await
+                    .worker_instance_id
+                    .map(|instance| instance.to_string());
                 if let Some(mark) = rig
                     .last_report()
                     .await
+                    .filter(|key| Some(&key.worker_instance_id) == instance.as_ref())
                     .map(|key| key.sequence)
                     .filter(|mark| *mark > Some(0))
                 {
@@ -1592,6 +1608,31 @@ async fn run_history(seed: u64, history: &[Step]) {
                 })
                 .await;
                 latest = next;
+            }
+            Step::ClaimThenPublicThenImport | Step::ClaimThenPublicThenExit => {
+                let public = name("accepted-later");
+                rig.claim_then_public(&name("claim-first"), &public).await;
+                latest = public;
+                if *step == Step::ClaimThenPublicThenImport {
+                    rig.block_worker_imports(false);
+                    let outcome = rig.settle(&rig.registry).await;
+                    assert_eq!(outcome, WorkerMetadataApplyOutcome::Applied, "{at}");
+                } else {
+                    let before = rig.launches();
+                    rig.exit(&rig.registry).await;
+                    rig.block_worker_imports(false);
+                    rig.registry.resume(rig.id()).await.expect("resume");
+                    wait_until("the resumed launch", || async {
+                        (rig.launch_argv(before).len() >= LAUNCH_ARGV_LINES).then_some(())
+                    })
+                    .await;
+                    assert_eq!(
+                        rig.launch_argv(before),
+                        ["--model", "fast", "--session", latest.as_str()],
+                        "recovery follows acceptance order: {at}"
+                    );
+                    older.clear();
+                }
             }
             Step::PublicSequenceZero => {
                 let instance = rig
@@ -1680,11 +1721,11 @@ async fn generated_histories_over_many_seeds_keep_the_latest_conversation() {
 #[tokio::test]
 async fn orderings_found_in_review_hold() {
     use Step::{
-        ExitAndResume, Fork, LoseProjectionWrites, PublicReport, PublicSequenceZero,
-        ReplayOlderSnapshot, Restart, Switch, SwitchAfterLease, SwitchDownThenExit,
-        SwitchViaWatcher, SwitchWhileDown,
+        ClaimThenPublicThenExit, ClaimThenPublicThenImport, ExitAndResume, Fork,
+        LoseProjectionWrites, PublicReport, PublicSequenceZero, ReplayOlderSnapshot, Restart,
+        Switch, SwitchAfterLease, SwitchDownThenExit, SwitchViaWatcher, SwitchWhileDown,
     };
-    let histories: [&[Step]; 10] = [
+    let histories: [&[Step]; 13] = [
         // A crash after the record write, then a resume, then another crash.
         &[Switch, LoseProjectionWrites, Switch, ExitAndResume, Restart],
         &[
@@ -1723,6 +1764,14 @@ async fn orderings_found_in_review_hold() {
         &[Switch, SwitchDownThenExit, SwitchAfterLease, Restart],
         // The watcher imports a switch that only the durable reference carries.
         &[SwitchViaWatcher, SwitchAfterLease, Restart, ExitAndResume],
+        // A claim journaled first and a public report accepted before its import.
+        &[ClaimThenPublicThenImport, Restart, ExitAndResume],
+        &[Switch, ClaimThenPublicThenExit, Restart],
+        &[
+            ClaimThenPublicThenImport,
+            SwitchAfterLease,
+            ClaimThenPublicThenExit,
+        ],
         // A worker claim followed by the first public report, numbered 0.
         &[Switch, PublicSequenceZero, PublicSequenceZero, Restart],
     ];
@@ -2034,4 +2083,177 @@ async fn a_recovered_generations_first_worker_report_numbered_zero_is_imported()
     )
     .await;
     rig.finish(&rig.registry).await;
+}
+
+impl Rig {
+    /// Makes every worker snapshot import wait, as if the daemon had not read
+    /// the worker's journal yet.
+    fn block_worker_imports(&self, blocked: bool) {
+        self.registry
+            .inner
+            .worker_imports_blocked
+            .store(blocked, Ordering::Relaxed);
+    }
+
+    /// The agent journals `claim`, then a public report `public` is accepted
+    /// before the daemon imported the claim.
+    async fn claim_then_public(&self, claim: &str, public: &str) {
+        self.block_worker_imports(true);
+        self.report(claim).await;
+        let report = public_report(self, public, |_| {}).await;
+        assert!(self.registry.report_native_id(report).await.recorded);
+    }
+}
+
+#[tokio::test]
+async fn a_public_report_accepted_before_a_worker_claim_is_imported_outranks_it() {
+    let rig = Rig::new(
+        "supersede-barrier",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.claim_then_public("claim-journaled-first", "public-accepted-later")
+        .await;
+    rig.assert_held(
+        &rig.registry,
+        "public-accepted-later",
+        NativeReferenceProvenance::Reported,
+    )
+    .await;
+
+    // The claim reaches the daemon only now; it is older than the report.
+    rig.block_worker_imports(false);
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    rig.assert_held(
+        &rig.registry,
+        "public-accepted-later",
+        NativeReferenceProvenance::Reported,
+    )
+    .await;
+    rig.exit(&rig.registry).await;
+    let ended = rig.registry.inspect(rig.id()).await.expect("inspect");
+    assert_eq!(
+        ended.native_session_id.as_deref(),
+        Some("public-accepted-later"),
+        "the final import does not bring the older claim back"
+    );
+    rig.finish(&rig.registry).await;
+}
+
+#[tokio::test]
+async fn a_stop_after_a_public_report_keeps_it_over_the_unimported_claim() {
+    let rig = Rig::new(
+        "supersede-barrier-stop",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.claim_then_public("claim-journaled-first", "public-accepted-later")
+        .await;
+
+    rig.registry.stop(rig.id()).await.expect("stop");
+
+    let recovery = rig.durable_record().recovery.expect("recovery");
+    assert_eq!(
+        recovery.native_session_id.as_deref(),
+        Some("public-accepted-later")
+    );
+}
+
+/// Kills the worker of `rig` the way a crash does: its task ends and its
+/// journal stays in the live phase.
+async fn crash_worker(rig: &Rig) {
+    let service_id = rig
+        .durable_record()
+        .runtime
+        .service_id
+        .expect("the record names its job");
+    let service_id =
+        pohunek_platform::supervisor::ServiceId::parse(service_id).expect("service id");
+    rig.launcher
+        .retire(&service_id)
+        .await
+        .expect("retire the worker job");
+}
+
+#[tokio::test]
+async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_when_the_worker_is_lost() {
+    let rig = Rig::new(
+        "supersede-crash-lost",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.block_worker_imports(true);
+    rig.report("switched-before-the-crash").await;
+    let (worker, identity) = live_worker_and_identity(&rig.registry, rig.id()).await;
+    crash_worker(&rig).await;
+    // The watcher has lost the connection: the entry holds no worker handle.
+    drop(worker);
+    rig.registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(rig.id())
+        .expect("session entry")
+        .runtime = RuntimeHandle::Unavailable(RuntimeState::Reconnecting);
+
+    let outcome = rig
+        .registry
+        .mark_worker_unavailable(rig.id(), &identity, RuntimeState::Lost, "worker_lost")
+        .await;
+
+    assert!(matches!(
+        outcome,
+        super::super::RuntimeTransitionOutcome::Applied(_)
+    ));
+    assert_eq!(
+        rig.durable_record()
+            .recovery
+            .expect("recovery")
+            .native_session_id
+            .as_deref(),
+        Some("switched-before-the-crash")
+    );
+}
+
+#[tokio::test]
+async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_at_startup() {
+    let mut rig = Rig::new(
+        "supersede-crash-startup",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    let barrier = rig.registry.inner.persist_lock.lock().await;
+    std::mem::forget(barrier);
+    rig.block_worker_imports(true);
+    rig.report("switched-before-the-crash").await;
+    crash_worker(&rig).await;
+    let entries: Vec<_> = rig
+        .registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .drain()
+        .map(|(_, entry)| entry)
+        .collect();
+    for entry in entries {
+        entry.cancel_runtime_watchers();
+    }
+
+    let restarted = Rig::registry(&rig.config, &rig.launcher, &rig.script, rig.existence);
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    let info = restarted.inspect(rig.id()).await.expect("inspect");
+    assert_eq!(
+        info.native_session_id.as_deref(),
+        Some("switched-before-the-crash")
+    );
+    rig.registry = restarted;
 }

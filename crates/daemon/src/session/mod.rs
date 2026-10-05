@@ -508,6 +508,10 @@ struct SessionRegistryInner {
     /// that died between the session record and its projection.
     #[cfg(test)]
     resume_writes_blocked: AtomicBool,
+    /// Test hook that makes every worker snapshot import retry later, standing
+    /// for a daemon that has not read the worker's journal yet.
+    #[cfg(test)]
+    worker_imports_blocked: AtomicBool,
     /// Shared by every fresh launch from verification until its durable record
     /// exists, exclusive for a package uninstall, so a launch cannot pin a
     /// package digest between the retained set being computed and the
@@ -1466,6 +1470,8 @@ impl SessionRegistry {
                 persist_lock: Mutex::new(()),
                 #[cfg(test)]
                 resume_writes_blocked: AtomicBool::new(false),
+                #[cfg(test)]
+                worker_imports_blocked: AtomicBool::new(false),
                 package_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
@@ -2468,6 +2474,12 @@ impl SessionRegistry {
             return not_recorded;
         }
 
+        // The worker claim this daemon has observed is ordered before the public
+        // report accepted below, whether or not the claim was imported yet.
+        let observed_worker_sequence = worker_snapshot
+            .native_reference
+            .as_ref()
+            .map(|reference| reference.sequence);
         let validated = match ref_kind {
             SessionRefKind::Id => SessionRef::id(params.native_session_id()),
             SessionRefKind::Path => params
@@ -2524,13 +2536,13 @@ impl SessionRegistry {
             let previous_native_path = entry.info.native_session_path.clone();
             let previous_provenance = entry.snapshot.reference_provenance;
             entry.snapshot.reference_provenance = NativeReferenceProvenance::Reported;
-            entry.last_native_report = Some(NativeIdentityReport::accepting(
+            entry.last_native_report = Some(NativeIdentityReport::accepting_public(
                 entry.last_native_report.as_ref(),
                 params.worker_instance_id(),
                 params.pid(),
                 params.pid_start_identity().get(),
-                ReportTransport::Public,
                 incoming_sequence,
+                observed_worker_sequence,
             ));
             // Store into the field chosen by kind, clearing the other so a session
             // resumes by exactly one mechanism (the persist literal copies both).
@@ -2558,13 +2570,13 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, error = %error, "failed to persist native-id ordering; ignoring report");
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(&session_id) {
-                let accepted = NativeIdentityReport::accepting(
+                let accepted = NativeIdentityReport::accepting_public(
                     previous_ordering.as_ref(),
                     params.worker_instance_id(),
                     params.pid(),
                     params.pid_start_identity().get(),
-                    ReportTransport::Public,
                     params.sequence().get(),
+                    observed_worker_sequence,
                 );
                 if entry.last_native_report.as_ref() == Some(&accepted) {
                     entry.last_native_report = previous_ordering;
@@ -4087,13 +4099,20 @@ impl SessionRegistry {
                 _ => None,
             })
         };
-        let Some(worker) = worker else {
-            return;
-        };
-        let Ok(snapshot) = worker.inspect().await else {
-            return;
-        };
         let mut record = Self::session_record(id, candidate, candidate.desired_state, None);
+        let live = match worker {
+            Some(worker) => worker.inspect().await.ok(),
+            None => None,
+        };
+        // A worker that cannot be asked (it crashed after journaling a switch)
+        // leaves its own generation's journal as the only evidence.
+        let snapshot = match live {
+            Some(snapshot) => snapshot,
+            None => match self.generation_journal_snapshot(&record).await {
+                Some(snapshot) => snapshot,
+                None => return,
+            },
+        };
         reconcile::import_native_reference(&mut record, &snapshot);
         candidate
             .info

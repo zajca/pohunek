@@ -435,6 +435,15 @@ impl SessionRegistry {
         id: &SessionId,
         snapshot: &InspectSnapshot,
     ) -> WorkerMetadataApplyOutcome {
+        #[cfg(test)]
+        if snapshot.phase == RuntimePhase::Running
+            && self
+                .inner
+                .worker_imports_blocked
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return WorkerMetadataApplyOutcome::Retryable(super::WorkerMetadataRetryCause::Commit);
+        }
         let expected_worker_id = snapshot.worker_id.to_string();
         let expected_worker_instance_id = snapshot
             .worker_instance_id
@@ -1016,7 +1025,7 @@ impl SessionRegistry {
         lifecycle: Option<&Lifecycle<'_>>,
         retry: bool,
     ) -> bool {
-        let record = match self.roll_back_undelivered_create(record).await {
+        let mut record = match self.roll_back_undelivered_create(record).await {
             UndeliveredCreate::Proceed(record) => record,
             UndeliveredCreate::Pending(record) => {
                 self.hold_pending_unpersisted(record, retry).await;
@@ -1239,6 +1248,11 @@ impl SessionRegistry {
                 }
             }
         }
+        // A worker that cannot be reached may still have journaled a switch the
+        // daemon never imported; its own generation's journal is the evidence.
+        if let Some(snapshot) = journal.and_then(|journal| journal.snapshot().ok()) {
+            import_native_reference(&mut record, &snapshot);
+        }
         let worker = journal.map(JournalEvidence::worker);
         match classify_unreachable(
             &job,
@@ -1418,6 +1432,9 @@ impl SessionRegistry {
             return true;
         }
         let id = SessionId(record.session_id.clone());
+        if let Some(snapshot) = self.generation_journal_snapshot(&record).await {
+            import_native_reference(&mut record, &snapshot);
+        }
         record.transaction = None;
         record.info.state = SessionState::Stopped;
         record.info.state_source = StateSource::Process;
@@ -2431,6 +2448,24 @@ impl SessionRegistry {
             .map(Option::<&JournalEvidence>::cloned)
     }
 
+    /// The snapshot the journal of exactly `record`'s runtime generation
+    /// stands for, or `None` when that journal is absent, ambiguous or
+    /// unreadable.
+    pub(super) async fn generation_journal_snapshot(
+        &self,
+        record: &SessionRecord,
+    ) -> Option<InspectSnapshot> {
+        let generation = record.runtime.generation.as_deref()?;
+        let journals = self.discover_worker_journals().await.ok()?;
+        let scan = journals.get(record.session_id.as_str())?;
+        scan.journal_of_generation(generation)
+            .ok()
+            .flatten()?
+            .snapshot()
+            .ok()
+    }
+
+    /// Scans every session's worker journals.
     /// Scans every session's worker journals.
     ///
     /// Returns why the scan failed instead of an empty map: a failed scan is
