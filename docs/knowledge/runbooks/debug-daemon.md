@@ -292,7 +292,10 @@ For durable notification issues:
    and nothing was overwritten (rerun the install); `configuration/integration_path_untrusted`
    means an unsafe path shape (symlinked config root, directory, FIFO, wrong
    owner, or group/world-writable parent), and the foreign entry is left as it
-   was. Every file already committed is restored from a snapshot when a later
+   was; `runtime/integration_update_incompatible` means the runtime's hook
+   schema does not admit the new asset set, and nothing was written (the
+   descriptor and the installed release disagree, so update or reinstall the
+   runtime package). Every file already committed is restored from a snapshot when a later
    step fails, including a displaced managed symlink, and a `hooks/` directory the
    install created is removed again when the rollback leaves it empty. When that rollback itself
    cannot restore a file, the error is

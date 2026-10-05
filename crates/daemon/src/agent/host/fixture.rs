@@ -1,5 +1,5 @@
-//! A package-provided, hook-less runtime for tests of the assigned native
-//! reference strategy.
+//! A package-provided runtime for tests of the assigned native reference
+//! strategy; it is hook-less unless a test declares an integration for it.
 //!
 //! The runtime is shaped like Pi: it starts with a caller-chosen id, resumes
 //! with `--session <id>` and forks with `--fork <id>`, and its conversations
@@ -141,6 +141,51 @@ pub(crate) fn pi_shaped_probed_host(program: &Path, existence: &str, probe: &str
         |_name| Ok(Arc::new(generic_shell_manifest().clone())),
     )
     .expect("the probed fixture document is valid");
+    let builtin = BuiltinSource::new("/bin/sh");
+    let fixture = FixtureSource(vec![definition]);
+    let registry =
+        RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
+    RuntimeHost::new(registry)
+}
+
+/// A host serving only the built-in runtimes, with `/bin/sh` as the shell, so
+/// it never reads the process environment.
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn builtin_host() -> RuntimeHost {
+    let registry = RuntimeRegistry::from_sources(&[&BuiltinSource::new("/bin/sh")])
+        .expect("the built-in registry builds");
+    RuntimeHost::new(registry)
+}
+
+/// A host serving the built-in runtimes plus the Pi-shaped fixture declaring
+/// the integration `handler` driving the hook schema `hook_schema`.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid, which would be a
+/// defect of the fixture.
+pub(crate) fn pi_shaped_integration_host(
+    program: &Path,
+    handler: &str,
+    hook_schema: &str,
+) -> RuntimeHost {
+    let document = format!(
+        "{}\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{hook_schema}\"\n",
+        pi_shaped_document(program, PI_SHAPED_NO_CHECK)
+    );
+    let definition = RuntimeDefinition::from_toml(
+        &document,
+        |package| DefinitionOrigin::Package {
+            package,
+            digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),
+        },
+        |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+    )
+    .expect("the integration fixture document is valid");
     let builtin = BuiltinSource::new("/bin/sh");
     let fixture = FixtureSource(vec![definition]);
     let registry =

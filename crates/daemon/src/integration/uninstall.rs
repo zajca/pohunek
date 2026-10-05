@@ -11,21 +11,23 @@ use std::path::Path;
 
 use protocol::{
     IntegrationUninstallReport, IntegrationUninstallResult, IntegrationUninstallState,
-    ProtocolError, RuntimeId, RuntimeRef,
+    ProtocolError, RuntimeRef,
 };
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item};
 
 use super::commit::{self, Action, Committed, Expected, Operation, Outcome, Step, StepGate};
+use super::handler;
 use super::{
-    apply_trust_moves, claude_config_dir, claude_notify_hook_commands, codex_config_dir,
-    codex_managed_hooks, codex_notify_hook_commands, config_dir_is_symlink, config_path_kind,
-    hook_command, is_owned_trust_record, json_pretty, owned_trust_hashes,
-    parse_json_object_or_empty, path_untrusted, remove_owned_command_hooks, settings_invalid,
-    toml_error_summary, trust_rekeys, validate_config_dir, CodexManagedHook, ConfigPath,
-    LoadedFile, OwnedTrustHashes, TrustedDir, HOOK_ACTION, HOOK_RELEASE_ACTION,
-    NOTIFY_HOOK_INSTALL_NAME, STATE_HOOK_INSTALL_NAME, SUBAGENT_START_ACTION, SUBAGENT_STOP_ACTION,
+    apply_trust_moves, claude_notify_hook_commands, codex_managed_hooks,
+    codex_notify_hook_commands, config_dir_is_symlink, config_path_kind, hook_command,
+    is_owned_trust_record, json_pretty, owned_trust_hashes, parse_json_object_or_empty,
+    path_untrusted, remove_owned_command_hooks, settings_invalid, toml_error_summary, trust_rekeys,
+    validate_config_dir, CodexManagedHook, ConfigPath, LoadedFile, OwnedTrustHashes, TrustedDir,
+    HOOK_ACTION, HOOK_RELEASE_ACTION, NOTIFY_HOOK_INSTALL_NAME, STATE_HOOK_INSTALL_NAME,
+    SUBAGENT_START_ACTION, SUBAGENT_STOP_ACTION,
 };
+use crate::agent::host::RuntimeHost;
 
 /// Marker line an installed Claude hook script carries.
 const CLAUDE_OWNERSHIP_MARKER: &str = "# POHUNEK_INTEGRATION_ID=claude";
@@ -33,33 +35,35 @@ const CLAUDE_OWNERSHIP_MARKER: &str = "# POHUNEK_INTEGRATION_ID=claude";
 /// Marker line an installed Codex hook script carries.
 const CODEX_OWNERSHIP_MARKER: &str = "# POHUNEK_INTEGRATION_ID=codex";
 
-/// Remove the managed hooks for one agent.
+/// Remove the managed hooks of one runtime through its integration handler.
 ///
-/// The agent is always named: removal never widens to other agents, so a
-/// failure cannot leave one agent removed and another unreported. An agent
-/// whose config directory is absent, or that holds nothing the installer owns,
+/// The runtime is always named: removal never widens to other runtimes, so a
+/// failure cannot leave one runtime removed and another unreported. A runtime
+/// whose config directory is absent, or that holds nothing the handler owns,
 /// is reported as `not_installed` and left unchanged.
 ///
 /// # Errors
 ///
-/// `agent_not_installable` for the shell runtime and Hermes, a typed
+/// `agent_not_installable` for a runtime without a daemon-run handler, a typed
 /// configuration error for an unresolvable or unsafe config path (including a
 /// symlink), the transaction errors of [`super::commit`], or any underlying I/O
 /// or settings error.
-pub fn uninstall(agent: &RuntimeRef) -> Result<IntegrationUninstallResult, ProtocolError> {
-    let report = match agent.as_wire() {
-        RuntimeId::CLAUDE => uninstall_claude(&claude_config_dir()?)?,
-        RuntimeId::CODEX => uninstall_codex(&codex_config_dir()?)?,
-        unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES) => {
-            return Err(super::status_unsupported(unsupported));
-        }
-        other => {
-            return Err(super::status_unsupported(other));
-        }
-    };
+pub fn uninstall_for(
+    host: &RuntimeHost,
+    agent: &RuntimeRef,
+) -> Result<IntegrationUninstallResult, ProtocolError> {
+    let resolved = handler::resolve(host, agent)?;
+    let dir = resolved.handler.config_dir()?;
+    let report = resolved.handler.uninstall(&resolved.runtime, &dir)?;
     Ok(IntegrationUninstallResult {
         uninstalled: vec![report],
     })
+}
+
+/// [`uninstall_for`] against the built-in runtimes.
+#[cfg(test)]
+pub fn uninstall(agent: &RuntimeRef) -> Result<IntegrationUninstallResult, ProtocolError> {
+    uninstall_for(&crate::agent::host::fixture::builtin_host(), agent)
 }
 
 /// Remove the managed Claude hooks from `claude_dir`.

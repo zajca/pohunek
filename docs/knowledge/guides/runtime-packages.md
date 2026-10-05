@@ -51,6 +51,20 @@ or handler id core does not provide, or whose handler does not drive the schema
 (`descriptor_invalid`), before anything is recorded. A package without
 `[integration]` (Pi) has no schema, and its sessions accept no hook report.
 
+The handler is compiled core code selected by the descriptor's
+`integration.handler`: `pohunek integration install`, `status`, `doctor`, and
+`uninstall` resolve the runtime definition and run the handler it names, never a
+branch on the runtime id. A handler owns exactly one active asset set, the paths
+and modes it may write, conflict detection, rollback, and the commands it may
+run; a package cannot ship shell installers, JSON patch programs, or filesystem
+targets. Re-installing is an update transaction: the handler stages the new
+assets against the active ones without changing them, checks that the hook
+schema admits everything the new set reports
+(`integration_update_incompatible` otherwise), activates atomically, and
+restores the exact prior tree if any step fails, so the old set stays active
+until activation succeeds. `hermes-hook-v1` is registered but its lifecycle runs
+in the CLI; the daemon answers `agent_not_installable` for it.
+
 ## Local only
 
 Package commands act on the daemon on this machine through its local control

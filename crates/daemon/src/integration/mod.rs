@@ -17,10 +17,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
+use pohunek_worker_protocol::HookAction;
 use protocol::{
-    ErrorClass, IntegrationAgentStatus, IntegrationInstallReport, IntegrationInstallResult,
-    IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams, IntegrationStatusResult,
-    ProtocolError, RuntimeId, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
+    ErrorClass, IntegrationAgentStatus, IntegrationInstallReport, IntegrationInstallState,
+    IntegrationRecovery, ProtocolError, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -36,14 +36,23 @@ use pohunek_platform::filesystem::{
 mod commit;
 #[cfg(unix)]
 mod doctor;
+mod handler;
+mod provider_handlers;
 #[cfg(unix)]
 mod quarantine;
 #[cfg(unix)]
 mod uninstall;
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 pub use doctor::doctor;
 #[cfg(unix)]
-pub use uninstall::{uninstall, uninstall_claude, uninstall_codex};
+pub use doctor::doctor_for;
+pub use handler::{install_for, status_for, AssetManifest, DaemonHandler, Handler, StagedUpdate};
+#[cfg(all(test, unix))]
+pub use uninstall::uninstall;
+#[cfg(unix)]
+pub use uninstall::{uninstall_claude, uninstall_codex, uninstall_for};
+#[cfg(all(test, unix))]
+mod handler_tests;
 #[cfg(all(test, unix))]
 mod lifecycle_tests;
 #[cfg(all(test, unix))]
@@ -185,6 +194,23 @@ const INSTALL_LOCK_MODE: u32 = 0o600;
 #[cfg(unix)]
 const INSTALL_IN_PROGRESS_CODE: &str = "integration_install_in_progress";
 
+/// Hook operations the managed Claude asset set reports.
+const CLAUDE_REPORTED_ACTIONS: &[HookAction] = &[
+    HookAction::IdentityReport,
+    HookAction::IdentityRelease,
+    HookAction::SubagentStart,
+    HookAction::SubagentStop,
+    HookAction::Notification,
+];
+/// Hook operations the managed Codex asset set reports. Codex has no session
+/// end hook, so it never reports an identity release.
+const CODEX_REPORTED_ACTIONS: &[HookAction] = &[
+    HookAction::IdentityReport,
+    HookAction::SubagentStart,
+    HookAction::SubagentStop,
+    HookAction::Notification,
+];
+
 /// Env var overriding Claude's config dir (else `~/.claude`).
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Env var overriding Codex's config dir (else `~/.codex`).
@@ -202,79 +228,46 @@ pub struct InstallPaths {
     pub cleanup_incomplete: Vec<String>,
 }
 
-/// Install the `SessionStart` hook for the selected agent(s).
+/// Install the hooks for the selected runtime(s) through their integration
+/// handlers.
 ///
-/// `Some(agent)` installs that agent only and fails fast if its config dir is
-/// absent. `None` installs the hook for every supported agent whose config dir
-/// exists, and errors only if none are present.
-///
-/// # Errors
-///
-/// `agent_not_installable` for the shell runtime, `agent_config_dir_missing`
-/// when a requested (or, for `None`, every) agent config dir is absent, or any
-/// underlying I/O / settings error.
-pub fn install(agent: Option<RuntimeRef>) -> Result<IntegrationInstallResult, ProtocolError> {
-    let installed = match agent {
-        Some(agent) => install_one(&agent)?,
-        None => install_all_present()?,
-    };
-    Ok(IntegrationInstallResult { installed })
-}
-
-/// Installs the hook for the one agent a caller named.
-fn install_one(agent: &RuntimeRef) -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
-    match agent.as_wire() {
-        RuntimeId::CLAUDE => Ok(vec![report(
-            RuntimeRef::claude(),
-            &install_claude(&claude_config_dir()?)?,
-        )]),
-        RuntimeId::CODEX => Ok(vec![report(
-            RuntimeRef::codex(),
-            &install_codex(&codex_config_dir()?)?,
-        )]),
-        RuntimeId::SHELL => Err(ProtocolError::new(
-            ErrorClass::Runtime,
-            "agent_not_installable",
-            "shell sessions have no hook integration",
-            None,
-        )),
-        RuntimeId::HERMES => Err(ProtocolError::new(
-            ErrorClass::Runtime,
-            "agent_not_installable",
-            "Hermes integration is not available in this milestone",
-            None,
-        )),
-        other => Err(status_unsupported(other)),
-    }
-}
-
-/// Inspect managed Codex and Claude hook files without writing anything.
-///
-/// Unsupported agents are rejected so callers cannot mistake an empty report
-/// for "nothing is installed". Missing config directories are reported as
-/// unavailable rather than treated as errors.
+/// `Some(agent)` installs the handler its runtime definition names and fails
+/// fast if that handler's config dir is absent. `None` installs every
+/// daemon-managed handler whose config dir exists, and errors only if none are
+/// present.
 ///
 /// # Errors
 ///
-/// Returns [`ProtocolError`] for unsupported agents or when the agent config
-/// directory cannot be resolved.
-pub fn status(params: IntegrationStatusParams) -> Result<IntegrationStatusResult, ProtocolError> {
-    let IntegrationStatusParams { agent } = params;
-    let agents = match agent.as_ref().map(RuntimeRef::as_wire) {
-        Some(RuntimeId::CLAUDE) => vec![reported_agent_status(StatusAgent::Claude)],
-        Some(RuntimeId::CODEX) => vec![reported_agent_status(StatusAgent::Codex)],
-        Some(unsupported @ (RuntimeId::SHELL | RuntimeId::HERMES)) => {
-            return Err(status_unsupported(unsupported));
-        }
-        Some(other) => {
-            return Err(status_unsupported(other));
-        }
-        None => vec![
-            reported_agent_status(StatusAgent::Claude),
-            reported_agent_status(StatusAgent::Codex),
-        ],
-    };
-    Ok(IntegrationStatusResult { agents })
+/// `agent_not_installable` for a runtime without a daemon-run handler,
+/// `agent_config_dir_missing` when a requested (or, for `None`, every) config
+/// dir is absent, `integration_update_incompatible` when the new asset set is
+/// not compatible with the active one, or any underlying I/O / settings error.
+#[cfg(test)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the owned argument is the established test entry-point shape"
+)]
+pub fn install(
+    agent: Option<RuntimeRef>,
+) -> Result<protocol::IntegrationInstallResult, ProtocolError> {
+    handler::install_for(&crate::agent::host::fixture::builtin_host(), agent.as_ref())
+}
+
+/// Inspect the managed hook files of the selected runtime(s) without writing
+/// anything.
+///
+/// Runtimes without a daemon-run handler are rejected so callers cannot
+/// mistake an empty report for "nothing is installed". Missing config
+/// directories are reported as unavailable rather than treated as errors.
+///
+/// # Errors
+///
+/// Returns [`ProtocolError`] for runtimes without a daemon-run handler.
+#[cfg(test)]
+pub fn status(
+    params: protocol::IntegrationStatusParams,
+) -> Result<protocol::IntegrationStatusResult, ProtocolError> {
+    handler::status_for(&crate::agent::host::fixture::builtin_host(), params)
 }
 
 /// Degrade one supported agent's config-resolution failure into a warning.
@@ -299,6 +292,11 @@ fn reported_agent_status(agent: StatusAgent) -> IntegrationAgentStatus {
     }
 }
 
+/// The provider whose managed asset set an inspection or install operates on.
+///
+/// Only the Claude and Codex handlers use it, to parameterize their shared
+/// inspection code; dispatch between runtimes goes through the handler
+/// registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusAgent {
     Claude,
@@ -312,18 +310,14 @@ impl StatusAgent {
             Self::Codex => RuntimeRef::codex(),
         }
     }
-}
 
-/// `agent_not_installable` for an agent whose runtime is installed but has no
-/// daemon-managed hook integration. Callers validate the runtime against the
-/// registry first, so a non-installed or historical value never reaches it.
-fn status_unsupported(agent: &str) -> ProtocolError {
-    ProtocolError::new(
-        ErrorClass::Runtime,
-        "agent_not_installable",
-        format!("{agent} has no daemon-managed hook integration"),
-        None,
-    )
+    /// Recovery hint for a missing provider config directory.
+    fn missing_config_hint(self) -> &'static str {
+        match self {
+            Self::Claude => "install Claude Code first",
+            Self::Codex => "install Codex first",
+        }
+    }
 }
 
 /// Build one supported agent's read-only status report.
@@ -1597,38 +1591,6 @@ fn registration_metadata_current(
     }
 }
 
-/// Install for every supported agent whose config dir exists.
-fn install_all_present() -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
-    let mut installed = Vec::new();
-    let claude_dir = claude_config_dir()?;
-    if config_path_kind(&claude_dir) == ConfigPath::Symlink {
-        return Err(config_dir_is_symlink(&claude_dir));
-    }
-    if claude_dir.is_dir() {
-        installed.push(report(RuntimeRef::claude(), &install_claude(&claude_dir)?));
-    }
-    let codex_dir = codex_config_dir()?;
-    if config_path_kind(&codex_dir) == ConfigPath::Symlink {
-        return Err(config_dir_is_symlink(&codex_dir));
-    }
-    if codex_dir.is_dir() {
-        installed.push(report(RuntimeRef::codex(), &install_codex(&codex_dir)?));
-    }
-    if installed.is_empty() {
-        return Err(ProtocolError::new(
-            ErrorClass::Runtime,
-            "agent_config_dir_missing",
-            format!(
-                "no agent config dir found (looked for {} and {})",
-                claude_dir.display(),
-                codex_dir.display()
-            ),
-            Some("install Claude Code or Codex first".to_owned()),
-        ));
-    }
-    Ok(installed)
-}
-
 fn report(agent: RuntimeRef, paths: &InstallPaths) -> IntegrationInstallReport {
     IntegrationInstallReport {
         agent,
@@ -1672,16 +1634,40 @@ fn install_claude_gated(
     claude_dir: &Path,
     gate: StepGate<'_>,
 ) -> Result<InstallPaths, ProtocolError> {
+    stage_claude(claude_dir)?.commit_install(gate)
+}
+
+/// A Claude asset set computed against the current config directory and held
+/// under the installer lock.
+///
+/// Nothing in the config directory has changed: the hooks directory is created
+/// and every file written only by [`StagedClaude::commit_install`].
+#[derive(Debug)]
+struct StagedClaude {
+    config_root: TrustedDir,
+    hooks_dir: PathBuf,
+    trusted_hooks: Option<TrustedDir>,
+    hook_path: PathBuf,
+    settings_path: PathBuf,
+    settings_file: Option<LoadedFile>,
+    settings_mode: u32,
+    settings_body: String,
+    manifest: AssetManifest,
+    _install_lock: InstallerLock,
+}
+
+/// Computes the Claude asset set for `claude_dir` without changing it.
+fn stage_claude(claude_dir: &Path) -> Result<StagedClaude, ProtocolError> {
     validate_config_dir(claude_dir.to_path_buf(), "Claude config directory")?;
     if config_path_kind(claude_dir) == ConfigPath::Symlink {
         return Err(config_dir_is_symlink(claude_dir));
     }
     if !claude_dir.is_dir() {
-        return Err(config_dir_missing(&RuntimeRef::claude(), claude_dir));
+        return Err(config_dir_missing(StatusAgent::Claude, claude_dir));
     }
 
     let config_root = TrustedDir::open(claude_dir, "Claude config directory")?;
-    let _install_lock = config_root.lock_installer()?;
+    let install_lock = config_root.lock_installer()?;
     let hooks_dir = claude_dir.join("hooks");
     let trusted_hooks = config_root.open_child("hooks", "Claude hooks directory")?;
     let hook_path = hooks_dir.join(STATE_HOOK_INSTALL_NAME);
@@ -1698,72 +1684,125 @@ fn install_claude_gated(
     )?;
     merge_claude_hooks(&mut settings, &settings_path, &hook_path, &notify_hook_path)?;
     let settings_body = json_pretty(&settings_path, &settings)?;
-
-    let created_hooks = trusted_hooks.is_none();
-    let trusted_hooks = match trusted_hooks {
-        Some(hooks) => hooks,
-        None => {
-            config_root.create_child("hooks", "Claude hooks directory", MANAGED_HOOK_DIR_MODE)?
-        }
+    let manifest = AssetManifest {
+        version: EXPECTED_INTEGRATION_VERSION,
+        active_version: active_version(
+            trusted_hooks.as_ref(),
+            STATE_HOOK_INSTALL_NAME,
+            "Claude state hook",
+        ),
+        actions: CLAUDE_REPORTED_ACTIONS,
     };
-    let steps = [
-        Step {
-            dir: &trusted_hooks,
-            name: STATE_HOOK_INSTALL_NAME,
-            label: "Claude state hook",
-            action: Action::Write {
-                body: CLAUDE_HOOK_ASSET,
-                mode: MANAGED_HOOK_MODE,
+
+    Ok(StagedClaude {
+        config_root,
+        hooks_dir,
+        trusted_hooks,
+        hook_path,
+        settings_path,
+        settings_file,
+        settings_mode,
+        settings_body,
+        manifest,
+        _install_lock: install_lock,
+    })
+}
+
+impl StagedClaude {
+    /// Activates the staged set: scripts first, registration last, as one
+    /// rollback-capable transaction.
+    fn commit_install(self, gate: StepGate<'_>) -> Result<InstallPaths, ProtocolError> {
+        let Self {
+            config_root,
+            hooks_dir,
+            trusted_hooks,
+            hook_path,
+            settings_path,
+            settings_file,
+            settings_mode,
+            settings_body,
+            _install_lock,
+            ..
+        } = self;
+        let created_hooks = trusted_hooks.is_none();
+        let trusted_hooks = match trusted_hooks {
+            Some(hooks) => hooks,
+            None => config_root.create_child(
+                "hooks",
+                "Claude hooks directory",
+                MANAGED_HOOK_DIR_MODE,
+            )?,
+        };
+        let steps = [
+            Step {
+                dir: &trusted_hooks,
+                name: STATE_HOOK_INSTALL_NAME,
+                label: "Claude state hook",
+                action: Action::Write {
+                    body: CLAUDE_HOOK_ASSET,
+                    mode: MANAGED_HOOK_MODE,
+                },
+                expected: Expected::Any,
             },
-            expected: Expected::Any,
-        },
-        Step {
-            dir: &trusted_hooks,
-            name: NOTIFY_HOOK_INSTALL_NAME,
-            label: "Claude notification hook",
-            action: Action::Write {
-                body: CLAUDE_NOTIFY_HOOK_ASSET,
-                mode: MANAGED_HOOK_MODE,
+            Step {
+                dir: &trusted_hooks,
+                name: NOTIFY_HOOK_INSTALL_NAME,
+                label: "Claude notification hook",
+                action: Action::Write {
+                    body: CLAUDE_NOTIFY_HOOK_ASSET,
+                    mode: MANAGED_HOOK_MODE,
+                },
+                expected: Expected::Any,
             },
-            expected: Expected::Any,
-        },
-        Step {
-            dir: &config_root,
-            name: "settings.json",
-            label: "Claude settings.json",
-            action: Action::Write {
-                body: &settings_body,
-                mode: settings_mode,
+            Step {
+                dir: &config_root,
+                name: "settings.json",
+                label: "Claude settings.json",
+                action: Action::Write {
+                    body: &settings_body,
+                    mode: settings_mode,
+                },
+                expected: Expected::Loaded(settings_file.as_ref()),
             },
-            expected: Expected::Loaded(settings_file.as_ref()),
-        },
-    ];
-    let committed = commit::commit(&steps, gate, commit::Operation::Install);
-    if let Err(error) = &committed {
-        // A directory this install created is removed again once the rollback
-        // left it empty; after an incomplete rollback it stays for inspection.
-        if created_hooks && error.code != commit::RECOVERY_REQUIRED_CODE {
-            if let Err(quarantine) = config_root.remove_created_empty_child("hooks", &trusted_hooks)
-            {
-                return Err(commit::recovery_required(
-                    &[format!(
-                        "{} (the created hooks directory and any files in it stay at {})",
-                        hooks_dir.display(),
-                        quarantine.display()
-                    )],
-                    Some(&error.code),
-                    commit::Operation::Install,
-                ));
+        ];
+        let committed = commit::commit(&steps, gate, commit::Operation::Install);
+        if let Err(error) = &committed {
+            // A directory this install created is removed again once the rollback
+            // left it empty; after an incomplete rollback it stays for inspection.
+            if created_hooks && error.code != commit::RECOVERY_REQUIRED_CODE {
+                if let Err(quarantine) =
+                    config_root.remove_created_empty_child("hooks", &trusted_hooks)
+                {
+                    return Err(commit::recovery_required(
+                        &[format!(
+                            "{} (the created hooks directory and any files in it stay at {})",
+                            hooks_dir.display(),
+                            quarantine.display()
+                        )],
+                        Some(&error.code),
+                        commit::Operation::Install,
+                    ));
+                }
             }
         }
-    }
-    let committed = committed?;
+        let committed = committed?;
 
-    Ok(InstallPaths {
-        hook_path,
-        config_paths: vec![settings_path],
-        cleanup_incomplete: committed.cleanup_incomplete,
-    })
+        Ok(InstallPaths {
+            hook_path,
+            config_paths: vec![settings_path],
+            cleanup_incomplete: committed.cleanup_incomplete,
+        })
+    }
+}
+
+/// Version marker of the active managed state hook in `dir`, when one is
+/// readable and carries a valid marker.
+///
+/// A script that cannot be read safely has no known version; the commit step
+/// that replaces it decides what happens to it.
+fn active_version(dir: Option<&TrustedDir>, name: &str, label: &str) -> Option<u32> {
+    let file = dir?.read_optional(name, label).ok().flatten()?;
+    parse_integration_version(&file.content)
 }
 
 /// Merges the managed Claude hook registrations into `settings`.
@@ -1842,24 +1881,50 @@ pub fn install_codex(codex_dir: &Path) -> Result<InstallPaths, ProtocolError> {
 }
 
 /// [`install_codex`] with a gate run before each committed file.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Codex hook and trust registration is one atomic configuration transaction"
-)]
 fn install_codex_gated(
     codex_dir: &Path,
     gate: StepGate<'_>,
 ) -> Result<InstallPaths, ProtocolError> {
+    stage_codex(codex_dir)?.commit_install(gate)
+}
+
+/// A Codex asset set computed against the current config directory and held
+/// under the installer lock.
+///
+/// Nothing in the config directory has changed: every file is written only by
+/// [`StagedCodex::commit_install`].
+#[derive(Debug)]
+struct StagedCodex {
+    config_root: TrustedDir,
+    hook_path: PathBuf,
+    hooks_path: PathBuf,
+    hooks_source: Option<LoadedFile>,
+    hooks_mode: u32,
+    hooks_body: String,
+    config_path: PathBuf,
+    config_source: Option<LoadedFile>,
+    config_mode: u32,
+    config_body: String,
+    manifest: AssetManifest,
+    _install_lock: InstallerLock,
+}
+
+/// Computes the Codex asset set for `codex_dir` without changing it.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Codex hook and trust registration is one atomic configuration transaction"
+)]
+fn stage_codex(codex_dir: &Path) -> Result<StagedCodex, ProtocolError> {
     validate_config_dir(codex_dir.to_path_buf(), "Codex config directory")?;
     if config_path_kind(codex_dir) == ConfigPath::Symlink {
         return Err(config_dir_is_symlink(codex_dir));
     }
     if !codex_dir.is_dir() {
-        return Err(config_dir_missing(&RuntimeRef::codex(), codex_dir));
+        return Err(config_dir_missing(StatusAgent::Codex, codex_dir));
     }
 
     let config_root = TrustedDir::open(codex_dir, "Codex config directory")?;
-    let _install_lock = config_root.lock_installer()?;
+    let install_lock = config_root.lock_installer()?;
     let hook_path = codex_dir.join(STATE_HOOK_INSTALL_NAME);
     let notify_hook_path = codex_dir.join(NOTIFY_HOOK_INSTALL_NAME);
 
@@ -1934,74 +1999,121 @@ fn install_codex_gated(
         &trust_moves,
     )?;
     let hooks_body = json_pretty(&hooks_path, &hooks_file)?;
-
-    // An unchanged config.toml is still an input of this install's decisions, so
-    // it is verified before any destructive step and again right before the
-    // registration step; a changed one is written with its exact expectation.
-    let config_unchanged = updated == existing;
-    let verify_config = || Step {
-        dir: &config_root,
-        name: "config.toml",
-        label: "Codex config.toml",
-        action: Action::Verify,
-        expected: Expected::Loaded(config_source.as_ref()),
+    let manifest = AssetManifest {
+        version: EXPECTED_INTEGRATION_VERSION,
+        active_version: active_version(
+            Some(&config_root),
+            STATE_HOOK_INSTALL_NAME,
+            "Codex state hook",
+        ),
+        actions: CODEX_REPORTED_ACTIONS,
     };
-    let mut steps = Vec::new();
-    if config_unchanged {
-        steps.push(verify_config());
-    }
-    steps.push(Step {
-        dir: &config_root,
-        name: STATE_HOOK_INSTALL_NAME,
-        label: "Codex state hook",
-        action: Action::Write {
-            body: CODEX_HOOK_ASSET,
-            mode: MANAGED_HOOK_MODE,
-        },
-        expected: Expected::Any,
-    });
-    steps.push(Step {
-        dir: &config_root,
-        name: NOTIFY_HOOK_INSTALL_NAME,
-        label: "Codex notification hook",
-        action: Action::Write {
-            body: CODEX_NOTIFY_HOOK_ASSET,
-            mode: MANAGED_HOOK_MODE,
-        },
-        expected: Expected::Any,
-    });
-    if config_unchanged {
-        steps.push(verify_config());
-    }
-    steps.push(Step {
-        dir: &config_root,
-        name: "hooks.json",
-        label: "Codex hooks.json",
-        action: Action::Write {
-            body: &hooks_body,
-            mode: hooks_mode,
-        },
-        expected: Expected::Loaded(hooks_source.as_ref()),
-    });
-    if !config_unchanged {
-        steps.push(Step {
+
+    Ok(StagedCodex {
+        config_root,
+        hook_path,
+        hooks_path,
+        hooks_source,
+        hooks_mode,
+        hooks_body,
+        config_path,
+        config_source,
+        config_mode,
+        config_body: updated,
+        manifest,
+        _install_lock: install_lock,
+    })
+}
+
+impl StagedCodex {
+    /// Activates the staged set: scripts first, registration last, as one
+    /// rollback-capable transaction.
+    fn commit_install(self, gate: StepGate<'_>) -> Result<InstallPaths, ProtocolError> {
+        let Self {
+            config_root,
+            hook_path,
+            hooks_path,
+            hooks_source,
+            hooks_mode,
+            hooks_body,
+            config_path,
+            config_source,
+            config_mode,
+            config_body: updated,
+            _install_lock,
+            ..
+        } = self;
+        let existing = config_source
+            .as_ref()
+            .map_or("", |file| file.content.as_str());
+        // An unchanged config.toml is still an input of this install's decisions, so
+        // it is verified before any destructive step and again right before the
+        // registration step; a changed one is written with its exact expectation.
+        let config_unchanged = updated == existing;
+        let verify_config = || Step {
             dir: &config_root,
             name: "config.toml",
             label: "Codex config.toml",
-            action: Action::Write {
-                body: &updated,
-                mode: config_mode,
-            },
+            action: Action::Verify,
             expected: Expected::Loaded(config_source.as_ref()),
+        };
+        let mut steps = Vec::new();
+        if config_unchanged {
+            steps.push(verify_config());
+        }
+        steps.push(Step {
+            dir: &config_root,
+            name: STATE_HOOK_INSTALL_NAME,
+            label: "Codex state hook",
+            action: Action::Write {
+                body: CODEX_HOOK_ASSET,
+                mode: MANAGED_HOOK_MODE,
+            },
+            expected: Expected::Any,
         });
-    }
-    let committed = commit::commit(&steps, gate, commit::Operation::Install)?;
+        steps.push(Step {
+            dir: &config_root,
+            name: NOTIFY_HOOK_INSTALL_NAME,
+            label: "Codex notification hook",
+            action: Action::Write {
+                body: CODEX_NOTIFY_HOOK_ASSET,
+                mode: MANAGED_HOOK_MODE,
+            },
+            expected: Expected::Any,
+        });
+        if config_unchanged {
+            steps.push(verify_config());
+        }
+        steps.push(Step {
+            dir: &config_root,
+            name: "hooks.json",
+            label: "Codex hooks.json",
+            action: Action::Write {
+                body: &hooks_body,
+                mode: hooks_mode,
+            },
+            expected: Expected::Loaded(hooks_source.as_ref()),
+        });
+        if !config_unchanged {
+            steps.push(Step {
+                dir: &config_root,
+                name: "config.toml",
+                label: "Codex config.toml",
+                action: Action::Write {
+                    body: &updated,
+                    mode: config_mode,
+                },
+                expected: Expected::Loaded(config_source.as_ref()),
+            });
+        }
+        let committed = commit::commit(&steps, gate, commit::Operation::Install)?;
 
-    Ok(InstallPaths {
-        hook_path,
-        config_paths: vec![hooks_path, config_path],
-        cleanup_incomplete: committed.cleanup_incomplete,
-    })
+        Ok(InstallPaths {
+            hook_path,
+            config_paths: vec![hooks_path, config_path],
+            cleanup_incomplete: committed.cleanup_incomplete,
+        })
+    }
 }
 
 struct CodexManagedHook {
@@ -2914,24 +3026,16 @@ fn json_pretty(path: &Path, value: &Value) -> Result<String, ProtocolError> {
         .map_err(|error| settings_invalid(path, &format!("could not serialize settings: {error}")))
 }
 
-fn config_dir_missing(agent: &RuntimeRef, dir: &Path) -> ProtocolError {
-    let (name, hint) = match agent.as_wire() {
-        RuntimeId::CLAUDE => ("claude", "install Claude Code first"),
-        RuntimeId::CODEX => ("codex", "install Codex first"),
-        RuntimeId::SHELL => ("shell", "shells have no hook integration"),
-        RuntimeId::HERMES => (
-            "hermes",
-            "Hermes integration is not available in this milestone",
-        ),
-        other => {
-            return status_unsupported(other);
-        }
-    };
+fn config_dir_missing(agent: StatusAgent, dir: &Path) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Runtime,
         "agent_config_dir_missing",
-        format!("{name} config dir not found at {}", dir.display()),
-        Some(hint.to_owned()),
+        format!(
+            "{} config dir not found at {}",
+            agent.kind().as_wire(),
+            dir.display()
+        ),
+        Some(agent.missing_config_hint().to_owned()),
     )
 }
 
