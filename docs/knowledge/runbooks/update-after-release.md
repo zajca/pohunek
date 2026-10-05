@@ -94,6 +94,25 @@ protocol constant that changed (`STORE_SCHEMA_VERSION`, `PROTOCOL_VERSION`,
 `PREVIOUS_VERSION`, `WORKER_JOURNAL_SCHEMA_VERSION`,
 `EXPECTED_INTEGRATION_VERSION`); read those lines before updating.
 
+A session launched from a host profile by a previous release that did not
+freeze the profile revision has none recorded, so after the upgrade a plain `pohunek session resume <id>` of it
+fails with `agent_profile_changed` ("no recorded revision"). Resume it with
+`pohunek session resume <id> --accept-profile-change`: the relaunch uses
+the current profile and freezes its revision, and later plain resumes work. The
+local daemon honors the flag; a remote host refuses it.
+
+CI proves the window on every change to the daemon, worker, protocol, or CLI
+crates and on every release tag: the `upgrade` workflow installs the previous
+release's published binaries, starts a session whose fake agent runs that
+release's managed hooks, upgrades the service to the new build with
+`pohunek service check` and `pohunek service upgrade`, and asserts that the
+same worker keeps the session live, `screen`, `input`, hook reports and
+notifications still work, `stop` then `resume --accept-profile-change`
+relaunch with the native reference (a plain `resume` is refused first), and the previous release's own CLI still talks to the new daemon.
+A failure there means a live session would not survive the upgrade; fix it
+before releasing. The run keeps the previous release's store and protocol
+outputs as the `upgrade-goldens-<tag>` artifact.
+
 On its first start after an update the daemon migrates an older store before
 it serves anything and first copies the original to
 `<data_dir>/metadata.jsonl.pre-schema-<old>`, where `<old>` is the oldest

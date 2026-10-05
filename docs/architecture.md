@@ -630,6 +630,10 @@ states the contract and then the current state.
   upgrade ([#527](https://github.com/zajca/pohunek/issues/527)). Mechanics, rules and
   fixtures are under "Protocol window and edge adapters" above.
 - **Persisted daemon state.** Migrates from any older kept schema (see below).
+  A session launched from a host profile by an N-1 that did not freeze the
+  profile revision carries none, so after the upgrade it resumes only with `session resume
+  --accept-profile-change`; a plain resume fails with `agent_profile_changed`,
+  and the accepted relaunch freezes the current revision.
 
 Everything else stays unshimmed. A record that cannot be migrated or adopted is
 logged at WARN, surfaced to the operator, and carries a recovery hint.

@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+# Upgrade test: a session started on the previous release's published
+# binaries survives `pohunek service upgrade` to this build's binaries.
+#
+# usage: scripts/upgrade-test --previous <vX.Y.Z|latest> --head-dir DIR \
+#          --repo OWNER/NAME --cache-dir DIR --artifacts-dir DIR \
+#          (--create-account | --current-user) [--exclude-tag TAG] [--keep-account]
+#        scripts/upgrade-test --previous <vX.Y.Z|latest> --repo OWNER/NAME \
+#          [--exclude-tag TAG] --resolve-only
+#
+#   --previous        Release tag to install first, or `latest` for the newest
+#                     published release (the tag chosen is printed).
+#   --head-dir        Source checkout whose binaries are the upgrade target.
+#                     This script and the test it runs always come from the
+#                     checkout containing this script, so an older tree can be
+#                     the target.
+#   --repo            GitHub repository the releases are downloaded from.
+#   --cache-dir       Download cache of release archives. The checksum file is
+#                     fetched on every run and the archive is verified against
+#                     it, so a cached archive is never trusted unchecked.
+#   --artifacts-dir   Receives `test-output/` (the previous release's store,
+#                     worker journals, service.toml, and `--json` outputs, the
+#                     fixture goldens, plus one record per CLI call) and, on
+#                     failure, `diagnostics/`. Everything is collected in a
+#                     directory only the invoking account can enter and copied
+#                     here at the end.
+#   --create-account  Run as a throwaway local account (see Isolation). One of
+#                     --create-account and --current-user is required.
+#   --current-user    CI mode: run as the invoking user against that user's own
+#                     systemd user manager, with the normal ~/.config,
+#                     ~/.local and runtime directories, like the
+#                     `systemd-supervision` CI job. Refused unless CI=true and
+#                     GITHUB_ACTIONS=true, because a hosted runner is
+#                     disposable and a developer's machine is not. The service,
+#                     state and config the test leaves are removed on exit.
+#   --exclude-tag     With `latest`, select the greatest published release below
+#                     this tag instead of the newest one (the release under test when
+#                     the script runs from its own release tag).
+#   --keep-account    Leave the account and the staging directory for inspection.
+#   --resolve-only    Print the resolved previous tag on stdout and exit; no other
+#                     flag is needed and nothing is downloaded or created.
+#
+# Isolation (--create-account): the released binaries use the default layout of the account that
+# runs them ($HOME/.config, $HOME/.local) and the user's systemd manager, so
+# the only way to keep a real installation out of reach is another account.
+# The script creates a throwaway account with sudo, starts its user manager
+# (loginctl enable-linger), runs the test as that account with a minimal
+# environment, then terminates the manager and deletes the account and its
+# home. Nothing of the invoking account's pohunek installation, XDG
+# directories, or systemd manager is read or written. It needs passwordless
+# sudo, systemd, and a Linux x86_64 host.
+#
+# Stages: resolve and download the previous release (checksum verified) ->
+# build the test binary from this checkout -> build the target binaries from
+# --head-dir -> run the test in the throwaway account. When the target's
+# version equals the previous release's, the target is built with a
+# `+upgrade.<commit>` build-metadata suffix (Cargo.toml and Cargo.lock are
+# restored afterwards): an upgrade to an identical version is a no-op.
+
+set -euo pipefail
+
+# Release asset target. Only Linux x86_64 release assets are exercised.
+readonly TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+# Name of the ignored integration test in crates/cli/tests/release_upgrade.rs.
+readonly TEST_NAME="previous_release_session_survives_the_upgrade_to_head"
+# Binaries one daemon archive and one build contain.
+readonly BINARIES=(pohunek pohunekd pohunek-sessiond)
+# Account name prefix; useradd limits names to 32 characters.
+readonly ACCOUNT_PREFIX="phkupg"
+# Lines of each journal kept in the failure diagnostics.
+readonly JOURNAL_LINES=400
+# Upper bound, in half-second polls, on the throwaway account's session bus
+# socket appearing after its user manager is started. A hang guard, not a
+# tuned value: a healthy manager creates the socket within a few seconds.
+readonly BUS_WAIT_POLLS=60
+# Interval between those polls.
+readonly BUS_POLL_SECONDS=0.5
+
+fail() {
+  printf 'upgrade-test: %s\n' "$*" >&2
+  exit 1
+}
+
+info() { printf 'upgrade-test: %s\n' "$*" >&2; }
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
+}
+
+previous=""
+head_dir=""
+repo=""
+cache_dir=""
+artifacts_dir=""
+create_account=false
+current_user=false
+exclude_tag=""
+keep_account=false
+resolve_only=false
+
+# State the cleanup trap reads. `created_account` becomes 1 only after this run's
+# `useradd` succeeded; every destructive account step is conditional on it, so a
+# name that already existed is never terminated or deleted.
+user=""
+uid=""
+home=""
+created_account=0
+staging=""
+collect_dir=""
+out_dir=""
+manifest_backup=""
+manifest_modified=0
+
+# The only entry point for commands that need privileges.
+priv() { sudo "$@"; }
+
+# Copies Cargo.toml and Cargo.lock of $head_dir aside. `manifest_backup` is set
+# only when both copies succeeded, so a partial backup is never restored.
+backup_manifests() {
+  local dir
+  dir=$(mktemp -d) || return 1
+  if cp "$head_dir/Cargo.toml" "$dir/" && cp "$head_dir/Cargo.lock" "$dir/"; then
+    manifest_backup=$dir
+  else
+    rm -rf "$dir"
+    return 1
+  fi
+}
+
+# Puts the originals back, and only when a complete backup exists and the
+# originals were actually modified. The flag and the backup are cleared only
+# after both copies succeeded; otherwise the backup stays and its location is
+# reported.
+restore_manifests() {
+  [ -n "$manifest_backup" ] || return 0
+  if [ "$manifest_modified" = 1 ]; then
+    if ! { cp "$manifest_backup/Cargo.toml" "$head_dir/Cargo.toml" &&
+      cp "$manifest_backup/Cargo.lock" "$head_dir/Cargo.lock"; }; then
+      info "could not restore Cargo.toml and Cargo.lock; the originals are kept in $manifest_backup"
+      return 1
+    fi
+    manifest_modified=0
+  fi
+  rm -rf "$manifest_backup"
+  manifest_backup=""
+}
+
+# Reads vX.Y.Z tags on stdin and prints the greatest one strictly below $1
+# (version order, not list order); prints nothing when there is none.
+greatest_below() {
+  local target=$1 tag best=""
+  while IFS= read -r tag; do
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    [ "$tag" != "$target" ] || continue
+    [ "$(printf '%s\n%s\n' "$tag" "$target" | sort -V | head -n 1)" = "$tag" ] || continue
+    if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best" "$tag" | sort -V | tail -n 1)" = "$tag" ]; then
+      best=$tag
+    fi
+  done
+  printf '%s' "$best"
+}
+
+# Published, non-draft, non-prerelease tags of $repo, one per line.
+list_release_tags() {
+  gh release list --repo "$repo" --exclude-drafts --exclude-pre-releases \
+    --limit 100 --json tagName --jq '.[].tagName'
+}
+
+# Whether the account database already knows $1.
+account_exists() { getent passwd "$1" >/dev/null 2>&1; }
+
+# Throwaway account names are the prefix and digits, nothing else.
+valid_account_name() {
+  [[ "$1" =~ ^${ACCOUNT_PREFIX}[0-9]+$ ]] && [ "${#1}" -le 32 ]
+}
+
+# Runs a command as the account that executes the test.
+as_user() {
+  if [ "$current_user" = true ]; then
+    (cd "$staging" && env -i \
+      "HOME=$HOME" \
+      "PATH=$PATH" \
+      "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" \
+      "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}" \
+      "$@")
+  else
+    (cd "$staging" && priv -u "$user" -H env -i \
+      "HOME=$home" \
+      "PATH=/usr/local/bin:/usr/bin:/bin" \
+      "XDG_RUNTIME_DIR=/run/user/$uid" \
+      "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+      "$@")
+  fi
+}
+
+# Creates the throwaway account, or fails without touching anything when the
+# generated name is malformed or already exists.
+create_account_user() {
+  local candidate="$ACCOUNT_PREFIX$RANDOM$RANDOM"
+  valid_account_name "$candidate" || fail "generated account name is malformed: $candidate"
+  if id "$candidate" >/dev/null 2>&1 || account_exists "$candidate"; then
+    fail "account $candidate already exists; nothing was changed"
+  fi
+  info "creating throwaway account $candidate"
+  priv useradd --create-home --shell /bin/bash --user-group "$candidate"
+  created_account=1
+  user=$candidate
+  uid=$(id -u "$user")
+  home=$(getent passwd "$user" | cut -d: -f6)
+  [ -d "$home" ] || fail "account $user has no home directory"
+}
+
+# Writes what is needed to diagnose a failure to $collect_dir/diagnostics, a
+# directory this invoking account created: unit status and journals,
+# service.toml, the transaction journal and state listing, and the account
+# manager's state. Every command is best effort.
+collect_diagnostics() {
+  local out="$collect_dir/diagnostics"
+  mkdir -p -m 700 "$out"
+  [ "$current_user" = true ] || [ "$created_account" = 1 ] || return 0
+  local layout_home=$HOME
+  [ "$current_user" = true ] || layout_home=$home
+  as_user systemctl --user list-units --all --no-pager 'pohunek*' >"$out/units.txt" 2>&1
+  as_user systemctl --user status --no-pager --lines "$JOURNAL_LINES" 'pohunek*' >"$out/unit-status.txt" 2>&1
+  as_user journalctl --user --no-pager --lines "$JOURNAL_LINES" >"$out/user-journal.txt" 2>&1
+  as_user cat "$layout_home/.config/pohunek/service.toml" >"$out/service.toml" 2>&1
+  as_user find "$layout_home/.config/pohunek" "$layout_home/.local/share/pohunek" \
+    "$layout_home/.local/state/pohunek" -maxdepth 4 -not -path '*/host/*' -ls >"$out/layout.txt" 2>&1
+  # The service transaction journal lives in the state directory; copy every
+  # small file there that names a transaction, never the host key directory.
+  as_user sh -c 'for f in $(find "$1" -maxdepth 4 -type f \( -name "*transaction*" -o -name "*.record" \) -not -path "*/host/*" 2>/dev/null); do echo "== $f"; cat "$f"; done' sh \
+    "$layout_home/.local/state/pohunek" >"$out/transaction.txt" 2>&1
+  if [ "$current_user" = false ] && [ "$created_account" = 1 ]; then
+    priv systemctl status "user@$uid.service" --no-pager >"$out/user-manager-status.txt" 2>&1
+    priv journalctl -u "user@$uid.service" --no-pager --lines "$JOURNAL_LINES" >"$out/user-manager-journal.txt" 2>&1
+    priv loginctl user-status "$user" --no-pager >"$out/loginctl-user-status.txt" 2>&1
+  fi
+}
+
+# Uninstalls what the test left behind. --current-user runs in the runner's own
+# account, so the service, its state and the fake agent are removed here, with
+# the HEAD CLI the test upgraded to (the previous CLI when the upgrade never ran).
+current_user_cleanup() {
+  local cli=$staging/head/pohunek
+  [ -x "$cli" ] || return 0
+  as_user "$cli" service uninstall --stop-sessions --purge >/dev/null 2>&1 ||
+    as_user "$staging/previous/pohunek" service uninstall --stop-sessions --purge >/dev/null 2>&1
+  as_user systemctl --user stop 'pohunek*.slice' >/dev/null 2>&1
+  rm -rf "$HOME/.claude" "$HOME/fake-agent" "$HOME/.config/pohunek" \
+    "$HOME/.local/share/pohunek" "$HOME/.local/state/pohunek" "$HOME/.local/libexec/pohunek"
+}
+
+# Removes the throwaway account. Does nothing unless this run created it.
+account_cleanup() {
+  [ "$created_account" = 1 ] || return 0
+  valid_account_name "$user" || return 0
+  priv loginctl terminate-user "$user" 2>/dev/null
+  priv loginctl disable-linger "$user" 2>/dev/null
+  [ -z "$uid" ] || priv systemctl stop "user@$uid.service" 2>/dev/null
+  priv userdel --remove "$user" 2>/dev/null || info "could not delete account $user"
+}
+
+# Moves the test's output out of the account-owned directory into the one this
+# account created. Only the throwaway account can read its own directory.
+fetch_account_output() {
+  [ "$created_account" = 1 ] && [ -d "$out_dir" ] || return 0
+  mkdir -p -m 700 "$collect_dir/test-output"
+  as_user tar -C "$out_dir" -cf - . |
+    tar -xf - --no-same-owner --no-same-permissions -C "$collect_dir/test-output"
+}
+
+cleanup() {
+  local status=$?
+  set +e
+  if [ "$status" -ne 0 ] && [ -n "$collect_dir" ]; then
+    collect_diagnostics
+  fi
+  restore_manifests
+  fetch_account_output
+  if [ -n "$collect_dir" ] && [ -n "$artifacts_dir" ] && [ -d "$collect_dir" ]; then
+    cp -r --no-dereference "$collect_dir/." "$artifacts_dir/"
+  fi
+  if [ "$keep_account" = true ]; then
+    info "kept account '${user:-none}', $staging and $collect_dir"
+    exit "$status"
+  fi
+  if [ "$current_user" = true ]; then
+    current_user_cleanup
+  else
+    account_cleanup
+  fi
+  if [ -n "$staging" ]; then
+    if [ "$created_account" = 1 ]; then priv rm -rf "$staging"; else rm -rf "$staging"; fi
+  fi
+  [ -z "$collect_dir" ] || rm -rf "$collect_dir"
+  exit "$status"
+}
+
+# `source scripts/upgrade-test` defines the functions above and stops here, so
+# the cleanup logic can be tested with `priv` replaced.
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --previous | --head-dir | --repo | --cache-dir | --artifacts-dir | --exclude-tag)
+      [ "$#" -ge 2 ] || fail "$1 needs a value"
+      case "$1" in
+        --previous) previous=$2 ;;
+        --head-dir) head_dir=$2 ;;
+        --repo) repo=$2 ;;
+        --cache-dir) cache_dir=$2 ;;
+        --artifacts-dir) artifacts_dir=$2 ;;
+        --exclude-tag) exclude_tag=$2 ;;
+      esac
+      shift 2
+      ;;
+    --create-account)
+      create_account=true
+      shift
+      ;;
+    --current-user)
+      current_user=true
+      shift
+      ;;
+    --keep-account)
+      keep_account=true
+      shift
+      ;;
+    --resolve-only)
+      resolve_only=true
+      shift
+      ;;
+    -h | --help)
+      sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$previous" ] || fail "--previous is required (a tag such as v0.33.1, or latest)"
+[ -n "$repo" ] || fail "--repo is required (OWNER/NAME)"
+need_cmd gh
+
+# ---------------------------------------------------------------- previous
+
+if [ "$previous" = latest ]; then
+  if [ -n "$exclude_tag" ]; then
+    # The target is a release tag: the previous release is the greatest
+    # published version below it, however many newer releases exist.
+    previous=$(list_release_tags | greatest_below "$exclude_tag")
+    [ -n "$previous" ] || fail "no published release below $exclude_tag"
+  else
+    previous=$(gh release view --repo "$repo" --json tagName --jq .tagName)
+  fi
+fi
+[[ "$previous" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "previous release tag is not vX.Y.Z: $previous"
+previous_version=${previous#v}
+info "previous release: $previous"
+if [ "$resolve_only" = true ]; then
+  printf '%s\n' "$previous"
+  exit 0
+fi
+
+[ -n "$head_dir" ] || fail "--head-dir is required"
+[ -n "$cache_dir" ] || fail "--cache-dir is required"
+[ -n "$artifacts_dir" ] || fail "--artifacts-dir is required"
+[ "$create_account" = true ] || [ "$current_user" = true ] ||
+  fail "--create-account or --current-user is required"
+[ "$create_account" = false ] || [ "$current_user" = false ] ||
+  fail "--create-account and --current-user are mutually exclusive"
+if [ "$current_user" = true ]; then
+  [ "${CI:-}" = true ] && [ "${GITHUB_ACTIONS:-}" = true ] ||
+    fail "--current-user runs against this account's own installation and is allowed only on a hosted CI runner (CI=true and GITHUB_ACTIONS=true)"
+  [ -n "${XDG_RUNTIME_DIR:-}" ] || fail "XDG_RUNTIME_DIR is not set; the runner has no user manager"
+  [ -n "${HOME:-}" ] || fail "HOME is not set"
+fi
+
+for tool in sha256sum tar cargo jq loginctl systemctl awk sed uname; do
+  need_cmd "$tool"
+done
+if [ "$create_account" = true ]; then
+  for tool in sudo useradd userdel getent; do
+    need_cmd "$tool"
+  done
+fi
+[ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] ||
+  fail "only Linux x86_64 is supported (release assets are for $TARGET_TRIPLE)"
+if [ "$create_account" = true ]; then
+  priv -n true 2>/dev/null || fail "passwordless sudo is required to create the throwaway account"
+fi
+
+harness_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
+[ -d "$head_dir" ] || fail "--head-dir is not a directory: $head_dir"
+head_dir=$(CDPATH='' cd -- "$head_dir" && pwd -P)
+mkdir -p "$cache_dir" "$artifacts_dir"
+cache_dir=$(CDPATH='' cd -- "$cache_dir" && pwd -P)
+artifacts_dir=$(CDPATH='' cd -- "$artifacts_dir" && pwd -P)
+
+asset="pohunek-daemon-${previous_version}-${TARGET_TRIPLE}.tar.gz"
+mkdir -p "$cache_dir/$previous"
+# The published checksum is fetched on every run; the cached archive must match it.
+gh release download "$previous" --repo "$repo" --pattern "$asset.sha256" \
+  --dir "$cache_dir/$previous" --clobber
+verify_archive() {
+  (cd "$cache_dir/$previous" && sha256sum --check --strict --status "$asset.sha256")
+}
+if [ ! -f "$cache_dir/$previous/$asset" ] || ! verify_archive; then
+  rm -f "$cache_dir/$previous/$asset"
+  gh release download "$previous" --repo "$repo" --pattern "$asset" \
+    --dir "$cache_dir/$previous" --clobber
+  verify_archive || fail "checksum mismatch for $asset"
+fi
+info "verified $asset"
+
+# ------------------------------------------------------------------ staging
+
+# Binaries the test runs. Under --create-account the throwaway account must be
+# able to traverse and read them, which the invoking account's home may forbid,
+# so staging lives in /var/tmp; it is never writable by anyone but this account.
+staging=$(mktemp -d /var/tmp/pohunek-upgrade.XXXXXX)
+if [ "$create_account" = true ]; then
+  chmod 755 "$staging"
+fi
+mkdir -p "$staging/previous" "$staging/head"
+# Everything this account writes or copies out lives in one directory only it
+# can enter: nothing here follows a path another user could have prepared.
+collect_dir=$(mktemp -d)
+chmod 700 "$collect_dir"
+trap cleanup EXIT
+
+tar -xzf "$cache_dir/$previous/$asset" --strip-components=1 -C "$staging/previous"
+for binary in "${BINARIES[@]}"; do
+  [ -x "$staging/previous/$binary" ] || fail "$asset has no executable $binary"
+done
+[ "$("$staging/previous/pohunek" --version)" = "pohunek $previous_version" ] ||
+  fail "the previous pohunek does not report $previous_version"
+
+# ------------------------------------------------------------- test binary
+
+info "building the test binary from $harness_root"
+test_binary=$(cd "$harness_root" && cargo test --locked -p pohunek-cli --test release_upgrade \
+  --no-run --message-format=json |
+  jq -r 'select(.reason == "compiler-artifact" and .profile.test == true
+                and .target.name == "release_upgrade") | .executable' | tail -n 1)
+[ -x "$test_binary" ] || fail "the release_upgrade test binary was not built"
+cp "$test_binary" "$staging/release_upgrade"
+
+# -------------------------------------------------------------- head build
+
+workspace_version() {
+  awk -F'"' '
+    /^\[workspace\.package\]/ { in_pkg = 1; next }
+    /^\[/ { in_pkg = 0 }
+    in_pkg && /^version[[:space:]]*=/ { print $2; exit }' "$1/Cargo.toml"
+}
+
+head_version=$(workspace_version "$head_dir")
+[ -n "$head_version" ] || fail "cannot read the workspace version of $head_dir"
+build_flags=(--locked)
+if [ "$head_version" = "$previous_version" ]; then
+  commit=$(git -C "$head_dir" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+  head_version="$head_version+upgrade.$commit"
+  info "head has the previous version; stamping it $head_version"
+  backup_manifests || fail "cannot back up Cargo.toml and Cargo.lock; nothing was modified"
+  manifest_modified=1
+  awk -v stamped="$head_version" '
+    /^\[workspace\.package\]/ { in_pkg = 1; print; next }
+    /^\[/ { in_pkg = 0 }
+    in_pkg && /^version[[:space:]]*=/ { print "version = \"" stamped "\""; in_pkg = 0; next }
+    { print }' "$manifest_backup/Cargo.toml" >"$head_dir/Cargo.toml"
+  # The lockfile records the member versions, so it is rewritten for the stamp.
+  build_flags=()
+fi
+info "building the target binaries ($head_version) from $head_dir"
+head_executables=$(cd "$head_dir" && cargo build "${build_flags[@]}" \
+  -p pohunek-daemon -p pohunek-session-worker -p pohunek-cli --bins --message-format=json |
+  jq -r 'select(.reason == "compiler-artifact" and .executable != null
+                and (.target.kind | index("bin"))) | .executable')
+for binary in "${BINARIES[@]}"; do
+  source_path=$(printf '%s\n' "$head_executables" | grep -E "/$binary\$" | tail -n 1 || true)
+  [ -x "$source_path" ] || fail "cargo did not build $binary in $head_dir"
+  cp "$source_path" "$staging/head/$binary"
+done
+restore_manifests
+[ "$("$staging/head/pohunek" --version)" = "pohunek $head_version" ] ||
+  fail "the head pohunek does not report $head_version"
+chmod -R a+rX "$staging"
+
+# ----------------------------------------------------------------- account
+
+if [ "$current_user" = true ]; then
+  user=$(id -un)
+  # The runner's shell carries no bus address; the user manager's socket is
+  # at a fixed place, as in the `systemd-supervision` CI job.
+  export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+  info "running as the CI runner account $user"
+  out_dir="$collect_dir/test-output"
+  mkdir -p -m 700 "$out_dir"
+else
+  create_account_user
+  # The account writes only inside this directory, which it owns.
+  out_dir="$staging/out"
+  priv install -d -o "$user" -m 700 "$out_dir"
+  priv loginctl enable-linger "$user"
+  # `user@.service` is Type=notify: start returns once the manager is up.
+  priv systemctl start "user@$uid.service"
+  bus_polls=0
+  until [ -S "/run/user/$uid/bus" ]; do
+    bus_polls=$((bus_polls + 1))
+    if [ "$bus_polls" -eq 1 ]; then
+      # The bus is socket-activated; ask the manager for its socket directly.
+      priv systemctl --user -M "$uid@" start dbus.socket >/dev/null 2>&1
+    fi
+    if [ "$bus_polls" -ge "$BUS_WAIT_POLLS" ]; then
+      info "the user manager of $user has no session bus; manager state follows"
+      priv systemctl status "user@$uid.service" --no-pager >&2
+      priv journalctl -u "user@$uid.service" --no-pager 2>&1 | tail -n 30 >&2
+      priv loginctl user-status "$user" --no-pager >&2
+      priv systemctl --user -M "$uid@" is-system-running >&2
+      fail "the user manager of $user has no session bus"
+    fi
+    sleep "$BUS_POLL_SECONDS"
+  done
+fi
+
+as_user systemctl --user is-system-running --wait >/dev/null ||
+  [ "$(as_user systemctl --user is-system-running)" = degraded ] ||
+  fail "the user manager of $user is not running"
+
+# ---------------------------------------------------------------------- run
+
+info "running $TEST_NAME as $user"
+status=0
+as_user \
+  POHUNEK_SYSTEMD_E2E=1 \
+  "POHUNEK_PREVIOUS_BIN_DIR=$staging/previous" \
+  "POHUNEK_HEAD_BIN_DIR=$staging/head" \
+  "POHUNEK_UPGRADE_ARTIFACTS_DIR=$out_dir" \
+  "$staging/release_upgrade" --ignored --exact "$TEST_NAME" --nocapture --test-threads 1 || status=$?
+
+if [ "$status" -ne 0 ]; then
+  info "the test failed (status $status); diagnostics are in the artifacts directory"
+  exit "$status"
+fi
+info "upgrade test passed: $previous -> $head_version"

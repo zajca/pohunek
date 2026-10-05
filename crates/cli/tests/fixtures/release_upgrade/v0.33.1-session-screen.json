@@ -1,0 +1,28 @@
+{
+  "cli_version": "0.33.1",
+  "protocol": {
+    "minimum": 4,
+    "maximum": 4
+  },
+  "ok": {
+    "session_id": "s-01M461GVM1YRZJHNB8K36ENJ67",
+    "worker_id": "worker-ca14dc7af8a1930c5ca9a93fc56ddadb",
+    "worker_instance_id": "runtime-6eb36d8aaa61719768b221c6ed63afe1",
+    "runtime_generation": "2",
+    "watermark": "105",
+    "dimensions": {
+      "cols": 80,
+      "rows": 24
+    },
+    "cursor": {
+      "row": 2,
+      "col": 0,
+      "visible": true
+    },
+    "alternate_screen": false,
+    "visible_lines": [
+      "fake-agent started args=[--resume native-before-upgrade]",
+      "fake-agent ready native=native-before-upgrade"
+    ]
+  }
+}

@@ -17,7 +17,9 @@ name: Release
 #
 # A tag push does NOT run the CI workflow (CI runs on branch pushes and PRs), so
 # the gate is duplicated here: no binary is published from a commit that fails
-# fmt, clippy, or tests.
+# fmt, clippy, tests, or the upgrade test (a session started on the previous
+# release must survive `pohunek service upgrade` to the tagged commit; see
+# upgrade.yml).
 #
 # The native Apple Silicon archives are built on macOS runners and ad-hoc signed
 # (no Developer ID, no notarization, no secret); see the macOS job comment. Every
@@ -114,6 +116,16 @@ jobs:
 
       - name: Audit release dependencies
         run: cargo audit
+
+  # Issue #525: the tagged commit must upgrade a session started on the
+  # newest earlier release. It runs beside the gate and blocks every job that
+  # builds a publishable binary (`build`, `stage-macos`), so nothing is
+  # published from a commit that would break live sessions on upgrade.
+  upgrade-test:
+    name: upgrade from the previous release
+    uses: ./.github/workflows/upgrade.yml
+    permissions:
+      contents: read
 
   docs-gate:
     name: docs check (deterministic build + secret scan)
@@ -326,7 +338,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.component }} for ${{ matrix.target }}
-    needs: [gate, docs-gate, sdk-gate]
+    needs: [gate, docs-gate, sdk-gate, upgrade-test]
     runs-on: ${{ matrix.runner }}
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -574,7 +586,7 @@ jobs:
   # Running the archives on macOS 14 itself is a separate acceptance gate.
   stage-macos:
     name: Stage ${{ matrix.component }} for aarch64-apple-darwin
-    needs: [gate, docs-gate, sdk-gate]
+    needs: [gate, docs-gate, sdk-gate, upgrade-test]
     runs-on: macos-15
     timeout-minutes: 120
     env:

@@ -179,6 +179,13 @@ Release packaging and contributor verification:
   retain per-shard JUnit timing evidence. Cold compilation
   is separate from the approximately two-minute fast-feedback target.
 - `scripts/tests/test_partitions.py` — regression checks for coverage validation.
+- `scripts/upgrade-test` — the upgrade test: downloads the previous release's
+  Linux daemon archive (checksum verified), builds the target binaries, and
+  runs `crates/cli/tests/release_upgrade.rs` as a throwaway local account with
+  its own systemd user manager. `.github/workflows/upgrade.yml` runs it from
+  CI (pull requests touching the daemon, worker, protocol, or CLI crates),
+  from `release.yml` before any publishable binary is built, and from
+  `gh workflow run upgrade.yml -f previous_tag=<tag> -f head_ref=<ref>`.
 - `bacon.toml` — optional watcher jobs for the documented fast loops
   (`check`, `nextest-fast` on the `fast` profile, `affected`, `clippy-fast`)
   with explicit `e`/`n`/`a`/`c` job-switch keys; no gate depends on it.

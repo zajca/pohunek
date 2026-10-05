@@ -1,0 +1,40 @@
+{
+  "cli_version": "0.33.1",
+  "protocol": {
+    "minimum": 4,
+    "maximum": 4
+  },
+  "ok": {
+    "id": "s-01M461GVM1YRZJHNB8K36ENJ67",
+    "external": false,
+    "capabilities": {
+      "resume": true,
+      "fork": true
+    },
+    "agent": "fake-claude",
+    "agent_base": "claude",
+    "cwd": "/home/runner",
+    "cwd_source": "launch",
+    "pid": 3443022,
+    "runtime": {
+      "state": "live",
+      "runtime_generation": "2",
+      "worker_id": "worker-ca14dc7af8a1930c5ca9a93fc56ddadb",
+      "worker_instance_id": "runtime-6eb36d8aaa61719768b221c6ed63afe1",
+      "started_at": "2026-10-05T12:46:03.256545544Z",
+      "last_connected_at": "2026-10-05T12:46:03.256545544Z"
+    },
+    "cols": 80,
+    "rows": 24,
+    "state": "running",
+    "state_source": "process",
+    "activity": "working",
+    "active_agent": "claude",
+    "active_agent_base": "claude",
+    "active_agent_pid": 3443022,
+    "active_agent_session_id": "native-before-upgrade",
+    "native_session_id": "native-before-upgrade",
+    "created_at": "2026-10-05T12:44:50.210257244Z",
+    "updated_at": "2026-10-05T12:46:03.358570461Z"
+  }
+}
