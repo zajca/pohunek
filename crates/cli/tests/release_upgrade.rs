@@ -285,6 +285,16 @@ impl Run {
         self.home.join(".local/state/pohunek")
     }
 
+    /// Waits until the fake agent has logged `count` launches and returns them.
+    /// A runtime is live before its agent appends its entry, so a launch count
+    /// is read only through this wait.
+    fn wait_launches(&self, count: usize) -> Vec<String> {
+        poll_until(&format!("{count} agent launches logged"), || {
+            let launches = self.launches();
+            (launches.len() >= count).then_some(launches)
+        })
+    }
+
     /// Launch lines the fake agent appended, oldest first.
     fn launches(&self) -> Vec<String> {
         fs::read_to_string(self.agent_log())
@@ -592,11 +602,11 @@ fn start_on_previous(run: Run, previous: Cli, head: Cli) -> (Upgrade, Runtime, u
     let before = wait_live(&previous, &id);
     wait_screen(&previous, &id, "fake-agent ready");
     wait_native_id(&previous, &id, NATIVE_BEFORE);
+    let launches = run.wait_launches(1);
     assert_eq!(
-        run.launches().len(),
+        launches.len(),
         1,
-        "one launch before the upgrade: {:?}",
-        run.launches()
+        "one launch before the upgrade: {launches:?}"
     );
     let daemon = daemon_pid(&service_status(&previous));
     let upgrade = Upgrade {
@@ -738,6 +748,7 @@ impl Upgrade {
                     is_profile_change(&refused),
                     "plain resume failed with something other than agent_profile_changed: {refused}"
                 );
+                // The refusal is synchronous, so no launch can still be pending.
                 assert_eq!(
                     self.run.launches().len(),
                     1,
@@ -753,7 +764,7 @@ impl Upgrade {
             "resume must start a new runtime generation: {after:?} -> {resumed:?}"
         );
         wait_screen(head, id, &format!("args=[--resume {NATIVE_BEFORE}]"));
-        let launches = self.run.launches();
+        let launches = self.run.wait_launches(2);
         assert_eq!(launches.len(), 2, "one launch per runtime: {launches:?}");
         assert!(
             launches[1].contains(&format!("--resume {NATIVE_BEFORE}")),
@@ -776,7 +787,8 @@ impl Upgrade {
             again.generation > resumed.generation,
             "the plain resume must start a new generation: {resumed:?} -> {again:?}"
         );
-        assert_eq!(self.run.launches().len(), 3, "{:?}", self.run.launches());
+        let launches = self.run.wait_launches(3);
+        assert_eq!(launches.len(), 3, "one launch per runtime: {launches:?}");
     }
 }
 
