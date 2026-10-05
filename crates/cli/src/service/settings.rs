@@ -105,6 +105,25 @@ pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// floods stdout.
 pub const VERSION_PROBE_OUTPUT: usize = 4 * 1024;
 
+/// Deadline for one `pohunekd upgrade-preflight` run.
+///
+/// The preflight reads the metadata store, the worker journals and the process
+/// table, which finishes in well under a second on a host with hundreds of
+/// sessions; thirty seconds only guards against a wedged filesystem and keeps
+/// an upgrade from hanging before its first effect.
+pub const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bytes of the preflight report kept from the new daemon.
+///
+/// A session verdict is a few hundred bytes, so four MiB covers thousands of
+/// live sessions; the cap bounds memory for a binary that floods stdout.
+pub const PREFLIGHT_OUTPUT: usize = 4 * 1024 * 1024;
+
+/// Bytes of the preflight's diagnostics kept for an error message.
+///
+/// Enough for the daemon's one-line failure while keeping errors bounded.
+pub const PREFLIGHT_DIAGNOSTICS: usize = 4 * 1024;
+
 /// Deadline for `systemd-analyze verify` on the rendered units.
 ///
 /// Verification loads the unit and its dependencies from disk; thirty seconds

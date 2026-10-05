@@ -403,3 +403,45 @@ fn a_store_already_at_the_current_schema_is_not_reinterpreted() {
     );
     assert_eq!(fs::read_to_string(&path).expect("read"), current);
 }
+
+/// What the migration does to the recovery of each resume line of `content`,
+/// judged on the stored bytes without applying it.
+fn assessed(content: &str) -> Vec<super::legacy_binding::RecoveryOutcome> {
+    raw_lines_of(content)
+        .iter()
+        .filter(|line| line["kind"] == "resume" || line["kind"] == "session")
+        .map(|line| {
+            super::legacy_binding::assess_recovery(line.as_object().expect("record object"))
+        })
+        .collect()
+}
+
+#[test]
+fn the_recovery_assessment_matches_what_the_migration_does() {
+    use super::legacy_binding::RecoveryOutcome::{Lost, NeedsRegistry, Preserved};
+
+    // A v0.33.0 store maps to launch specs.
+    assert_eq!(assessed(V0_33_0_STORE), [Preserved, Preserved]);
+    // A v0.33.1 binding of a built-in agent is restored; a profile's needs the registry.
+    assert!(assessed(V0_33_1_DAMAGED_STORE)
+        .iter()
+        .all(|outcome| *outcome == Preserved));
+    let profile = V0_33_1_DAMAGED_STORE.replace("\"agent\":\"claude\"", "\"agent\":\"work\"");
+    assert_eq!(assessed(&profile), [NeedsRegistry, NeedsRegistry]);
+    // Frozen fields no release maps lose the recovery of a binding that has a reference.
+    let unmappable = legacy_resume_line(
+        "claude",
+        "claude",
+        &[],
+        &json!({ "resume_mode": "no-such-mode", "ref_kind": "id", "resumable": true }),
+    );
+    assert_eq!(assessed(&unmappable), [Lost]);
+    // A binding v0.33.0 itself did not recover has nothing to lose.
+    let not_resumable = legacy_resume_line(
+        "claude",
+        "claude",
+        &[],
+        &json!({ "resume_mode": "flag", "ref_kind": "id", "resumable": false }),
+    );
+    assert_eq!(assessed(&not_resumable), [Preserved]);
+}

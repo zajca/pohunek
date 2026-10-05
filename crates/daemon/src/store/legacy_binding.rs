@@ -49,28 +49,62 @@ enum Outcome {
     Mapped(NativeSessionLaunch),
     /// The binding awaits resolution through the runtime registry.
     Unresolved,
+    /// The binding carries a native reference but its legacy fields cannot be
+    /// mapped to a launch spec, so it cannot recover natively.
+    Unmappable,
     /// The binding needed no new launch spec.
     Unchanged,
 }
 
-/// Maps one record of any kind; only resume bindings and the recovery binding
-/// of session records are rewritten.
-pub(super) fn migrate_record(record: &mut Map<String, Value>) {
-    match record.get("kind").and_then(Value::as_str) {
-        Some("resume") => {
-            migrate_binding(record);
+/// What the migration does to the native recovery of one record, as far as the
+/// stored bytes can tell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RecoveryOutcome {
+    /// The recovery has a launch spec or never had native recovery.
+    Preserved,
+    /// The launch spec is completed from the runtime registry when the
+    /// record loads, which the migration cannot do.
+    NeedsRegistry,
+    /// The recovery cannot be mapped to a launch spec.
+    Lost,
+}
+
+impl From<&Outcome> for RecoveryOutcome {
+    fn from(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Mapped(_) | Outcome::Unchanged => Self::Preserved,
+            Outcome::Unresolved => Self::NeedsRegistry,
+            Outcome::Unmappable => Self::Lost,
         }
-        Some("session") => migrate_session(record),
-        _ => {}
     }
 }
 
-fn migrate_session(record: &mut Map<String, Value>) {
+/// Runs the mapping on a copy of `record` and reports what it does to the
+/// recovery; the same function [`migrate_record`] applies, so the verdict
+/// cannot drift from the migration.
+pub(crate) fn assess_recovery(record: &Map<String, Value>) -> RecoveryOutcome {
+    let mut copy = record.clone();
+    migrate_record(&mut copy)
+}
+
+/// Maps one record of any kind; only resume bindings and the recovery binding
+/// of session records are rewritten.
+pub(super) fn migrate_record(record: &mut Map<String, Value>) -> RecoveryOutcome {
+    match record.get("kind").and_then(Value::as_str) {
+        Some("resume") => RecoveryOutcome::from(&migrate_binding(record)),
+        Some("session") => migrate_session(record),
+        _ => RecoveryOutcome::Preserved,
+    }
+}
+
+fn migrate_session(record: &mut Map<String, Value>) -> RecoveryOutcome {
     let Some(Value::Object(recovery)) = record.get_mut("recovery") else {
-        return;
+        return RecoveryOutcome::Preserved;
     };
-    let Outcome::Mapped(launch) = migrate_binding(recovery) else {
-        return;
+    let outcome = migrate_binding(recovery);
+    let recovery_outcome = RecoveryOutcome::from(&outcome);
+    let Outcome::Mapped(launch) = outcome else {
+        return recovery_outcome;
     };
     let capabilities = SessionCapabilities {
         resume: true,
@@ -81,6 +115,7 @@ fn migrate_session(record: &mut Map<String, Value>) {
     {
         info.insert("capabilities".to_owned(), capabilities);
     }
+    recovery_outcome
 }
 
 fn migrate_binding(binding: &mut Map<String, Value>) -> Outcome {
@@ -91,7 +126,11 @@ fn migrate_binding(binding: &mut Map<String, Value>) -> Outcome {
     let outcome = if already_current {
         Outcome::Unchanged
     } else if had_legacy_fields {
-        legacy_launch(binding).map_or(Outcome::Unchanged, Outcome::Mapped)
+        match legacy_launch(binding) {
+            Legacy::Spec(launch) => Outcome::Mapped(launch),
+            Legacy::Unmappable if has_native_reference(binding) => Outcome::Unmappable,
+            Legacy::Unmappable | Legacy::NotRecoverable => Outcome::Unchanged,
+        }
     } else if is_damaged(binding) {
         damaged_outcome(binding)
     } else {
@@ -109,25 +148,38 @@ fn migrate_binding(binding: &mut Map<String, Value>) -> Outcome {
         Outcome::Unresolved => {
             binding.insert(UNRESOLVED_KEY.to_owned(), Value::Bool(true));
         }
-        Outcome::Unchanged => {}
+        Outcome::Unmappable | Outcome::Unchanged => {}
     }
     outcome
+}
+
+/// What the flat v0.33.0 fields translate to.
+enum Legacy {
+    /// The fields are one launch spec.
+    Spec(NativeSessionLaunch),
+    /// v0.33.0 itself did not recover this binding.
+    NotRecoverable,
+    /// The fields are incomplete or name a mode or kind that is not known.
+    Unmappable,
 }
 
 /// Translates the flat v0.33.0 fields with the rules that version applied when
 /// it relaunched: a binding with a snapshot program that was not `resumable`
 /// does not recover, otherwise the frozen mode and reference kind are the
 /// resume operation, and a fork needs its own complete, matching fields.
-fn legacy_launch(binding: &Map<String, Value>) -> Option<NativeSessionLaunch> {
+fn legacy_launch(binding: &Map<String, Value>) -> Legacy {
     let has_program = text(binding, "program").is_some_and(|program| !program.is_empty());
     if !flag(binding, "resumable") && has_program {
-        return None;
+        return Legacy::NotRecoverable;
     }
-    let mode = ResumeMode::parse(text(binding, "resume_mode")?)?;
-    let kind = reference_kind(text(binding, "ref_kind")?)?;
-    let resume = mode.template().map(str::to_owned);
-    let fork = legacy_fork(binding, kind);
-    NativeSessionLaunch::from_templates(kind, &resume, fork.as_deref()).ok()
+    let spec = || {
+        let mode = ResumeMode::parse(text(binding, "resume_mode")?)?;
+        let kind = reference_kind(text(binding, "ref_kind")?)?;
+        let resume = mode.template().map(str::to_owned);
+        let fork = legacy_fork(binding, kind);
+        NativeSessionLaunch::from_templates(kind, &resume, fork.as_deref()).ok()
+    };
+    spec().map_or(Legacy::Unmappable, Legacy::Spec)
 }
 
 /// The fork operation of the flat fields: the frozen resume mode followed by
@@ -205,12 +257,17 @@ fn reference_kind(value: &str) -> Option<SessionRefKind> {
 /// pinned one was written by a daemon that already knew the launch spec, and a
 /// binding without a reference never recovered natively.
 fn is_damaged(binding: &Map<String, Value>) -> bool {
-    let has_reference = ["native_session_id", "native_session_path"]
-        .into_iter()
-        .any(|key| text(binding, key).is_some_and(|reference| !reference.is_empty()));
+    let has_reference = has_native_reference(binding);
     let has_program = text(binding, "program").is_some_and(|program| !program.is_empty());
     let unpinned = binding.get("launch_binding").is_none_or(Value::is_null);
     has_reference && has_program && unpinned
+}
+
+/// Whether the binding stores a native session id or path.
+fn has_native_reference(binding: &Map<String, Value>) -> bool {
+    ["native_session_id", "native_session_path"]
+        .into_iter()
+        .any(|key| text(binding, key).is_some_and(|reference| !reference.is_empty()))
 }
 
 fn damaged_outcome(binding: &Map<String, Value>) -> Outcome {

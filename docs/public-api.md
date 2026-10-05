@@ -1423,6 +1423,28 @@ running across an upgrade from the previous private protocol version keeps
 starting its session's children from its own sanitized environment until that
 session gets a new worker generation.
 
+`pohunek service upgrade` and `pohunek service check` of an existing service run
+a read-only preflight before any effect by invoking `pohunekd upgrade-preflight`
+of the staged archive. That mode takes no other argument, is an internal contract
+between the two binaries of one archive rather than a public client interface,
+and prints one JSON document (`PreflightReport` in `crates/service-config`,
+`report_version` 1): `store` (`state` `missing`, `up_to_date`, `would_migrate` or
+`refused`, with `schema_from`, `schema_to`, `records`, `error_code`, `error`) and
+`sessions` (per live session `session_id`, `verdict` `adoptable`,
+`would_lose_recovery` or `would_not_be_adopted`, a stable `code`, and a human
+`detail`, plus the owner-set `name` when there is one) and `unmanaged_workers`
+(ids of live worker journals the store has no record of; the running daemon does
+not manage them either, so they never refuse the upgrade). A session that is not `adoptable` fails the command with the CLI error
+code `service_upgrade_sessions_at_risk` unless `--accept-runtime-loss` is given;
+a `refused` store fails it with `service_upgrade_store_unusable` and a preflight
+that cannot run or be parsed with `service_upgrade_preflight_failed`, neither of
+which the flag overrides. The `--json` success reports of both commands carry
+`preflight` (the report, or `null` when no preflight ran) and
+`accepted_runtime_loss` (boolean, true only when sessions were at risk and the
+flag accepted them). The preflight reads the store, the worker
+journals and the process table only; it never connects to a worker socket. See
+[update after release](knowledge/runbooks/update-after-release.md).
+
 Identity hooks prefer the owner-private worker endpoint so an accepted launch
 or active identity is retained while the daemon is unavailable. Notification
 hooks continue to use the public daemon socket; notifications produced during a

@@ -8,19 +8,23 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pohunek_client::ClientError;
+use pohunek_daemon::session::upgrade_preflight::PreflightInputs;
+use pohunek_daemon::store::{DesiredState, RuntimeRecord, SessionRecord, Store as DaemonStore};
 use pohunek_paths::BasePaths;
 use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
 };
 use pohunek_platform::supervisor::{DaemonSupervisor, Operation as Pending, ServiceId, Supervisor};
+use pohunek_service_config::preflight::{StoreState, Verdict};
 use pohunek_session_worker::RuntimePhase;
 use pohunek_test_support::wait::wait_until;
 use protocol::{
-    DaemonHealthResult, RuntimeGeneration, RuntimeRef, SessionCapabilities, SessionId,
-    SessionRuntime, StateSource,
+    DaemonHealthResult, RuntimeGeneration, RuntimeRef, RuntimeState, SessionCapabilities,
+    SessionId, SessionRuntime, SessionState, StateSource,
 };
 
 use super::*;
@@ -30,6 +34,7 @@ use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
 use crate::service::layout::tests::stage_dir;
 use crate::service::layout::CLI_NAME;
+use crate::service::preflight::Judging;
 use crate::service::usage::tests::{
     own_identity, spawn_when_exec_free, write_journal, write_live_journal, write_outdated_journal,
     SESSION,
@@ -150,11 +155,41 @@ impl ProcessInspector for OwnProcesses {
 #[cfg(target_os = "linux")]
 const ACCEPTING_VERIFIER: &str = "/bin/true";
 
+/// Judges adoption with the daemon's own rules, in this process, over the
+/// store and journals below the context's paths.
+///
+/// The staged `pohunekd` of these tests only prints its version, so the
+/// rules run through the daemon library instead of a child process; the
+/// process runner has its own tests against the real binary. Process facts
+/// come from [`OwnProcesses`].
+#[derive(Debug, Default)]
+struct InProcessPreflight {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AdoptionPreflight for InProcessPreflight {
+    fn judge<'a>(&'a self, context: &'a Context, _daemon: &'a Path) -> Judging<'a> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let paths = context.paths();
+            let inputs = PreflightInputs {
+                store_path: paths.data_dir.join(pohunek_paths::METADATA_STORE_NAME),
+                worker_state_root: paths.worker_state_root(),
+            };
+            Ok(pohunek_daemon::session::upgrade_preflight::run(
+                &inputs,
+                &OwnProcesses::default(),
+            ))
+        })
+    }
+}
+
 /// An engine over `context` and `backend` that observes only this test's
 /// own processes and, on Linux, verifies units with [`ACCEPTING_VERIFIER`].
 fn engine_over<'a>(context: &'a Context, backend: &'a Backend) -> Engine<'a> {
     let mut engine = Engine::new(context, backend);
     engine.inspector = Box::new(OwnProcesses::default());
+    let engine = engine.with_adoption_preflight(Box::new(InProcessPreflight::default()));
     #[cfg(target_os = "linux")]
     let engine =
         engine.with_unit_verifier(UnitVerifier::default().with_program(ACCEPTING_VERIFIER));
@@ -570,6 +605,14 @@ impl Harness {
 
     async fn upgrade(&self, version: &str) -> Result<UpgradeReport, Error> {
         self.engine().upgrade(&self.staged(version), version).await
+    }
+
+    /// Upgrades with `--accept-runtime-loss`.
+    async fn upgrade_accepting_loss(&self, version: &str) -> Result<UpgradeReport, Error> {
+        self.engine()
+            .with_runtime_loss_accepted(true)
+            .upgrade(&self.staged(version), version)
+            .await
     }
 
     fn config(&self) -> Option<ServiceConfig> {
@@ -3749,4 +3792,622 @@ async fn check_refuses_a_prefix_another_namespace_owns() {
         .await
         .expect_err("install refuses it too");
     assert_owned_by(&installed, &first);
+}
+
+/// Second logical session of the preflight tests.
+const OTHER_SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN3";
+/// Third logical session of the preflight tests.
+const THIRD_SESSION: &str = "s-01KYAPVPFVHD56Z69B9CX3XWN4";
+
+fn store_path(harness: &Harness) -> PathBuf {
+    harness
+        .context
+        .paths()
+        .data_dir
+        .join(pohunek_paths::METADATA_STORE_NAME)
+}
+
+/// Writes a live session through the daemon's own store and the live journal
+/// of its worker, the way a running daemon of the installed version leaves them.
+fn seed_live_session(harness: &Harness, session_id: &str, worker: &str) {
+    let executable = harness.layout().worker_executable(V1).expect("worker");
+    seed_live_session_at(harness.context.paths(), &executable, session_id, worker);
+}
+
+/// Like [`seed_live_session`] for state below `paths`.
+fn seed_live_session_at(paths: &BasePaths, executable: &Path, session_id: &str, worker: &str) {
+    let mut info = session(session_id, None);
+    info.runtime.as_mut().expect("runtime").worker_id = Some(worker.to_owned());
+    let record = SessionRecord {
+        schema_version: pohunek_daemon::store::STORE_SCHEMA_VERSION,
+        session_id: session_id.to_owned(),
+        desired_state: DesiredState::Running,
+        transaction: None,
+        info,
+        recovery: None,
+        native_identity_ordering: None,
+        runtime: RuntimeRecord {
+            state: RuntimeState::Live,
+            worker_id: Some(worker.to_owned()),
+            worker_instance_id: None,
+            service_id: Some(worker_id(session_id).to_string()),
+            generation: Some(GENERATION.to_owned()),
+            executable: Some(executable.to_path_buf()),
+            reason: None,
+        },
+    };
+    DaemonStore::new(paths.data_dir.join(pohunek_paths::METADATA_STORE_NAME))
+        .record_session(&record)
+        .expect("record session");
+    write_live_journal(paths, session_id, worker, executable);
+}
+
+/// Rewrites the stored line of `session_id` as a schema-1 line `edit` changed.
+fn edit_stored_line(harness: &Harness, session_id: &str, edit: impl Fn(&mut serde_json::Value)) {
+    let path = store_path(harness);
+    let body = std::fs::read_to_string(&path).expect("read store");
+    let mut out = String::new();
+    for line in body.lines() {
+        let mut value: serde_json::Value = serde_json::from_str(line).expect("store line");
+        if value["session_id"] == session_id {
+            edit(&mut value);
+            value["schema_version"] = 1.into();
+        }
+        out.push_str(&value.to_string());
+        out.push('\n');
+    }
+    std::fs::write(&path, out).expect("write store");
+}
+
+/// A legacy (v0.33.0) recovery binding whose resume mode no release maps.
+fn unmappable_legacy_recovery(session_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "agent": "shell",
+        "agent_base": "shell",
+        "cwd": "/work",
+        "cols": 80,
+        "rows": 24,
+        "native_session_id": "native-1",
+        "program": "sh",
+        "args": [],
+        "input_rules": { "bracketed_paste": false, "submit_delay_ms": 150 },
+        "resume_mode": "no-such-mode",
+        "ref_kind": "id",
+        "resumable": true
+    })
+}
+
+/// Names of the version directories below the installation's versions directory.
+fn version_dirs(harness: &Harness) -> Vec<String> {
+    layout::installed_versions(&harness.layout())
+        .expect("versions")
+        .into_iter()
+        .collect()
+}
+
+#[tokio::test]
+async fn an_upgrade_refuses_live_sessions_whose_records_cannot_be_migrated_and_the_flag_proceeds() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    for (session_id, worker) in [
+        (SESSION, "w-1"),
+        (OTHER_SESSION, "w-2"),
+        (THIRD_SESSION, "w-3"),
+    ] {
+        seed_live_session(&harness, session_id, worker);
+    }
+    // The first record cannot be loaded at all, the second loads but its
+    // recovery cannot be mapped to a launch spec.
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+    edit_stored_line(&harness, OTHER_SESSION, |line| {
+        line["recovery"] = unmappable_legacy_recovery(OTHER_SESSION);
+    });
+    let store_before = std::fs::read(store_path(&harness)).expect("read store");
+
+    let error = harness
+        .upgrade(V2)
+        .await
+        .expect_err("the upgrade is refused");
+
+    let Error::UpgradeAtRisk { sessions } = &error else {
+        panic!("{error:?}");
+    };
+    let listed: Vec<_> = sessions
+        .iter()
+        .map(|session| {
+            (
+                session.session_id.as_str(),
+                session.verdict,
+                session.code.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (SESSION, Verdict::WouldNotBeAdopted, "record_unreadable"),
+            (
+                OTHER_SESSION,
+                Verdict::WouldLoseRecovery,
+                "native_recovery_unmappable"
+            ),
+        ]
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains(SESSION) && message.contains(OTHER_SESSION),
+        "{message}"
+    );
+    assert!(!message.contains(THIRD_SESSION), "{message}");
+    assert_eq!(error.code(), "service_upgrade_sessions_at_risk");
+    harness.assert_installed(V1);
+    assert_eq!(
+        version_dirs(&harness),
+        [V1],
+        "a refusal leaves no version behind"
+    );
+    assert_eq!(
+        std::fs::read(store_path(&harness)).expect("read store"),
+        store_before,
+        "a refusal never writes the store"
+    );
+
+    let report = harness
+        .upgrade_accepting_loss(V2)
+        .await
+        .expect("the flag proceeds");
+
+    assert!(report.accepted_runtime_loss);
+    let preflight = report.preflight.expect("the preflight ran");
+    assert_eq!(preflight.store.state, StoreState::WouldMigrate);
+    assert_eq!(preflight.sessions.len(), 3);
+    assert_eq!(
+        preflight
+            .sessions
+            .iter()
+            .find(|session| session.session_id == THIRD_SESSION)
+            .map(|session| session.verdict),
+        Some(Verdict::Adoptable)
+    );
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_clean_upgrade_with_live_sessions_proceeds_and_reports_them_adoptable() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+    seed_live_session(&harness, OTHER_SESSION, "w-2");
+
+    let report = harness.upgrade(V2).await.expect("a clean upgrade proceeds");
+
+    assert!(!report.accepted_runtime_loss);
+    let preflight = report.preflight.expect("the preflight ran");
+    assert_eq!(preflight.store.state, StoreState::UpToDate);
+    let verdicts: Vec<_> = preflight
+        .sessions
+        .iter()
+        .map(|session| (session.session_id.as_str(), session.verdict))
+        .collect();
+    assert_eq!(
+        verdicts,
+        [
+            (SESSION, Verdict::Adoptable),
+            (OTHER_SESSION, Verdict::Adoptable)
+        ]
+    );
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn a_store_the_new_daemon_cannot_start_with_is_refused_even_with_the_flag() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line["schema_version"] = 99.into();
+    });
+    // `edit_stored_line` stamps schema 1 after the edit; restore the future schema.
+    let path = store_path(&harness);
+    let body = std::fs::read_to_string(&path).expect("read store");
+    std::fs::write(
+        &path,
+        body.replace("\"schema_version\":1", "\"schema_version\":99"),
+    )
+    .expect("write store");
+
+    for result in [
+        harness.upgrade(V2).await,
+        harness.upgrade_accepting_loss(V2).await,
+    ] {
+        let error = result.expect_err("the store is refused");
+        assert!(
+            matches!(error, Error::UpgradeStoreUnusable { .. }),
+            "{error:?}"
+        );
+        assert_eq!(error.code(), "service_upgrade_store_unusable");
+    }
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn the_adoption_preflight_is_skipped_when_no_daemon_swap_starts() {
+    let harness = Harness::new();
+    harness.install(V2).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = harness
+        .engine()
+        .with_adoption_preflight(Box::new(InProcessPreflight {
+            calls: Arc::clone(&calls),
+        }));
+
+    let report = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect("rerunning the active version swaps nothing");
+
+    assert!(report.unchanged);
+    assert!(report.preflight.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn check_asks_the_preflight_of_an_upgrade_and_honours_the_flag() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+    let preflight = InProcessPreflight::default();
+    let daemon_dir = harness.staged(V2);
+    // The checked version is the staged one, so `check` probes that daemon.
+    let refused =
+        crate::service::check_with_preflight(&harness.context, &daemon_dir, &preflight, V2, false)
+            .await
+            .expect_err("the check refuses what the upgrade refuses");
+    assert!(
+        matches!(refused, Error::UpgradeAtRisk { .. }),
+        "{refused:?}"
+    );
+
+    let accepted =
+        crate::service::check_with_preflight(&harness.context, &daemon_dir, &preflight, V2, true)
+            .await
+            .expect("the flag passes the check");
+
+    assert_eq!(accepted.operation, "upgrade");
+    assert!(accepted.accepted_runtime_loss);
+    assert_eq!(accepted.preflight.expect("preflight").sessions.len(), 1);
+    harness.assert_installed(V1);
+}
+
+#[tokio::test]
+async fn a_session_created_between_staging_and_the_swap_is_caught_by_the_late_preflight() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    // The host is empty when the upgrade starts; the old daemon then accepts a
+    // session whose worker the new daemon could not adopt.
+    let paths = harness.context.paths().clone();
+    let executable = harness.layout().worker_executable(V1).expect("worker");
+    let mut engine = harness.engine();
+    engine.before_swap = Some(SwapHook(Box::new(move || {
+        seed_live_session_at(&paths, &executable, SESSION, "w-1");
+        let store = paths.data_dir.join(pohunek_paths::METADATA_STORE_NAME);
+        let body = std::fs::read_to_string(&store).expect("read store");
+        let mut line: serde_json::Value = serde_json::from_str(body.trim()).expect("line");
+        line.as_object_mut().expect("record").remove("runtime");
+        std::fs::write(&store, format!("{line}\n")).expect("write store");
+    })));
+
+    let error = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the late preflight refuses");
+
+    let Error::UpgradeAtRisk { sessions } = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(sessions[0].session_id, SESSION);
+    harness.assert_installed(V1);
+    assert_eq!(
+        version_dirs(&harness),
+        [V1],
+        "the refused swap is rolled back"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_upgrade_that_still_has_to_swap_the_daemon_is_judged_again() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Binaries);
+    let interrupted = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted before the config step");
+    assert!(
+        matches!(interrupted, Error::Interrupted(Step::Binaries)),
+        "{interrupted:?}"
+    );
+    // The old daemon keeps running and gains a session nobody consented to lose.
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+
+    let error = harness.upgrade(V2).await.expect_err("the resume is judged");
+    assert!(matches!(error, Error::UpgradeAtRisk { .. }), "{error:?}");
+
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V2),
+        &InProcessPreflight::default(),
+        V2,
+        false,
+    )
+    .await;
+    // The refused resume rolled the transaction back, so check sees a fresh upgrade.
+    assert!(
+        matches!(checked, Err(Error::UpgradeAtRisk { .. })),
+        "{checked:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_interrupted_before_the_service_manager_call_is_judged_again_on_resume() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    let interrupted = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after recording the registration");
+    assert!(
+        matches!(interrupted, Error::Interrupted(Step::Registering)),
+        "{interrupted:?}"
+    );
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+    // The old daemon is still running and gains a session the new one would lose.
+    seed_live_session(&harness, SESSION, "w-1");
+    edit_stored_line(&harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(V2),
+        &InProcessPreflight::default(),
+        V2,
+        false,
+    )
+    .await;
+    assert!(
+        matches!(checked, Err(Error::UpgradeAtRisk { .. })),
+        "{checked:?}"
+    );
+    let error = harness.upgrade(V2).await.expect_err("the resume is judged");
+    assert!(matches!(error, Error::UpgradeAtRisk { .. }), "{error:?}");
+    assert_eq!(
+        harness.fake.daemon_version().as_deref(),
+        Some(V1),
+        "no replacement"
+    );
+}
+
+/// Judges adoption in this process until its `fail_from`-th call, then fails
+/// as a daemon that gives no report does.
+#[derive(Debug)]
+struct FailingFrom {
+    inner: InProcessPreflight,
+    fail_from: usize,
+}
+
+impl AdoptionPreflight for FailingFrom {
+    fn judge<'a>(&'a self, context: &'a Context, daemon: &'a Path) -> Judging<'a> {
+        let call = self.inner.calls.load(Ordering::SeqCst);
+        if call >= self.fail_from {
+            return Box::pin(async move {
+                Err(Error::UpgradePreflightFailed {
+                    binary: daemon.to_path_buf(),
+                    detail: "injected".to_owned(),
+                })
+            });
+        }
+        self.inner.judge(context, daemon)
+    }
+}
+
+/// Seeds a live session the new daemon would not adopt.
+fn seed_unadoptable_session(harness: &Harness) {
+    seed_live_session(harness, SESSION, "w-1");
+    edit_stored_line(harness, SESSION, |line| {
+        line.as_object_mut().expect("record").remove("runtime");
+    });
+}
+
+/// Asserts the previous daemon was never replaced or restarted.
+fn assert_daemon_untouched(harness: &Harness, replaces_before: usize) {
+    assert_eq!(
+        harness.fake.world().replaces,
+        replaces_before,
+        "no replacement call"
+    );
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V1));
+}
+
+#[tokio::test]
+async fn a_refused_resume_at_registering_never_touches_the_daemon_and_stays_resumable() {
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registering);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted before the service-manager call");
+    let replaces = harness.fake.world().replaces;
+    let paths = harness.context.paths().clone();
+    let executable = harness.layout().worker_executable(V1).expect("worker");
+    let mut resumed = harness.engine();
+    resumed.before_swap = Some(SwapHook(Box::new(move || {
+        seed_live_session_at(&paths, &executable, SESSION, "w-1");
+        let store = paths.data_dir.join(pohunek_paths::METADATA_STORE_NAME);
+        let body = std::fs::read_to_string(&store).expect("read store");
+        let mut line: serde_json::Value = serde_json::from_str(body.trim()).expect("line");
+        line.as_object_mut().expect("record").remove("runtime");
+        std::fs::write(&store, format!("{line}\n")).expect("write store");
+    })));
+
+    let error = resumed
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("the final gate refuses");
+
+    assert!(matches!(error, Error::UpgradeAtRisk { .. }), "{error:?}");
+    assert_daemon_untouched(&harness, replaces);
+    let pending = harness.pending().expect("the transaction is kept");
+    assert_eq!(pending.step, Step::Registering);
+
+    let report = harness
+        .upgrade_accepting_loss(V2)
+        .await
+        .expect("a later resume with the flag proceeds");
+    assert!(report.accepted_runtime_loss);
+    assert!(report.resumed);
+    harness.assert_installed(V2);
+}
+
+#[tokio::test]
+async fn no_gate_refusal_before_the_swap_restarts_the_daemon() {
+    // Early refusal: the sessions are at risk when the upgrade starts.
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    seed_unadoptable_session(&harness);
+    let replaces = harness.fake.world().replaces;
+    harness.upgrade(V2).await.expect_err("early refusal");
+    assert_daemon_untouched(&harness, replaces);
+    harness.assert_installed(V1);
+
+    // Store the new daemon cannot start with, found at the final gate.
+    let harness = Harness::new();
+    harness.install(V1).await.expect("install");
+    let replaces = harness.fake.world().replaces;
+    let path = store_path(&harness);
+    let mut engine = harness.engine();
+    engine.before_swap = Some(SwapHook(Box::new(move || {
+        let directory = path.parent().expect("store directory");
+        std::fs::create_dir_all(directory).expect("data directory");
+        std::fs::set_permissions(
+            directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private data directory");
+        std::fs::write(&path, "{\"kind\":\"project\",\"schema_version\":99}\n")
+            .expect("write future store");
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .expect("private store");
+    })));
+    let error = engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("late refusal of the store");
+    assert!(
+        matches!(error, Error::UpgradeStoreUnusable { .. }),
+        "{error:?}"
+    );
+    assert_daemon_untouched(&harness, replaces);
+    harness.assert_installed(V1);
+
+    // A preflight that gives no report, early and then late.
+    for fail_from in [0, 1] {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let replaces = harness.fake.world().replaces;
+        let engine = harness
+            .engine()
+            .with_adoption_preflight(Box::new(FailingFrom {
+                inner: InProcessPreflight::default(),
+                fail_from,
+            }));
+        let error = engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("no report");
+        assert!(
+            matches!(error, Error::UpgradePreflightFailed { .. }),
+            "{error:?}"
+        );
+        assert_daemon_untouched(&harness, replaces);
+        harness.assert_installed(V1);
+    }
+}
+
+#[tokio::test]
+async fn cancelling_an_interrupted_upgrade_is_not_gated_by_the_adoption_preflight() {
+    for interrupted_at in [Step::Binaries, Step::Registering, Step::Registered] {
+        let harness = Harness::new();
+        harness.install(V1).await.expect("install");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(interrupted_at);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted");
+        // Sessions the new daemon would lose appear while the old one runs, and
+        // the preflight is unavailable too: neither may stop the cancellation.
+        seed_unadoptable_session(&harness);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = harness
+            .engine()
+            .with_adoption_preflight(Box::new(CountingFailure(Arc::clone(&calls))));
+
+        let checked = crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(V1),
+            &CountingFailure(Arc::clone(&calls)),
+            V1,
+            false,
+        )
+        .await
+        .expect("check does not refuse the cancellation");
+        let report = engine
+            .upgrade(&harness.staged(V1), V1)
+            .await
+            .expect("asking for the restored version cancels the upgrade");
+
+        assert!(checked.preflight.is_none());
+        assert!(
+            report.unchanged && report.rolled_back.is_some(),
+            "{report:?}"
+        );
+        assert!(report.preflight.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{interrupted_at:?}");
+        harness.assert_installed(V1);
+    }
+}
+
+/// A preflight that fails the test when it is consulted.
+#[derive(Debug)]
+struct CountingFailure(Arc<AtomicUsize>);
+
+impl AdoptionPreflight for CountingFailure {
+    fn judge<'a>(&'a self, _context: &'a Context, daemon: &'a Path) -> Judging<'a> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Err(Error::UpgradePreflightFailed {
+                binary: daemon.to_path_buf(),
+                detail: "must not be consulted".to_owned(),
+            })
+        })
+    }
 }

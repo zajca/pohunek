@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 
 use pohunek_platform::supervisor::{ServiceObservation, ServiceState};
+use pohunek_service_config::preflight::PreflightReport;
 use serde::Serialize;
 
 use super::usage::JournalRef;
@@ -89,6 +90,12 @@ pub struct UpgradeReport {
     pub kept_versions: Vec<KeptVersion>,
     /// Why garbage collection did not run, when it failed.
     pub gc_error: Option<String>,
+    /// What the new daemon's adoption preflight found; `null` when the upgrade
+    /// resumed an interrupted one or the version was already active.
+    pub preflight: Option<PreflightReport>,
+    /// Whether `--accept-runtime-loss` let the upgrade proceed over sessions
+    /// the preflight listed as at risk.
+    pub accepted_runtime_loss: bool,
 }
 
 /// Result of `pohunek service uninstall`.
@@ -133,6 +140,12 @@ pub struct CheckReport {
     /// Whether the check ran under a transaction lock a `pohunek service
     /// lock` ancestor holds, so no other transaction can change the result.
     pub locked: bool,
+    /// What the new daemon's adoption preflight found; `null` for an install,
+    /// a resumed upgrade, and a version that is already active.
+    pub preflight: Option<PreflightReport>,
+    /// Whether `--accept-runtime-loss` would let the upgrade proceed over
+    /// sessions the preflight listed as at risk.
+    pub accepted_runtime_loss: bool,
 }
 
 /// A version directory garbage collection kept.

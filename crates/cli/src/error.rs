@@ -403,6 +403,8 @@ fn service_error_class(error: &crate::service::Error) -> ErrorClass {
         | Error::DaemonJobPresent { .. }
         | Error::VerifierMissing
         | Error::UnitVerification { .. }
+        | Error::UpgradeAtRisk { .. }
+        | Error::UpgradeStoreUnusable { .. }
         | Error::LiveSessions { .. } => ErrorClass::Configuration,
         Error::DaemonNotReady { .. } | Error::Control { .. } => ErrorClass::Daemon,
         _ => ErrorClass::Runtime,

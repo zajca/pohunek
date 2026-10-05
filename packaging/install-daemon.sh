@@ -27,11 +27,25 @@
 # before its first effect (HOME and the XDG roots, the prefix, every directory
 # it writes, a pending transaction, the recorded installation), so a host the
 # final command would refuse never has its legacy install retired.
+#
+# `--accept-runtime-loss` is the single flag that accepts live sessions losing
+# their runtime. For the legacy migration it is passed to the migration
+# preflight. For a service-managed upgrade it is passed to both `service check`
+# and `service upgrade`, whose upgrade preflight refuses (with the typed error
+# `service_upgrade_sessions_at_risk`) while a live session would not be adopted
+# by the new daemon or would lose its native recovery; the flag lets the
+# upgrade proceed and report what it accepted. A store the new daemon refuses
+# to start with is never overridable. `service install` takes no such flag and
+# is never given it.
 
 set -eu
 
 usage() {
     echo "usage: $0 [--accept-runtime-loss]" >&2
+    echo "  --accept-runtime-loss  accept live sessions losing their runtime: those a legacy" >&2
+    echo "                         migration would stop, and, on a service-managed host, those" >&2
+    echo "                         the upgraded daemon would not adopt or would lose native" >&2
+    echo "                         recovery for; a store the new daemon refuses is never accepted" >&2
 }
 
 accept_runtime_loss=0
@@ -219,10 +233,17 @@ fi
 # and runtime roots), a pending transaction it would refuse, and the recorded
 # installation of an upgrade. The check runs under this run's lock, which its
 # report confirms, so its answer holds until the final command.
-if ! check_json=$("$archive_dir/pohunek" service check --prefix "$prefix" --json); then
+set -- service check --prefix "$prefix" --json
+if [ "$service_action" = upgrade ] && [ "$accept_runtime_loss" -eq 1 ]; then
+    set -- "$@" --accept-runtime-loss
+fi
+if ! check_json=$("$archive_dir/pohunek" "$@"); then
     printf '%s\n' "$check_json" >&2
     echo "\`pohunek service $service_action\` would refuse this host, so the legacy install was not retired;" >&2
     echo "nothing was changed; fix the reported problem and re-run $0" >&2
+    if printf '%s\n' "$check_json" | grep -q 'service_upgrade_sessions_at_risk'; then
+        echo "live sessions the upgrade would not carry over are listed above; re-run $0 --accept-runtime-loss to accept losing them" >&2
+    fi
     exit 1
 fi
 if ! printf '%s\n' "$check_json" | grep -Eq '"locked"[[:space:]]*:[[:space:]]*true'; then
@@ -591,6 +612,9 @@ fi
 
 if [ "$service_action" = upgrade ]; then
     set -- service upgrade --from "$archive_dir"
+    if [ "$accept_runtime_loss" -eq 1 ]; then
+        set -- "$@" --accept-runtime-loss
+    fi
 else
     set -- service install --from "$archive_dir" --prefix "$prefix"
 fi

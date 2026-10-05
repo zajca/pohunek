@@ -63,6 +63,99 @@ fn a_pending_install_is_finished_by_service_install_even_with_service_config() {
 }
 
 #[test]
+fn an_upgrade_passes_no_loss_acceptance_without_the_flag() {
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    let output = fixture.run(&[], &[]);
+    assert_success(&output);
+    assert_eq!(
+        fixture.guard_calls(),
+        [fixture.lock_call(&[]), fixture.check_call()]
+    );
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.upgrade_call()]
+    );
+    for call in fixture.guard_calls().iter().chain(&fixture.pohunek_calls()) {
+        assert!(!call.contains("--accept-runtime-loss"), "{call}");
+    }
+}
+
+#[test]
+fn an_upgrade_passes_the_loss_acceptance_to_the_check_and_the_upgrade_once() {
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    let output = fixture.run(&["--accept-runtime-loss"], &[]);
+    assert_success(&output);
+    assert_eq!(
+        fixture.guard_calls(),
+        [
+            fixture.lock_call(&["--accept-runtime-loss"]),
+            format!("{} --accept-runtime-loss", fixture.check_call()),
+        ]
+    );
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [
+            STATUS.to_owned(),
+            format!("{} --accept-runtime-loss", fixture.upgrade_call()),
+        ]
+    );
+    for call in [&fixture.guard_calls()[1], &fixture.pohunek_calls()[1]] {
+        assert_eq!(call.matches("--accept-runtime-loss").count(), 1, "{call}");
+    }
+}
+
+#[test]
+fn an_upgrade_refused_for_sessions_at_risk_stops_before_anything_changes() {
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    fixture.legacy_install();
+    let output = fixture.run(
+        &[],
+        &[
+            ("POHUNEK_TEST_LEGACY_ACTIVE", "1"),
+            (
+                "POHUNEK_TEST_CHECK_ERROR",
+                "service_upgrade_sessions_at_risk",
+            ),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("service_upgrade_sessions_at_risk"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--accept-runtime-loss"), "{stderr}");
+    assert!(stderr.contains("nothing was changed"), "{stderr}");
+    fixture.assert_guarded(&[]);
+    assert_eq!(fixture.pohunek_calls(), [STATUS]);
+    assert!(fixture.systemctl_calls().is_empty());
+    for legacy in fixture.legacy_files() {
+        assert!(legacy.exists(), "{} was removed", legacy.display());
+    }
+}
+
+#[test]
+fn an_install_never_receives_the_loss_acceptance() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["--accept-runtime-loss"], &[]);
+    assert_success(&output);
+    assert_eq!(
+        fixture.guard_calls(),
+        [
+            fixture.lock_call(&["--accept-runtime-loss"]),
+            fixture.check_call(),
+        ]
+    );
+    assert_eq!(
+        fixture.pohunek_calls(),
+        [STATUS.to_owned(), fixture.install_call()]
+    );
+}
+
+#[test]
 fn a_pending_upgrade_keeps_service_upgrade() {
     let fixture = Fixture::new();
     write(&fixture.config_home.join("pohunek/service.toml"), "");

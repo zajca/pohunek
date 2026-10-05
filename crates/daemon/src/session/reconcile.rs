@@ -41,15 +41,52 @@ use super::{
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
     journal_schema_supported, observation_live, require_supported_journal_schema, Lifecycle,
-    IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
+    UnsupportedJournalSchema, IDENTITY_MISMATCH, SUPERVISION_AMBIGUOUS, SUPERVISION_UNAVAILABLE,
 };
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
 // Rust guideline compliant 2026-10-05
 
+pub mod upgrade_preflight;
+
 /// Discovery reason of a worker socket that does not answer.
 const UNREACHABLE_SOCKET: &str = "worker_unavailable";
+
+/// Reason of a worker whose id or runtime instance differs from the record's.
+pub(super) const RUNTIME_IDENTITY_MISMATCH: &str = "runtime_identity_mismatch";
+
+/// Reason of a recovery that found the worker it was meant to replace.
+pub(super) const WORKER_GENERATION_NOT_ADVANCED: &str = "worker_generation_not_advanced";
+
+/// Whether the worker named by `worker_id` and `worker_instance_id` is not the
+/// runtime the record binds; ids the record does not carry never conflict.
+pub(super) fn runtime_identity_conflict(
+    record: &SessionRecord,
+    worker_id: &str,
+    worker_instance_id: Option<&str>,
+) -> bool {
+    record
+        .runtime
+        .worker_id
+        .as_deref()
+        .is_some_and(|expected| expected != worker_id)
+        || record
+            .runtime
+            .worker_instance_id
+            .as_deref()
+            .zip(worker_instance_id)
+            .is_some_and(|(expected, actual)| expected != actual)
+}
+
+/// Whether the record's recovery is still waiting for a worker other than
+/// `worker_id`.
+pub(super) fn recovery_not_advanced(record: &SessionRecord, worker_id: &str) -> bool {
+    record.transaction.as_ref().is_some_and(|transaction| {
+        transaction.kind == crate::store::TransactionKind::Recover
+            && transaction.previous_worker_id.as_deref() == Some(worker_id)
+    })
+}
 
 /// Maximum worker journal accepted during daemon reconciliation.
 const MAX_WORKER_JOURNAL_BYTES: usize = 1024 * 1024;
@@ -139,6 +176,30 @@ pub(super) struct JournalEvidence {
     /// schema delivery.
     #[serde(default)]
     hook_schema: Option<String>,
+    /// Lowest private-protocol version the worker serves.
+    #[serde(default)]
+    protocol_minimum: Option<u16>,
+    /// Highest private-protocol version the worker serves.
+    #[serde(default)]
+    protocol_maximum: Option<u16>,
+    /// Immutable launch identity the worker accepted, when it accepted one.
+    #[serde(default)]
+    launch_identity: Option<JournalLaunchIdentity>,
+    /// Latest active identity claim the worker journaled.
+    #[serde(default)]
+    active_identity: Option<JournalActiveIdentity>,
+    /// Latest accepted release of an active identity.
+    #[serde(default)]
+    active_identity_release: Option<JournalReleasedIdentity>,
+}
+
+/// The recovery facts of a worker's accepted launch identity.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct JournalLaunchIdentity {
+    provider: String,
+    reference_kind: String,
+    native_reference: String,
+    process: Option<JournalProcess>,
 }
 
 impl JournalEvidence {
@@ -155,6 +216,131 @@ impl JournalEvidence {
 #[derive(Debug, Clone, Deserialize)]
 struct JournalChild {
     pid: u32,
+    /// Platform start identity, as the worker recorded it.
+    #[serde(default)]
+    start_identity: String,
+}
+
+/// A process a journaled identity names.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct JournalProcess {
+    pid: u32,
+    #[serde(default)]
+    start_identity: String,
+}
+
+impl JournalProcess {
+    /// The process as the worker reports it over its socket; `None` for a
+    /// start identity that is not a number.
+    fn wire(&self) -> Option<pohunek_worker_protocol::ProcessIdentity> {
+        Some(pohunek_worker_protocol::ProcessIdentity {
+            pid: self.pid,
+            start_identity: self.start_identity.parse().ok()?,
+        })
+    }
+}
+
+/// The live active identity claim a worker journaled.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct JournalActiveIdentity {
+    provider: String,
+    process: JournalProcess,
+    sequence: u64,
+    expires_at: String,
+    reference_kind: Option<String>,
+    native_reference: Option<String>,
+}
+
+/// The release of an active identity a worker journaled.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct JournalReleasedIdentity {
+    provider: String,
+    process: JournalProcess,
+    sequence: u64,
+}
+
+impl JournalEvidence {
+    /// The inspection snapshot this journal stands for, as the live worker
+    /// would report it, or the reason it cannot be built.
+    ///
+    /// The upgrade preflight cannot ask the worker, so it judges the snapshot
+    /// its journal implies with the functions adoption applies to the real one.
+    pub(super) fn snapshot(&self) -> Result<InspectSnapshot, &'static str> {
+        const UNREADABLE: &str = "worker_journal_unreadable";
+        let wire = |process: &JournalProcess| process.wire().ok_or(UNREADABLE);
+        let child_process = match &self.child {
+            Some(child) => Some(wire(&JournalProcess {
+                pid: child.pid,
+                start_identity: child.start_identity.clone(),
+            })?),
+            None => None,
+        };
+        let launch_identity = match &self.launch_identity {
+            Some(claim) => Some(pohunek_worker_protocol::ReportedLaunchIdentity {
+                provider: claim.provider.clone(),
+                process: wire(claim.process.as_ref().ok_or(UNREADABLE)?)?,
+                reference_kind: claim.reference_kind.clone(),
+                native_reference: claim.native_reference.clone(),
+            }),
+            None => None,
+        };
+        // The worker reports an active claim only while it has not expired.
+        let active_identity = match &self.active_identity {
+            Some(claim) if identity_claim_expiry_is_valid(&claim.expires_at) => {
+                Some(pohunek_worker_protocol::ActiveIdentityClaim {
+                    provider: claim.provider.clone(),
+                    process: wire(&claim.process)?,
+                    sequence: claim.sequence,
+                    expires_at: claim.expires_at.clone(),
+                    reference_kind: claim.reference_kind.clone(),
+                    native_reference: claim.native_reference.clone(),
+                })
+            }
+            _ => None,
+        };
+        let active_identity_release = match &self.active_identity_release {
+            Some(release) => Some(ReleasedIdentityClaim {
+                provider: release.provider.clone(),
+                process: wire(&release.process)?,
+                sequence: release.sequence,
+            }),
+            None => None,
+        };
+        let phase = match self.phase {
+            JournalPhase::Bootstrap => RuntimePhase::Uninitialized,
+            JournalPhase::Starting => RuntimePhase::Starting,
+            JournalPhase::Live => RuntimePhase::Running,
+            JournalPhase::Terminal => RuntimePhase::Exited,
+            JournalPhase::NeverInitialized | JournalPhase::Faulted => RuntimePhase::Faulted,
+        };
+        Ok(InspectSnapshot {
+            session_id: pohunek_worker_protocol::SessionId::new(&self.session_id)
+                .map_err(|_invalid| UNREADABLE)?,
+            worker_id: pohunek_worker_protocol::WorkerId::new(&self.worker_id)
+                .map_err(|_invalid| UNREADABLE)?,
+            worker_instance_id: self
+                .worker_instance_id
+                .as_deref()
+                .map(pohunek_worker_protocol::WorkerInstanceId::new)
+                .transpose()
+                .map_err(|_invalid| UNREADABLE)?,
+            phase,
+            worker_process: wire(&JournalProcess {
+                pid: self.worker_pid,
+                start_identity: self.worker_start_identity.clone(),
+            })?,
+            child_process,
+            dimensions: None,
+            history_start_offset: 0,
+            next_offset: 0,
+            exit: None,
+            launch_identity,
+            active_identity,
+            active_identity_release,
+            subagents: self.subagents.clone(),
+            hook_schema: self.hook_schema.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -1279,12 +1465,7 @@ impl SessionRegistry {
     /// Whether `record` is a running create whose `initial_input` marker was
     /// written by another daemon instance, or names none.
     fn orphaned_initial_input(&self, record: &SessionRecord) -> bool {
-        record.desired_state == DesiredState::Running
-            && record
-                .transaction
-                .as_ref()
-                .is_some_and(crate::store::SessionTransaction::is_initial_input)
-            && initial_input_owner(record).as_deref() != Some(self.daemon_instance_id())
+        initial_input_orphaned(record, self.daemon_instance_id())
     }
 
     /// Parks an undelivered-create conversion before its conditional write
@@ -2442,36 +2623,29 @@ impl SessionRegistry {
                 .await;
         };
 
-        let identity_conflict = record
-            .runtime
-            .worker_id
-            .as_deref()
-            .is_some_and(|expected| expected != snapshot.worker_id.as_str())
-            || record
-                .runtime
+        if runtime_identity_conflict(
+            &record,
+            snapshot.worker_id.as_str(),
+            snapshot
                 .worker_instance_id
-                .as_deref()
-                .zip(snapshot.worker_instance_id.as_ref())
-                .is_some_and(|(expected, actual)| expected != actual.as_str());
-        if identity_conflict {
+                .as_ref()
+                .map(pohunek_worker_protocol::WorkerInstanceId::as_str),
+        ) {
             self.mark_pending(
                 record,
                 RuntimeState::Conflict,
-                "runtime_identity_mismatch",
+                RUNTIME_IDENTITY_MISMATCH,
                 retry,
             )
             .await;
             return true;
         }
-        if record.transaction.as_ref().is_some_and(|transaction| {
-            transaction.kind == crate::store::TransactionKind::Recover
-                && transaction.previous_worker_id.as_deref() == Some(snapshot.worker_id.as_str())
-        }) {
+        if recovery_not_advanced(&record, snapshot.worker_id.as_str()) {
             return !self
                 .insert_unavailable_record(
                     record,
                     RuntimeState::Lost,
-                    "worker_generation_not_advanced",
+                    WORKER_GENERATION_NOT_ADVANCED,
                 )
                 .await;
         }
@@ -3389,6 +3563,17 @@ enum UndeliveredCreate {
 
 /// The daemon instance an `initial_input` marker of `record` names, which
 /// keeps holding the undelivered input while it runs.
+/// Whether `record` is a running create whose `initial_input` marker was not
+/// written by the daemon instance `daemon_instance_id`.
+fn initial_input_orphaned(record: &SessionRecord, daemon_instance_id: &str) -> bool {
+    record.desired_state == DesiredState::Running
+        && record
+            .transaction
+            .as_ref()
+            .is_some_and(crate::store::SessionTransaction::is_initial_input)
+        && initial_input_owner(record).as_deref() != Some(daemon_instance_id)
+}
+
 fn initial_input_owner(record: &SessionRecord) -> Option<String> {
     record
         .transaction
@@ -3416,7 +3601,9 @@ fn reported_hook_schema(
         .transpose()
 }
 
-fn import_worker_subagents(snapshot: &InspectSnapshot) -> Result<Vec<SubagentInfo>, &'static str> {
+pub(super) fn import_worker_subagents(
+    snapshot: &InspectSnapshot,
+) -> Result<Vec<SubagentInfo>, &'static str> {
     map_worker_subagents(
         &snapshot.subagents,
         reported_hook_schema(snapshot.hook_schema.as_deref())?,
@@ -3488,7 +3675,7 @@ fn is_pending_stop(record: &SessionRecord) -> bool {
             .is_some_and(|transaction| transaction.kind == crate::store::TransactionKind::Stop)
 }
 
-fn merge_persisted_recovery(
+pub(super) fn merge_persisted_recovery(
     record: &mut SessionRecord,
     mut binding: crate::store::ResumeBinding,
 ) -> Result<(), &'static str> {
@@ -3677,13 +3864,13 @@ fn metadata_write_failure_outcome(error: &ProtocolError) -> WorkerMetadataApplyO
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdentityValidationFailure {
+pub(super) enum IdentityValidationFailure {
     Retryable(&'static str),
     Permanent(&'static str),
 }
 
 impl IdentityValidationFailure {
-    fn reason_and_retryability(self) -> (&'static str, bool) {
+    pub(super) fn reason_and_retryability(self) -> (&'static str, bool) {
         match self {
             Self::Retryable(reason) => (reason, true),
             Self::Permanent(reason) => (reason, false),
@@ -3695,13 +3882,58 @@ impl IdentityValidationFailure {
     }
 }
 
+/// The processes a worker's identity claims must find in its PTY tree.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IdentityClaims {
+    /// The PTY root the worker reports.
+    pub(super) root: Option<pohunek_worker_protocol::ProcessIdentity>,
+    /// The process of the immutable launch identity.
+    pub(super) launch: Option<pohunek_worker_protocol::ProcessIdentity>,
+    /// The process of the live active identity.
+    pub(super) active: Option<pohunek_worker_protocol::ProcessIdentity>,
+    /// The matcher the active identity is held to: its schema's, or the core
+    /// matcher, the strictest one, when the schema is absent or unknown (such
+    /// a snapshot is refused when its identities are applied).
+    pub(super) active_matcher: AncestryMatcher,
+}
+
+impl IdentityClaims {
+    /// The claims a worker reports in its inspection snapshot.
+    pub(super) fn from_snapshot(snapshot: &InspectSnapshot) -> Self {
+        Self {
+            root: snapshot.child_process,
+            launch: snapshot.launch_identity.as_ref().map(|claim| claim.process),
+            active: snapshot.active_identity.as_ref().map(|claim| claim.process),
+            active_matcher: reported_hook_schema(snapshot.hook_schema.as_deref())
+                .ok()
+                .flatten()
+                .map_or(AncestryMatcher::CORE, |schema| schema.ancestry),
+        }
+    }
+
+    /// Whether any claim beyond the root needs validating.
+    pub(super) fn has_claims(&self) -> bool {
+        self.launch.is_some() || self.active.is_some()
+    }
+}
+
 fn validate_worker_identity_processes(
     inspector: &dyn ProcessInspector,
     snapshot: &InspectSnapshot,
 ) -> Result<(), IdentityValidationFailure> {
-    let root = snapshot
-        .child_process
-        .as_ref()
+    validate_identity_claims(inspector, &IdentityClaims::from_snapshot(snapshot))
+}
+
+/// Validates `claims` against the live process tree below the claimed root.
+///
+/// Startup adoption and the upgrade preflight both decide through this
+/// function, so a claim is judged the same wherever its evidence came from.
+pub(super) fn validate_identity_claims(
+    inspector: &dyn ProcessInspector,
+    claims: &IdentityClaims,
+) -> Result<(), IdentityValidationFailure> {
+    let root = claims
+        .root
         .ok_or(IdentityValidationFailure::Permanent("worker_child_missing"))?;
     let expected_root = crate::procwatch::ProcessIdentity {
         pid: root.pid,
@@ -3725,19 +3957,29 @@ fn validate_worker_identity_processes(
     let descendants = inspector.descendants(root.pid).map_err(|_error| {
         IdentityValidationFailure::Retryable("identity_process_inspection_failed")
     })?;
-    validate_worker_identity_process_facts(snapshot, &current_root, &descendants)
+    claim_process_facts(claims, &current_root, &descendants)
         .map_err(IdentityValidationFailure::Permanent)
 }
 
+#[cfg(test)]
 fn validate_worker_identity_process_facts(
     snapshot: &InspectSnapshot,
     current_root: &crate::procwatch::ProcessFact,
     descendants: &[crate::procwatch::ProcessFact],
 ) -> Result<(), &'static str> {
-    let root = snapshot
-        .child_process
-        .as_ref()
-        .ok_or("worker_child_missing")?;
+    claim_process_facts(
+        &IdentityClaims::from_snapshot(snapshot),
+        current_root,
+        descendants,
+    )
+}
+
+fn claim_process_facts(
+    claims: &IdentityClaims,
+    current_root: &crate::procwatch::ProcessFact,
+    descendants: &[crate::procwatch::ProcessFact],
+) -> Result<(), &'static str> {
+    let root = claims.root.ok_or("worker_child_missing")?;
     if current_root.pid != root.pid || current_root.start_identity.get() != root.start_identity {
         return Err("identity_process_root_reused");
     }
@@ -3750,24 +3992,17 @@ fn validate_worker_identity_process_facts(
         )
     };
     // The launch identity is core-owned and always held to the core matcher.
-    // An active identity is held to its schema's matcher; a snapshot whose
-    // schema is absent or unknown is refused when its identities are applied,
-    // so the core matcher is the strictest one available here.
-    let active_matcher = reported_hook_schema(snapshot.hook_schema.as_deref())
-        .ok()
-        .flatten()
-        .map_or(AncestryMatcher::CORE, |schema| schema.ancestry);
-    if snapshot
-        .launch_identity
+    if claims
+        .launch
         .as_ref()
-        .is_some_and(|identity| !AncestryMatcher::CORE.admits(relation(&identity.process)))
+        .is_some_and(|process| !AncestryMatcher::CORE.admits(relation(process)))
     {
         return Err("launch_identity_process_invalid");
     }
-    if snapshot
-        .active_identity
+    if claims
+        .active
         .as_ref()
-        .is_some_and(|identity| !active_matcher.admits(relation(&identity.process)))
+        .is_some_and(|process| !claims.active_matcher.admits(relation(process)))
     {
         return Err("active_identity_process_invalid");
     }
@@ -3920,12 +4155,28 @@ fn apply_worker_launch_identity(
     let Some(identity) = identity else {
         return Ok(());
     };
+    apply_launch_identity(
+        record,
+        &identity.provider,
+        &identity.reference_kind,
+        &identity.native_reference,
+    )
+}
+
+/// Binds the launch identity a worker accepted to the record's recovery, or
+/// names the contradiction.
+pub(super) fn apply_launch_identity(
+    record: &mut SessionRecord,
+    provider: &str,
+    reference_kind: &str,
+    native_reference: &str,
+) -> Result<(), &'static str> {
     let expected_provider = super::agent_kind_label(&record.info.agent_base);
-    if identity.provider != expected_provider {
+    if provider != expected_provider {
         return Err("launch_identity_provider_mismatch");
     }
-    let kind = parse_reference_kind(&identity.reference_kind)
-        .ok_or("launch_identity_reference_kind_invalid")?;
+    let kind =
+        parse_reference_kind(reference_kind).ok_or("launch_identity_reference_kind_invalid")?;
     let binding = record
         .recovery
         .as_mut()
@@ -3945,7 +4196,7 @@ fn apply_worker_launch_identity(
     if contradicts {
         return Err("launch_identity_reference_kind_mismatch");
     }
-    let native = validate_native_reference(kind, &identity.native_reference)
+    let native = validate_native_reference(kind, native_reference)
         .ok_or("launch_identity_reference_invalid")?;
     let existing = match kind {
         SessionRefKind::Id => record.info.native_session_id.as_deref(),
@@ -4400,10 +4651,24 @@ enum TerminalJournalClassification {
     Absent,
 }
 
+/// Why a journal file of a session is not usable as evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum JournalReject {
+    /// The file or its directory cannot be read or parsed.
+    Unreadable,
+    /// The file declares a schema the daemon does not read.
+    UnsupportedSchema(u32),
+    /// The file disagrees with the path it was found under, or holds a
+    /// malformed identity.
+    Mismatched,
+}
+
 #[derive(Debug, Clone, Default)]
-struct WorkerJournalScan {
-    evidence: Vec<JournalEvidence>,
-    conflict: bool,
+pub(super) struct WorkerJournalScan {
+    pub(super) evidence: Vec<JournalEvidence>,
+    pub(super) conflict: bool,
+    /// The journal files behind `conflict`, by file name.
+    pub(super) rejected: Vec<(String, JournalReject)>,
 }
 
 impl WorkerJournalScan {
@@ -4411,7 +4676,7 @@ impl WorkerJournalScan {
     ///
     /// Journals of other generations are history, never evidence about the
     /// record's current generation.
-    fn scoped_to(&self, generation: Option<&super::Generation>) -> Self {
+    pub(super) fn scoped_to(&self, generation: Option<&super::Generation>) -> Self {
         Self {
             evidence: self
                 .evidence
@@ -4423,6 +4688,7 @@ impl WorkerJournalScan {
                 .cloned()
                 .collect(),
             conflict: self.conflict,
+            rejected: self.rejected.clone(),
         }
     }
 
@@ -4487,7 +4753,9 @@ fn classify_terminal_journals(
     }
 }
 
-fn scan_worker_journals(state_root: &Path) -> std::io::Result<HashMap<String, WorkerJournalScan>> {
+pub(super) fn scan_worker_journals(
+    state_root: &Path,
+) -> std::io::Result<HashMap<String, WorkerJournalScan>> {
     let mut journals = HashMap::<String, WorkerJournalScan>::new();
     let root_metadata = match std::fs::symlink_metadata(state_root) {
         Ok(metadata) => metadata,
@@ -4507,7 +4775,10 @@ fn scan_worker_journals(state_root: &Path) -> std::io::Result<HashMap<String, Wo
         // An unsafe or unreadable session directory may hold any worker's
         // journal, so it is a conflict rather than an absence.
         let Ok(session_directory) = root.open_child(&session_name, 0o700) else {
-            journals.entry(session_id).or_default().conflict = true;
+            let scan = journals.entry(session_id).or_default();
+            scan.conflict = true;
+            scan.rejected
+                .push((String::new(), JournalReject::Unreadable));
             continue;
         };
         for journal_name in session_directory
@@ -4522,34 +4793,49 @@ fn scan_worker_journals(state_root: &Path) -> std::io::Result<HashMap<String, Wo
                 continue;
             };
             let scan = journals.entry(session_id.clone()).or_default();
-            let Ok(bytes) =
-                session_directory.read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
-            else {
-                scan.conflict = true;
-                continue;
-            };
-            if require_supported_journal_schema(&bytes, &session_id, journal_stem).is_err() {
-                scan.conflict = true;
-                continue;
+            let evidence = session_directory
+                .read_file(&journal_name, 0o600, MAX_WORKER_JOURNAL_BYTES)
+                .map_err(|_unreadable| JournalReject::Unreadable)
+                .and_then(|bytes| journal_evidence(&bytes, &session_id, journal_stem));
+            match evidence {
+                Ok(evidence) => scan.evidence.push(evidence),
+                Err(reject) => {
+                    scan.conflict = true;
+                    scan.rejected
+                        .push((journal_name.to_string_lossy().into_owned(), reject));
+                }
             }
-            let Ok(evidence) = serde_json::from_slice::<JournalEvidence>(&bytes) else {
-                scan.conflict = true;
-                continue;
-            };
-            if !journal_schema_supported(evidence.schema_version)
-                || evidence.session_id != session_id
-                || evidence.worker_id != journal_stem
-                || pohunek_paths::valid_worker_generation(&evidence.generation).is_none()
-                || !evidence.executable.is_absolute()
-                || BootIdentity::parse(evidence.boot_identity.clone()).is_err()
-            {
-                scan.conflict = true;
-                continue;
-            }
-            scan.evidence.push(evidence);
         }
     }
     Ok(journals)
+}
+
+/// Decodes one journal file found under `session_id` as `journal_stem`.
+fn journal_evidence(
+    bytes: &[u8],
+    session_id: &str,
+    journal_stem: &str,
+) -> Result<JournalEvidence, JournalReject> {
+    if let Err(error) = require_supported_journal_schema(bytes, session_id, journal_stem) {
+        return Err(error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<UnsupportedJournalSchema>())
+            .map_or(JournalReject::Unreadable, |unsupported| {
+                JournalReject::UnsupportedSchema(unsupported.found)
+            }));
+    }
+    let evidence = serde_json::from_slice::<JournalEvidence>(bytes)
+        .map_err(|_malformed| JournalReject::Unreadable)?;
+    if !journal_schema_supported(evidence.schema_version)
+        || evidence.session_id != session_id
+        || evidence.worker_id != journal_stem
+        || pohunek_paths::valid_worker_generation(&evidence.generation).is_none()
+        || !evidence.executable.is_absolute()
+        || BootIdentity::parse(evidence.boot_identity.clone()).is_err()
+    {
+        return Err(JournalReject::Mismatched);
+    }
+    Ok(evidence)
 }
 
 fn discover_runtime_slots(runtime_root: &Path) -> std::io::Result<Vec<(String, PathBuf)>> {
@@ -5460,7 +5746,10 @@ while os.getppid() == parent:
             worker_start_identity: "410".to_owned(),
             boot_identity: "boot-test".to_owned(),
             worker_instance_id: record.runtime.worker_instance_id.clone(),
-            child: Some(super::JournalChild { pid: 50 }),
+            child: Some(super::JournalChild {
+                pid: 50,
+                start_identity: "500".to_owned(),
+            }),
             cols: Some(80),
             rows: Some(24),
             phase: super::JournalPhase::Terminal,
@@ -5471,6 +5760,11 @@ while os.getppid() == parent:
             }),
             subagents: Vec::new(),
             hook_schema: None,
+            protocol_minimum: None,
+            protocol_maximum: None,
+            launch_identity: None,
+            active_identity: None,
+            active_identity_release: None,
         };
         let mut mismatch = exact.clone();
         mismatch.worker_id = "different-worker".to_owned();
@@ -5479,7 +5773,7 @@ while os.getppid() == parent:
             super::classify_terminal_journals(
                 &super::WorkerJournalScan {
                     evidence: vec![mismatch],
-                    conflict: false,
+                    ..Default::default()
                 },
                 &record
             ),
@@ -5489,7 +5783,7 @@ while os.getppid() == parent:
             super::classify_terminal_journals(
                 &super::WorkerJournalScan {
                     evidence: vec![exact.clone(), exact],
-                    conflict: false,
+                    ..Default::default()
                 },
                 &record
             ),
@@ -5550,6 +5844,7 @@ while os.getppid() == parent:
                 &super::WorkerJournalScan {
                     evidence: accepted.evidence.clone(),
                     conflict: accepted.conflict,
+                    rejected: accepted.rejected.clone(),
                 },
                 &identity_record()
             ),
@@ -14801,4 +15096,460 @@ handler = "codex-hook-v1"
             worker.server_task.abort();
         }
     }
+
+    /// What startup reconciliation does with one worker and record, against
+    /// what the upgrade preflight says about the same files.
+    struct Differential {
+        name: &'static str,
+        /// Whether the worker is initialized; an uninitialized one is still in
+        /// its `bootstrap` phase.
+        initialized: bool,
+        edit_record: fn(&mut SessionRecord),
+        edit_journal: fn(&mut serde_json::Value),
+        /// Damages the store file after the record is written.
+        damage_store: fn(&Path),
+        /// Replaces the journal file with these bytes instead of editing it.
+        journal_bytes: Option<&'static [u8]>,
+        /// Whether the preflight must call the session adoptable.
+        preflight_adoptable: bool,
+        /// Whether reconciliation adopts the worker live.
+        reconcile_live: bool,
+    }
+
+    fn untouched_record(_: &mut SessionRecord) {}
+
+    /// Cuts the store file in the middle of its only line.
+    fn truncate_store(path: &Path) {
+        let body = std::fs::read_to_string(path).expect("read store");
+        std::fs::write(path, &body[..body.len() / 2]).expect("truncate store");
+    }
+    fn untouched_journal(_: &mut serde_json::Value) {}
+
+    /// The preflight is never more optimistic than reconciliation: it calls a
+    /// session adoptable only when startup adopts its worker live. Each case
+    /// runs the real reconcile over a real in-process worker, so a rule added
+    /// to one side and not the other fails here.
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table drives every case through the same real worker fixture"
+    )]
+    async fn the_upgrade_preflight_is_never_more_optimistic_than_reconciliation() {
+        use super::upgrade_preflight::{run, PreflightInputs};
+        use pohunek_service_config::preflight::Verdict;
+
+        let cases = [
+            Differential {
+                name: "an intact initialized worker",
+                initialized: true,
+                edit_record: untouched_record,
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: true,
+                reconcile_live: true,
+            },
+            Differential {
+                name: "a record bound to another runtime instance",
+                initialized: true,
+                edit_record: |record| {
+                    record.runtime.worker_instance_id = Some("other-instance".to_owned());
+                },
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a record bound to another worker",
+                initialized: true,
+                edit_record: |record| record.runtime.worker_id = Some("other-worker".to_owned()),
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a record without a worker generation",
+                initialized: true,
+                edit_record: |record| {
+                    record.runtime.service_id = None;
+                    record.runtime.generation = None;
+                    record.runtime.executable = None;
+                },
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a recovery that waits for another worker",
+                initialized: true,
+                edit_record: |record| {
+                    record.transaction = Some(crate::store::SessionTransaction {
+                        id: "recover-diff".to_owned(),
+                        kind: crate::store::TransactionKind::Recover,
+                        phase: "starting".to_owned(),
+                        previous_worker_id: Some(DIFFERENTIAL_WORKER.to_owned()),
+                        previous_worker_instance_id: None,
+                        daemon_instance_id: None,
+                    });
+                },
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a worker that never initialized",
+                initialized: false,
+                edit_record: |record| record.runtime.worker_instance_id = None,
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a stop intent the new daemon finishes",
+                initialized: true,
+                edit_record: |record| record.desired_state = DesiredState::Stopped,
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a removal intent the new daemon finishes",
+                initialized: true,
+                edit_record: |record| record.desired_state = DesiredState::Removed,
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a create whose initial input was never delivered",
+                initialized: true,
+                edit_record: |record| {
+                    record.transaction = Some(crate::store::SessionTransaction {
+                        id: "create-diff".to_owned(),
+                        kind: crate::store::TransactionKind::Create,
+                        phase: crate::store::INITIAL_INPUT_PHASE.to_owned(),
+                        previous_worker_id: None,
+                        previous_worker_instance_id: None,
+                        daemon_instance_id: Some("previous-daemon".to_owned()),
+                    });
+                },
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a worker journal that cannot be read",
+                initialized: true,
+                edit_record: untouched_record,
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: Some(b"not json"),
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a worker journal of an unsupported schema",
+                initialized: true,
+                edit_record: untouched_record,
+                edit_journal: |journal| journal["schema_version"] = serde_json::json!(3),
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a store line damaged beyond loading",
+                initialized: true,
+                edit_record: untouched_record,
+                edit_journal: untouched_journal,
+                damage_store: truncate_store,
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            Differential {
+                name: "a damaged store line and an unreadable journal",
+                initialized: true,
+                edit_record: untouched_record,
+                edit_journal: untouched_journal,
+                damage_store: truncate_store,
+                journal_bytes: Some(b"not json"),
+                preflight_adoptable: false,
+                reconcile_live: false,
+            },
+            // The preflight reads the journal only; reconciliation asks the
+            // live worker, so it stays more pessimistic here.
+            Differential {
+                name: "a launch identity process outside the PTY tree",
+                initialized: true,
+                edit_record: untouched_record,
+                edit_journal: |journal| {
+                    let parent = std::os::unix::process::parent_id();
+                    let identity = crate::procwatch::HostInspector::new()
+                        .identity(parent)
+                        .expect("inspect the parent")
+                        .expect("the parent runs");
+                    journal["launch_identity"] = serde_json::json!({
+                        "provider": "shell",
+                        "process": {
+                            "pid": identity.pid,
+                            "process_group": 0,
+                            "start_identity": identity.start_identity.get().to_string(),
+                        },
+                        "reference_kind": "id",
+                        "native_reference": "native-diff",
+                    });
+                },
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: true,
+            },
+            Differential {
+                name: "a journal whose protocol range this daemon cannot serve",
+                initialized: true,
+                edit_record: untouched_record,
+                edit_journal: |journal| {
+                    journal["protocol_minimum"] = serde_json::json!(1);
+                    journal["protocol_maximum"] = serde_json::json!(2);
+                },
+                damage_store: |_| {},
+                journal_bytes: None,
+                preflight_adoptable: false,
+                reconcile_live: true,
+            },
+        ];
+
+        for case in cases {
+            let root = temp_root();
+            let runtime_root = root.join("runtime/workers");
+            let session_id = DIFFERENTIAL_SESSION;
+            let (instance, child_pid, controller, task) = if case.initialized {
+                let (controller, instance, child_pid, task) =
+                    spawn_initialized_worker(&root, &runtime_root, session_id, DIFFERENTIAL_WORKER)
+                        .await;
+                (Some(instance), child_pid, Some(controller), task)
+            } else {
+                let (_socket, task) = spawn_uninitialized_worker(
+                    &root,
+                    &runtime_root,
+                    session_id,
+                    session_id,
+                    DIFFERENTIAL_WORKER,
+                )
+                .await;
+                (None, 0, None, task)
+            };
+            let state_root = root.join("state/workers");
+            for private in [
+                root.join("state"),
+                state_root.clone(),
+                state_root.join(session_id),
+            ] {
+                std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+                    .expect("private journal directories");
+            }
+
+            let mut record = identity_record();
+            record.session_id = session_id.to_owned();
+            record.info.id = SessionId(session_id.to_owned());
+            record.info.agent = "shell".to_owned();
+            record.info.agent_base = RuntimeRef::shell();
+            record.info.cwd = root.clone();
+            record.info.pid = child_pid;
+            let info_runtime = record.info.runtime.as_mut().expect("runtime info");
+            info_runtime.worker_id = Some(DIFFERENTIAL_WORKER.to_owned());
+            info_runtime.worker_instance_id = instance.as_ref().map(ToString::to_string);
+            record.runtime.worker_id = Some(DIFFERENTIAL_WORKER.to_owned());
+            record.runtime.worker_instance_id = instance.as_ref().map(ToString::to_string);
+            let recovery = record.recovery.as_mut().expect("recovery binding");
+            recovery.session_id = session_id.to_owned();
+            recovery.agent = "shell".to_owned();
+            recovery.agent_base = RuntimeRef::shell();
+            recovery.cwd = root.clone();
+            recovery.program = "/bin/sh".to_owned();
+            recovery.args = vec!["-c".to_owned(), "sleep 30".to_owned()];
+            bind_test_generation(&mut record);
+            (case.edit_record)(&mut record);
+            let store_path = root.join("data/metadata.jsonl");
+            Store::new(store_path.clone())
+                .record_session(&record)
+                .expect("persist logical record");
+            let journal_path = state_root
+                .join(session_id)
+                .join(format!("{DIFFERENTIAL_WORKER}.json"));
+            (case.damage_store)(&store_path);
+            if let Some(bytes) = case.journal_bytes {
+                std::fs::write(&journal_path, bytes).expect("damage journal");
+            } else {
+                let mut journal: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&journal_path).expect("read journal"))
+                        .expect("journal json");
+                (case.edit_journal)(&mut journal);
+                std::fs::write(&journal_path, journal.to_string()).expect("write journal");
+            }
+
+            let report = run(
+                &PreflightInputs {
+                    store_path: store_path.clone(),
+                    worker_state_root: state_root.clone(),
+                },
+                &crate::procwatch::HostInspector::new(),
+            );
+            let verdict = report
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .map(|session| session.verdict);
+            // The worker serves one controller at a time.
+            drop(controller);
+            let registry = SessionRegistry::new(SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                store_path: Some(store_path),
+                worker_runtime_root: Some(runtime_root),
+                worker_state_root: Some(state_root),
+                worker_connect_deadline: Duration::from_millis(300),
+                procwatch_poll: Duration::from_secs(60),
+                ..SessionRegistryConfig::default()
+            });
+            Box::pin(registry.reconcile_workers())
+                .await
+                .expect("reconcile");
+            let runtime = registry
+                .inspect(&SessionId(session_id.to_owned()))
+                .await
+                .ok()
+                .and_then(|info| info.runtime);
+            let live = runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.state == RuntimeState::Live);
+            if let Some(entry) = registry
+                .inner
+                .sessions
+                .lock()
+                .await
+                .get(&SessionId(session_id.to_owned()))
+            {
+                entry.procwatch_cancel.cancel();
+            }
+            task.abort();
+
+            let adoptable = verdict == Some(Verdict::Adoptable);
+            assert_eq!(live, case.reconcile_live, "{}: reconcile", case.name);
+            assert_eq!(
+                adoptable, case.preflight_adoptable,
+                "{}: preflight {:?}",
+                case.name, report.sessions
+            );
+            assert!(
+                !adoptable || live,
+                "{}: the preflight must not call adoptable what reconciliation does not adopt",
+                case.name
+            );
+            assert!(
+                live || report.at_risk().count() > 0,
+                "{}: a session reconciliation does not adopt must be listed at risk: {:?}",
+                case.name,
+                report
+            );
+        }
+    }
+
+    /// A process table that cannot be read never makes a session adoptable.
+    #[tokio::test]
+    async fn the_upgrade_preflight_fails_closed_when_identity_processes_cannot_be_inspected() {
+        use super::upgrade_preflight::{run, PreflightInputs};
+        use pohunek_service_config::preflight::Verdict;
+
+        let root = temp_root();
+        let runtime_root = root.join("runtime/workers");
+        let session_id = DIFFERENTIAL_SESSION;
+        let (_controller, instance, child_pid, task) =
+            spawn_initialized_worker(&root, &runtime_root, session_id, DIFFERENTIAL_WORKER).await;
+        let state_root = root.join("state/workers");
+        for private in [
+            root.join("state"),
+            state_root.clone(),
+            state_root.join(session_id),
+        ] {
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+                .expect("private journal directories");
+        }
+        let mut record = identity_record();
+        record.session_id = session_id.to_owned();
+        record.info.id = SessionId(session_id.to_owned());
+        record.info.agent = "shell".to_owned();
+        record.info.agent_base = RuntimeRef::shell();
+        record.info.pid = child_pid;
+        record.runtime.worker_id = Some(DIFFERENTIAL_WORKER.to_owned());
+        record.runtime.worker_instance_id = Some(instance.to_string());
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.session_id = session_id.to_owned();
+        recovery.agent = "shell".to_owned();
+        recovery.agent_base = RuntimeRef::shell();
+        bind_test_generation(&mut record);
+        let store_path = root.join("data/metadata.jsonl");
+        Store::new(store_path.clone())
+            .record_session(&record)
+            .expect("persist record");
+        let journal_path = state_root
+            .join(session_id)
+            .join(format!("{DIFFERENTIAL_WORKER}.json"));
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&journal_path).expect("read journal"))
+                .expect("journal json");
+        // The launch process is the PTY root itself, so a readable table passes.
+        journal["launch_identity"] = serde_json::json!({
+            "provider": "shell",
+            "process": journal["child"].clone(),
+            "reference_kind": "id",
+            "native_reference": "native-diff",
+        });
+        std::fs::write(&journal_path, journal.to_string()).expect("write journal");
+        let inputs = PreflightInputs {
+            store_path,
+            worker_state_root: state_root,
+        };
+        let verdict = |inspector: &dyn ProcessInspector| {
+            run(&inputs, inspector)
+                .sessions
+                .into_iter()
+                .find(|session| session.session_id == session_id)
+                .expect("the session is judged")
+        };
+
+        let readable = verdict(&RetryInspector::default());
+        let unreadable_table = RetryInspector::default();
+        unreadable_table.fail_descendants(true);
+        let unreadable = verdict(&unreadable_table);
+        task.abort();
+
+        assert!(
+            !readable.code.starts_with("identity_process_") && !readable.code.contains("child"),
+            "{readable:?}"
+        );
+        assert_eq!(unreadable.verdict, Verdict::WouldNotBeAdopted);
+        assert_eq!(unreadable.code, "identity_process_inspection_failed");
+    }
+
+    /// Session of the differential cases.
+    const DIFFERENTIAL_SESSION: &str = "s-301";
+    /// Worker of the differential cases.
+    const DIFFERENTIAL_WORKER: &str = "worker-differential";
 }

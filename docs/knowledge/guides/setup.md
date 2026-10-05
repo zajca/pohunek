@@ -82,7 +82,8 @@ already gone). Upgrades use
 `pohunek service upgrade`; `pohunek service status` shows the daemon job,
 versions, and workers. `pohunek service check [--prefix DIR]` runs every check
 the install or upgrade would make before changing anything, and changes
-nothing; `pohunek service lock -- <command>` runs a command that no other
+nothing (an upgrade also runs a read-only live-session preflight that
+`--accept-runtime-loss` can override, except for an unusable store); `pohunek service lock -- <command>` runs a command that no other
 service transaction can interleave with (the archive installer uses both). For
 upgrades, removal, and runtime diagnosis, see
 [update after release](../runbooks/update-after-release.md) and

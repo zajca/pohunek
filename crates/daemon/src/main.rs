@@ -18,6 +18,13 @@
 //!   workers as direct children under the documented dev/test contract.
 //!
 //! Anything else fails at startup.
+//!
+//! `pohunekd upgrade-preflight` is the one other mode. It prints, as one JSON
+//! document, whether this build would adopt the live sessions of the installed
+//! state, reading the store, the worker journals and the process table only. It
+//! runs before any lock, directory, log or socket is touched, so it is safe
+//! while the previous release's daemon runs; `pohunek service check|upgrade`
+//! invoke it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -50,6 +57,7 @@ use pohunek_daemon::runtime::lifecycle::{
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerLauncher, SupervisionConfig, WorkerLauncher,
 };
+use pohunek_daemon::session::upgrade_preflight::{self, PreflightInputs};
 use pohunek_daemon::session::{
     SessionRegistry, SessionRegistryConfig, SessionRetentionTask, RETENTION_POLICY_NAME,
 };
@@ -134,6 +142,14 @@ const REMOTE_LISTENER_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// lock, or socket work.
 const VERSION_FLAG: &str = "--version";
 
+/// Sole argument that prints the adoption preflight of the installed state.
+///
+/// Like [`VERSION_FLAG`] it is answered before any environment-dependent
+/// startup work: it takes no instance lock, creates no directory and
+/// initializes no logging, because the previous release's daemon owns all of
+/// them while the preflight runs.
+const UPGRADE_PREFLIGHT_ARG: &str = "upgrade-preflight";
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if std::env::args_os()
@@ -141,6 +157,12 @@ async fn main() -> ExitCode {
         .eq([OsString::from(VERSION_FLAG)])
     {
         return print_version();
+    }
+    if std::env::args_os()
+        .skip(1)
+        .eq([OsString::from(UPGRADE_PREFLIGHT_ARG)])
+    {
+        return print_upgrade_preflight();
     }
     // The startup future is large (reconciliation, listeners, event logs); box
     // it so it lives on the heap instead of inflating the `main` task frame.
@@ -151,6 +173,31 @@ async fn main() -> ExitCode {
             // print to stderr to guarantee the operator sees the failure.
             eprintln!("pohunekd: fatal: {err}");
             error!(error = %err, "daemon exited with error");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints the preflight report of the installed state as JSON.
+fn print_upgrade_preflight() -> ExitCode {
+    let report = Paths::resolve()
+        .map_err(|error| error.to_string())
+        .and_then(|paths| {
+            let inputs = PreflightInputs {
+                store_path: paths.data_dir.join(STORE_NAME),
+                worker_state_root: paths.state_dir.join(WORKERS_SUBDIR),
+            };
+            let inspector = pohunek_daemon::procwatch::HostInspector::new();
+            serde_json::to_string_pretty(&upgrade_preflight::run(&inputs, &inspector))
+                .map_err(|error| error.to_string())
+        });
+    match report {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("pohunekd: upgrade-preflight failed: {error}");
             ExitCode::FAILURE
         }
     }

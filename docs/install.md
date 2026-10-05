@@ -101,6 +101,14 @@ rather than the daemon's whole environment. `pohunek service uninstall` refuses
 while sessions are live unless `--stop-sessions` is given, and keeps durable
 metadata unless `--purge` is given.
 
+`pohunek service upgrade` first runs a read-only preflight with the new
+binaries and refuses while a live session would lose its recovery or would not
+be adopted by the new daemon (`service_upgrade_sessions_at_risk`, listing each
+session with a reason code). Passing `--accept-runtime-loss` proceeds after you
+have reviewed that list; a store the new daemon would refuse to start with is
+never overridable. See the
+[update runbook](knowledge/runbooks/update-after-release.md).
+
 The first upgrade from a legacy daemon-owned PTY release refuses live sessions
 by default because those open PTYs cannot be transferred. Let them finish; use
 `--accept-runtime-loss` only after reviewing the affected ids and knowingly

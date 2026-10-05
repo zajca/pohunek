@@ -103,6 +103,7 @@ use pohunek_platform::supervisor::{
 use serde::{Deserialize, Serialize};
 
 mod error;
+pub mod preflight;
 
 #[doc(inline)]
 pub use error::ConfigError;

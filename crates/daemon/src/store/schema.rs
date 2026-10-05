@@ -55,9 +55,12 @@ pub(super) struct Migration {
 /// Every kept schema step, ordered by `from`. A store at any `from` listed here
 /// reaches [`STORE_SCHEMA_VERSION`] by applying the steps in sequence.
 pub(super) const MIGRATIONS: &[Migration] = &[Migration {
-    from: 1,
+    from: LEGACY_BINDING_STEP_FROM,
     apply: migrate_v1_to_v2,
 }];
+
+/// Schema the [`legacy_binding`] step upgrades from.
+pub(super) const LEGACY_BINDING_STEP_FROM: u32 = 1;
 
 /// Schema 1 to 2: introduces the per-line version and the native-launch shape.
 ///
@@ -313,7 +316,10 @@ pub(super) fn stamp_current_schema(value: &mut Value) -> io::Result<()> {
 ///
 /// Deterministic: the same input lines always yield the same bytes, which is
 /// what lets [`Store::is_schema_migration_of`] recognise a migrated store.
-fn migrated_body(lines: Vec<ParsedLine<'_>>, capacity: usize) -> io::Result<(String, usize)> {
+pub(super) fn migrated_body(
+    lines: Vec<ParsedLine<'_>>,
+    capacity: usize,
+) -> io::Result<(String, usize)> {
     let mut body = String::with_capacity(capacity);
     let mut records = 0;
     for line in lines {

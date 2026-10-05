@@ -36,6 +36,7 @@ pub mod engine;
 pub mod error;
 pub mod inherited;
 pub mod layout;
+pub mod preflight;
 pub mod record;
 pub mod report;
 pub mod settings;
@@ -86,14 +87,21 @@ pub async fn install(
 ///
 /// # Errors
 ///
-/// Returns [`Error::NotInstalled`] without an installation, and the same
-/// errors as [`install`] otherwise.
-pub async fn upgrade(from: Option<PathBuf>) -> Result<report::UpgradeReport, Error> {
+/// Returns [`Error::NotInstalled`] without an installation,
+/// [`Error::UpgradeAtRisk`] when live sessions would lose their runtime or
+/// native recovery and `accept_runtime_loss` is `false`,
+/// [`Error::UpgradeStoreUnusable`] when the new daemon cannot start with the
+/// metadata store, and the same errors as [`install`] otherwise.
+pub async fn upgrade(
+    from: Option<PathBuf>,
+    accept_runtime_loss: bool,
+) -> Result<report::UpgradeReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
     let from = staged_dir(&context, from)?;
     let backend = connect_installed(&context).await?;
     engine(&context, &backend, inherited)
+        .with_runtime_loss_accepted(accept_runtime_loss)
         .upgrade(&from, VERSION)
         .await
 }
@@ -130,7 +138,10 @@ pub async fn uninstall(options: UninstallOptions) -> Result<report::UninstallRep
 /// Returns the error install or upgrade would return before its first
 /// effect, [`Error::PrefixMismatch`], or [`Error::InheritedLock`] when
 /// `POHUNEK_SERVICE_LOCK_TOKEN` proves no live lock holder.
-pub async fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error> {
+pub async fn check(
+    prefix: Option<PathBuf>,
+    accept_runtime_loss: bool,
+) -> Result<report::CheckReport, Error> {
     let context = Context::resolve()?;
     let inherited = inherited_lock(&context)?;
     let checked = check_local(&context, prefix, VERSION, inherited.is_some())?;
@@ -146,6 +157,38 @@ pub async fn check(prefix: Option<PathBuf>) -> Result<report::CheckReport, Error
     }
     if checked.needs_discovery && !checked.discovery_first {
         context.install_search_path()?;
+    }
+    let daemon_dir = staged_dir(&context, None)?;
+    finish_check(
+        checked,
+        &preflight::DaemonPreflight,
+        &context,
+        &daemon_dir,
+        VERSION,
+        accept_runtime_loss,
+    )
+    .await
+}
+
+/// Completes a check with the adoption preflight an upgrade that swaps the
+/// daemon makes, last, after every other check passed.
+///
+/// # Errors
+///
+/// Returns the errors of [`preflight::gate`].
+async fn finish_check(
+    mut checked: Checked,
+    preflight: &dyn preflight::AdoptionPreflight,
+    context: &Context,
+    daemon_dir: &Path,
+    version: &str,
+    accept_runtime_loss: bool,
+) -> Result<report::CheckReport, Error> {
+    if checked.adoption == Adoption::Required {
+        let gated =
+            preflight::gate(preflight, context, daemon_dir, version, accept_runtime_loss).await?;
+        checked.report.accepted_runtime_loss = gated.accepted;
+        checked.report.preflight = Some(gated.report);
     }
     Ok(checked.report)
 }
@@ -523,6 +566,19 @@ pub(crate) struct Checked {
     /// Whether install discovers before it looks for a daemon job: the
     /// rollback of an interrupted install does, a fresh install does not.
     pub(crate) discovery_first: bool,
+    /// Whether the adoption preflight applies.
+    pub(crate) adoption: Adoption,
+}
+
+/// Whether a check asks the new daemon's adoption preflight
+/// ([`preflight::gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Adoption {
+    /// Upgrade swaps the daemon, so the live sessions are judged.
+    Required,
+    /// An install, a resumed upgrade, and a rerun of the active version swap
+    /// no daemon.
+    NotApplicable,
 }
 
 /// Runs the checks of [`check`] that need no service manager.
@@ -548,6 +604,7 @@ pub(crate) fn check_local(
     let prefix = prefix
         .map(|prefix| absolute("--prefix", prefix))
         .transpose()?;
+    let mut adoption = Adoption::NotApplicable;
     let config_path = context.config_path();
     let pending = record::Store::new(context.paths().state_dir.clone()).load()?;
     let pending_install = pending
@@ -578,6 +635,9 @@ pub(crate) fn check_local(
         let config = verified_config(context)?;
         engine::upgrade_preflight(context)?;
         let plan = engine::upgrade_plan(pending, version)?;
+        if engine::swaps_daemon(&plan, Some(config.active_version()), version) {
+            adoption = Adoption::Required;
+        }
         let layout = config.layout();
         if let Some(requested) = prefix.filter(|requested| requested != layout.prefix()) {
             return Err(Error::PrefixMismatch {
@@ -609,12 +669,15 @@ pub(crate) fn check_local(
             engine::Plan::RollBack(_) => Some("roll_back"),
         },
         locked,
+        preflight: None,
+        accepted_runtime_loss: false,
     };
     Ok(Checked {
         report,
         fresh_install,
         needs_discovery: operation == record::Operation::Install && engine::plan_discovers(&plan),
         discovery_first: matches!(plan, engine::Plan::RollBack(_)),
+        adoption,
     })
 }
 
@@ -642,6 +705,32 @@ pub(crate) async fn check_with(
         context.install_search_path()?;
     }
     Ok(checked.report)
+}
+
+/// Runs [`check`] for `context` against `backend`, with `preflight` judging
+/// adoption of the daemon staged in `daemon_dir`.
+///
+/// # Errors
+///
+/// See [`check`].
+#[cfg(test)]
+pub(crate) async fn check_with_preflight(
+    context: &Context,
+    daemon_dir: &Path,
+    preflight: &dyn preflight::AdoptionPreflight,
+    version: &str,
+    accept_runtime_loss: bool,
+) -> Result<report::CheckReport, Error> {
+    let checked = check_local(context, None, version, false)?;
+    finish_check(
+        checked,
+        preflight,
+        context,
+        daemon_dir,
+        version,
+        accept_runtime_loss,
+    )
+    .await
 }
 
 /// Reports the installation.

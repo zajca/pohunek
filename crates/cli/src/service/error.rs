@@ -2,11 +2,13 @@
 
 // Rust guideline compliant 2026-09-30
 
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use pohunek_platform::filesystem::FsError;
 use pohunek_platform::supervisor;
+use pohunek_service_config::preflight::SessionVerdict;
 
 /// One session that blocks an uninstall.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -389,6 +391,37 @@ pub enum Error {
         workers: Vec<OutdatedWorker>,
     },
 
+    /// The new daemon would not adopt, or would adopt without native
+    /// recovery, live sessions of the running daemon.
+    #[error("{}", at_risk_summary(sessions))]
+    UpgradeAtRisk {
+        /// The sessions the preflight judged at risk, ordered by id.
+        sessions: Vec<SessionVerdict>,
+    },
+
+    /// The new daemon would refuse to start with the installed metadata store.
+    #[error(
+        "upgrade refused: the new daemon cannot start with the metadata store {} ({code}): {detail}",
+        path.display()
+    )]
+    UpgradeStoreUnusable {
+        /// The store file.
+        path: PathBuf,
+        /// Machine code of the store refusal.
+        code: String,
+        /// The refusal, as the daemon words it.
+        detail: String,
+    },
+
+    /// The new daemon's preflight did not produce a report.
+    #[error("the adoption preflight of {} failed: {detail}", binary.display())]
+    UpgradePreflightFailed {
+        /// The daemon executable that was asked.
+        binary: PathBuf,
+        /// Why no report came back.
+        detail: String,
+    },
+
     /// Worker jobs of this namespace remained after retirement.
     #[error("worker jobs remain after uninstall: {}", ids.join(", "))]
     OrphanWorkers {
@@ -487,6 +520,9 @@ impl Error {
             Self::StopTimeout { .. } => "service_stop_timeout",
             Self::UnreadableJournals { .. } => "service_unreadable_journals",
             Self::OutdatedJournals { .. } => "service_outdated_journals",
+            Self::UpgradeAtRisk { .. } => "service_upgrade_sessions_at_risk",
+            Self::UpgradeStoreUnusable { .. } => "service_upgrade_store_unusable",
+            Self::UpgradePreflightFailed { .. } => "service_upgrade_preflight_failed",
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
@@ -527,6 +563,15 @@ impl Error {
             Self::StopTimeout { .. } => {
                 Some("inspect the listed sessions with `pohunek session list` and retry")
             }
+            Self::UpgradeAtRisk { .. } => Some(
+                "end or save the listed sessions first, or pass --accept-runtime-loss (to packaging/install-daemon.sh as well) to upgrade anyway and accept the loss of their runtime or native recovery",
+            ),
+            Self::UpgradeStoreUnusable { .. } => Some(
+                "--accept-runtime-loss does not apply: install a pohunek release that reads this store, or restore the store's .pre-schema-<n> backup",
+            ),
+            Self::UpgradePreflightFailed { .. } => Some(
+                "run `<staged>/pohunekd upgrade-preflight` by hand with the same XDG environment to see its error, then retry",
+            ),
             Self::VerifierMissing => Some("install systemd's `systemd-analyze` and retry"),
             Self::Config(pohunek_service_config::ConfigError::NamespaceMismatch { .. }) => Some(
                 "run the command as the user and with the XDG_STATE_HOME and XDG_RUNTIME_DIR the installation was made with",
@@ -570,6 +615,27 @@ impl Error {
             _ => None,
         }
     }
+}
+
+/// The refusal text: one line per session with its verdict, code and evidence.
+fn at_risk_summary(sessions: &[SessionVerdict]) -> String {
+    let mut text = format!(
+        "upgrade refused: {} live session(s) would not survive the new daemon intact",
+        sessions.len()
+    );
+    for session in sessions {
+        let name = session
+            .name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        let _ = write!(
+            text,
+            "\n  {}{name}: {} [{}] {}",
+            session.session_id, session.verdict, session.code, session.detail
+        );
+    }
+    text
 }
 
 fn live_summary(prefix: &str, sessions: &[LiveSession], workers: &[String]) -> String {
