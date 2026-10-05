@@ -10,10 +10,12 @@
 //! An update is a transaction in four steps: [`DaemonHandler::stage`] computes
 //! the new asset set against the active one without changing it,
 //! [`DaemonHandler::verify_compatibility`] proves the new set against the
-//! runtime's hook schema, [`StagedUpdate::activate`] switches to it atomically,
-//! and any failure while activating restores the exact prior tree before the
-//! error is returned. The active set stays untouched until activation
-//! succeeds, and a staged set that is dropped changes nothing.
+//! runtime's hook schema and with the schema of every package version that a
+//! session or profile pin still references ([`RetainedSchemas`]),
+//! [`StagedUpdate::activate`] switches to it atomically, and any failure while
+//! activating restores the exact prior tree before the error is returned. The
+//! active set stays untouched until activation succeeds, and a staged set that
+//! is dropped changes nothing.
 
 // Rust guideline compliant 2026-10-05
 
@@ -25,7 +27,7 @@ use pohunek_worker_protocol::{HookAction, HookSchema};
 use protocol::{
     BindingProvenance, ErrorClass, IntegrationAgentStatus, IntegrationInstallReport,
     IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
-    IntegrationUninstallReport, ProtocolError, RuntimeRef,
+    IntegrationUninstallReport, PackageId, ProtocolError, RuntimeRef,
 };
 
 use super::commit::StepGate;
@@ -128,25 +130,7 @@ pub trait DaemonHandler: Send + Sync + Debug {
         staged: &dyn StagedUpdate,
         schema: &HookSchema,
     ) -> Result<(), ProtocolError> {
-        let manifest = staged.manifest();
-        if !schema.supports_handler(self.id()) {
-            return Err(update_incompatible(&format!(
-                "hook schema {} is not driven by integration handler {}",
-                schema.id,
-                self.id()
-            )));
-        }
-        if let Some(action) = manifest
-            .actions
-            .iter()
-            .find(|action| !schema.allows(**action))
-        {
-            return Err(update_incompatible(&format!(
-                "the new asset set reports {action}, which hook schema {} does not admit",
-                schema.id
-            )));
-        }
-        Ok(())
+        admits(self.id(), staged.manifest(), schema).map_err(|detail| update_incompatible(&detail))
     }
 
     /// Removes exactly what the handler installed, reported for `runtime`.
@@ -160,6 +144,71 @@ pub trait DaemonHandler: Send + Sync + Debug {
         runtime: &RuntimeRef,
         dir: &Path,
     ) -> Result<IntegrationUninstallReport, ProtocolError>;
+}
+
+/// Why `schema` cannot carry the asset set `manifest` of handler `handler`:
+/// the handler must drive the schema and the schema must admit every operation
+/// the set reports.
+fn admits(handler: &str, manifest: &AssetManifest, schema: &HookSchema) -> Result<(), String> {
+    if !schema.supports_handler(handler) {
+        return Err(format!(
+            "hook schema {} is not driven by integration handler {handler}",
+            schema.id
+        ));
+    }
+    if let Some(action) = manifest
+        .actions
+        .iter()
+        .find(|action| !schema.allows(**action))
+    {
+        return Err(format!(
+            "the new asset set reports {action}, which hook schema {} does not admit",
+            schema.id
+        ));
+    }
+    Ok(())
+}
+
+/// The hook schemas of the installed package versions that live, lost or
+/// resumable sessions and host profile pins still reference.
+///
+/// A session keeps reporting through the schema it was launched under, so an
+/// asset set that replaces the active one must be admitted by each of them, not
+/// only by the schema of the version fresh launches use. Sessions of built-in
+/// runtimes are not package pins; their schema is the one this build compiles.
+#[derive(Debug, Clone, Default)]
+pub struct RetainedSchemas {
+    schemas: Vec<(String, &'static HookSchema)>,
+    unresolvable: BTreeSet<PackageId>,
+}
+
+impl RetainedSchemas {
+    /// Records that a retained package version names `handler` with `schema`.
+    pub fn push(&mut self, handler: String, schema: &'static HookSchema) {
+        self.schemas.push((handler, schema));
+    }
+
+    /// Records a retained version of `package` whose integration cannot be
+    /// determined, which no update of that package's runtime may proceed
+    /// without.
+    pub fn push_unresolvable(&mut self, package: PackageId) {
+        self.unresolvable.insert(package);
+    }
+
+    /// The schemas of the retained versions that name `handler`.
+    pub fn for_handler<'a>(
+        &'a self,
+        handler: &'a str,
+    ) -> impl Iterator<Item = &'static HookSchema> + 'a {
+        self.schemas
+            .iter()
+            .filter(move |(named, _schema)| named == handler)
+            .map(|(_named, schema)| *schema)
+    }
+
+    fn unresolvable_for(&self, package: Option<&PackageId>) -> bool {
+        package.is_some_and(|package| self.unresolvable.contains(package))
+    }
 }
 
 /// A handler whose lifecycle the `pohunek` CLI runs on the operator's host.
@@ -280,6 +329,8 @@ pub(super) struct Resolved {
     pub(super) handler: &'static dyn DaemonHandler,
     /// The compiled hook schema the definition names.
     pub(super) schema: &'static HookSchema,
+    /// The package serving the runtime; `None` for a built-in runtime.
+    package: Option<PackageId>,
 }
 
 /// Resolves the runtime `agent` names to its daemon-run handler.
@@ -307,6 +358,10 @@ fn resolved(
         display_name: definition.display_name().to_owned(),
         handler,
         schema: definition.hook_schema()?,
+        package: match &definition.binding().provenance {
+            BindingProvenance::Package { package, .. } => Some(package.id.clone()),
+            BindingProvenance::Builtin { .. } => None,
+        },
     })
 }
 
@@ -338,16 +393,42 @@ pub(super) fn managed(host: &RuntimeHost) -> Vec<Resolved> {
 
 /// Stages, verifies, and activates the update of `resolved`'s asset set in
 /// `dir`, running `gate` before each committed file.
+///
+/// The staged set must be compatible with the runtime's current hook schema and
+/// with the schema of every retained package version of the same handler.
 pub(super) fn update(
     resolved: &Resolved,
     dir: &Path,
+    retained: &RetainedSchemas,
     gate: StepGate<'_>,
 ) -> Result<InstallPaths, ProtocolError> {
     let staged = resolved.handler.stage(dir)?;
     resolved
         .handler
         .verify_compatibility(staged.as_ref(), resolved.schema)?;
+    verify_retained(resolved, staged.as_ref(), retained)?;
     staged.activate(gate)
+}
+
+/// Proves that `staged` is admitted by every retained schema of the handler
+/// and that no retained version of the runtime's package is undetermined.
+fn verify_retained(
+    resolved: &Resolved,
+    staged: &dyn StagedUpdate,
+    retained: &RetainedSchemas,
+) -> Result<(), ProtocolError> {
+    if retained.unresolvable_for(resolved.package.as_ref()) {
+        return Err(update_incompatible(
+            "a package version still in use has an integration that cannot be determined",
+        ));
+    }
+    let handler = resolved.handler.id();
+    for schema in retained.for_handler(handler) {
+        admits(handler, staged.manifest(), schema).map_err(|detail| {
+            update_incompatible(&format!("a package version still in use: {detail}"))
+        })?;
+    }
+    Ok(())
 }
 
 /// Whether `dir` exists as a directory; a symlink is an error.
@@ -358,21 +439,27 @@ fn dir_present(dir: &Path) -> Result<bool, ProtocolError> {
     Ok(dir.is_dir())
 }
 
-fn install_one(resolved: &Resolved) -> Result<IntegrationInstallReport, ProtocolError> {
+fn install_one(
+    resolved: &Resolved,
+    retained: &RetainedSchemas,
+) -> Result<IntegrationInstallReport, ProtocolError> {
     let dir = resolved.handler.config_dir()?;
-    let paths = update(resolved, &dir, &mut |_index, _name| Ok(()))?;
+    let paths = update(resolved, &dir, retained, &mut |_index, _name| Ok(()))?;
     Ok(report(resolved.runtime.clone(), &paths))
 }
 
 /// Updates the asset set of every daemon-run handler whose config dir exists.
-fn install_all_present(host: &RuntimeHost) -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
+fn install_all_present(
+    host: &RuntimeHost,
+    retained: &RetainedSchemas,
+) -> Result<Vec<IntegrationInstallReport>, ProtocolError> {
     let mut installed = Vec::new();
     let mut looked = Vec::new();
     let mut names = Vec::new();
     for resolved in managed(host) {
         let dir = resolved.handler.config_dir()?;
         if dir_present(&dir)? {
-            let paths = update(&resolved, &dir, &mut |_index, _name| Ok(()))?;
+            let paths = update(&resolved, &dir, retained, &mut |_index, _name| Ok(()))?;
             installed.push(report(resolved.runtime.clone(), &paths));
         }
         looked.push(dir.display().to_string());
@@ -403,16 +490,33 @@ fn install_all_present(host: &RuntimeHost) -> Result<Vec<IntegrationInstallRepor
 /// `agent_not_installable` for a runtime without a daemon-run handler,
 /// `agent_config_dir_missing` when a requested (or, for `None`, every) config
 /// dir is absent, `integration_update_incompatible` when the new asset set is
-/// not compatible with the active one, or any underlying I/O / settings error.
+/// not compatible with the active one, with the runtime's hook schema, or with
+/// the schema of a retained package version, or any underlying I/O / settings
+/// error.
+pub fn install_for_retained(
+    host: &RuntimeHost,
+    agent: Option<&RuntimeRef>,
+    retained: &RetainedSchemas,
+) -> Result<IntegrationInstallResult, ProtocolError> {
+    let installed = match agent {
+        Some(agent) => vec![install_one(&resolve(host, agent)?, retained)?],
+        None => install_all_present(host, retained)?,
+    };
+    Ok(IntegrationInstallResult { installed })
+}
+
+/// [`install_for_retained`] with no retained package version, for hosts whose
+/// runtimes are all built in.
+///
+/// # Errors
+///
+/// The errors of [`install_for_retained`].
+#[cfg(test)]
 pub fn install_for(
     host: &RuntimeHost,
     agent: Option<&RuntimeRef>,
 ) -> Result<IntegrationInstallResult, ProtocolError> {
-    let installed = match agent {
-        Some(agent) => vec![install_one(&resolve(host, agent)?)?],
-        None => install_all_present(host)?,
-    };
-    Ok(IntegrationInstallResult { installed })
+    install_for_retained(host, agent, &RetainedSchemas::default())
 }
 
 /// Inspects the managed hook files of the selected runtime(s) without writing

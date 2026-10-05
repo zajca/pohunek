@@ -108,7 +108,8 @@ pub use package::{
     PackageFindingKind, PackageInfo, PackageInspectParams, PackageInspectResult,
     PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
     PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
-    PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
+    PackageSelectionBlock, PackageSelectionBlockReason, PackageSetEnabledParams, PackageTrust,
+    PackageUninstallParams, PackageUninstallResult,
 };
 #[doc(inline)]
 pub use project::{

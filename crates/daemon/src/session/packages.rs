@@ -8,7 +8,7 @@
 //! exclusive guard, so a launch can never pin a digest between the retained
 //! set being computed and the package being removed.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 use std::io;
 use std::sync::Arc;
@@ -180,7 +180,8 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// Returns the stable protocol error of
-    /// [`host::RuntimeHost::verify_launchable`].
+    /// [`host::RuntimeHost::verify_launchable`], or `runtime_package_changed`
+    /// when the definition is no longer the selected version of its package.
     pub(super) async fn guard_package_launch(
         &self,
         definition: &host::RuntimeDefinition,
@@ -190,7 +191,51 @@ impl SessionRegistry {
             .profiles
             .runtimes()
             .verify_launchable(definition)?;
+        self.ensure_launch_is_current(definition).await?;
         Ok(guard)
+    }
+
+    /// Verifies, under the shared lifecycle guard, that a launch resolved
+    /// before the guard was taken still launches the version that serves its
+    /// runtime now.
+    ///
+    /// A package selection commits under the exclusive guard after proving
+    /// that no referenced version is incompatible with the selected one, so a
+    /// launch that resolved the previously selected version and pinned it
+    /// after the selection would reference exactly such a version. A digest
+    /// that a host profile pins launches whatever is selected.
+    async fn ensure_launch_is_current(
+        &self,
+        definition: &host::RuntimeDefinition,
+    ) -> Result<(), ProtocolError> {
+        let BindingProvenance::Package {
+            package,
+            package_digest,
+        } = &definition.binding().provenance
+        else {
+            return Ok(());
+        };
+        let runtimes = self.inner.profiles.runtimes();
+        let Some(store) = runtimes.package_store() else {
+            return Ok(());
+        };
+        let incompatible = || ProtocolError::runtime_incompatible(definition.runtime_id());
+        let state = store.registry().state().map_err(|_error| incompatible())?;
+        if state.selected(&package.id) == Some(package_digest) {
+            return Ok(());
+        }
+        let profiles = self.inner.profiles.clone();
+        let pinned = tokio::task::spawn_blocking(move || profiles.pinned_digests())
+            .await
+            .map_err(|_error| incompatible())?
+            .map_err(|_error| incompatible())?;
+        if pinned.contains(package_digest) {
+            Ok(())
+        } else {
+            Err(ProtocolError::runtime_package_changed(
+                definition.runtime_id(),
+            ))
+        }
     }
 }
 

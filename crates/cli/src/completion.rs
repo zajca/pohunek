@@ -1127,6 +1127,7 @@ mod tests {
             runtime_id: None,
             fault: None,
             referenced: false,
+            selection_blocked: None,
         }
     }
 

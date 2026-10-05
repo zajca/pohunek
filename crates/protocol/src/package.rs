@@ -12,7 +12,7 @@
 //! package root is described by its identity, its trust origin and typed
 //! health, never by where it sits on disk.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +66,39 @@ pub enum PackageFault {
     RuntimeConflict,
 }
 
+/// Why a package that is not selected cannot become the selected one now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts",
+    ts(export, export_to = "PackageSelectionBlockReason.ts")
+)]
+pub enum PackageSelectionBlockReason {
+    /// A retained reference (a live, lost or resumable session or a host
+    /// profile pin) uses another version of the same package whose
+    /// integration handler or hook schema differs, or cannot be determined.
+    /// Selecting the package would make the runtime's integration serve two
+    /// incompatible handler or schema declarations at once.
+    IncompatibleWithRetained,
+}
+
+/// A package that stays installed but not selected, and what holds it back.
+///
+/// The state is derived from the registry and the references that exist now,
+/// never stored: it disappears on the first listing after the last reference
+/// to `retained` is gone, and the package is then selectable again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "PackageSelectionBlock.ts"))]
+pub struct PackageSelectionBlock {
+    /// Why the package cannot be selected.
+    pub reason: PackageSelectionBlockReason,
+    /// The referenced digest of the same package whose integration the package
+    /// is not compatible with; the lowest such digest when several are.
+    pub retained: PackageDigest,
+}
+
 /// One installed package as the registry records it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
@@ -97,6 +130,12 @@ pub struct PackageInfo {
     /// Whether a live, lost or resumable session or a host profile pins the
     /// digest, which keeps it from being uninstalled.
     pub referenced: bool,
+    /// Why an installed, unselected package cannot be selected yet; absent
+    /// when it is selected or may be selected now. The package stays installed
+    /// and never serves a fresh launch while this is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub selection_blocked: Option<PackageSelectionBlock>,
 }
 
 /// What a package's runtime descriptor declares, for review before and after
@@ -151,6 +190,12 @@ pub struct PackageRuntimeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub integration_handler: Option<String>,
+    /// The core-owned hook schema the runtime names, if any. It decides which
+    /// hook reports sessions of the runtime may make and must be driven by
+    /// `integration_handler`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub hook_schema: Option<String>,
 }
 
 /// How an archive is trusted when it is installed.
@@ -414,6 +459,10 @@ pub enum PackageFindingKind {
     UnregisteredRoot,
     /// A session or host profile pins a digest the registry does not record.
     PinnedNotInstalled,
+    /// An installed, unselected package cannot be selected while a retained
+    /// reference uses an incompatible version of the same package; see
+    /// `blocked_by`.
+    SelectionBlocked,
 }
 
 /// One doctor finding.
@@ -436,6 +485,11 @@ pub struct PackageFinding {
     pub fault: Option<PackageFault>,
     /// Whether a session or host profile pins the digest.
     pub referenced: bool,
+    /// The retained digest a [`PackageFindingKind::SelectionBlocked`] finding
+    /// waits on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub blocked_by: Option<PackageDigest>,
 }
 
 /// Result of `package.doctor`.
@@ -513,6 +567,10 @@ pub enum PackageErrorKind {
     ProfileTargetInvalid,
     /// The profile changed while it was being rewritten and was left as found.
     ProfileChanged,
+    /// The package's integration handler or hook schema is not compatible with
+    /// a version of the same package that is retained by a session or profile
+    /// pin, or that is selected; nothing was changed.
+    IntegrationIncompatible,
 }
 
 impl PackageErrorKind {
@@ -544,6 +602,7 @@ impl PackageErrorKind {
             Self::ProfileBaseBuiltin => "package_profile_base_builtin",
             Self::ProfileTargetInvalid => "package_profile_target_invalid",
             Self::ProfileChanged => "package_profile_changed",
+            Self::IntegrationIncompatible => "package_integration_incompatible",
         }
     }
 
@@ -591,6 +650,9 @@ impl PackageErrorKind {
             Self::ProfileChanged => {
                 "the agent profile changed while it was being rewritten and was left as found"
             }
+            Self::IntegrationIncompatible => {
+                "the package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected"
+            }
         }
     }
 
@@ -626,6 +688,9 @@ impl PackageErrorKind {
                 "install, enable and select a package that serves the base runtime, or pass the digest of one"
             }
             Self::ProfileChanged => "run the command again to review the profile as it is now",
+            Self::IntegrationIncompatible => {
+                "stop or remove the sessions and unpin the profiles that use the other version, or uninstall it, then retry"
+            }
         }
     }
 
@@ -749,6 +814,7 @@ mod tests {
             PackageErrorKind::ProfileBaseBuiltin,
             PackageErrorKind::ProfileTargetInvalid,
             PackageErrorKind::ProfileChanged,
+            PackageErrorKind::IntegrationIncompatible,
         ];
         let codes: BTreeSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());
@@ -777,6 +843,42 @@ mod tests {
         assert_eq!(
             serde_json::to_value(PackageFindingKind::PinnedNotInstalled).expect("serialize"),
             "pinned_not_installed"
+        );
+    }
+
+    #[test]
+    fn selection_block_is_additive_and_uses_snake_case_wire_names() {
+        let info = serde_json::json!({
+            "digest": digest(),
+            "package": { "id": "acme.runtime.pi", "version": "1.0.0" },
+            "origin": "explicit_digest",
+            "enabled": true,
+            "selected": false,
+            "installed_at_unix_seconds": 1,
+            "referenced": false
+        });
+        let plain: PackageInfo = serde_json::from_value(info.clone()).expect("no block");
+        assert_eq!(plain.selection_blocked, None);
+        let round = serde_json::to_value(&plain).expect("serialize");
+        assert!(
+            round.get("selection_blocked").is_none(),
+            "absent stays absent"
+        );
+
+        let mut blocked = info;
+        blocked["selection_blocked"] = serde_json::json!({
+            "reason": "incompatible_with_retained",
+            "retained": digest()
+        });
+        let parsed: PackageInfo = serde_json::from_value(blocked.clone()).expect("blocked");
+        assert_eq!(
+            parsed.selection_blocked.as_ref().map(|block| block.reason),
+            Some(PackageSelectionBlockReason::IncompatibleWithRetained)
+        );
+        assert_eq!(serde_json::to_value(&parsed).expect("serialize"), blocked);
+        assert_eq!(
+            serde_json::to_value(PackageFindingKind::SelectionBlocked).expect("serialize"),
+            "selection_blocked"
         );
     }
 }

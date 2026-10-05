@@ -62,7 +62,11 @@ assets against the active ones without changing them, checks that the hook
 schema admits everything the new set reports
 (`integration_update_incompatible` otherwise), activates atomically, and
 restores the exact prior tree if any step fails, so the old set stays active
-until activation succeeds. `hermes-hook-v1` is registered but its lifecycle runs
+until activation succeeds. The check covers the hook schema of every package
+version that a live, lost or resumable session or a host profile pin still
+references for that handler, not only the schema of the selected version, and an
+update is refused while such a version of the runtime's package cannot be read.
+`hermes-hook-v1` is registered but its lifecycle runs
 in the CLI; the daemon answers `agent_not_installable` for it.
 `pohunek integration --agent` takes the runtime id of a package runtime that
 names a daemon-run handler, and the recovery commands in status and doctor name
@@ -120,6 +124,42 @@ characters>` and `--version <v>`.
   digest they pinned, so an update never changes a pinned profile.
 - `update` requires the id to be installed and the archive to declare the same
   package id.
+
+### Incompatible updates stay installed but unselected
+
+Sessions launched from an older version keep reporting through that version's
+integration handler and hook schema until they end, so a version whose
+integration differs cannot become the selected one while something still
+references the old version. The integration of a version is the pair of its
+`[integration]` handler id and hook schema id, or none; versions of one package
+are compatible only when the pairs are equal (adding or dropping an integration
+is a difference too), and a retained version whose descriptor or root cannot be
+read counts as incompatible.
+
+- A version is *held back* while a live, lost or resumable session or a host
+  profile pin (the references that block `uninstall`) uses another version of
+  the same package with a different integration. `plugin select` then fails with
+  `package_integration_incompatible` and changes nothing. `plugin install` and
+  `plugin update` still install the archive (enabled), report it as not
+  selected, and name the digest it waits on; `update` exits with the select
+  error because it promises a selected version. `plugin list` shows
+  `selection blocked`, `plugin inspect` shows the `Selection:` line and the
+  hook schema, and `plugin doctor` reports a `selection blocked by <digest>`
+  finding.
+- The selected version keeps serving fresh launches and nothing falls back to
+  another package. A pinned profile or session still resolves from exactly its
+  digest.
+- The state is derived at each call from the registry and the sessions, never
+  stored, so a daemon restart recomputes it. It clears when the last reference
+  to the old version is gone (stop and remove the sessions, unpin or rebind the
+  profiles, or uninstall the old version); the package is then selectable, but
+  nothing selects it for you: run `plugin select` (or `plugin update` again).
+- `package.bind_profile` (the wire method behind `plugin profile migrate`)
+  refuses to pin a version whose integration differs from the selected version
+  of its package, with the same error, because the pin would be a retained
+  reference next to an incompatible selected version.
+- A launch that resolved the previously selected version just before a select
+  committed is refused with `runtime_package_changed`; retry it.
 
 ## Disable
 

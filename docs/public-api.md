@@ -520,8 +520,10 @@ Shared payloads:
 - `PackageInfo`: `digest`, `package` (`{id, version}` from the runtime
   descriptor), `origin` (`official`, `explicit_digest` or `link`), `enabled`,
   `selected`, `installed_at_unix_seconds`, optional `runtime_id`, optional
-  `fault`, and `referenced` (a live, lost or resumable session or a host
-  profile pins the digest).
+  `fault`, `referenced` (a live, lost or resumable session or a host
+  profile pins the digest) and optional `selection_blocked`
+  (`{reason, retained}`: why an installed, unselected package cannot be
+  selected yet; see "Compatibility-gated selection" below).
 - `PackageFault`: `root_missing`, `root_modified`, `root_unsafe`,
   `root_unreadable`, `descriptor_missing`, `descriptor_invalid`,
   `identity_mismatch`, `runtime_not_claimable`, `runtime_conflict`. `fault` is
@@ -530,7 +532,9 @@ Shared payloads:
   `resumable`, `forkable`, `prompt_argument` and the optional `launch_args`
   (the arguments appended at a fresh launch to pass the generated reference),
   `resume_args`, `fork_args` (templates in which `{reference}` marks the
-  reference slot), `version_probe` and `integration_handler`. The program, the
+  reference slot), `version_probe`, `integration_handler` and `hook_schema` (the
+  core-owned handler and hook schema ids of the descriptor's `[integration]`
+  table, absent for a runtime without one). The program, the
   fixed arguments and every template are exactly what the daemon can put in
   the argv of a process it launches as the owner (the first prompt is appended
   when `prompt_argument` is true), so all of it can be reviewed before an
@@ -544,13 +548,40 @@ Shared payloads:
 |---|---|---|---|
 | `package.list` | `null` | `{generation, packages[]}` | `generation` counts committed registry changes. |
 | `package.inspect` | `{digest}` | `{package, runtime?}` | `runtime` is absent when the descriptor cannot be loaded. |
-| `package.doctor` | `{package?}` or `null` | `{generation, findings[]}` | `package` restricts the report to one package id. A finding is `{kind, digest, package?, fault?, referenced}`; `kind` is `fault`, `unregistered_root` (a root on disk without a record; installing the same archive again adopts it after verification) or `pinned_not_installed` (a session or host profile pins a digest the registry does not record). An empty list means everything verified. |
-| `package.install` | `{archive_path, trust, enable, select, dry_run}` | `{status, package, runtime, reloaded}` | All fields are required. `archive_path` is absolute on the daemon host. `status` is `preview` (dry run, nothing changed), `installed`, `already_installed` (recorded with a verified root) or `root_restored` (recorded, root was missing and extracted again). A package that is already recorded keeps its recorded `enabled`, `selected` and origin: `enable`, `select` and `trust` apply to a new record only. |
+| `package.doctor` | `{package?}` or `null` | `{generation, findings[]}` | `package` restricts the report to one package id. A finding is `{kind, digest, package?, fault?, referenced}`; `kind` is `fault`, `unregistered_root` (a root on disk without a record; installing the same archive again adopts it after verification), `pinned_not_installed` (a session or host profile pins a digest the registry does not record) or `selection_blocked` (an installed, unselected package that cannot be selected until a retained reference to an incompatible version of the same package is gone; `blocked_by` is that digest). A finding carries `blocked_by?` besides the fields above. An empty list means everything verified. |
+| `package.install` | `{archive_path, trust, enable, select, dry_run}` | `{status, package, runtime, reloaded}` | All fields are required. `archive_path` is absolute on the daemon host. `status` is `preview` (dry run, nothing changed), `installed`, `already_installed` (recorded with a verified root) or `root_restored` (recorded, root was missing and extracted again). A package that is already recorded keeps its recorded `enabled`, `selected` and origin: `enable`, `select` and `trust` apply to a new record only. With `select: true`, a package whose integration is incompatible with a retained version of the same package is still installed, but unselected: the call succeeds with `package.selected: false` and `package.selection_blocked` set (a dry run reports the same). |
 | `package.link` | `{directory, dry_run}` | `{status, package, runtime, reloaded}` | Copies the directory into content-addressed storage and installs it disabled and unselected; the daemon never loads the directory itself. |
 | `package.set_enabled` | `{digest, enabled}` | `{package, reloaded}` | Disabling blocks fresh launches only; a session already pinned to the digest still resumes. Enabling first proves the package root verifies and the package may serve its runtime id, so it cannot create a runtime id conflict. |
-| `package.select` | `{digest}` | `{package, reloaded}` | Bare requests of the package id resolve to this version afterwards. The same root and runtime id checks as enabling apply. |
+| `package.select` | `{digest}` | `{package, reloaded}` | Bare requests of the package id resolve to this version afterwards. The same root and runtime id checks as enabling apply. Refused with `package_integration_incompatible` while a retained reference uses a version of the same package whose integration differs; nothing changes. |
 | `package.uninstall` | `{digest, remove_modified}` | `{digest, reloaded}` | Refused with `package_referenced` while a session or host profile pins the digest. `remove_modified: true` removes only a root that fails verification; a verified root is refused with `package_root_intact`. |
-| `package.bind_profile` | `{profile, digest?, dry_run}` | `{status, profile, base, previous?, package, runtime, reloaded}` | `profile` is the file name under the agents directory without `.toml`. With `digest` the installed package of that digest must serve the profile's base runtime and load without a fault; without it the target is the one selected, enabled package serving the base. Only the `package` and `digest` keys are rewritten, every other byte is kept, and the new file replaces the old with one `rename(2)` so the profile name never stops resolving; a profile edited after it was read is left as found. `status` is `preview` (dry run, the pin would change), `bound` or `unchanged` (already pinned; nothing written). `previous` is the digest pinned before. `reloaded` is `true` only for `bound`: profile files are read at every resolution, so the pin is live at once. Runs under the same exclusive authority as `package.uninstall`, so an uninstall of the target either precedes the bind (`package_profile_target_invalid`) or is refused with `package_referenced`. |
+| `package.bind_profile` | `{profile, digest?, dry_run}` | `{status, profile, base, previous?, package, runtime, reloaded}` | `profile` is the file name under the agents directory without `.toml`. With `digest` the installed package of that digest must serve the profile's base runtime and load without a fault; without it the target is the one selected, enabled package serving the base. Only the `package` and `digest` keys are rewritten, every other byte is kept, and the new file replaces the old with one `rename(2)` so the profile name never stops resolving; a profile edited after it was read is left as found. `status` is `preview` (dry run, the pin would change), `bound` or `unchanged` (already pinned; nothing written). `previous` is the digest pinned before. `reloaded` is `true` only for `bound`: profile files are read at every resolution, so the pin is live at once. Runs under the same exclusive authority as `package.uninstall`, so an uninstall of the target either precedes the bind (`package_profile_target_invalid`) or is refused with `package_referenced`. A pin of a version whose integration differs from the selected version of its package is refused with `package_integration_incompatible`, because the pin would be a retained reference that coexists with an incompatible selected version. |
+
+Compatibility-gated selection. An integration handler owns one active asset set
+per runtime, and sessions launched from an older version keep reporting through
+that version's handler and hook schema until they end. The integration of a
+package is the pair of its handler id and hook schema id, or none. Two versions
+of one package are compatible when their integrations are equal: every compiled
+handler drives exactly one schema and the registry declares no coexistence
+between different pairs, so any difference, including one side having no
+integration, is incompatible. A version whose integration cannot be determined
+(its root or descriptor is unreadable) is treated as incompatible; a descriptor
+that predates `hook_schema` resolves through the schema its handler drives. A
+package is *held back* while a retained digest of the same package (a live, lost
+or resumable session, or a host profile pin; the same set that blocks
+`package.uninstall`) has a different integration: `package.select` is refused
+with `package_integration_incompatible`, `package.install` with `select: true`
+installs it unselected, and the selected version keeps serving, with no fallback
+to another package. A retained pin still resolves from exactly its pinned digest.
+The state is not stored: `package.list`, `package.inspect` and `package.doctor`
+derive `selection_blocked` from the registry and the retained set at the moment
+of the call, so it survives a daemon restart and clears on the first listing
+after the last such reference is gone (session removed, profile unpinned or
+rebound, old version uninstalled). Nothing selects the package then; the owner
+selects it explicitly. Selection changes commit under the exclusive lifecycle
+authority, and a launch that resolved the previously selected version before a
+selection committed is refused with `runtime/runtime_package_changed` (retry the
+request) instead of pinning the version that was just replaced; a digest a host
+profile pins launches whatever is selected.
 
 Install and link validate the package in memory before anything is extracted:
 `runtime.toml` is parsed from the verified archive, and the package identity
@@ -609,6 +640,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_profile_base_builtin` | `runtime` | The profile's base runtime is served by a built-in, so there is no package to pin. |
 | `package_profile_target_invalid` | `runtime` | The package is not installed, is faulted, does not serve the base runtime, or is not the unique selected package. |
 | `package_profile_changed` | `runtime` | The profile changed while it was being rewritten and was left as found. |
+| `package_integration_incompatible` | `runtime` | The package's integration handler or hook schema is not compatible with another version of it that is still referenced or selected; nothing changed. |
 
 ### Daemon Runtime Configuration
 
@@ -1648,7 +1680,10 @@ stages the new set against the active one without changing it, proves
 compatibility, activates atomically, and restores the exact prior tree when any
 step fails, so the active set stays in place until activation succeeds.
 Compatibility requires the runtime's hook schema to be driven by the handler and
-to admit every operation the new set reports; otherwise the update is refused
+to admit every operation the new set reports, and every hook schema of the
+package versions that live, lost or resumable sessions and host profile pins
+still reference for that handler to admit them too (an undeterminable retained
+version of the runtime's package refuses as well); otherwise the update is refused
 with `runtime/integration_update_incompatible` before anything is written. An
 active set of any version is replaceable, so a rolled-back release reinstalls
 its older set.

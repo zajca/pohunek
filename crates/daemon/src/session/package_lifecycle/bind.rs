@@ -8,7 +8,7 @@
 
 // Rust guideline compliant 2026-10-05
 
-use package::registry::RetainedDigests;
+use package::registry::{RegistryState, RetainedDigests};
 use package::PackageDigest;
 use protocol::{
     PackageBindProfileParams, PackageBindProfileResult, PackageBindStatus, PackageErrorKind,
@@ -16,6 +16,7 @@ use protocol::{
 };
 use tracing::warn;
 
+use super::selection::differs;
 use super::{inspect_record, prove_loadable, read_state, Context, Inspected};
 use crate::agent::host::ServedBy;
 use std::sync::Arc;
@@ -126,6 +127,37 @@ fn resolve_target(
     })
 }
 
+/// Refuses a pin of a version whose integration differs from the selected
+/// version of the same package.
+///
+/// A pin is a retained reference, so it must not make an unselected version
+/// with another handler or hook schema coexist with the selected one, which is
+/// the state the selection gate keeps from arising in the other order.
+fn ensure_coexists_with_selected(
+    context: &Context,
+    state: &RegistryState,
+    digest: &PackageDigest,
+) -> Result<(), PackageErrorKind> {
+    let record = state
+        .package(digest)
+        .ok_or(PackageErrorKind::NotInstalled)?;
+    let Some(selected) = state
+        .selected(&record.identity().id)
+        .filter(|selected| *selected != digest)
+        .and_then(|selected| state.package(selected))
+    else {
+        return Ok(());
+    };
+    if differs(context, record, selected) {
+        warn!(
+            package = %record.identity().id,
+            "a profile cannot pin a version whose integration differs from the selected one"
+        );
+        return Err(PackageErrorKind::IntegrationIncompatible);
+    }
+    Ok(())
+}
+
 /// Reads, validates, edits and publishes the profile under the lifecycle
 /// authority the caller holds.
 fn bind_profile(
@@ -164,6 +196,7 @@ fn bind_profile(
     if head.pin().as_ref() == Some(&pin) {
         return Ok(result(PackageBindStatus::Unchanged, false, true));
     }
+    ensure_coexists_with_selected(context, &read_state(context)?, &pin.digest)?;
     let rewritten = apply_pin(file.text(), &pin).map_err(|detail| unusable(name, &detail))?;
     // The candidate must resolve against the target exactly as a launch of it
     // would (size bound, structure, resume and fork overrides against the
