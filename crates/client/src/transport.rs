@@ -16,9 +16,9 @@ use protocol::{
     ProtocolVersion, ProtocolVersionRange, Request, Response, SessionDetectionParams,
     SessionDetectionResult, SessionId, SessionInputParams, SessionInputResult, SessionOutputParams,
     SessionOutputResult, SessionReadParams, SessionReadResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams, SessionWaitResult,
-    ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
+    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionWaitParams,
+    SessionWaitResult, ENV_DAEMON_ID, ENV_SESSION_ID, MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -661,12 +661,25 @@ impl Client {
     }
 
     /// Resume one logical session through the typed lifecycle API.
+    ///
+    /// Refuses a host profile that changed since the session was launched; use
+    /// [`Self::session_resume_with`] to accept the change.
     pub async fn session_resume(
         &mut self,
         session_id: SessionId,
     ) -> Result<SessionResumeResult, ClientError> {
-        self.call::<protocol::method::SessionResume>(session_id)
+        self.session_resume_with(SessionResumeParams::new(session_id, false))
             .await
+    }
+
+    /// Resume one logical session with an explicit decision on a changed host
+    /// profile. The daemon honors `accept_profile_change` on its local control
+    /// socket only.
+    pub async fn session_resume_with(
+        &mut self,
+        params: SessionResumeParams,
+    ) -> Result<SessionResumeResult, ClientError> {
+        self.call::<protocol::method::SessionResume>(params).await
     }
 
     /// Resize one managed terminal through the typed lifecycle API.

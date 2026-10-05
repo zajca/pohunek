@@ -27,4 +27,11 @@ export type SessionForkParams = {
    * Initial terminal height in rows.
    */
   rows: number;
+  /**
+   * Fork under the source session's current host profile although the
+   * profile changed since the session was launched, or never recorded a
+   * revision. Accepted from the local owner only; the fork freezes the
+   * current revision.
+   */
+  accept_profile_change?: boolean;
 };

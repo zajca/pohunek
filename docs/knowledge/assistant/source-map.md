@@ -427,6 +427,7 @@ Daemon, sessions, integrations, and project state:
   worker socket.
 - `crates/daemon/src/session/native_repair.rs`
 - `crates/daemon/src/session/target.rs`
+- `crates/daemon/src/session/resume.rs` — resume and fork, the frozen profile revision check and the `ProfileChange` decision.
 - `crates/daemon/src/session/procwatch.rs`
 - `crates/daemon/src/runtime/`
 - `crates/daemon/src/runtime/lifecycle.rs` — worker generation lifecycle
@@ -472,6 +473,7 @@ Agent runtime and profile resolution:
 - `crates/session-worker/`
 - `crates/worker-protocol/`
 - `crates/daemon/src/agent/mod.rs`
+- `crates/daemon/src/agent/launch_env.rs` — the redacting launch environment carrier.
 - `crates/daemon/src/agent/native_launch.rs`
 - `crates/daemon/src/agent/native_reference.rs`
 - `crates/daemon/src/agent/profile.rs`

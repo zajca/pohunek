@@ -34,10 +34,10 @@ use protocol::{
     SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
     SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionRuntime,
-    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
-    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
-    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
+    SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
+    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
+    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
     ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId, TerminalCursor,
     TerminalDimensions, TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate,
     TransferOutcomeId, TransferProposal, UnconfirmedProcess, CLIENT_PROTOCOL_VERSIONS,
@@ -1111,6 +1111,7 @@ fn session_fork_params_json_shape_roundtrips() {
         cwd_mode: ForkCwdMode::Same,
         cols: 100,
         rows: 30,
+        accept_profile_change: false,
     };
 
     let value = serde_json::to_value(&params).expect("serialize fork params");
@@ -1127,6 +1128,76 @@ fn session_fork_params_json_shape_roundtrips() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
+}
+
+#[test]
+fn session_fork_params_carry_the_profile_override_only_when_set() {
+    let accepted: SessionForkParams = serde_json::from_value(json!({
+        "session_id": "s-42",
+        "cols": 100,
+        "rows": 30,
+        "accept_profile_change": true
+    }))
+    .expect("deserialize fork params with the override");
+    assert!(accepted.accept_profile_change);
+    assert_eq!(
+        serde_json::to_value(&accepted).expect("serialize")["accept_profile_change"],
+        json!(true)
+    );
+
+    let plain: SessionForkParams = serde_json::from_value(json!({
+        "session_id": "s-42",
+        "cols": 100,
+        "rows": 30
+    }))
+    .expect("deserialize fork params of an older client");
+    assert!(!plain.accept_profile_change);
+}
+
+#[test]
+fn session_resume_params_accept_the_bare_id_and_the_object_form() {
+    let bare: SessionResumeParams = serde_json::from_value(json!("s-42")).expect("bare id");
+    assert_eq!(bare.session_id(), &SessionId("s-42".to_owned()));
+    assert!(!bare.accept_profile_change());
+    assert_eq!(
+        serde_json::to_value(&bare).expect("serialize"),
+        json!("s-42"),
+        "a bare id serializes back as a bare id"
+    );
+
+    let accepted: SessionResumeParams =
+        serde_json::from_value(json!({"session_id": "s-42", "accept_profile_change": true}))
+            .expect("object form");
+    assert_eq!(accepted.session_id(), &SessionId("s-42".to_owned()));
+    assert!(accepted.accept_profile_change());
+    assert_eq!(line_roundtrip(&accepted), accepted);
+
+    let without_flag: SessionResumeParams =
+        serde_json::from_value(json!({"session_id": "s-42"})).expect("object without the flag");
+    assert!(!without_flag.accept_profile_change());
+
+    assert_eq!(
+        SessionResumeParams::new(SessionId("s-42".to_owned()), false),
+        bare
+    );
+    assert_eq!(
+        SessionResumeParams::new(SessionId("s-42".to_owned()), true),
+        accepted
+    );
+}
+
+#[test]
+fn session_resume_params_reject_a_malformed_shape() {
+    for malformed in [
+        json!(42),
+        json!({"accept_profile_change": true}),
+        json!(null),
+    ] {
+        assert!(
+            serde_json::from_value::<SessionResumeParams>(malformed.clone()).is_err(),
+            "{malformed}"
+        );
+    }
 }
 
 #[test]

@@ -113,6 +113,25 @@ pub(crate) mod test_support {
     }
 
     std::thread_local! {
+        /// The host-state directory of the current test thread.
+        static THREAD_HOST_STATE: std::cell::OnceCell<std::path::PathBuf> =
+            const { std::cell::OnceCell::new() };
+    }
+
+    /// The owner-private host-state directory shared by every default session
+    /// registry configuration of the calling test thread.
+    ///
+    /// One directory per test means one profile-revision key per test, so a
+    /// registry rebuilt from a default configuration keeps verifying the
+    /// revisions it froze earlier.
+    pub(crate) fn thread_host_state_dir() -> std::path::PathBuf {
+        THREAD_HOST_STATE.with(|cell| {
+            cell.get_or_init(|| thread_scoped_dir("pohunek-host-state-"))
+                .clone()
+        })
+    }
+
+    std::thread_local! {
         /// The hermetic environment of the current test thread.
         static THREAD_ENV: std::cell::OnceCell<pohunek_test_support::env::TestEnv> =
             const { std::cell::OnceCell::new() };

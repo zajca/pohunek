@@ -278,7 +278,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
         .await
         .expect("stop session through replacement daemon");
     let recovered_result = client
-        .call::<method::SessionResume>(SessionId(fixture.session_id.clone()))
+        .call::<method::SessionResume>(SessionId(fixture.session_id.clone()).into())
         .await;
     if recovered_result.is_err() {
         fixture.print_status();
@@ -345,7 +345,7 @@ async fn daemon_restart_and_sigkill_preserve_systemd_worker_runtime() {
     );
 
     let repeated = client
-        .call::<method::SessionResume>(SessionId(fixture.session_id.clone()))
+        .call::<method::SessionResume>(SessionId(fixture.session_id.clone()).into())
         .await
         .expect_err("a live recovered runtime is not recoverable again");
     assert_eq!(
@@ -675,6 +675,10 @@ impl Fixture {
         );
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one persisted session record literal"
+    )]
     fn persist_record_for(
         &self,
         session_id: &str,
@@ -769,6 +773,7 @@ impl Fixture {
                     launch_binding: pohunek_daemon::agent::host::LaunchPin::Unpinned,
                     native_reference_provenance:
                         pohunek_daemon::agent::NativeReferenceProvenance::default(),
+                    profile_revision: None,
                     native_launch_unresolved: false,
                 }),
                 native_identity_ordering: None,

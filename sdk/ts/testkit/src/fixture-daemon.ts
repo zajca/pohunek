@@ -849,9 +849,10 @@ class FixtureDaemon implements FixtureDaemonHandle, FixturePtyEvents, ScenarioBa
   }
 
   private handleSessionResume(request: ControlRequest): ControlResponse {
-    if (typeof request.params !== "string") return errResponse(request.id, invalidParams(request.method));
-    const session = this.sessions.get(request.params);
-    if (session === undefined) return errResponse(request.id, sessionNotFound(request.params));
+    const sessionId = resumeSessionId(request.params);
+    if (sessionId === undefined) return errResponse(request.id, invalidParams(request.method));
+    const session = this.sessions.get(sessionId);
+    if (session === undefined) return errResponse(request.id, sessionNotFound(sessionId));
     if (session.external === true) return errResponse(request.id, badRequest("session cannot be resumed"));
     if (!session.capabilities.resume) return errResponse(request.id, agentResumeUnsupported(session.id));
     if (!isResumableSessionState(session)) {
@@ -1918,13 +1919,20 @@ function parseRequest(line: string): ControlRequest | { readonly err: ProtocolEr
   };
 }
 
+/** The session a `session.resume` names: a bare id or the object form. */
+function resumeSessionId(params: unknown): string | undefined {
+  if (typeof params === "string") return params;
+  return isRecord(params) && typeof params["session_id"] === "string" ? params["session_id"] : undefined;
+}
+
 function mutationSessionId(request: ControlRequest): string | undefined {
   switch (request.method) {
     case "session.stop":
-    case "session.resume":
     case "session.remove":
     case "session.remove_accepting_unconfirmed":
       return typeof request.params === "string" ? request.params : undefined;
+    case "session.resume":
+      return resumeSessionId(request.params);
     case "session.fork":
     case "session.resize":
     case "session.set_metadata":

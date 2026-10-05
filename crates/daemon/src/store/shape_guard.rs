@@ -33,7 +33,13 @@ use super::{
 };
 
 /// Key-set snapshots by schema version. A new schema adds its entry here.
-const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[(2, include_str!("fixtures/shape/schema-2.txt"))];
+const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
+    (2, include_str!("fixtures/shape/schema-2.txt")),
+    (3, include_str!("fixtures/shape/schema-3.txt")),
+];
+
+/// A profile revision: 64 lowercase hex digits.
+const REVISION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -74,7 +80,8 @@ fn resume_builtin_json() -> Value {
                 "descriptor_digest": DIGEST
             }
         },
-        "native_reference_provenance": "assigned"
+        "native_reference_provenance": "assigned",
+        "profile_revision": REVISION
     })
 }
 
@@ -249,6 +256,7 @@ fn assert_every_field_is_reviewed(
             native_launch_unresolved: _,
             launch_binding: _,
             native_reference_provenance: _,
+            profile_revision: _,
         } = binding;
         let StoredInputRules {
             bracketed_paste: _,

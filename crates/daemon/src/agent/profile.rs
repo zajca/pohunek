@@ -27,7 +27,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use super::host::{ProfileInputs, RevisionKeys, RuntimeDefinition, RuntimeHost, ServedBy};
-use super::{InputRules, NativeArgs, NativeSessionLaunch, SessionRefKind};
+use super::{InputRules, LaunchEnv, NativeArgs, NativeSessionLaunch, SessionRefKind};
 use crate::detect::{Manifest, MAX_MANIFEST_SOURCE_BYTES};
 use crate::project::config::validate_name;
 
@@ -173,8 +173,10 @@ pub(crate) struct ResolvedProfile {
     pub program: String,
     /// Launch args.
     pub args: Vec<String>,
-    /// Non-secret PTY env, with every `POHUNEK_`-prefixed key already stripped.
-    pub env: Vec<(String, String)>,
+    /// PTY env from the profile's `[env]` table, with every `POHUNEK_`-prefixed
+    /// key already stripped. Secret-bearing: its `Debug` form is redacted and
+    /// it never reaches the store.
+    pub env: LaunchEnv,
     /// Input-rules override; `None` ⇒ inherit the base kind's rules.
     pub input_rules: Option<InputRules>,
     /// Resolved native-session launch spec; `None` ⇒ not resumable and not
@@ -308,17 +310,12 @@ impl ProfileRegistry {
     }
 
     /// The revision of the host profile `agent` resolved from, or `None` for a
-    /// bare runtime. This is the owner's approval step; its caller arrives
-    /// with the locally approved `HostShare` (#82).
+    /// bare runtime.
     ///
     /// # Errors
     ///
     /// Returns `agent_profile_revision_unavailable` when the host's revision
     /// key cannot be read or created.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the approval caller arrives with #82")
-    )]
     pub(crate) fn revision_of(
         &self,
         agent: &ResolvedAgent,
@@ -804,12 +801,13 @@ fn resolve_profile_text(
     // Every `POHUNEK_`-prefixed key is reserved for the daemon handshake; strip the
     // whole prefix so a profile can never shadow `POHUNEK_ENV`/`_PROTOCOL_VERSION`/…
     // (the launch path also re-asserts this by appending the handshake env last).
-    let env: Vec<(String, String)> = raw
+    let env: LaunchEnv = raw
         .env
         .into_iter()
         .filter(|(key, _)| !key.starts_with("POHUNEK_"))
         .map(|(key, value)| (key, value.0))
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
     let input_rules = raw.input_rules.map(|rules| {
         definition.input_rules().with_framing(
             rules.bracketed_paste.unwrap_or(false),
@@ -1167,6 +1165,29 @@ mod tests {
         let rules = profile.input_rules.expect("input rules override");
         assert!(!rules.bracketed_paste);
         assert_eq!(rules.submit_delay, Duration::from_millis(150));
+    }
+
+    #[test]
+    fn a_debug_rendering_of_a_resolved_agent_never_carries_profile_env() {
+        let dir = tmp_agents_dir("debug-redaction");
+        std::fs::write(
+            dir.join("secret.toml"),
+            "base = \"claude\"\n[env]\nCLAUDE_CONFIG_DIR = \"/home/me/.claude-work\"\nANTHROPIC_API_KEY = \"sk-ant-never-print\"\n",
+        )
+        .expect("write profile");
+        let reg = ProfileRegistry::new(Some(dir.clone()));
+        let resolved = reg.resolve_agent("secret").expect("resolves");
+        assert_eq!(resolved.profile.as_ref().expect("profile").env.len(), 2);
+
+        for rendered in [format!("{resolved:?}"), format!("{resolved:#?}")] {
+            for leaked in [
+                "sk-ant-never-print",
+                "/home/me/.claude-work",
+                "ANTHROPIC_API_KEY",
+            ] {
+                assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
+            }
+        }
     }
 
     #[test]

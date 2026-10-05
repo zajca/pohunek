@@ -192,6 +192,7 @@ export type { SessionReportNativeIdParams } from "./SessionReportNativeIdParams"
 export type { SessionReportNativeIdResult } from "./SessionReportNativeIdResult";
 export type { SessionResizeParams } from "./SessionResizeParams";
 export type { SessionResizeResult } from "./SessionResizeResult";
+export type { SessionResumeParams } from "./SessionResumeParams";
 export type { SessionResumeResult } from "./SessionResumeResult";
 export type { SessionRetentionCandidate } from "./SessionRetentionCandidate";
 export type { SessionRetentionHold } from "./SessionRetentionHold";

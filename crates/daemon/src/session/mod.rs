@@ -75,6 +75,8 @@ mod package_lifecycle;
 mod packages;
 mod procwatch;
 #[cfg(test)]
+mod profile_freeze_tests;
+#[cfg(test)]
 mod profile_pin_tests;
 mod read;
 mod reconcile;
@@ -98,6 +100,7 @@ use hooks::{parse_agent_activity, spawn_agent_state_hook_dispatcher};
 use input::{build_input_writes, InputSubmission};
 use input::{input_rules_for_agent, input_rules_for_definition, plan_initial_input_delivery};
 use lag::{log_lag_warn, LagWarnThrottle};
+pub use resume::ProfileChange;
 use resume::ResumeSnapshot;
 pub(crate) use target::ActiveSupervision;
 use target::{build_launch_command, LaunchCommandPlan, PtySessionSpec, TargetResolution};
@@ -422,6 +425,11 @@ impl Default for SessionRegistryConfig {
             log_dir: None,
             config_dir: None,
             agents_dir: None,
+            // Unit tests launch profile-backed sessions, which need a revision
+            // key; every default configuration of a test shares one directory.
+            #[cfg(test)]
+            host_state_dir: Some(crate::test_support::thread_host_state_dir()),
+            #[cfg(not(test))]
             host_state_dir: None,
             plugins_dir: None,
             catalog_trust_anchor: None,
@@ -547,6 +555,10 @@ struct SessionRegistryInner {
     /// Holds the next create once its target is bound, before its launch.
     #[cfg(test)]
     bound_create_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
+    /// Holds the next resume or fork once its profile is resolved and verified,
+    /// before it launches.
+    #[cfg(test)]
+    recovery_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
     /// Holds the next committed create before its initial input.
     #[cfg(test)]
     initial_input_hold: std::sync::Mutex<Option<crate::runtime::lifecycle::tests::StartGate>>,
@@ -1456,6 +1468,8 @@ impl SessionRegistry {
                 #[cfg(test)]
                 bound_create_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
+                recovery_hold: std::sync::Mutex::new(None),
+                #[cfg(test)]
                 initial_input_hold: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 initial_input_commit_hold: std::sync::Mutex::new(None),
@@ -1880,6 +1894,10 @@ impl SessionRegistry {
             name: params.agent.clone(),
         }
         .resolve(&self.inner.profiles)?;
+        // Frozen into the session so a later resume can tell whether the
+        // profile still is the one the session launched under. A host that
+        // cannot key revisions launches no profile-backed session.
+        let profile_revision = self.inner.profiles.revision_of(&resolved)?;
         let profile_env = resolved
             .profile
             .as_ref()
@@ -1918,6 +1936,7 @@ impl SessionRegistry {
                 id,
                 params,
                 resolved,
+                profile_revision,
                 validated_program,
                 fallback_cwd,
             ))
@@ -2078,6 +2097,7 @@ impl SessionRegistry {
         id: SessionId,
         params: SessionNewParams,
         resolved: ResolvedAgent,
+        profile_revision: Option<host::ProfileRevision>,
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         fallback_cwd: PathBuf,
     ) -> Result<(SessionInfo, Option<String>), ProtocolError> {
@@ -2091,7 +2111,14 @@ impl SessionRegistry {
             Ok(target) => {
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
-                self.create_spec(&id, &params, &resolved, validated_program, target)
+                self.create_spec(
+                    &id,
+                    &params,
+                    &resolved,
+                    profile_revision,
+                    validated_program,
+                    target,
+                )
             }
             Err(error) => Err(error),
         };
@@ -2104,7 +2131,7 @@ impl SessionRegistry {
                 return Err(error);
             }
         };
-        let info = self.clone().run_pty_registration(spec, guard).await?;
+        let info = Box::pin(self.clone().run_pty_registration(spec, guard)).await?;
         Ok((info, pending_initial_input))
     }
 
@@ -2132,6 +2159,31 @@ impl SessionRegistry {
         }
     }
 
+    /// Parks a resume or fork after its profile resolved when a test armed the
+    /// hold.
+    #[cfg(test)]
+    async fn hold_recovery(&self, id: &SessionId) {
+        let gate = {
+            let mut slot = self
+                .inner
+                .recovery_hold
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let held = slot
+                .as_ref()
+                .is_some_and(|gate| gate.session_id.as_deref().is_none_or(|held| held == id.0));
+            if held {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
+    }
+
     /// Builds the first-launch registration of a `session.new` in `target`,
     /// with the initial input its launch command does not carry.
     fn create_spec(
@@ -2139,6 +2191,7 @@ impl SessionRegistry {
         id: &SessionId,
         params: &SessionNewParams,
         resolved: &ResolvedAgent,
+        profile_revision: Option<host::ProfileRevision>,
         validated_program: Option<crate::agent::ValidatedLaunchProgram>,
         target: TargetResolution,
     ) -> Result<(PtySessionSpec, Option<String>), ProtocolError> {
@@ -2184,6 +2237,7 @@ impl SessionRegistry {
             } else {
                 NativeReferenceProvenance::Reported
             },
+            profile_revision,
         };
         // The detection-manifest override is consumed only by the detector, on
         // both the launch and resume paths; never persisted (re-resolved by name).

@@ -530,7 +530,7 @@ impl SessionRegistry {
         guard: LifecycleGuard,
     ) -> Result<SessionInfo, ProtocolError> {
         let registry = self.clone();
-        tokio::spawn(async move { registry.run_pty_registration(spec, guard).await })
+        tokio::spawn(async move { Box::pin(registry.run_pty_registration(spec, guard)).await })
             .await
             .map_err(|_join_error| {
                 runtime_error("session_launch_failed", "session launch task panicked")
@@ -755,6 +755,7 @@ impl SessionRegistry {
                 native_launch: snapshot.native.clone(),
                 launch_binding: snapshot.launch_binding.clone(),
                 native_reference_provenance: snapshot.reference_provenance,
+                profile_revision: snapshot.profile_revision.clone(),
                 native_launch_unresolved: false,
             }),
             runtime: RuntimeRecord {

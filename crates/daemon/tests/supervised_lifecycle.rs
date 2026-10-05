@@ -649,7 +649,7 @@ async fn repeated_start_stop_recover_cycles_leave_no_orphans() {
         let resumed = fixture
             .client()
             .await
-            .call::<method::SessionResume>(SessionId(recovered.to_owned()))
+            .call::<method::SessionResume>(SessionId(recovered.to_owned()).into())
             .await
             .unwrap_or_else(|error| panic!("recover round {round}: {error}"))
             .session;

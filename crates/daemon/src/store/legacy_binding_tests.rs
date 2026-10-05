@@ -390,7 +390,7 @@ fn a_store_already_at_the_current_schema_is_not_reinterpreted() {
     let current = raw_lines_of(V0_33_1_DAMAGED_STORE).into_iter().fold(
         String::new(),
         |mut store, mut line| {
-            line["schema_version"] = json!(2);
+            line["schema_version"] = json!(super::STORE_SCHEMA_VERSION);
             writeln!(store, "{line}").expect("write to a string");
             store
         },

@@ -1311,6 +1311,7 @@ async fn resume_refuses_a_runtime_it_cannot_resolve_or_whose_pin_does_not_match(
         native_launch: None,
         launch_binding,
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+        profile_revision: None,
         native_launch_unresolved: false,
     };
     let package_pin = LaunchPin::Pinned(Box::new(LaunchBinding {
@@ -1453,7 +1454,7 @@ fn write_host_hook(config_dir: &std::path::Path, event: &str, body: &str) {
 }
 
 #[cfg(unix)]
-fn write_executable(path: &std::path::Path, body: &str) {
+pub(super) fn write_executable(path: &std::path::Path, body: &str) {
     fs::write(path, body).expect("write executable");
     let mut perms = fs::metadata(path).expect("metadata").permissions();
     perms.set_mode(0o700);
@@ -1489,7 +1490,7 @@ fn terminate_pid(pid: u32) {
         .status();
 }
 
-async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
+pub(super) async fn wait_for_file_contains(path: &std::path::Path, needle: &str) -> String {
     wait_until(
         &format!("{} to contain {needle:?}", path.display()),
         || async {
@@ -2322,7 +2323,7 @@ fn pty_command<'a>(program: &str, args: impl IntoIterator<Item = &'a str>) -> La
     LaunchCommand {
         program: program.to_owned(),
         args: args.into_iter().map(str::to_owned).collect(),
-        env: Vec::new(),
+        env: crate::agent::LaunchEnv::default(),
         cwd: crate::test_support::thread_scoped_dir("pohunek-cwd-"),
         cols: 80,
         rows: 24,
@@ -3843,7 +3844,7 @@ async fn session_start_hook_runs_after_spawn_without_blocking_create() {
 /// test holds it, and opening read-write never blocks. Keep the handle alive
 /// until the hook has acknowledged the release: a FIFO with no open descriptor
 /// discards its buffered data, and a later reader-open would block.
-fn hook_gate(path: &std::path::Path) -> fs::File {
+pub(super) fn hook_gate(path: &std::path::Path) -> fs::File {
     nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).expect("create hook gate fifo");
     fs::OpenOptions::new()
         .read(true)
@@ -11592,6 +11593,7 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
             cwd_mode: ForkCwdMode::Same,
             cols: 100,
             rows: 30,
+            accept_profile_change: false,
         })
         .await
         .expect("fork live claude session");
@@ -11641,6 +11643,7 @@ async fn fork_shell_session_reports_agent_fork_unsupported() {
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         })
         .await
         .expect_err("shell sessions cannot be forked");
@@ -11682,6 +11685,7 @@ async fn fork_codex_session_reports_agent_fork_unsupported() {
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         })
         .await
         .expect_err("codex fork is intentionally unsupported");
@@ -11731,6 +11735,7 @@ async fn fork_hermes_session_is_rejected_before_child_side_effects() {
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         })
         .await
         .expect_err("Hermes fork is unsupported");
@@ -11844,6 +11849,7 @@ async fn fork_disable_is_frozen_across_profile_removal() {
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         })
         .await
         .expect_err("frozen fork disable must survive profile removal");
@@ -12006,6 +12012,7 @@ async fn non_resumable_profile_binding_reports_agent_not_resumable() {
         native_launch: None,
         launch_binding: crate::agent::host::LaunchPin::Unpinned,
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+        profile_revision: None,
         native_launch_unresolved: false,
     };
 
@@ -12484,6 +12491,7 @@ async fn incompatible_hermes_resume_binding_fails_before_recovery_side_effects()
         native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
         launch_binding: crate::agent::host::LaunchPin::Unpinned,
         native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+        profile_revision: None,
         native_launch_unresolved: false,
     };
 
@@ -12726,6 +12734,7 @@ async fn pi_shaped_profile_resumes_and_forks_through_the_frozen_spec() {
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         })
         .await
         .expect("native fork");
@@ -12996,6 +13005,7 @@ async fn resume_binding_restores_metadata_from_store() {
             native_launch: Some(test_native_launch(SessionRefKind::Id, false)),
             launch_binding: crate::agent::host::LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            profile_revision: None,
             native_launch_unresolved: false,
         })
         .expect("seed resume binding");
@@ -13061,6 +13071,10 @@ async fn resize_without_captured_native_id_persists_no_binding() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario: create, resize, edit, refuse, accept"
+)]
 async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
     let store_path = temp_store_path("resume-edit-resize");
     let dir = temp_dir("resume-edit-resize-runtime");
@@ -13137,10 +13151,21 @@ async fn resume_after_profile_edit_and_resize_uses_original_snapshot() {
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
     });
-    let resumed = restarted
-        .resume_binding(binding)
+    let refused = restarted
+        .resume_binding(binding.clone())
         .await
-        .expect("resume from frozen binding");
+        .expect_err("an edited profile is not relaunched without the owner's decision");
+    assert_eq!(refused.code, "agent_profile_changed");
+    assert_eq!(
+        fs::read_to_string(&marker_v1).expect("read v1 marker"),
+        "",
+        "a refused resume launches nothing"
+    );
+
+    let resumed = restarted
+        .resume_binding_with(binding, super::ProfileChange::Accept)
+        .await
+        .expect("resume from frozen binding once the owner accepted the edit");
 
     assert_eq!((resumed.cols, resumed.rows), (123, 55));
     let argv = wait_for_file_contains(&marker_v1, "native-edit-resize").await;
@@ -17122,6 +17147,7 @@ async fn a_hook_less_runtime_launches_with_an_assigned_reference_and_recovers_fr
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         })
         .await
         .expect("native fork");
@@ -17194,6 +17220,7 @@ async fn a_probed_package_runtime_is_revalidated_before_every_launch_kind() {
         cwd_mode: ForkCwdMode::Same,
         cols: 80,
         rows: 24,
+        accept_profile_change: false,
     };
     let launches = |marker: &std::path::Path| {
         fs::read_to_string(marker).map_or(0, |text| text.matches("launch\n").count())
@@ -17317,6 +17344,7 @@ async fn recovery_refuses_an_assigned_reference_whose_conversation_is_missing() 
         cwd_mode: ForkCwdMode::Same,
         cols: 80,
         rows: 24,
+        accept_profile_change: false,
     };
     let refused = registry
         .fork(fork.clone())
@@ -18011,6 +18039,7 @@ async fn a_fork_holds_the_package_authority_until_its_registration_ends() {
                 cwd_mode: ForkCwdMode::Same,
                 cols: 80,
                 rows: 24,
+                accept_profile_change: false,
             })
             .await
     });
@@ -18143,12 +18172,18 @@ async fn recovery_keeps_an_unchanged_profile_after_its_package_is_disabled() {
     let binding = durable_recovery(&store_path, &created.id);
 
     packaged.disable_and_reload(&registry);
-    let (env, _manifest) = registry.recovery_profile(&binding, "resume");
+    let recovered = registry
+        .resolve_recovery_profile(&binding, super::ProfileChange::Refuse)
+        .expect("the unchanged profile still matches its frozen revision");
 
     assert_eq!(
-        env,
+        recovered.env,
         [("PROFILE_MARK".to_owned(), "kept".to_owned())],
         "the unchanged profile resolves against the pinned package"
+    );
+    assert!(
+        recovered.revision.is_some() && recovered.revision == binding.profile_revision,
+        "the pinned resolution reproduces the revision frozen at creation"
     );
 }
 
@@ -18587,6 +18622,7 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
             cwd_mode: ForkCwdMode::Same,
             cols: 80,
             rows: 24,
+            accept_profile_change: false,
         })
         .await;
     match case.fork_argv {

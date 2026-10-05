@@ -214,6 +214,81 @@ pub struct SessionForkParams {
     pub cols: u16,
     /// Initial terminal height in rows.
     pub rows: u16,
+    /// Fork under the source session's current host profile although the
+    /// profile changed since the session was launched, or never recorded a
+    /// revision. Accepted from the local owner only; the fork freezes the
+    /// current revision.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub accept_profile_change: bool,
+}
+
+/// Parameters for `session.resume`.
+///
+/// A bare session id is the original shape and stays valid; the object form
+/// adds the owner's decision on a changed host profile. A bare id serializes
+/// back as a bare id, so a client that does not request the override keeps
+/// speaking the shape every daemon of the protocol window understands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "SessionResumeParams.ts"))]
+#[serde(untagged)]
+pub enum SessionResumeParams {
+    /// The session to resume, refusing a changed host profile.
+    Id(SessionId),
+    /// The session to resume with an explicit decision on a changed profile.
+    Options {
+        /// The session to resume.
+        session_id: SessionId,
+        /// Relaunch under the session's current host profile although it
+        /// changed since the session was launched, or never recorded a
+        /// revision. Accepted from the local owner only; the resumed session
+        /// freezes the current revision.
+        #[serde(default)]
+        accept_profile_change: bool,
+    },
+}
+
+impl SessionResumeParams {
+    /// Parameters resuming `session_id`, in the shortest wire shape that
+    /// carries `accept_profile_change`.
+    #[must_use]
+    pub fn new(session_id: SessionId, accept_profile_change: bool) -> Self {
+        if accept_profile_change {
+            Self::Options {
+                session_id,
+                accept_profile_change,
+            }
+        } else {
+            Self::Id(session_id)
+        }
+    }
+
+    /// The session to resume.
+    #[must_use]
+    pub fn session_id(&self) -> &SessionId {
+        match self {
+            Self::Id(session_id) | Self::Options { session_id, .. } => session_id,
+        }
+    }
+
+    /// Whether the request asks to relaunch under a changed host profile.
+    #[must_use]
+    pub fn accept_profile_change(&self) -> bool {
+        matches!(
+            self,
+            Self::Options {
+                accept_profile_change: true,
+                ..
+            }
+        )
+    }
+}
+
+impl From<SessionId> for SessionResumeParams {
+    fn from(session_id: SessionId) -> Self {
+        Self::Id(session_id)
+    }
 }
 
 /// Parameters for `session.list`.

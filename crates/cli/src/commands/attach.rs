@@ -853,6 +853,7 @@ fn build_menu_fork_request(target: &Target, cols: u16, rows: u16) -> Result<Requ
             cwd_mode: ForkCwdMode::Same,
             cols,
             rows,
+            accept_profile_change: false,
         },
     )
 }

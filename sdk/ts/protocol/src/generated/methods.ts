@@ -94,6 +94,7 @@ import type {
   SessionReportNativeIdResult,
   SessionResizeParams,
   SessionResizeResult,
+  SessionResumeParams,
   SessionResumeResult,
   SessionRetentionParams,
   SessionRetentionResult,
@@ -163,7 +164,7 @@ export interface Methods {
   "session.report_agent": { params: SessionReportAgentParams; output: SessionReportAgentResult };
   "session.report_native_id": { params: SessionReportNativeIdParams; output: SessionReportNativeIdResult };
   "session.resize": { params: SessionResizeParams; output: SessionResizeResult };
-  "session.resume": { params: SessionId; output: SessionResumeResult };
+  "session.resume": { params: SessionResumeParams; output: SessionResumeResult };
   "session.retention.sweep": { params: SessionRetentionParams; output: SessionRetentionResult };
   "session.runtime_inventory": { params: null; output: RuntimeInventoryResult };
   "session.screen": { params: SessionScreenParams; output: SessionScreenResult };

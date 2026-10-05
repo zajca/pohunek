@@ -141,13 +141,13 @@ pub use session::{
     SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult, SessionRenameParams,
     SessionRenameResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
-    SessionResizeResult, SessionResumeResult, SessionRetentionCandidate, SessionRetentionHold,
-    SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason, SessionRetentionResult,
-    SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
-    SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor, TerminalDimensions,
-    TerminalDimensionsError, UnconfirmedProcess,
+    SessionResizeResult, SessionResumeParams, SessionResumeResult, SessionRetentionCandidate,
+    SessionRetentionHold, SessionRetentionParams, SessionRetentionPolicy, SessionRetentionReason,
+    SessionRetentionResult, SessionRuntime, SessionRuntimeIdentity, SessionScreenParams,
+    SessionScreenResult, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
+    SessionStopResult, SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning,
+    SessionWarningKind, SubagentInfo, SubagentLifecycle, SubagentStateEvent, TerminalCursor,
+    TerminalDimensions, TerminalDimensionsError, UnconfirmedProcess,
 };
 #[doc(inline)]
 pub use version::{

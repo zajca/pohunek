@@ -61,7 +61,7 @@ use protocol::{ProjectSource, RuntimeRef, RuntimeState, SessionInfo};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::agent::host::{LaunchPin, RESERVED_RUNTIME_IDS};
+use crate::agent::host::{LaunchPin, ProfileRevision, RESERVED_RUNTIME_IDS};
 use crate::agent::{InputRules, NativeReferenceProvenance, NativeSessionLaunch, SessionRefKind};
 use crate::project::detect::project_id;
 
@@ -160,6 +160,14 @@ pub struct ResumeBinding {
         skip_serializing_if = "NativeReferenceProvenance::is_reported"
     )]
     pub native_reference_provenance: NativeReferenceProvenance,
+    /// The keyed revision of the host profile the session was launched from,
+    /// frozen when it was created or when the owner accepted a profile change.
+    /// Resume and fork relaunch under the profile only while its current
+    /// revision matches. Absent for a session without a profile and for a
+    /// binding written before revisions were frozen. A keyed MAC, so it reveals
+    /// nothing about the profile's `[env]` values.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<ProfileRevision>,
     /// Set by the schema migration on a binding that lost its `native_launch`
     /// and whose runtime has to supply it: the registry resolves the spec by
     /// agent name when the binding is loaded and clears the flag.
@@ -230,6 +238,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             #[serde(default)]
             native_reference_provenance: NativeReferenceProvenance,
             #[serde(default)]
+            profile_revision: Option<ProfileRevision>,
+            #[serde(default)]
             native_launch_unresolved: bool,
         }
 
@@ -265,6 +275,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             native_launch: raw.native_launch,
             launch_binding: raw.launch_binding,
             native_reference_provenance: raw.native_reference_provenance,
+            profile_revision: raw.profile_revision,
             native_launch_unresolved: raw.native_launch_unresolved,
         })
     }
@@ -1941,6 +1952,7 @@ mod tests {
             )),
             launch_binding: LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            profile_revision: None,
             native_launch_unresolved: false,
         }
     }
@@ -2054,6 +2066,7 @@ mod tests {
             )),
             launch_binding: LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            profile_revision: None,
             native_launch_unresolved: false,
         };
         store.record_resume(&binding).expect("record");
@@ -2092,7 +2105,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":2,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2108,7 +2121,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":2,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2147,7 +2160,7 @@ mod tests {
     fn resume_provenance_defaults_to_reported_and_roundtrips_when_assigned() {
         let store = Store::new(temp_store_path("resume-provenance"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":2,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":3,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
             "\n"
         );
@@ -2174,6 +2187,63 @@ mod tests {
             stored.native_reference_provenance,
             NativeReferenceProvenance::Assigned
         );
+    }
+
+    const REVISION_HEX: &str = "89abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn profile_revision_is_absent_by_default_and_round_trips_as_hex() {
+        let store = Store::new(temp_store_path("resume-profile-revision"));
+        let legacy = concat!(
+            r#"{"kind":"resume","schema_version":3,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
+            "\n"
+        );
+        write_private(store.path(), legacy);
+        let loaded = store.load_resume().expect("load");
+        assert_eq!(loaded[0].profile_revision, None);
+        assert!(!serde_json::to_string(&loaded[0])
+            .expect("encode")
+            .contains("profile_revision"));
+
+        let mut frozen = resume("s-frozen", "frozen-ref");
+        frozen.profile_revision =
+            Some(crate::agent::host::ProfileRevision::parse(REVISION_HEX).expect("revision"));
+        store.record_resume(&frozen).expect("record");
+        let stored = store
+            .load_resume()
+            .expect("load")
+            .into_iter()
+            .find(|binding| binding.session_id == "s-frozen")
+            .expect("stored");
+        assert_eq!(stored, frozen);
+        assert!(
+            fs::read_to_string(store.path())
+                .expect("read store")
+                .contains(&format!("\"profile_revision\":\"{REVISION_HEX}\"")),
+            "the revision is stored as its hex form"
+        );
+    }
+
+    #[test]
+    fn resume_line_with_a_malformed_profile_revision_is_dropped() {
+        let store = Store::new(temp_store_path("resume-profile-revision-corrupt"));
+        for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
+            let line = format!(
+                concat!(
+                    r#"{{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","#,
+                    r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
+                    r#""profile_revision":{}}}"#,
+                    "\n"
+                ),
+                malformed
+            );
+            write_private(store.path(), &line);
+            assert!(
+                store.load_resume().expect("load").is_empty(),
+                "{malformed} must not load as a binding"
+            );
+        }
     }
 
     #[test]
@@ -2216,7 +2286,7 @@ mod tests {
         // than inferring current compiled provider behavior.
         let store = Store::new(temp_store_path("resume-legacy"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":2,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":3,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-old"}"#,
             "\n"
         );
@@ -2240,10 +2310,10 @@ mod tests {
     fn resume_legacy_line_without_agent_base_infers_base_kind_from_agent_name() {
         let store = Store::new(temp_store_path("resume-legacy-agent-base"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":2,"session_id":"s-codex","agent":"codex","#,
+            r#"{"kind":"resume","schema_version":3,"session_id":"s-codex","agent":"codex","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-codex"}"#,
             "\n",
-            r#"{"kind":"resume","schema_version":2,"session_id":"s-claude","agent":"claude","#,
+            r#"{"kind":"resume","schema_version":3,"session_id":"s-claude","agent":"claude","#,
             r#""cwd":"/w","cols":100,"rows":30,"native_session_id":"native-claude"}"#,
             "\n"
         );
@@ -2280,7 +2350,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":2,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":3,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2321,7 +2391,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":2,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
+                r#"{"kind":"resume","schema_version":3,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
                 r#""cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2789,7 +2859,7 @@ mod tests {
         // still loads, defaulting project_id to None — the store's only
         // compatibility concession (serde default), not a guarantee.
         let legacy = concat!(
-            r#"{"kind":"worktree","schema_version":2,"session_id":"s-2","repository":"/r","branch":"feat/y","#,
+            r#"{"kind":"worktree","schema_version":3,"session_id":"s-2","repository":"/r","branch":"feat/y","#,
             r#""base_branch":"main","branch_slug":"feat-y","path":"/p","status":"active","#,
             r#""created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}"#,
             "\n"

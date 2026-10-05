@@ -36,7 +36,7 @@ use super::{
 ///
 /// Bump it, and add a [`MIGRATIONS`] step, whenever the serialized shape of a
 /// persisted record kind changes.
-pub const STORE_SCHEMA_VERSION: u32 = 2;
+pub const STORE_SCHEMA_VERSION: u32 = 3;
 
 /// Schema assumed for a line that has no `schema_version` field.
 pub(super) const UNVERSIONED_LINE_SCHEMA: u32 = 1;
@@ -54,10 +54,16 @@ pub(super) struct Migration {
 
 /// Every kept schema step, ordered by `from`. A store at any `from` listed here
 /// reaches [`STORE_SCHEMA_VERSION`] by applying the steps in sequence.
-pub(super) const MIGRATIONS: &[Migration] = &[Migration {
-    from: LEGACY_BINDING_STEP_FROM,
-    apply: migrate_v1_to_v2,
-}];
+pub(super) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        from: LEGACY_BINDING_STEP_FROM,
+        apply: migrate_v1_to_v2,
+    },
+    Migration {
+        from: 2,
+        apply: migrate_v2_to_v3,
+    },
+];
 
 /// Schema the [`legacy_binding`] step upgrades from.
 pub(super) const LEGACY_BINDING_STEP_FROM: u32 = 1;
@@ -69,6 +75,13 @@ pub(super) const LEGACY_BINDING_STEP_FROM: u32 = 1;
 fn migrate_v1_to_v2(record: &mut Map<String, Value>) {
     legacy_binding::migrate_record(record);
 }
+
+/// Schema 2 to 3: resume bindings gain the optional frozen `profile_revision`.
+///
+/// A binding without the field is a session without a recorded profile
+/// revision, which is exactly how an older binding must read, so no record
+/// changes beyond the version stamp.
+fn migrate_v2_to_v3(_record: &mut Map<String, Value>) {}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -580,6 +593,47 @@ mod tests {
 
     fn schema_error(error: &std::io::Error) -> &StoreSchemaError {
         StoreSchemaError::from_io(error).expect("error carries a StoreSchemaError")
+    }
+
+    #[test]
+    fn a_schema_2_store_migrates_to_3_keeping_every_record_as_it_was() {
+        let schema_2 = concat!(
+            r#"{"kind":"resume","schema_version":2,"session_id":"s-two","agent":"claude","agent_base":"claude","#,
+            r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","program":"claude","#,
+            r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"},"reference"]}}"#,
+            "\n",
+            r#"{"kind":"project","schema_version":2,"git_common_dir":"/r/.git","repo_root":"/r","#,
+            r#""added_at":"2026-01-01T00:00:00Z","last_used_at":"2026-01-01T00:00:01Z"}"#,
+            "\n"
+        );
+        let (store, path) = store_with("v2-to-v3", schema_2);
+
+        let migrated = store.migrate_to_current().expect("migrate");
+
+        assert!(
+            matches!(migrated, SchemaMigration::Migrated { from: 2, to, .. } if to == STORE_SCHEMA_VERSION),
+            "{migrated:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_path(&path, 2)).expect("read backup"),
+            schema_2,
+            "the schema 2 store is backed up before the rewrite"
+        );
+        let before: Vec<serde_json::Value> = schema_2
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("json"))
+            .collect();
+        for (after, mut before) in raw_lines(&path).into_iter().zip(before) {
+            before["schema_version"] = serde_json::json!(STORE_SCHEMA_VERSION);
+            assert_eq!(after, before, "only the version stamp changes");
+        }
+        let bindings = store.load_resume().expect("load after migration");
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| binding.profile_revision.is_none()),
+            "a migrated binding has no frozen revision"
+        );
     }
 
     #[test]
