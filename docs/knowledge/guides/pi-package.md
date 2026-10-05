@@ -42,6 +42,9 @@ so no catalog is needed.
   descriptor accepts `[1.0.0, 1.1.0)`; any other release, or output that is not
   one `MAJOR.MINOR.PATCH` line, refuses the launch with
   `agent_runtime_unsupported`. `host.inspect` shows `version` and `supported`.
+  The probe runs under the `PATH` the launch will see (the daemon's forwarded
+  environment overridden by the profile's `PATH`), so a profile that selects a
+  Node installation is probed with that Node; every other variable is isolated.
 - Native reference: `strategy = "assigned"`. The daemon generates a UUID, starts
   `pi --session-id <id>` (Pi creates the conversation with that id), resumes with
   `pi --session <id>`, and forks with `pi --fork <id>`. No integration hook is
@@ -51,12 +54,18 @@ so no catalog is needed.
   `$PI_CODING_AGENT_DIR/sessions/` (default `~/.pi/agent/sessions/`). Pi writes
   `sessions/--<cwd with / as ->--/<ISO time with : and . as ->_<id>.jsonl`, and
   only after the first model reply.
-- Detection: Pi frames its editor between two full-width rules; while a turn
-  runs the upper rule reads `── ⠇ Working ──…` with a braille spinner. That is
-  `working`; plain rules mean `idle`. Only these two screens were verified: no
-  blocked signal (extension dialogs, login) and no overlay (model or session
-  selector) was exercised, so no `blocked` rule exists, an overlay may still
-  read as `idle`, and an unrecognized screen keeps the byte-activity fallback. Process matchers accept the kernel name `pi` (Pi retitles its
+- Detection: Pi frames its editor between two full-width rules with the footer
+  below. While Pi is busy, a braille spinner and its message (`Working`,
+  `Compacting context...`, `Auto-compacting...`, `Retrying (n/m) in Ns...`) sit
+  inside the upper rule; any such indicator means `working`, however tall the
+  draft is. `idle` needs a plain upper rule, the editor body, a plain lower rule
+  and only the footer after it; a `↑ N more` / `↓ N more` scroll marker in a rule
+  is allowed. Both rules read the whole visible screen because the editor grows
+  with the draft. The idle, working, compaction, retry and multi-line draft
+  screens in `compat/pi/screens/` were captured from a real Pi; no blocked
+  signal (extension dialogs, login) and no overlay (model or session selector)
+  was exercised, so no `blocked` rule exists and an unrecognized screen keeps
+  the byte-activity fallback. Process matchers accept the kernel name `pi` (Pi retitles its
   process shortly after start) and `node` running
   `…/coding-agent/dist/bundle/cli.js` for the first moments.
 

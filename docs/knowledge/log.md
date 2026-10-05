@@ -1,5 +1,12 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, Pi detection and probe PATH)
+
+- The Pi package guide describes idle detection as positive evidence over the
+  whole screen, lists the busy indicators (`Working`, compaction, retry) and
+  states that the version probe runs under the launch `PATH`, profile override
+  included.
+
 ## Unreleased (2026-10-04, upgrade window and store schema)
 
 - The update runbook states the upgrade window (release N carries N-1 for live

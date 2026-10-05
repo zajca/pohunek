@@ -336,6 +336,97 @@ fn the_manifest_classifies_screens_captured_from_a_real_pi() {
     );
 }
 
+/// Fixture screens captured from a real Pi 1.0.2 and the activity each means.
+///
+/// The `Working` and `Retrying` frames keep the editor rules while a turn runs,
+/// so the multi-line drafts (six lines, and a draft scrolled inside the
+/// editor's height limit) are the frames whose status indicator sits furthest
+/// above the footer.
+const CAPTURED_SCREENS: [(&str, AgentActivity); 10] = [
+    ("idle.txt", AgentActivity::Idle),
+    ("idle_after_turn.txt", AgentActivity::Idle),
+    ("idle_draft6.txt", AgentActivity::Idle),
+    ("idle_draft_scrolled_up.txt", AgentActivity::Idle),
+    ("idle_draft_scrolled_mid.txt", AgentActivity::Idle),
+    ("working.txt", AgentActivity::Working),
+    ("working_draft6.txt", AgentActivity::Working),
+    ("working_draft_scrolled.txt", AgentActivity::Working),
+    ("compaction.txt", AgentActivity::Working),
+    ("retry.txt", AgentActivity::Working),
+];
+
+#[test]
+fn every_captured_screen_is_classified_by_screen_evidence() {
+    let definition = installed_definition();
+    for (screen, expected) in CAPTURED_SCREENS {
+        let started = Instant::now();
+        let mut detector = detector(&definition, started);
+        assert_eq!(
+            detector.feed(started, &screen_bytes(screen)),
+            vec![pohunek_daemon::detect::ActivityTransition {
+                activity: expected,
+                source: StateSource::Screen,
+            }],
+            "{screen}"
+        );
+    }
+}
+
+#[test]
+fn a_status_indicator_outranks_the_editor_rules_in_every_working_screen() {
+    let definition = installed_definition();
+    let started = Instant::now();
+    let mut detector = detector(&definition, started);
+    let mut now = started;
+    // Alternating busy and plain frames: each one moves the activity, so no
+    // frame is shadowed by the previous classification.
+    for (screen, expected) in [
+        ("idle_draft6.txt", AgentActivity::Idle),
+        ("working_draft6.txt", AgentActivity::Working),
+        ("idle_draft6.txt", AgentActivity::Idle),
+        ("compaction.txt", AgentActivity::Working),
+        ("idle.txt", AgentActivity::Idle),
+        ("retry.txt", AgentActivity::Working),
+    ] {
+        now += Duration::from_secs(1);
+        let transitions = detector.feed(now, &screen_bytes(screen));
+        assert_eq!(
+            transitions
+                .last()
+                .map(|transition| (transition.activity, transition.source)),
+            Some((expected, StateSource::Screen)),
+            "{screen}"
+        );
+    }
+}
+
+#[test]
+fn an_editor_screen_without_its_footer_or_a_foreign_rule_pair_is_not_idle() {
+    let definition = installed_definition();
+    let started = Instant::now();
+    let rule = "\u{2500}".repeat(40);
+    for (name, screen) in [
+        // The rules alone, no footer below the lower rule.
+        ("no footer", format!("text\r\n{rule}\r\n\r\n{rule}")),
+        // A rule pair followed by more output than a footer holds.
+        (
+            "output below",
+            format!("{rule}\r\n\r\n{rule}\r\na\r\nb\r\nc\r\nd\r\ne"),
+        ),
+        // A lone rule has no editor frame.
+        ("one rule", format!("text\r\n{rule}\r\nfooter")),
+    ] {
+        let mut detector = detector(&definition, started);
+        let transitions = detector.feed(started, format!("\x1b[2J\x1b[H{screen}").as_bytes());
+        assert!(
+            transitions
+                .iter()
+                .all(|transition| transition.source != StateSource::Screen),
+            "{name}: only the byte-activity fallback may speak: {transitions:?}"
+        );
+    }
+}
+
 #[test]
 fn a_screen_without_pi_chrome_is_never_classified() {
     let definition = installed_definition();

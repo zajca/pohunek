@@ -1,11 +1,20 @@
 # Pi 1.0.2 activity manifest, matched against a real terminal session.
 #
-# Pi paints its editor between two full-width rules. While a turn runs, the
-# upper rule carries a braille spinner and the word "Working"; otherwise both
-# rules are plain. No blocked signal was verified (extension dialogs and login
-# overlays were not exercised), so no blocked state is declared; a screen no
-# rule matches keeps the byte-activity fallback. The idle rule is only verified
-# against the main editor screen, not against overlays such as selectors.
+# Pi paints its editor between two full-width rules, with the footer (working
+# directory and statistics) below. While Pi is busy, its status indicator (a
+# braille spinner and a message: `Working`, `Compacting context...`,
+# `Auto-compacting...`, `Retrying (n/m) in Ns...`) sits inside the upper rule.
+# The editor grows with the draft (up to 30% of the terminal rows, scrolling
+# beyond that) and puts `↑ N more` / `↓ N more` scroll markers into the rules,
+# so both rules are matched over the whole visible screen instead of a fixed
+# number of bottom lines.
+#
+# `idle` needs positive evidence: the lower rule is the last rule, the nearest
+# rule above it is a plain rule (no indicator), and only the footer follows. A
+# frame that carries an indicator never matches it. No blocked signal was
+# verified (extension dialogs and login overlays were not exercised), so no
+# blocked state is declared; a screen no rule matches (overlays, selectors)
+# keeps the byte-activity fallback.
 
 [process]
 # Pi retitles its process to `pi` shortly after start (kernel name and argv),
@@ -20,12 +29,16 @@ cmdline = [
 id = "working_rule"
 state = "working"
 priority = 700
-region = "bottom_non_empty_lines(8)"
-line_regex = ['^─+ [\x{2800}-\x{28FF}] Working\b']
+region = "whole_recent"
+# Any status indicator in the upper rule: a spinner followed by its message.
+line_regex = ['^─+ [\x{2800}-\x{28FF}] \S']
 
 [[rules]]
 id = "idle_editor_rule"
 state = "idle"
 priority = 300
-region = "bottom_non_empty_lines(5)"
-line_regex = ['^─{20,}$']
+region = "whole_recent"
+# Upper rule, editor body (blank or text lines, never a rule), lower rule, then
+# one to four footer lines to the end of the screen. A rule may carry a scroll
+# marker but no spinner.
+regex = ['(?m)^─{3,}(?: [↑↓] \d+ more ─+)?\n(?:(?:[^─\n][^\n]*)?\n)*─{3,}(?: [↑↓] \d+ more ─+)?(?:\n[^\n]+){1,4}\z']
