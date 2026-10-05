@@ -101,9 +101,22 @@ async fn assert_provider_named_launch_process(worker: &Worker) {
     );
 }
 
-/// The bash binary the agent script runs on, resolved from `PATH`.
+/// The bash binary the agent script runs on, resolved once per process.
+///
+/// `PATH` is read under the binary-wide environment lock, so a test that
+/// replaces it concurrently cannot make the lookup fail.
 fn bash_path() -> PathBuf {
-    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+    static BASH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BASH.get_or_init(resolve_bash).clone()
+}
+
+/// Finds `bash` on the `PATH` current under the environment lock.
+fn resolve_bash() -> PathBuf {
+    let path = {
+        let _env = pohunek_test_support::process_env::ProcessEnv::lock();
+        std::env::var_os("PATH").expect("PATH is set")
+    };
+    std::env::split_paths(&path)
         .map(|dir| dir.join("bash"))
         .find(|candidate| candidate.is_file())
         .expect("the fixture agent needs bash on PATH")
@@ -2256,4 +2269,32 @@ async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_at_startup() {
         Some("switched-before-the-crash")
     );
     rig.registry = restarted;
+}
+
+/// How many replacements the PATH regression test races the lookup against.
+const PATH_RACE_ROUNDS: usize = 50;
+
+#[test]
+fn resolving_bash_is_not_broken_by_a_concurrent_path_replacement() {
+    for _ in 0..PATH_RACE_ROUNDS {
+        let (replaced_tx, replaced_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let replacer = std::thread::spawn(move || {
+            let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
+            env.set("PATH", "/nonexistent-path-for-the-test");
+            replaced_tx.send(()).expect("announce the replacement");
+            started_rx.recv().expect("wait for the lookup to start");
+        });
+        replaced_rx.recv().expect("PATH is replaced");
+
+        // The lookup starts while PATH is replaced; it waits for the lock and
+        // sees the restored value.
+        let lookup = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce the lookup");
+            resolve_bash()
+        });
+        replacer.join().expect("replacer thread");
+
+        assert!(lookup.join().expect("lookup thread").is_file());
+    }
 }

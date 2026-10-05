@@ -1417,6 +1417,10 @@ impl SessionRegistry {
     /// ([`Self::stop_cleanup_confirmed`]) decides nothing; the session stays
     /// pending and the re-check sweeps again. Returns whether the session
     /// needs that re-check.
+    ///
+    /// The caller imported the generation journal's native reference into
+    /// `record` before classifying the unreachable worker, so the stop keeps
+    /// a switch the dead worker journaled.
     async fn settle_ended_stop(
         &self,
         mut record: SessionRecord,
@@ -1432,9 +1436,6 @@ impl SessionRegistry {
             return true;
         }
         let id = SessionId(record.session_id.clone());
-        if let Some(snapshot) = self.generation_journal_snapshot(&record).await {
-            import_native_reference(&mut record, &snapshot);
-        }
         record.transaction = None;
         record.info.state = SessionState::Stopped;
         record.info.state_source = StateSource::Process;
@@ -14227,6 +14228,106 @@ handler = "codex-hook-v1"
                     .await
                     .expect("a further stop is idempotent")
                     .stopped
+            );
+        }
+
+        /// A stop interrupted after its job was retired keeps the conversation
+        /// its dead worker journaled: the startup replay reads that journal.
+        #[tokio::test]
+        async fn a_stop_replayed_at_startup_keeps_the_switch_the_dead_worker_journaled() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let session = "s-5241";
+            interrupted_stop(&fixture, session).await;
+            let mut record = durable_record(&fixture.root, session);
+            let instance = record
+                .runtime
+                .worker_instance_id
+                .clone()
+                .expect("the record names its worker instance");
+            record.info.native_session_id = Some("assigned-ref".to_owned());
+            let binding = record.recovery.as_mut().expect("recovery binding");
+            binding.native_session_id = Some("assigned-ref".to_owned());
+            binding.native_reference_provenance = crate::agent::NativeReferenceProvenance::Assigned;
+            binding.native_launch = Some(
+                crate::agent::NativeSessionLaunch::from_templates(
+                    crate::agent::SessionRefKind::Id,
+                    &["--session", "{reference}"],
+                    None,
+                )
+                .expect("resume template")
+                .with_assigned(crate::agent::AssignedReference::new(
+                    crate::agent::NativeArgs::from_template(&["--session-id", "{reference}"])
+                        .expect("launch template"),
+                    crate::agent::ReferenceExistence::Unchecked,
+                ))
+                .expect("an id spec accepts an assignment"),
+            );
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the assigned record");
+            let existing: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    fixture
+                        .root
+                        .join("state/workers")
+                        .join(session)
+                        .join(format!("worker-{session}.json")),
+                )
+                .expect("read the worker journal"),
+            )
+            .expect("decode the worker journal");
+            let worker = (
+                u32::try_from(existing["worker_pid"].as_u64().expect("worker pid"))
+                    .expect("pid fits"),
+                existing["worker_start_identity"]
+                    .as_str()
+                    .expect("worker start identity")
+                    .parse::<u64>()
+                    .expect("start identity number"),
+            );
+            let provider = crate::session::agent_kind_label(&record.info.agent_base).to_owned();
+            let process = pohunek_session_worker::ChildIdentity {
+                pid: 50,
+                process_group: 50,
+                start_identity: "500".to_owned(),
+            };
+            write_journal_record(
+                &fixture.root,
+                session,
+                &format!("worker-{session}"),
+                TEST_GENERATION,
+                worker,
+                Some(&instance),
+                |journal| {
+                    journal.child = Some(process.clone());
+                    journal.launch_identity = Some(pohunek_session_worker::LaunchIdentity {
+                        provider: provider.clone(),
+                        process: process.clone(),
+                        reference_kind: "id".to_owned(),
+                        native_reference: "assigned-ref".to_owned(),
+                    });
+                    journal.native_reference_claim =
+                        Some(pohunek_session_worker::NativeReferenceClaim {
+                            provider: provider.clone(),
+                            process,
+                            sequence: 7,
+                            reference_kind: "id".to_owned(),
+                            native_reference: "switched-before-the-stop".to_owned(),
+                        });
+                },
+            );
+            // The restart starts from an empty registry.
+            fixture.registry.inner.sessions.lock().await.clear();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile after the restart");
+
+            assert_stopped(&fixture, session).await;
+            let durable = durable_record(&fixture.root, session);
+            assert_eq!(
+                durable.info.native_session_id.as_deref(),
+                Some("switched-before-the-stop")
             );
         }
 
