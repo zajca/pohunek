@@ -1,5 +1,13 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, preflight hook schema)
+
+- The upgrade preflight resolves the hook schema of a worker whose journal
+  carries none from the runtime definitions (built-in runtimes and the package
+  store, read-only), so a live agent session that reported its active identity
+  is adoptable. `worker_identity_unverified` remains only for a runtime whose
+  definition cannot be read.
+
 ## Unreleased (2026-10-05, config homes)
 
 - A runtime descriptor may declare its config home in `[config_home]` (a

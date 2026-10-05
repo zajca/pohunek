@@ -175,6 +175,7 @@ impl AdoptionPreflight for InProcessPreflight {
             let inputs = PreflightInputs {
                 store_path: paths.data_dir.join(pohunek_paths::METADATA_STORE_NAME),
                 worker_state_root: paths.worker_state_root(),
+                plugins_dir: paths.plugins_dir(),
             };
             Ok(pohunek_daemon::session::upgrade_preflight::run(
                 &inputs,

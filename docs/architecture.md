@@ -648,8 +648,12 @@ daemon holds each worker's single controller slot; the identity claims, subagent
 state and protocol range a socket would give are judged from what the journal
 recorded, through the same functions adoption uses (process-tree ancestry of the
 launch and active identity processes included; an unreadable process table
-fails closed). The remaining blind spots are the supervisor job's identity and
-socket failures at connect time. A binding that needs the
+fails closed). A worker that journals no hook schema is validated with the
+schema its runtime declares, resolved by the function adoption uses from the
+built-in definitions and the package store opened read-only (nothing is
+created); only an unreadable runtime definition leaves it unavailable
+(`worker_identity_unverified`). The remaining blind spots are the supervisor
+job's identity and socket failures at connect time. A binding that needs the
 runtime registry to complete its launch spec is reported as
 `native_recovery_unverified`. A live worker journal without a store record is
 listed as an unmanaged worker and does not refuse the upgrade, unless a store

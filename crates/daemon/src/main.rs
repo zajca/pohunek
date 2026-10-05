@@ -186,6 +186,7 @@ fn print_upgrade_preflight() -> ExitCode {
             let inputs = PreflightInputs {
                 store_path: paths.data_dir.join(STORE_NAME),
                 worker_state_root: paths.state_dir.join(WORKERS_SUBDIR),
+                plugins_dir: paths.plugins_dir(),
             };
             let inspector = pohunek_daemon::procwatch::HostInspector::new();
             serde_json::to_string_pretty(&upgrade_preflight::run(&inputs, &inspector))

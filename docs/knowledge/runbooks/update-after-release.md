@@ -425,8 +425,13 @@ closed with `identity_process_inspection_failed`). A record with a pending stop,
 removal or undelivered create is reported too (`stop_or_removal_intent_pending`,
 `create_rolled_back`), because startup finishes those instead of adopting. The
 real blind spots are what only a service manager or the live socket can show:
-the supervisor job's identity, a hook schema only the runtime registry can
-supply (`worker_identity_unverified`), and socket failures at connect time. The previous daemon has no facility that pauses
+the supervisor job's identity and socket failures at connect time. A worker
+that journals no hook schema (a previous-release worker) is validated with the
+schema its runtime declares, read without side effects from the built-in
+runtime definitions and the installed package store; a live agent session that
+reported its active identity is therefore adoptable. Only a runtime whose
+definition cannot be read leaves the schema unavailable
+(`worker_identity_unverified`). The previous daemon has no facility that pauses
 session creation, so the upgrade runs the preflight twice: once before any
 effect, and again after staging, immediately before the daemon is replaced. A
 session created in between is caught by the second run; the window that remains

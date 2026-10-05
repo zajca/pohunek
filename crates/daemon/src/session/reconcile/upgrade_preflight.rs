@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pohunek_service_config::preflight::{
     PreflightReport, SessionVerdict, StoreReport, StoreState, Verdict, CODE_ADOPTABLE,
@@ -39,8 +39,10 @@ use super::{
     scan_worker_journals, validate_identity_claims, IdentityClaims, JournalEvidence, JournalPhase,
     JournalReject, WorkerJournalScan,
 };
+use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::IDENTITY_MISMATCH;
+use crate::session::{runtime_hook_schema, HookSchemaLookup};
 use crate::session::{DesiredState, Generation, SessionRecord};
 use crate::store::{
     may_hold_session, DryRun, DryRunState, RecoveryOutcome, ResumeBinding, Store,
@@ -55,6 +57,9 @@ pub struct PreflightInputs {
     pub store_path: PathBuf,
     /// The durable worker journal root.
     pub worker_state_root: PathBuf,
+    /// The runtime package store, read when a session needs a hook schema its
+    /// journal does not carry; it is never created or changed.
+    pub plugins_dir: PathBuf,
 }
 
 /// Machine code of a store written by a newer daemon.
@@ -75,10 +80,12 @@ const STORE_UNREADABLE: &str = "store_unreadable";
 pub fn run(inputs: &PreflightInputs, inspector: &dyn ProcessInspector) -> PreflightReport {
     let journals = scan_worker_journals(&inputs.worker_state_root)
         .map_err(|error| format!("the worker journal root cannot be read: {error}"));
+    let runtimes = read_only_runtimes(&inputs.plugins_dir);
     let dry = Store::new(inputs.store_path.clone()).dry_run_migration();
     let (store, sessions, unmanaged_workers) = match dry {
         Ok(dry) => {
-            let (sessions, unmanaged) = judge_sessions(&dry, journals.as_ref(), inspector);
+            let (sessions, unmanaged) =
+                judge_sessions(&dry, journals.as_ref(), inspector, &runtimes);
             (store_report(inputs, &dry), sessions, unmanaged)
         }
         Err(error) => {
@@ -110,6 +117,22 @@ pub fn run(inputs: &PreflightInputs, inspector: &dyn ProcessInspector) -> Prefli
         sessions,
         unmanaged_workers,
     }
+}
+
+/// The runtime definitions the preflight reads: the built-in runtimes, plus the
+/// installed packages when the package store exists and can be read. Nothing is
+/// created, and a store that cannot be read leaves only the built-in runtimes,
+/// so a package runtime then resolves to no schema.
+fn read_only_runtimes(plugins_dir: &Path) -> RuntimeHost {
+    if let Ok(Some(store)) = PackageStore::open_existing(plugins_dir) {
+        if let Ok(host) = RuntimeHost::with_packages(
+            BuiltinSource::from_host_environment(),
+            PackageSource::new(store),
+        ) {
+            return host;
+        }
+    }
+    RuntimeHost::from_host_environment()
 }
 
 fn store_report(inputs: &PreflightInputs, dry: &DryRun) -> StoreReport {
@@ -160,6 +183,7 @@ fn judge_sessions(
     dry: &DryRun,
     journals: Result<&HashMap<String, WorkerJournalScan>, &String>,
     inspector: &dyn ProcessInspector,
+    runtimes: &RuntimeHost,
 ) -> (Vec<SessionVerdict>, Vec<String>) {
     let bindings: HashMap<&str, &ResumeBinding> = dry
         .resume
@@ -198,7 +222,7 @@ fn judge_sessions(
             resume_unreadable: anonymous_resume
                 || unreadable_resume.contains(record.session_id.as_str()),
         };
-        let (verdict, code, detail) = judge(record, &facts, scan, inspector);
+        let (verdict, code, detail) = judge(record, &facts, scan, inspector, runtimes);
         verdicts.insert(
             record.session_id.clone(),
             SessionVerdict {
@@ -411,6 +435,7 @@ fn judge(
     facts: &Facts<'_>,
     scan: Result<Option<&WorkerJournalScan>, &str>,
     inspector: &dyn ProcessInspector,
+    runtimes: &RuntimeHost,
 ) -> Judgement {
     // Startup rolls back a create whose initial input a previous daemon never
     // delivered; no new daemon instance can own that marker.
@@ -506,7 +531,7 @@ fn judge(
     if let Some(judgement) = judge_protocol(journal) {
         return judgement;
     }
-    if let Some(judgement) = judge_identity(journal, &mut candidate, inspector) {
+    if let Some(judgement) = judge_identity(journal, &mut candidate, inspector, runtimes) {
         return judgement;
     }
     judge_recovery(facts, &candidate)
@@ -604,8 +629,9 @@ fn judge_identity(
     journal: &JournalEvidence,
     candidate: &mut SessionRecord,
     inspector: &dyn ProcessInspector,
+    runtimes: &RuntimeHost,
 ) -> Option<Judgement> {
-    let snapshot = match journal.snapshot() {
+    let mut snapshot = match journal.snapshot() {
         Ok(snapshot) => snapshot,
         Err(reason) => {
             return Some(not_adopted(
@@ -625,16 +651,27 @@ fn judge_identity(
             ));
         }
     }
-    // Adoption completes a missing hook schema from the runtime registry,
-    // which the preflight cannot build.
+    // A worker that journals no schema is validated with the schema its
+    // runtime declares, as adoption does.
     if snapshot.hook_schema.is_none()
         && (snapshot.active_identity.is_some() || snapshot.active_identity_release.is_some())
     {
-        return Some(not_adopted(
-            CODE_IDENTITY_UNVERIFIED,
-            "the worker journaled an active identity without the hook schema that validates \
-             it, which only the runtime registry can supply",
-        ));
+        let pin = candidate
+            .recovery
+            .as_ref()
+            .map(|binding| binding.launch_binding.clone())
+            .unwrap_or_default();
+        match runtime_hook_schema(runtimes, &candidate.info.agent_base, &pin) {
+            HookSchemaLookup::Schema(schema) => snapshot.hook_schema = Some(schema.id.to_owned()),
+            HookSchemaLookup::NoIntegration => {}
+            HookSchemaLookup::Unresolved(_) => {
+                return Some(not_adopted(
+                    CODE_IDENTITY_UNVERIFIED,
+                    "the worker journaled an active identity without a hook schema, and the \
+                     definition of its runtime cannot be read to supply one",
+                ));
+            }
+        }
     }
     if let Err(reason) = import_worker_identities(candidate, &snapshot) {
         return Some(not_adopted(

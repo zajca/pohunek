@@ -146,6 +146,17 @@ impl PackageStore {
         package::registry::Registry::open_at(plugins_dir, Limits::DEFAULT).map(Self::new)
     }
 
+    /// Opens the plugin root at `plugins_dir` only if it exists, creating
+    /// nothing; `None` is a host that never installed a package.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry error when an existing directory is unsafe.
+    pub fn open_existing(plugins_dir: &Path) -> Result<Option<Self>, RegistryError> {
+        package::registry::Registry::open_existing_at(plugins_dir, Limits::DEFAULT)
+            .map(|registry| registry.map(Self::new))
+    }
+
     /// Wraps an opened registry.
     #[must_use]
     pub fn new(registry: package::registry::Registry) -> Self {
