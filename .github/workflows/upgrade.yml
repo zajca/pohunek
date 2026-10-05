@@ -1,0 +1,154 @@
+name: Upgrade test
+
+# A session started on the previous release's published binaries must survive
+# `pohunek service upgrade` to this build (issue #525). The job installs the
+# previous release from its GitHub Release assets (checksum verified, never
+# rebuilt), starts a session with a fake agent that runs the managed hooks,
+# upgrades through the operator path, and asserts the session stays live, its
+# screen, input, hooks and notifications work, stop/resume relaunch with the
+# native reference, and the previous release's own CLI still talks to the new
+# daemon. scripts/upgrade-test does the work; crates/cli/tests/release_upgrade.rs
+# holds the assertions.
+#
+# Callers:
+# - ci.yml runs it on pull requests that touch the daemon, worker, protocol or
+#   CLI crates, and on push to main, the weekly schedule and manual CI runs;
+# - release.yml runs it on a release tag, before any binary is built for
+#   publishing, with the tagged commit as the target and the newest earlier
+#   release as the previous one;
+# - `gh workflow run upgrade.yml -f previous_tag=v0.33.0 -f head_ref=v0.33.1`
+#   runs it on any pair. The harness (script and test) always comes from the
+#   ref the workflow is dispatched on; `head_ref` selects only the source built
+#   as the upgrade target, so an older tree without the harness can be tested.
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_tag:
+        description: Release tag to install first (vX.Y.Z), or `latest` for the newest published release
+        type: string
+        default: latest
+      head_ref:
+        description: Branch, tag or commit built as the upgrade target; empty means the ref this run was started on
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      previous_tag:
+        description: Release tag to install first (vX.Y.Z), or `latest` for the newest published release
+        type: string
+        default: latest
+      head_ref:
+        description: Branch, tag or commit built as the upgrade target; empty means the caller's ref
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Pinned mold release; the same pin as ci.yml (MOLD_SHA256 is the sha256
+  # GitHub publishes for mold-2.42.1-x86_64-linux.tar.gz). Bump both together.
+  MOLD_VERSION: "2.42.1"
+  MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
+
+jobs:
+  upgrade:
+    name: upgrade from the previous release
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+      GH_TOKEN: ${{ github.token }}
+      PREVIOUS_TAG: ${{ inputs.previous_tag }}
+      HEAD_REF: ${{ inputs.head_ref }}
+    steps:
+      # The harness: scripts/upgrade-test and the release_upgrade test.
+      - uses: actions/checkout@v4
+
+      # The upgrade target, when it is not the harness's own tree.
+      - name: Check out the upgrade target
+        if: ${{ inputs.head_ref != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.head_ref }}
+          path: head-src
+
+      - name: Install mold linker
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The same compile cache as the other debug jobs; this job only
+          # restores it.
+          shared-key: bins
+          save-if: false
+
+      # The previous tag is resolved here, not inside the script, so the
+      # archive cache can be keyed by it. When the target is a release tag
+      # (a tag push, or a tag named by head_ref), that tag is never the
+      # previous release.
+      - name: Resolve the previous release
+        id: previous
+        run: |
+          set -euo pipefail
+          exclude=""
+          if [[ "$HEAD_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            exclude="$HEAD_REF"
+          elif [ -z "$HEAD_REF" ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            exclude="$GITHUB_REF_NAME"
+          fi
+          tag=$(scripts/upgrade-test --previous "$PREVIOUS_TAG" --repo "$GITHUB_REPOSITORY" \
+            --exclude-tag "$exclude" --resolve-only)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Previous release: $tag (target: ${HEAD_REF:-$GITHUB_REF})"
+
+      # The script verifies the archive against the checksum published with the
+      # release on every run, so the cache is never trusted.
+      - name: Cache the previous release archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/upgrade-archives
+          key: upgrade-archives-${{ steps.previous.outputs.tag }}
+
+      # The hosted runner is disposable, so the test runs as the runner user
+      # against its own systemd user manager, like `systemd-supervision`
+      # (scripts/upgrade-test --current-user refuses to run anywhere else).
+      - name: Require a running systemd user manager
+        run: |
+          systemctl --version | head -n 1
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=${XDG_RUNTIME_DIR}/bus" >> "$GITHUB_ENV"
+          systemctl --user is-system-running --wait || systemctl --user is-system-running | grep -qx degraded
+
+      - name: Upgrade test
+        run: |
+          set -euo pipefail
+          head_dir="."
+          if [ -n "$HEAD_REF" ]; then head_dir="head-src"; fi
+          scripts/upgrade-test \
+            --previous "${{ steps.previous.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --head-dir "$head_dir" \
+            --cache-dir "$RUNNER_TEMP/upgrade-archives" \
+            --artifacts-dir "$RUNNER_TEMP/upgrade-goldens" \
+            --current-user
+
+      # The previous release's store and protocol goldens, for the
+      # fixture-based tests, kept even when the upgrade fails.
+      - name: Upload the previous release's goldens
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-goldens-${{ steps.previous.outputs.tag }}
+          path: ${{ runner.temp }}/upgrade-goldens
+          if-no-files-found: warn

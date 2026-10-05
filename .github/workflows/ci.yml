@@ -589,6 +589,7 @@ jobs:
       pi_package: ${{ steps.filter.outputs.pi_package }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
+      upgrade: ${{ steps.filter.outputs.upgrade }}
     steps:
       # Push events (after merge to main) resolve the filter with git commands
       # against the previous commit, which needs more than a depth-1 checkout.
@@ -807,6 +808,30 @@ jobs:
               - '.github/workflows/release.yml'
               - 'scripts/release'
               - 'packaging/**'
+            # Upgrade from the previous release's published binaries to this
+            # build with a live session (issue #525): the crates that decide
+            # whether a live session survives (public protocol, worker
+            # protocol, daemon, worker, CLI service engine) and the crates
+            # they link that carry state or paths, the installer wrapper, and
+            # the harness itself.
+            upgrade:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.cargo/**'
+              - 'crates/protocol/**'
+              - 'crates/daemon/**'
+              - 'crates/session-worker/**'
+              - 'crates/worker-protocol/**'
+              - 'crates/cli/**'
+              - 'crates/client/**'
+              - 'crates/platform/**'
+              - 'crates/paths/**'
+              - 'crates/service-config/**'
+              - 'crates/terminal/**'
+              - 'scripts/upgrade-test'
+              - 'packaging/install-daemon.sh'
+              - '.github/workflows/upgrade.yml'
+              - '.github/workflows/ci.yml'
 
   integration:
     name: tests (heavy, PTY + Hermes)
@@ -933,6 +958,19 @@ jobs:
       - name: pohunek service upgrade with live workers
         if: ${{ !cancelled() }}
         run: cargo test --locked -p pohunek-cli --test service_upgrade -- --ignored --test-threads 1
+
+  # Issue #525: a session started on the previous release survives
+  # `pohunek service upgrade` to this build. The job is the reusable
+  # upgrade.yml, which downloads the previous release's published binaries and
+  # runs scripts/upgrade-test; it is skipped, not failed, when no relevant path
+  # changed.
+  upgrade-test:
+    name: upgrade from the previous release
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.upgrade == 'true' }}
+    uses: ./.github/workflows/upgrade.yml
+    permissions:
+      contents: read
 
   # Relay heavy tests are the only PostgreSQL fixture consumers, so they get
   # their own job whose Postgres service only starts when relay-relevant files

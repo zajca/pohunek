@@ -24,6 +24,13 @@
   `pohunek integration` gains `--profile` and `--all-profiles`. The agent
   profiles page starts the subscription-switching guide, the public API, CLI,
   runtime packages and secrets pages describe the surface.
+## Unreleased (2026-10-05, upgrade test)
+
+- CI upgrades a session started on the previous release's published binaries
+  to the current build through `pohunek service check` and `service upgrade`
+  and asserts the session survives (`scripts/upgrade-test`, the `upgrade`
+  workflow, and `release.yml` before any publishable binary is built). The
+  update-after-release runbook and the source map describe it.
 
 ## Unreleased (2026-10-05, frozen profile revision)
 

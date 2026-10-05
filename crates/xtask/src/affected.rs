@@ -201,9 +201,9 @@ const RULES: &[Rule] = &[
     ),
     reminding(
         Pattern::Dir("crates/protocol/tests/fixtures/compat"),
-        Effect::Packages(&["pohunek-protocol", "pohunek-client"]),
+        Effect::Packages(&["pohunek-protocol", "pohunek-client", "pohunek-cli"]),
         &[Reminder::SdkGates],
-        "previous-release recordings read by pohunek-protocol's adapter tests, replayed by pohunek-client's previous_daemon test and by the SDK's compat tests",
+        "previous-release recordings read by pohunek-protocol's adapter tests, replayed by pohunek-client's previous_daemon test and by the SDK's compat tests, and embedded by pohunek-cli's release_upgrade test",
     ),
     rule(
         Pattern::Dir("compat/codex"),

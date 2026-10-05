@@ -1,0 +1,12 @@
+{
+  "cli_version": "0.33.1",
+  "protocol": {
+    "minimum": 4,
+    "maximum": 4
+  },
+  "err": {
+    "class": "runtime",
+    "code": "session_not_found",
+    "msg": "session not found: s-nonexistent"
+  }
+}

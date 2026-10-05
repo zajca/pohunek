@@ -1,0 +1,57 @@
+{
+  "cli_version": "0.33.1",
+  "protocol": {
+    "minimum": 4,
+    "maximum": 4
+  },
+  "ok": {
+    "notifications": [
+      {
+        "id": "n-3490381-1791204486888600163-2",
+        "source": {
+          "provider": "claude",
+          "provider_event": "StopFailure",
+          "host_local_source_id": "hook:claude:StopFailure:evt-x"
+        },
+        "kind": "error",
+        "severity": "error",
+        "status": "unread",
+        "title": "Claude stop hook failed",
+        "body": "Claude reported a stop hook failure.",
+        "metadata": {
+          "hook_event_id": "evt-x",
+          "provider": "claude",
+          "provider_event": "StopFailure"
+        },
+        "created_at": "2026-10-05T12:48:06.888522983Z",
+        "session_id": "s-01M461PFSW07YW454C210Q5DED",
+        "agent_kind": "claude",
+        "source_id": "hook:claude:StopFailure:evt-x"
+      },
+      {
+        "id": "n-3490381-1791204475035898337-1",
+        "source": {
+          "provider": "claude",
+          "provider_event": "Notification.permission_prompt",
+          "host_local_source_id": "hook:claude:Notification.permission_prompt:evt-before-upgrade"
+        },
+        "kind": "approval_required",
+        "severity": "action_required",
+        "status": "unread",
+        "title": "Claude approval required",
+        "body": "Claude is waiting for approval.",
+        "metadata": {
+          "hook_event_id": "evt-before-upgrade",
+          "matcher": "permission_prompt",
+          "provider": "claude",
+          "provider_event": "Notification.permission_prompt"
+        },
+        "created_at": "2026-10-05T12:47:55.035806397Z",
+        "session_id": "s-01M461PFSW07YW454C210Q5DED",
+        "agent_kind": "claude",
+        "source_id": "hook:claude:Notification.permission_prompt:evt-before-upgrade",
+        "dedupe_key": "attention:s-01M461PFSW07YW454C210Q5DED"
+      }
+    ]
+  }
+}

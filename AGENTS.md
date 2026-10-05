@@ -223,7 +223,43 @@ before pushing. The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `real systemd supervision` runs all three with `--ignored --test-threads 1`
 after building the daemon, worker, and CLI binaries. Run them locally the same
 way (`POHUNEK_DAEMON_BIN`, `POHUNEK_WORKER_BIN`, and `POHUNEK_CLI_BIN` point the
-suites at the built binaries). The `macOS package install and upgrade
+suites at the built binaries). The `upgrade from the previous release` CI job (`.github/workflows/upgrade.yml`,
+called by `ci.yml` when the daemon, worker, protocol, or CLI crates change, and
+by `release.yml` before any publishable binary is built) installs the previous
+release's published Linux binaries (checksum verified, never rebuilt), starts a
+session with a fake agent running that release's managed hooks, upgrades the
+service to this build with `pohunek service check` and `service upgrade`, and
+asserts the session stays live on the same worker, `screen`, `input`, hooks and
+notifications work, `stop` then `resume` relaunch with the native reference, and
+the previous release's CLI still talks to the new daemon
+(`crates/cli/tests/release_upgrade.rs`). It uploads the previous release's store
+and protocol outputs as the `upgrade-goldens-<tag>` artifact. Run it on any pair
+with `gh workflow run upgrade.yml -f previous_tag=v0.33.0 -f head_ref=v0.33.1`
+(the harness comes from the dispatched ref; `head_ref` is only the source built
+as the target). Run it locally on a Linux x86_64 host with systemd, passwordless
+sudo, `gh`, and `jq`:
+
+```bash
+scripts/upgrade-test --previous latest --repo zajca/pohunek --head-dir . \
+  --cache-dir ~/.cache/pohunek-upgrade --artifacts-dir /var/tmp/pohunek-upgrade-out \
+  --create-account
+```
+
+CI runs it with `--current-user` instead, as the runner user against the
+runner's own user manager; that mode refuses to run unless `CI=true` and
+`GITHUB_ACTIONS=true`. On failure the script leaves the unit status, journals,
+`service.toml`, the transaction journal, and every CLI call's output under the
+artifacts directory (`diagnostics/`, and `test-output/calls/`).
+
+Released binaries use the default `$HOME` layout and the user's systemd manager,
+so the script never touches your own installation: it creates a throwaway local
+account (`--create-account` is the explicit consent), starts that account's user
+manager, runs the test there with a minimal environment, and deletes the account
+and its home afterwards. When the target has the previous release's version the
+script builds it with a `+upgrade.<commit>` version suffix (`Cargo.toml` and
+`Cargo.lock` are restored). Never run the `release_upgrade` test directly in
+your own account.
+The `macOS package install and upgrade
 (arm64)` CI job builds the daemon archive twice with `packaging/macos/build-release`
 and `packaging/macos/package --development` (the archives must be
 byte-identical and pass `packaging/macos/audit-macho`), then installs,
