@@ -33,7 +33,8 @@
 #                     GITHUB_ACTIONS=true, because a hosted runner is
 #                     disposable and a developer's machine is not. The service,
 #                     state and config the test leaves are removed on exit.
-#   --exclude-tag     With `latest`, skip this tag (the release under test when
+#   --exclude-tag     With `latest`, select the greatest published release below
+#                     this tag instead of the newest one (the release under test when
 #                     the script runs from its own release tag).
 #   --keep-account    Leave the account and the staging directory for inspection.
 #   --resolve-only    Print the resolved previous tag on stdout and exit; no other
@@ -127,14 +128,42 @@ backup_manifests() {
 }
 
 # Puts the originals back, and only when a complete backup exists and the
-# originals were actually modified.
+# originals were actually modified. The flag and the backup are cleared only
+# after both copies succeeded; otherwise the backup stays and its location is
+# reported.
 restore_manifests() {
-  if [ -n "$manifest_backup" ] && [ "$manifest_modified" = 1 ]; then
-    cp "$manifest_backup/Cargo.toml" "$head_dir/Cargo.toml" &&
-      cp "$manifest_backup/Cargo.lock" "$head_dir/Cargo.lock" || info "could not restore Cargo.toml and Cargo.lock; backup kept in $manifest_backup"
+  [ -n "$manifest_backup" ] || return 0
+  if [ "$manifest_modified" = 1 ]; then
+    if ! { cp "$manifest_backup/Cargo.toml" "$head_dir/Cargo.toml" &&
+      cp "$manifest_backup/Cargo.lock" "$head_dir/Cargo.lock"; }; then
+      info "could not restore Cargo.toml and Cargo.lock; the originals are kept in $manifest_backup"
+      return 1
+    fi
     manifest_modified=0
   fi
-  [ "$manifest_modified" = 1 ] || { [ -z "$manifest_backup" ] || rm -rf "$manifest_backup"; manifest_backup=""; }
+  rm -rf "$manifest_backup"
+  manifest_backup=""
+}
+
+# Reads vX.Y.Z tags on stdin and prints the greatest one strictly below $1
+# (version order, not list order); prints nothing when there is none.
+greatest_below() {
+  local target=$1 tag best=""
+  while IFS= read -r tag; do
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    [ "$tag" != "$target" ] || continue
+    [ "$(printf '%s\n%s\n' "$tag" "$target" | sort -V | head -n 1)" = "$tag" ] || continue
+    if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$best" "$tag" | sort -V | tail -n 1)" = "$tag" ]; then
+      best=$tag
+    fi
+  done
+  printf '%s' "$best"
+}
+
+# Published, non-draft, non-prerelease tags of $repo, one per line.
+list_release_tags() {
+  gh release list --repo "$repo" --exclude-drafts --exclude-pre-releases \
+    --limit 100 --json tagName --jq '.[].tagName'
 }
 
 # Whether the account database already knows $1.
@@ -318,11 +347,13 @@ need_cmd gh
 # ---------------------------------------------------------------- previous
 
 if [ "$previous" = latest ]; then
-  previous=$(gh release view --repo "$repo" --json tagName --jq .tagName)
-  if [ -n "$exclude_tag" ] && [ "$previous" = "$exclude_tag" ]; then
-    previous=$(gh release list --repo "$repo" --exclude-drafts --exclude-pre-releases \
-      --limit 20 --json tagName --jq '.[].tagName' | grep -vxF "$exclude_tag" | head -n 1 || true)
-    [ -n "$previous" ] || fail "no published release other than $exclude_tag"
+  if [ -n "$exclude_tag" ]; then
+    # The target is a release tag: the previous release is the greatest
+    # published version below it, however many newer releases exist.
+    previous=$(list_release_tags | greatest_below "$exclude_tag")
+    [ -n "$previous" ] || fail "no published release below $exclude_tag"
+  else
+    previous=$(gh release view --repo "$repo" --json tagName --jq .tagName)
   fi
 fi
 [[ "$previous" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "previous release tag is not vX.Y.Z: $previous"

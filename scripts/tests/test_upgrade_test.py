@@ -129,6 +129,72 @@ echo "backup=[$manifest_backup]"
         self.assertEqual((head / "Cargo.toml").read_text(), "original-toml")
         self.assertEqual((head / "Cargo.lock").read_text(), "original-lock")
 
+    def test_a_failed_restore_copy_keeps_the_backup(self) -> None:
+        for failing in ("Cargo.toml", "Cargo.lock"):
+            with self.subTest(failing=failing):
+                head = Path(self.tmp.name) / f"head-{failing}"
+                backup = Path(self.tmp.name) / f"backup-{failing}"
+                head.mkdir()
+                backup.mkdir()
+                for name in ("Cargo.toml", "Cargo.lock"):
+                    (head / name).write_text("stamped")
+                    (backup / name).write_text("original")
+                body = f"""
+head_dir="{head}"
+manifest_backup="{backup}"
+manifest_modified=1
+cp() {{ case "$2" in */{failing}) return 1 ;; *) command cp "$@" ;; esac; }}
+restore_manifests && echo unexpected-success
+echo "modified=$manifest_modified backup=[$manifest_backup]"
+"""
+                result = run_sourced(body, self.log, self.home)
+                self.assertNotIn("unexpected-success", result.stdout)
+                self.assertIn(f"modified=1 backup=[{backup}]", result.stdout)
+                self.assertIn(str(backup), result.stderr)
+                self.assertTrue((backup / "Cargo.toml").exists())
+                self.assertTrue((backup / "Cargo.lock").exists())
+
+    def select(self, target: str, tags: list[str]) -> str:
+        listing = "\n".join(tags)
+        body = f'printf "%s\\n" "$(printf "{listing}\\n" | greatest_below {target})"'
+        return run_sourced(body, self.log, self.home).stdout.strip()
+
+    def test_a_tagged_target_selects_the_greatest_version_below_it(self) -> None:
+        tags = ["v0.34.0", "v0.33.1", "v0.33.0", "v0.32.3", "v0.9.0", "v0.10.0"]
+        self.assertEqual(self.select("v0.33.1", tags), "v0.33.0")
+        self.assertEqual(self.select("v0.34.0", tags), "v0.33.1")
+        self.assertEqual(self.select("v0.10.0", tags), "v0.9.0")
+        self.assertEqual(self.select("v0.9.0", tags), "")
+        self.assertEqual(self.select("v0.33.2", tags), "v0.33.1")
+
+    def test_an_untagged_target_keeps_latest_selection(self) -> None:
+        # With no --exclude-tag the script asks `gh release view` for the latest.
+        fake = Path(self.tmp.name) / "bin"
+        fake.mkdir()
+        gh = fake / "gh"
+        gh.write_text('#!/bin/sh\necho v0.34.0\n')
+        gh.chmod(0o755)
+        result = subprocess.run(
+            [str(SCRIPT), "--previous", "latest", "--repo", "o/r", "--resolve-only"],
+            capture_output=True, text=True, check=False,
+            env={"PATH": f"{fake}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(result.stdout.strip(), "v0.34.0")
+
+    def test_a_tagged_target_resolves_through_the_release_list(self) -> None:
+        fake = Path(self.tmp.name) / "bin2"
+        fake.mkdir()
+        gh = fake / "gh"
+        gh.write_text('#!/bin/sh\nprintf "v0.34.0\\nv0.33.1\\nv0.33.0\\n"\n')
+        gh.chmod(0o755)
+        result = subprocess.run(
+            [str(SCRIPT), "--previous", "latest", "--repo", "o/r",
+             "--exclude-tag", "v0.33.1", "--resolve-only"],
+            capture_output=True, text=True, check=False,
+            env={"PATH": f"{fake}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(result.stdout.strip(), "v0.33.0")
+
     def run_script(self, *args: str, **env: str) -> subprocess.CompletedProcess:
         environment = {"PATH": os.environ["PATH"], **env}
         return subprocess.run(
