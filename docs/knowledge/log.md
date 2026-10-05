@@ -33,6 +33,13 @@
   backup, and the recovery from a newer-schema refusal. The daemon debug
   runbook points at it, and the source map lists the schema and shape-guard
   sources.
+## Unreleased (2026-10-04, conflict watch and stop exit)
+
+- Documented the WARN logged for every `conflict`, `lost`, `reconnecting`, or
+  `incompatible` classification, the background re-check of a `conflict` and
+  what ends it, adoption of a live worker after an upgrade (a binding without a
+  launch spec does not block it), and `session stop` of a `conflict` with its
+  journal and job proof and error codes.
 
 ## Unreleased (2026-10-04, public protocol window)
 

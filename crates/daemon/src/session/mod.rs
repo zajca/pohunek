@@ -63,6 +63,7 @@ use crate::worktree::{
 use reconcile::LossClassification;
 
 mod attach;
+mod conflict_stop;
 mod detector;
 mod diff;
 mod hooks;
@@ -115,6 +116,9 @@ const DEFAULT_ATTACH_RESULT_CAPACITY: usize = 128;
 const DEFAULT_WORKER_CONNECT_DEADLINE: Duration = Duration::from_secs(10);
 /// Initial retry interval while a systemd worker binds its bootstrap socket.
 const WORKER_CONNECT_RETRY: Duration = Duration::from_millis(100);
+/// Reason of a runtime whose worker control connection dropped and is being
+/// re-established.
+const WORKER_CONNECTION_LOST: &str = "worker_connection_lost";
 /// Bounds optimistic terminal-state CAS retries before surfacing contention.
 const MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS: usize = 8;
 /// Caps retry load while preserving eventual recovery of unchanged metadata.
@@ -443,6 +447,9 @@ pub struct SessionRegistry {
 struct SessionRegistryInner {
     sessions: Mutex<HashMap<SessionId, SessionEntry>>,
     runtime_inventory: Mutex<Vec<RuntimeInventoryEntry>>,
+    /// Sessions shown only by an in-memory placeholder because the write of
+    /// their classification failed, with the state and reason shown.
+    unpersisted_classifications: std::sync::Mutex<HashMap<String, (RuntimeState, String)>>,
     pending_attaches: Mutex<HashMap<String, PendingAttach>>,
     active_attaches: Mutex<HashMap<String, ActiveAttach>>,
     recent_attach_failures: Mutex<VecDeque<attach::RecentAttachFailure>>,
@@ -902,6 +909,10 @@ fn exit_transition(
     if let Some(runtime) = candidate.info.runtime.as_mut() {
         runtime.state = RuntimeState::Terminal;
         runtime.loss_reason = None;
+    }
+    // A runtime that was unavailable ends as the terminal runtime it is.
+    if matches!(candidate.runtime, RuntimeHandle::Unavailable(_)) {
+        candidate.runtime = RuntimeHandle::Unavailable(RuntimeState::Terminal);
     }
     candidate.info.updated_at = timestamp_now();
     ExitTransition {
@@ -1404,6 +1415,7 @@ impl SessionRegistry {
             inner: Arc::new(SessionRegistryInner {
                 sessions: Mutex::new(HashMap::new()),
                 runtime_inventory: Mutex::new(Vec::new()),
+                unpersisted_classifications: std::sync::Mutex::new(HashMap::new()),
                 pending_attaches: Mutex::new(HashMap::new()),
                 active_attaches: Mutex::new(HashMap::new()),
                 recent_attach_failures: Mutex::new(VecDeque::new()),
@@ -3081,9 +3093,16 @@ impl SessionRegistry {
     }
 
     /// Stop a running session.
+    ///
+    /// A session whose runtime is unavailable is refused before any durable
+    /// write, except a `conflict` whose recorded worker is journal-proven: its
+    /// supervised job is stopped by that recorded identity.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
         self.ensure_not_external(id).await?;
         let _guard = self.lock_lifecycle(id).await;
+        if let Some(stopped) = self.stop_unavailable_runtime(id).await? {
+            return Ok(stopped);
+        }
         self.stop_with_intent(id, DesiredState::Stopped, TransactionKind::Stop)
             .await
     }
@@ -3151,8 +3170,8 @@ impl SessionRegistry {
                 ),
             )
         };
-        let terminal_base = match self.commit_stop_intent(id, durable_intent).await {
-            Ok(record) => record,
+        let (terminal_base, _) = match Box::pin(self.commit_stop_intent(id, durable_intent)).await {
+            Ok(committed) => committed,
             Err(error) => {
                 self.rollback_stop_intent(
                     id,
@@ -3215,11 +3234,12 @@ impl SessionRegistry {
         Ok(SessionStopResult { stopped: true })
     }
 
+    /// Persists `intent` and returns it with the durable record it replaced.
     async fn commit_stop_intent(
         &self,
         id: &SessionId,
         intent: SessionRecord,
-    ) -> Result<SessionRecord, ProtocolError> {
+    ) -> Result<(SessionRecord, SessionRecord), ProtocolError> {
         for _ in 0..MAX_RUNTIME_TRANSITION_COMMIT_ATTEMPTS {
             let durable_base = self
                 .load_durable_session_record(id)
@@ -3228,10 +3248,10 @@ impl SessionRegistry {
             let mut candidate = intent.clone();
             preserve_durable_worker_metadata(&durable_base, &mut candidate);
             match self
-                .write_session_record_if_current(durable_base, candidate.clone())
+                .write_session_record_if_current(durable_base.clone(), candidate.clone())
                 .await
             {
-                Ok(()) => return Ok(candidate),
+                Ok(()) => return Ok((candidate, durable_base)),
                 Err(error)
                     if matches!(
                         error.code.as_str(),
@@ -3491,7 +3511,7 @@ impl SessionRegistry {
         self.delete_session_logs(id).await?;
 
         // A concurrent eviction (another removal path) leaves no entry here.
-        let evicted = self.inner.sessions.lock().await.remove(id);
+        let evicted = self.remove_session_entry(id).await;
         if let Some(entry) = &evicted {
             entry.cancel_runtime_watchers();
         }
@@ -3827,14 +3847,16 @@ impl SessionRegistry {
         }
         if let Some(runtime) = entry.info.runtime.as_mut() {
             runtime.state = RuntimeState::Reconnecting;
-            runtime.loss_reason = Some("worker_connection_lost".to_owned());
+            runtime.loss_reason = Some(WORKER_CONNECTION_LOST.to_owned());
         }
         entry.info.updated_at = timestamp_now();
         drop(sessions);
-        warn!(
-            session_id = %id.0,
-            error = %error,
-            "worker control connection lost; runtime remains alive while reconnecting"
+        reconcile::warn_unavailable(
+            &id.0,
+            Some(&expected.worker_id),
+            RuntimeState::Reconnecting,
+            WORKER_CONNECTION_LOST,
+            &error.to_string(),
         );
         true
     }
@@ -3890,12 +3912,7 @@ impl SessionRegistry {
             );
         }
         if let RuntimeTransitionOutcome::Applied(info) = &outcome {
-            warn!(
-                session_id = %id.0,
-                runtime.state = ?state,
-                reason,
-                "session worker could not be reconnected"
-            );
+            reconcile::warn_unavailable(&id.0, Some(&expected.worker_id), state, reason, "");
             let event_name = match state {
                 RuntimeState::Lost | RuntimeState::Incompatible => event::SESSION_RUNTIME_LOST,
                 RuntimeState::Conflict => event::SESSION_RUNTIME_CONFLICT,
@@ -4026,8 +4043,29 @@ impl SessionRegistry {
             candidate.cancel_runtime_watchers();
         }
         let info = candidate.info.clone();
+        self.set_unpersisted(&id.0, None);
         sessions.insert(id.clone(), candidate);
         RuntimeTransitionOutcome::Applied(Box::new(info))
+    }
+
+    /// Records or clears the placeholder classification shown for `id`.
+    ///
+    /// Callers hold the `sessions` lock, so the flag and the entry it
+    /// describes change together; this lock is never held across an await.
+    fn set_unpersisted(&self, id: &str, shown: Option<(RuntimeState, String)>) {
+        let mut flagged = self
+            .inner
+            .unpersisted_classifications
+            .lock()
+            .expect("unpersisted classifications are never poisoned");
+        match shown {
+            Some(shown) => {
+                flagged.insert(id.to_owned(), shown);
+            }
+            None => {
+                flagged.remove(id);
+            }
+        }
     }
 
     /// Installs `entry`, which carries fresh watcher tokens, as the session's
@@ -4036,10 +4074,40 @@ impl SessionRegistry {
     /// The watchers of a replaced entry are cancelled, so re-adopting or
     /// reclassifying a runtime never leaves a second watcher set on it.
     async fn install_session_entry(&self, id: &SessionId, entry: SessionEntry) {
-        let replaced = self.inner.sessions.lock().await.insert(id.clone(), entry);
+        let replaced = {
+            let mut sessions = self.inner.sessions.lock().await;
+            self.set_unpersisted(&id.0, None);
+            sessions.insert(id.clone(), entry)
+        };
         if let Some(replaced) = replaced {
             replaced.cancel_runtime_watchers();
         }
+    }
+
+    /// Installs `placeholder`, showing `shown`, unless the session has an
+    /// entry; returns whether it was installed. The entry and its flag are
+    /// set in one critical section, so a real install never meets a stale
+    /// flag.
+    async fn install_placeholder_entry(
+        &self,
+        id: &SessionId,
+        placeholder: SessionEntry,
+        shown: (RuntimeState, String),
+    ) -> bool {
+        let mut sessions = self.inner.sessions.lock().await;
+        if sessions.contains_key(id) {
+            return false;
+        }
+        self.set_unpersisted(&id.0, Some(shown));
+        sessions.insert(id.clone(), placeholder);
+        true
+    }
+
+    /// Drops the entry of `id` together with its placeholder flag.
+    async fn remove_session_entry(&self, id: &SessionId) -> Option<SessionEntry> {
+        let mut sessions = self.inner.sessions.lock().await;
+        self.set_unpersisted(&id.0, None);
+        sessions.remove(id)
     }
 
     async fn record_exit(

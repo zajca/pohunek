@@ -55,6 +55,19 @@ these codes instead of a runtime state:
   `pohunekd.jsonl` as a `worker.stderr.captured` event; for a native job read
   the systemd journal or the launchd job log instead.
 
+Every time the daemon classifies a session runtime `conflict`, `lost`,
+`reconnecting`, or `incompatible`, at startup or while it runs, `pohunekd`
+logs exactly one WARN with the message template `session runtime is
+{runtime.state}: {reason}` (the braces name the fields that carry the values)
+and the fields `session_id`, `worker_id` (`none` when the record names no
+worker), `runtime.state`, `reason`, and `detail` when there is evidence text,
+for example the control-connection error behind `worker_connection_lost`.
+Search `~/.local/state/pohunek/logs/pohunekd.jsonl` for `session runtime is`
+and filter by `session_id`. A re-check that finds the same state and reason
+logs nothing more and emits no new event; a runtime whose worker connection
+dropped logs `worker_connection_lost` (`reconnecting`) once and a second WARN
+when it is classified again, for example `lost` with `runtime_lost`.
+
 Interpret runtime states as follows:
 
 - `live`: the daemon has the current worker controller lease. Attach should use
@@ -98,9 +111,11 @@ Interpret runtime states as follows:
   while its job still runs, `reconnecting` while the manager is unavailable).
   A socket that accepts but never answers counts as unreachable: each connect
   attempt ends at the same deadline.
-- `conflict`: multiple or mismatched identities claim the session. Do not stop,
-  unlink, or kill either candidate automatically. Preserve the job, journal,
-  and socket evidence for diagnosis. `runtime_supervision_ambiguous` means the
+- `conflict`: multiple or mismatched identities claim the session. Never stop,
+  unlink, or kill either candidate by hand, and the daemon never kills one
+  automatically. Preserve the job, journal, and socket evidence for diagnosis;
+  `pohunek session stop <id>` is the supported exit when it can prove the
+  recorded identity (see below). `runtime_supervision_ambiguous` means the
   native job is present but its worker socket does not answer and its journal is
   not terminal, or that its journals or worker socket directory could not be
   read at all. It is not permanent: the daemon re-checks it in the background
@@ -111,7 +126,85 @@ Interpret runtime states as follows:
   until the worker initialization deadline; the job is then retired and the
   unfinished session disappears. `runtime_identity_mismatch` means the job's definition or
   process does not match the recorded executable, session, or generation.
-  Afterward, `pohunek session rm <id>` removes a
+  A conflict whose record names a worker generation is watched whatever its
+  reason, while a worker still answers or its job is supervised: adoption
+  reasons (`launch_identity_*`, `active_identity_*`, subagent snapshot
+  rejections, `multiple_worker_candidates`), `runtime_identity_mismatch`, and
+  `runtime_supervision_ambiguous`. The first re-check runs after 1 s and the
+  delay doubles to at most 60 s; a session that newly joins the watch is
+  re-checked after 1 s again, whatever the delay of the others has grown to.
+  Each pass classifies from fresh evidence and never kills: while the evidence holds the session stays `conflict` (no new
+  event or log), a worker that becomes adoptable is adopted `live`, and once
+  the worker is gone and its job has ended the session becomes `lost` with
+  `runtime_lost` (`runtime_lost_cleanup_unconfirmed` when the marked-process
+  sweep is unconfirmed). Every pass probes all worker sockets, not only the
+  session's own: a worker is adopted only while no other socket claims the same
+  session, so a shadow worker keeps the conflict (`multiple_worker_candidates`)
+  until it is gone. A worker that exits in an orderly way and leaves a
+  terminal journal is imported as `terminal`, not `lost`. Not re-checked, and
+  needing the operator: a record that disagrees with its stored resume binding
+  (`resume_binding_*` reasons), a journal-only conflict
+  (`worker_journal_identity_mismatch`, a journal naming another worker than
+  the record), and a record naming no worker generation.
+  A live worker started by the previous release is adopted `live` after the
+  store migration. Its reported launch identity is checked against the stored
+  native recovery binding and fails closed only on a real contradiction: another
+  provider than the session's runtime (`launch_identity_provider_mismatch`), a
+  reference kind that contradicts the binding's launch spec or is stored under
+  the other kind when the binding has no launch spec
+  (`launch_identity_reference_kind_mismatch`), or a reference that differs from
+  the stored one (`launch_identity_reference_mismatch`). A binding the migration
+  could not complete (no launch spec, for example a deleted profile or a profile
+  without native resume; the session carries a `native_recovery` warning) does
+  not block adoption: the worker is adopted `live` and `screen`, `input`, and
+  `stop` work; only resume and fork stay unavailable.
+  `pohunek session stop <id>` on a `conflict` stops the supervised job by the
+  identity the record names instead of refusing. Before anything is written it
+  proves that the journal of the recorded generation names the recorded worker
+  and that the job the service manager shows under that generation's service id
+  is that worker's (executable, `--session-id` and `--worker-generation`
+  arguments, and main process match the journal). It refuses with
+  `session_runtime_conflict` when the record names no generation or worker,
+  `runtime_identity_mismatch` when no journal of the generation names the
+  recorded worker or the job is not that worker's,
+  `runtime_supervision_ambiguous` when the journals are unreadable or no job holds
+  the recorded worker process while it still runs (nothing could stop it), and
+  `runtime_supervision_unavailable` when the job cannot be inspected. After the
+  proof it persists the stop intent, retires the job of the exact generation
+  (which ends the worker and its child), requires every worker journaled for
+  the generation to be gone, and sweeps the processes carrying the session's
+  runtime ownership markers. A sweep that cannot confirm every marked process
+  exited refuses with `runtime_supervision_ambiguous` and a `recover` hint to
+  inspect and end the listed processes and retry the stop; a stop never accepts
+  unconfirmed cleanup (`--accept-unconfirmed-cleanup` belongs to `session rm`
+  only). On success the result is `stopped: true`, the session state is
+  `stopped`, the runtime `terminal`, and the stop transaction committed. A
+  refusal leaves the record exactly as it was (no `desired_state = stopped`, no
+  `requested` stop transaction); a retirement the supervisor reports as failed
+  rolls the intent back only when the worker is proven alive beside a live job.
+  Every other failure (a worker still running after the retirement, an
+  unconfirmed marked-process sweep, a retirement error with the worker gone or
+  unverifiable) keeps the persisted stop intent, and the watch (or the next
+  daemon start) finishes the stop as `stopped` once the worker is gone and the
+  marked-process sweep is confirmed; until then the session stays `conflict`
+  with `runtime_supervision_ambiguous`. A stop whose record names a runtime
+  (`worker_instance_id`) that the journal does not is refused with `runtime_identity_mismatch` before anything
+  is written, and only journal-proven runtimes are swept. A persisted stop
+  or removal intent is finished even over a `resume_binding_*` conflict, which
+  quarantines adoption only, at startup and in the watch. A pending stop ends
+  only once the marked-process sweep is confirmed, also when the worker left a
+  terminal journal. Every watch pass judges the persisted resume binding again,
+  so a quarantine whose classification could not be written stays in force,
+  and an adoption or classification whose write fails keeps the session
+  pending (listed as `runtime_supervision_unavailable`, with its one WARN, if
+  it had no entry); the next pass writes the classification without logging it
+  again. A committed stop is never turned into `lost` by a restart, although
+  the retired job leaves no terminal journal (a `resume_binding_*` conflict is
+  never re-checked). `session stop` on a `lost`, `reconnecting`, or
+  `incompatible` session is refused before anything is written with
+  `session_runtime_lost`, `session_runtime_reconnecting`, or
+  `worker_protocol_incompatible`.
+  `pohunek session rm <id>` removes a
   `runtime_supervision_ambiguous` session: it retires the worker job of the
   exact generation the record names through the service manager, which stops
   that worker and its child, requires every worker the session's journals

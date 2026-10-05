@@ -793,12 +793,14 @@ impl SessionRegistry {
             Err(LaunchFailure::Unavailable(error)) => {
                 // The job may still be live; it stays recorded for
                 // reconciliation instead of being deleted or killed.
-                self.insert_unavailable_record(
-                    preparing_record,
-                    RuntimeState::Reconnecting,
-                    SUPERVISION_UNAVAILABLE,
-                )
-                .await;
+                // The retry is scheduled whether or not the listing was committed.
+                let _persisted = self
+                    .insert_unavailable_record(
+                        preparing_record,
+                        RuntimeState::Reconnecting,
+                        SUPERVISION_UNAVAILABLE,
+                    )
+                    .await;
                 self.schedule_supervision_retry(&id);
                 return Err(LaunchFailure::Unavailable(error));
             }
@@ -904,12 +906,15 @@ impl SessionRegistry {
                     // job may still be live; the preparing record stays
                     // classified for reconciliation instead of being deleted
                     // or killed.
-                    self.insert_unavailable_record(
-                        preparing_record,
-                        RuntimeState::Reconnecting,
-                        SUPERVISION_UNAVAILABLE,
-                    )
-                    .await;
+                    // The retry is scheduled whether or not the listing was
+                    // committed.
+                    let _persisted = self
+                        .insert_unavailable_record(
+                            preparing_record,
+                            RuntimeState::Reconnecting,
+                            SUPERVISION_UNAVAILABLE,
+                        )
+                        .await;
                     self.schedule_supervision_retry(&id);
                     LaunchFailure::Unavailable(error)
                 }

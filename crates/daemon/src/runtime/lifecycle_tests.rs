@@ -105,6 +105,8 @@ pub(crate) struct ScriptedSupervisor {
     persisted_at_start: StdMutex<Vec<Option<String>>>,
     jobs: StdMutex<HashMap<ServiceId, JobScript>>,
     retire_unavailable: StdMutex<HashSet<ServiceId>>,
+    retire_ends: StdMutex<HashMap<ServiceId, u32>>,
+    retire_ends_then_fails: StdMutex<HashMap<ServiceId, u32>>,
     discovery_unavailable: std::sync::atomic::AtomicBool,
 }
 
@@ -152,6 +154,25 @@ impl ScriptedSupervisor {
             .lock()
             .expect("retire script")
             .insert(id);
+    }
+
+    /// Makes the next successful `retire` of `id` end process `pid`, the way
+    /// retiring a real job ends its worker.
+    pub(crate) fn script_retire_ends(&self, id: ServiceId, pid: u32) {
+        self.retire_ends
+            .lock()
+            .expect("retire script")
+            .insert(id, pid);
+    }
+
+    /// Makes the next `retire` of `id` end process `pid` and the job, then
+    /// fail as an unreachable manager, the way a backend errors while it
+    /// checks a stop that already took effect.
+    pub(crate) fn script_retire_ends_then_fails(&self, id: ServiceId, pid: u32) {
+        self.retire_ends_then_fails
+            .lock()
+            .expect("retire script")
+            .insert(id, pid);
     }
 
     /// Makes `discover` fail as an unreachable manager.
@@ -361,10 +382,35 @@ impl Supervisor for ScriptedSupervisor {
             {
                 return Err(unavailable("retire"));
             }
+            let ends_then_fails = self
+                .retire_ends_then_fails
+                .lock()
+                .expect("retire script")
+                .remove(id);
+            if let Some(pid) = ends_then_fails {
+                self.jobs.lock().expect("jobs").remove(id);
+                let ended = pohunek_test_support::process_env::command("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .expect("end the process of the failing retirement");
+                assert!(ended.success(), "the retired job's process was running");
+                return Err(unavailable("retire"));
+            }
             let scripted = self.jobs.lock().expect("jobs").remove(id);
             if let Some(script) = scripted {
                 return match script {
-                    JobScript::Present { .. } => Ok(()),
+                    JobScript::Present { .. } => {
+                        if let Some(pid) =
+                            self.retire_ends.lock().expect("retire script").remove(id)
+                        {
+                            let ended = pohunek_test_support::process_env::command("kill")
+                                .args(["-KILL", &pid.to_string()])
+                                .status()
+                                .expect("end the retired job's process");
+                            assert!(ended.success(), "the retired job's process was running");
+                        }
+                        Ok(())
+                    }
                     JobScript::Unavailable => Err(unavailable("retire")),
                     JobScript::Panic => panic!("scripted supervisor panic retiring {id}"),
                 };
