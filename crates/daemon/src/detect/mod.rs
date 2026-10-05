@@ -159,6 +159,17 @@ pub fn hermes_manifest() -> &'static Manifest {
 /// both claim resolves deterministically.
 #[must_use]
 pub fn identify_agent(host: &RuntimeHost, fact: &ProcessFact) -> Option<RuntimeRef> {
+    identify_definition(host, fact)
+        .map(|definition| RuntimeRef::from(definition.runtime_id().clone()))
+}
+
+/// [`identify_agent`] returning the definition whose matchers matched, so the
+/// caller applies that definition's rules to the process.
+#[must_use]
+pub fn identify_definition(
+    host: &RuntimeHost,
+    fact: &ProcessFact,
+) -> Option<std::sync::Arc<RuntimeDefinition>> {
     host.registry()
         .definitions()
         .find(|definition| {
@@ -167,7 +178,7 @@ pub fn identify_agent(host: &RuntimeHost, fact: &ProcessFact) -> Option<RuntimeR
                 .process_matchers()
                 .is_some_and(|matchers| matchers.matches(fact))
         })
-        .map(|definition| RuntimeRef::from(definition.runtime_id().clone()))
+        .map(std::sync::Arc::clone)
 }
 
 #[derive(Debug)]

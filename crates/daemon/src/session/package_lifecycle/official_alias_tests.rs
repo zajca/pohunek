@@ -540,5 +540,61 @@ async fn a_live_built_in_session_keeps_its_own_observation_through_a_takeover() 
         unretained.is_empty(),
         "without the retained definition the built-in process is lost"
     );
+
+    assert_transition_rules(
+        &fixture,
+        &created.id,
+        &builtin_process,
+        &official_process,
+        now,
+    )
+    .await;
     let _ = fixture.registry.stop(&created.id).await;
+}
+
+/// Applies the foreground transition to each observed process and checks
+/// which manifest the session's detector then runs.
+async fn assert_transition_rules(
+    fixture: &Fixture,
+    id: &protocol::SessionId,
+    builtin_process: &std::collections::HashMap<crate::procwatch::Pid, super::super::ObservedAgent>,
+    official_process: &std::collections::HashMap<
+        crate::procwatch::Pid,
+        super::super::ObservedAgent,
+    >,
+    now: std::time::Instant,
+) {
+    // The foreground transition applies the rules of the definition each
+    // process matched: the session's own launch root gets the built-in rules,
+    // a child the package recognizes gets the package rules.
+    let blocker = |manifest: &str| manifest.contains("official_blocked");
+    let mut sessions = fixture.registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(id).expect("the live session");
+    for (process, expect_package_rule) in [(builtin_process, false), (official_process, true)] {
+        let observed = process.values().next().expect("one observed process");
+        let report = super::super::ActiveAgentReport {
+            source: "test".to_owned(),
+            agent: "codex".to_owned(),
+            seq: Some(1),
+            pid: Some(observed.pid),
+            start_identity: Some(observed.start_identity),
+            reported_at: now,
+            activity_reported: false,
+        };
+        super::super::procwatch::apply_observed_transition(
+            entry,
+            observed,
+            report,
+            "codex".to_owned(),
+        );
+        let applied = format!("{:?}", entry.detector_config.borrow().config.manifest);
+        assert_eq!(blocker(&applied), expect_package_rule, "{}", observed.pid);
+        if !expect_package_rule {
+            assert_eq!(
+                applied,
+                format!("{:?}", Some(crate::detect::codex_manifest().clone()))
+            );
+        }
+    }
+    drop(sessions);
 }
