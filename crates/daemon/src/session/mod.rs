@@ -1377,13 +1377,9 @@ impl SessionRegistry {
         config: SessionRegistryConfig,
         runtimes: RuntimeHost,
         launcher: Arc<dyn WorkerLauncher>,
+        inspector: Arc<dyn ProcessInspector>,
     ) -> Self {
-        Self::build(
-            config,
-            Some(launcher),
-            Arc::new(crate::procwatch::readable_host::ReadableHost::new()),
-            Some(runtimes),
-        )
+        Self::build(config, Some(launcher), inspector, Some(runtimes))
     }
 
     /// Creates a registry with explicit worker and process-observer backends.

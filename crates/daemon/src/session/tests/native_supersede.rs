@@ -52,6 +52,8 @@ struct Rig {
     registry: SessionRegistry,
     session: SessionInfo,
     assigned: String,
+    /// The worker's handle while no daemon holds the session.
+    orphan: Option<Worker>,
 }
 
 impl Rig {
@@ -181,6 +183,7 @@ impl Rig {
             registry,
             session,
             assigned,
+            orphan: None,
         }
     }
 
@@ -194,6 +197,7 @@ impl Rig {
             config.clone(),
             crate::agent::host::fixture::pi_shaped_hooked_host(script, existence),
             Arc::clone(launcher),
+            Arc::new(ReadableHost::new()),
         )
     }
 
@@ -217,20 +221,11 @@ impl Rig {
         // The worker verifies the launch process asynchronously when the
         // process table is slow to answer; the reference is journaled once it
         // has, so the snapshots the tests apply always carry it.
-        // While no daemon holds the session there is no worker handle to ask;
-        // the restart that follows reads whatever the worker journaled.
-        if !self
-            .registry
-            .inner
-            .sessions
-            .lock()
-            .await
-            .contains_key(self.id())
-        {
-            return;
-        }
+        let worker = match &self.orphan {
+            Some(worker) => worker.clone(),
+            None => live_worker_and_identity(&self.registry, self.id()).await.0,
+        };
         wait_until("the worker to journal the reported reference", || async {
-            let (worker, _identity) = live_worker_and_identity(&self.registry, self.id()).await;
             let snapshot = worker.inspect().await.ok()?;
             snapshot
                 .native_reference
@@ -357,6 +352,9 @@ impl Rig {
             .expect("committed session entry");
         entry.cancel_runtime_watchers();
         drop(entry);
+        // The dead daemon's controller connection is gone before the new one
+        // connects.
+        self.orphan = None;
         let restarted = Self::registry(&self.config, &self.launcher, &self.script, self.existence);
         restarted
             .reconcile_workers()
@@ -1192,6 +1190,7 @@ impl Rig {
         std::mem::forget(barrier);
         // Every session of the dead daemon lets go of its worker, forks
         // included, or a worker would keep serving its former controller.
+        self.orphan = Some(live_worker_and_identity(&self.registry, self.id()).await.0);
         let entries: Vec<_> = self
             .registry
             .inner
@@ -1207,6 +1206,9 @@ impl Rig {
         if let Some(reference) = while_down {
             self.report(reference).await;
         }
+        // The dead daemon's controller connection is gone before the new one
+        // connects.
+        self.orphan = None;
         let restarted = Self::registry(&self.config, &self.launcher, &self.script, self.existence);
         restarted
             .reconcile_workers()
@@ -1221,6 +1223,7 @@ impl Rig {
     async fn restart_down_then_exit(&mut self, reference: &str) {
         let barrier = self.registry.inner.persist_lock.lock().await;
         std::mem::forget(barrier);
+        self.orphan = Some(live_worker_and_identity(&self.registry, self.id()).await.0);
         let entries: Vec<_> = self
             .registry
             .inner
@@ -1235,6 +1238,9 @@ impl Rig {
         }
         self.report(reference).await;
         self.send("exit");
+        // The dead daemon's controller connection is gone before the new one
+        // connects.
+        self.orphan = None;
         let restarted = Self::registry(&self.config, &self.launcher, &self.script, self.existence);
         restarted
             .reconcile_workers()
@@ -1566,4 +1572,126 @@ async fn a_recovery_from_the_stored_binding_keeps_the_ordering_key_of_the_record
         "the recovered record stays the keyed side of a later reconciliation"
     );
     rig.finish(&rig.registry).await;
+}
+
+#[tokio::test]
+async fn a_launch_process_that_already_exited_still_hands_over_its_journaled_reference() {
+    let dir = temp_dir("supersede-root-gone");
+    let marker = dir.join("argv.txt");
+    let (script, _gate) = assigned_agent_script(&dir, &marker);
+    let inspector = Arc::new(MockInspector::default());
+    let registry = SessionRegistry::new_for_test(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            procwatch_poll: Duration::from_mins(1),
+            store_path: Some(temp_store_path("supersede-root-gone")),
+            ..SessionRegistryConfig::default()
+        },
+        Arc::<MockInspector>::clone(&inspector),
+        Some(crate::agent::host::fixture::pi_shaped_hooked_host(
+            &script,
+            crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        )),
+        None,
+    );
+    let created = registry
+        .create(SessionNewParams {
+            agent: RUNTIME.to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create an assigned session");
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let mut snapshot = worker.inspect().await.expect("inspect the worker");
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.launch_identity = Some(pohunek_worker_protocol::ReportedLaunchIdentity {
+        provider: RUNTIME.to_owned(),
+        process: root,
+        reference_kind: "id".to_owned(),
+        native_reference: "journaled-after-exit".to_owned(),
+    });
+    snapshot.native_reference = Some(pohunek_worker_protocol::ReportedNativeReference {
+        provider: RUNTIME.to_owned(),
+        process: root,
+        sequence: 5,
+        reference_kind: "id".to_owned(),
+        native_reference: "journaled-after-exit".to_owned(),
+    });
+    inspector.set_not_running(ProcessIdentity {
+        pid: root.pid,
+        start_identity: StartIdentity::new(root.start_identity),
+    });
+
+    let _ = registry
+        .apply_worker_metadata_snapshot(&created.id, &snapshot)
+        .await;
+
+    let info = registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(
+        info.native_session_id.as_deref(),
+        Some("journaled-after-exit"),
+        "the exited process's journaled reference is its own"
+    );
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn an_adopted_worker_whose_launch_process_just_exited_hands_over_its_journaled_reference() {
+    let mut rig = Rig::new(
+        "supersede-drain-adopt",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    let (worker, _identity) = live_worker_and_identity(&rig.registry, rig.id()).await;
+    let root = worker
+        .inspect()
+        .await
+        .expect("inspect")
+        .child_process
+        .expect("worker child");
+    rig.orphan = Some(worker);
+
+    // The daemon restarts while the worker is still draining the PTY of a
+    // launch process that has already ended.
+    let barrier = rig.registry.inner.persist_lock.lock().await;
+    std::mem::forget(barrier);
+    let entries: Vec<_> = rig
+        .registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .drain()
+        .map(|(_, entry)| entry)
+        .collect();
+    for entry in entries {
+        entry.cancel_runtime_watchers();
+    }
+    // The agent switches while no daemon holds the session.
+    rig.report("conversation-before-exit").await;
+    rig.orphan = None;
+    let inspector = Arc::new(MockInspector::default());
+    inspector.set_not_running(ProcessIdentity {
+        pid: root.pid,
+        start_identity: StartIdentity::new(root.start_identity),
+    });
+    let restarted = SessionRegistry::new_with_runtimes_and_launcher(
+        rig.config.clone(),
+        crate::agent::host::fixture::pi_shaped_hooked_host(&rig.script, rig.existence),
+        Arc::clone(&rig.launcher),
+        inspector,
+    );
+    restarted
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+
+    let info = restarted.inspect(rig.id()).await.expect("inspect");
+    assert_eq!(
+        info.native_session_id.as_deref(),
+        Some("conversation-before-exit")
+    );
+    let _ = restarted.stop(rig.id()).await;
 }

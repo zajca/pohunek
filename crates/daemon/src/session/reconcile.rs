@@ -462,10 +462,12 @@ impl SessionRegistry {
         let snapshot = &projected;
         let mut outcome = WorkerMetadataApplyOutcome::Applied;
         let mut identities_accepted = true;
+        let mut launch_root_gone = false;
         if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
             if let Err(failure) =
                 validate_worker_identity_processes(&*self.inner.inspector, snapshot)
             {
+                launch_root_gone = failure.is_missing_root();
                 let (reason, retryable) = failure.reason_and_retryability();
                 if retryable {
                     tracing::debug!(session_id = %id.0, reason, "worker identity process validation is retryable");
@@ -520,6 +522,11 @@ impl SessionRegistry {
                 }
             }
         } else {
+            // A launch process that already ended cannot be inspected, but the
+            // reference the worker journaled for it is still its own.
+            if launch_root_gone {
+                import_ended_native_reference(&mut candidate, snapshot);
+            }
             WorkerIdentityProjection::unreported()
         };
         candidate.info.subagents.clone_from(&subagents);
@@ -3032,6 +3039,9 @@ impl SessionRegistry {
             }
         }
         let identity_projection = if root_missing_during_drain || retry_identity {
+            if root_missing_during_drain {
+                import_ended_native_reference(&mut record, &snapshot);
+            }
             clear_active_identity(&mut record.info);
             WorkerIdentityProjection::unreported()
         } else {
