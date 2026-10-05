@@ -393,6 +393,7 @@ pub(crate) mod process_environment {
 
     /// Homes over `host` with no host profiles and a base environment taken
     /// from this process.
+    #[must_use]
     pub fn config_homes_for_tests(host: &RuntimeHost) -> ConfigHomes {
         let registry = host.registry();
         let forwarded = registry
