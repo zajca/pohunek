@@ -144,10 +144,7 @@ fn initialize(
 }
 
 fn notify_asset(agent: &str) -> PathBuf {
-    pohunek_test_support::manifest_dir()
-        .join("src/integration/assets/")
-        .join(agent)
-        .join("pohunek-agent-notify.sh")
+    super::runnable_script(agent, "pohunek-agent-notify.sh")
 }
 
 /// Hook schema the notification tests launch their worker with.
@@ -428,10 +425,7 @@ async fn prebump_notify_hooks_fall_back_to_the_daemon_in_their_launch_version() 
 }
 
 fn state_asset(agent: &str) -> PathBuf {
-    pohunek_test_support::manifest_dir()
-        .join("src/integration/assets/")
-        .join(agent)
-        .join("pohunek-agent-state.sh")
+    super::runnable_script(agent, "pohunek-agent-state.sh")
 }
 
 /// Runs the real Claude state asset inside a real worker initialized with

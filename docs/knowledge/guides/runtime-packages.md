@@ -95,6 +95,11 @@ until activation succeeds. The check covers the hook schema of every package
 version that a live, lost or resumable session or a host profile pin still
 references for that handler, not only the schema of the selected version, and an
 update of any handler is refused while such a version cannot be read.
+The reporter scripts a handler installs are core-owned templates: the handler
+renders them from the runtime's id and display name before staging, a value
+outside a conservative character set is refused with a typed error, and the
+rendered bytes are what is installed and what drift is compared against. A
+package never supplies script bytes.
 `hermes-hook-v1` is registered but its lifecycle runs
 in the CLI; the daemon answers `agent_not_installable` for it.
 `pohunek integration --agent` takes the runtime id of a package runtime that

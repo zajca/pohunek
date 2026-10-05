@@ -825,10 +825,16 @@ async fn run_prebump_hook(
 ) -> std::process::ExitStatus {
     use tokio::io::AsyncWriteExt as _;
 
-    let asset = pohunek_test_support::manifest_dir()
-        .join("src/integration/assets")
-        .join(agent)
-        .join(script);
+    // The Codex script ships as a template; the recorded rendering is
+    // byte-identical to what the handler installs (pinned by a daemon unit test).
+    let integration = pohunek_test_support::manifest_dir().join("src/integration");
+    let asset = if agent == "codex" {
+        integration
+            .join("reporter_golden")
+            .join(format!("codex-{script}"))
+    } else {
+        integration.join("assets").join(agent).join(script)
+    };
     let mut command = tokio::process::Command::new("/bin/sh");
     command
         .arg(&asset)

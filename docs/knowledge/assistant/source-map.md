@@ -461,6 +461,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/integration/handler.rs`
 - `crates/daemon/src/integration/homes.rs`
 - `crates/daemon/src/integration/provider_handlers.rs`
+- `crates/daemon/src/integration/reporter.rs`
 - `crates/daemon/src/integration/uninstall.rs`
 - `crates/daemon/src/integration/assets/codex/pohunek-agent-state.sh`
 - `crates/daemon/src/integration/assets/codex/pohunek-agent-notify.sh`
