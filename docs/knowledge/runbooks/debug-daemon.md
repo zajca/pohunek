@@ -122,6 +122,12 @@ For durable notification issues:
    For human output, remote recovery commands explicitly name the daemon host;
    run the local-only installer on that machine rather than adding `--host` to
    `integration install`.
+   When a host profile points the agent at its own config home, the hooks must
+   be installed there too: run `pohunek integration install --agent
+   <codex-or-claude> --profile <name>` (or `--all-profiles` for every distinct
+   home) and check it with `pohunek integration doctor --agent
+   <codex-or-claude> --profile <name>`. `--all-profiles` exits non-zero when any
+   home failed and never rolls back across homes.
    `current` verifies both executable assets with the installer-owned permission
    mode and effective-UID owner, exactly one managed registration under each
    expected provider event, and Codex feature/trust state. Asset type, UID, mode,

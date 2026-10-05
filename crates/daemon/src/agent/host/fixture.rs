@@ -190,11 +190,12 @@ pub(crate) fn pi_shaped_integration_host_as(
     hook_schema: &str,
 ) -> RuntimeHost {
     let document = format!(
-        "{}\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{hook_schema}\"\n",
+        "{}\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{hook_schema}\"\n{}",
         pi_shaped_document(program, PI_SHAPED_NO_CHECK).replace(
             &format!("id = \"{PI_SHAPED_ID}\""),
             &format!("id = \"{runtime_id}\"")
-        )
+        ),
+        config_home_table(handler),
     );
     let definition = RuntimeDefinition::from_toml(
         &document,
@@ -314,8 +315,20 @@ pub(crate) fn install_pi_version(
 /// hook schema its reports follow.
 fn with_integration(document: &str) -> String {
     format!(
-        "{document}\n[integration]\nhandler = \"codex-hook-v1\"\nhook_schema = \"identity-subagent-v1\"\n"
+        "{document}\n[integration]\nhandler = \"codex-hook-v1\"\nhook_schema = \"identity-subagent-v1\"\n{}",
+        config_home_table("codex-hook-v1"),
     )
+}
+
+/// The `[config_home]` table a fixture runtime driven by `handler` declares so
+/// its integration has a directory to act on; empty for a handler whose
+/// lifecycle the daemon does not run.
+pub(crate) fn config_home_table(handler: &str) -> &'static str {
+    match handler {
+        "codex-hook-v1" => "\n[config_home]\nenv = \"CODEX_HOME\"\ndefault = \".codex\"\n",
+        "claude-hook-v1" => "\n[config_home]\nenv = \"CLAUDE_CONFIG_DIR\"\ndefault = \".claude\"\n",
+        _ => "",
+    }
 }
 
 /// Installs `document` (a Pi-shaped descriptor) as a package of

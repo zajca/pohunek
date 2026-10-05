@@ -1072,6 +1072,7 @@ fn doctor_selects_agents_and_rejects_unsupported_ones() {
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::claude()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -1088,14 +1089,22 @@ fn doctor_selects_agents_and_rejects_unsupported_ones() {
     assert_eq!(both.agents.len(), 2);
 
     for agent in [RuntimeRef::shell(), RuntimeRef::hermes()] {
-        let error = doctor_with(IntegrationDoctorParams { agent: Some(agent) }, &[], &[])
-            .expect_err("unsupported");
+        let error = doctor_with(
+            IntegrationDoctorParams {
+                agent: Some(agent),
+                ..Default::default()
+            },
+            &[],
+            &[],
+        )
+        .expect_err("unsupported");
         assert_eq!(error.code, "agent_not_installable");
     }
     assert_eq!(
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::from_wire("pi")),
+                ..Default::default()
             },
             &[],
             &[],
@@ -1472,7 +1481,10 @@ fn a_dangling_symlink_through_env_overrides_and_the_default_dir_is_a_failure() {
     let codex_link = dangling_link(&root, "codex-override");
 
     let overridden = with_config_dirs(&claude_link, &codex_link, || {
-        super::status(protocol::IntegrationStatusParams { agent: None })
+        super::status(protocol::IntegrationStatusParams {
+            agent: None,
+            ..Default::default()
+        })
     })
     .expect("status");
     for report in &overridden.agents {
@@ -1502,7 +1514,10 @@ fn a_dangling_symlink_through_env_overrides_and_the_default_dir_is_a_failure() {
     symlink(home.join("nowhere"), home.join(".claude")).expect("dangling default Claude dir");
     symlink(home.join("nowhere"), home.join(".codex")).expect("dangling default Codex dir");
     let default = super::tests::with_status_env(None, None, Some(&home), || {
-        super::status(protocol::IntegrationStatusParams { agent: None })
+        super::status(protocol::IntegrationStatusParams {
+            agent: None,
+            ..Default::default()
+        })
     })
     .expect("status");
     for report in &default.agents {
@@ -1686,6 +1701,7 @@ fn doctor_with_dirs(claude: &Path) -> protocol::IntegrationDoctorResult {
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::claude()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -1871,6 +1887,7 @@ fn status_and_doctor_refuse_exactly_the_paths_install_and_uninstall_refuse() {
                 let status = run(&|| {
                     let report = super::status(protocol::IntegrationStatusParams {
                         agent: Some(agent.clone()),
+                        ..Default::default()
                     })
                     .expect("status")
                     .agents
@@ -1890,6 +1907,7 @@ fn status_and_doctor_refuse_exactly_the_paths_install_and_uninstall_refuse() {
                     let result = doctor_with(
                         IntegrationDoctorParams {
                             agent: Some(agent.clone()),
+                            ..Default::default()
                         },
                         &[],
                         &[],
@@ -2208,6 +2226,7 @@ fn doctor_is_not_ok_when_the_real_scan_bound_is_exceeded() {
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::codex()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -2972,6 +2991,7 @@ fn doctor_does_not_conclude_anything_while_an_operation_holds_the_lock() {
     let codex = scoped_dir("doctor-busy-codex");
     let params = IntegrationDoctorParams {
         agent: Some(RuntimeRef::claude()),
+        ..Default::default()
     };
 
     let holder = TrustedDir::open(&claude, "test root").expect("open");
@@ -3013,6 +3033,7 @@ fn the_doctor_lock_probe_never_creates_the_lock_file() {
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::claude()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -3092,6 +3113,7 @@ fn an_unsafe_installer_lock_is_an_error_finding() {
             doctor_with(
                 IntegrationDoctorParams {
                     agent: Some(RuntimeRef::claude()),
+                    ..Default::default()
                 },
                 &[],
                 &[],
@@ -3128,6 +3150,7 @@ fn the_doctor_holds_the_lock_for_its_whole_inspection() {
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::claude()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -3166,6 +3189,7 @@ fn an_operation_that_creates_the_lock_during_the_inspection_drops_the_conclusion
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::claude()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -3363,6 +3387,7 @@ fn unsafe_paths_in_a_not_installed_config_still_fail_the_doctor_and_the_install(
             doctor_with(
                 IntegrationDoctorParams {
                     agent: Some(RuntimeRef::claude()),
+                    ..Default::default()
                 },
                 &[],
                 &[],
@@ -3395,6 +3420,7 @@ fn unsafe_paths_in_a_not_installed_config_still_fail_the_doctor_and_the_install(
         doctor_with(
             IntegrationDoctorParams {
                 agent: Some(RuntimeRef::codex()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -3431,6 +3457,7 @@ fn an_empty_safe_config_is_still_only_informational() {
                 doctor_with(
                     IntegrationDoctorParams {
                         agent: Some(agent.clone()),
+                        ..Default::default()
                     },
                     &[],
                     &[],

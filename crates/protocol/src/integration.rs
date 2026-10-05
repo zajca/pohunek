@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::RuntimeRef;
+use crate::{ProtocolError, RuntimeRef};
 
 /// Gate flag the daemon sets so the agent hook knows it was launched by pohunek.
 ///
@@ -53,7 +53,11 @@ pub const ENV_PROTOCOL_VERSION: &str = "POHUNEK_PROTOCOL_VERSION";
 pub const EXPECTED_INTEGRATION_VERSION: u32 = 11;
 
 /// Parameters for `integration.install`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Unknown fields are rejected so a misspelled selector cannot narrow an
+/// install to the runtime's own home.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallParams.ts"))]
 pub struct IntegrationInstallParams {
@@ -62,6 +66,84 @@ pub struct IntegrationInstallParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<RuntimeRef>,
+    /// Install into the config home the named host profile launches with,
+    /// instead of the runtime's own home. Accepted from local owner
+    /// connections only. Without `agent` the profile's runtime is installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub profile: Option<String>,
+    /// Install into every distinct config home of the selected runtime(s): the
+    /// runtime's own home and the home of each of its host profiles. Local
+    /// owner connections only; exclusive with `profile`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub all_profiles: bool,
+}
+
+/// Whether a flag is unset, so it is left out of the serialized parameters and
+/// a request that does not use it is byte-identical to one an older client
+/// sends.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the signature `skip_serializing_if` requires"
+)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// The launch selector a recovery command passes to reach a config home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationSelector.ts"))]
+pub enum IntegrationSelector {
+    /// The runtime launched without a profile (no `--profile`).
+    Default,
+    /// The named host profile (`--profile <name>`).
+    Profile {
+        /// Host profile name.
+        name: String,
+    },
+}
+
+/// The config home a profile-aware report describes: which launch
+/// selector(s) resolve to it.
+///
+/// Two selectors that resolve to the same canonical directory share one home
+/// and one transaction, so the report names every selector it stands for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationHome.ts"))]
+pub struct IntegrationHome {
+    /// Host profiles whose environment resolves to this home, sorted by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Vec<String>>", optional))]
+    pub profiles: Vec<String>,
+    /// Whether the runtime launched without a profile resolves to this home.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub bare: bool,
+    /// The selector the daemon verified reaches the directory the installer
+    /// uses for this home. Aliases listed above can resolve through a symlink
+    /// the installer refuses, so a recovery command is built from this field
+    /// and never from the order of `profiles` or from `bare`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub selector: Option<IntegrationSelector>,
+}
+
+/// One config home whose transaction failed while the others ran.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationHomeFailure.ts"))]
+pub struct IntegrationHomeFailure {
+    /// Agent whose home failed.
+    pub agent: RuntimeRef,
+    /// The home that failed.
+    pub home: IntegrationHome,
+    /// Why the transaction of this home failed; it left the home unchanged or
+    /// reports its own recovery error.
+    pub error: ProtocolError,
 }
 
 /// Result returned by `integration.install`.
@@ -69,8 +151,17 @@ pub struct IntegrationInstallParams {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationInstallResult.ts"))]
 pub struct IntegrationInstallResult {
-    /// One report per agent the hook was installed for.
+    /// One report per agent config home the hook was installed for.
     pub installed: Vec<IntegrationInstallReport>,
+    /// Homes whose install failed while the others ran; only a request with
+    /// `all_profiles` reports failures here, and each home is its own
+    /// transaction with no atomicity across homes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "ts",
+        ts(as = "Option<Vec<IntegrationHomeFailure>>", optional)
+    )]
+    pub failed: Vec<IntegrationHomeFailure>,
 }
 
 /// Request parameters for `integration.status`.
@@ -86,6 +177,17 @@ pub struct IntegrationStatusParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<RuntimeRef>,
+    /// Report the config home the named host profile launches with. The
+    /// report carries paths derived from the profile's environment, so only
+    /// local owner connections may set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub profile: Option<String>,
+    /// Report every distinct config home of the selected runtime(s); local
+    /// owner connections only; exclusive with `profile`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub all_profiles: bool,
 }
 
 /// Result returned by `integration.status`.
@@ -95,6 +197,12 @@ pub struct IntegrationStatusParams {
 pub struct IntegrationStatusResult {
     /// One read-only report per requested (or supported) hook agent.
     pub agents: Vec<IntegrationAgentStatus>,
+    /// Whether the daemon honors the `profile` and `all_profiles` selectors.
+    /// A daemon that predates them ignores the selectors and omits this field,
+    /// so a client that must not act on the wrong home checks it first.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub home_selectors: bool,
 }
 
 /// Read-only installation state for one managed hook integration.
@@ -123,6 +231,11 @@ pub struct IntegrationAgentStatus {
     /// Non-fatal, non-secret reasons the complete install contract is unhealthy.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The config home the report describes; present only on a profile-aware
+    /// request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub home: Option<IntegrationHome>,
 }
 
 /// Safe recovery action for one managed hook integration report.
@@ -170,6 +283,11 @@ pub struct IntegrationInstallReport {
     /// succeeded; empty when cleanup completed.
     #[serde(default)]
     pub cleanup_incomplete: Vec<String>,
+    /// The config home that was installed into; present only on a
+    /// profile-aware request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub home: Option<IntegrationHome>,
 }
 
 /// Parameters for `integration.uninstall`.
@@ -187,6 +305,16 @@ pub struct IntegrationInstallReport {
 pub struct IntegrationUninstallParams {
     /// Agent to remove the managed hooks for.
     pub agent: RuntimeRef,
+    /// Remove from the config home the named host profile launches with.
+    /// Local owner connections only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub profile: Option<String>,
+    /// Remove from every distinct config home of the runtime, one transaction
+    /// per home. Local owner connections only; exclusive with `profile`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub all_profiles: bool,
 }
 
 /// Outcome of removing one agent's managed hooks.
@@ -226,6 +354,11 @@ pub struct IntegrationUninstallReport {
     /// succeeded; empty when cleanup completed.
     #[serde(default)]
     pub cleanup_incomplete: Vec<String>,
+    /// The config home that was removed from; present only on a profile-aware
+    /// request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub home: Option<IntegrationHome>,
 }
 
 /// Result returned by `integration.uninstall`.
@@ -236,8 +369,17 @@ pub struct IntegrationUninstallReport {
     ts(export, export_to = "IntegrationUninstallResult.ts")
 )]
 pub struct IntegrationUninstallResult {
-    /// The report for the agent the removal ran for.
+    /// One report per config home the removal ran for.
     pub uninstalled: Vec<IntegrationUninstallReport>,
+    /// Homes whose removal failed while the others ran; only a request with
+    /// `all_profiles` reports failures here, and each home is its own
+    /// transaction with no atomicity across homes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(
+        feature = "ts",
+        ts(as = "Option<Vec<IntegrationHomeFailure>>", optional)
+    )]
+    pub failed: Vec<IntegrationHomeFailure>,
 }
 
 /// Request parameters for `integration.doctor`.
@@ -253,6 +395,17 @@ pub struct IntegrationDoctorParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<RuntimeRef>,
+    /// Diagnose the config home the named host profile launches with. The
+    /// diagnosis carries paths derived from the profile's environment, so only
+    /// local owner connections may set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub profile: Option<String>,
+    /// Diagnose every distinct config home of the selected runtime(s); local
+    /// owner connections only; exclusive with `profile`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub all_profiles: bool,
 }
 
 /// Stable identifier of one doctor finding.
@@ -355,6 +508,11 @@ pub struct IntegrationAgentDoctor {
     pub status: Option<IntegrationAgentStatus>,
     /// Every observed cause, in a stable order.
     pub findings: Vec<IntegrationFinding>,
+    /// The config home the diagnosis describes; present only on a
+    /// profile-aware request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub home: Option<IntegrationHome>,
 }
 
 /// Result returned by `integration.doctor`.
@@ -366,6 +524,11 @@ pub struct IntegrationDoctorResult {
     pub ok: bool,
     /// One diagnosis per requested (or supported) hook agent.
     pub agents: Vec<IntegrationAgentDoctor>,
+    /// Whether the daemon honors the `profile` and `all_profiles` selectors;
+    /// see `IntegrationStatusResult::home_selectors`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub home_selectors: bool,
 }
 
 #[cfg(test)]
@@ -386,6 +549,164 @@ mod tests {
         .expect_err("unknown integration status fields must fail");
 
         assert!(error.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn requests_without_the_home_selectors_keep_their_pre_existing_wire_shape() {
+        use super::{
+            IntegrationDoctorParams, IntegrationInstallParams, IntegrationStatusParams,
+            IntegrationUninstallParams,
+        };
+        use crate::RuntimeRef;
+
+        // An older client sends neither selector, and a request that sets none
+        // serializes to exactly what that client sends.
+        assert_eq!(
+            serde_json::to_value(IntegrationInstallParams::default()).expect("serialize"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(IntegrationStatusParams::default()).expect("serialize"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(IntegrationDoctorParams::default()).expect("serialize"),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            serde_json::to_value(IntegrationUninstallParams {
+                agent: RuntimeRef::claude(),
+                profile: None,
+                all_profiles: false,
+            })
+            .expect("serialize"),
+            serde_json::json!({ "agent": "claude" })
+        );
+        for old in [
+            serde_json::json!({}),
+            serde_json::json!({ "agent": "codex" }),
+        ] {
+            let install: IntegrationInstallParams =
+                serde_json::from_value(old.clone()).expect("an older install request parses");
+            assert_eq!((install.profile, install.all_profiles), (None, false));
+            let status: IntegrationStatusParams =
+                serde_json::from_value(old.clone()).expect("an older status request parses");
+            assert_eq!((status.profile, status.all_profiles), (None, false));
+            let doctor: IntegrationDoctorParams =
+                serde_json::from_value(old).expect("an older doctor request parses");
+            assert_eq!((doctor.profile, doctor.all_profiles), (None, false));
+        }
+        let uninstall: IntegrationUninstallParams =
+            serde_json::from_value(serde_json::json!({ "agent": "claude" }))
+                .expect("an older uninstall request parses");
+        assert_eq!((uninstall.profile, uninstall.all_profiles), (None, false));
+    }
+
+    #[test]
+    fn the_home_selectors_round_trip_and_unknown_install_fields_are_rejected() {
+        let install = super::IntegrationInstallParams {
+            agent: Some(crate::RuntimeRef::claude()),
+            profile: Some("work".to_owned()),
+            all_profiles: false,
+        };
+        let wire = serde_json::to_value(&install).expect("serialize");
+        assert_eq!(
+            wire,
+            serde_json::json!({ "agent": "claude", "profile": "work" })
+        );
+        assert_eq!(
+            serde_json::from_value::<super::IntegrationInstallParams>(wire).expect("parse"),
+            install
+        );
+        let all = serde_json::to_value(super::IntegrationInstallParams {
+            all_profiles: true,
+            ..super::IntegrationInstallParams::default()
+        })
+        .expect("serialize");
+        assert_eq!(all, serde_json::json!({ "all_profiles": true }));
+        let error = serde_json::from_value::<super::IntegrationInstallParams>(
+            serde_json::json!({ "agent": "claude", "all_profile": true }),
+        )
+        .expect_err("a misspelled selector must not narrow an install");
+        assert!(error.to_string().contains("unknown field `all_profile`"));
+    }
+
+    #[test]
+    fn results_without_labels_or_failures_keep_their_pre_existing_wire_shape() {
+        let result = super::IntegrationInstallResult {
+            installed: vec![super::IntegrationInstallReport {
+                agent: crate::RuntimeRef::claude(),
+                hook_path: "/h/hooks/x.sh".to_owned(),
+                config_paths: vec![],
+                cleanup_incomplete: vec![],
+                home: None,
+            }],
+            failed: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(&result).expect("serialize"),
+            serde_json::json!({
+                "installed": [{
+                    "agent": "claude",
+                    "hook_path": "/h/hooks/x.sh",
+                    "config_paths": [],
+                    "cleanup_incomplete": [],
+                }]
+            })
+        );
+        let older: super::IntegrationInstallResult = serde_json::from_value(serde_json::json!({
+            "installed": [{
+                "agent": "claude",
+                "hook_path": "/h/hooks/x.sh",
+                "config_paths": [],
+            }]
+        }))
+        .expect("a result without labels or failures parses");
+        assert!(older.failed.is_empty() && older.installed[0].home.is_none());
+    }
+
+    #[test]
+    fn a_result_proves_selector_support_only_when_the_marker_is_present() {
+        let older: super::IntegrationStatusResult =
+            serde_json::from_value(serde_json::json!({ "agents": [] })).expect("older result");
+        assert!(!older.home_selectors, "an older daemon omits the marker");
+        let newer = super::IntegrationStatusResult {
+            agents: vec![],
+            home_selectors: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&newer).expect("serialize"),
+            serde_json::json!({ "agents": [], "home_selectors": true })
+        );
+        let doctor: super::IntegrationDoctorResult =
+            serde_json::from_value(serde_json::json!({ "ok": true, "agents": [] }))
+                .expect("older doctor result");
+        assert!(!doctor.home_selectors);
+    }
+
+    #[test]
+    fn the_recovery_selector_round_trips_with_a_stable_shape() {
+        let home = super::IntegrationHome {
+            profiles: vec!["b-real".to_owned()],
+            bare: false,
+            selector: Some(super::IntegrationSelector::Profile {
+                name: "b-real".to_owned(),
+            }),
+        };
+        let wire = serde_json::to_value(&home).expect("serialize");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "profiles": ["b-real"],
+                "selector": { "kind": "profile", "name": "b-real" }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<super::IntegrationHome>(wire).expect("parse"),
+            home
+        );
+        let default = serde_json::to_value(super::IntegrationSelector::Default).expect("ser");
+        assert_eq!(default, serde_json::json!({ "kind": "default" }));
     }
 
     #[test]

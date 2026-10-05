@@ -784,6 +784,21 @@ owner-local launches never need the key. Connecting a relay-origin
 [#82](https://github.com/zajca/pohunek/issues/82); until then the relay
 variant is covered at the resolution seam only.
 
+A runtime declares its config home (the directory its agent keeps settings,
+hook registration and conversations in) in an optional `[config_home]` table: a
+variable name and a home-relative default. One resolver
+(`crates/daemon/src/agent/host/config_home.rs`, applied by
+`crates/daemon/src/integration/homes.rs`) answers what a launch would give the
+agent: the variable read from the launch environment (the daemon's base
+environment overridden by the host profile's `[env]`), else the default below
+that environment's `HOME`. A non-absolute value is a typed error and is never
+expanded with the daemon's `HOME`. The integration handlers take the resolved
+directory instead of resolving one themselves, so install, status, doctor,
+removal and a launched agent agree; `profile` and `all_profiles` on the
+integration methods select one profile's home or every distinct home (one
+transaction per canonical directory) and are served on the local control socket
+only.
+
 The built-in descriptors and the remaining per-agent names are data or work
 owned by other issues. A source-scan test
 (`crates/xtask/tests/no_special_dispatch.rs`) pins every production line under

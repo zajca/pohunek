@@ -34,3 +34,9 @@ strategy = "hook"
 [integration]
 handler = "codex-hook-v1"
 hook_schema = "identity-subagent-v1"
+
+# Where Codex keeps its settings and hook registration: the variable it reads
+# to relocate its home, else this directory below the user's home.
+[config_home]
+env = "CODEX_HOME"
+default = ".codex"

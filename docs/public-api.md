@@ -468,10 +468,10 @@ All params and result type names below refer to structs exported by
 | `session.policy.set` | `SessionPolicyParams` | `SessionPolicyResult` | Validates, replaces, and persists the session retention policy at `<data_dir>/session-policy.json`. The running sweep task reloads it on its next cycle, so no daemon restart is needed. |
 | `session.retention.sweep` | `SessionRetentionParams` or `null` | `SessionRetentionResult` | Runs one retention sweep under the current policy TTLs, or reports the selection when `dry_run` is true. It works whether or not automatic sweeps are enabled, never exceeds the policy's own per-sweep removal cap, and never selects an `external` session or one in `conflict`/`incompatible` runtime state. A matched session whose pohunek-owned worktree has an uncommitted change, an untracked file, commits contained in no other branch/remote/tag, or a state git cannot report is **held**, never removed: it is counted in `held`, excluded from `eligible`, and carries the `hold` reason (`worktree_uncommitted`, `worktree_untracked`, `worktree_unpushed`, `worktree_unknown`) on its candidate. One sweep inspects at most 64 checkouts; a matched session beyond that bound is held as `worktree_unknown` and inspected by the next sweep. `worktrees_cleaned` counts only checkouts confirmed gone from disk; a checkout that survived its removal is reported in `worktrees_failed`. The `pohunek session retention sweep` CLI exits non-zero when `failed` or `worktrees_failed` is above zero. |
 | `subscribe` | `null` | `{subscribed: true}` then event stream | Consumes the connection into a one-way event stream. |
-| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications. Each report carries `cleanup_incomplete`, the quarantine paths of replaced originals whose deletion did not finish after the install committed (empty when cleanup completed). |
-| `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. `null` selects both agents; unknown parameter fields return `bad_request`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. |
-| `integration.uninstall` | `IntegrationUninstallParams` (`agent` required) | `IntegrationUninstallResult` | Removes exactly the assets and registrations the installer owns for Codex and Claude, as one rollback-protected transaction under the installer lock: registration first, then Codex trust records, then marker-carrying scripts. User hooks, the Codex hooks feature flag, the hooks directory, and the lock file are left alone; a symlink, directory, FIFO, or unmarked file at a managed script path is preserved and reported in `preserved_paths`. Each report carries `state` (`removed` or `not_installed`), `removed_paths`, `updated_paths`, `preserved_paths`, and `cleanup_incomplete` (quarantined originals whose deletion did not finish after the removal committed). `agent` names the one agent to remove and is required: a missing agent, unknown fields, and `null` params return `bad_request`, so removal never widens to every agent and a failure cannot leave one agent removed without a report. Ownership is judged on the inode that is deleted, and a provider file whose content, mode, or inode changed since it was read is a collision. The same re-verification runs before any rollback, so a file another writer changed is kept there too rather than replaced by the original. Every rollback or cleanup outcome that leaves data in quarantine is reported with its true path, as `integration_recovery_required` during a rollback and as `cleanup_incomplete` after commit. A registration file the removal wrote that another writer changed before the scripts are removed, or before the removal completes, is also a collision: it is re-verified (inode, mode, complete content), the other version is kept, and the removed scripts are moved back. Collisions, interrupted rollbacks, and concurrent installers return `integration_destination_collision`, `integration_recovery_required`, and `integration_install_in_progress`. |
-| `integration.doctor` | `IntegrationDoctorParams` or `null` | `IntegrationDoctorResult` | Read-only diagnosis of the managed Codex and Claude hooks: per agent `ok`, the status report (absent while an operation is running), and findings with a stable snake_case `code`, `severity` (`info` or `error`), `summary`, and `remediation`. Only the absence expected of a not-installed integration is informational: an unsafe, symlinked, or group-writable config path is an error even when nothing is installed. Codes cover absent agents and hooks, config-root, asset, registration, provider-config, and Codex feature/trust drift, `displaced_original_left_behind` (a quarantined original from an earlier install or removal remains in the agent config directory) and `quarantine_scan_incomplete` (the bounded scan could not cover every entry, so it is an error and the diagnosis is never clean), and `operation_in_progress` (info: another install, uninstall, or doctor holds the installer lock, so nothing is read or scanned for that agent, `status` is absent, and the doctor stays `ok`; the doctor takes the lock non-blocking without creating the file and holds it for its whole inspection, so an installer arriving meanwhile gets `integration_install_in_progress`), `unsafe_installer_lock` (error: the lock file is not a regular owner-private file, so every install and uninstall fails), `install_drift`, and three informational `python3` notes that never fail the doctor or change its exit code, because the daemon cannot know the agent's `PATH`: `hook_runtime_python_found` (the first executable `python3` behind an absolute entry of the daemon's own `PATH`), `hook_runtime_missing` (none found; relative and empty entries are skipped), and `hook_runtime_macos_shim` (the first one is the `/usr/bin/python3` stub, recognized through any alias, with no Command Line Tools or Xcode behind it); the probe never runs an interpreter and the remediation is to verify `python3` on the agent's `PATH`, and `hook_socket_path_invalid` (daemon or worker socket path over the platform limit). The runtime notes apply only to an agent whose hooks are installed. `null` selects both agents; unknown fields return `bad_request`. |
+| `integration.install` | `IntegrationInstallParams` or `null` | `IntegrationInstallResult` | Installs agent hooks for active-agent state, native session id capture, provider-managed subagent lifecycle, and notifications into the config home of the selected runtime(s). Each report carries `cleanup_incomplete`, the quarantine paths of replaced originals whose deletion did not finish after the install committed (empty when cleanup completed). `profile` selects the config home a host profile launches with and `all_profiles` every distinct home of the runtime (see "Config homes and host profiles"); both are local-only, exclusive, and unknown fields return `bad_request`. With `all_profiles` a home that fails is listed in `failed` (`{agent, home, error}`) while the others still install, and the result is not atomic across homes. |
+| `integration.status` | `IntegrationStatusParams` or `null` | `IntegrationStatusResult` | Returns a read-only per-agent report for managed Codex and Claude hooks: availability, expected and present asset paths, inspected registration paths, installed and expected versions, aggregate health (`not_installed`, `current`, or `outdated`), typed recovery (`none`, `reinstall`, or `repair_configuration`), and non-secret warnings. `null` selects both agents; unknown parameter fields return `bad_request`. `profile` and `all_profiles` select profile config homes (local-only; see "Config homes and host profiles") and label each report with `home`. `current` requires exact managed executable permissions and exactly one registration under each installer-owned event. Inspection is size-bounded and runs outside the Tokio request task. It never mutates provider configuration. |
+| `integration.uninstall` | `IntegrationUninstallParams` (`agent` required) | `IntegrationUninstallResult` | Removes exactly the assets and registrations the installer owns for Codex and Claude, as one rollback-protected transaction under the installer lock: registration first, then Codex trust records, then marker-carrying scripts. User hooks, the Codex hooks feature flag, the hooks directory, and the lock file are left alone; a symlink, directory, FIFO, or unmarked file at a managed script path is preserved and reported in `preserved_paths`. Each report carries `state` (`removed` or `not_installed`), `removed_paths`, `updated_paths`, `preserved_paths`, and `cleanup_incomplete` (quarantined originals whose deletion did not finish after the removal committed). `agent` names the one agent to remove and is required: a missing agent, unknown fields, and `null` params return `bad_request`, so removal never widens to every agent and a failure cannot leave one agent removed without a report. `profile` selects one profile's config home and `all_profiles` every distinct home of that agent, one transaction per home with failures listed in `failed` and no atomicity across homes (local-only; see "Config homes and host profiles"); an absent `agent` is still `bad_request` with either. Ownership is judged on the inode that is deleted, and a provider file whose content, mode, or inode changed since it was read is a collision. The same re-verification runs before any rollback, so a file another writer changed is kept there too rather than replaced by the original. Every rollback or cleanup outcome that leaves data in quarantine is reported with its true path, as `integration_recovery_required` during a rollback and as `cleanup_incomplete` after commit. A registration file the removal wrote that another writer changed before the scripts are removed, or before the removal completes, is also a collision: it is re-verified (inode, mode, complete content), the other version is kept, and the removed scripts are moved back. Collisions, interrupted rollbacks, and concurrent installers return `integration_destination_collision`, `integration_recovery_required`, and `integration_install_in_progress`. |
+| `integration.doctor` | `IntegrationDoctorParams` or `null` | `IntegrationDoctorResult` | Read-only diagnosis of the managed Codex and Claude hooks: per agent `ok`, the status report (absent while an operation is running), and findings with a stable snake_case `code`, `severity` (`info` or `error`), `summary`, and `remediation`. Only the absence expected of a not-installed integration is informational: an unsafe, symlinked, or group-writable config path is an error even when nothing is installed. Codes cover absent agents and hooks, config-root, asset, registration, provider-config, and Codex feature/trust drift, `displaced_original_left_behind` (a quarantined original from an earlier install or removal remains in the agent config directory) and `quarantine_scan_incomplete` (the bounded scan could not cover every entry, so it is an error and the diagnosis is never clean), and `operation_in_progress` (info: another install, uninstall, or doctor holds the installer lock, so nothing is read or scanned for that agent, `status` is absent, and the doctor stays `ok`; the doctor takes the lock non-blocking without creating the file and holds it for its whole inspection, so an installer arriving meanwhile gets `integration_install_in_progress`), `unsafe_installer_lock` (error: the lock file is not a regular owner-private file, so every install and uninstall fails), `install_drift`, and three informational `python3` notes that never fail the doctor or change its exit code, because the daemon cannot know the agent's `PATH`: `hook_runtime_python_found` (the first executable `python3` behind an absolute entry of the daemon's own `PATH`), `hook_runtime_missing` (none found; relative and empty entries are skipped), and `hook_runtime_macos_shim` (the first one is the `/usr/bin/python3` stub, recognized through any alias, with no Command Line Tools or Xcode behind it); the probe never runs an interpreter and the remediation is to verify `python3` on the agent's `PATH`, and `hook_socket_path_invalid` (daemon or worker socket path over the platform limit). The runtime notes apply only to an agent whose hooks are installed. `null` selects both agents; unknown fields return `bad_request`. `profile` and `all_profiles` diagnose profile config homes (local-only; see "Config homes and host profiles"); each diagnosis carries `home`, and the recovery commands in its findings name `--profile` for a profile's home. |
 | `assistant.materialize` | `AssistantMaterializeParams` | `AssistantMaterializeResult` | Materializes the assistant knowledge bundle on the daemon host. |
 | `notification.create` | `NotificationCreateParams` | `NotificationCreateResult` | Creates a host-local notification. Daemon policy is enforced for every producer, including provider hooks and daemon projectors. Dedupe may return `created: false` with an existing or upgraded record. `agent_blocked`/`approval_required` with `attention:<session_id>` and `turn_completed` with `turn:<session_id>` are deferred: the result still reports `created: true` with a minted id, but the record is held pending until `attention_debounce_secs` elapses; see `NotificationPolicy`. |
 | `notification.list` | `NotificationListParams` or `null` | `NotificationListResult` | Lists notification records with exact-match filters and cursor pagination. Deleted records are excluded unless `status: deleted` is requested. |
@@ -758,6 +758,27 @@ session reference that resume and fork consume. The table is required.
 
 The built-in runtimes declare `shell` = `none` and `codex`, `claude`, `hermes`
 = `hook`, so their behavior is unchanged.
+
+### Config home
+
+A runtime may declare where its agent keeps its configuration, hook registration
+and conversations, apart from `[integration]` because the home concerns every
+runtime:
+
+```toml
+[config_home]
+env = "CLAUDE_CONFIG_DIR"
+default = ".claude"
+```
+
+`env` names the variable the agent reads to relocate its home (upper-case, not
+in the reserved `POHUNEK_` namespace) and `default` is the directory below the
+user's home used while the variable is unset or empty (a relative path of plain
+components: no `..`, no absolute path, no glob or shell characters, bounded).
+Both keys are required and unknown keys are refused (`descriptor_invalid`). The
+daemon-run integration handlers install into this home, so a runtime that names
+one needs the table. The built-in `claude` and `codex` declare it; a package may
+too. Pi keeps declaring its conversation root under `[native_reference.existence]`.
 
 ### Hook schemas
 
@@ -1737,8 +1758,65 @@ id. The handlers are compiled core code and a closed set (`codex-hook-v1`,
 daemon answers `agent_not_installable` for it). A handler owns one active asset
 set, its accepted paths and modes, conflict detection, and rollback; a package
 never supplies installer logic. Bare `integration.install`, `status`, and
-`doctor` visit each daemon-run handler once, in runtime-id order of the first
-runtime naming it, and reports carry the runtime the request addressed.
+`doctor` visit each distinct config home of the daemon-run runtimes once (the
+same handler on the same canonical directory is one home), in runtime-id order
+of the first runtime naming it, and reports carry the runtime the request
+addressed.
+
+#### Config homes and host profiles
+
+The directory a handler installs into is the config home its runtime declares
+(the `[config_home]` descriptor table, see "Config home" under the runtime
+package format), resolved the way a launch resolves it: the declared variable
+read from the environment the launched agent sees (the daemon's base
+environment, which only forwards variables its allowlist names, overridden by
+the host profile's own `[env]`), else the declared default below that
+environment's `HOME`. A value that is not an absolute path (a literal `~`
+included) is `agent_config_dir_invalid`; it is never expanded with the daemon's
+`HOME`. A runtime that names a daemon-run handler but declares no
+`[config_home]` is `agent_config_home_undeclared`. The built-in `claude` and
+`codex` declare `CLAUDE_CONFIG_DIR` / `.claude` and `CODEX_HOME` / `.codex`.
+The daemon's own process environment steers nothing unless the allowlist
+forwards the variable, so an install, a status report and a launched agent
+always agree on the directory. A daemon that relied on such a variable in its
+service environment must add it to the environment allowlist (so launched agents
+see it too) or move it into a host profile's `[env]` and select the profile;
+hooks installed in the directory the daemon's own variable names are not
+reported. A package runtime without `[config_home]` is left out of bare
+`install`, `status` and `doctor`.
+
+`profile` (a host profile name) and `all_profiles` (boolean, exclusive with
+`profile`) on `integration.install`, `status`, `doctor` and `uninstall` select
+which home a request acts on; without either the runtime's own (profile-less)
+home is used and the request is unchanged. `profile` must be a host profile of
+the selected runtime (`integration_profile_runtime_mismatch` otherwise; a name
+that is no profile file, a bare runtime name included, is
+`agent_profile_not_found`), and without `agent` the profile's runtime is the
+selection. `all_profiles` covers the runtime's own home and the home of each of
+its resolvable host profiles (a profile that does not resolve is skipped and
+logged, as `host.inspect` does). Selectors that resolve to the same canonical
+directory share one home and one transaction; the report's `home`
+(`{profiles, bare, selector}`) names every selector it stands for and carries
+`selector` (`{kind: "default"}` or `{kind: "profile", name}`), the one the
+daemon verified reaches the directory the installer uses: an alias can resolve
+through a symlink the installer refuses, so recovery commands are built from
+`selector`, never from the order of `profiles` or from `bare`.
+`IntegrationStatusResult` and `IntegrationDoctorResult` carry
+`home_selectors: true`; a daemon that predates the selectors omits it (and an
+older `integration.install` silently ignores the selector fields), so a client
+checks the marker before it sends a mutation that carries a selector. Install under
+`all_profiles` skips homes whose directory does not exist and fails with
+`agent_config_dir_missing` only when none exists. Each home is its own
+transaction under its own installer lock, so a failing home rolls back to its
+exact prior tree and leaves the others as they are; `install` and `uninstall`
+list a failing home in `failed` and the CLI then exits non-zero, and `status`
+and `doctor` report an unresolvable home as a degraded report instead.
+
+`profile` and `all_profiles` are accepted only from the local control socket:
+reports, errors and installed paths name directories derived from a profile's
+environment, which can hold secrets. A remote overlay connection gets
+`daemon/local_only_method` before any parameter is acted on. The team relay is
+not a daemon transport yet; a relay-originated path must never arrive as local.
 
 An install over an existing asset set is an update transaction: the handler
 stages the new set against the active one without changing it, proves

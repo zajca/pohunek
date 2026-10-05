@@ -21,6 +21,7 @@ use protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::config_home::ConfigHome;
 use super::version_probe::{VersionProbePolicy, SEMVER_PARSER_ID};
 use crate::agent::{
     AssignedReference, ExistenceSpec, InputRules, InputTextPolicy, NativeArgs, NativeLaunchError,
@@ -337,6 +338,7 @@ pub struct RuntimeDefinition {
     version_probe_parser: Option<HandlerId>,
     version_probe_policy: Option<VersionProbePolicy>,
     integration: Option<Integration>,
+    config_home: Option<ConfigHome>,
 }
 
 impl RuntimeDefinition {
@@ -434,7 +436,19 @@ impl RuntimeDefinition {
             version_probe_parser,
             version_probe_policy,
             integration,
+            config_home: None,
         })
+    }
+
+    /// This definition declaring `config_home` as the directory its agent keeps
+    /// its configuration in.
+    ///
+    /// The declaration is separate from [`DefinitionParts`] because it names
+    /// where the agent's own files live and takes no part in launching it.
+    #[must_use]
+    pub fn with_config_home(mut self, config_home: ConfigHome) -> Self {
+        self.config_home = Some(config_home);
+        self
     }
 
     /// Parses a `runtime.toml` document.
@@ -498,7 +512,12 @@ impl RuntimeDefinition {
             Duration::from_millis(raw.input.submit_delay_ms),
         );
         let native = raw.native()?;
-        Self::new(DefinitionParts {
+        let config_home = raw
+            .config_home
+            .as_ref()
+            .map(|declared| ConfigHome::new(&declared.env, &declared.default))
+            .transpose()?;
+        let definition = Self::new(DefinitionParts {
             runtime_id,
             origin: origin(package),
             display_name: raw.runtime.name,
@@ -534,6 +553,10 @@ impl RuntimeDefinition {
                     )
                 })
                 .transpose()?,
+        })?;
+        Ok(match config_home {
+            Some(config_home) => definition.with_config_home(config_home),
+            None => definition,
         })
     }
 
@@ -631,6 +654,12 @@ impl RuntimeDefinition {
     #[must_use]
     pub fn hook_schema(&self) -> Option<&'static HookSchema> {
         self.integration.as_ref().map(Integration::hook_schema)
+    }
+
+    /// Where the agent keeps its configuration, when the descriptor declares it.
+    #[must_use]
+    pub fn config_home(&self) -> Option<&ConfigHome> {
+        self.config_home.as_ref()
     }
 }
 
@@ -857,6 +886,8 @@ struct RawDefinition {
     native_reference: RawNativeReference,
     #[serde(default)]
     integration: Option<RawIntegration>,
+    #[serde(default)]
+    config_home: Option<RawConfigHome>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -963,6 +994,13 @@ struct RawNativeReference {
 struct RawIntegration {
     handler: String,
     hook_schema: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigHome {
+    env: String,
+    default: String,
 }
 
 impl RawDefinition {

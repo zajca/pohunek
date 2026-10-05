@@ -1560,3 +1560,25 @@ fn builtin_runtimes_resolve_their_hook_schema() {
     }
     assert!(package_definition("acme").hook_schema().is_none());
 }
+
+#[test]
+fn the_builtin_runtimes_declare_their_config_homes() {
+    let host = super::fixture::builtin_host();
+    let declared = |id: &str| {
+        host.resolve_ref(&protocol::RuntimeRef::from_wire(id))
+            .expect("a built-in runtime")
+            .config_home()
+            .map(|home| (home.env().to_owned(), home.default_relative().to_owned()))
+    };
+
+    assert_eq!(
+        declared("claude"),
+        Some(("CLAUDE_CONFIG_DIR".to_owned(), ".claude".to_owned()))
+    );
+    assert_eq!(
+        declared("codex"),
+        Some(("CODEX_HOME".to_owned(), ".codex".to_owned()))
+    );
+    assert_eq!(declared("hermes"), None);
+    assert_eq!(declared("shell"), None);
+}

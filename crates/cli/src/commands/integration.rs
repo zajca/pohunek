@@ -5,7 +5,7 @@
 //! follow `--host`). Hermes is an owner-local plugin lifecycle and deliberately
 //! never contacts the daemon.
 
-// Rust guideline compliant 2026-09-19
+// Rust guideline compliant 2026-10-05
 
 use std::env;
 use std::fmt::Write as _;
@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 use clap::ValueEnum;
 use protocol::{
     method, ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult,
-    IntegrationFindingSeverity, IntegrationInstallParams, IntegrationInstallResult,
-    IntegrationInstallState, IntegrationStatusParams, IntegrationStatusResult,
-    IntegrationUninstallParams, IntegrationUninstallResult, IntegrationUninstallState,
-    ProtocolError, RuntimeId, RuntimeRef,
+    IntegrationFindingSeverity, IntegrationHome, IntegrationHomeFailure, IntegrationInstallParams,
+    IntegrationInstallResult, IntegrationInstallState, IntegrationSelector,
+    IntegrationStatusParams, IntegrationStatusResult, IntegrationUninstallParams,
+    IntegrationUninstallResult, IntegrationUninstallState, ProtocolError, RuntimeId, RuntimeRef,
 };
 use serde::Serialize;
 
@@ -284,7 +284,112 @@ impl HermesAction {
     }
 }
 
+/// Which config home of a Codex or Claude runtime a command acts on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HomeSelectionArgs {
+    /// Host profile whose config home is selected.
+    pub(crate) profile: Option<String>,
+    /// Every distinct config home of the selected runtime.
+    pub(crate) all_profiles: bool,
+}
+
+impl HomeSelectionArgs {
+    /// Whether the invocation names a home other than the runtime's own.
+    #[must_use]
+    pub(crate) fn is_selected(&self) -> bool {
+        self.profile.is_some() || self.all_profiles
+    }
+
+    /// Refuses a home selection for the Hermes plugin, which lives in a Hermes
+    /// home chosen with `--hermes-profile` or `--hermes-home`.
+    ///
+    /// # Errors
+    ///
+    /// A typed configuration error when a selector is present.
+    pub(crate) fn refuse_for_hermes(&self) -> Result<(), CliError> {
+        if self.is_selected() {
+            return Err(CliError::Protocol(ProtocolError::new(
+                ErrorClass::Configuration,
+                "integration_profile_not_for_hermes",
+                "`--profile` and `--all-profiles` select Codex or Claude config homes, not a Hermes home"
+                    .to_owned(),
+                Some("use `--hermes-profile` or `--hermes-home` for Hermes".to_owned()),
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `integration_home_selectors_unsupported`: the daemon predates `--profile` and
+/// `--all-profiles`, so it would act on the runtime's own home.
+fn selectors_unsupported() -> CliError {
+    CliError::Protocol(ProtocolError::new(
+        ErrorClass::Configuration,
+        "integration_home_selectors_unsupported",
+        "the daemon does not support `--profile` and `--all-profiles`; it would act on the default config home instead"
+            .to_owned(),
+        Some("update and restart the pohunek daemon to the release of this CLI".to_owned()),
+    ))
+}
+
+/// The unsupported-selector error for a daemon that rejected the selectors as
+/// unknown fields; any other error is unchanged.
+fn unsupported_if_rejected(error: CliError, home: &HomeSelectionArgs) -> CliError {
+    match error {
+        CliError::Protocol(inner) if home.is_selected() && inner.code == "bad_request" => {
+            selectors_unsupported()
+        }
+        other => other,
+    }
+}
+
+/// Proves, with a read-only request on `client`, that the daemon honors the
+/// home selectors before a mutation that carries them is sent.
+///
+/// A daemon that predates the selectors ignores them on install and returns no
+/// `home_selectors` marker (or rejects them as unknown fields), and a request
+/// it ignored the selectors of would change the wrong home. Nothing is sent
+/// when no selector is set.
+async fn require_selector_support(
+    client: &mut Client,
+    agent: Option<RuntimeRef>,
+    home: &HomeSelectionArgs,
+) -> Result<(), CliError> {
+    if !home.is_selected() {
+        return Ok(());
+    }
+    let probe = IntegrationStatusParams {
+        agent,
+        profile: home.profile.clone(),
+        all_profiles: home.all_profiles,
+    };
+    match client.call::<method::IntegrationStatus>(probe).await {
+        Ok(result) if result.home_selectors => Ok(()),
+        Ok(_) => Err(selectors_unsupported()),
+        Err(CliError::Protocol(error)) if error.code == "bad_request" => {
+            Err(selectors_unsupported())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// How a result names the config home it describes.
+fn home_label(home: &IntegrationHome) -> String {
+    let mut parts = Vec::new();
+    if home.bare {
+        parts.push("default".to_owned());
+    }
+    parts.extend(
+        home.profiles
+            .iter()
+            .map(|profile| format!("profile {profile}")),
+    );
+    parts.join(", ")
+}
+
 /// Run the original daemon-backed Codex or Claude hook installation.
+///
+/// Returns whether every selected home was installed.
 ///
 /// # Errors
 ///
@@ -293,15 +398,19 @@ impl HermesAction {
 pub(crate) async fn run_install(
     paths: &Paths,
     agent: Option<HookAgentArg>,
+    home: &HomeSelectionArgs,
     json: bool,
-) -> Result<(), CliError> {
+) -> Result<bool, CliError> {
     let params = IntegrationInstallParams {
         agent: agent.map(Into::into),
+        profile: home.profile.clone(),
+        all_profiles: home.all_profiles,
     };
     // Installing hooks is inherently a *local* daemon operation: it writes into
     // this machine's agent config dirs. Always use the local transport regardless
     // of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    require_selector_support(&mut client, params.agent.clone(), home).await?;
     let result: IntegrationInstallResult =
         client.call::<method::IntegrationInstall>(params).await?;
 
@@ -310,7 +419,7 @@ pub(crate) async fn run_install(
     } else {
         print!("{}", render_install_human(&result));
     }
-    Ok(())
+    Ok(result.failed.is_empty())
 }
 
 /// Run the read-only Codex and Claude integration status RPC.
@@ -322,13 +431,22 @@ pub(crate) async fn run_status(
     host: &str,
     paths: &Paths,
     agent: Option<HookAgentArg>,
+    home: &HomeSelectionArgs,
     json: bool,
 ) -> Result<(), CliError> {
     let params = IntegrationStatusParams {
         agent: agent.map(Into::into),
+        profile: home.profile.clone(),
+        all_profiles: home.all_profiles,
     };
     let mut client = Client::connect(host, paths).await?;
-    let result: IntegrationStatusResult = client.call::<method::IntegrationStatus>(params).await?;
+    let result: IntegrationStatusResult = client
+        .call::<method::IntegrationStatus>(params)
+        .await
+        .map_err(|error| unsupported_if_rejected(error, home))?;
+    if home.is_selected() && !result.home_selectors {
+        return Err(selectors_unsupported());
+    }
 
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -340,6 +458,8 @@ pub(crate) async fn run_status(
 
 /// Run the daemon-backed Codex and Claude hook removal.
 ///
+/// Returns whether every selected home was removed from.
+///
 /// # Errors
 ///
 /// Returns [`CliError`] if the daemon is unreachable, rejects the request, or
@@ -347,14 +467,18 @@ pub(crate) async fn run_status(
 pub(crate) async fn run_uninstall(
     paths: &Paths,
     agent: HookAgentArg,
+    home: &HomeSelectionArgs,
     json: bool,
-) -> Result<(), CliError> {
+) -> Result<bool, CliError> {
     let params = IntegrationUninstallParams {
         agent: agent.into(),
+        profile: home.profile.clone(),
+        all_profiles: home.all_profiles,
     };
     // Removal edits this machine's agent config dirs, so it always uses the
     // local transport regardless of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    require_selector_support(&mut client, Some(params.agent.clone()), home).await?;
     let result: IntegrationUninstallResult =
         client.call::<method::IntegrationUninstall>(params).await?;
 
@@ -363,7 +487,7 @@ pub(crate) async fn run_uninstall(
     } else {
         print!("{}", render_uninstall_human(&result));
     }
-    Ok(())
+    Ok(result.failed.is_empty())
 }
 
 /// Run the read-only Codex and Claude integration doctor RPC.
@@ -377,13 +501,22 @@ pub(crate) async fn run_doctor(
     host: &str,
     paths: &Paths,
     agent: Option<HookAgentArg>,
+    home: &HomeSelectionArgs,
     json: bool,
 ) -> Result<bool, CliError> {
     let params = IntegrationDoctorParams {
         agent: agent.map(Into::into),
+        profile: home.profile.clone(),
+        all_profiles: home.all_profiles,
     };
     let mut client = Client::connect(host, paths).await?;
-    let result: IntegrationDoctorResult = client.call::<method::IntegrationDoctor>(params).await?;
+    let result: IntegrationDoctorResult = client
+        .call::<method::IntegrationDoctor>(params)
+        .await
+        .map_err(|error| unsupported_if_rejected(error, home))?;
+    if home.is_selected() && !result.home_selectors {
+        return Err(selectors_unsupported());
+    }
 
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -680,15 +813,36 @@ fn agent_label(agent: &RuntimeRef) -> &str {
     agent.as_wire()
 }
 
+/// The lines that describe the homes whose transaction failed.
+fn render_failures(output: &mut String, failed: &[IntegrationHomeFailure]) {
+    for failure in failed {
+        let _ = writeln!(
+            output,
+            "failed {} ({}): {}: {}",
+            agent_label(&failure.agent),
+            home_label(&failure.home),
+            failure.error.code,
+            failure.error.msg
+        );
+        if let Some(recover) = &failure.error.recover {
+            let _ = writeln!(output, "  fix: {recover}");
+        }
+    }
+}
+
 fn render_install_human(result: &IntegrationInstallResult) -> String {
-    if result.installed.is_empty() {
+    if result.installed.is_empty() && result.failed.is_empty() {
         return "no agent hooks installed\n".to_owned();
     }
     let mut output = String::new();
     for report in &result.installed {
+        let home = report
+            .home
+            .as_ref()
+            .map_or_else(String::new, |home| format!(" ({})", home_label(home)));
         let _ = writeln!(
             output,
-            "installed {} hook: {}",
+            "installed {} hook{home}: {}",
             agent_label(&report.agent),
             report.hook_path
         );
@@ -699,13 +853,17 @@ fn render_install_human(result: &IntegrationInstallResult) -> String {
             let _ = writeln!(output, "  cleanup incomplete: {leftover}");
         }
     }
+    render_failures(&mut output, &result.failed);
     output
 }
 
 fn render_uninstall_human(result: &IntegrationUninstallResult) -> String {
     let mut output = String::new();
     for report in &result.uninstalled {
-        let agent = agent_label(&report.agent);
+        let agent = match &report.home {
+            Some(home) => format!("{} ({})", agent_label(&report.agent), home_label(home)),
+            None => agent_label(&report.agent).to_owned(),
+        };
         match report.state {
             IntegrationUninstallState::NotInstalled => {
                 let _ = writeln!(
@@ -730,6 +888,7 @@ fn render_uninstall_human(result: &IntegrationUninstallResult) -> String {
             let _ = writeln!(output, "  cleanup incomplete: {leftover}");
         }
     }
+    render_failures(&mut output, &result.failed);
     output
 }
 
@@ -737,7 +896,11 @@ fn render_doctor_human(result: &IntegrationDoctorResult) -> String {
     let mut output = String::new();
     for agent in &result.agents {
         let verdict = if agent.ok { "ok" } else { "needs attention" };
-        let _ = writeln!(output, "{}: {verdict}", agent_label(&agent.agent));
+        let home = agent
+            .home
+            .as_ref()
+            .map_or_else(String::new, |home| format!(" ({})", home_label(home)));
+        let _ = writeln!(output, "{}{home}: {verdict}", agent_label(&agent.agent));
         for finding in &agent.findings {
             let severity = match finding.severity {
                 IntegrationFindingSeverity::Info => "info",
@@ -771,6 +934,9 @@ fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
             installed_version_label(report.installed_version),
             report.expected_version,
         );
+        if let Some(home) = &report.home {
+            let _ = writeln!(output, "  home: {}", home_label(home));
+        }
         for path in &report.expected_asset_paths {
             let _ = writeln!(output, "  expected asset: {path}");
         }
@@ -787,7 +953,7 @@ fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
         match report.recovery {
             protocol::IntegrationRecovery::None => {}
             protocol::IntegrationRecovery::Reinstall => {
-                let agent = agent_label(&report.agent);
+                let agent = recovery_selector(report);
                 if host.is_empty() || host == LOCAL_HOST {
                     let _ = writeln!(
                         output,
@@ -816,6 +982,16 @@ fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
         }
     }
     output
+}
+
+/// The `--agent` value of a recovery command, followed by the `--profile` the
+/// daemon verified reaches the home the report describes.
+fn recovery_selector(report: &protocol::IntegrationAgentStatus) -> String {
+    let agent = agent_label(&report.agent);
+    match report.home.as_ref().and_then(|home| home.selector.as_ref()) {
+        Some(IntegrationSelector::Profile { name }) => format!("{agent} --profile {name}"),
+        Some(IntegrationSelector::Default) | None => agent.to_owned(),
+    }
 }
 
 fn qualify_status_warning(host: &str, warning: &str) -> String {
@@ -962,8 +1138,10 @@ mod status_tests {
     #[test]
     fn renders_status_table_with_paths_warnings_and_versions() {
         let result = IntegrationStatusResult {
+            home_selectors: false,
             agents: vec![
                 IntegrationAgentStatus {
+                    home: None,
                     agent: RuntimeRef::claude(),
                     available: true,
                     expected_asset_paths: vec![
@@ -982,6 +1160,7 @@ mod status_tests {
                     warnings: Vec::new(),
                 },
                 IntegrationAgentStatus {
+                    home: None,
                     agent: RuntimeRef::codex(),
                     available: true,
                     expected_asset_paths: vec![
@@ -1026,7 +1205,9 @@ mod status_tests {
     #[test]
     fn configuration_recovery_never_recommends_reinstall() {
         let result = IntegrationStatusResult {
+            home_selectors: false,
             agents: vec![IntegrationAgentStatus {
+                home: None,
                 agent: RuntimeRef::codex(),
                 available: true,
                 expected_asset_paths: Vec::new(),
@@ -1050,8 +1231,8 @@ mod status_tests {
 
     #[test]
     fn remote_status_qualifies_install_commands_with_the_daemon_host() {
-        let result = IntegrationStatusResult {
-            agents: vec![IntegrationAgentStatus {
+        let result = IntegrationStatusResult { home_selectors: false,
+            agents: vec![IntegrationAgentStatus { home: None,
                 agent: RuntimeRef::codex(),
                 available: true,
                 expected_asset_paths: Vec::new(),
@@ -1096,11 +1277,15 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use clap::ValueEnum as _;
-    use protocol::{IntegrationInstallReport, IntegrationInstallResult, RuntimeRef};
+    use protocol::{
+        ErrorClass, IntegrationHome, IntegrationHomeFailure, IntegrationInstallReport,
+        IntegrationInstallResult, IntegrationUninstallReport, IntegrationUninstallResult,
+        IntegrationUninstallState, ProtocolError, RuntimeRef,
+    };
 
     use super::{
         agent_name, lifecycle_from_doctor, render_doctor_human, render_install_human,
-        render_uninstall_human, AccessModeArg, HookAgentArg,
+        render_uninstall_human, AccessModeArg, HomeSelectionArgs, HookAgentArg,
     };
     use crate::hermes_integration::doctor;
     use crate::hermes_integration::policy::{
@@ -1191,14 +1376,17 @@ mod tests {
     #[test]
     fn renders_install_reports_with_hook_and_config_paths() {
         let result = IntegrationInstallResult {
+            failed: Vec::new(),
             installed: vec![
                 IntegrationInstallReport {
+                    home: None,
                     agent: RuntimeRef::claude(),
                     hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                     config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
                     cleanup_incomplete: vec![],
                 },
                 IntegrationInstallReport {
+                    home: None,
                     agent: RuntimeRef::codex(),
                     hook_path: "/home/u/.codex/pohunek-agent-state.sh".to_owned(),
                     config_paths: vec![
@@ -1221,8 +1409,96 @@ mod tests {
     }
 
     #[test]
+    fn renders_the_home_of_each_report_and_the_failed_homes() {
+        let work = IntegrationHome {
+            selector: None,
+            profiles: vec!["work".to_owned()],
+            bare: false,
+        };
+        let shared = IntegrationHome {
+            selector: None,
+            profiles: vec!["alt".to_owned(), "work".to_owned()],
+            bare: true,
+        };
+        let result = IntegrationInstallResult {
+            installed: vec![IntegrationInstallReport {
+                agent: RuntimeRef::claude(),
+                hook_path: "/p/work/hooks/pohunek-agent-state.sh".to_owned(),
+                config_paths: vec![],
+                cleanup_incomplete: vec![],
+                home: Some(work.clone()),
+            }],
+            failed: vec![IntegrationHomeFailure {
+                agent: RuntimeRef::claude(),
+                home: shared.clone(),
+                error: ProtocolError::new(
+                    ErrorClass::Runtime,
+                    "integration_settings_invalid",
+                    "settings.json is not valid JSON",
+                    Some("repair the file".to_owned()),
+                ),
+            }],
+        };
+
+        let output = render_install_human(&result);
+
+        assert!(output.contains("installed claude hook (profile work): /p/work/hooks/"));
+        assert!(output.contains(
+            "failed claude (default, profile alt, profile work): integration_settings_invalid: settings.json is not valid JSON\n  fix: repair the file\n"
+        ));
+        let removal = IntegrationUninstallResult {
+            uninstalled: vec![IntegrationUninstallReport {
+                agent: RuntimeRef::claude(),
+                state: IntegrationUninstallState::NotInstalled,
+                removed_paths: vec![],
+                updated_paths: vec![],
+                preserved_paths: vec![],
+                cleanup_incomplete: vec![],
+                home: Some(work),
+            }],
+            failed: vec![],
+        };
+        assert!(render_uninstall_human(&removal)
+            .starts_with("claude (profile work): no managed hooks installed"));
+        let only_failures = IntegrationInstallResult {
+            installed: vec![],
+            failed: result.failed,
+        };
+        assert!(
+            !render_install_human(&only_failures).starts_with("no agent hooks installed"),
+            "a request that only failed is not reported as an empty install"
+        );
+    }
+
+    #[test]
+    fn home_selection_is_refused_for_the_hermes_plugin() {
+        HomeSelectionArgs::default()
+            .refuse_for_hermes()
+            .expect("no selector is not refused");
+        for selected in [
+            HomeSelectionArgs {
+                profile: Some("work".to_owned()),
+                all_profiles: false,
+            },
+            HomeSelectionArgs {
+                profile: None,
+                all_profiles: true,
+            },
+        ] {
+            let error = selected.refuse_for_hermes().expect_err("refused");
+            assert!(
+                matches!(&error, crate::error::CliError::Protocol(inner) if inner.code == "integration_profile_not_for_hermes"),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn renders_empty_install_result() {
-        let output = render_install_human(&IntegrationInstallResult { installed: vec![] });
+        let output = render_install_human(&IntegrationInstallResult {
+            failed: Vec::new(),
+            installed: vec![],
+        });
         assert_eq!(output, "no agent hooks installed\n");
     }
 
@@ -1295,7 +1571,9 @@ mod tests {
     #[test]
     fn renders_install_result_as_json_that_deserializes() {
         let result = IntegrationInstallResult {
+            failed: Vec::new(),
             installed: vec![IntegrationInstallReport {
+                home: None,
                 agent: RuntimeRef::claude(),
                 hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
@@ -1594,8 +1872,10 @@ mod tests {
         };
 
         let result = IntegrationUninstallResult {
+            failed: Vec::new(),
             uninstalled: vec![
                 IntegrationUninstallReport {
+                    home: None,
                     agent: RuntimeRef::claude(),
                     state: IntegrationUninstallState::Removed,
                     removed_paths: vec!["/c/hooks/state.sh".to_owned()],
@@ -1604,6 +1884,7 @@ mod tests {
                     cleanup_incomplete: vec![],
                 },
                 IntegrationUninstallReport {
+                    home: None,
                     agent: RuntimeRef::codex(),
                     state: IntegrationUninstallState::NotInstalled,
                     removed_paths: vec![],
@@ -1629,6 +1910,7 @@ mod tests {
         };
 
         let status = IntegrationAgentStatus {
+            home: None,
             agent: RuntimeRef::codex(),
             available: true,
             expected_asset_paths: vec![],
@@ -1641,8 +1923,10 @@ mod tests {
             warnings: vec![],
         };
         let result = IntegrationDoctorResult {
+            home_selectors: false,
             ok: false,
             agents: vec![IntegrationAgentDoctor {
+                home: None,
                 agent: RuntimeRef::codex(),
                 ok: false,
                 status: Some(status),

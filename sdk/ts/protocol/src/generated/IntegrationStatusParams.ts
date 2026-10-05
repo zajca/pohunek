@@ -13,4 +13,15 @@ export type IntegrationStatusParams = {
    * supported hook agent regardless of whether its config dir exists.
    */
   agent?: RuntimeRef;
+  /**
+   * Report the config home the named host profile launches with. The
+   * report carries paths derived from the profile's environment, so only
+   * local owner connections may set it.
+   */
+  profile?: string;
+  /**
+   * Report every distinct config home of the selected runtime(s); local
+   * owner connections only; exclusive with `profile`.
+   */
+  all_profiles?: boolean;
 };

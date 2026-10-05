@@ -741,6 +741,7 @@ async fn integration_status_sdk_helper_sends_typed_read_only_request() {
     let result = client
         .integration_status(protocol::IntegrationStatusParams {
             agent: Some(protocol::RuntimeRef::codex()),
+            ..Default::default()
         })
         .await
         .expect("integration status succeeds");

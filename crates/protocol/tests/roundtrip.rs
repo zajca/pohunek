@@ -1822,13 +1822,19 @@ fn integration_install_method_name_is_stable() {
 #[test]
 fn integration_install_params_roundtrips_with_and_without_agent() {
     let with_agent = IntegrationInstallParams {
+        all_profiles: false,
+        profile: None,
         agent: Some(RuntimeRef::claude()),
     };
     let value = serde_json::to_value(&with_agent).expect("serialize install params");
     assert_eq!(value, json!({ "agent": "claude" }));
     assert_eq!(line_roundtrip(&with_agent), with_agent);
 
-    let all_agents = IntegrationInstallParams { agent: None };
+    let all_agents = IntegrationInstallParams {
+        all_profiles: false,
+        profile: None,
+        agent: None,
+    };
     let value = serde_json::to_value(&all_agents).expect("serialize install params");
     assert!(
         !value
@@ -1843,14 +1849,17 @@ fn integration_install_params_roundtrips_with_and_without_agent() {
 #[test]
 fn integration_install_result_roundtrips() {
     let result = IntegrationInstallResult {
+        failed: Vec::new(),
         installed: vec![
             IntegrationInstallReport {
+                home: None,
                 agent: RuntimeRef::claude(),
                 hook_path: "/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec!["/home/user/.claude/settings.json".to_owned()],
                 cleanup_incomplete: vec![],
             },
             IntegrationInstallReport {
+                home: None,
                 agent: RuntimeRef::codex(),
                 hook_path: "/home/user/.codex/pohunek-agent-state.sh".to_owned(),
                 config_paths: vec![
@@ -1878,6 +1887,8 @@ fn integration_uninstall_and_doctor_method_names_are_stable() {
 #[test]
 fn integration_uninstall_params_and_result_roundtrip() {
     let params = IntegrationUninstallParams {
+        all_profiles: false,
+        profile: None,
         agent: RuntimeRef::codex(),
     };
     assert_eq!(
@@ -1891,7 +1902,9 @@ fn integration_uninstall_params_and_result_roundtrip() {
     );
 
     let result = IntegrationUninstallResult {
+        failed: Vec::new(),
         uninstalled: vec![IntegrationUninstallReport {
+            home: None,
             agent: RuntimeRef::claude(),
             state: IntegrationUninstallState::Removed,
             removed_paths: vec!["/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned()],
@@ -1906,6 +1919,8 @@ fn integration_uninstall_params_and_result_roundtrip() {
 #[test]
 fn integration_doctor_params_and_result_roundtrip() {
     let params = IntegrationDoctorParams {
+        all_profiles: false,
+        profile: None,
         agent: Some(RuntimeRef::claude()),
     };
     assert_eq!(line_roundtrip(&params), params);
@@ -1915,11 +1930,14 @@ fn integration_doctor_params_and_result_roundtrip() {
     );
 
     let result = IntegrationDoctorResult {
+        home_selectors: false,
         ok: false,
         agents: vec![IntegrationAgentDoctor {
+            home: None,
             agent: RuntimeRef::codex(),
             ok: false,
             status: Some(IntegrationAgentStatus {
+                home: None,
                 agent: RuntimeRef::codex(),
                 available: true,
                 expected_asset_paths: vec!["/h/.codex/pohunek-agent-state.sh".to_owned()],

@@ -69,6 +69,39 @@ An unknown future base-kind string is presentation-only: it can be displayed
 neutrally but cannot be launched, mutated, recovered, or persisted until the
 daemon explicitly supports it.
 
+## Switching between subscriptions
+
+Several accounts of one agent (for example a work and a personal Claude
+subscription) are several host profiles that point the agent at different config
+homes. A runtime declares which variable relocates its home (`CLAUDE_CONFIG_DIR`
+for Claude, `CODEX_HOME` for Codex); a profile with `base = "claude"` sets that
+variable to an absolute path in its environment entries (a `~` is refused, not
+expanded). The pieces fit together like this:
+
+- **Launch.** The agent starts with the daemon's base environment (an allowlist
+  of session variables) overridden by the profile's `[env]`, so the profile's
+  variable decides which home the agent reads. A variable that only the daemon's
+  own process has reaches no agent, unless the daemon's environment allowlist
+  forwards it.
+- **Hooks.** Native session ids, subagent lifecycle and notifications reach the
+  daemon through hooks that live in the agent's config home, so every home an
+  agent can run with needs them. `pohunek integration install --agent claude
+  --profile work` installs into the home that profile launches with, and
+  `--all-profiles` into every distinct home of the runtime (its own and each
+  profile's). `integration status` and `doctor` take the same selectors, and
+  their recovery commands name the profile of the home they describe. The
+  installer resolves the home exactly as a launch does, so install, status and
+  the launched agent always agree on the directory. Each home is its own
+  transaction: a failure rolls that home back to its prior tree and leaves the
+  others alone, and `--all-profiles` exits non-zero when any home failed.
+- **Safety.** The profile selection is served by the local daemon only, because
+  reports name directories derived from secret-bearing environment values, and
+  a profile value that is not an absolute path is refused instead of expanded.
+  Reports show directories, never environment values.
+
+Resume freezing of the profile and the observer of external transcripts follow
+in later changes of the same work; this page grows with them.
+
 ## Launch sources
 
 A launch names its agent through a launch source. `session.new` on the owner's

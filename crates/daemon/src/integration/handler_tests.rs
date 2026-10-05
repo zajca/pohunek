@@ -17,7 +17,7 @@ use protocol::{
 use super::commit::StepGate;
 use super::doctor::doctor_for_with;
 use super::handler::{
-    handler, handlers, managed, resolve, update, Handler, Resolved, RetainedSchemas,
+    handler, handlers, resolve, update, Handler, Resolved, RetainedSchemas,
     UPDATE_INCOMPATIBLE_CODE,
 };
 use super::tests::{scoped_dir, tree_snapshot, with_config_dirs};
@@ -285,7 +285,7 @@ fn a_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active() {
         drop(staged);
 
         assert_eq!(content_snapshot(&dir), before, "{agent:?}");
-        let status = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent));
+        let status = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent, Ok(&dir)));
         assert_eq!(status.state, IntegrationInstallState::Current);
     }
 }
@@ -528,7 +528,7 @@ fn an_active_set_newer_than_the_update_is_replaced_by_it() {
             .expect("a rolled-back release may reinstall its older set");
         staged.activate(&mut ok_gate).expect("activate");
 
-        let status = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent));
+        let status = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent, Ok(&dir)));
         assert_eq!(status.state, IntegrationInstallState::Current, "{agent:?}");
         assert_eq!(status.installed_version, Some(EXPECTED_INTEGRATION_VERSION));
     }
@@ -585,7 +585,7 @@ fn updating_from_the_previous_asset_set_activates_atomically() {
         set_script_version(&state_hook, EXPECTED_INTEGRATION_VERSION - 1);
         let previous = content_snapshot(&dir);
         let resolved = builtin(&agent);
-        let outdated = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent));
+        let outdated = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent, Ok(&dir)));
         assert_eq!(outdated.state, IntegrationInstallState::Outdated);
         assert_eq!(
             outdated.installed_version,
@@ -613,7 +613,7 @@ fn updating_from_the_previous_asset_set_activates_atomically() {
 
         assert_eq!(paths.hook_path, state_hook);
         assert!(paths.cleanup_incomplete.is_empty());
-        let current = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent));
+        let current = with_config_dirs(&dir, &dir, || resolved.handler.inspect(&agent, Ok(&dir)));
         assert_eq!(current.state, IntegrationInstallState::Current);
         assert_eq!(
             current.installed_version,
@@ -660,6 +660,7 @@ fn install_dispatches_through_the_package_runtime_definition() {
             &host,
             IntegrationStatusParams {
                 agent: Some(pi.clone()),
+                ..Default::default()
             },
         )
     })
@@ -684,10 +685,13 @@ fn a_handler_is_reached_once_when_several_runtimes_name_it() {
     let codex = scoped_dir("dispatch-once-codex");
     let host = pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
 
-    let ids: Vec<String> = managed(&host)
-        .iter()
-        .map(|resolved| resolved.handler.id().to_owned())
-        .collect();
+    let ids: Vec<String> = with_config_dirs(&claude, &codex, || {
+        super::config_homes_for_tests(&host).targets(None, &super::HomeSelection::Runtime)
+    })
+    .expect("targets")
+    .iter()
+    .map(|target| target.resolved.handler.id().to_owned())
+    .collect();
     assert_eq!(ids, [CLAUDE_ID, CODEX_ID]);
 
     let installed = with_config_dirs(&claude, &codex, || install_for(&host, None))
@@ -714,6 +718,7 @@ fn a_package_runtime_naming_the_cli_run_handler_is_not_installable() {
             &host,
             IntegrationStatusParams {
                 agent: Some(pi.clone()),
+                ..Default::default()
             },
         )
     })
@@ -760,6 +765,7 @@ fn a_package_runtime_is_named_in_every_recovery_command_of_status_and_doctor() {
             &host,
             IntegrationStatusParams {
                 agent: Some(pi.clone()),
+                ..Default::default()
             },
         )
     })
@@ -773,6 +779,7 @@ fn a_package_runtime_is_named_in_every_recovery_command_of_status_and_doctor() {
             &host,
             IntegrationDoctorParams {
                 agent: Some(pi.clone()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -805,6 +812,7 @@ fn a_package_runtime_is_named_in_every_recovery_command_of_status_and_doctor() {
             &host,
             IntegrationDoctorParams {
                 agent: Some(pi.clone()),
+                ..Default::default()
             },
             &[],
             &[],
@@ -848,6 +856,7 @@ fn doctor_findings(
             host,
             IntegrationDoctorParams {
                 agent: Some(agent.clone()),
+                ..Default::default()
             },
             &[],
             &[],

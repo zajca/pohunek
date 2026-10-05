@@ -37,6 +37,7 @@ mod commit;
 #[cfg(unix)]
 mod doctor;
 mod handler;
+mod homes;
 mod provider_handlers;
 #[cfg(unix)]
 mod quarantine;
@@ -45,17 +46,21 @@ mod uninstall;
 #[cfg(all(test, unix))]
 pub use doctor::doctor;
 #[cfg(unix)]
-pub use doctor::doctor_for;
-#[cfg(test)]
-pub use handler::install_for;
+pub use doctor::doctor_in;
 pub use handler::{
-    install_for_retained, status_for, AssetManifest, DaemonHandler, Handler, RetainedSchemas,
-    StagedUpdate,
+    install_in, status_in, AssetManifest, DaemonHandler, Handler, RetainedSchemas, StagedUpdate,
 };
+#[cfg(all(test, unix))]
+pub use homes::process_environment::uninstall_for;
+#[cfg(test)]
+pub use homes::process_environment::{
+    config_homes_for_tests, install_for, install_for_retained, status_for,
+};
+pub use homes::{ConfigHomes, HomeSelection};
 #[cfg(all(test, unix))]
 pub use uninstall::uninstall;
 #[cfg(unix)]
-pub use uninstall::{uninstall_claude, uninstall_codex, uninstall_for};
+pub use uninstall::{uninstall_claude, uninstall_codex, uninstall_in};
 #[cfg(all(test, unix))]
 mod handler_tests;
 #[cfg(all(test, unix))]
@@ -216,9 +221,11 @@ const CODEX_REPORTED_ACTIONS: &[HookAction] = &[
     HookAction::Notification,
 ];
 
-/// Env var overriding Claude's config dir (else `~/.claude`).
+/// Env var the tests set to relocate Claude's config dir.
+#[cfg(test)]
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
-/// Env var overriding Codex's config dir (else `~/.codex`).
+/// Env var the tests set to relocate Codex's config dir.
+#[cfg(test)]
 pub(crate) const CODEX_HOME_ENV: &str = "CODEX_HOME";
 
 /// Files the installer wrote for one agent.
@@ -255,7 +262,7 @@ pub struct InstallPaths {
 pub fn install(
     agent: Option<RuntimeRef>,
 ) -> Result<protocol::IntegrationInstallResult, ProtocolError> {
-    handler::install_for(&crate::agent::host::fixture::builtin_host(), agent.as_ref())
+    install_for(&crate::agent::host::fixture::builtin_host(), agent.as_ref())
 }
 
 /// Inspect the managed hook files of the selected runtime(s) without writing
@@ -272,13 +279,16 @@ pub fn install(
 pub fn status(
     params: protocol::IntegrationStatusParams,
 ) -> Result<protocol::IntegrationStatusResult, ProtocolError> {
-    handler::status_for(&crate::agent::host::fixture::builtin_host(), params)
+    status_for(&crate::agent::host::fixture::builtin_host(), params)
 }
 
 /// Degrade one supported agent's config-resolution failure into a warning.
-fn reported_agent_status(agent: StatusAgent) -> IntegrationAgentStatus {
-    match agent_status(agent) {
-        Ok(report) => report,
+fn reported_agent_status(
+    agent: StatusAgent,
+    home: Result<&Path, &ProtocolError>,
+) -> IntegrationAgentStatus {
+    match home {
+        Ok(dir) => agent_status_at(agent, dir),
         Err(error) => IntegrationAgentStatus {
             agent: agent.kind(),
             available: false,
@@ -293,6 +303,7 @@ fn reported_agent_status(agent: StatusAgent) -> IntegrationAgentStatus {
                 "agent config directory could not be resolved ({})",
                 error.code
             )],
+            home: None,
         },
     }
 }
@@ -325,21 +336,22 @@ impl StatusAgent {
     }
 }
 
-/// Build one supported agent's read-only status report.
-fn agent_status(agent: StatusAgent) -> Result<IntegrationAgentStatus, ProtocolError> {
+/// Build one supported agent's read-only status report for the config
+/// directory `dir`.
+fn agent_status_at(agent: StatusAgent, dir: &Path) -> IntegrationAgentStatus {
     match agent {
-        StatusAgent::Claude => Ok(status_at(
+        StatusAgent::Claude => status_at(
             StatusAgent::Claude,
-            &claude_config_dir()?,
+            dir,
             CLAUDE_HOOK_ASSET,
             CLAUDE_NOTIFY_HOOK_ASSET,
-        )),
-        StatusAgent::Codex => Ok(status_at(
+        ),
+        StatusAgent::Codex => status_at(
             StatusAgent::Codex,
-            &codex_config_dir()?,
+            dir,
             CODEX_HOOK_ASSET,
             CODEX_NOTIFY_HOOK_ASSET,
-        )),
+        ),
     }
 }
 
@@ -370,6 +382,7 @@ fn status_at(
             state: issue.state,
             recovery: issue.recovery,
             warnings: issue.warning.map(str::to_owned).into_iter().collect(),
+            home: None,
         };
     }
 
@@ -446,6 +459,7 @@ fn status_at(
         state,
         recovery,
         warnings,
+        home: None,
     }
 }
 
@@ -1606,17 +1620,22 @@ fn report(agent: RuntimeRef, paths: &InstallPaths) -> IntegrationInstallReport {
             .map(|path| path.display().to_string())
             .collect(),
         cleanup_incomplete: paths.cleanup_incomplete.clone(),
+        home: None,
     }
 }
 
-/// Resolve Claude's config dir: `$CLAUDE_CONFIG_DIR` or `~/.claude`.
+/// Claude's config dir as the built-in descriptor and this test process's
+/// environment name it.
+#[cfg(test)]
 pub fn claude_config_dir() -> Result<PathBuf, ProtocolError> {
-    config_dir(CLAUDE_CONFIG_DIR_ENV, ".claude")
+    homes::process_environment::runtime_config_dir(&RuntimeRef::claude())
 }
 
-/// Resolve Codex's config dir: `$CODEX_HOME` or `~/.codex`.
+/// Codex's config dir as the built-in descriptor and this test process's
+/// environment name it.
+#[cfg(test)]
 pub fn codex_config_dir() -> Result<PathBuf, ProtocolError> {
-    config_dir(CODEX_HOME_ENV, ".codex")
+    homes::process_environment::runtime_config_dir(&RuntimeRef::codex())
 }
 
 /// Install the Claude hooks into `claude_dir`.
@@ -2851,50 +2870,22 @@ fn toml_basic_string(value: &str) -> String {
     escaped
 }
 
-fn config_dir(env_var: &str, home_relative: &str) -> Result<PathBuf, ProtocolError> {
-    if let Some(value) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
-        return validate_config_dir(expand_tilde(PathBuf::from(value)), env_var);
-    }
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            ProtocolError::new(
-                ErrorClass::Configuration,
-                "missing_env",
-                format!("cannot resolve agent config dir: neither {env_var} nor HOME is set"),
-                None,
-            )
-        })?;
-    validate_config_dir(PathBuf::from(home).join(home_relative), "HOME")
-}
-
 fn validate_config_dir(path: PathBuf, source: &str) -> Result<PathBuf, ProtocolError> {
     if !path.is_absolute() || path.to_str().is_none() {
-        return Err(ProtocolError::new(
-            ErrorClass::Configuration,
-            "agent_config_dir_invalid",
-            format!("{source} must resolve to an absolute UTF-8 path for agent hook registration"),
-            Some("set the provider config directory to an absolute path".to_owned()),
-        ));
+        return Err(config_dir_invalid(source));
     }
     Ok(path)
 }
 
-/// Expand a leading `~`/`~/` against `$HOME`.
-fn expand_tilde(path: PathBuf) -> PathBuf {
-    let Some(raw) = path.to_str() else {
-        return path;
-    };
-    let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
-        return path;
-    };
-    if raw == "~" {
-        return PathBuf::from(home);
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return PathBuf::from(home).join(rest);
-    }
-    path
+/// `agent_config_dir_invalid`: the value of `source` (an environment variable
+/// or `HOME`) is not an absolute UTF-8 path. The value itself is never named.
+fn config_dir_invalid(source: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Configuration,
+        "agent_config_dir_invalid",
+        format!("{source} must resolve to an absolute UTF-8 path for agent hook registration"),
+        Some("set the provider config directory to an absolute path".to_owned()),
+    )
 }
 
 #[cfg(unix)]
@@ -4800,7 +4791,10 @@ mod tests {
         let codex = root.join(".codex");
 
         let result = with_config_dirs(&claude, &codex, || {
-            super::status(protocol::IntegrationStatusParams { agent: None })
+            super::status(protocol::IntegrationStatusParams {
+                agent: None,
+                ..Default::default()
+            })
         })
         .expect("status missing");
 
@@ -4886,7 +4880,10 @@ mod tests {
         let before = tree_snapshot(&root);
 
         let result = with_config_dirs(&claude, &codex, || {
-            super::status(protocol::IntegrationStatusParams { agent: None })
+            super::status(protocol::IntegrationStatusParams {
+                agent: None,
+                ..Default::default()
+            })
         })
         .expect("status current");
 
@@ -5208,10 +5205,15 @@ mod tests {
 
         let mut bytes = b"/work/pohunek-non-utf8-".to_vec();
         bytes.push(0xff);
-        let path = PathBuf::from(OsString::from_vec(bytes));
-        let error = with_status_env(Some(&path), None, None, || {
-            super::claude_config_dir().expect_err("reject non-UTF-8 Claude config root")
-        });
+        let path = OsString::from_vec(bytes);
+        // The launch base environment never carries a non-UTF-8 variable, so
+        // the resolver is exercised with the lookup directly.
+        let declared = crate::agent::host::ConfigHome::new("PROVIDER_HOME", ".provider")
+            .expect("valid declaration");
+        let error = super::homes::resolve_declared(&declared, &|name| {
+            (name == "PROVIDER_HOME").then(|| path.clone())
+        })
+        .expect_err("reject non-UTF-8 config root");
 
         assert_eq!(error.code, "agent_config_dir_invalid");
     }
@@ -6069,7 +6071,10 @@ mod tests {
         install_codex(&codex).expect("install Codex fixture");
 
         let result = with_status_env(None, Some(&codex), None, || {
-            super::status(protocol::IntegrationStatusParams { agent: None })
+            super::status(protocol::IntegrationStatusParams {
+                agent: None,
+                ..Default::default()
+            })
         })
         .expect("aggregate status");
 
@@ -6096,6 +6101,7 @@ mod tests {
         let report = with_status_env(None, None, None, || {
             super::status(protocol::IntegrationStatusParams {
                 agent: Some(RuntimeRef::claude()),
+                ..Default::default()
             })
         })
         .expect("explicit status")
@@ -6114,8 +6120,11 @@ mod tests {
     #[test]
     fn explicit_unsupported_status_agents_return_typed_errors() {
         for agent in [RuntimeRef::shell(), RuntimeRef::hermes()] {
-            let error = super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
-                .expect_err("unsupported agent must fail");
+            let error = super::status(protocol::IntegrationStatusParams {
+                agent: Some(agent),
+                ..Default::default()
+            })
+            .expect_err("unsupported agent must fail");
             assert_eq!(error.code, "agent_not_installable");
         }
     }
@@ -6124,6 +6133,7 @@ mod tests {
     fn install_and_status_report_an_installed_runtime_without_a_hook_integration() {
         let status = super::status(protocol::IntegrationStatusParams {
             agent: Some(RuntimeRef::from_wire("pi")),
+            ..Default::default()
         })
         .expect_err("status must reject the agent");
         assert_eq!(status.code, "agent_not_installable");
@@ -6189,7 +6199,10 @@ mod tests {
         agent: RuntimeRef,
     ) -> protocol::IntegrationAgentStatus {
         with_config_dirs(config_dir, config_dir, || {
-            super::status(protocol::IntegrationStatusParams { agent: Some(agent) })
+            super::status(protocol::IntegrationStatusParams {
+                agent: Some(agent),
+                ..Default::default()
+            })
         })
         .expect("explicit status")
         .agents

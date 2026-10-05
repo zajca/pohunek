@@ -6,7 +6,7 @@
 
 // Rust guideline compliant 2026-10-05
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use pohunek_worker_protocol::HookAction;
 use protocol::{IntegrationAgentStatus, IntegrationUninstallReport, ProtocolError, RuntimeRef};
@@ -14,9 +14,8 @@ use protocol::{IntegrationAgentStatus, IntegrationUninstallReport, ProtocolError
 use super::commit::StepGate;
 use super::handler::{CliRunHandler, DaemonHandler, Handler, StagedUpdate};
 use super::{
-    claude_config_dir, codex_config_dir, reported_agent_status, stage_claude, stage_codex,
-    AssetManifest, InstallPaths, StagedClaude, StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS,
-    CODEX_REPORTED_ACTIONS,
+    reported_agent_status, stage_claude, stage_codex, AssetManifest, InstallPaths, StagedClaude,
+    StagedCodex, StatusAgent, CLAUDE_REPORTED_ACTIONS, CODEX_REPORTED_ACTIONS,
 };
 
 /// Hook operations the Hermes asset set reports.
@@ -76,16 +75,12 @@ impl DaemonHandler for CodexHook {
         CODEX_REPORTED_ACTIONS
     }
 
-    fn config_dir(&self) -> Result<PathBuf, ProtocolError> {
-        codex_config_dir()
-    }
-
     fn quarantine_subdirs(&self) -> &'static [&'static str] {
         &[]
     }
 
-    fn inspect_provider(&self) -> IntegrationAgentStatus {
-        reported_agent_status(StatusAgent::Codex)
+    fn inspect_provider(&self, home: Result<&Path, &ProtocolError>) -> IntegrationAgentStatus {
+        reported_agent_status(StatusAgent::Codex, home)
     }
 
     fn stage(&self, dir: &Path) -> Result<Box<dyn StagedUpdate>, ProtocolError> {
@@ -112,16 +107,12 @@ impl DaemonHandler for ClaudeHook {
         CLAUDE_REPORTED_ACTIONS
     }
 
-    fn config_dir(&self) -> Result<PathBuf, ProtocolError> {
-        claude_config_dir()
-    }
-
     fn quarantine_subdirs(&self) -> &'static [&'static str] {
         &["hooks"]
     }
 
-    fn inspect_provider(&self) -> IntegrationAgentStatus {
-        reported_agent_status(StatusAgent::Claude)
+    fn inspect_provider(&self, home: Result<&Path, &ProtocolError>) -> IntegrationAgentStatus {
+        reported_agent_status(StatusAgent::Claude, home)
     }
 
     fn stage(&self, dir: &Path) -> Result<Box<dyn StagedUpdate>, ProtocolError> {

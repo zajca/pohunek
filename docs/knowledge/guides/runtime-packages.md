@@ -32,6 +32,30 @@ Every subcommand accepts `--json`: one envelope on stdout, digests in full.
 Tables abbreviate a digest to its first 12 hex characters; that prefix is a
 valid `--digest` selector.
 
+## Config home
+
+A runtime that keeps its settings, hook registration or conversations in a
+directory of its own declares it in an optional `[config_home]` table, separate
+from `[integration]` because the home concerns every runtime:
+
+```toml
+[config_home]
+env = "ACME_HOME"          # variable the agent reads to relocate its home
+default = ".config/acme"   # directory below the user's home used otherwise
+```
+
+`env` is an upper-case variable name outside the reserved `POHUNEK_` namespace;
+`default` is a relative path of plain components (no `..`, no absolute path, no
+glob or shell character, bounded in length and depth). Both keys are required
+and unknown keys are refused (`descriptor_invalid`) before anything is recorded.
+The daemon resolves the home the way a launch does (the variable from the
+environment the launched agent sees, a host profile's `[env]` overriding the
+daemon's base environment, else the default below that environment's `HOME`) and
+never expands a `~`. A runtime that names a daemon-run integration handler
+needs the table, or `integration install` answers `agent_config_home_undeclared`
+for it. A runtime without an integration (Pi) may omit it; Pi keeps declaring
+its conversation root under `[native_reference.existence]`.
+
 ## Hook schemas and integration handlers
 
 A package whose agent reports lifecycle hooks names its compiled integration

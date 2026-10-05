@@ -13,4 +13,15 @@ export type IntegrationDoctorParams = {
    * every supported hook agent.
    */
   agent?: RuntimeRef;
+  /**
+   * Diagnose the config home the named host profile launches with. The
+   * diagnosis carries paths derived from the profile's environment, so only
+   * local owner connections may set it.
+   */
+  profile?: string;
+  /**
+   * Diagnose every distinct config home of the selected runtime(s); local
+   * owner connections only; exclusive with `profile`.
+   */
+  all_profiles?: boolean;
 };

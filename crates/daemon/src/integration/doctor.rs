@@ -21,8 +21,10 @@ use protocol::{
     RuntimeRef,
 };
 
-use super::handler::{self, Resolved};
+use super::handler;
+use super::homes::{ConfigHomes, HomeSelection, Target};
 use super::{GROUP_OR_OTHER_WRITE_MASK, INSTALL_LOCK_MODE, INSTALL_LOCK_NAME};
+#[cfg(test)]
 use crate::agent::host::RuntimeHost;
 
 /// File name every hook looks up for its interpreter.
@@ -276,7 +278,7 @@ pub(super) fn classify_warning(
     {
         (
             IntegrationFindingCode::ConfigRootInvalid,
-            "point CLAUDE_CONFIG_DIR or CODEX_HOME at an existing absolute directory owned by the daemon user (use the canonical path when the current one goes through a symlink), then re-run the doctor".to_owned(),
+            "make the runtime's config home an existing absolute directory owned by the daemon user: set the variable its descriptor declares (a host profile sets it in its [env]) or create the default directory below HOME, and use the canonical path when the current one goes through a symlink, then re-run the doctor".to_owned(),
         )
     } else if warning.contains("managed asset parent") {
         (IntegrationFindingCode::AssetUnsafe, repair)
@@ -403,6 +405,7 @@ pub(super) fn diagnose_as(
         ok,
         status: Some(status),
         findings,
+        home: None,
     }
 }
 
@@ -550,6 +553,7 @@ fn operation_in_progress(agent: RuntimeRef) -> IntegrationAgentDoctor {
             "an integration install, uninstall, or doctor is running, so nothing was inspected for this agent",
             Some("run the doctor again once the other operation has finished".to_owned()),
         )],
+        home: None,
     }
 }
 
@@ -565,30 +569,41 @@ fn unsafe_installer_lock(dir: &std::path::Path) -> IntegrationFinding {
     )
 }
 
-/// Diagnose the selected runtime(s) through their integration handlers
-/// without changing anything.
+/// Diagnose the selected runtime(s) in the selected config homes through their
+/// integration handlers without changing anything.
 ///
 /// # Errors
 ///
 /// `agent_not_installable` for a runtime without a daemon-run handler (the
-/// shell, and Hermes, which has its own local doctor); the API handler rejects
-/// historical and uninstalled runtimes before this runs.
-pub fn doctor_for(
-    host: &RuntimeHost,
+/// shell, and Hermes, which has its own local doctor), or the typed errors of
+/// an unusable profile selection; the API handler rejects historical and
+/// uninstalled runtimes before this runs.
+pub fn doctor_in(
+    homes: &ConfigHomes,
     params: IntegrationDoctorParams,
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
-    doctor_for_with(
-        host,
+    doctor_in_with(
+        homes,
         params,
         &python_findings(&PythonProbe::from_environment()),
         &socket_findings_for_process(),
     )
 }
 
-/// [`doctor_for`] against the built-in runtimes.
+/// [`doctor_in`] against the built-in runtimes.
 #[cfg(test)]
 pub fn doctor(params: IntegrationDoctorParams) -> Result<IntegrationDoctorResult, ProtocolError> {
     doctor_for(&crate::agent::host::fixture::builtin_host(), params)
+}
+
+/// [`doctor_in`] over `host`, resolving homes against this test process's
+/// environment.
+#[cfg(test)]
+pub(super) fn doctor_for(
+    host: &RuntimeHost,
+    params: IntegrationDoctorParams,
+) -> Result<IntegrationDoctorResult, ProtocolError> {
+    doctor_in(&super::config_homes_for_tests(host), params)
 }
 
 /// [`doctor_for_with`] against the built-in runtimes.
@@ -620,68 +635,109 @@ pub(super) fn quarantine_findings(
     quarantine_findings_in(dir, subdirs, limit)
 }
 
-/// [`doctor_for`] with the runtime probes supplied by the caller.
+/// [`doctor_in_with`] over `host`, resolving homes against this test process's
+/// environment.
+#[cfg(test)]
 pub(super) fn doctor_for_with(
     host: &RuntimeHost,
     params: IntegrationDoctorParams,
     python: &[IntegrationFinding],
     socket: &[IntegrationFinding],
 ) -> Result<IntegrationDoctorResult, ProtocolError> {
-    let IntegrationDoctorParams { agent } = params;
-    let selected: Vec<Resolved> = match agent {
-        Some(agent) => vec![handler::resolve(host, &agent)?],
-        None => handler::managed(host),
-    };
+    doctor_in_with(&super::config_homes_for_tests(host), params, python, socket)
+}
+
+/// [`doctor_in`] with the runtime probes supplied by the caller.
+pub(super) fn doctor_in_with(
+    homes: &ConfigHomes,
+    params: IntegrationDoctorParams,
+    python: &[IntegrationFinding],
+    socket: &[IntegrationFinding],
+) -> Result<IntegrationDoctorResult, ProtocolError> {
+    let IntegrationDoctorParams {
+        agent,
+        profile,
+        all_profiles,
+    } = params;
+    let selection = HomeSelection::from_params(profile, all_profiles)?;
+    let selected = homes.targets(agent.as_ref(), &selection)?;
     let runtime: Vec<IntegrationFinding> = python.iter().chain(socket).cloned().collect();
     let agents: Vec<IntegrationAgentDoctor> = selected
-        .into_iter()
-        .map(|agent| {
-            let config_dir = agent.handler.config_dir().ok();
-            let probe = config_dir
-                .as_deref()
-                .map_or(LockProbe::Absent, probe_installer_lock);
-            if matches!(probe, LockProbe::Busy) {
-                return operation_in_progress(agent.runtime.clone());
-            }
-            super::commit::race_point("doctor.inspecting", agent.runtime.as_wire());
-            let mut diagnosis = diagnose_as(
-                agent.handler.inspect_provider(),
-                agent.runtime.as_wire(),
-                &runtime,
-            );
-            retarget_diagnosis(&mut diagnosis, &agent.runtime);
-            if let Some(dir) = &config_dir {
-                diagnosis.findings.extend(quarantine_findings_in(
-                    dir,
-                    agent.handler.quarantine_subdirs(),
-                    MAX_SCANNED_QUARANTINE_ENTRIES,
-                ));
-                if matches!(probe, LockProbe::Unsafe) {
-                    diagnosis.findings.push(unsafe_installer_lock(dir));
-                }
-                diagnosis.ok = diagnosis
-                    .findings
-                    .iter()
-                    .all(|finding| finding.severity != IntegrationFindingSeverity::Error);
-            }
-            // Without a lock file to hold, an operation that created it during
-            // the inspection may have parked originals under the same names.
-            let started_meanwhile = matches!(probe, LockProbe::Absent)
-                && config_dir.as_deref().is_some_and(|dir| {
-                    !matches!(
-                        probe_installer_lock(dir),
-                        LockProbe::Absent | LockProbe::Unsafe
-                    )
-                });
-            if started_meanwhile {
-                return operation_in_progress(agent.runtime.clone());
-            }
-            drop(probe);
+        .iter()
+        .map(|target| {
+            let mut diagnosis = diagnose_target(target, &runtime);
+            diagnosis.home.clone_from(&target.label);
             diagnosis
         })
         .collect();
     Ok(IntegrationDoctorResult {
         ok: agents.iter().all(|agent| agent.ok),
         agents,
+        home_selectors: true,
     })
+}
+
+/// Diagnoses the home of `target`.
+fn diagnose_target(target: &Target, runtime: &[IntegrationFinding]) -> IntegrationAgentDoctor {
+    let agent = &target.resolved;
+    let config_dir = target.dir_ref().ok();
+    let probe = config_dir.map_or(LockProbe::Absent, probe_installer_lock);
+    if matches!(probe, LockProbe::Busy) {
+        return operation_in_progress(agent.runtime.clone());
+    }
+    super::commit::race_point("doctor.inspecting", agent.runtime.as_wire());
+    let mut diagnosis = diagnose_as(
+        agent.handler.inspect_provider(target.dir_ref()),
+        agent.runtime.as_wire(),
+        runtime,
+    );
+    retarget_diagnosis(&mut diagnosis, &agent.runtime);
+    scope_diagnosis(&mut diagnosis, target);
+    if let Some(dir) = config_dir {
+        diagnosis.findings.extend(quarantine_findings_in(
+            dir,
+            agent.handler.quarantine_subdirs(),
+            MAX_SCANNED_QUARANTINE_ENTRIES,
+        ));
+        if matches!(probe, LockProbe::Unsafe) {
+            diagnosis.findings.push(unsafe_installer_lock(dir));
+        }
+        diagnosis.ok = diagnosis
+            .findings
+            .iter()
+            .all(|finding| finding.severity != IntegrationFindingSeverity::Error);
+    }
+    // Without a lock file to hold, an operation that created it during
+    // the inspection may have parked originals under the same names.
+    let started_meanwhile = matches!(probe, LockProbe::Absent)
+        && config_dir.is_some_and(|dir| {
+            !matches!(
+                probe_installer_lock(dir),
+                LockProbe::Absent | LockProbe::Unsafe
+            )
+        });
+    if started_meanwhile {
+        return operation_in_progress(agent.runtime.clone());
+    }
+    drop(probe);
+    diagnosis
+}
+
+/// Rewrites the recovery commands of `diagnosis` to address the profile home
+/// `target` is.
+fn scope_diagnosis(diagnosis: &mut IntegrationAgentDoctor, target: &Target) {
+    let Some(profile) = target.scope_profile() else {
+        return;
+    };
+    let runtime = target.resolved.runtime.as_wire();
+    if let Some(status) = &mut diagnosis.status {
+        handler::scope_status(status, target);
+    }
+    for finding in &mut diagnosis.findings {
+        finding.summary = handler::scope_text(&finding.summary, runtime, profile);
+        finding.remediation = finding
+            .remediation
+            .as_deref()
+            .map(|remediation| handler::scope_text(remediation, runtime, profile));
+    }
 }

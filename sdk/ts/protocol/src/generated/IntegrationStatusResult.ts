@@ -10,4 +10,10 @@ export type IntegrationStatusResult = {
    * One read-only report per requested (or supported) hook agent.
    */
   agents: Array<IntegrationAgentStatus>;
+  /**
+   * Whether the daemon honors the `profile` and `all_profiles` selectors.
+   * A daemon that predates them ignores the selectors and omits this field,
+   * so a client that must not act on the wrong home checks it first.
+   */
+  home_selectors?: boolean;
 };

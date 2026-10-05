@@ -14,4 +14,9 @@ export type IntegrationDoctorResult = {
    * One diagnosis per requested (or supported) hook agent.
    */
   agents: Array<IntegrationAgentDoctor>;
+  /**
+   * Whether the daemon honors the `profile` and `all_profiles` selectors;
+   * see `IntegrationStatusResult::home_selectors`.
+   */
+  home_selectors?: boolean;
 };

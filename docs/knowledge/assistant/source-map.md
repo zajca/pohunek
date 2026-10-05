@@ -450,6 +450,7 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/integration/commit.rs`
 - `crates/daemon/src/integration/doctor.rs`
 - `crates/daemon/src/integration/handler.rs`
+- `crates/daemon/src/integration/homes.rs`
 - `crates/daemon/src/integration/provider_handlers.rs`
 - `crates/daemon/src/integration/uninstall.rs`
 - `crates/daemon/src/integration/assets/codex/pohunek-agent-state.sh`
@@ -508,6 +509,7 @@ Runtime package archive format:
 - `crates/package/src/catalog_state.rs` — persisted catalog high-water mark and revoked key ids.
 - `crates/daemon/src/session/package_lifecycle/` — the `package.*` operations: validate from the verified archive, claim rules, catalog trust, record, reload, and the compatibility-gated selection (`selection.rs`).
 - `crates/daemon/src/agent/host/claim.rs` — which package may serve which runtime id.
+- `crates/daemon/src/agent/host/config_home.rs` — the `[config_home]` descriptor declaration and the one resolver of a runtime's config directory.
 - `crates/daemon/src/api/handler/package.rs` — `package.*` handlers and the local-only gate.
 - `crates/daemon/src/agent/profile.rs` — profile `package`/`digest` pins and `pinned_digests`.
 - `crates/protocol/src/package.rs` — `package.*` payloads and stable error codes.

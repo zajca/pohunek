@@ -21,6 +21,7 @@ mod profile;
 pub use native_launch::{
     NativeArg, NativeArgs, NativeLaunchError, NativeSessionLaunch, REFERENCE_PLACEHOLDER,
 };
+pub(crate) use native_reference::{env_name_problem, is_plain_relative_path};
 pub use native_reference::{
     generate_assigned_reference, AssignedReference, ExistenceCheckKind, ExistenceError,
     ExistenceSpec, FileExistence, NameMatch, NativeReferenceError, NativeReferenceProvenance,
@@ -29,7 +30,9 @@ pub use native_reference::{
 };
 #[cfg(test)]
 pub(crate) use profile::MAX_PROFILE_BYTES;
-pub(crate) use profile::{apply_pin, parse_head, BindError, Pin, ProfileRegistry, ResolvedAgent};
+pub(crate) use profile::{
+    agent_profile_not_found, apply_pin, parse_head, BindError, Pin, ProfileRegistry, ResolvedAgent,
+};
 
 /// Shell launched when the host reports no usable login shell.
 pub(crate) const FALLBACK_LOGIN_SHELL: &str = "/bin/sh";

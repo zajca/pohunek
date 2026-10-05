@@ -4,6 +4,9 @@ import type { RuntimeRef } from "./RuntimeRef";
 
 /**
  * Parameters for `integration.install`.
+ *
+ * Unknown fields are rejected so a misspelled selector cannot narrow an
+ * install to the runtime's own home.
  */
 export type IntegrationInstallParams = {
   /**
@@ -11,4 +14,16 @@ export type IntegrationInstallParams = {
    * hook for every supported agent whose config dir is present.
    */
   agent?: RuntimeRef;
+  /**
+   * Install into the config home the named host profile launches with,
+   * instead of the runtime's own home. Accepted from local owner
+   * connections only. Without `agent` the profile's runtime is installed.
+   */
+  profile?: string;
+  /**
+   * Install into every distinct config home of the selected runtime(s): the
+   * runtime's own home and the home of each of its host profiles. Local
+   * owner connections only; exclusive with `profile`.
+   */
+  all_profiles?: boolean;
 };
