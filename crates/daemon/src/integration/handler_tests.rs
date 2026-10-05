@@ -5,15 +5,17 @@
 
 use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use pohunek_worker_protocol::{hook_schema, hook_schemas, is_known_hook_handler, HookAction};
 use protocol::{
-    ErrorClass, IntegrationInstallState, IntegrationStatusParams, IntegrationUninstallState,
-    ProtocolError, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
+    ErrorClass, IntegrationDoctorParams, IntegrationInstallState, IntegrationStatusParams,
+    IntegrationUninstallState, ProtocolError, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
 };
 
 use super::commit::StepGate;
+use super::doctor::doctor_for_with;
 use super::handler::{
     handler, handlers, managed, resolve, update, Handler, Resolved, UPDATE_INCOMPATIBLE_CODE,
 };
@@ -518,5 +520,81 @@ fn the_activation_gate_runs_before_every_committed_file() {
         seen.last().map(|(_index, name)| name.as_str()),
         Some("settings.json"),
         "registration is committed last: {seen:?}"
+    );
+}
+
+#[test]
+fn a_package_runtime_is_named_in_every_recovery_command_of_status_and_doctor() {
+    let dir = scoped_dir("recovery-command");
+    let codex = scoped_dir("recovery-command-codex");
+    let host = pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
+    let pi = RuntimeRef::from_wire("pi");
+    install_claude(&dir).expect("install");
+    let hooks = dir.join("hooks");
+    fs::set_permissions(&hooks, fs::Permissions::from_mode(0o777)).expect("loosen hooks");
+
+    let status = with_config_dirs(&dir, &codex, || {
+        status_for(
+            &host,
+            IntegrationStatusParams {
+                agent: Some(pi.clone()),
+            },
+        )
+    })
+    .expect("status");
+    let warnings = status.agents[0].warnings.join("\n");
+    assert!(warnings.contains("--agent pi"), "{warnings}");
+    assert!(!warnings.contains("--agent claude"), "{warnings}");
+
+    let doctor = with_config_dirs(&dir, &codex, || {
+        doctor_for_with(
+            &host,
+            IntegrationDoctorParams {
+                agent: Some(pi.clone()),
+            },
+            &[],
+            &[],
+        )
+    })
+    .expect("doctor");
+    let remediations: Vec<&str> = doctor.agents[0]
+        .findings
+        .iter()
+        .filter_map(|finding| finding.remediation.as_deref())
+        .collect();
+    assert!(!remediations.is_empty());
+    for remediation in remediations {
+        assert!(!remediation.contains("--agent claude"), "{remediation}");
+    }
+    assert!(
+        doctor.agents[0].findings.iter().any(|finding| finding
+            .remediation
+            .as_deref()
+            .is_some_and(|text| text.contains("pohunek integration install --agent pi"))),
+        "{:?}",
+        doctor.agents[0].findings
+    );
+
+    fs::set_permissions(&hooks, fs::Permissions::from_mode(0o700)).expect("restore hooks");
+    fs::remove_dir_all(&hooks).expect("remove hooks");
+    fs::remove_file(dir.join("settings.json")).expect("remove settings");
+    let absent = with_config_dirs(&dir, &codex, || {
+        doctor_for_with(
+            &host,
+            IntegrationDoctorParams {
+                agent: Some(pi.clone()),
+            },
+            &[],
+            &[],
+        )
+    })
+    .expect("doctor");
+    assert!(
+        absent.agents[0].findings.iter().any(|finding| finding
+            .remediation
+            .as_deref()
+            .is_some_and(|text| text.contains("--agent pi"))),
+        "{:?}",
+        absent.agents[0].findings
     );
 }

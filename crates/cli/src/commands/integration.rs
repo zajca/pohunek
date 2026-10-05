@@ -18,7 +18,7 @@ use protocol::{
     IntegrationFindingSeverity, IntegrationInstallParams, IntegrationInstallResult,
     IntegrationInstallState, IntegrationStatusParams, IntegrationStatusResult,
     IntegrationUninstallParams, IntegrationUninstallResult, IntegrationUninstallState,
-    ProtocolError, RuntimeRef,
+    ProtocolError, RuntimeId, RuntimeRef,
 };
 use serde::Serialize;
 
@@ -49,7 +49,12 @@ const HERMES_EXECUTABLE_NAME: &str = "hermes";
 const HOME_ENVIRONMENT_VARIABLE: &str = "HOME";
 
 /// Agent selector accepted by `integration --agent`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+///
+/// The built-in names keep their meaning; any other value is a runtime id the
+/// daemon resolves to the integration handler its definition names, so a
+/// runtime id that no installed runtime backs is refused by the daemon with its
+/// typed error.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HookAgentArg {
     /// Install or manage the Hermes operator plugin locally.
     Hermes,
@@ -57,6 +62,68 @@ pub(crate) enum HookAgentArg {
     Claude,
     /// Install the Codex hook.
     Codex,
+    /// A runtime the daemon resolves through its definition's handler.
+    Runtime(RuntimeId),
+}
+
+/// Wire names of the built-in agents, offered to help and completion.
+const BUILTIN_AGENT_NAMES: [&str; 3] = ["claude", "codex", "hermes"];
+
+impl std::str::FromStr for HookAgentArg {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "hermes" => Ok(Self::Hermes),
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            other => RuntimeId::parse(other)
+                .map(Self::Runtime)
+                .map_err(|error| format!("`{other}` is not a runtime id ({error})")),
+        }
+    }
+}
+
+/// Clap parser of [`HookAgentArg`] that offers the built-in names as possible
+/// values without restricting the argument to them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HookAgentParser;
+
+impl clap::builder::TypedValueParser for HookAgentParser {
+    type Value = HookAgentArg;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let text = value.to_str().ok_or_else(|| {
+            cmd.clone().error(
+                clap::error::ErrorKind::InvalidUtf8,
+                "the agent is not UTF-8",
+            )
+        })?;
+        text.parse().map_err(|message: String| {
+            cmd.clone()
+                .error(clap::error::ErrorKind::ValueValidation, message)
+        })
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(
+            BUILTIN_AGENT_NAMES
+                .into_iter()
+                .map(clap::builder::PossibleValue::new),
+        ))
+    }
+}
+
+/// The parser of `--agent` values.
+pub(crate) fn hook_agent_parser() -> HookAgentParser {
+    HookAgentParser
 }
 
 impl From<HookAgentArg> for RuntimeRef {
@@ -65,6 +132,7 @@ impl From<HookAgentArg> for RuntimeRef {
             HookAgentArg::Claude => RuntimeRef::claude(),
             HookAgentArg::Codex => RuntimeRef::codex(),
             HookAgentArg::Hermes => RuntimeRef::hermes(),
+            HookAgentArg::Runtime(id) => RuntimeRef::from_wire(id.as_str()),
         }
     }
 }
@@ -399,7 +467,7 @@ pub(crate) fn run_hermes(
 
 /// Returns the typed unsupported-action error before any daemon connection.
 pub(crate) fn unsupported_action(agent: Option<HookAgentArg>) -> CliError {
-    let agent = agent.map_or("none", agent_name);
+    let agent = agent.map_or_else(|| "none".to_owned(), agent_name);
     CliError::Protocol(ProtocolError::new(
         ErrorClass::Configuration,
         "integration_action_unsupported",
@@ -603,12 +671,8 @@ fn hermes_error(error: HermesError) -> CliError {
     CliError::Hermes { error }
 }
 
-fn agent_name(agent: HookAgentArg) -> &'static str {
-    match agent {
-        HookAgentArg::Hermes => "hermes",
-        HookAgentArg::Claude => "claude",
-        HookAgentArg::Codex => "codex",
-    }
+fn agent_name(agent: HookAgentArg) -> String {
+    RuntimeRef::from(agent).as_wire().to_owned()
 }
 
 fn agent_label(agent: &RuntimeRef) -> &str {
@@ -1090,6 +1154,22 @@ mod tests {
             .iter()
             .all(|check| check.status == doctor::Status::Pass);
         doctor::Report { ok, checks }
+    }
+
+    #[test]
+    fn hook_agent_arg_accepts_builtin_names_and_runtime_ids() {
+        assert_eq!("claude".parse(), Ok(HookAgentArg::Claude));
+        assert_eq!("codex".parse(), Ok(HookAgentArg::Codex));
+        assert_eq!("hermes".parse(), Ok(HookAgentArg::Hermes));
+        let acme: HookAgentArg = "acme".parse().expect("a runtime id");
+        assert_eq!(
+            RuntimeRef::from(acme.clone()),
+            RuntimeRef::from_wire("acme")
+        );
+        assert_eq!(agent_name(acme), "acme");
+        for invalid in ["", "Not An Id", "a/b"] {
+            assert!(invalid.parse::<HookAgentArg>().is_err(), "{invalid:?}");
+        }
     }
 
     #[test]

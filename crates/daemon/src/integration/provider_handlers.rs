@@ -26,6 +26,9 @@ const HERMES_REPORTED_ACTIONS: &[HookAction] = &[
     HookAction::Notification,
 ];
 
+/// Command-line flag the recovery commands of a status warning select a runtime with.
+const AGENT_FLAG: &str = "--agent";
+
 /// The closed handler registry, in a stable order.
 pub(super) static REGISTRY: [Handler; 3] = [
     Handler::Daemon(&CodexHook),
@@ -68,8 +71,20 @@ impl StagedUpdate for StagedCodex {
 }
 
 /// Reports `agent`'s status for `runtime`.
+///
+/// The status inspection words its recovery commands with the provider's own
+/// agent name; they are rewritten to name `runtime`, the id the operator
+/// passes to `--agent`.
 fn inspect_for(agent: StatusAgent, runtime: &RuntimeRef) -> IntegrationAgentStatus {
     let mut status = reported_agent_status(agent);
+    let provider = agent.kind();
+    if provider != *runtime {
+        let from = format!("{AGENT_FLAG} {}", provider.as_wire());
+        let to = format!("{AGENT_FLAG} {}", runtime.as_wire());
+        for warning in &mut status.warnings {
+            *warning = warning.replace(&from, &to);
+        }
+    }
     status.agent = runtime.clone();
     status
 }

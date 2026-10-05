@@ -1655,7 +1655,12 @@ its older set.
 
 `integration.status` is the corresponding read-only drift report. Bare status
 reports both daemon-managed agents; `--agent codex` and `--agent claude` select
-one. Every managed script is checked independently against its embedded asset
+one. `--agent` takes any runtime id: the CLI sends it unchanged and the daemon
+resolves it to the handler the runtime definition names (an id no installed
+runtime backs is `runtime_not_installed`, a runtime without a daemon-run handler
+is `agent_not_installable`), so a package runtime is addressed by its own id and
+the recovery commands in status and doctor output name that id. `hermes` keeps
+its local CLI-run lifecycle. Every managed script is checked independently against its embedded asset
 and executable mode. Claude must also contain every exact managed registration
 in `settings.json`. Codex must contain every exact registration in `hooks.json`,
 have the hooks feature enabled, and retain the position-derived trust hash for

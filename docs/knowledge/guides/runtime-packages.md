@@ -64,6 +64,9 @@ schema admits everything the new set reports
 restores the exact prior tree if any step fails, so the old set stays active
 until activation succeeds. `hermes-hook-v1` is registered but its lifecycle runs
 in the CLI; the daemon answers `agent_not_installable` for it.
+`pohunek integration --agent` takes the runtime id of a package runtime that
+names a daemon-run handler, and the recovery commands in status and doctor name
+that id.
 
 ## Local only
 

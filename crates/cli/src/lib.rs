@@ -656,7 +656,7 @@ enum IntegrationAction {
     /// resume. Without `--agent`, installs for every supported agent present.
     Install {
         /// Restrict installation to a single agent.
-        #[arg(long, value_enum)]
+        #[arg(long, value_parser = commands::integration::hook_agent_parser())]
         agent: Option<commands::integration::HookAgentArg>,
         #[command(flatten)]
         hermes: HermesCliOptions,
@@ -667,7 +667,7 @@ enum IntegrationAction {
     /// Inspect local Hermes or daemon-backed Codex/Claude integration status.
     Status {
         /// Restrict status; Hermes requires an explicit local target.
-        #[arg(long, value_enum)]
+        #[arg(long, value_parser = commands::integration::hook_agent_parser())]
         agent: Option<commands::integration::HookAgentArg>,
         #[command(flatten)]
         hermes: HermesStatusCliOptions,
@@ -680,7 +680,7 @@ enum IntegrationAction {
     Doctor {
         /// Restrict the diagnosis; Hermes requires an explicit local target.
         /// Without `--agent`, diagnoses Codex and Claude.
-        #[arg(long, value_enum, requires_if("hermes", HERMES_TARGET_GROUP))]
+        #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: Option<commands::integration::HookAgentArg>,
         #[command(flatten)]
         hermes: HermesDoctorCliOptions,
@@ -691,7 +691,7 @@ enum IntegrationAction {
     /// Atomically update the managed Hermes plugin and its policy.
     Update {
         /// Hermes is the only agent with an update lifecycle.
-        #[arg(long, value_enum, requires_if("hermes", HERMES_TARGET_GROUP))]
+        #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: commands::integration::HookAgentArg,
         #[command(flatten)]
         hermes: HermesUpdateCliOptions,
@@ -703,7 +703,7 @@ enum IntegrationAction {
     /// Hermes plugin and its policy.
     Uninstall {
         /// Agent to remove; naming it is required so a removal is never implicit.
-        #[arg(long, value_enum, requires_if("hermes", HERMES_TARGET_GROUP))]
+        #[arg(long, value_parser = commands::integration::hook_agent_parser(), requires_if("hermes", HERMES_TARGET_GROUP))]
         agent: commands::integration::HookAgentArg,
         #[command(flatten)]
         hermes: HermesUninstallCliOptions,

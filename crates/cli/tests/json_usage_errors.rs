@@ -65,11 +65,11 @@ fn missing_required_arg_under_json_is_structured_and_nonzero() {
 
 #[test]
 fn invalid_enum_value_under_json_is_structured() {
-    // A clap invalid-enum-value error under --json. `session new --agent` is a
-    // free string since Part C (resolved daemon-side), so use the still-enum
-    // `integration install --agent`, whose value_parser only accepts claude/codex.
+    // A clap invalid-value error under --json. `session new --agent` is a free
+    // string (resolved daemon-side), so use `integration install --agent`, whose
+    // value_parser accepts the built-in names and any valid runtime id.
     let out = pohunek()
-        .args(["integration", "install", "--agent", "nonsense", "--json"])
+        .args(["integration", "install", "--agent", "Not An Id", "--json"])
         .output()
         .expect("spawn pohunek");
 

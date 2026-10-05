@@ -9,7 +9,9 @@
   check, atomic activation, rollback to the exact prior tree), the
   `integration_update_incompatible` error, and that `hermes-hook-v1` is
   registered with its lifecycle in the CLI. The source map lists the handler
-  sources.
+  sources. `pohunek integration --agent` accepts any
+  runtime id (built-in names unchanged), and status and doctor recovery commands
+  name the runtime that was addressed.
 
 ## Unreleased (2026-10-05, hook schemas)
 
