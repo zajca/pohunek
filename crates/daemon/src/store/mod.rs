@@ -586,8 +586,10 @@ pub struct NativeIdentityOrdering {
     pub pid: u32,
     /// Kernel start identity that protects against pid reuse.
     pub pid_start_identity: u64,
-    /// Highest accepted `session.report_native_id` sequence for this runtime.
-    pub sequence: u64,
+    /// Highest accepted `session.report_native_id` sequence for this runtime;
+    /// absent while no public report was accepted, which is not sequence 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
     /// Highest accepted worker identity-claim sequence for this runtime.
     ///
     /// The shipped adapters stamp worker claims and public reports from
@@ -620,7 +622,7 @@ impl NativeIdentityOrdering {
             return true;
         }
         match transport {
-            ReportTransport::Public => sequence > self.sequence,
+            ReportTransport::Public => self.sequence.is_none_or(|mark| sequence > mark),
             ReportTransport::Worker => self.worker_sequence.is_none_or(|mark| sequence > mark),
         }
     }
@@ -638,9 +640,10 @@ impl NativeIdentityOrdering {
         sequence: u64,
     ) -> Self {
         let kept = current.filter(|current| current.worker_instance_id == worker_instance_id);
-        let (public, worker) = kept.map_or((0, None), |kept| (kept.sequence, kept.worker_sequence));
+        let (public, worker) =
+            kept.map_or((None, None), |kept| (kept.sequence, kept.worker_sequence));
         let (public, worker) = match transport {
-            ReportTransport::Public => (sequence, worker),
+            ReportTransport::Public => (Some(sequence), worker),
             ReportTransport::Worker => (public, Some(sequence)),
         };
         Self {
@@ -1914,12 +1917,32 @@ mod tests {
             worker_instance_id: "instance-1".to_owned(),
             pid: 7,
             pid_start_identity: 9,
-            sequence: 3,
+            sequence: Some(3),
             worker_sequence: None,
         };
         let encoded = serde_json::to_value(&ordering).expect("encode ordering");
         assert_eq!(encoded["runtime_id"], "instance-1");
         assert!(encoded.get("worker_instance_id").is_none());
+
+        // An ordering key written by schema 3 has a public mark and no worker
+        // mark; one that only saw a worker claim has no public mark at all.
+        let schema3: NativeIdentityOrdering = serde_json::from_value(serde_json::json!({
+            "runtime_id": "instance-1", "pid": 7, "pid_start_identity": 9, "sequence": 3
+        }))
+        .expect("decode a schema 3 ordering");
+        assert_eq!((schema3.sequence, schema3.worker_sequence), (Some(3), None));
+        let worker_only: NativeIdentityOrdering = serde_json::from_value(serde_json::json!({
+            "runtime_id": "instance-1", "pid": 7, "pid_start_identity": 9, "worker_sequence": 5
+        }))
+        .expect("decode a worker-only ordering");
+        assert_eq!(
+            (worker_only.sequence, worker_only.worker_sequence),
+            (None, Some(5))
+        );
+        assert!(serde_json::to_value(&worker_only)
+            .expect("encode")
+            .get("sequence")
+            .is_none());
 
         let transaction: SessionTransaction = serde_json::from_value(serde_json::json!({
             "id": "t-1",

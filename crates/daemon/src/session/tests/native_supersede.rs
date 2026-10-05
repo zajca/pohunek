@@ -214,6 +214,30 @@ impl Rig {
     async fn report(&self, reference: &str) {
         self.send(&format!("report {reference}"));
         wait_for_file_contains(&self.acks, &format!("{reference}\n")).await;
+        // The worker verifies the launch process asynchronously when the
+        // process table is slow to answer; the reference is journaled once it
+        // has, so the snapshots the tests apply always carry it.
+        // While no daemon holds the session there is no worker handle to ask;
+        // the restart that follows reads whatever the worker journaled.
+        if !self
+            .registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .contains_key(self.id())
+        {
+            return;
+        }
+        wait_until("the worker to journal the reported reference", || async {
+            let (worker, _identity) = live_worker_and_identity(&self.registry, self.id()).await;
+            let snapshot = worker.inspect().await.ok()?;
+            snapshot
+                .native_reference
+                .filter(|journaled| journaled.native_reference == reference)
+                .map(|_| ())
+        })
+        .await;
         let python = fs::read_to_string(&self.python).unwrap_or_default();
         assert!(
             !python.trim().is_empty(),
@@ -647,7 +671,7 @@ async fn a_public_report_replaces_the_assigned_reference_in_sequence_order_and_r
         .and_then(|entry| entry.last_native_report.clone())
         .expect("the accepted report is ordered");
     let stale = public_report(&rig, "conversation-stale", |report| {
-        report.sequence = accepted.sequence - 1;
+        report.sequence = accepted.sequence.expect("public mark") - 1;
     })
     .await;
     assert!(!rig.registry.report_native_id(stale).await.recorded);
@@ -1059,7 +1083,7 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
         .and_then(|entry| entry.last_native_report.clone())
         .expect("ordered report");
     let stale = public_report(&rig, "public-stale", |report| {
-        report.sequence = accepted.sequence;
+        report.sequence = accepted.sequence.expect("public mark");
     })
     .await;
     assert!(!rig.registry.report_native_id(stale).await.recorded);
@@ -1075,7 +1099,7 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
     // though a worker claim was accepted after it, and never replaces the
     // newer conversation.
     let late = public_report(&rig, "public-late", |report| {
-        report.sequence = accepted.sequence;
+        report.sequence = accepted.sequence.expect("public mark");
     })
     .await;
     assert!(!rig.registry.report_native_id(late).await.recorded);
@@ -1114,9 +1138,17 @@ enum Step {
     ExitAndResume,
     /// The latest conversation is forked.
     Fork,
+    /// The agent switches while no daemon runs and exits before the daemon
+    /// returns; the ended session is then resumed.
+    SwitchDownThenExit,
+    /// The agent switches and the registry's own watcher imports it.
+    SwitchViaWatcher,
+    /// A public report numbered 0, admitted only while no public report was
+    /// accepted for the generation.
+    PublicSequenceZero,
 }
 
-const STEPS: [Step; 10] = [
+const STEPS: [Step; 13] = [
     Step::Switch,
     Step::SwitchAfterLease,
     Step::PublicReport,
@@ -1127,6 +1159,9 @@ const STEPS: [Step; 10] = [
     Step::SwitchWhileDown,
     Step::ExitAndResume,
     Step::Fork,
+    Step::SwitchDownThenExit,
+    Step::SwitchViaWatcher,
+    Step::PublicSequenceZero,
 ];
 
 /// Deterministic generator of step histories: a 64-bit xorshift stream, so a
@@ -1143,7 +1178,7 @@ impl Generator {
 
     fn history(&mut self, length: usize) -> Vec<Step> {
         (0..length)
-            .map(|_| STEPS[usize::try_from(self.next() % 10).expect("index")])
+            .map(|_| STEPS[usize::try_from(self.next() % STEPS.len() as u64).expect("index")])
             .collect()
     }
 }
@@ -1179,6 +1214,38 @@ impl Rig {
             .expect("startup reconciliation");
         drop(std::mem::replace(&mut self.registry, restarted.clone()));
         restarted
+    }
+
+    /// The agent switches to `reference` and exits while no daemon runs; the
+    /// new daemon then finds an ended worker.
+    async fn restart_down_then_exit(&mut self, reference: &str) {
+        let barrier = self.registry.inner.persist_lock.lock().await;
+        std::mem::forget(barrier);
+        let entries: Vec<_> = self
+            .registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect();
+        for entry in entries {
+            entry.cancel_runtime_watchers();
+        }
+        self.report(reference).await;
+        self.send("exit");
+        let restarted = Self::registry(&self.config, &self.launcher, &self.script, self.existence);
+        restarted
+            .reconcile_workers()
+            .await
+            .expect("startup reconciliation");
+        wait_until("the ended session to be imported", || async {
+            let info = restarted.inspect(self.id()).await.ok()?;
+            matches!(info.state, SessionState::Done | SessionState::Failed).then_some(())
+        })
+        .await;
+        drop(std::mem::replace(&mut self.registry, restarted));
     }
 
     fn launches(&self) -> usize {
@@ -1260,10 +1327,10 @@ async fn run_history(seed: u64, history: &[Step]) {
                     .last_report()
                     .await
                     .map(|key| key.sequence)
-                    .filter(|mark| *mark > 0)
+                    .filter(|mark| *mark > Some(0))
                 {
                     let report = public_report(&rig, &name("stale"), |report| {
-                        report.sequence = mark;
+                        report.sequence = mark.expect("filtered");
                     })
                     .await;
                     assert!(
@@ -1309,6 +1376,50 @@ async fn run_history(seed: u64, history: &[Step]) {
                     "resume uses the latest reference: {at}"
                 );
                 older.clear();
+            }
+            Step::SwitchDownThenExit => {
+                let next = name("ended");
+                rig.restart_down_then_exit(&next).await;
+                older.clear();
+                latest = next;
+                let before = rig.launches();
+                rig.registry.resume(rig.id()).await.expect("resume");
+                wait_until("the resumed launch", || async {
+                    (rig.launch_argv(before).len() >= LAUNCH_ARGV_LINES).then_some(())
+                })
+                .await;
+                assert_eq!(
+                    rig.launch_argv(before),
+                    ["--model", "fast", "--session", latest.as_str()],
+                    "an ended session resumes the reference it switched to: {at}"
+                );
+            }
+            Step::SwitchViaWatcher => {
+                let next = name("watched");
+                rig.report(&next).await;
+                wait_until("the watcher to import the switch", || async {
+                    let info = rig.registry.inspect(rig.id()).await.ok()?;
+                    (info.native_session_id.as_deref() == Some(next.as_str())).then_some(())
+                })
+                .await;
+                latest = next;
+            }
+            Step::PublicSequenceZero => {
+                let instance = rig
+                    .snapshot(&rig.registry)
+                    .await
+                    .worker_instance_id
+                    .map(|instance| instance.to_string());
+                let first_public = rig.last_report().await.is_none_or(|key| {
+                    key.sequence.is_none() || Some(key.worker_instance_id) != instance
+                });
+                let next = name("zero");
+                let report = public_report(&rig, &next, |report| report.sequence = 0).await;
+                let recorded = rig.registry.report_native_id(report).await.recorded;
+                assert_eq!(recorded, first_public, "{at}");
+                if recorded {
+                    latest = next;
+                }
             }
             Step::Fork => {
                 let before = rig.launches();
@@ -1380,10 +1491,11 @@ async fn generated_histories_over_many_seeds_keep_the_latest_conversation() {
 #[tokio::test]
 async fn orderings_found_in_review_hold() {
     use Step::{
-        ExitAndResume, Fork, LoseProjectionWrites, PublicReport, ReplayOlderSnapshot, Restart,
-        Switch, SwitchAfterLease, SwitchWhileDown,
+        ExitAndResume, Fork, LoseProjectionWrites, PublicReport, PublicSequenceZero,
+        ReplayOlderSnapshot, Restart, Switch, SwitchAfterLease, SwitchDownThenExit,
+        SwitchViaWatcher, SwitchWhileDown,
     };
-    let histories: [&[Step]; 6] = [
+    let histories: [&[Step]; 10] = [
         // A crash after the record write, then a resume, then another crash.
         &[Switch, LoseProjectionWrites, Switch, ExitAndResume, Restart],
         &[
@@ -1417,6 +1529,13 @@ async fn orderings_found_in_review_hold() {
             Restart,
             ReplayOlderSnapshot,
         ],
+        // A switch while the daemon is down, then an exit before it returns.
+        &[SwitchDownThenExit, Restart, Fork],
+        &[Switch, SwitchDownThenExit, SwitchAfterLease, Restart],
+        // The watcher imports a switch that only the durable reference carries.
+        &[SwitchViaWatcher, SwitchAfterLease, Restart, ExitAndResume],
+        // A worker claim followed by the first public report, numbered 0.
+        &[Switch, PublicSequenceZero, PublicSequenceZero, Restart],
     ];
     for (index, history) in histories.iter().enumerate() {
         run_history(1000 + u64::try_from(index).expect("index"), history).await;

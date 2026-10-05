@@ -968,7 +968,11 @@ max_depth = 1                                    # directory levels below dir
   switch made while the daemon was down is still read when it returns. The
   reference must name the runtime itself, never a nested process, carry the
   declared reference kind and be newer than the last worker report accepted for
-  the runtime generation. A worker that journals no such reference is read
+  the runtime generation. A report of the launch process that arrives while the
+  worker is still verifying it is kept and promoted with the claim, and a
+  session whose runtime ended while the daemon was down imports the journaled
+  reference too, when it belongs to the record's own worker instance and the
+  verified launch process. A worker that journals no such reference is read
   through its launch and active claims instead, for as long as the active
   claim's lease lasts. Every replacement carries an ordering key, and a
   recovered session keeps the key of the reference it recovers. Sequences are compared only within one transport and one runtime generation

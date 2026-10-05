@@ -3197,6 +3197,7 @@ where
                                 },
                                 expires_at,
                                 sequence,
+                                latest_reference: None,
                             };
                             launch_identity_status = launch::submit(
                                 &mut journal,

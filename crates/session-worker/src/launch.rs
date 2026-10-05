@@ -5,7 +5,7 @@
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::journal::{JournalRecord, NativeReferenceClaim, PendingLaunchClaim, RuntimePhase};
+use crate::journal::{JournalRecord, PendingLaunchClaim, RuntimePhase};
 use crate::WorkerError;
 
 /// Launch-specific disposition, separate from acceptance of active identity.
@@ -32,11 +32,13 @@ pub(crate) fn submit(
             LaunchClaimStatus::Rejected
         });
     }
-    if let Some(existing) = journal.pending_launch_claims.iter().find(|existing| {
+    if let Some(existing) = journal.pending_launch_claims.iter_mut().find(|existing| {
         existing.identity.process == claim.identity.process
             && existing.identity.provider == claim.identity.provider
     }) {
-        // A later active report cannot replace or extend the first launch claim.
+        // A later report cannot replace or extend the first launch claim, but
+        // the launch process's latest reference is kept to promote with it.
+        existing.note_report(claim.promoted_reference());
         return Ok(
             if existing.retry_pending && existing.identity == claim.identity {
                 LaunchClaimStatus::Pending
@@ -47,13 +49,7 @@ pub(crate) fn submit(
     }
     match verify(&claim) {
         Ok(true) => {
-            journal.native_reference_claim = Some(NativeReferenceClaim {
-                provider: claim.identity.provider.clone(),
-                process: claim.identity.process.clone(),
-                sequence: claim.sequence,
-                reference_kind: claim.identity.reference_kind.clone(),
-                native_reference: claim.identity.native_reference.clone(),
-            });
+            journal.native_reference_claim = Some(claim.promoted_reference());
             journal.launch_identity = Some(claim.identity);
             journal.pending_launch_claims.clear();
             Ok(LaunchClaimStatus::Accepted)
@@ -102,42 +98,9 @@ pub(crate) fn retry(
         }
         match verify(&claim) {
             Ok(true) => {
-                // A retried claim is the first the worker could verify; a
-                // newer report of the same process that arrived while it was
-                // pending is the launch process's latest reference.
-                if journal.native_reference_claim.is_none() {
-                    let newer = journal.active_identity.as_ref().filter(|active| {
-                        active.provider == claim.identity.provider
-                            && active.process == claim.identity.process
-                            && active.sequence > claim.sequence
-                    });
-                    journal.native_reference_claim = Some(
-                        match newer.and_then(|active| {
-                            Some((
-                                active.reference_kind.clone()?,
-                                active.native_reference.clone()?,
-                                active.sequence,
-                            ))
-                        }) {
-                            Some((reference_kind, native_reference, sequence)) => {
-                                NativeReferenceClaim {
-                                    provider: claim.identity.provider.clone(),
-                                    process: claim.identity.process.clone(),
-                                    sequence,
-                                    reference_kind,
-                                    native_reference,
-                                }
-                            }
-                            None => NativeReferenceClaim {
-                                provider: claim.identity.provider.clone(),
-                                process: claim.identity.process.clone(),
-                                sequence: claim.sequence,
-                                reference_kind: claim.identity.reference_kind.clone(),
-                                native_reference: claim.identity.native_reference.clone(),
-                            },
-                        },
-                    );
-                }
+                // The verified claim promotes the latest reference its process
+                // reported while verification was pending.
+                journal.native_reference_claim = Some(claim.promoted_reference());
                 journal.launch_identity = Some(claim.identity);
                 changed = true;
             }
@@ -199,6 +162,7 @@ mod tests {
                 .format(&Rfc3339)
                 .unwrap(),
             sequence: 0,
+            latest_reference: None,
         };
         (journal, claim, now)
     }
@@ -240,6 +204,67 @@ mod tests {
             ))
             .unwrap(),
             LaunchClaimStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn the_latest_reference_reported_while_verification_is_pending_is_promoted_with_the_claim() {
+        let (mut journal, claim, now) = fixture();
+        assert_eq!(
+            submit(&mut journal, claim.clone(), 1, unavailable).unwrap(),
+            LaunchClaimStatus::Pending
+        );
+        let report = |sequence: u64, reference: &str| {
+            let mut later = claim.clone();
+            later.sequence = sequence;
+            later.identity.native_reference = reference.into();
+            later
+        };
+        // A switch while pending, an older number arriving late, and a release
+        // of the active claim in between: only the newest reference survives.
+        submit(&mut journal, report(5, "switched"), 1, unavailable).unwrap();
+        submit(&mut journal, report(3, "older"), 1, unavailable).unwrap();
+        journal.active_identity = None;
+
+        assert!(retry(&mut journal, now, |_| Ok(true)));
+        let promoted = journal.native_reference_claim.expect("promoted reference");
+        assert_eq!(
+            (promoted.native_reference.as_str(), promoted.sequence),
+            ("switched", 5)
+        );
+        assert_eq!(
+            journal
+                .launch_identity
+                .expect("launch identity")
+                .native_reference,
+            "first-reference",
+            "the launch identity stays the first claim"
+        );
+    }
+
+    #[test]
+    fn a_report_of_another_process_never_becomes_the_pending_reference() {
+        let (mut journal, claim, now) = fixture();
+        submit(&mut journal, claim.clone(), 2, unavailable).unwrap();
+        let mut nested = claim;
+        nested.identity.process = crate::journal::ChildIdentity {
+            pid: 99,
+            process_group: 10,
+            start_identity: "990".into(),
+        };
+        nested.identity.native_reference = "nested-reference".into();
+        nested.sequence = 9;
+        submit(&mut journal, nested, 2, unavailable).unwrap();
+
+        assert!(retry(&mut journal, now, |pending| {
+            Ok(pending.identity.native_reference == "first-reference")
+        }));
+        assert_eq!(
+            journal
+                .native_reference_claim
+                .expect("promoted reference")
+                .native_reference,
+            "first-reference"
         );
     }
 

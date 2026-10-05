@@ -2558,6 +2558,12 @@ impl SessionRegistry {
                 tracing::warn!(session_id = %record.session_id, reason, "rejected terminal worker subagent journal");
             }
         }
+        match evidence.snapshot() {
+            Ok(snapshot) => import_ended_native_reference(&mut record, &snapshot),
+            Err(reason) => {
+                tracing::warn!(session_id = %record.session_id, reason, "unreadable terminal worker journal; its native reference is not imported");
+            }
+        }
         record.info.pid = evidence.child.as_ref().map_or(0, |child| child.pid);
         if let Some(cols) = evidence.cols {
             record.info.cols = cols;
@@ -2752,6 +2758,7 @@ impl SessionRegistry {
             }
         }
         terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
+        import_ended_native_reference(&mut record, snapshot);
         if let Some(exit) = &snapshot.exit {
             record.info.exit_code = exit.code;
             record.info.state = if exit.stopped_by_user {
@@ -4343,6 +4350,36 @@ pub(super) fn apply_launch_identity(
         }
     }
     Ok(())
+}
+
+/// Imports the journaled native reference into the record of a session whose
+/// runtime has ended.
+///
+/// The launch process can no longer be inspected, so the reference is trusted
+/// only when the snapshot belongs to the record's own worker instance and the
+/// reference is bound to the launch process the worker verified. Anything
+/// unprovable leaves the stored reference alone.
+fn import_ended_native_reference(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+) {
+    let Some(reference) = snapshot.native_reference.as_ref() else {
+        return;
+    };
+    let recorded = record.runtime.worker_instance_id.as_deref();
+    let same_generation = recorded.is_some()
+        && snapshot
+            .worker_instance_id
+            .as_ref()
+            .map(pohunek_worker_protocol::WorkerInstanceId::as_str)
+            == recorded;
+    let bound_to_launch = snapshot
+        .launch_identity
+        .as_ref()
+        .is_some_and(|launch| launch.process == reference.process);
+    if same_generation && bound_to_launch {
+        let _ = apply_journaled_native_reference(record, snapshot, reference);
+    }
 }
 
 /// Imports the native reference the worker journaled for its verified launch
@@ -5981,6 +6018,137 @@ while os.getppid() == parent:
         assert!(!schema_in_window(4, 6, &[4, 5, 6]));
     }
 
+    /// The record of an assigned runtime whose worker instance is
+    /// `runtime-identity`, holding `assigned-ref`.
+    fn ended_assigned_record() -> SessionRecord {
+        assigned_record("assigned-ref")
+    }
+
+    #[test]
+    fn an_ended_worker_hands_its_journaled_reference_over_only_when_it_proves_its_binding() {
+        let reported = |snapshot: &mut InspectSnapshot, pid: u32| {
+            snapshot.native_reference = Some(pohunek_worker_protocol::ReportedNativeReference {
+                provider: "codex".to_owned(),
+                process: ProcessIdentity {
+                    pid,
+                    start_identity: u64::from(pid) * 10,
+                },
+                sequence: 8,
+                reference_kind: "id".to_owned(),
+                native_reference: "journaled-ref".to_owned(),
+            });
+        };
+        let held = |record: &SessionRecord| record.info.native_session_id.clone();
+
+        let mut snapshot = switch_snapshot(Some("assigned-ref"), None);
+        reported(&mut snapshot, 50);
+        let mut record = ended_assigned_record();
+        super::import_ended_native_reference(&mut record, &snapshot);
+        assert_eq!(held(&record).as_deref(), Some("journaled-ref"));
+        assert_eq!(provenance_of(&record), NativeReferenceProvenance::Reported);
+
+        // Another worker instance, a reference of a process that is not the
+        // verified launch process, and a missing launch claim prove nothing.
+        let mut other_instance = snapshot.clone();
+        other_instance.worker_instance_id =
+            Some(WorkerInstanceId::new("another-instance").expect("instance id"));
+        let mut nested = switch_snapshot(Some("assigned-ref"), None);
+        reported(&mut nested, 60);
+        let mut unverified = snapshot.clone();
+        unverified.launch_identity = None;
+        for (name, snapshot) in [
+            ("another instance", other_instance),
+            ("not the launch process", nested),
+            ("no verified launch", unverified),
+        ] {
+            let mut record = ended_assigned_record();
+            super::import_ended_native_reference(&mut record, &snapshot);
+            assert_eq!(held(&record).as_deref(), Some("assigned-ref"), "{name}");
+        }
+        let mut no_instance = ended_assigned_record();
+        no_instance.runtime.worker_instance_id = None;
+        super::import_ended_native_reference(&mut no_instance, &snapshot);
+        assert_eq!(held(&no_instance).as_deref(), Some("assigned-ref"));
+    }
+
+    /// The terminal journal of the assigned runtime's worker, whose launch
+    /// process reported `journaled-ref` after the launch claim named
+    /// `assigned-ref`.
+    fn ended_evidence(record: &SessionRecord) -> super::JournalEvidence {
+        super::JournalEvidence {
+            schema_version: crate::runtime::lifecycle::WORKER_JOURNAL_SCHEMA_VERSION,
+            session_id: record.session_id.clone(),
+            worker_id: record.runtime.worker_id.clone().expect("worker id"),
+            generation: "abcd2345".to_owned(),
+            executable: PathBuf::from("/usr/libexec/pohunek-sessiond"),
+            worker_pid: 41,
+            worker_start_identity: "410".to_owned(),
+            boot_identity: "boot-test".to_owned(),
+            worker_instance_id: record.runtime.worker_instance_id.clone(),
+            child: Some(super::JournalChild {
+                pid: 50,
+                start_identity: "500".to_owned(),
+            }),
+            cols: Some(80),
+            rows: Some(24),
+            phase: super::JournalPhase::Terminal,
+            outcome: Some(super::JournalOutcome {
+                exit_code: Some(0),
+                signal: None,
+                success: true,
+            }),
+            subagents: Vec::new(),
+            hook_schema: None,
+            protocol_minimum: None,
+            protocol_maximum: None,
+            launch_identity: serde_json::from_value(serde_json::json!({
+                "provider": "codex", "reference_kind": "id",
+                "native_reference": "assigned-ref",
+                "process": {"pid": 50, "start_identity": "500"}
+            }))
+            .expect("launch identity"),
+            active_identity: None,
+            active_identity_release: None,
+            native_reference_claim: serde_json::from_value(serde_json::json!({
+                "provider": "codex", "sequence": 8, "reference_kind": "id",
+                "native_reference": "journaled-ref",
+                "process": {"pid": 50, "start_identity": "500"}
+            }))
+            .expect("native reference"),
+        }
+    }
+
+    #[test]
+    fn a_terminal_journal_carries_the_journaled_reference_into_its_snapshot() {
+        let record = ended_assigned_record();
+        let snapshot = ended_evidence(&record)
+            .snapshot()
+            .expect("a readable journal");
+        let reference = snapshot.native_reference.expect("journaled reference");
+        assert_eq!(reference.native_reference, "journaled-ref");
+        assert_eq!(reference.sequence, 8);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_journal_import_records_the_journaled_reference() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 1"]),
+            ..SessionRegistryConfig::default()
+        });
+        let record = ended_assigned_record();
+        let id = SessionId(record.session_id.clone());
+        assert!(
+            registry
+                .import_terminal_journal(record.clone(), ended_evidence(&record))
+                .await
+        );
+        let info = registry
+            .inspect(&id)
+            .await
+            .expect("inspect the ended session");
+        assert_eq!(info.native_session_id.as_deref(), Some("journaled-ref"));
+    }
+
     #[test]
     fn terminal_journal_identity_mismatch_and_duplicates_fail_closed() {
         let record = identity_record();
@@ -6499,7 +6667,7 @@ while os.getppid() == parent:
             worker_instance_id: worker_instance_id.to_string(),
             pid: child.pid,
             pid_start_identity: child.start_identity,
-            sequence: 1,
+            sequence: Some(1),
             worker_sequence: None,
         });
         let recovery = record.recovery.as_mut().expect("recovery binding");
@@ -6811,7 +6979,7 @@ while os.getppid() == parent:
                     worker_instance_id: worker_instance_id.to_string(),
                     pid: child.pid,
                     pid_start_identity: child.start_identity,
-                    sequence: 100,
+                    sequence: Some(100),
                     worker_sequence: None,
                 }),
                 info: SessionInfo {
@@ -8171,7 +8339,7 @@ while os.getppid() == parent:
             worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
-            sequence: 2,
+            sequence: Some(2),
             worker_sequence: None,
         });
         record.info.native_session_id = Some("native-newer".to_owned());
@@ -8295,7 +8463,7 @@ while os.getppid() == parent:
             worker_instance_id: instance.to_owned(),
             pid: 50,
             pid_start_identity: 500,
-            sequence: 4,
+            sequence: Some(4),
             worker_sequence: None,
         };
 
@@ -8363,7 +8531,7 @@ while os.getppid() == parent:
                 worker_instance_id: "runtime-identity".to_owned(),
                 pid: 50,
                 pid_start_identity: 500,
-                sequence: 0,
+                sequence: None,
                 worker_sequence: Some(9),
             })
         );
@@ -8434,7 +8602,7 @@ while os.getppid() == parent:
                 worker_instance_id: "runtime-identity".to_owned(),
                 pid: 50,
                 pid_start_identity: 500,
-                sequence,
+                sequence: Some(sequence),
                 worker_sequence,
             });
             record.info.native_session_id = Some(reference.to_owned());
@@ -8470,7 +8638,10 @@ while os.getppid() == parent:
             Some("newer-public-conversation")
         );
         let merged = newer.native_identity_ordering.expect("merged ordering");
-        assert_eq!((merged.sequence, merged.worker_sequence), (6, Some(900)));
+        assert_eq!(
+            (merged.sequence, merged.worker_sequence),
+            (Some(6), Some(900))
+        );
         assert!(!merged.admits("runtime-identity", crate::store::ReportTransport::Public, 5));
         assert!(!merged.admits(
             "runtime-identity",
@@ -8497,15 +8668,20 @@ while os.getppid() == parent:
         ordering = NativeIdentityOrdering::accepting(Some(&ordering), "gen", 1, 2, Public, 7);
         assert_eq!(
             (ordering.sequence, ordering.worker_sequence),
-            (7, Some(5_000_000))
+            (Some(7), Some(5_000_000))
         );
         assert!(!ordering.admits("gen", Public, 7));
         assert!(
             !ordering.admits("gen", Worker, 5_000_000),
             "an accepted public report keeps the worker mark: the old claim is not newer"
         );
+        // A worker claim leaves the public mark absent, not at zero, so the
+        // first public report of any number is admitted.
+        let worker_only = NativeIdentityOrdering::accepting(None, "gen", 1, 2, Worker, 9);
+        assert_eq!(worker_only.sequence, None);
+        assert!(worker_only.admits("gen", Public, 0));
         let fresh = NativeIdentityOrdering::accepting(Some(&ordering), "next", 1, 2, Public, 3);
-        assert_eq!((fresh.sequence, fresh.worker_sequence), (3, None));
+        assert_eq!((fresh.sequence, fresh.worker_sequence), (Some(3), None));
     }
 
     #[test]
@@ -8594,7 +8770,7 @@ while os.getppid() == parent:
             worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
-            sequence: 7,
+            sequence: Some(7),
             worker_sequence: None,
         });
         assert_eq!(
@@ -8641,7 +8817,7 @@ while os.getppid() == parent:
             worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
-            sequence: 7,
+            sequence: Some(7),
             worker_sequence: None,
         });
         existing.info.native_session_id = Some("native-authoritative".to_owned());

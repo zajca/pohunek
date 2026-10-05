@@ -4660,6 +4660,7 @@ type WorkerMetadataFingerprint = (
     Option<pohunek_worker_protocol::ReportedLaunchIdentity>,
     Option<pohunek_worker_protocol::ActiveIdentityClaim>,
     Option<pohunek_worker_protocol::ReleasedIdentityClaim>,
+    Option<pohunek_worker_protocol::ReportedNativeReference>,
     Vec<pohunek_worker_protocol::SubagentSnapshot>,
 );
 
@@ -4777,12 +4778,17 @@ fn worker_metadata_fingerprint(
         snapshot.launch_identity.clone(),
         snapshot.active_identity.clone(),
         snapshot.active_identity_release.clone(),
+        snapshot.native_reference.clone(),
         snapshot.subagents.clone(),
     )
 }
 
 fn worker_metadata_is_empty(identity: &WorkerMetadataFingerprint) -> bool {
-    identity.0.is_none() && identity.1.is_none() && identity.2.is_none() && identity.3.is_empty()
+    identity.0.is_none()
+        && identity.1.is_none()
+        && identity.2.is_none()
+        && identity.3.is_none()
+        && identity.4.is_empty()
 }
 
 fn identity_claim_expiry_is_valid(value: &str) -> bool {

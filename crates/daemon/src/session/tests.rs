@@ -7069,8 +7069,57 @@ async fn durable_launch_identity_survives_worker_metadata_rebase() {
 }
 
 #[test]
+fn a_journaled_native_reference_alone_changes_the_worker_metadata_fingerprint() {
+    let reference = |value: &str| pohunek_worker_protocol::ReportedNativeReference {
+        provider: "pi".to_owned(),
+        process: pohunek_worker_protocol::ProcessIdentity {
+            pid: 7,
+            start_identity: 70,
+        },
+        sequence: 3,
+        reference_kind: "id".to_owned(),
+        native_reference: value.to_owned(),
+    };
+    let snapshot = |value: Option<&str>| pohunek_worker_protocol::InspectSnapshot {
+        session_id: pohunek_worker_protocol::SessionId::new("s-fp").expect("session id"),
+        worker_id: pohunek_worker_protocol::WorkerId::new("w-fp").expect("worker id"),
+        worker_instance_id: None,
+        phase: pohunek_worker_protocol::RuntimePhase::Running,
+        worker_process: pohunek_worker_protocol::ProcessIdentity {
+            pid: 1,
+            start_identity: 1,
+        },
+        child_process: None,
+        dimensions: None,
+        history_start_offset: 0,
+        next_offset: 0,
+        exit: None,
+        launch_identity: None,
+        active_identity: None,
+        active_identity_release: None,
+        native_reference: value.map(reference),
+        subagents: Vec::new(),
+        hook_schema: None,
+    };
+    let (first, second) = (
+        super::worker_metadata_fingerprint(&snapshot(Some("a"))),
+        super::worker_metadata_fingerprint(&snapshot(Some("b"))),
+    );
+    assert_ne!(first, second);
+    assert!(!super::worker_metadata_is_empty(&first));
+    assert!(super::worker_metadata_is_empty(
+        &super::worker_metadata_fingerprint(&snapshot(None))
+    ));
+
+    // A reconnect whose every other field matches still applies the snapshot.
+    let mut tracker = WorkerMetadataTracker::default();
+    tracker.complete(first);
+    assert!(tracker.should_apply(&second));
+}
+
+#[test]
 fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
-    let fingerprint = (None, None, None, Vec::new());
+    let fingerprint = (None, None, None, None, Vec::new());
     let mut tracker = WorkerMetadataTracker::default();
     let now = Instant::now();
 
@@ -7129,7 +7178,7 @@ fn metadata_tracker_recovers_unchanged_fingerprint_after_previous_limit() {
 
 #[test]
 fn terminal_identity_retry_finishes_without_completing_commit_failures() {
-    let fingerprint = (None, None, None, Vec::new());
+    let fingerprint = (None, None, None, None, Vec::new());
     let now = Instant::now();
     let mut identity_tracker = WorkerMetadataTracker::default();
 
@@ -10148,7 +10197,7 @@ async fn report_native_id_records_binding_and_updates_info() {
         !native_report_is_current(
             Some(ordering),
             &ordering.worker_instance_id,
-            ordering.sequence - 1,
+            ordering.sequence.expect("public mark") - 1,
             crate::store::ReportTransport::Public,
         ),
         "a lower sequence must remain stale after the ordering key is reloaded"
@@ -10233,7 +10282,7 @@ async fn concurrent_session_writes_cannot_regress_native_ordering() {
             .as_ref()
             .expect("persisted ordering")
             .sequence,
-        u64::MAX
+        Some(u64::MAX)
     );
     assert_eq!(
         persisted.info.native_session_id.as_deref(),
@@ -10919,7 +10968,7 @@ async fn spontaneous_exit_uses_durable_base_after_uncaptured_resize() {
         worker_instance_id,
         pid: 4242,
         pid_start_identity: 777,
-        sequence: 9,
+        sequence: Some(9),
         worker_sequence: None,
     });
     let recovery = durable_before_exit
@@ -11205,7 +11254,7 @@ fn native_ordering_record(
         worker_instance_id: worker_instance_id.to_owned(),
         pid,
         pid_start_identity: 1,
-        sequence,
+        sequence: Some(sequence),
         worker_sequence: None,
     });
     record.info.native_session_id = Some(native.to_owned());

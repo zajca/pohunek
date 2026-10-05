@@ -244,6 +244,39 @@ pub struct PendingLaunchClaim {
     /// the field existed.
     #[serde(default)]
     pub sequence: u64,
+    /// Latest reference the same process reported while verification was
+    /// pending; promoted with the claim when verification succeeds.
+    #[serde(default)]
+    pub latest_reference: Option<NativeReferenceClaim>,
+}
+
+impl PendingLaunchClaim {
+    /// The reference this claim journals as the launch process's latest once
+    /// it is verified.
+    #[must_use]
+    pub fn promoted_reference(&self) -> NativeReferenceClaim {
+        self.latest_reference
+            .clone()
+            .unwrap_or_else(|| NativeReferenceClaim {
+                provider: self.identity.provider.clone(),
+                process: self.identity.process.clone(),
+                sequence: self.sequence,
+                reference_kind: self.identity.reference_kind.clone(),
+                native_reference: self.identity.native_reference.clone(),
+            })
+    }
+
+    /// Records `reported` as the latest reference of this claim's process when
+    /// it is newer than the one held.
+    pub fn note_report(&mut self, reported: NativeReferenceClaim) {
+        let held = self
+            .latest_reference
+            .as_ref()
+            .map_or(self.sequence, |latest| latest.sequence);
+        if reported.sequence > held {
+            self.latest_reference = Some(reported);
+        }
+    }
 }
 
 /// Durable ordering tombstone for an accepted active-identity release.
@@ -705,6 +738,7 @@ mod tests {
                 identity: record.launch_identity.as_ref().unwrap().clone(),
                 expires_at: "2026-07-23T00:01:00Z".to_owned(),
                 sequence: 0,
+                latest_reference: None,
             });
         record.active_identity_release = Some(ReleasedIdentity {
             provider: "claude".to_owned(),

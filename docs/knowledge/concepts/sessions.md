@@ -674,7 +674,11 @@ supersedes the reference it was relaunched with. The worker journals the latest
 reference of the verified launch process apart from the active claim's lease, so
 a switch made while the daemon was down survives the lease, and every
 replacement carries an ordering key that decides record-versus-projection
-reconciliation: the newer key wins and an unkeyed side loses to a keyed one. The public API reference
+reconciliation: the newer key wins and an unkeyed side loses to a keyed one. A
+session whose runtime ended while the daemon was down imports that reference too,
+when it belongs to the record's own worker instance and the verified launch
+process; a report that arrives while the worker is still verifying the launch
+process is promoted with the claim. The public API reference
 has the field-level contract.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
