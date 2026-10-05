@@ -1805,7 +1805,17 @@ pub(crate) struct LogCapture(Arc<StdMutex<Vec<u8>>>);
 
 impl LogCapture {
     /// Installs a capturing subscriber as this thread's default.
+    ///
+    /// A process-wide anchor dispatcher is registered first. With a single
+    /// registered dispatcher, `tracing` computes a callsite's interest from
+    /// the dispatcher of whichever thread reaches the callsite first, and a
+    /// thread without a default turns that into a cached "never" for every
+    /// other thread. With the anchor present at least two dispatchers are
+    /// registered, so interest is combined over all of them and the
+    /// per-event check consults the emitting thread's own default.
     pub(crate) fn install(&self) -> tracing::subscriber::DefaultGuard {
+        static ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_writer(self.clone())
             .with_ansi(false)
@@ -1837,6 +1847,31 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// An event whose callsite another thread without a default subscriber
+/// reached first is still captured on the installing thread.
+#[test]
+fn log_capture_sees_a_callsite_first_reached_by_an_unsubscribed_thread() {
+    fn emit() {
+        tracing::warn!("emitted from a callsite shared by two threads");
+    }
+    let logs = LogCapture::default();
+    let _subscriber = logs.install();
+
+    std::thread::spawn(emit)
+        .join()
+        .expect("the unsubscribed thread emits");
+    emit();
+
+    assert_eq!(
+        logs.text()
+            .matches("emitted from a callsite shared by two threads")
+            .count(),
+        1,
+        "{}",
+        logs.text()
+    );
 }
 
 #[tokio::test]
