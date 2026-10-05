@@ -4196,6 +4196,7 @@ fn apply_worker_launch_identity(
         &identity.provider,
         &identity.reference_kind,
         &identity.native_reference,
+        worker_instance_id,
     )
 }
 
@@ -4206,6 +4207,7 @@ pub(super) fn apply_launch_identity(
     provider: &str,
     reference_kind: &str,
     native_reference: &str,
+    worker_instance_id: Option<&str>,
 ) -> Result<(), &'static str> {
     let expected_provider = super::agent_kind_label(&record.info.agent_base);
     if provider != expected_provider {
