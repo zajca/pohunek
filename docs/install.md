@@ -154,3 +154,41 @@ pohunek session new --agent codex \
   --repo ~/Code/myapp --branch feat/retry-logic --base-branch main \
   --input "Add retry logic to the API client, then run the tests."
 ```
+
+## Install the Pi runtime package
+
+Pi (`pi`, the Pi coding agent) is an optional runtime delivered as a runtime
+package, not compiled into the daemon. The package declares launch, native
+resume and fork, input framing, and detection for Pi `1.0.x`; the supported range
+and the verified release are in `compat/pi/compatibility-lock.json`. It needs a
+Pi on the daemon's `PATH` (`npm install --global
+@earendil-works/pi-coding-agent@1.0.2`, Node 22.19 or newer).
+
+```bash
+# From a checkout: build the archive and note the digest it prints.
+cargo xtask package build runtime-packages/pi --output pi.tar.zst
+
+# Review what it declares, then install it with that exact digest (local trust,
+# never official). Repeat with --yes to install.
+pohunek plugin install ./pi.tar.zst --sha256 sha256:<digest-printed-above>
+pohunek plugin install ./pi.tar.zst --sha256 sha256:<digest-printed-above> --yes
+
+pohunek host inspect local --json     # the pi runtime reports its version and `supported`
+pohunek session new --agent pi --name "refactor-parser" --input "Refactor the parser."
+```
+
+- Pi chooses its own conversation file from the session id the daemon passes
+  at launch (`pi --session-id <id>`), so `pohunek session resume` runs
+  `pi --session <id>` and `pohunek session fork` runs `pi --fork <id>`.
+- Pi writes its session file only after the first model reply. A session that
+  never got one has nothing to resume, and resume is refused with
+  `agent_native_reference_missing` before anything launches. The same code
+  answers a session file that was deleted.
+- A forked session holds no reference of its own, so it is not resumable.
+- Recovery looks for the session file below `PI_CODING_AGENT_DIR` (default
+  `~/.pi/agent`) in `sessions/`. A Pi configured with `--session-dir`,
+  `PI_CODING_AGENT_SESSION_DIR`, or the `sessionDir` setting stores elsewhere,
+  and recovery then fails closed.
+- A Pi outside the supported range refuses to launch with
+  `agent_runtime_unsupported`; update the package (`pohunek plugin update`) when
+  a new Pi range is verified.

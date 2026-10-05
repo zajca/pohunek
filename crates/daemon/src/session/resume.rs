@@ -8,6 +8,7 @@ use super::{
     SessionId, SessionInfo, SessionRef, SessionRefKind, SessionRegistry, ValidatedLaunchProgram,
 };
 
+use std::ffi::OsString;
 use std::io;
 use std::sync::Arc;
 
@@ -205,7 +206,12 @@ impl SessionRegistry {
             )
         };
         let configured_program = binding_program(&binding, &definition);
-        let validated_program = host::validate_launch_runtime(&definition, &configured_program)?;
+        let launch_path = self.binding_probe_search_path(&binding, &definition)?;
+        let validated_program = host::validate_launch_runtime(
+            &definition,
+            &configured_program,
+            launch_path.as_deref(),
+        )?;
 
         let info = match self
             .resume_binding_with_registration(binding, registration, validated_program, guard)
@@ -291,10 +297,15 @@ impl SessionRegistry {
             .ok_or_else(agent_fork_unsupported)?;
         let session_ref = session_ref_from_binding(launch.reference_kind(), &binding)?;
 
+        // A fork starts a new process of the runtime, so a runtime with a
+        // version probe is probed again before anything is allocated.
+        let program = binding_program(&binding, &definition);
+        let launch_path = self.binding_probe_search_path(&binding, &definition)?;
+        let validated_program =
+            host::validate_launch_runtime(&definition, &program, launch_path.as_deref())?;
         let id = Self::allocate_session_id();
         self.ensure_worker_socket(&id)?;
         let has_snapshot = !binding.program.is_empty();
-        let program = binding_program(&binding, &definition);
         let input_rules = if has_snapshot {
             binding.input_rules.to_input_rules(definition.input_rules())
         } else {
@@ -319,7 +330,7 @@ impl SessionRegistry {
             cols: params.cols,
             rows: params.rows,
             env_extra,
-            validated_program: None,
+            validated_program,
         };
         let command = fork_pty_command_from_launch(
             &program,
@@ -382,6 +393,32 @@ impl SessionRegistry {
         Ok(info)
     }
 
+    /// The base environment `host.inspect` assumes for launches.
+    ///
+    /// A registry whose base environment cannot be built cannot launch an
+    /// agent either; the inventory then probes under an empty environment, so
+    /// it never reports a `PATH` no launch would see.
+    pub(crate) fn inspect_base_environment(&self) -> BaseEnv {
+        self.launch_base_environment().unwrap_or_default()
+    }
+
+    /// The `PATH` a launch of `definition` hands to the agent: the base
+    /// environment overridden by `profile_env`.
+    ///
+    /// Only a runtime with a version probe needs it, so any other definition
+    /// yields `None` without building the base environment.
+    pub(super) fn probe_search_path(
+        &self,
+        definition: &RuntimeDefinition,
+        profile_env: &[(String, String)],
+    ) -> Result<Option<OsString>, ProtocolError> {
+        if definition.version_probe_parser().is_none() {
+            return Ok(None);
+        }
+        let base = self.launch_base_environment()?;
+        Ok(effective_variable(&base, profile_env, "PATH"))
+    }
+
     /// The base environment a launch of this registry hands to the agent.
     fn launch_base_environment(&self) -> Result<BaseEnv, ProtocolError> {
         let lifecycle = self.lifecycle()?;
@@ -404,14 +441,7 @@ impl SessionRegistry {
         binding: &ResumeBinding,
         operation: &'static str,
     ) -> (Vec<(String, String)>, Option<Manifest>) {
-        let resolved = match self.binding_definition(binding) {
-            Ok(pinned) => self
-                .inner
-                .profiles
-                .resolve_agent_pinned(&binding.agent, &pinned),
-            Err(_unresolved) => self.inner.profiles.resolve_agent(&binding.agent),
-        };
-        match resolved {
+        match self.resolve_recovery_agent(binding) {
             Ok(resolved) => resolved.profile.map_or((Vec::new(), None), |profile| {
                 (profile.env, profile.manifest)
             }),
@@ -426,6 +456,38 @@ impl SessionRegistry {
                 (Vec::new(), None)
             }
         }
+    }
+
+    /// Re-resolves the agent `binding` was launched as.
+    fn resolve_recovery_agent(
+        &self,
+        binding: &ResumeBinding,
+    ) -> Result<crate::agent::ResolvedAgent, ProtocolError> {
+        match self.binding_definition(binding) {
+            Ok(pinned) => self
+                .inner
+                .profiles
+                .resolve_agent_pinned(&binding.agent, &pinned),
+            Err(_unresolved) => self.inner.profiles.resolve_agent(&binding.agent),
+        }
+    }
+
+    /// The `PATH` a relaunch of `binding` hands to the agent, for the version
+    /// probe that precedes it.
+    ///
+    /// A profile that no longer resolves contributes no environment here; the
+    /// relaunch itself reports it through [`Self::recovery_profile`].
+    fn binding_probe_search_path(
+        &self,
+        binding: &ResumeBinding,
+        definition: &RuntimeDefinition,
+    ) -> Result<Option<OsString>, ProtocolError> {
+        let profile_env = self
+            .resolve_recovery_agent(binding)
+            .ok()
+            .and_then(|resolved| resolved.profile)
+            .map_or_else(Vec::new, |profile| profile.env);
+        self.probe_search_path(definition, &profile_env)
     }
 
     /// The resume binding and git context a fork of `id` launches from.
@@ -492,7 +554,12 @@ impl SessionRegistry {
     ) -> Result<SessionInfo, ProtocolError> {
         let definition = self.binding_definition(&binding)?;
         let configured_program = binding_program(&binding, &definition);
-        let validated_program = host::validate_launch_runtime(&definition, &configured_program)?;
+        let launch_path = self.binding_probe_search_path(&binding, &definition)?;
+        let validated_program = host::validate_launch_runtime(
+            &definition,
+            &configured_program,
+            launch_path.as_deref(),
+        )?;
         let id = SessionId(binding.session_id.clone());
         let guard = self.lock_lifecycle(&id).await;
         let registration = match self.load_durable_session_record(&id).await? {

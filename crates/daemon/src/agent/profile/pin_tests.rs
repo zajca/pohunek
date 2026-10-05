@@ -482,7 +482,11 @@ fn host_inspect_describes_a_pinned_profile_from_its_pinned_definition() {
     fixture.write_pinned("pinned", &fixture.digest);
     fixture.update_to_second_version();
 
-    let capabilities = crate::capabilities::host_capabilities("0.0.0", &fixture.profiles());
+    let capabilities = crate::capabilities::host_capabilities(
+        "0.0.0",
+        &fixture.profiles(),
+        &pohunek_worker_protocol::BaseEnv::default(),
+    );
 
     let pinned = runtime_of(&capabilities, "pinned");
     let bare = runtime_of(&capabilities, "pi");
@@ -514,7 +518,11 @@ fn host_inspect_reports_a_pinned_profile_unavailable_when_its_package_is_disable
         .expect("disable");
     fixture.host.reload().expect("reload");
 
-    let capabilities = crate::capabilities::host_capabilities("0.0.0", &fixture.profiles());
+    let capabilities = crate::capabilities::host_capabilities(
+        "0.0.0",
+        &fixture.profiles(),
+        &pohunek_worker_protocol::BaseEnv::default(),
+    );
 
     assert!(!runtime_of(&capabilities, "pinned").available);
     assert!(capabilities
@@ -529,7 +537,11 @@ fn host_inspect_reports_a_pinned_profile_unavailable_when_itsroot_fails_verifica
     fixture.write_pinned("pinned", &fixture.digest);
     fixture.tamper();
 
-    let capabilities = crate::capabilities::host_capabilities("0.0.0", &fixture.profiles());
+    let capabilities = crate::capabilities::host_capabilities(
+        "0.0.0",
+        &fixture.profiles(),
+        &pohunek_worker_protocol::BaseEnv::default(),
+    );
 
     let pinned = runtime_of(&capabilities, "pinned");
     assert!(!pinned.available);
@@ -553,7 +565,11 @@ fn host_inspect_reports_a_pinned_profile_unavailable_when_its_package_is_uninsta
         .expect("uninstall");
     fixture.host.reload().expect("reload");
 
-    let capabilities = crate::capabilities::host_capabilities("0.0.0", &fixture.profiles());
+    let capabilities = crate::capabilities::host_capabilities(
+        "0.0.0",
+        &fixture.profiles(),
+        &pohunek_worker_protocol::BaseEnv::default(),
+    );
 
     assert!(!runtime_of(&capabilities, "pinned").available);
 }

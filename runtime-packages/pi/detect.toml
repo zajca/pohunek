@@ -1,0 +1,69 @@
+# Pi 1.0.2 activity manifest, matched against a real terminal session.
+#
+# Frame structure, anchored at the bottom of the visible screen (derived from
+# the captured screens in compat/pi/screens/, which cover terminal widths 20 to
+# 200 and Pi's source geometry):
+#
+#   transcript ...      anything, never inspected
+#   UPPER BORDER        busy: "── <spinner> <message> <rule>"; idle: a plain rule
+#   body lines          the draft: blank or any text, zero or more
+#   LOWER BORDER        a plain rule
+#   footer              one to four non-empty lines up to the screen end
+#
+# Busy border: Pi writes "── ", a braille spinner and its message (Working,
+# Compacting context..., Auto-compacting..., Context overflow detected,
+# Auto-compacting..., Retrying (n/m) in Ns...) truncated to the width, one space
+# and a closing rule of width - status - 4 columns. That rule is as short as one
+# column (24 columns with Retrying, 36 with Compacting) and the message is cut
+# mid-word, so a busy border is recognised by its "── <spinner>" start alone, at
+# every width. With a hidden-line marker the label sits between two rules
+# ("↑ N more"); at narrow widths only the spinner remains.
+#
+# Plain border: a rule of 20 or more "─", or "↑ N more" / "↓ N more" between
+# runs of four or more (what Pi draws from 20 columns up). Narrower terminals
+# are not recognised, which only ever withholds idle.
+#
+# Footer lines and body lines are, by the same classes, never borders. So the
+# lower border is the last border on the screen and the upper border the nearest
+# one above it: the frame is unique, and the working rule (busy upper border)
+# and the idle rule (plain upper border) can never both match, whatever the
+# transcript holds. Text that merely starts with "─", or looks like a status
+# without the "── <spinner>" start, is body or footer text; a draft or footer
+# line that starts "── <spinner>" or is itself a complete plain border cannot be
+# told from the frame in plain text. Transcript lines are never consulted, so a
+# column-zero rule above the editor cannot stand in for the upper border of a
+# busy frame. The regexes are generated, and the complement property is checked
+# exhaustively, by scripts/pi-detect-regex.
+#
+# working: the upper border is a busy border.
+# idle:    the upper border is a plain border. A screen that is not the editor
+#          frame matches neither rule.
+#
+# Not covered: a replacement editor that does not embed the status in its border
+# or an extension that swaps the braille spinner. No blocked signal was verified
+# (extension dialogs and login overlays were not exercised), so no blocked state
+# is declared; a screen no rule matches (overlays, selectors) keeps the
+# byte-activity fallback.
+
+[process]
+# Pi retitles its process to `pi` shortly after start (kernel name and argv),
+# and runs as `node <install>/coding-agent/dist/bundle/cli.js` before that.
+comm = ["^pi$"]
+cmdline = [
+  '^pi(?: .*)?$',
+  '^(?:[^ ]*/)?node [^ ]*coding-agent/dist/bundle/cli\.js(?: .*)?$',
+]
+
+[[rules]]
+id = "working_rule"
+state = "working"
+priority = 700
+region = "whole_recent"
+regex = ['(?m)^── [⠀-⣿][^\n]*\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n(?:[^─\n][^\n]*|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)){1,4}\z']
+
+[[rules]]
+id = "idle_editor_rule"
+state = "idle"
+priority = 300
+region = "whole_recent"
+regex = ['(?m)^(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n(?:[^─\n][^\n]*|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)){1,4}\z']

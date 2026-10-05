@@ -21,6 +21,10 @@ positioning; [architecture.md](architecture.md) is the authoritative design.
   backends are outside Pohunek's PTY ownership model. The selected Hermes
   profile can additionally host the owner-private Pohunek operator plugin:
   bounded typed tools, a generated skill, and best-effort lifecycle hooks.
+- The Pi coding agent `1.0.x` is an optional runtime package
+  (`runtime-packages/pi`) installed with `pohunek plugin install`: launch,
+  detection, resume and fork need no daemon release, and the daemon assigns the
+  session id Pi stores its conversation under.
 - **Live agent state detection** — `working` / `blocked` / `idle` — derived
   from OSC terminal titles, screen-content pattern matching, and PTY activity.
   Detection rules are TOML manifests, so new agents can be added without

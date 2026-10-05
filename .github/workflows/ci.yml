@@ -586,6 +586,7 @@ jobs:
       macos_package: ${{ steps.filter.outputs.macos_package }}
       sdk_macos: ${{ steps.filter.outputs.sdk_macos }}
       hermes: ${{ steps.filter.outputs.hermes }}
+      pi_package: ${{ steps.filter.outputs.pi_package }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
     steps:
@@ -752,6 +753,27 @@ jobs:
               - 'scripts/smoke-hermes-plugin-release'
               - 'scripts/tests/smoke-hermes-plugin-release.sh'
               - 'scripts/tests/fixtures/smoke-*'
+              - '.github/workflows/ci.yml'
+            # Official Pi runtime package: the package source and its
+            # compatibility lock, the daemon and CLI code the real-Pi test
+            # drives, and the crates those link. Any of them can change what a
+            # real `pi` does through the installed package.
+            pi_package:
+              - 'runtime-packages/**'
+              - 'compat/pi/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/cli/**'
+              - 'crates/daemon/**'
+              - 'crates/package/**'
+              - 'crates/protocol/**'
+              - 'crates/session-worker/**'
+              - 'crates/worker-protocol/**'
+              - 'crates/terminal/**'
+              - 'crates/platform/**'
+              - 'crates/paths/**'
+              - 'crates/test-support/**'
+              - 'crates/xtask/src/runtime_package.rs'
               - '.github/workflows/ci.yml'
             # Generated TS binding drift lives under a schedule or when the
             # protocol surface or generation driver changes (issue #125).
@@ -1200,6 +1222,88 @@ jobs:
             ${{ hashFiles('scripts/provision-hermes-compat') }}-
             ${{ hashFiles('scripts/tests/provision-hermes-compat.sh') }}-
             ${{ hashFiles('.github/workflows/ci.yml') }}
+
+  # Official Pi runtime package against the real, locked Pi release. The job
+  # installs exactly `compat/pi/compatibility-lock.json`'s release from npm,
+  # builds the package with `cargo xtask package build`, installs it into a real
+  # daemon with explicit-digest trust and drives a real `pi` through launch,
+  # detection, resume and fork. The model is a loopback stub: no provider, no
+  # credential and no model call. The always-running unit tests in the same
+  # test binary keep the descriptor, the supported range and the lock in sync;
+  # this job proves the locked release still behaves as they say.
+  pi-package:
+    name: Pi runtime package (locked release, model-free)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.pi_package == 'true' }}
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+      POHUNEK_PI_E2E: "1"
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read the Pi lock
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=compat/pi/compatibility-lock.json
+          {
+            echo "npm=$(jq -er '.upstream.npm' "$lock")"
+            echo "release=$(jq -er '.upstream.release' "$lock")"
+            echo "node=$(jq -er '.upstream.node_min' "$lock")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.lock.outputs.node }}
+
+      - name: Install the locked Pi release
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/pi"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund \
+            "${{ steps.lock.outputs.npm }}@${{ steps.lock.outputs.release }}"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          installed="$(env -i PATH="$prefix/bin:$PATH" HOME="$RUNNER_TEMP" pi --version)"
+          test "$installed" = "${{ steps.lock.outputs.release }}" \
+            || { echo "installed Pi $installed is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
+
+      - name: Install mold linker
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: pi-package
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the package deterministically
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo xtask package verify runtime-packages/pi
+          cargo xtask package build runtime-packages/pi --output "$RUNNER_TEMP/pi.tar.zst"
+          echo "POHUNEK_PI_PACKAGE_ARCHIVE=$RUNNER_TEMP/pi.tar.zst" >> "$GITHUB_ENV"
+
+      - name: Build the session worker
+        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+
+      - name: Drive the real Pi through the installed package
+        run: cargo test --locked -p pohunek-cli --test pi_package -- --include-ignored --test-threads 1
 
   # Native Apple Silicon counterpart of `hermes-compatibility`. It provisions
   # the same locked Hermes runtime under the runner's /bin/bash 3.2 and BSD

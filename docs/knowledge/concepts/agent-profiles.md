@@ -47,7 +47,11 @@ recovery write. The probe clears ambient user state and uses private temporary
 HOME, Hermes, XDG, Python-cache, and working directories. Pohunek canonicalizes
 the executable once and launches that exact absolute path without another PATH
 lookup. A same-owner replacement of the canonical file between probe and exec
-remains within the documented single-operator trust boundary. Keep legacy custom profiles usable when `agent_base` is absent,
+remains within the documented single-operator trust boundary. A runtime package can declare its own supported range with a data-driven probe
+(`version_probe = { parser = "semver-v1", args, min, below }`); the daemon applies the
+same sandboxed, bounded probe and the same `version`/`supported`/`agent_runtime_unsupported`
+behavior to it, with only `PATH` inherited so interpreter scripts resolve (the Pi
+package uses this). Keep legacy custom profiles usable when `agent_base` is absent,
 but treat a present unknown base as display-only.
 
 Hermes profiles use `base = "hermes"`. Their program and fixed arguments may

@@ -172,7 +172,9 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
 | `sdk/ts/`         | TypeScript SDK packages in the Bun workspace: `protocol` (generated protocol types), `sdk` (runtime client and runtime-path resolver), and `testkit` (fixture daemon and loopback test relay). |
 
-Other top-level: `compat/` (pinned upstream compatibility locks and sanitized
+Other top-level: `runtime-packages/` (source of the official runtime packages, one
+directory per runtime holding exactly its archive content; see its README),
+`compat/` (pinned upstream compatibility locks and sanitized
 goldens), `docs/` (architecture, roadmap, phases, knowledge source), `scripts/`
 (release helper, CI and dev tooling; the rofi/sway launchers live in
 `zajca/pohunek-work`).
@@ -253,6 +255,22 @@ POHUNEK_E2E=1 POHUNEK_DAEMON_BIN=/absolute/path/to/target/debug/pohunekd \
   POHUNEK_PYTHON_BIN=/usr/bin/python3 \
   bun test sdk/ts/sdk/test/e2e.test.ts sdk/ts/sdk/test/hermes-plugin.e2e.test.ts
 ```
+
+The official Pi runtime package (`runtime-packages/pi`, lock in `compat/pi/`) has
+always-running tests in `crates/cli/tests/pi_package.rs` (descriptor, supported
+range against the lock, manifest on real screens, existence check on Pi's real
+file layout) and two `#[ignore]`d tests that drive a real `pi` through the
+installed package against a loopback model stub. The `pi-package` CI job
+installs the locked release from npm and runs them; locally:
+
+```bash
+cargo xtask package build runtime-packages/pi --output ABS/pi.tar.zst
+POHUNEK_PI_E2E=1 POHUNEK_PI_PACKAGE_ARCHIVE=ABS/pi.tar.zst \
+  cargo test -p pohunek-cli --test pi_package -- --include-ignored --test-threads 1
+```
+
+Moving the supported Pi range means changing the descriptor's `min`/`below`
+and the lock together; the pure test fails when they differ.
 
 The TypeScript SDK is released as three npm-pack tarballs
 (`pohunek-ts-protocol-X.Y.Z.tgz`, `pohunek-ts-sdk-X.Y.Z.tgz`,

@@ -1,5 +1,16 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, Pi detection and probe PATH)
+
+- The Pi package guide describes detection as one bottom-anchored editor frame
+  (upper border, draft, lower border, footer) read for both states, with busy
+  borders recognised at every terminal width (their closing rule can be one
+  column), the busy indicators (`Working`, compaction, retry), the 20-column
+  floor for idle, the rule that draft and transcript text never decides, and
+  that the working and idle rules cannot both match. It
+  also states that the version probe runs under the launch `PATH`, profile
+  override included.
+
 ## Unreleased (2026-10-04, upgrade window and store schema)
 
 - The update runbook states the upgrade window (release N carries N-1 for live
@@ -17,6 +28,24 @@
   the update runbook now says to upgrade daemons before their clients (a new
   client against an N-1 daemon remains #527). The source
   map lists `crates/protocol/src/compat/`.
+
+## Unreleased (2026-10-04, Pi runtime package)
+
+- Added the Pi runtime package guide: package source layout
+  (`runtime-packages/pi`, `compat/pi`), explicit-digest install, the assigned
+  `--session-id`/`--session`/`--fork` contract, the session-file existence check
+  verified against Pi 1.0.2, detection facts, limits, and how CI keeps the
+  descriptor, the supported range and the tests in sync.
+- The source map lists the package sources, the compatibility lock, the real-Pi
+  test and the `pi-package` CI job.
+
+## Unreleased (2026-10-04, data-driven version probe)
+
+- Runtime descriptors can declare `version_probe = { parser = "semver-v1", args,
+  min, below }`: the daemon probes the program with the declared argv in the
+  sandboxed probe environment and accepts a release in `[min, below)`, so a
+  package moves its supported range without a daemon release. Documented in the
+  public API reference and the source map.
 
 ## Unreleased (2026-10-04, README and reference pages)
 

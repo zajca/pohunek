@@ -617,6 +617,7 @@ unchecked. Recovery never falls back to another runtime, the shell or
 own and is not resumable. That a later validated report supersedes an assigned
 reference, with `/clear` switching covered by tests, ships with the
 integration-report work; the public API reference has the field-level contract.
+The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
 `session.fork` creates a new pohunek session id and PTY from the source session's
 native agent conversation. The source may still be live; fork does not require a

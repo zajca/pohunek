@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Builds and checks the frame regexes of runtime-packages/pi/detect.toml.
+
+  pi-detect-regex            print the working and idle regexes (TOML-ready)
+  pi-detect-regex --verify   prove, over every short string, that the body
+                             class is the exact complement of the border class
+
+A border is a busy border ("── " and a braille spinner, any width) or a plain
+border (PURE or more rules, or a scroll marker between runs of MARK or more).
+BODY matches exactly the lines that are not borders; FOOT is BODY without the
+empty line. Because footer lines are never borders, the lower border of the
+frame is the last border on the screen and the upper border the nearest one
+above it, so the working rule (busy upper border) and the idle rule (plain
+upper border) can never both match.
+"""
+import itertools
+import re
+import sys
+
+BRAILLE = '⠀-⣿'
+PURE = 20
+MARK = 4
+
+
+def build(pure, mark):
+    assert 3 <= mark <= pure
+    busy = f'── [{BRAILLE}][^\\n]*'
+    plain = f'(?:─{{{pure},}}|─{{{mark},}} [↑↓] [^\\n]*─{{{mark},}})'
+    notend = f'(?:[^\\n]*[^─\\n])?─{{0,{mark - 1}}}'
+    cases = [
+        r'[^─\n][^\n]*',                                        # n = 0, non-empty
+        r'─(?:[^─\n][^\n]*)?',                                  # n = 1
+        f'──(?:[^─ \\n][^\\n]*| (?:[^{BRAILLE}\\n][^\\n]*)?)?',  # n = 2, not busy
+    ]
+    if mark > 3:
+        cases.append(f'─{{3,{mark - 1}}}(?:[^─\\n][^\\n]*)?')    # 3 <= n < mark
+    if pure > mark:
+        cases.append(f'─{{{mark},{pure - 1}}}')                 # short pure run
+    cases.append(f'─{{{mark},}}[^─ \\n][^\\n]*')                 # n >= mark, text
+    cases.append(
+        f'─{{{mark},}} (?:[^↑↓\\n][^\\n]*|[↑↓](?:[^ \\n][^\\n]*| {notend})?)?'
+    )
+    foot = '(?:' + '|'.join(cases) + ')'
+    body = '(?:(?:' + cases[0] + ')?|' + '|'.join(cases[1:]) + ')'
+    return dict(busy=busy, plain=plain, body=body, foot=foot)
+
+
+def frames(pure=PURE, mark=MARK):
+    p = build(pure, mark)
+    def frame(upper):
+        return (f"(?m)^{upper}\\n(?:{p['body']}\\n)*{p['plain']}"
+                f"(?:\\n{p['foot']}){{1,4}}\\z")
+    return frame(p['busy']), frame(p['plain'])
+
+
+def verify(pure, mark, maxlen):
+    p = build(pure, mark)
+    border = re.compile(f'(?:{p["busy"]}|{p["plain"]})')
+    body = re.compile(p['body'])
+    foot = re.compile(p['foot'])
+    count = 0
+    for length in range(maxlen + 1):
+        for chars in itertools.product(['─', ' ', 'x', '↑', '⠇'], repeat=length):
+            line = ''.join(chars)
+            is_border = border.fullmatch(line) is not None
+            if is_border == (body.fullmatch(line) is not None):
+                sys.exit(f'body is not the complement of border: {line!r}')
+            if (foot.fullmatch(line) is not None) != (not is_border and line != ''):
+                sys.exit(f'foot is not body without the empty line: {line!r}')
+            count += 1
+    print(f'ok pure={pure} mark={mark}: {count} strings')
+
+
+if __name__ == '__main__':
+    if '--verify' in sys.argv:
+        verify(5, 3, 9)
+        verify(6, 4, 9)
+    else:
+        working, idle = frames()
+        print(f"working_rule regex = ['{working}']")
+        print(f"idle_editor_rule regex = ['{idle}']")

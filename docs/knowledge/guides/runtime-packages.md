@@ -14,7 +14,7 @@ session) to the host. `pohunek plugin` manages the packages installed on the
 machine the daemon runs on. See the
 [runtime package archive](../concepts/runtime-package-archive.md) for the file
 format and the [runtime catalog](../concepts/runtime-catalog.md) for official
-trust.
+trust. The repository's own package, [Pi](pi-package.md), is installed this way.
 
 ```bash
 pohunek plugin list

@@ -21,8 +21,11 @@ pub(super) fn handle_host_inspect(
     health: &HealthInfo,
     sessions: &SessionRegistry,
 ) -> Response {
-    let mut capabilities =
-        crate::capabilities::host_capabilities(&health.daemon_version, sessions.profiles());
+    let mut capabilities = crate::capabilities::host_capabilities(
+        &health.daemon_version,
+        sessions.profiles(),
+        &sessions.inspect_base_environment(),
+    );
     capabilities.protocol_version = selected_version(request);
     ok_value(request, &capabilities)
 }

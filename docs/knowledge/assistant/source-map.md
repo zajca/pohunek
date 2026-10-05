@@ -487,6 +487,7 @@ Runtime package archive format:
 - `crates/package/src/layout.rs` — package root names, modes and bounds.
 - `crates/daemon/src/agent/host/package.rs` — package-backed runtime loading and pin resolution.
 - `crates/daemon/src/agent/host/handle.rs` — runtime host snapshot, reload and launch verification.
+- `crates/daemon/src/agent/host/version_probe.rs` — the `semver-v1` data-driven version probe policy (probe argv and `[min, below)` release range).
 - `crates/daemon/src/session/packages.rs` — reload and retention-checked uninstall.
 - `crates/package/src/hash.rs` — SHA-256 helpers.
 - `crates/package/src/directory.rs` — directory-to-archive builder behind `plugin link` and `cargo xtask package build`.
@@ -499,6 +500,15 @@ Runtime package archive format:
 - `crates/cli/src/commands/plugin.rs` — `pohunek plugin list|inspect|install|link|update|select|enable|disable|uninstall|doctor`.
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate`.
 - `docs/knowledge/guides/runtime-packages.md`
+- `docs/knowledge/guides/pi-package.md`
+- `runtime-packages/README.md` — layout convention of the official package sources.
+- `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference, existence check, version probe).
+- `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
+- `compat/pi/compatibility-lock.json` — pinned Pi release, supported range and Node requirement.
+- `compat/pi/screens/` — screens captured from a real Pi that the manifest test classifies.
+- `crates/cli/tests/pi_package.rs` — pure package tests and the opt-in real-Pi tests.
+- `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
+- `crates/cli/tests/support/model_stub.rs` — loopback chat-completions stub used instead of a model provider.
 - `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`
 - `crates/package/tests/install.rs`

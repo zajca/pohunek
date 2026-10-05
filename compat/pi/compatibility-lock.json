@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "package": "pohunek.runtime.pi",
+  "runtime": "pi",
+  "upstream": {
+    "npm": "@earendil-works/pi-coding-agent",
+    "release": "1.0.2",
+    "binary": "pi",
+    "node_min": "22.19.0"
+  },
+  "supported": {
+    "min": "1.0.0",
+    "below": "1.1.0"
+  },
+  "verified_with": "PTY run of the pinned release: session file layout, bracketed paste, idle and working screens, process name, session-id resume and fork"
+}

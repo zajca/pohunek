@@ -147,9 +147,14 @@ fn same_origin(frozen: &BindingProvenance, current: &BindingProvenance) -> bool 
 ///
 /// Returns `agent_runtime_unsupported` when the probe rejects the executable
 /// or the definition names a parser this daemon does not provide.
+///
+/// `launch_path` is the `PATH` the launched agent will see (the daemon's base
+/// environment overridden by the profile); the probe runs under it so an
+/// interpreter script resolves the interpreter the launch will use.
 pub(crate) fn validate_launch_runtime(
     definition: &RuntimeDefinition,
     program: &str,
+    launch_path: Option<&std::ffi::OsStr>,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    crate::capabilities::validate_definition_launch(definition, program)
+    crate::capabilities::validate_definition_launch(definition, program, launch_path)
 }
