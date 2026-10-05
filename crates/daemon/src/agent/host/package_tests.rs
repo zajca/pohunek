@@ -963,3 +963,63 @@ fn installing_a_package_with_an_unknown_or_mismatched_schema_is_refused() {
     }
     assert!(install_rejection(&descriptor("acme.agent", "1.0.0", "acme")).is_none());
 }
+
+/// A descriptor in the format before `[integration] hook_schema` existed.
+fn pre_schema_descriptor(handler: Option<&str>) -> String {
+    let base = descriptor("acme.agent", "1.0.0", "acme");
+    handler.map_or(base.clone(), |handler| {
+        format!("{base}\n[integration]\nhandler = \"{handler}\"\n")
+    })
+}
+
+#[test]
+fn a_pre_schema_descriptor_resolves_its_schema_from_its_handler_only() {
+    for (handler, schema) in [
+        (Some("codex-hook-v1"), Some("identity-subagent-v1")),
+        (Some("claude-hook-v1"), Some("identity-subagent-v1")),
+        (Some("hermes-hook-v1"), Some("identity-v1")),
+        (Some("acme-hook-v1"), None),
+        (None, None),
+    ] {
+        let plugins = Plugins::new();
+        let built = build(
+            &pre_schema_descriptor(handler),
+            "x",
+            identity("acme.agent", "1.0.0"),
+        );
+        install(&plugins.registry(), &built, true, true);
+        let host = plugins.host();
+        let pin = pin_of(&built, "acme");
+
+        assert_eq!(
+            host.resolve_pinned(&RuntimeRef::from_wire("acme"), &pin)
+                .is_err(),
+            handler.is_some(),
+            "a handler without a schema is not a current definition: {handler:?}"
+        );
+        assert_eq!(
+            host.legacy_hook_schema(&pin).map(|schema| schema.id),
+            schema,
+            "{handler:?}"
+        );
+    }
+}
+
+#[test]
+fn the_legacy_schema_lookup_ignores_unpinned_and_builtin_pins_and_foreign_identities() {
+    let plugins = Plugins::new();
+    let built = build(
+        &pre_schema_descriptor(Some("codex-hook-v1")),
+        "x",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &built, true, true);
+    let host = plugins.host();
+
+    assert!(host.legacy_hook_schema(&LaunchPin::Unpinned).is_none());
+    let other = Built {
+        identity: identity("other.agent", "1.0.0"),
+        ..built
+    };
+    assert!(host.legacy_hook_schema(&pin_of(&other, "acme")).is_none());
+}

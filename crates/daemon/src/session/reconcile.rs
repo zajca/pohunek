@@ -7271,6 +7271,153 @@ while os.getppid() == parent:
         assert_eq!(mapped[0].revision, protocol::SubagentRevision::new(7));
     }
 
+    /// Installs a package whose descriptor names only `[integration] handler`
+    /// and returns the pin a session of it froze plus a registry serving it.
+    fn pre_schema_package_registry() -> (SessionRegistry, crate::agent::host::LaunchPin) {
+        use package::registry::{
+            InstallRequest, PackageSource as InstallSource, Registry as PackageRegistry,
+        };
+        use package::{build_archive, read_archive, ArchiveEntry, Limits};
+        use protocol::{
+            BindingProvenance, LaunchBinding, PackageId, PackageIdentity, PackageVersion,
+        };
+
+        let descriptor = r#"schema = 1
+id = "acme.agent"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "acme"
+name = "Acme"
+program = "acme-agent"
+args = []
+detect_manifest = "detect.toml"
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--session", "{reference}"]
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "hook"
+
+[integration]
+handler = "codex-hook-v1"
+"#;
+        let entries = [
+            ArchiveEntry {
+                path: "runtime.toml".to_owned(),
+                contents: descriptor.as_bytes().to_vec(),
+                executable: false,
+            },
+            ArchiveEntry {
+                path: "detect.toml".to_owned(),
+                contents: b"[[rules]]\nid = \"idle\"\nstate = \"idle\"\npriority = 100\nregion = \"whole_recent\"\nany = [{ contains = \"ready\" }]\n".to_vec(),
+                executable: false,
+            },
+        ];
+        let bytes = build_archive(&entries, &Limits::DEFAULT).expect("archive");
+        let digest = read_archive(&bytes, &Limits::DEFAULT)
+            .expect("reads")
+            .digest()
+            .clone();
+        let identity = PackageIdentity {
+            id: PackageId::parse("acme.agent").expect("package id"),
+            version: PackageVersion::parse("1.0.0").expect("version"),
+        };
+        let root = crate::test_support::thread_scoped_dir("pre-schema-");
+        let plugins = root.join("plugins");
+        PackageRegistry::open_at(&plugins, Limits::DEFAULT)
+            .expect("registry")
+            .install(&InstallRequest {
+                archive: &bytes,
+                expected: &digest,
+                identity: identity.clone(),
+                source: InstallSource::ExplicitDigest,
+                enabled: true,
+                select: true,
+                installed_at_unix_seconds: 1_700_000_000,
+            })
+            .expect("install");
+        let host = crate::agent::host::RuntimeHost::with_packages(
+            crate::agent::host::BuiltinSource::new("/bin/sh"),
+            crate::agent::host::PackageSource::new(
+                crate::agent::host::PackageStore::open(&plugins).expect("store"),
+            ),
+        )
+        .expect("host");
+        let registry = SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                ..SessionRegistryConfig::default()
+            },
+            host,
+        );
+        let pin = crate::agent::host::LaunchPin::Pinned(Box::new(LaunchBinding {
+            runtime_id: protocol::RuntimeId::parse("acme").expect("runtime id"),
+            provenance: BindingProvenance::Package {
+                package: identity,
+                package_digest: digest,
+            },
+        }));
+        (registry, pin)
+    }
+
+    #[tokio::test]
+    async fn a_schemaless_worker_of_a_pre_schema_package_pin_is_reprojected_not_refused() {
+        let (registry, pin) = pre_schema_package_registry();
+        let mut record = identity_record();
+        record.info.agent = "acme".to_owned();
+        record.info.agent_base = RuntimeRef::from_wire("acme");
+        record
+            .recovery
+            .as_mut()
+            .expect("recovery binding")
+            .launch_binding = pin;
+        let mut snapshot = identity_snapshot("launch-native");
+        snapshot.hook_schema = None;
+        snapshot.launch_identity = None;
+        snapshot.subagents.push(SubagentSnapshot {
+            id: "child".to_owned(),
+            parent_id: None,
+            provider: "codex".to_owned(),
+            agent_type: None,
+            phase: SubagentPhase::Running,
+            revision: 1,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: None,
+        });
+
+        let projected = InspectSnapshot {
+            hook_schema: registry.effective_hook_schema_id(&record, &snapshot),
+            ..snapshot
+        };
+
+        assert_eq!(
+            projected.hook_schema.as_deref(),
+            Some("identity-subagent-v1")
+        );
+        import_worker_identities(&mut record, &projected)
+            .expect("the nested active identity is admitted");
+        assert_eq!(record.info.active_agent.as_deref(), Some("claude"));
+        assert_eq!(
+            import_worker_subagents(&projected)
+                .expect("the subagent is admitted")
+                .len(),
+            1
+        );
+    }
+
     #[test]
     fn worker_claims_are_validated_with_the_snapshot_hook_schema() {
         let mut record = identity_record();

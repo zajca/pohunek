@@ -4992,6 +4992,9 @@ impl SessionRegistry {
         {
             Ok(definition) => definition.hook_schema(),
             Err(error) => {
+                if let Some(schema) = self.inner.profiles.runtimes().legacy_hook_schema(pin) {
+                    return Some(schema);
+                }
                 debug!(
                     runtime = %agent_kind_label(agent_base),
                     error = %error,

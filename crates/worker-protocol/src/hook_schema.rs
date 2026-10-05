@@ -235,6 +235,21 @@ pub fn hook_schemas() -> &'static [&'static HookSchema] {
     &REGISTRY
 }
 
+/// The schema an integration handler drives, when exactly one registered
+/// schema does.
+///
+/// A handler that drives several schemas (or none) has no unambiguous schema,
+/// so the answer is `None`.
+#[must_use]
+pub fn hook_schema_for_handler(handler: &str) -> Option<&'static HookSchema> {
+    let mut driven = REGISTRY
+        .iter()
+        .copied()
+        .filter(|schema| schema.supports_handler(handler));
+    let first = driven.next()?;
+    driven.next().is_none().then_some(first)
+}
+
 /// Whether any registered schema is driven by the integration handler
 /// `handler`.
 #[must_use]
@@ -277,6 +292,19 @@ mod tests {
         }
         assert!(!is_known_hook_handler("acme-v1"));
         assert!(!is_known_hook_handler(""));
+    }
+
+    #[test]
+    fn a_handler_resolves_to_a_schema_only_when_exactly_one_is_driven() {
+        assert_eq!(
+            super::hook_schema_for_handler("hermes-hook-v1").map(|schema| schema.id),
+            Some("identity-v1")
+        );
+        assert_eq!(
+            super::hook_schema_for_handler("codex-hook-v1").map(|schema| schema.id),
+            Some("identity-subagent-v1")
+        );
+        assert!(super::hook_schema_for_handler("acme-v1").is_none());
     }
 
     #[test]

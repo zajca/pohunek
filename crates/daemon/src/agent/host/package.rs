@@ -28,7 +28,8 @@ use thiserror::Error;
 
 use super::claim::is_reserved;
 use super::definition::{
-    DefinitionError, DefinitionInvariant, DefinitionOrigin, RuntimeDefinition, MAX_DEFINITION_BYTES,
+    DefinitionError, DefinitionInvariant, DefinitionOrigin, HandlerId, RuntimeDefinition,
+    MAX_DEFINITION_BYTES,
 };
 use crate::detect::Manifest;
 
@@ -309,6 +310,52 @@ impl PackageStore {
         }
     }
 
+    /// The integration handler a recorded package's descriptor names, read
+    /// from a verified root without requiring the current descriptor shape.
+    ///
+    /// A descriptor written before `[integration] hook_schema` existed names
+    /// only the handler and no longer parses as a definition, yet a worker
+    /// launched under it can still be live. Only the package identity and the
+    /// handler id are read; nothing else of the descriptor is trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`PackageRejection`] when the package is not installed
+    /// under `identity`, its root fails verification, or the descriptor is
+    /// missing, oversized, malformed, or names another package identity.
+    pub fn read_legacy_integration_handler(
+        &self,
+        digest: &PackageDigest,
+        identity: &PackageIdentity,
+    ) -> Result<Option<HandlerId>, PackageRejection> {
+        self.record(digest, identity)?;
+        let root = self.ready_root(digest)?;
+        let files = RootFiles(&root);
+        let size = files
+            .size(RUNTIME_DESCRIPTOR_PATH)
+            .ok_or(PackageRejection::DescriptorMissing)?;
+        if size > u64::try_from(MAX_DEFINITION_BYTES).unwrap_or(u64::MAX) {
+            return Err(PackageRejection::Descriptor(DefinitionError::TooLarge));
+        }
+        let bytes = files
+            .read(RUNTIME_DESCRIPTOR_PATH)
+            .map_err(PackageRejection::Root)?;
+        let malformed = || PackageRejection::Descriptor(DefinitionError::Malformed { line: None });
+        let text = std::str::from_utf8(&bytes).map_err(|_error| malformed())?;
+        let raw: LegacyDescriptor = toml::from_str(text).map_err(|_error| malformed())?;
+        let declared = PackageIdentity {
+            id: PackageId::parse(&raw.id).map_err(|_error| malformed())?,
+            version: protocol::PackageVersion::parse(&raw.version).map_err(|_error| malformed())?,
+        };
+        if declared != *identity {
+            return Err(PackageRejection::IdentityMismatch);
+        }
+        raw.integration
+            .map(|integration| HandlerId::parse(&integration.handler, "integration.handler"))
+            .transpose()
+            .map_err(PackageRejection::Descriptor)
+    }
+
     /// [`Self::read_definition`] for a package a fresh launch may use: a
     /// reserved runtime id is refused outright.
     fn load_definition(
@@ -391,6 +438,20 @@ impl PackageFiles for ArchiveFiles<'_> {
             .map(|entry| entry.contents.clone())
             .ok_or(VerifyError::UnknownPath)
     }
+}
+
+/// The fields of a runtime descriptor the legacy handler lookup reads; every
+/// other key is ignored.
+#[derive(serde::Deserialize)]
+struct LegacyDescriptor {
+    id: String,
+    version: String,
+    integration: Option<LegacyIntegration>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyIntegration {
+    handler: String,
 }
 
 /// Parses the descriptor of a package.

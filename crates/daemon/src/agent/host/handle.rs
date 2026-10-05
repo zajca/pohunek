@@ -493,6 +493,33 @@ impl RuntimeHost {
         }
     }
 
+    /// The hook schema of a session pinned to a package whose descriptor
+    /// predates `[integration] hook_schema`, resolved from the handler it
+    /// names.
+    ///
+    /// A live worker of the previous release journals no schema, and its
+    /// pinned descriptor no longer parses as a definition. The verified
+    /// descriptor's handler resolves to a schema only when exactly one
+    /// registered schema is driven by it; every other case yields `None`.
+    #[must_use]
+    pub fn legacy_hook_schema(
+        &self,
+        pin: &LaunchPin,
+    ) -> Option<&'static pohunek_worker_protocol::HookSchema> {
+        let BindingProvenance::Package {
+            package,
+            package_digest,
+        } = &pin.binding()?.provenance
+        else {
+            return None;
+        };
+        let handler = self
+            .package_store()?
+            .read_legacy_integration_handler(package_digest, package)
+            .ok()??;
+        pohunek_worker_protocol::hook_schema_for_handler(handler.as_str())
+    }
+
     fn snapshot(&self) -> Arc<HostState> {
         Arc::clone(&self.state.read().unwrap_or_else(PoisonError::into_inner))
     }
