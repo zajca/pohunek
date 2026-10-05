@@ -64,8 +64,53 @@ fn pending_claims(config: &SessionRegistryConfig, session: &str) -> String {
     found.join("; ")
 }
 
+/// Asserts that the launch process of `worker`, or a process below it, runs an
+/// executable whose file name contains [`RUNTIME`], as the worker's launch
+/// verification requires.
+async fn assert_provider_named_launch_process(worker: &Worker) {
+    let root = worker
+        .inspect()
+        .await
+        .expect("inspect the worker")
+        .child_process
+        .expect("worker child");
+    let inspector = crate::procwatch::HostInspector::new();
+    let identity = ProcessIdentity {
+        pid: root.pid,
+        start_identity: StartIdentity::new(root.start_identity),
+    };
+    let mut processes = vec![identity];
+    processes.extend(
+        inspector
+            .descendant_identities(identity)
+            .expect("list the launch process tree"),
+    );
+    let executables: Vec<_> = processes
+        .iter()
+        .map(|process| inspector.executable(process.pid))
+        .collect();
+    assert!(
+        executables.iter().any(|executable| matches!(
+            executable,
+            Ok(Some(path)) if path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|name| name.contains(RUNTIME))
+        )),
+        "no process of the fixture agent runs an executable named for {RUNTIME:?}: {executables:?}"
+    );
+}
+
+/// The bash binary the agent script runs on, resolved from `PATH`.
+fn bash_path() -> PathBuf {
+    std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|dir| dir.join("bash"))
+        .find(|candidate| candidate.is_file())
+        .expect("the fixture agent needs bash on PATH")
+}
+
 /// The runtime the fixture agent is registered as.
-const RUNTIME: &str = "pi";
+const RUNTIME: &str = "bash";
 
 /// Rewrites the real Claude state adapter to report as the fixture runtime, so
 /// the identity protocol exercised is the shipped one.
@@ -73,12 +118,16 @@ fn pi_adapter(dir: &std::path::Path) -> PathBuf {
     let source = pohunek_test_support::manifest_dir()
         .join("src/integration/assets/claude/pohunek-agent-state.sh");
     let script = fs::read_to_string(&source).expect("read the Claude state adapter");
-    let adapted = script.replacen("agent = \"claude\"\n", "agent = \"pi\"\n", 1);
+    let adapted = script.replacen(
+        "agent = \"claude\"\n",
+        &format!("agent = \"{RUNTIME}\"\n"),
+        1,
+    );
     assert_ne!(
         adapted, script,
         "the adapter names its provider on one line"
     );
-    let path = dir.join("pi-agent-state.sh");
+    let path = dir.join("agent-state.sh");
     write_executable(&path, &adapted);
     path
 }
@@ -140,13 +189,12 @@ impl Rig {
         let commands = hook_gate(&commands_path);
         let adapter = pi_adapter(&dir);
         // The worker accepts a launch claim only from a process whose
-        // executable is named for the provider, so the agent runs on a copy of
-        // the shell carrying that name.
-        let interpreter = dir.join("pi-sh");
-        fs::copy("/bin/sh", &interpreter).expect("copy the shell");
-        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700))
-            .expect("make the interpreter executable");
-        let inner = dir.join("pi-switching");
+        // executable file name contains the provider, and a real agent runs as
+        // its own image. The fixture runtime is therefore named for the shell
+        // that runs the agent script: bash, a real binary that does not
+        // re-exec on any host.
+        let interpreter = bash_path();
+        let inner = dir.join("agent-script");
         write_executable(
             &inner,
             &format!(
@@ -177,13 +225,18 @@ impl Rig {
             ),
         );
         // The wrapper keeps the root; the worker designates the provider
-        // process below it as the launch process.
+        // process below it as the launch process. It is a Python process, so
+        // no image of the wrapper chain carries the provider name.
         let script = if wrapped {
-            let shim = dir.join("pi-wrapper");
+            let shim = dir.join("agent-wrapper");
             write_executable(
                 &shim,
                 &format!(
-                    "#!/bin/sh\n'{}' '{}' \"$@\"\nif [ -e '{}' ]; then exec sleep 30; fi\n",
+                    "#!/usr/bin/env python3\n\
+                     import os, subprocess, sys, time\n\
+                     status = subprocess.call(['{}', '{}'] + sys.argv[1:])\n\
+                     while os.path.exists('{}'):\n    time.sleep(0.05)\n\
+                     sys.exit(status)\n",
                     interpreter.display(),
                     inner.display(),
                     dir.join("linger").display()
@@ -224,6 +277,11 @@ impl Rig {
         // The launch records its argv line by line; later launches are counted
         // against a settled first one.
         wait_for_file_contains(&marker, &format!("{assigned}\n")).await;
+        // A fixture whose launch process image is not named for the provider can
+        // never be verified; failing here names that once instead of as a
+        // timeout in every test.
+        let worker = live_worker_and_identity(&registry, &session.id).await.0;
+        assert_provider_named_launch_process(&worker).await;
         Self {
             dir,
             marker,
@@ -251,7 +309,7 @@ impl Rig {
     ) -> SessionRegistry {
         SessionRegistry::new_with_runtimes_and_launcher(
             config.clone(),
-            crate::agent::host::fixture::pi_shaped_hooked_host(script, existence),
+            crate::agent::host::fixture::pi_shaped_hooked_host_as(script, existence, RUNTIME),
             Arc::clone(launcher),
             Arc::new(ReadableHost::new()),
         )
@@ -926,9 +984,9 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
     let tag = "supersede-existence";
     let agents_dir = temp_agents_dir_with(
         tag,
-        "pi-home",
+        "bash-home",
         &format!(
-            "base = \"pi\"\n{}[env]\n{} = \"{}\"\n",
+            "base = \"{RUNTIME}\"\n{}[env]\n{} = \"{}\"\n",
             crate::agent::host::fixture::pi_shaped_profile_pin(),
             crate::agent::host::fixture::PI_SHAPED_HOME_ENV,
             home.display()
@@ -938,7 +996,7 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
         tag,
         crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
         Some(agents_dir),
-        "pi-home",
+        "bash-home",
         false,
     )
     .await;
@@ -958,7 +1016,7 @@ async fn recovery_checks_an_assigned_reference_but_trusts_a_reported_one() {
         "supersede-existence-reported",
         crate::agent::host::fixture::PI_SHAPED_FILE_CHECK,
         first.config.agents_dir.clone(),
-        "pi-home",
+        "bash-home",
         false,
     )
     .await;
@@ -1714,9 +1772,10 @@ async fn a_launch_process_that_already_exited_still_hands_over_its_journaled_ref
             ..SessionRegistryConfig::default()
         },
         Arc::<MockInspector>::clone(&inspector),
-        Some(crate::agent::host::fixture::pi_shaped_hooked_host(
+        Some(crate::agent::host::fixture::pi_shaped_hooked_host_as(
             &script,
             crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+            RUNTIME,
         )),
         None,
     );
@@ -1804,7 +1863,7 @@ async fn an_adopted_worker_whose_launch_process_just_exited_hands_over_its_journ
     });
     let restarted = SessionRegistry::new_with_runtimes_and_launcher(
         rig.config.clone(),
-        crate::agent::host::fixture::pi_shaped_hooked_host(&rig.script, rig.existence),
+        crate::agent::host::fixture::pi_shaped_hooked_host_as(&rig.script, rig.existence, RUNTIME),
         Arc::clone(&rig.launcher),
         inspector,
     );
