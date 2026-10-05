@@ -25,6 +25,8 @@ use crate::agent::host::{
     SEMVER_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
+use crate::runtime::environment::effective_variable;
+use pohunek_worker_protocol::BaseEnv;
 
 /// The reviewed Hermes release metadata shipped with this Pohunek build.
 const HERMES_COMPATIBILITY_LOCK: &str =
@@ -71,14 +73,20 @@ impl<'a> VersionProbe<'a> {
     }
 
     /// Runs the probe against `path` and returns the normalized version.
-    fn detect_version(self, path: &Path) -> Option<String> {
+    ///
+    /// `launch_path` is the `PATH` the agent launch sees. A data-driven probe
+    /// hands it to the child so an interpreter script resolves the interpreter
+    /// the launch will use; the pinned probe keeps its fixed search path.
+    fn detect_version(self, path: &Path, launch_path: Option<&OsStr>) -> Option<String> {
         match self {
             Self::HermesV1 => {
                 run_hermes_version_probe(path).and_then(|output| parse_hermes_version(&output))
             }
-            Self::SemverV1(policy) => run_semver_version_probe(path, policy).and_then(|output| {
-                VersionProbePolicy::parse_output(&output).map(|version| version.to_string())
-            }),
+            Self::SemverV1(policy) => {
+                run_semver_version_probe(path, policy, launch_path).and_then(|output| {
+                    VersionProbePolicy::parse_output(&output).map(|version| version.to_string())
+                })
+            }
         }
     }
 
@@ -120,13 +128,22 @@ fn inventory_rank(runtime_id: &RuntimeId) -> usize {
 /// version-probe parser additionally reports its version and whether the daemon
 /// accepts it. Probing uses the same executable check as the launch path
 /// ([`which_executable`]) so "available" agrees with what a launch would accept.
+/// A version probe runs under the `PATH` the launch would see: `base_env` (the
+/// environment the daemon forwards to agents) overridden by the profile's own
+/// environment.
 /// `git_available` reflects a `git` probe and currently also gates worktree support.
 #[must_use]
 pub(crate) fn host_capabilities(
     daemon_version: &str,
     profiles: &ProfileRegistry,
+    base_env: &BaseEnv,
 ) -> HostCapabilities {
-    host_capabilities_for(daemon_version, profiles, &profiles.runtimes().registry())
+    host_capabilities_for(
+        daemon_version,
+        profiles,
+        &profiles.runtimes().registry(),
+        base_env,
+    )
 }
 
 /// [`host_capabilities`] against an explicit runtime registry.
@@ -134,6 +151,7 @@ fn host_capabilities_for(
     daemon_version: &str,
     profiles: &ProfileRegistry,
     registry: &RuntimeRegistry,
+    base_env: &BaseEnv,
 ) -> HostCapabilities {
     let mut definitions: Vec<&Arc<RuntimeDefinition>> = registry.definitions().collect();
     // The sort is stable, so runtimes outside the reserved set stay in id order.
@@ -155,7 +173,7 @@ fn host_capabilities_for(
                 supported: None,
             },
             LaunchProgram::Fixed(program) => {
-                probe_definition(agent, agent_base, definition, program)
+                probe_definition(agent, agent_base, definition, program, base_env, &[])
             }
         });
         supported_agents.push(agent.to_owned());
@@ -167,17 +185,24 @@ fn host_capabilities_for(
         // A pinned profile is described by the definition it launches from,
         // and is unavailable once that package cannot launch a fresh session.
         let launchable = profiles.runtimes().verify_launchable(&agent.definition);
-        let base = RuntimeRef::from(agent.base.clone());
+        let agent_base = RuntimeRef::from(agent.base.clone());
         let runtime = match (&launchable, agent.profile.as_ref()) {
-            (Err(_), _) => unavailable_runtime(&agent.name, base),
-            (Ok(()), Some(profile)) => {
-                probe_definition(&agent.name, base, &agent.definition, &profile.program)
-            }
+            (Err(_), _) => unavailable_runtime(&agent.name, agent_base),
+            (Ok(()), Some(profile)) => probe_definition(
+                &agent.name,
+                agent_base,
+                &agent.definition,
+                &profile.program,
+                base_env,
+                &profile.env,
+            ),
             (Ok(()), None) => probe_definition(
                 &agent.name,
-                base,
+                agent_base,
                 &agent.definition,
                 agent.definition.program().as_str(),
+                base_env,
+                &[],
             ),
         };
         runtimes.push(runtime);
@@ -226,9 +251,20 @@ fn probe_definition(
     agent_base: RuntimeRef,
     definition: &RuntimeDefinition,
     program: &str,
+    base_env: &BaseEnv,
+    profile_env: &[(String, String)],
 ) -> AgentRuntime {
     match definition.version_probe_parser() {
-        Some(_) => probe_versioned_runtime(agent, agent_base, program, definition),
+        Some(_) => {
+            let launch_path = effective_variable(base_env, profile_env, SEARCH_PATH_VAR);
+            probe_versioned_runtime(
+                agent,
+                agent_base,
+                program,
+                definition,
+                launch_path.as_deref(),
+            )
+        }
         None => probe_runtime(agent, agent_base, program),
     }
 }
@@ -270,6 +306,7 @@ fn probe_versioned_runtime(
     agent_base: RuntimeRef,
     binary: &str,
     definition: &RuntimeDefinition,
+    launch_path: Option<&OsStr>,
 ) -> AgentRuntime {
     let Some(program) = ValidatedLaunchProgram::resolve(binary) else {
         return AgentRuntime {
@@ -283,7 +320,7 @@ fn probe_versioned_runtime(
     };
 
     let probe = VersionProbe::for_definition(definition);
-    let version = probe.and_then(|probe| probe.detect_version(program.as_path()));
+    let version = probe.and_then(|probe| probe.detect_version(program.as_path(), launch_path));
     let supported = probe
         .zip(version.as_deref())
         .is_some_and(|(probe, version)| probe.accepts(version));
@@ -311,9 +348,10 @@ pub(crate) fn validate_launch_runtime(
     base: &RuntimeRef,
     binary: &str,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
+    let launch_path = std::env::var_os(SEARCH_PATH_VAR);
     let registry = crate::agent::host::RuntimeHost::default().registry();
     match base.id().and_then(|id| definition_for_base(&registry, id)) {
-        Some(definition) => validate_definition_launch(definition, binary),
+        Some(definition) => validate_definition_launch(definition, binary, launch_path.as_deref()),
         None => Ok(None),
     }
 }
@@ -324,9 +362,13 @@ pub(crate) fn validate_launch_runtime(
 ///
 /// Returns `agent_runtime_unsupported` when the probe rejects the executable
 /// or the definition names a parser this daemon does not provide.
+///
+/// `launch_path` is the `PATH` the launched agent will see; the probe runs
+/// under it.
 pub(crate) fn validate_definition_launch(
     definition: &RuntimeDefinition,
     binary: &str,
+    launch_path: Option<&OsStr>,
 ) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
     if definition.version_probe_parser().is_none() {
         return Ok(None);
@@ -336,7 +378,7 @@ pub(crate) fn validate_definition_launch(
         .ok_or_else(ProtocolError::agent_runtime_unsupported)?;
     let supported = VersionProbe::for_definition(definition).is_some_and(|probe| {
         probe
-            .detect_version(program.as_path())
+            .detect_version(program.as_path(), launch_path)
             .is_some_and(|version| probe.accepts(&version))
     });
     supported
@@ -427,10 +469,17 @@ fn probe_hermes_version_with_clock(
 
 /// Runs the data-driven probe `policy` declares with isolated state, bounded
 /// time and bounded output, and returns its standard output.
-fn run_semver_version_probe(path: &Path, policy: &VersionProbePolicy) -> Option<String> {
+fn run_semver_version_probe(
+    path: &Path,
+    policy: &VersionProbePolicy,
+    launch_path: Option<&OsStr>,
+) -> Option<String> {
     match spawn_and_collect_probe(
         path,
-        ProbeKind::Semver(policy),
+        ProbeKind::Semver {
+            policy,
+            launch_path,
+        },
         VERSION_PROBE_TIMEOUT,
         &[],
         &Instant::now,
@@ -446,8 +495,12 @@ fn run_semver_version_probe(path: &Path, policy: &VersionProbePolicy) -> Option<
 enum ProbeKind<'a> {
     /// `--version` under the fixed search path of the compiled probe.
     Pinned,
-    /// The declared arguments under a runtime-neutral environment.
-    Semver(&'a VersionProbePolicy),
+    /// The declared arguments under a runtime-neutral environment plus the
+    /// `PATH` the launch sees.
+    Semver {
+        policy: &'a VersionProbePolicy,
+        launch_path: Option<&'a OsStr>,
+    },
 }
 
 /// The environment variable that holds the executable search path.
@@ -492,12 +545,16 @@ fn spawn_and_collect_probe(
                 .env("PYTHONSAFEPATH", "1")
                 .env("PYTHONPYCACHEPREFIX", &sandbox.python_cache_path);
         }
-        ProbeKind::Semver(policy) => {
+        ProbeKind::Semver {
+            policy,
+            launch_path,
+        } => {
             // The probed program may be an interpreter script (`#!/usr/bin/env
-            // node`); the search path the daemon launches agents with finds the
-            // same interpreter the launch will use.
+            // node`); the effective launch `PATH` (daemon base plus profile
+            // overrides) finds the interpreter the launch will use. Every
+            // other variable stays isolated.
             command.args(policy.args());
-            if let Some(search_path) = std::env::var_os(SEARCH_PATH_VAR) {
+            if let Some(search_path) = launch_path {
                 command.env(SEARCH_PATH_VAR, search_path);
             }
         }
@@ -769,6 +826,7 @@ fn which_on_path_value(name: &str, path_var: &OsStr) -> Option<std::path::PathBu
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
 
     use pohunek_test_support::wait::{poll_until, HANG_GUARD};
@@ -781,6 +839,20 @@ mod tests {
     /// can only end through the probe, never by exiting on its own.
     const FIXTURE_HOLD: Duration = Duration::from_secs(HANG_GUARD.as_secs() * 5);
 
+    /// The daemon's own `PATH`, as a launch without a profile override sees it.
+    fn process_path() -> Option<OsString> {
+        std::env::var_os(SEARCH_PATH_VAR)
+    }
+
+    /// The base environment the daemon forwards to agents in this process.
+    fn process_base() -> BaseEnv {
+        crate::runtime::environment::base_environment(
+            pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST,
+            &crate::runtime::environment::EnvironmentSource::Process,
+        )
+        .expect("the default allowlist builds")
+    }
+
     /// An empty profile registry (no host-config layer) for the base-kind tests.
     fn no_profiles() -> ProfileRegistry {
         ProfileRegistry::default()
@@ -792,7 +864,7 @@ mod tests {
 
     #[test]
     fn snapshot_reports_protocol_version_and_four_supported_agents() {
-        let caps = host_capabilities("1.2.3-test", &no_profiles());
+        let caps = host_capabilities("1.2.3-test", &no_profiles(), &process_base());
         assert_eq!(caps.daemon_version, "1.2.3-test");
         assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
         assert_eq!(
@@ -805,7 +877,7 @@ mod tests {
 
     #[test]
     fn shell_runtime_is_always_available() {
-        let caps = host_capabilities("0.0.0", &no_profiles());
+        let caps = host_capabilities("0.0.0", &no_profiles(), &process_base());
         let shell = caps
             .runtimes
             .iter()
@@ -821,7 +893,7 @@ mod tests {
 
     #[test]
     fn agent_runtime_availability_matches_resolved_path() {
-        let caps = host_capabilities("0.0.0", &no_profiles());
+        let caps = host_capabilities("0.0.0", &no_profiles(), &process_base());
         for runtime in &caps.runtimes {
             if runtime.agent == "shell" {
                 continue;
@@ -840,7 +912,11 @@ mod tests {
             "base = \"claude\"\nprogram = \"/bin/sh\"\n",
         )
         .expect("write profile");
-        let caps = host_capabilities("0.0.0", &ProfileRegistry::new(Some(dir.clone())));
+        let caps = host_capabilities(
+            "0.0.0",
+            &ProfileRegistry::new(Some(dir.clone())),
+            &process_base(),
+        );
 
         assert!(
             caps.supported_agents.contains(&"my-claude".to_owned()),
@@ -927,7 +1003,13 @@ strategy = "none"
     }
 
     fn probe_hermes_for_test(binary: &str) -> AgentRuntime {
-        probe_versioned_runtime("hermes", RuntimeRef::hermes(), binary, &hermes_definition())
+        probe_versioned_runtime(
+            "hermes",
+            RuntimeRef::hermes(),
+            binary,
+            &hermes_definition(),
+            process_path().as_deref(),
+        )
     }
 
     const SEMVER_PROBE: &str =
@@ -953,7 +1035,7 @@ strategy = "none"
             let registry =
                 RuntimeRegistry::from_sources(&[&BuiltinSource::from_login_shell(shell)])
                     .expect("an invalid login shell must not fail the registry");
-            let caps = host_capabilities_for("0.0.0", &no_profiles(), &registry);
+            let caps = host_capabilities_for("0.0.0", &no_profiles(), &registry, &process_base());
             let names: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
             assert_eq!(names, RESERVED_RUNTIME_IDS);
             let shell_def = registry
@@ -972,7 +1054,8 @@ strategy = "none"
 
     #[test]
     fn inventory_lists_builtins_in_reserved_order_with_their_wire_shape() {
-        let caps = host_capabilities_for("0.0.0", &no_profiles(), &test_registry());
+        let caps =
+            host_capabilities_for("0.0.0", &no_profiles(), &test_registry(), &process_base());
         let order: Vec<&str> = caps.runtimes.iter().map(|r| r.agent.as_str()).collect();
         assert_eq!(order, RESERVED_RUNTIME_IDS);
         assert_eq!(caps.supported_agents, RESERVED_RUNTIME_IDS);
@@ -1039,6 +1122,7 @@ strategy = "none"
             RuntimeRef::hermes(),
             &program.display().to_string(),
             &definition,
+            process_path().as_deref(),
         );
         assert!(runtime.available);
         assert_eq!(runtime.version, None);
@@ -1059,6 +1143,7 @@ strategy = "none"
             "0.0.0",
             &ProfileRegistry::new(Some(dir.clone())),
             &test_registry(),
+            &process_base(),
         );
         let runtime = caps
             .runtimes
@@ -1524,7 +1609,11 @@ strategy = "none"
         )
         .expect("write profile");
 
-        let caps = host_capabilities("0.0.0", &ProfileRegistry::new(Some(dir.clone())));
+        let caps = host_capabilities(
+            "0.0.0",
+            &ProfileRegistry::new(Some(dir.clone())),
+            &process_base(),
+        );
         let runtime = caps
             .runtimes
             .iter()
@@ -1549,12 +1638,17 @@ strategy = "none"
         let definition = probed_definition(SEMVER_PROBE);
 
         write_test_executable(&tool, "#!/bin/sh\necho 1.0.2\n");
-        let supported =
-            probe_versioned_runtime("tool", RuntimeRef::from_wire("tool"), &binary, &definition);
+        let supported = probe_versioned_runtime(
+            "tool",
+            RuntimeRef::from_wire("tool"),
+            &binary,
+            &definition,
+            process_path().as_deref(),
+        );
         assert!(supported.available);
         assert_eq!(supported.version.as_deref(), Some("1.0.2"));
         assert_eq!(supported.supported, Some(true));
-        let validated = validate_definition_launch(&definition, &binary)
+        let validated = validate_definition_launch(&definition, &binary, process_path().as_deref())
             .expect("a release inside the range launches")
             .expect("the probed executable is pinned");
         assert_eq!(validated.as_path(), tool.canonicalize().expect("canonical"));
@@ -1572,19 +1666,25 @@ strategy = "none"
                 RuntimeRef::from_wire("tool"),
                 &binary,
                 &definition,
+                process_path().as_deref(),
             );
             assert!(runtime.available, "{output:?}");
             assert_eq!(runtime.version.as_deref(), version, "{output:?}");
             assert_eq!(runtime.supported, Some(false), "{output:?}");
-            let error = validate_definition_launch(&definition, &binary)
+            let error = validate_definition_launch(&definition, &binary, process_path().as_deref())
                 .expect_err("a release outside the range is refused");
             assert_eq!(error.code, "agent_runtime_unsupported");
             assert!(!error.msg.contains(output) || output.is_empty());
         }
 
         write_test_executable(&tool, "#!/bin/sh\necho 1.0.2\nexit 3\n");
-        let failing =
-            probe_versioned_runtime("tool", RuntimeRef::from_wire("tool"), &binary, &definition);
+        let failing = probe_versioned_runtime(
+            "tool",
+            RuntimeRef::from_wire("tool"),
+            &binary,
+            &definition,
+            process_path().as_deref(),
+        );
         assert_eq!(
             failing.supported,
             Some(false),
@@ -1596,9 +1696,131 @@ strategy = "none"
             RuntimeRef::from_wire("tool"),
             &dir.join("missing").display().to_string(),
             &definition,
+            process_path().as_deref(),
         );
         assert!(!missing.available);
         assert_eq!(missing.supported, None);
+    }
+
+    /// Two interpreter directories whose `interp` shim prints a release inside
+    /// (`in_range`) and outside (`out_of_range`) the probe range, and a script
+    /// that runs whichever `interp` the `PATH` it is started under finds.
+    struct InterpreterFixture {
+        _root: crate::test_support::ScopedDir,
+        tool: PathBuf,
+        in_range: PathBuf,
+        out_of_range: PathBuf,
+    }
+
+    fn interpreter_fixture() -> InterpreterFixture {
+        let root = temp_agents_dir();
+        let in_range = root.join("in-range");
+        let out_of_range = root.join("out-of-range");
+        for (dir, version) in [(&in_range, "1.0.2"), (&out_of_range, "2.0.0")] {
+            std::fs::create_dir(dir).expect("interpreter dir");
+            write_test_executable(&dir.join("interp"), &format!("#!/bin/sh\necho {version}\n"));
+        }
+        let tool = root.join("tool");
+        write_test_executable(&tool, "#!/usr/bin/env interp\n");
+        InterpreterFixture {
+            tool,
+            in_range,
+            out_of_range,
+            _root: root,
+        }
+    }
+
+    fn version_under(
+        fixture: &InterpreterFixture,
+        definition: &RuntimeDefinition,
+        launch_path: &Path,
+    ) -> Option<String> {
+        probe_versioned_runtime(
+            "tool",
+            RuntimeRef::from_wire("tool"),
+            &fixture.tool.display().to_string(),
+            definition,
+            Some(launch_path.as_os_str()),
+        )
+        .version
+    }
+
+    #[test]
+    fn semver_probe_resolves_the_interpreter_on_the_launch_path() {
+        let fixture = interpreter_fixture();
+        let definition = probed_definition(SEMVER_PROBE);
+
+        assert_eq!(
+            version_under(&fixture, &definition, &fixture.in_range).as_deref(),
+            Some("1.0.2")
+        );
+        assert_eq!(
+            version_under(&fixture, &definition, &fixture.out_of_range).as_deref(),
+            Some("2.0.0")
+        );
+        let binary = fixture.tool.display().to_string();
+        assert!(
+            validate_definition_launch(&definition, &binary, Some(fixture.in_range.as_os_str()))
+                .is_ok(),
+            "an interpreter inside the range launches"
+        );
+        let error = validate_definition_launch(
+            &definition,
+            &binary,
+            Some(fixture.out_of_range.as_os_str()),
+        )
+        .expect_err("an interpreter outside the range is refused");
+        assert_eq!(error.code, "agent_runtime_unsupported");
+    }
+
+    #[test]
+    fn a_profile_path_override_decides_the_interpreter_the_inventory_probes() {
+        let fixture = interpreter_fixture();
+        let definition = probed_definition(SEMVER_PROBE);
+        let binary = fixture.tool.display().to_string();
+        let daemon_base = |dir: &Path| {
+            BaseEnv::new(std::collections::BTreeMap::from([(
+                "PATH".to_owned(),
+                dir.display().to_string(),
+            )]))
+            .expect("base environment")
+        };
+        let profile_path = |dir: &Path| vec![("PATH".to_owned(), dir.display().to_string())];
+        let supported = |base: &BaseEnv, profile_env: &[(String, String)]| {
+            probe_definition(
+                "tool",
+                RuntimeRef::from_wire("tool"),
+                &definition,
+                &binary,
+                base,
+                profile_env,
+            )
+            .supported
+        };
+
+        // The profile PATH wins over the daemon's, in both directions.
+        assert_eq!(
+            supported(
+                &daemon_base(&fixture.out_of_range),
+                &profile_path(&fixture.in_range)
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            supported(
+                &daemon_base(&fixture.in_range),
+                &profile_path(&fixture.out_of_range)
+            ),
+            Some(false)
+        );
+        // Without an override the base environment's PATH decides.
+        assert_eq!(supported(&daemon_base(&fixture.in_range), &[]), Some(true));
+        assert_eq!(
+            supported(&daemon_base(&fixture.out_of_range), &[]),
+            Some(false)
+        );
+        // A launch without any PATH has no interpreter to find.
+        assert_eq!(supported(&BaseEnv::default(), &[]), Some(false));
     }
 
     #[test]
@@ -1639,7 +1861,10 @@ strategy = "none"
         ];
         let outcome = spawn_and_collect_probe(
             &tool,
-            ProbeKind::Semver(policy),
+            ProbeKind::Semver {
+                policy,
+                launch_path: process_path().as_deref(),
+            },
             HANG_GUARD,
             &seeded_env,
             &Instant::now,

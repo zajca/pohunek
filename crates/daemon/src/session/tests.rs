@@ -18195,3 +18195,128 @@ async fn callbacks_of_a_running_package_session_are_accepted_after_disable_and_r
     assert!(release.released, "and releases");
     let _ = registry.stop(&created.id).await;
 }
+
+/// Writes `<root>/<name>/interp`, a shim that prints `version` whatever its
+/// arguments, and returns its directory.
+#[cfg(unix)]
+fn interpreter_dir(root: &std::path::Path, name: &str, version: &str) -> PathBuf {
+    let dir = root.join(name);
+    fs::create_dir_all(&dir).expect("interpreter dir");
+    write_executable(&dir.join("interp"), &format!("#!/bin/sh\necho {version}\n"));
+    dir
+}
+
+/// A registry whose agents are `script`-backed Pi-shaped runtimes probed
+/// under the `PATH` they launch with. The daemon's base environment carries
+/// `base_path`; the profiles come from `agents_dir`.
+#[cfg(unix)]
+fn path_probed_registry(
+    script: &std::path::Path,
+    agents_dir: PathBuf,
+    base_path: &std::path::Path,
+) -> SessionRegistry {
+    let crate::runtime::EnvironmentSource::Fixed(mut variables) =
+        crate::test_support::thread_environment_source()
+    else {
+        panic!("a test fixture supplies an explicit environment");
+    };
+    variables.insert("PATH".into(), base_path.into());
+    SessionRegistry::new_with_runtimes_and_environment(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_probed_host(
+            script,
+            crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+            crate::agent::host::fixture::PI_SHAPED_PROBE,
+        ),
+        crate::runtime::EnvironmentSource::Fixed(variables),
+        pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect(),
+    )
+}
+
+#[cfg(unix)]
+async fn create_in(
+    registry: &SessionRegistry,
+    agent: &str,
+    cwd: &std::path::Path,
+) -> Result<SessionInfo, protocol::ProtocolError> {
+    registry
+        .create(SessionNewParams {
+            agent: agent.to_owned(),
+            cwd: Some(cwd.to_path_buf()),
+            ..params()
+        })
+        .await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_version_probe_runs_under_the_launch_path_of_every_launch_kind() {
+    let root = temp_dir("probed-launch-path");
+    let in_range = interpreter_dir(&root, "in-range", "1.0.2");
+    let out_of_range = interpreter_dir(&root, "out-of-range", "2.0.0");
+    let script = root.join("agent");
+    write_executable(&script, "#!/usr/bin/env interp\n");
+    let profile = |path: &std::path::Path| {
+        format!(
+            "base = \"pi\"\n{}program = \"{}\"\n[env]\nPATH = \"{}\"\n",
+            crate::agent::host::fixture::pi_shaped_profile_pin(),
+            script.display(),
+            path.display()
+        )
+    };
+    let agents_dir = temp_agents_dir_with("probed-launch-path", "pi-in", &profile(&in_range));
+    fs::write(agents_dir.join("pi-out.toml"), profile(&out_of_range)).expect("profile");
+
+    // The base PATH decides for an agent without a profile override, and the
+    // profile PATH wins over it in both directions.
+    for (base, bare_launches) in [(&in_range, true), (&out_of_range, false)] {
+        let registry = path_probed_registry(&script, agents_dir.clone(), base);
+        let capabilities = crate::capabilities::host_capabilities(
+            "0.0.0",
+            registry.profiles(),
+            &registry.inspect_base_environment(),
+        );
+        for (agent, launches) in [("pi", bare_launches), ("pi-in", true), ("pi-out", false)] {
+            let listed = capabilities
+                .runtimes
+                .iter()
+                .find(|runtime| runtime.agent == agent)
+                .expect("the agent is listed");
+            assert_eq!(listed.supported, Some(launches), "inventory of {agent}");
+            match create_in(&registry, agent, &root).await {
+                Ok(created) => {
+                    assert!(launches, "{agent} must be refused");
+                    let _ = registry.stop(&created.id).await;
+                }
+                Err(error) => {
+                    assert!(!launches, "{agent} must launch: {}", error.code);
+                    assert_eq!(error.code, "agent_runtime_unsupported");
+                }
+            }
+        }
+    }
+
+    // A relaunch resolves the profile again: the profile PATH picks the
+    // interpreter although the base PATH holds an unsupported one.
+    let registry = path_probed_registry(&script, agents_dir, &out_of_range);
+    let created = create_in(&registry, "pi-in", &root)
+        .await
+        .expect("pi-in launches");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("the session exits");
+    let resumed = registry
+        .resume(&created.id)
+        .await
+        .expect("resume probes under the profile PATH");
+    let _ = registry.stop(&resumed.id).await;
+}

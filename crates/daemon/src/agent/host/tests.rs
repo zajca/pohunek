@@ -1102,7 +1102,7 @@ mod launch_validation {
     fn a_runtime_without_a_version_probe_launches_without_validation() {
         let missing = "/nonexistent/pohunek/agent";
         for name in ["shell", "codex", "claude"] {
-            let validated = validate_launch_runtime(&builtin_definition(name), missing)
+            let validated = validate_launch_runtime(&builtin_definition(name), missing, None)
                 .expect("no probe, no validation");
             assert!(validated.is_none(), "{name}");
         }
@@ -1120,7 +1120,7 @@ mod launch_validation {
         );
 
         let supported = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
-        let validated = validate_launch_runtime(&hermes, &supported)
+        let validated = validate_launch_runtime(&hermes, &supported, None)
             .expect("the pinned release passes")
             .expect("the probed executable is pinned");
         assert_eq!(
@@ -1131,9 +1131,9 @@ mod launch_validation {
         );
 
         let newer = executable(&dir, "#!/bin/sh\necho 'Hermes Agent v0.21.0'\n");
-        let error = validate_launch_runtime(&hermes, &newer).expect_err("another release");
+        let error = validate_launch_runtime(&hermes, &newer, None).expect_err("another release");
         assert_eq!(error.code, "agent_runtime_unsupported");
-        let error = validate_launch_runtime(&hermes, "/nonexistent/pohunek/hermes")
+        let error = validate_launch_runtime(&hermes, "/nonexistent/pohunek/hermes", None)
             .expect_err("a missing executable");
         assert_eq!(error.code, "agent_runtime_unsupported");
     }
@@ -1161,7 +1161,7 @@ mod launch_validation {
             integration_handler: None,
         })
         .expect("valid package definition");
-        let error = validate_launch_runtime(&unknown, "acme").expect_err("unknown parser");
+        let error = validate_launch_runtime(&unknown, "acme", None).expect_err("unknown parser");
         assert_eq!(error.code, "agent_runtime_unsupported");
     }
 }

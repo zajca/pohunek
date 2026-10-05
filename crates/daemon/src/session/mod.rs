@@ -1866,8 +1866,16 @@ impl SessionRegistry {
             name: params.agent.clone(),
         }
         .resolve(&self.inner.profiles)?;
-        let validated_program =
-            host::validate_launch_runtime(&resolved.definition, resolved.program())?;
+        let profile_env = resolved
+            .profile
+            .as_ref()
+            .map_or(&[][..], |profile| profile.env.as_slice());
+        let launch_path = self.probe_search_path(&resolved.definition, profile_env)?;
+        let validated_program = host::validate_launch_runtime(
+            &resolved.definition,
+            resolved.program(),
+            launch_path.as_deref(),
+        )?;
         // Fallback launch dir for a no-project (plain shell) session: the CLI's
         // own cwd for a local session, else the daemon's. A resolved project
         // overrides this with its checkout (or worktree) path.
