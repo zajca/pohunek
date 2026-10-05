@@ -1060,6 +1060,16 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
         WorkerMetadataApplyOutcome::Applied
     );
     held("worker-four").await;
+
+    // A public report numbered below the accepted public one is stale even
+    // though a worker claim was accepted after it, and never replaces the
+    // newer conversation.
+    let late = public_report(&rig, "public-late", |report| {
+        report.sequence = accepted.sequence;
+    })
+    .await;
+    assert!(!rig.registry.report_native_id(late).await.recorded);
+    held("worker-four").await;
     let public = public_report(&rig, "public-five", |_| {}).await;
     assert!(rig.registry.report_native_id(public).await.recorded);
     held("public-five").await;

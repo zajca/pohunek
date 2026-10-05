@@ -607,6 +607,14 @@ impl SessionRegistry {
                 );
                 let _ = self.inner.events.send(event);
             }
+        } else if identities_accepted
+            && (snapshot.launch_identity.is_some() || snapshot.active_identity.is_some())
+        {
+            // A concurrent applier may have committed the same identity to
+            // memory and still be writing its resume binding. Persisting here
+            // queues behind that write on the persist lock, so an applied
+            // snapshot always leaves the binding matching the record.
+            self.persist_resume_binding(id).await;
         }
         if identities_accepted {
             WorkerMetadataApplyOutcome::Applied
@@ -8301,6 +8309,59 @@ while os.getppid() == parent:
                 "{name} is not the verified launch process"
             );
         }
+    }
+
+    #[test]
+    fn a_stale_writer_never_demotes_a_newer_reference_of_the_other_transport() {
+        let ordered = |sequence: u64, worker_sequence: Option<u64>, reference: &str| {
+            let mut record = identity_record();
+            record.native_identity_ordering = Some(NativeIdentityOrdering {
+                worker_instance_id: "runtime-identity".to_owned(),
+                pid: 50,
+                pid_start_identity: 500,
+                sequence,
+                worker_sequence,
+            });
+            record.info.native_session_id = Some(reference.to_owned());
+            record
+                .recovery
+                .as_mut()
+                .expect("recovery binding")
+                .native_session_id = Some(reference.to_owned());
+            record
+        };
+        // The store accepted a worker claim after the public report the
+        // writer's record was built from: the writer is behind in the worker
+        // domain and not ahead in the public one.
+        let durable = ordered(5, Some(900), "worker-conversation");
+        let mut stale = ordered(5, None, "public-conversation");
+        crate::store::preserve_newer_native_identity(&durable, &mut stale);
+        assert_eq!(
+            stale.info.native_session_id.as_deref(),
+            Some("worker-conversation")
+        );
+        assert_eq!(
+            stale.native_identity_ordering,
+            durable.native_identity_ordering
+        );
+
+        // A writer that accepted a newer public report keeps its reference and
+        // inherits the worker mark, so a late public report numbered like the
+        // old one is still stale.
+        let mut newer = ordered(6, None, "newer-public-conversation");
+        crate::store::preserve_newer_native_identity(&durable, &mut newer);
+        assert_eq!(
+            newer.info.native_session_id.as_deref(),
+            Some("newer-public-conversation")
+        );
+        let merged = newer.native_identity_ordering.expect("merged ordering");
+        assert_eq!((merged.sequence, merged.worker_sequence), (6, Some(900)));
+        assert!(!merged.admits("runtime-identity", crate::store::ReportTransport::Public, 5));
+        assert!(!merged.admits(
+            "runtime-identity",
+            crate::store::ReportTransport::Worker,
+            900
+        ));
     }
 
     #[test]
