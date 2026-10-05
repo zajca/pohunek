@@ -65,9 +65,13 @@ use crate::agent::host::{LaunchPin, RESERVED_RUNTIME_IDS};
 use crate::agent::{InputRules, NativeReferenceProvenance, NativeSessionLaunch, SessionRefKind};
 use crate::project::detect::project_id;
 
+mod legacy_binding;
 mod schema;
 #[cfg(test)]
 mod shape_guard;
+
+#[cfg(test)]
+mod legacy_binding_tests;
 
 pub use schema::{migrate_at_startup, SchemaMigration, StoreSchemaError, STORE_SCHEMA_VERSION};
 
@@ -153,6 +157,11 @@ pub struct ResumeBinding {
         skip_serializing_if = "NativeReferenceProvenance::is_reported"
     )]
     pub native_reference_provenance: NativeReferenceProvenance,
+    /// Set by the schema migration on a binding that lost its `native_launch`
+    /// and whose runtime has to supply it: the registry resolves the spec by
+    /// agent name when the binding is loaded and clears the flag.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native_launch_unresolved: bool,
 }
 
 impl ResumeBinding {
@@ -217,6 +226,8 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             launch_binding: LaunchPin,
             #[serde(default)]
             native_reference_provenance: NativeReferenceProvenance,
+            #[serde(default)]
+            native_launch_unresolved: bool,
         }
 
         let raw = RawResumeBinding::deserialize(deserializer)?;
@@ -251,6 +262,7 @@ impl<'de> Deserialize<'de> for ResumeBinding {
             native_launch: raw.native_launch,
             launch_binding: raw.launch_binding,
             native_reference_provenance: raw.native_reference_provenance,
+            native_launch_unresolved: raw.native_launch_unresolved,
         })
     }
 }
@@ -1831,6 +1843,7 @@ mod tests {
             )),
             launch_binding: LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            native_launch_unresolved: false,
         }
     }
 
@@ -1943,6 +1956,7 @@ mod tests {
             )),
             launch_binding: LaunchPin::Unpinned,
             native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
+            native_launch_unresolved: false,
         };
         store.record_resume(&binding).expect("record");
         let loaded = store.load_resume().expect("load");
@@ -2010,18 +2024,25 @@ mod tests {
     }
 
     #[test]
-    fn resume_line_with_removed_mode_fields_loads_as_non_recoverable() {
-        let store = Store::new(temp_store_path("resume-removed-fields"));
+    fn resume_line_with_legacy_mode_fields_migrates_to_a_native_launch() {
+        let store = Store::new(temp_store_path("resume-legacy-fields"));
         let old = concat!(
-            r#"{"kind":"resume","schema_version":2,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","session_id":"s-old","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","program":"claude","#,
             r#""resume_mode":"flag","ref_kind":"id","resumable":true}"#,
             "\n"
         );
         write_private(store.path(), old);
+        store.migrate_to_current().expect("migrate");
         let loaded = store.load_resume().expect("load");
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].native_launch, None);
+        let launch = loaded[0].native_launch.as_ref().expect("native launch");
+        assert_eq!(
+            launch
+                .resume_argv(&crate::agent::SessionRef::id("n").expect("id"))
+                .expect("resume argv"),
+            ["--resume", "n"]
+        );
     }
 
     #[test]

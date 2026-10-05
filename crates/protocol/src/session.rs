@@ -2161,9 +2161,9 @@ impl SessionState {
     }
 }
 
-/// The kind of a non-fatal worktree-setup warning.
+/// The kind of a non-fatal session warning.
 ///
-/// Each variant mirrors a Kandev worktree warning field (see
+/// The worktree variants mirror a Kandev worktree warning field (see
 /// `docs/plan-phase-1.md` "Worktree-per-Session"): none of them aborts session
 /// creation — the worktree is kept, the warning is surfaced, and the user
 /// decides whether to intervene.
@@ -2186,9 +2186,14 @@ pub enum SessionWarningKind {
     /// the warning's `message`/`detail`, not the kind (a **unit** variant, so the
     /// enum stays `Copy` and serializes to the bare string `"hook"`).
     Hook,
+    /// The session's stored native recovery record could not be completed
+    /// after an upgrade, so it cannot resume or fork natively. The session
+    /// stays listed; start a new session and resume the native conversation
+    /// from the reference in the warning's `detail`.
+    NativeRecovery,
 }
 
-/// A non-fatal warning surfaced while setting up a session's worktree.
+/// A non-fatal warning surfaced for a session.
 ///
 /// Carries a machine-readable [`kind`](Self::kind), a human-readable summary,
 /// and optional raw detail (e.g. trimmed git output) for debugging. Never

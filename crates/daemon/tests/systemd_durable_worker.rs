@@ -768,6 +768,7 @@ impl Fixture {
                     launch_binding: pohunek_daemon::agent::host::LaunchPin::Unpinned,
                     native_reference_provenance:
                         pohunek_daemon::agent::NativeReferenceProvenance::default(),
+                    native_launch_unresolved: false,
                 }),
                 native_identity_ordering: None,
                 runtime: RuntimeRecord {

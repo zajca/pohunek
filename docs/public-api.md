@@ -221,7 +221,8 @@ instance. A v3 client that sends its range `3..=3` to a v4 daemon is served by
 the protocol 3 adapter: the daemon accepts the `runtime_id` spelling in its
 requests (a request that already carries the v4 spelling is `bad_request`) and
 answers, and streams events, in the `runtime_id` spelling, withholding warning
-kinds and events v3 never defined. A v4 client against a daemon that only speaks
+kinds and events v3 never defined (a v3 connection never receives a
+`native_recovery` session warning; v4 connections do). A v4 client against a daemon that only speaks
 v3 receives `daemon/version_mismatch` before any method runs. The window covers
 the public daemon protocol only: the CLI's `--json` envelope reports `protocol`
 `4..=4` and its `--runtime-id` flags are now `--worker-instance-id`, so an
@@ -887,7 +888,12 @@ Important fields:
   context. When a session leaves every known active worktree, `worktree_path` is
   cleared; `repo` and `branch` remain populated when git detection still finds a
   repository at the new cwd.
-- `warnings`: non-fatal worktree setup warnings.
+- `warnings`: non-fatal warnings, each `{kind, message, detail?}`. `kind` is
+  `fetch`, `base_branch_fallback`, `setup_script` or `hook` for worktree setup,
+  and `native_recovery` for a session whose stored native recovery record could
+  not be completed after an upgrade: it cannot resume or fork, `message` says to
+  start a new session and resume the native conversation, and `detail` carries
+  the stored native reference.
 - `metadata`: owner-controlled strings; must not contain secrets. The daemon
   treats every key opaquely; clients own the convention. One such
   client-defined convention is the `link.*` key family (`link.provider`,

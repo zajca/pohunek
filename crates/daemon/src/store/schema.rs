@@ -28,7 +28,7 @@ use tracing::{info, warn};
 use crate::error::DaemonError;
 
 use super::{
-    fs_error_to_io, parent_directory, Store, MAX_METADATA_STORE_BYTES,
+    fs_error_to_io, legacy_binding, parent_directory, Store, MAX_METADATA_STORE_BYTES,
     OWNER_PRIVATE_DIRECTORY_MODE, OWNER_PRIVATE_FILE_MODE, TEMP_SEQUENCE,
 };
 
@@ -61,10 +61,11 @@ pub(super) const MIGRATIONS: &[Migration] = &[Migration {
 
 /// Schema 1 to 2: introduces the per-line version and the native-launch shape.
 ///
-/// The step does not remove any field: legacy keys (`resume_mode`, `ref_kind`,
-/// `resumable`, `fork_*`) stay on the value so a later step can map them, and a
-/// line already in the current shape is left untouched.
-fn migrate_v1_to_v2(_record: &mut Map<String, Value>) {}
+/// Resume bindings written before the native launch spec existed are mapped by
+/// [`legacy_binding::migrate_record`]; every other record keeps its fields.
+fn migrate_v1_to_v2(record: &mut Map<String, Value>) {
+    legacy_binding::migrate_record(record);
+}
 
 /// A metadata store whose schema this daemon cannot use as is.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -755,13 +756,14 @@ mod tests {
         }
         let resume = &lines[0];
         assert_eq!(resume["kind"], "resume");
-        assert_eq!(
-            resume["resume_mode"], "subcommand",
-            "legacy fields stay on the migrated record for later steps"
+        assert!(
+            resume.get("resume_mode").is_none() && resume.get("forkable").is_none(),
+            "the legacy fields are replaced by the native launch spec: {resume}"
         );
-        assert_eq!(resume["ref_kind"], "id");
-        assert_eq!(resume["resumable"], true);
-        assert_eq!(resume["fork_mode"], "claude_session");
+        assert_eq!(
+            resume["native_launch"]["resume_args"],
+            json!([{"literal": "resume"}, "reference"])
+        );
 
         let resumes = store.load_resume().expect("load resume");
         assert_eq!(resumes.len(), 1);

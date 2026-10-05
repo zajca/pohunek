@@ -631,6 +631,24 @@ Codex-backed sessions return the typed `agent_fork_unsupported` error instead
 of fabricating an unsupported branch. Hermes-backed sessions return the same
 typed unsupported error.
 
+Recovery records written by earlier releases are completed when the daemon
+starts, so an upgrade does not strand a resumable session. The metadata store
+migration maps the flat `resume_mode`/`ref_kind`/`resumable`/`fork_*` fields of
+v0.33.0 onto the session's native-session launch spec with the argv they
+already produced. A v0.33.1 record that kept its native reference but lost its
+launch spec is restored with the built-in spec for Claude, Codex and Hermes
+(Claude regains fork); for a profile or package runtime the spec is resolved by
+agent name when the record is loaded. The migration never launches anything: a
+restored session stays `lost` until an explicit `session.resume`. A record that
+cannot be completed (the profile was deleted, no longer runs on the same
+runtime, or declares no native resume) still loads and keeps its place in
+`session list`. The daemon logs `reconcile.native_recovery.unrepairable` at
+WARN, the session carries a `native_recovery` warning, and `session list` prints
+the hint under the table: start a new session and resume the native conversation
+in it, using the reference in the warning's `detail`. Never resume the old
+record when the native conversation already continues under another session,
+because that would start a second agent on the same native id.
+
 For project-aware work, prefer a registered project or repository target over an
 ad hoc directory. See [projects](projects.md) and [worktrees](worktrees.md).
 

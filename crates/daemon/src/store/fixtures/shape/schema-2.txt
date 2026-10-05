@@ -49,6 +49,7 @@ resume.native_launch.fork_args[].literal
 resume.native_launch.reference_kind
 resume.native_launch.resume_args
 resume.native_launch.resume_args[].literal
+resume.native_launch_unresolved
 resume.native_reference_provenance
 resume.native_session_id
 resume.native_session_path
@@ -155,6 +156,7 @@ session.recovery.native_launch.fork_args[].literal
 session.recovery.native_launch.reference_kind
 session.recovery.native_launch.resume_args
 session.recovery.native_launch.resume_args[].literal
+session.recovery.native_launch_unresolved
 session.recovery.native_reference_provenance
 session.recovery.native_session_id
 session.recovery.native_session_path
