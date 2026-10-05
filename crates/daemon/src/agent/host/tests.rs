@@ -10,8 +10,9 @@ use protocol::{
 
 use super::{
     check_pin, validate_launch_runtime, BuiltinSource, DefinitionError, DefinitionInvariant,
-    DefinitionOrigin, DefinitionParts, LaunchPin, LaunchProgram, RegistryError, RuntimeDefinition,
-    RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust, RESERVED_RUNTIME_IDS,
+    DefinitionOrigin, DefinitionParts, HandlerId, Integration, LaunchPin, LaunchProgram,
+    RegistryError, RuntimeDefinition, RuntimeHost, RuntimeRegistry, RuntimeSource, SourceTrust,
+    RESERVED_RUNTIME_IDS,
 };
 use crate::agent::{
     InputRules, NativeLaunchError, NativeReferenceError, NativeReferenceStrategy,
@@ -116,7 +117,7 @@ fn package_definition(runtime: &str) -> RuntimeDefinition {
         prompt_arg: false,
         version_probe_parser: None,
         version_probe_policy: None,
-        integration_handler: None,
+        integration: None,
     })
     .expect("valid package definition")
 }
@@ -307,7 +308,7 @@ fn descriptor_digest_changes_with_launch_fields() {
             prompt_arg,
             version_probe_parser: None,
             version_probe_policy: None,
-            integration_handler: None,
+            integration: None,
         })
         .expect("valid")
         .binding()
@@ -654,7 +655,7 @@ fn definitions_reject_unsafe_launch_text() {
             prompt_arg: false,
             version_probe_parser: None,
             version_probe_policy: None,
-            integration_handler: None,
+            integration: None,
         })
     };
     build("Demo", Vec::new()).expect("baseline is valid");
@@ -704,7 +705,7 @@ fn builtin_parts() -> DefinitionParts {
         prompt_arg: false,
         version_probe_parser: None,
         version_probe_policy: None,
-        integration_handler: None,
+        integration: None,
     }
 }
 
@@ -1073,7 +1074,7 @@ fn a_pin_needs_the_same_runtime_from_the_same_origin() {
         prompt_arg: false,
         version_probe_parser: None,
         version_probe_policy: None,
-        integration_handler: None,
+        integration: None,
     })
     .expect("valid package definition");
     assert_eq!(
@@ -1158,7 +1159,7 @@ mod launch_validation {
                 super::super::HandlerId::parse("acme-v1", "test").expect("handler id"),
             ),
             version_probe_policy: None,
-            integration_handler: None,
+            integration: None,
         })
         .expect("valid package definition");
         let error = validate_launch_runtime(&unknown, "acme", None).expect_err("unknown parser");
@@ -1429,4 +1430,133 @@ fn the_descriptor_digest_covers_the_assignment_and_ignores_hook_runtimes() {
     );
     assert_ne!(hook, assigned);
     assert_ne!(assigned, other_template);
+}
+
+fn integration_document(integration: &str) -> String {
+    format!(
+        "{}\n[integration]\n{integration}\n",
+        document_with(ID_RESUME, "supported = false", "strategy = \"hook\"")
+    )
+}
+
+fn integration_field_error(integration: &str) -> &'static str {
+    match parse(&integration_document(integration)) {
+        Err(DefinitionError::Field { field, .. }) => field,
+        other => panic!("expected a field error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_descriptor_names_its_handler_and_a_hook_schema_the_handler_supports() {
+    let definition = parse(&integration_document(
+        "handler = \"codex-hook-v1\"\nhook_schema = \"identity-subagent-v1\"",
+    ))
+    .expect("a supported pair");
+    assert_eq!(
+        definition.integration_handler().map(HandlerId::as_str),
+        Some("codex-hook-v1")
+    );
+    assert_eq!(
+        definition.hook_schema().map(|schema| schema.id),
+        Some("identity-subagent-v1")
+    );
+
+    let hermes = parse(&integration_document(
+        "handler = \"hermes-hook-v1\"\nhook_schema = \"identity-v1\"",
+    ))
+    .expect("the identity schema pairs with its handler");
+    assert!(hermes
+        .hook_schema()
+        .is_some_and(|schema| !schema.allows(pohunek_worker_protocol::HookAction::SubagentStart)));
+}
+
+#[test]
+fn an_unknown_hook_schema_or_handler_is_refused() {
+    assert_eq!(
+        integration_field_error("handler = \"codex-hook-v1\"\nhook_schema = \"identity-v9\""),
+        "integration.hook_schema"
+    );
+    assert_eq!(
+        integration_field_error("handler = \"acme-hook-v1\"\nhook_schema = \"identity-v1\""),
+        "integration.handler"
+    );
+}
+
+#[test]
+fn a_handler_and_schema_pair_the_handler_does_not_support_is_refused() {
+    assert_eq!(
+        integration_field_error(
+            "handler = \"hermes-hook-v1\"\nhook_schema = \"identity-subagent-v1\""
+        ),
+        "integration.hook_schema"
+    );
+    assert_eq!(
+        integration_field_error("handler = \"codex-hook-v1\"\nhook_schema = \"identity-v1\""),
+        "integration.hook_schema"
+    );
+}
+
+#[test]
+fn an_integration_without_its_hook_schema_or_handler_is_malformed() {
+    for integration in [
+        "handler = \"codex-hook-v1\"",
+        "hook_schema = \"identity-v1\"",
+        "handler = \"codex-hook-v1\"\nhook_schema = \"identity-v1\"\nasset = \"x\"",
+    ] {
+        assert!(
+            matches!(
+                parse(&integration_document(integration)),
+                Err(DefinitionError::Malformed { .. })
+            ),
+            "{integration}"
+        );
+    }
+}
+
+#[test]
+fn only_the_builtin_shell_may_name_a_schema_without_a_handler() {
+    let handlerless = Integration::new(None, "identity-v1").expect("a registered schema");
+    let result = RuntimeDefinition::new(DefinitionParts {
+        runtime_id: id("acme"),
+        origin: DefinitionOrigin::Package {
+            package: package("acme.runtime"),
+            digest: PackageDigest::parse(DIGEST).expect("valid digest"),
+        },
+        display_name: "Acme".to_owned(),
+        program: LaunchProgram::Fixed("acme".to_owned()),
+        default_args: Vec::new(),
+        input_rules: InputRules::unrestricted(false, Duration::ZERO),
+        submit_delay_configurable: false,
+        manifest: shell_manifest(),
+        native: None,
+        prompt_arg: false,
+        version_probe_parser: None,
+        version_probe_policy: None,
+        integration: Some(handlerless),
+    });
+    assert!(matches!(
+        result,
+        Err(DefinitionError::Invariant(
+            DefinitionInvariant::HookSchemaRequiresHandler
+        ))
+    ));
+}
+
+#[test]
+fn builtin_runtimes_resolve_their_hook_schema() {
+    let registry = builtin_registry("/bin/sh");
+    for (runtime, schema) in [
+        ("shell", "identity-subagent-v1"),
+        ("codex", "identity-subagent-v1"),
+        ("claude", "identity-subagent-v1"),
+        ("hermes", "identity-v1"),
+    ] {
+        let definition = registry.resolve(&id(runtime)).expect("built in");
+        assert_eq!(
+            definition.hook_schema().map(|schema| schema.id),
+            Some(schema),
+            "{runtime}"
+        );
+    }
+    assert!(package_definition("acme").hook_schema().is_none());
 }

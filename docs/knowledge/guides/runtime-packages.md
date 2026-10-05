@@ -32,6 +32,25 @@ Every subcommand accepts `--json`: one envelope on stdout, digests in full.
 Tables abbreviate a digest to its first 12 hex characters; that prefix is a
 valid `--digest` selector.
 
+## Hook schemas and integration handlers
+
+A package whose agent reports lifecycle hooks names its compiled integration
+handler and the hook schema its reports follow in the descriptor:
+
+```toml
+[integration]
+handler = "codex-hook-v1"
+hook_schema = "identity-subagent-v1"
+```
+
+Core owns the schemas: `identity-v1` (identity, release, notification) and
+`identity-subagent-v1` (the same plus subagent start and stop). A package only
+names one; it cannot carry schema contents, add actions, or relax validation.
+`plugin install` and `plugin install --yes` refuse a descriptor whose schema id
+or handler id core does not provide, or whose handler does not drive the schema
+(`descriptor_invalid`), before anything is recorded. A package without
+`[integration]` (Pi) has no schema, and its sessions accept no hook report.
+
 ## Local only
 
 Package commands act on the daemon on this machine through its local control
@@ -62,7 +81,8 @@ they need `--yes`.
   arguments the daemon will launch as the owner, the arguments it appends at
   launch to pass the session reference, the resume and fork argument templates
   (`{reference}` marks the reference slot), whether the first prompt is
-  appended to the arguments, the version probe and the integration handler), and fails with code `consent_required`. Nothing changed.
+  appended to the arguments, the version probe and the integration handler; the
+  hook schema is part of the same descriptor), and fails with code `consent_required`. Nothing changed.
 - With `--yes`, the CLI repeats the dry run and then performs the change.
 - Under `--json` without `--yes` only the error envelope is printed; its
   message names the package, so omit `--json` to see the full review.

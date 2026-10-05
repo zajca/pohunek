@@ -205,6 +205,7 @@ impl Fixture {
             stop_policy: StopPolicy::new(500).expect("stop policy"),
             hook_protocol_version: Version::new(1).expect("hook version"),
             public_protocol_version: 7,
+            hook_schema: None,
         }
     }
 

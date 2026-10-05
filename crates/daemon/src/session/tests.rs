@@ -6407,6 +6407,113 @@ async fn codex_hook_journal_survives_daemon_reconciliation() {
 }
 
 #[tokio::test]
+async fn a_worker_without_a_journaled_schema_is_reprojected_with_the_runtime_schema() {
+    let store_path = temp_store_path("hook-schema-reprojection");
+    let worker_state_root = store_path
+        .parent()
+        .expect("store parent")
+        .join("worker-state");
+    let worker_runtime_root = crate::test_support::thread_scoped_dir("pw-schema-");
+    let hook_path = pohunek_test_support::manifest_dir()
+        .join("src/integration/assets/codex/pohunek-agent-state.sh");
+    let payload = serde_json::json!({
+        "session_id": "native-parent",
+        "turn_id": "turn-child",
+        "hook_event_name": "SubagentStart",
+        "agent_id": "child-reprojected",
+        "agent_type": "reviewer",
+    });
+    let command = format!(
+        "printf '%s' '{}' | sh '{}' subagent-start; sleep 30",
+        payload,
+        hook_path.display()
+    );
+    let registry = SessionRegistry::new(SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", command.as_str()]),
+        stop_grace: Duration::from_millis(50),
+        store_path: Some(store_path.clone()),
+        worker_runtime_root: Some(worker_runtime_root.clone()),
+        worker_state_root: Some(worker_state_root.clone()),
+        ..SessionRegistryConfig::default()
+    });
+    let created = registry.create(params()).await.expect("create session");
+    wait_until("the hook-reported subagent", || async {
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("inspect session")
+            .subagents
+            .first()
+            .cloned()
+    })
+    .await;
+
+    let (worker, _identity) = live_worker_and_identity(&registry, &created.id).await;
+    let journaled = worker.inspect().await.expect("inspect worker journal");
+    assert_eq!(
+        journaled.hook_schema.as_deref(),
+        Some("identity-subagent-v1"),
+        "the worker journals the schema the daemon delivered at initialize"
+    );
+    registry.begin_daemon_shutdown();
+    worker
+        .release_controller()
+        .await
+        .expect("release previous daemon controller");
+    let store = crate::store::Store::new(store_path.clone());
+    let mut record = store
+        .load_sessions()
+        .expect("load logical record")
+        .pop()
+        .expect("logical record");
+    record.info.subagents.clear();
+    store
+        .record_session(&record)
+        .expect("persist pre-observation daemon snapshot");
+    let socket_path = worker_runtime_root
+        .join(&created.id.0)
+        .join(pohunek_paths::WORKER_SOCKET_NAME);
+    let reconnected = Worker::connect_discovered(&socket_path, "replacement-daemon")
+        .await
+        .expect("reconnect worker");
+    let mut snapshot = reconnected
+        .inspect()
+        .await
+        .expect("inspect after reconnect");
+    // A worker built before schema delivery journals no schema.
+    snapshot.hook_schema = None;
+    wait_for_current_worker_metadata_record(&registry, &store, &created.id, &snapshot).await;
+    assert_eq!(
+        registry
+            .apply_worker_metadata_snapshot(&created.id, &snapshot)
+            .await,
+        WorkerMetadataApplyOutcome::Applied,
+        "the daemon resolves the schema from the session's pinned runtime"
+    );
+    registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get_mut(&created.id)
+        .expect("session entry")
+        .runtime = RuntimeHandle::Worker(reconnected);
+    let restored = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect restored");
+    assert_eq!(
+        restored
+            .subagents
+            .first()
+            .map(|subagent| subagent.id.as_str()),
+        Some("child-reprojected")
+    );
+
+    let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
 async fn a_worker_connection_lost_during_daemon_shutdown_leaves_the_runtime_live() {
     let store_path = temp_store_path("shutdown-connection-loss");
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -13324,7 +13431,7 @@ fn acme_definition(submit_delay_configurable: bool, prompt_arg: bool) -> Runtime
         prompt_arg,
         version_probe_parser: None,
         version_probe_policy: None,
-        integration_handler: None,
+        integration: None,
     })
     .expect("valid definition")
 }
@@ -17276,11 +17383,17 @@ async fn a_report_labels_the_reference_it_writes_reported() {
     let marker = dir.join("argv.txt");
     let (script, _gate) = assigned_agent_script(&dir, &marker);
     let store_path = temp_store_path("assigned-reported");
-    let registry = assigned_registry(
-        &script,
-        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
-        &store_path,
-        None,
+    let registry = SessionRegistry::new_with_runtimes(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path.clone()),
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::pi_shaped_hooked_host(
+            &script,
+            crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+        ),
     );
     let created = registry
         .create(SessionNewParams {
@@ -17517,6 +17630,19 @@ impl PackagedPi {
     fn install(tag: &str, script: &std::path::Path) -> Self {
         let plugins = temp_dir(tag).join("plugins");
         let (host, digest) = crate::agent::host::fixture::installed_pi_host(&plugins, script);
+        Self {
+            plugins,
+            digest,
+            host,
+        }
+    }
+
+    /// [`Self::install`] for a package that declares an integration, whose
+    /// sessions therefore admit hook reports.
+    fn install_hooked(tag: &str, script: &std::path::Path) -> Self {
+        let plugins = temp_dir(tag).join("plugins");
+        let (host, digest) =
+            crate::agent::host::fixture::installed_hooked_pi_host(&plugins, script);
         Self {
             plugins,
             digest,
@@ -18115,7 +18241,7 @@ async fn callbacks_of_a_pinned_session_use_its_own_version_after_another_is_sele
     let dir = temp_dir("packaged-callback-select");
     let marker = dir.join("argv.txt");
     let (script, _gate) = assigned_agent_script(&dir, &marker);
-    let packaged = PackagedPi::install("packaged-callback-select-plugins", &script);
+    let packaged = PackagedPi::install_hooked("packaged-callback-select-plugins", &script);
     let registry = packaged.registry(&temp_store_path("packaged-callback-select"));
     let created = registry
         .create(packaged_params(&dir))
@@ -18169,7 +18295,7 @@ async fn callbacks_of_a_running_package_session_are_accepted_after_disable_and_r
     let dir = temp_dir("packaged-callback-disable");
     let marker = dir.join("argv.txt");
     let (script, _gate) = assigned_agent_script(&dir, &marker);
-    let packaged = PackagedPi::install("packaged-callback-disable-plugins", &script);
+    let packaged = PackagedPi::install_hooked("packaged-callback-disable-plugins", &script);
     let registry = packaged.registry(&temp_store_path("packaged-callback-disable"));
     let created = registry
         .create(packaged_params(&dir))
@@ -18491,4 +18617,397 @@ async fn assert_migrated_binding_argv(generation: &str, case: &MigratedAgentCase
         ),
     }
     let _ = registry.stop(&resumed.id).await;
+}
+
+/// Writes the script a hooked session runs: every real Codex and Claude
+/// adapter once through the worker socket and, with the worker socket hidden,
+/// once through the public daemon socket, then a completion marker.
+///
+/// Returns the script and the marker path.
+#[cfg(unix)]
+fn adapter_script(dir: &std::path::Path, public_only: bool) -> (PathBuf, PathBuf) {
+    let assets = pohunek_test_support::manifest_dir().join("src/integration/assets");
+    let a = assets.display();
+    let done = dir.join("adapters.done");
+    let script = dir.join("adapter-session");
+    let hide = "env -u POHUNEK_WORKER_SOCKET_PATH";
+    // With `public_only`, every adapter runs with the worker socket hidden.
+    let first = if public_only { hide } else { "env" };
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s' '{{\"session_id\":\"native-codex\",\"transcript_path\":\"/t/codex.jsonl\"}}' | {first} sh '{a}/codex/pohunek-agent-state.sh' session\n\
+             printf '%s' '{{\"session_id\":\"native-claude\",\"transcript_path\":\"/t/claude.jsonl\"}}' | {first} sh '{a}/claude/pohunek-agent-state.sh' session\n\
+             printf '%s' '{{\"agent_id\":\"child-1\",\"agent_type\":\"explore\"}}' | {first} sh '{a}/codex/pohunek-agent-state.sh' subagent-start\n\
+             printf '%s' '{{\"session_id\":\"native-public\",\"transcript_path\":\"/t/public.jsonl\"}}' | {hide} sh '{a}/codex/pohunek-agent-state.sh' session\n\
+             printf '%s' '{{}}' | {first} sh '{a}/codex/pohunek-agent-notify.sh' stop\n\
+             printf '%s' '{{}}' | {hide} sh '{a}/claude/pohunek-agent-notify.sh' stop\n\
+             command -v python3 > '{done}.python'\n\
+             : > '{done}'\n\
+             exec sleep 30\n",
+            done = done.display(),
+        ),
+    );
+    (script, done)
+}
+
+/// A session registry over `host` (the built-in runtimes when `None`) with a
+/// real control server on the daemon socket the session hooks fall back to.
+#[cfg(unix)]
+struct HookRig {
+    registry: SessionRegistry,
+    state: DaemonState,
+    notifications: crate::notifications::NotificationService,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl HookRig {
+    async fn start(
+        dir: &std::path::Path,
+        host: Option<crate::agent::host::RuntimeHost>,
+        shell_command: ShellCommand,
+    ) -> Self {
+        // The in-process worker launcher gives sessions `test-daemon.sock` below
+        // the worker runtime root as their daemon socket.
+        let runtime_root = crate::test_support::thread_scoped_dir("pw-hook-");
+        let socket = runtime_root.join("test-daemon.sock");
+        let config = SessionRegistryConfig {
+            shell_command,
+            stop_grace: Duration::from_millis(50),
+            worker_runtime_root: Some(runtime_root),
+            ..SessionRegistryConfig::default()
+        };
+        let registry = match host {
+            Some(host) => SessionRegistry::new_with_runtimes(config, host),
+            None => SessionRegistry::new(config),
+        };
+        let notifications =
+            crate::notifications::NotificationService::open(&dir.join("notifications"))
+                .expect("notification service opens");
+        let state = DaemonState::new(
+            HealthInfo::new("test"),
+            registry.clone(),
+            Arc::new(crate::governance::HostGovernanceService::open_test()),
+            crate::test_support::overlay_registry(),
+        )
+        .with_notifications(notifications.clone());
+        let server = crate::api::ControlServer::bind_with_state(&socket, state.clone())
+            .await
+            .expect("control server binds");
+        let (shutdown, stop) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            server
+                .serve(async move {
+                    let _ = stop.await;
+                })
+                .await;
+        });
+        Self {
+            registry,
+            state,
+            notifications,
+            shutdown: Some(shutdown),
+            server,
+        }
+    }
+
+    /// Dispatches one public request and returns its response.
+    async fn request(&self, method: &str, params: serde_json::Value) -> Response {
+        let request = Request::new("hook-rig", method, params).expect("valid request");
+        let line = serde_json::to_string(&request).expect("request serializes");
+        let crate::api::Dispatch::Reply(reply) = dispatch_line(&line, &self.state, None).await
+        else {
+            panic!("{method} returns a one-shot reply");
+        };
+        serde_json::from_str(&reply).expect("response deserializes")
+    }
+
+    /// Stops the server and the session.
+    async fn finish(mut self, id: &SessionId) {
+        let _ = self.registry.stop(id).await;
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let _ = self.server.await;
+    }
+}
+
+/// Waits for the adapter script of a session to finish.
+#[cfg(unix)]
+async fn wait_for_adapters(done: &std::path::Path) {
+    wait_until("the adapter script to finish", || async {
+        done.exists().then_some(())
+    })
+    .await;
+    // Each adapter answers only after the worker or daemon handled its report,
+    // so state is settled once the script is done. A rejection test proves
+    // nothing if the adapters could not run, so the interpreter must exist.
+    let python = fs::read_to_string(format!("{}.python", done.display())).unwrap_or_default();
+    assert!(
+        !python.trim().is_empty(),
+        "the adapters need python3 on PATH"
+    );
+}
+
+/// Asserts that the worker journaled the adapters' identity and subagent and
+/// that the daemon imports that snapshot.
+///
+/// The daemon's own `active_agent` projection is not observed: procwatch
+/// releases a claim that no foreground process backs within a tick, so it is
+/// transient. The worker journal is written before the adapter is answered,
+/// and applying the snapshot returns once the daemon has committed it.
+#[cfg(unix)]
+async fn assert_worker_state_imported(registry: &SessionRegistry, id: &SessionId) {
+    let (worker, _identity) = live_worker_and_identity(registry, id).await;
+    let snapshot = worker.inspect().await.expect("inspect worker");
+    assert!(snapshot.active_identity.is_some(), "identity journaled");
+    assert_eq!(snapshot.subagents.len(), 1, "subagent journaled");
+    let outcome = wait_until("the daemon to settle the worker snapshot", || async {
+        match Box::pin(registry.apply_worker_metadata_snapshot(id, &snapshot)).await {
+            WorkerMetadataApplyOutcome::Retryable(_) => None,
+            settled => Some(settled),
+        }
+    })
+    .await;
+    assert_eq!(
+        outcome,
+        WorkerMetadataApplyOutcome::Applied,
+        "the daemon imports the admitted claims"
+    );
+}
+
+/// The public notification request a hook of `provider` sends for `session`.
+#[cfg(unix)]
+fn hook_notification(provider: &str, session: &SessionId) -> serde_json::Value {
+    serde_json::json!({
+        "source": {
+            "provider": provider,
+            "provider_event": "Stop",
+            "host_local_source_id": format!("hook:{provider}:Stop:e1"),
+        },
+        "kind": "error", "severity": "error", "title": "Agent error",
+        "body": "The agent reported an error.", "metadata": {}, "session_id": session,
+        "agent_kind": provider, "source_id": format!("hook:{provider}:Stop:e1"),
+    })
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_runtime_without_a_hook_schema_rejects_every_adapter_report_on_both_sockets() {
+    let dir = temp_dir("hook-schema-negative");
+    let (script, done) = adapter_script(&dir, false);
+    let host = crate::agent::host::fixture::pi_shaped_host(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    );
+    let rig = HookRig::start(&dir, Some(host), hermetic_shell()).await;
+    let created = rig
+        .registry
+        .create(SessionNewParams {
+            agent: "pi".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    let launch_reference = created.native_session_id.clone();
+    wait_for_adapters(&done).await;
+
+    let info = rig.registry.inspect(&created.id).await.expect("inspect");
+    assert_eq!(info.active_agent, None, "no adapter report set an identity");
+    assert_eq!(info.native_session_id, launch_reference);
+    assert!(
+        rig.registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(&created.id)
+            .is_some_and(|entry| entry.last_agent_report.is_none()),
+        "the public fallback recorded nothing"
+    );
+    assert!(info.subagents.is_empty());
+    let (worker, _identity) = live_worker_and_identity(&rig.registry, &created.id).await;
+    let snapshot = worker.inspect().await.expect("inspect worker");
+    assert!(snapshot.active_identity.is_none());
+    assert!(snapshot.launch_identity.is_none());
+    assert!(snapshot.subagents.is_empty());
+
+    let report_agent = serde_json::json!({
+        "session_id": created.id, "source": "pohunek:codex", "agent": "codex", "seq": "1",
+    });
+    let response = rig
+        .request(method::SESSION_REPORT_AGENT, report_agent)
+        .await;
+    assert_eq!(response.into_result().expect("reply")["recorded"], false);
+    let release = serde_json::json!({
+        "session_id": created.id, "source": "pohunek:codex", "agent": "codex", "seq": "2",
+    });
+    let response = rig.request(method::SESSION_RELEASE_AGENT, release).await;
+    assert_eq!(response.into_result().expect("reply")["released"], false);
+    let notification = rig
+        .request(
+            method::NOTIFICATION_CREATE,
+            hook_notification("codex", &created.id),
+        )
+        .await;
+    assert_eq!(
+        notification.into_result().expect_err("refused").code,
+        "hook_not_admitted"
+    );
+    let listed = rig
+        .notifications
+        .list(protocol::NotificationListParams::default())
+        .expect("list notifications");
+    assert!(
+        listed.notifications.is_empty(),
+        "no notification was created"
+    );
+
+    rig.finish(&created.id).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_runtime_with_a_hook_schema_accepts_the_adapter_reports_on_both_sockets() {
+    let dir = temp_dir("hook-schema-positive");
+    let (script, done) = adapter_script(&dir, false);
+    let host = crate::agent::host::fixture::pi_shaped_hooked_host(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    );
+    let rig = HookRig::start(&dir, Some(host), hermetic_shell()).await;
+    let created = rig
+        .registry
+        .create(SessionNewParams {
+            agent: "pi".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    wait_for_adapters(&done).await;
+
+    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
+    let notification = rig
+        .request(
+            method::NOTIFICATION_CREATE,
+            hook_notification("codex", &created.id),
+        )
+        .await;
+    notification
+        .into_result()
+        .expect("the hooked notification is created");
+
+    rig.finish(&created.id).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_public_socket_alone_accepts_adapter_reports_of_a_runtime_with_a_hook_schema() {
+    let dir = temp_dir("hook-schema-public");
+    let (script, done) = adapter_script(&dir, true);
+    let host = crate::agent::host::fixture::pi_shaped_hooked_host(
+        &script,
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    );
+    let rig = HookRig::start(&dir, Some(host), hermetic_shell()).await;
+    let created = rig
+        .registry
+        .create(SessionNewParams {
+            agent: "pi".to_owned(),
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    wait_for_adapters(&done).await;
+
+    let source = rig
+        .registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(&created.id)
+        .and_then(|entry| entry.last_agent_report.as_ref().map(|r| r.source.clone()));
+    assert!(
+        source.is_some_and(|source| source.starts_with("pohunek:")),
+        "the public socket recorded an adapter report"
+    );
+    let (worker, _identity) = live_worker_and_identity(&rig.registry, &created.id).await;
+    let snapshot = worker.inspect().await.expect("inspect worker");
+    assert!(
+        snapshot.active_identity.is_none(),
+        "the worker was not used"
+    );
+
+    rig.finish(&created.id).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_shell_session_accepts_the_adapter_reports_of_the_agents_it_hosts() {
+    let dir = temp_dir("hook-schema-shell");
+    let (script, done) = adapter_script(&dir, false);
+    let command = ShellCommand::new("/bin/sh", [script.to_str().expect("utf-8 path")]);
+    let rig = HookRig::start(&dir, None, command).await;
+    let created = rig
+        .registry
+        .create(SessionNewParams {
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+    wait_for_adapters(&done).await;
+
+    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
+    for provider in ["codex", "claude"] {
+        let response = rig
+            .request(
+                method::NOTIFICATION_CREATE,
+                hook_notification(provider, &created.id),
+            )
+            .await;
+        let result = response.into_result();
+        assert!(result.is_ok(), "{provider}: {result:?}");
+    }
+
+    rig.finish(&created.id).await;
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn the_identity_schema_admits_hermes_reports_and_refuses_unlisted_sessions() {
+    let dir = temp_dir("hook-schema-hermes");
+    let rig = HookRig::start(&dir, None, hermetic_shell()).await;
+    let created = rig
+        .registry
+        .create(SessionNewParams {
+            cwd: Some(dir.clone()),
+            ..params()
+        })
+        .await
+        .expect("create session");
+
+    let hermes = serde_json::json!({
+        "session_id": created.id, "source": "pohunek:hermes", "agent": "hermes", "seq": "1",
+    });
+    let response = rig.request(method::SESSION_REPORT_AGENT, hermes).await;
+    assert_eq!(response.into_result().expect("reply")["recorded"], true);
+    let notification = rig
+        .request(
+            method::NOTIFICATION_CREATE,
+            hook_notification("hermes", &created.id),
+        )
+        .await;
+    notification
+        .into_result()
+        .expect("the hooked notification is created");
+
+    rig.finish(&created.id).await;
 }

@@ -899,3 +899,127 @@ fn a_recovered_safe_text_runtime_keeps_its_input_safety_when_its_package_fails_v
     ));
     assert!(!open.to_standalone_rules().is_restricted());
 }
+
+/// The fixture descriptor of runtime `acme` with an `[integration]` table.
+fn integration_descriptor(integration: &str) -> String {
+    format!(
+        "{}\n[integration]\n{integration}\n",
+        descriptor("acme.agent", "1.0.0", "acme")
+    )
+}
+
+/// The rejection installing `descriptor` as an archive reports.
+fn install_rejection(descriptor: &str) -> Option<PackageRejection> {
+    let built = build(descriptor, "x", identity("acme.agent", "1.0.0"));
+    super::package::definition_from_archive(&entries(descriptor, "x"), &built.digest).err()
+}
+
+#[test]
+fn a_package_with_a_supported_handler_and_hook_schema_serves_its_schema() {
+    let plugins = Plugins::new();
+    let built = build(
+        &integration_descriptor(
+            "handler = \"claude-hook-v1\"\nhook_schema = \"identity-subagent-v1\"",
+        ),
+        "x",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &built, true, true);
+
+    let definition = plugins
+        .host()
+        .resolve_id(&runtime("acme"))
+        .expect("the package runtime is served");
+
+    assert_eq!(
+        definition.hook_schema().map(|schema| schema.id),
+        Some("identity-subagent-v1")
+    );
+}
+
+#[test]
+fn installing_a_package_with_an_unknown_or_mismatched_schema_is_refused() {
+    for (integration, field) in [
+        (
+            "handler = \"claude-hook-v1\"\nhook_schema = \"identity-v9\"",
+            "integration.hook_schema",
+        ),
+        (
+            "handler = \"claude-hook-v1\"\nhook_schema = \"identity-v1\"",
+            "integration.hook_schema",
+        ),
+        (
+            "handler = \"acme-hook-v1\"\nhook_schema = \"identity-v1\"",
+            "integration.handler",
+        ),
+    ] {
+        match install_rejection(&integration_descriptor(integration)) {
+            Some(PackageRejection::Descriptor(super::DefinitionError::Field {
+                field: refused,
+                ..
+            })) => assert_eq!(refused, field, "{integration}"),
+            other => panic!("expected a refused descriptor for {integration}, got {other:?}"),
+        }
+    }
+    assert!(install_rejection(&descriptor("acme.agent", "1.0.0", "acme")).is_none());
+}
+
+/// A descriptor in the format before `[integration] hook_schema` existed.
+fn pre_schema_descriptor(handler: Option<&str>) -> String {
+    let base = descriptor("acme.agent", "1.0.0", "acme");
+    handler.map_or(base.clone(), |handler| {
+        format!("{base}\n[integration]\nhandler = \"{handler}\"\n")
+    })
+}
+
+#[test]
+fn a_pre_schema_descriptor_resolves_its_schema_from_its_handler_only() {
+    for (handler, schema) in [
+        (Some("codex-hook-v1"), Some("identity-subagent-v1")),
+        (Some("claude-hook-v1"), Some("identity-subagent-v1")),
+        (Some("hermes-hook-v1"), Some("identity-v1")),
+        (Some("acme-hook-v1"), None),
+        (None, None),
+    ] {
+        let plugins = Plugins::new();
+        let built = build(
+            &pre_schema_descriptor(handler),
+            "x",
+            identity("acme.agent", "1.0.0"),
+        );
+        install(&plugins.registry(), &built, true, true);
+        let host = plugins.host();
+        let pin = pin_of(&built, "acme");
+
+        assert_eq!(
+            host.resolve_pinned(&RuntimeRef::from_wire("acme"), &pin)
+                .is_err(),
+            handler.is_some(),
+            "a handler without a schema is not a current definition: {handler:?}"
+        );
+        assert_eq!(
+            host.legacy_hook_schema(&pin).map(|schema| schema.id),
+            schema,
+            "{handler:?}"
+        );
+    }
+}
+
+#[test]
+fn the_legacy_schema_lookup_ignores_unpinned_and_builtin_pins_and_foreign_identities() {
+    let plugins = Plugins::new();
+    let built = build(
+        &pre_schema_descriptor(Some("codex-hook-v1")),
+        "x",
+        identity("acme.agent", "1.0.0"),
+    );
+    install(&plugins.registry(), &built, true, true);
+    let host = plugins.host();
+
+    assert!(host.legacy_hook_schema(&LaunchPin::Unpinned).is_none());
+    let other = Built {
+        identity: identity("other.agent", "1.0.0"),
+        ..built
+    };
+    assert!(host.legacy_hook_schema(&pin_of(&other, "acme")).is_none());
+}

@@ -1,5 +1,19 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, hook schemas)
+
+- The hook schema is enforced on the public socket (`session.report_agent`,
+  `session.release_agent`, `session.report_native_id`, hook-claim
+  `notification.create`) as well as on the worker socket.
+
+- Runtime descriptors name a core-owned hook schema next to the integration
+  handler (`[integration] handler`, `hook_schema`). The runtime packages guide
+  and the public API document the closed schema set (`identity-v1`,
+  `identity-subagent-v1`), the install-time refusals, and that a runtime without
+  an integration accepts no hook report. The sessions concept describes how the
+  schema reaches the worker, is journaled, and validates daemon imports,
+  including the re-projection of a worker that journals no schema.
+
 ## Unreleased (2026-10-05, Pi detection and probe PATH)
 
 - The Pi package guide describes detection as one bottom-anchored editor frame

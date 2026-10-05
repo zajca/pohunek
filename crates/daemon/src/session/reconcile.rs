@@ -12,7 +12,7 @@ use pohunek_platform::{
 };
 use pohunek_worker_protocol::{ControlCode, InspectSnapshot, ReleasedIdentityClaim, RuntimePhase};
 use protocol::{
-    AgentActivity, RuntimeId, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
+    AgentActivity, RuntimeInventoryEntry, RuntimeInventoryEvent, RuntimeInventoryStatus,
     RuntimeRef, SessionRuntimeIdentity, SubagentInfo, SubagentLifecycle, SubagentRevision,
     SubagentStateEvent, UnconfirmedProcess,
 };
@@ -43,7 +43,7 @@ use crate::runtime::lifecycle::{
 use crate::session::target::open_detector_output;
 use crate::store::{ResumeBinding, SessionWriteOutcome};
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-05
 
 /// Discovery reason of a worker socket that does not answer.
 const UNREACHABLE_SOCKET: &str = "worker_unavailable";
@@ -132,6 +132,10 @@ pub(super) struct JournalEvidence {
     outcome: Option<JournalOutcome>,
     #[serde(default)]
     subagents: Vec<pohunek_worker_protocol::SubagentSnapshot>,
+    /// Hook schema id the worker journaled; absent for a worker that predates
+    /// schema delivery.
+    #[serde(default)]
+    hook_schema: Option<String>,
 }
 
 impl JournalEvidence {
@@ -186,6 +190,28 @@ impl WorkerIdentityProjection {
 }
 
 impl SessionRegistry {
+    /// The hook schema id `snapshot` is validated with: the one the worker
+    /// journaled, else the schema of the session's pinned runtime.
+    ///
+    /// A worker that predates schema delivery journals none, so the daemon
+    /// re-projects its claims with the schema its runtime resolves to now.
+    fn effective_hook_schema_id(
+        &self,
+        record: &SessionRecord,
+        snapshot: &InspectSnapshot,
+    ) -> Option<String> {
+        if snapshot.hook_schema.is_some() {
+            return snapshot.hook_schema.clone();
+        }
+        let pin = record
+            .recovery
+            .as_ref()
+            .map(|binding| binding.launch_binding.clone())
+            .unwrap_or_default();
+        self.session_hook_schema(&record.info.agent_base, &pin)
+            .map(|schema| schema.id.to_owned())
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one locked projection keeps identity and subagent snapshot updates atomic"
@@ -215,6 +241,11 @@ impl SessionRegistry {
             }
             record
         };
+        let projected = InspectSnapshot {
+            hook_schema: self.effective_hook_schema_id(&memory_base, snapshot),
+            ..snapshot.clone()
+        };
+        let snapshot = &projected;
         let mut outcome = WorkerMetadataApplyOutcome::Applied;
         let mut identities_accepted = true;
         if snapshot.launch_identity.is_some() || snapshot.active_identity.is_some() {
@@ -1902,7 +1933,19 @@ impl SessionRegistry {
                 runtime.runtime_generation
             });
         record.transaction = None;
-        match map_worker_subagents(&evidence.subagents) {
+        let schema = reported_hook_schema(evidence.hook_schema.as_deref())
+            .map(|reported| {
+                reported.or_else(|| {
+                    let pin = record
+                        .recovery
+                        .as_ref()
+                        .map(|binding| binding.launch_binding.clone())
+                        .unwrap_or_default();
+                    self.session_hook_schema(&record.info.agent_base, &pin)
+                })
+            })
+            .and_then(|schema| map_worker_subagents(&evidence.subagents, schema));
+        match schema {
             Ok(subagents) => record.info.subagents = subagents,
             Err(reason) => {
                 tracing::warn!(session_id = %record.session_id, reason, "rejected terminal worker subagent journal");
@@ -2086,6 +2129,11 @@ impl SessionRegistry {
     /// live: `terminal` with its exit when it exited, `lost` otherwise, with
     /// its final subagent snapshot.
     async fn import_ended_worker(&self, mut record: SessionRecord, snapshot: &InspectSnapshot) {
+        let projected = InspectSnapshot {
+            hook_schema: self.effective_hook_schema_id(&record, snapshot),
+            ..snapshot.clone()
+        };
+        let snapshot = &projected;
         let state = if snapshot.phase == RuntimePhase::Exited {
             RuntimeState::Terminal
         } else {
@@ -2319,6 +2367,10 @@ impl SessionRegistry {
         mut record: SessionRecord,
         snapshot: pohunek_worker_protocol::InspectSnapshot,
     ) {
+        let snapshot = InspectSnapshot {
+            hook_schema: self.effective_hook_schema_id(&record, &snapshot),
+            ..snapshot
+        };
         let native_recovery = record.transaction.as_ref().and_then(|transaction| {
             (transaction.kind == crate::store::TransactionKind::Recover)
                 .then(|| transaction.previous_worker_instance_id.clone())
@@ -2883,20 +2935,35 @@ fn uncommitted_create(record: &SessionRecord) -> bool {
     })
 }
 
-fn import_worker_subagents(snapshot: &InspectSnapshot) -> Result<Vec<SubagentInfo>, &'static str> {
-    map_worker_subagents(&snapshot.subagents)
+/// Resolves the hook schema id a worker reported, if any, against the compiled
+/// registry.
+fn reported_hook_schema(
+    id: Option<&str>,
+) -> Result<Option<&'static pohunek_worker_protocol::HookSchema>, &'static str> {
+    id.map(|id| pohunek_worker_protocol::hook_schema(id).ok_or("hook_schema_unknown"))
+        .transpose()
 }
 
+fn import_worker_subagents(snapshot: &InspectSnapshot) -> Result<Vec<SubagentInfo>, &'static str> {
+    map_worker_subagents(
+        &snapshot.subagents,
+        reported_hook_schema(snapshot.hook_schema.as_deref())?,
+    )
+}
+
+/// Maps journaled subagents to public state, admitting only the providers the
+/// session's hook schema lets report subagents.
 fn map_worker_subagents(
     subagents: &[pohunek_worker_protocol::SubagentSnapshot],
+    schema: Option<&pohunek_worker_protocol::HookSchema>,
 ) -> Result<Vec<SubagentInfo>, &'static str> {
     let mut mapped = subagents
         .iter()
         .map(|subagent| {
-            let provider = match subagent.provider.as_str() {
-                RuntimeId::CODEX | RuntimeId::CLAUDE => RuntimeRef::from_wire(&subagent.provider),
-                _ => return Err("subagent_provider_invalid"),
-            };
+            if !schema.is_some_and(|schema| schema.admits_subagent_provider(&subagent.provider)) {
+                return Err("subagent_provider_invalid");
+            }
+            let provider = RuntimeRef::from_wire(&subagent.provider);
             let lifecycle = match subagent.phase {
                 pohunek_worker_protocol::SubagentPhase::Running => SubagentLifecycle::Running,
                 pohunek_worker_protocol::SubagentPhase::Completed => SubagentLifecycle::Completed,
@@ -3250,7 +3317,12 @@ fn apply_worker_identities(
         let Some(release) = snapshot.active_identity_release.clone() else {
             return Ok(WorkerIdentityProjection::unreported());
         };
-        if parse_provider(&release.provider).is_none() {
+        let schema = reported_hook_schema(snapshot.hook_schema.as_deref())?;
+        let launch_runtime = super::agent_kind_label(&record.info.agent_base);
+        if !schema.is_some_and(|schema| {
+            schema.allows(pohunek_worker_protocol::HookAction::IdentityRelease)
+                && schema.admits_identity_provider(&release.provider, Some(launch_runtime))
+        }) {
             return Err("active_identity_release_provider_invalid");
         }
         let release_matches = record.info.active_agent.as_deref() == Some(&release.provider)
@@ -3267,16 +3339,25 @@ fn apply_worker_identities(
     if !identity_claim_expiry_is_valid(&identity.expires_at) {
         return Err("active_identity_expired_or_overlong");
     }
-    let Some(agent_base) = parse_provider(&identity.provider) else {
-        return Err("active_identity_provider_invalid");
-    };
+    let schema = reported_hook_schema(snapshot.hook_schema.as_deref())?
+        .filter(|schema| schema.allows(pohunek_worker_protocol::HookAction::IdentityReport))
+        .filter(|schema| {
+            schema.admits_identity_provider(
+                &identity.provider,
+                Some(super::agent_kind_label(&record.info.agent_base)),
+            )
+        })
+        .ok_or("active_identity_provider_invalid")?;
+    let agent_base = RuntimeRef::from_wire(&identity.provider);
     let (active_id, active_path) = match (
         identity.reference_kind.as_deref(),
         identity.native_reference.as_deref(),
     ) {
         (Some(kind), Some(reference)) => {
-            let kind =
-                parse_reference_kind(kind).ok_or("active_identity_reference_kind_invalid")?;
+            let kind = Some(kind)
+                .filter(|kind| schema.admits_reference_kind(kind))
+                .and_then(parse_reference_kind)
+                .ok_or("active_identity_reference_kind_invalid")?;
             let native = validate_native_reference(kind, reference)
                 .ok_or("active_identity_reference_invalid")?;
             match kind {
@@ -3351,15 +3432,6 @@ fn apply_worker_launch_identity(
         }
     }
     Ok(())
-}
-
-fn parse_provider(provider: &str) -> Option<protocol::RuntimeRef> {
-    match provider {
-        RuntimeId::SHELL | RuntimeId::CODEX | RuntimeId::CLAUDE | RuntimeId::HERMES => {
-            Some(RuntimeRef::from_wire(provider))
-        }
-        _ => None,
-    }
 }
 
 fn parse_reference_kind(kind: &str) -> Option<SessionRefKind> {
@@ -4600,6 +4672,7 @@ while os.getppid() == parent:
                 success: true,
             }),
             subagents: Vec::new(),
+            hook_schema: None,
         };
         let mut mismatch = exact.clone();
         mismatch.worker_id = "different-worker".to_owned();
@@ -5255,6 +5328,7 @@ while os.getppid() == parent:
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+                hook_schema: Some("identity-subagent-v1".to_owned()),
             })
             .await
             .expect("initialize worker");
@@ -5647,6 +5721,7 @@ while os.getppid() == parent:
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+                hook_schema: Some("identity-v1".to_owned()),
             })
             .await
             .expect("initialize Hermes worker");
@@ -6476,6 +6551,7 @@ while os.getppid() == parent:
                 stop_policy: StopPolicy::new(100).expect("stop policy"),
                 hook_protocol_version: Version::new(1).expect("version"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+                hook_schema: Some("identity-subagent-v1".to_owned()),
             })
             .await
             .expect("initialize worker");
@@ -7156,6 +7232,7 @@ while os.getppid() == parent:
             }),
             active_identity_release: None,
             subagents: Vec::new(),
+            hook_schema: Some("identity-subagent-v1".to_owned()),
         }
     }
 
@@ -7192,6 +7269,237 @@ while os.getppid() == parent:
         assert_eq!(mapped[0].provider, RuntimeRef::claude());
         assert_eq!(mapped[0].activity, Some(AgentActivity::Working));
         assert_eq!(mapped[0].revision, protocol::SubagentRevision::new(7));
+    }
+
+    /// Installs a package whose descriptor names only `[integration] handler`
+    /// and returns the pin a session of it froze plus a registry serving it.
+    fn pre_schema_package_registry() -> (SessionRegistry, crate::agent::host::LaunchPin) {
+        use package::registry::{
+            InstallRequest, PackageSource as InstallSource, Registry as PackageRegistry,
+        };
+        use package::{build_archive, read_archive, ArchiveEntry, Limits};
+        use protocol::{
+            BindingProvenance, LaunchBinding, PackageId, PackageIdentity, PackageVersion,
+        };
+
+        let descriptor = r#"schema = 1
+id = "acme.agent"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "acme"
+name = "Acme"
+program = "acme-agent"
+args = []
+detect_manifest = "detect.toml"
+
+[input]
+bracketed_paste = false
+submit_delay_ms = 0
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["--session", "{reference}"]
+
+[fork]
+supported = false
+
+[native_reference]
+strategy = "hook"
+
+[integration]
+handler = "codex-hook-v1"
+"#;
+        let entries = [
+            ArchiveEntry {
+                path: "runtime.toml".to_owned(),
+                contents: descriptor.as_bytes().to_vec(),
+                executable: false,
+            },
+            ArchiveEntry {
+                path: "detect.toml".to_owned(),
+                contents: b"[[rules]]\nid = \"idle\"\nstate = \"idle\"\npriority = 100\nregion = \"whole_recent\"\nany = [{ contains = \"ready\" }]\n".to_vec(),
+                executable: false,
+            },
+        ];
+        let bytes = build_archive(&entries, &Limits::DEFAULT).expect("archive");
+        let digest = read_archive(&bytes, &Limits::DEFAULT)
+            .expect("reads")
+            .digest()
+            .clone();
+        let identity = PackageIdentity {
+            id: PackageId::parse("acme.agent").expect("package id"),
+            version: PackageVersion::parse("1.0.0").expect("version"),
+        };
+        let root = crate::test_support::thread_scoped_dir("pre-schema-");
+        let plugins = root.join("plugins");
+        PackageRegistry::open_at(&plugins, Limits::DEFAULT)
+            .expect("registry")
+            .install(&InstallRequest {
+                archive: &bytes,
+                expected: &digest,
+                identity: identity.clone(),
+                source: InstallSource::ExplicitDigest,
+                enabled: true,
+                select: true,
+                installed_at_unix_seconds: 1_700_000_000,
+            })
+            .expect("install");
+        let host = crate::agent::host::RuntimeHost::with_packages(
+            crate::agent::host::BuiltinSource::new("/bin/sh"),
+            crate::agent::host::PackageSource::new(
+                crate::agent::host::PackageStore::open(&plugins).expect("store"),
+            ),
+        )
+        .expect("host");
+        let registry = SessionRegistry::new_with_runtimes(
+            SessionRegistryConfig {
+                shell_command: hermetic_shell(),
+                ..SessionRegistryConfig::default()
+            },
+            host,
+        );
+        let pin = crate::agent::host::LaunchPin::Pinned(Box::new(LaunchBinding {
+            runtime_id: protocol::RuntimeId::parse("acme").expect("runtime id"),
+            provenance: BindingProvenance::Package {
+                package: identity,
+                package_digest: digest,
+            },
+        }));
+        (registry, pin)
+    }
+
+    #[tokio::test]
+    async fn a_schemaless_worker_of_a_pre_schema_package_pin_is_reprojected_not_refused() {
+        let (registry, pin) = pre_schema_package_registry();
+        let mut record = identity_record();
+        record.info.agent = "acme".to_owned();
+        record.info.agent_base = RuntimeRef::from_wire("acme");
+        record
+            .recovery
+            .as_mut()
+            .expect("recovery binding")
+            .launch_binding = pin;
+        let mut snapshot = identity_snapshot("launch-native");
+        snapshot.hook_schema = None;
+        snapshot.launch_identity = None;
+        snapshot.subagents.push(SubagentSnapshot {
+            id: "child".to_owned(),
+            parent_id: None,
+            provider: "codex".to_owned(),
+            agent_type: None,
+            phase: SubagentPhase::Running,
+            revision: 1,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: None,
+        });
+
+        let projected = InspectSnapshot {
+            hook_schema: registry.effective_hook_schema_id(&record, &snapshot),
+            ..snapshot
+        };
+
+        assert_eq!(
+            projected.hook_schema.as_deref(),
+            Some("identity-subagent-v1")
+        );
+        import_worker_identities(&mut record, &projected)
+            .expect("the nested active identity is admitted");
+        assert_eq!(record.info.active_agent.as_deref(), Some("claude"));
+        assert_eq!(
+            import_worker_subagents(&projected)
+                .expect("the subagent is admitted")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn worker_claims_are_validated_with_the_snapshot_hook_schema() {
+        let mut record = identity_record();
+        let mut snapshot = identity_snapshot("launch-native");
+
+        snapshot.hook_schema = Some("identity-v1".to_owned());
+        import_worker_identities(&mut record, &snapshot)
+            .expect("the identity schema admits the nested provider");
+
+        snapshot.hook_schema = None;
+        assert_eq!(
+            import_worker_identities(&mut identity_record(), &snapshot)
+                .expect_err("a runtime without a schema admits no claim"),
+            "active_identity_provider_invalid"
+        );
+
+        snapshot.hook_schema = Some("identity-v9".to_owned());
+        assert_eq!(
+            import_worker_identities(&mut identity_record(), &snapshot)
+                .expect_err("an unknown schema id is refused"),
+            "hook_schema_unknown"
+        );
+    }
+
+    #[test]
+    fn reported_native_reference_kind_must_be_in_the_schema_shape() {
+        let mut snapshot = identity_snapshot("launch-native");
+        snapshot
+            .active_identity
+            .as_mut()
+            .expect("active identity")
+            .reference_kind = Some("uri".to_owned());
+
+        assert_eq!(
+            import_worker_identities(&mut identity_record(), &snapshot)
+                .expect_err("a kind outside the schema shape"),
+            "active_identity_reference_kind_invalid"
+        );
+    }
+
+    #[test]
+    fn subagent_providers_follow_the_snapshot_hook_schema() {
+        let subagent = |provider: &str| SubagentSnapshot {
+            id: "child".to_owned(),
+            parent_id: None,
+            provider: provider.to_owned(),
+            agent_type: None,
+            phase: SubagentPhase::Running,
+            revision: 1,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            finished_at_ms: None,
+        };
+        let mut snapshot = identity_snapshot("launch-native");
+        snapshot.subagents.push(subagent("codex"));
+
+        snapshot.hook_schema = Some("identity-v1".to_owned());
+        assert_eq!(
+            import_worker_subagents(&snapshot).expect_err("identity schema has no subagents"),
+            "subagent_provider_invalid"
+        );
+        snapshot.hook_schema = None;
+        assert_eq!(
+            import_worker_subagents(&snapshot).expect_err("no schema admits no subagents"),
+            "subagent_provider_invalid"
+        );
+        snapshot.hook_schema = Some("identity-subagent-v1".to_owned());
+        assert_eq!(
+            import_worker_subagents(&snapshot).expect("admitted").len(),
+            1
+        );
+
+        snapshot.subagents = vec![subagent("hermes")];
+        assert_eq!(
+            import_worker_subagents(&snapshot).expect_err("hermes reports no subagents"),
+            "subagent_provider_invalid"
+        );
+        snapshot.subagents.clear();
+        snapshot.hook_schema = None;
+        assert!(import_worker_subagents(&snapshot)
+            .expect("an empty collection needs no schema")
+            .is_empty());
     }
 
     /// A minimal legacy-manifest session snapshot, as `pohunek migration

@@ -34,3 +34,4 @@ strategy = "hook"
 
 [integration]
 handler = "hermes-hook-v1"
+hook_schema = "identity-v1"

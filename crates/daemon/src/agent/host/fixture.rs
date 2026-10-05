@@ -161,6 +161,31 @@ impl RuntimeSource for FixtureSource {
     }
 }
 
+/// [`pi_shaped_host`] with the fixture runtime declaring an integration, so
+/// its sessions admit hook reports.
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn pi_shaped_hooked_host(program: &Path, existence: &str) -> RuntimeHost {
+    let document = with_integration(&pi_shaped_document(program, existence));
+    let definition = RuntimeDefinition::from_toml(
+        &document,
+        |package| DefinitionOrigin::Package {
+            package,
+            digest: PackageDigest::parse(PACKAGE_DIGEST).expect("valid digest"),
+        },
+        |_name| Ok(Arc::new(generic_shell_manifest().clone())),
+    )
+    .expect("the hooked fixture document is valid");
+    let builtin = BuiltinSource::new("/bin/sh");
+    let fixture = FixtureSource(vec![definition]);
+    let registry =
+        RuntimeRegistry::from_sources(&[&builtin, &fixture]).expect("the fixture registry builds");
+    RuntimeHost::new(registry)
+}
+
 /// A host serving the built-in runtimes plus the Pi-shaped fixture.
 ///
 /// # Panics
@@ -217,10 +242,31 @@ pub(crate) fn install_pi_version(
     detect: &str,
     select: bool,
 ) -> PackageDigest {
+    let document = pi_shaped_document(program, PI_SHAPED_NO_CHECK);
+    install_document(plugins_dir, &document, version, detect, select)
+}
+
+/// Appends the integration of the hooked fixture variant: a handler and the
+/// hook schema its reports follow.
+fn with_integration(document: &str) -> String {
+    format!(
+        "{document}\n[integration]\nhandler = \"codex-hook-v1\"\nhook_schema = \"identity-subagent-v1\"\n"
+    )
+}
+
+/// Installs `document` (a Pi-shaped descriptor) as a package of
+/// `plugins_dir` and returns its archive digest.
+fn install_document(
+    plugins_dir: &Path,
+    document: &str,
+    version: &str,
+    detect: &str,
+    select: bool,
+) -> PackageDigest {
     use package::registry::{InstallRequest, PackageSource as InstallSource, Registry};
     use package::{build_archive, read_archive, ArchiveEntry, Limits};
 
-    let document = pi_shaped_document(program, PI_SHAPED_NO_CHECK)
+    let document = document
         .replace(
             "detect_manifest = \"any\"",
             "detect_manifest = \"detect.toml\"",
@@ -281,6 +327,35 @@ pub(crate) fn install_pi_package(
         PACKAGED_DETECT_MANIFEST,
         select,
     )
+}
+
+/// [`installed_pi_host`] for the fixture variant that declares an
+/// integration, so sessions of the package admit hook reports.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot be installed or loaded, which would be a
+/// defect of the fixture.
+pub(crate) fn installed_hooked_pi_host(
+    plugins_dir: &Path,
+    program: &Path,
+) -> (RuntimeHost, PackageDigest) {
+    use super::package::{PackageSource, PackageStore};
+
+    let document = with_integration(&pi_shaped_document(program, PI_SHAPED_NO_CHECK));
+    let digest = install_document(
+        plugins_dir,
+        &document,
+        "1.0.0",
+        PACKAGED_DETECT_MANIFEST,
+        true,
+    );
+    let host = RuntimeHost::with_packages(
+        BuiltinSource::new("/bin/sh"),
+        PackageSource::new(PackageStore::open(plugins_dir).expect("the store opens")),
+    )
+    .expect("the host builds");
+    (host, digest)
 }
 
 /// Installs the Pi-shaped fixture as an enabled, selected package into the

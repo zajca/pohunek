@@ -134,6 +134,7 @@ fn initialize(root: &Path, script: &str, public_protocol_version: u32) -> Initia
         stop_policy: StopPolicy::new(500).expect("stop policy"),
         hook_protocol_version: CURRENT_VERSION,
         public_protocol_version,
+        hook_schema: Some("identity-subagent-v1".to_owned()),
     }
 }
 

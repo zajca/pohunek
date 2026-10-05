@@ -11,7 +11,7 @@
 
 #![forbid(unsafe_code)]
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-05
 
 /// Maximum lifetime accepted for a worker-private identity claim.
 ///
@@ -23,6 +23,7 @@ mod codec;
 mod control;
 mod data;
 mod env;
+mod hook_schema;
 mod id;
 mod secret;
 mod token;
@@ -49,6 +50,11 @@ pub use env::{
     is_denylisted, validate_pattern, BaseEnv, EnvError, DEFAULT_ENVIRONMENT_ALLOWLIST,
     MAX_BASE_ENV_BYTES, MAX_BASE_ENV_ENTRIES, MAX_BASE_ENV_NAME_BYTES, MAX_BASE_ENV_VALUE_BYTES,
     SERVICE_MANAGER_DENYLIST,
+};
+#[doc(inline)]
+pub use hook_schema::{
+    admit_hook, hook_schema, hook_schema_for_handler, hook_schemas, is_known_hook_handler,
+    AncestryMatcher, HookAction, HookDenial, HookSchema, ReferenceKind, SubagentField,
 };
 #[doc(inline)]
 pub use id::{

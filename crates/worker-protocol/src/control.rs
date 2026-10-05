@@ -4,7 +4,7 @@
 //! connection. Unknown additive object fields are ignored by serde, while
 //! unknown operations fail deserialization and affect only that connection.
 
-// Rust guideline compliant 2026-09-24
+// Rust guideline compliant 2026-10-05
 
 use std::fmt::{Debug, Formatter};
 use std::path::PathBuf;
@@ -400,6 +400,13 @@ pub struct Initialize {
     /// protocol; this crate does not depend on the public `protocol` crate,
     /// so the daemon threads the value through as a plain integer.
     pub public_protocol_version: u32,
+    /// Id of the hook schema resolved from the session's pinned runtime.
+    ///
+    /// Absent for a runtime without an integration, in which case the worker
+    /// admits no hook report. A peer that predates the field ignores it and
+    /// keeps the validation it was built with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_schema: Option<String>,
 }
 
 impl Debug for Initialize {
@@ -419,6 +426,7 @@ impl Debug for Initialize {
             .field("stop_policy", &self.stop_policy)
             .field("hook_protocol_version", &self.hook_protocol_version)
             .field("public_protocol_version", &self.public_protocol_version)
+            .field("hook_schema", &self.hook_schema)
             .finish()
     }
 }
@@ -696,6 +704,11 @@ pub struct InspectSnapshot {
     /// Durable provider-managed subagent state.
     #[serde(default)]
     pub subagents: Vec<SubagentSnapshot>,
+    /// Hook schema id the worker validates reports with, journaled at
+    /// initialization. Absent for a worker that predates schema delivery or
+    /// whose runtime has no integration.
+    #[serde(default)]
+    pub hook_schema: Option<String>,
 }
 
 /// Defines one daemon-to-worker request.
@@ -1074,6 +1087,7 @@ mod tests {
             stop_policy: StopPolicy::new(5_000).expect("valid policy"),
             hook_protocol_version: CURRENT_VERSION,
             public_protocol_version: 1,
+            hook_schema: None,
         }
     }
 
@@ -1112,6 +1126,44 @@ mod tests {
                 required: true,
             })
         );
+    }
+
+    #[test]
+    fn initialize_hook_schema_is_additive_on_the_wire() {
+        let without = initialize("value");
+        let wire = serde_json::to_value(&without).expect("serialize");
+        assert!(wire.get("hook_schema").is_none());
+        let parsed: Initialize = serde_json::from_value(wire).expect("peer without the field");
+        assert_eq!(parsed.hook_schema, None);
+
+        let with = Initialize {
+            hook_schema: Some("identity-v1".to_owned()),
+            ..initialize("value")
+        };
+        let wire = serde_json::to_value(&with).expect("serialize");
+        assert_eq!(wire["hook_schema"], "identity-v1");
+        let parsed: Initialize = serde_json::from_value(wire).expect("round trip");
+        assert_eq!(parsed.hook_schema.as_deref(), Some("identity-v1"));
+    }
+
+    #[test]
+    fn inspect_snapshot_without_a_hook_schema_deserializes_as_unreported() {
+        let snapshot = serde_json::json!({
+            "session_id": "s-1",
+            "worker_id": "worker-1",
+            "runtime_id": null,
+            "phase": "uninitialized",
+            "worker_process": {"pid": 1, "start_identity": 2},
+            "child_process": null,
+            "dimensions": null,
+            "history_start_offset": 0,
+            "next_offset": 0,
+            "exit": null,
+            "launch_identity": null,
+            "active_identity": null,
+        });
+        let parsed: InspectSnapshot = serde_json::from_value(snapshot).expect("older worker");
+        assert_eq!(parsed.hook_schema, None);
     }
 
     #[test]

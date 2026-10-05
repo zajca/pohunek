@@ -772,6 +772,7 @@ impl SessionRegistry {
             .await
             .map_err(LaunchFailure::Cleaned)?;
 
+        let hook_schema = self.session_hook_schema(&agent_base, &snapshot.launch_binding);
         let started = match self
             .start_runtime(
                 &lifecycle,
@@ -779,6 +780,7 @@ impl SessionRegistry {
                 &id,
                 &agent,
                 agent_base.clone(),
+                hook_schema,
                 snapshot.native_ref_kind(),
                 command,
                 &transaction_id,
@@ -1002,6 +1004,7 @@ impl SessionRegistry {
         id: &SessionId,
         agent: &str,
         agent_base: RuntimeRef,
+        hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
@@ -1015,6 +1018,7 @@ impl SessionRegistry {
                 id,
                 agent,
                 agent_base,
+                hook_schema,
                 reference_kind,
                 command,
                 transaction_id,
@@ -1038,6 +1042,7 @@ impl SessionRegistry {
         id: &SessionId,
         agent: &str,
         agent_base: RuntimeRef,
+        hook_schema: Option<&'static pohunek_worker_protocol::HookSchema>,
         reference_kind: Option<SessionRefKind>,
         command: LaunchCommand,
         transaction_id: &str,
@@ -1096,6 +1101,7 @@ impl SessionRegistry {
                 hook_protocol_version: Version::new(1)
                     .expect("worker hook protocol version is nonzero"),
                 public_protocol_version: protocol::PROTOCOL_VERSION.get(),
+                hook_schema: hook_schema.map(|schema| schema.id.to_owned()),
             })
             .await
             .map_err(super::worker_error_to_protocol)?;

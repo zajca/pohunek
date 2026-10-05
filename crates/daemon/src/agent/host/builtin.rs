@@ -10,7 +10,8 @@ use std::time::Duration;
 use protocol::RuntimeId;
 
 use super::definition::{
-    DefinitionError, DefinitionOrigin, DefinitionParts, LaunchProgram, RuntimeDefinition,
+    DefinitionError, DefinitionOrigin, DefinitionParts, Integration, LaunchProgram,
+    RuntimeDefinition,
 };
 use super::registry::{RuntimeSource, SourceTrust};
 use crate::agent::InputRules;
@@ -25,6 +26,13 @@ const EMBEDDED_DESCRIPTORS: [&str; 3] = [
 
 /// Display name of the shell runtime.
 const SHELL_DISPLAY_NAME: &str = "Shell";
+
+/// Hook schema of the shell runtime.
+///
+/// A shell session hosts Codex and Claude in the foreground, so it admits
+/// their identity, notification, and subagent reports. The shell has no
+/// integration handler of its own.
+const SHELL_HOOK_SCHEMA: &str = "identity-subagent-v1";
 
 /// Supplies the shell, Codex, Claude and Hermes definitions.
 #[derive(Debug, Clone)]
@@ -74,7 +82,7 @@ impl BuiltinSource {
             prompt_arg: false,
             version_probe_parser: None,
             version_probe_policy: None,
-            integration_handler: None,
+            integration: Some(Integration::new(None, SHELL_HOOK_SCHEMA)?),
         })
     }
 }
