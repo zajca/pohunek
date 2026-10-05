@@ -92,6 +92,14 @@ Run steps 1–5 for each slice, bottom-up, then step 6 once for the stack.
    <slice-branch> --title "<title>" --body-file <file>` (remove the scratch
    file afterwards). Confirm the URL, then check the initial CI status (`gh pr
    checks <n>`). Report the PR number, URL, and CI state.
+
+   **Review trigger.** The automated review runs only for a PR that carries
+   the `ai:review` label, so add it right after opening (`gh pr edit <n>
+   --add-label ai:review`; create the label first with `gh label create
+   ai:review` if the repository does not have it yet) and verify it from
+   `gh pr view <n> --json labels`. Re-apply it after every push to the PR
+   when the reviewer removed it, and never assume a review is coming for an
+   unlabeled PR.
 6. **Update the milestone tracking.** Via the `github-workflow` skill, comment
    the ordered list of stack PR links on the milestone issue with the standard
    handoff content (branch/worktree, HEAD revision, scope covered, exact

@@ -106,8 +106,9 @@ slice:
 2. Commit per `pr-handoff`: explicit staging, `--no-gpg-sign`, concise
    imperative English message with the *why*, no trailers or footers.
 3. Push and open the PR stack per `pr-handoff` (evidence-built
-   descriptions, `Refs #N` / final `Closes #N`). Comment the stack links on
-   the issue.
+   descriptions, `Refs #N` / final `Closes #N`) and label every PR
+   `ai:review`, the only trigger of the automated review. Comment the stack
+   links on the issue.
 
 ## Phase 5 — the CI + review loop
 
@@ -116,15 +117,34 @@ body starts with `<!-- hermes-codex-review:<repo>#<pr>:<sha> -->`) lands per
 head commit, typically minutes after CI. **Both** must be checked for every
 head; checking only CI loses review rounds.
 
-1. **Watch.** Start one Monitor per push that polls until (a) every check of
+1. **Label first.** The automated review runs only for a PR labeled
+   `ai:review`. Before arming the watch verify the label with `gh pr view
+   <n> --json labels` and add it when missing or removed (`gh pr edit <n>
+   --add-label ai:review`; `gh label create ai:review` first if the label
+   does not exist). Do this for every PR of the stack and after every push.
+2. **Watch.** Start one Monitor per push that polls until (a) every check of
    the PR is non-pending and (b) a review whose `commit_id` equals the pushed
    head exists (`gh api repos/<repo>/pulls/<n>/reviews`); emit each failed
    check and the review id as events. Also read human reviews, inline review
    comments, and PR conversation comments since the last round. Re-arm on
-   expiry. If no review arrives within two hours after CI finished, record
-   that on the issue and keep waiting with long wakeups — never merge
-   without the review of the final head.
-2. **CI failure triage** — before changing anything:
+   expiry. The reviewer normally answers within about 10 minutes of the push.
+   If no review of the head exists 15 minutes after the push (or after CI
+   finished, whichever is later), the reviewer is stuck: first check the
+   `ai:review` label (a missing label is the usual cause), then re-fire the
+   `labeled` event by removing and re-adding `ai:review` (no new head, so no
+   CI churn), and only if that also gets no review within 15 minutes
+   re-trigger it by pushing a new head — rebase onto the current `main` when it moved,
+   otherwise `git commit --amend --no-edit --date=now` and
+   `--force-with-lease` with the old head SHA — and record the retrigger on
+   the issue. In a stack, keep the ancestry: rebase onto `main` only the
+   bottom slice, rebase any other slice onto its rewritten parent, amend in
+   place, and restack every slice above the rewritten one with the
+   pr-handoff restack procedure (`git rebase --update-refs`, gates on each
+   rebased slice, push all with `--force-with-lease`) before restarting the
+   review watches. Repeat at most three times; after that record the blocker on
+   the issue and keep waiting with long wakeups. Never merge without the
+   review of the final head.
+3. **CI failure triage** — before changing anything:
    - Fetch logs only after the whole run completed (`gh run view <run> --job
      <job> --log-failed`; earlier it returns nothing).
    - Classify with evidence: regression from this diff; product race or
@@ -138,7 +158,7 @@ head; checking only CI loses review rounds.
      contract (e.g. the product hook's timeout), never weakened below it.
      A pre-existing flake outside the diff gets its own issue (with root
      cause); rerun the failed job only after that.
-3. **Review findings** — for each finding of the round:
+4. **Review findings** — for each finding of the round:
    - Verify it against the code. A false positive is answered, not coded
      around: record the evidence (`path:line`, spec/manual reference, a
      reproduction) in the round's issue comment.
@@ -150,12 +170,12 @@ head; checking only CI loses review rounds.
    - A finding whose proper fix is a separate design decision outside the
      issue's DoD becomes a follow-up issue with the evidence; one inside
      the DoD is fixed here, never deferred.
-4. **Close the round.** Gates (Phase 4.1), commit, push to the owning slice
+5. **Close the round.** Gates (Phase 4.1), commit, push to the owning slice
    branch (restack upper slices with `git rebase --update-refs` and
    `--force-with-lease` per `pr-handoff`), then post one issue comment per
    round: review id, each finding → fixed (`path:line`, test) / rejected
    (evidence) / follow-up (#issue), CI triage results, gate results, new
-   head SHA. Go back to step 1.
+   head SHA. Go back to step 1 (re-check the `ai:review` label).
 
 **Merge criteria** for a PR (all must hold on its current head):
 every required check green; the automated review of that exact head exists
@@ -206,7 +226,10 @@ address its findings in a new fix PR off the updated `main` (same loop).
 - Run tests through `bash`, with every `POHUNEK_*` variable unset — zsh does
   not word-split `$VAR`, so a zsh `env $U …` silently removes nothing:
   `bash -c 'for v in $(compgen -e | grep "^POHUNEK_"); do unset "$v"; done; cargo nextest run …'`.
-  Never print variable values.
+  Never print variable values. Never call `env` or `printenv` in any form
+  (including `env | grep -c` to verify): the user's `Bash(env)` ask rule
+  fires on any occurrence and blocks the autonomous run on a confirmation;
+  verify with `compgen -e | grep -c '^POHUNEK_'`.
 - The relay PostgreSQL tests need `POHUNEK_RELAY_TEST_DATABASE_URL`; without
   it about 140 relay tests fail locally by design — they are CI-only
   evidence, not regressions.
