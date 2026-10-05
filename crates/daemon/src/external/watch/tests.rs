@@ -134,11 +134,11 @@ struct FakeSink {
 }
 
 impl TranscriptSink for FakeSink {
-    async fn upsert(&self, agent_base: RuntimeRef, path: PathBuf) -> io::Result<bool> {
+    async fn upsert(&self, owner: TranscriptRoot, path: PathBuf) -> io::Result<bool> {
         self.agents
             .lock()
             .expect("agents")
-            .push((agent_base, path.clone()));
+            .push((owner.agent_base, path.clone()));
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(active, Ordering::SeqCst);
         self.upserts.lock().expect("upserts").push(path);
@@ -272,6 +272,7 @@ fn claude_root(path: &Path) -> TranscriptRoot {
     TranscriptRoot {
         agent_base: RuntimeRef::claude(),
         path: path.to_path_buf(),
+        private: false,
     }
 }
 
@@ -516,6 +517,7 @@ async fn a_hint_under_a_symlinked_nested_root_is_owned_by_the_nested_provider() 
         TranscriptRoot {
             agent_base: RuntimeRef::codex(),
             path: link,
+            private: false,
         },
     ];
     start(
@@ -729,10 +731,12 @@ async fn nested_roots_own_their_own_transcripts_and_duplicates_are_dropped() {
         TranscriptRoot {
             agent_base: RuntimeRef::codex(),
             path: inner.clone(),
+            private: false,
         },
         TranscriptRoot {
             agent_base: RuntimeRef::codex(),
             path: outer.clone(),
+            private: false,
         },
     ];
     start(
@@ -1052,4 +1056,57 @@ async fn a_tree_hint_for_a_directory_over_a_transcript_drops_the_candidate() {
         .send(Ok(vec![WatchEvent::TreeChanged(path.clone())]));
 
     harness.wait_until_gone(&path).await;
+}
+
+/// A provider whose roots the test replaces between passes.
+#[derive(Default)]
+struct SwitchRoots(Mutex<Vec<TranscriptRoot>>);
+
+impl super::RootProvider for Arc<SwitchRoots> {
+    fn roots(&self) -> impl Future<Output = Vec<TranscriptRoot>> + Send {
+        std::future::ready(self.0.lock().expect("roots").clone())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pending_parse_below_a_root_that_left_is_dropped_by_the_next_pass() {
+    let root = pohunek_test_support::tempdir().expect("transcript root");
+    let (input, receiver) = mpsc::unbounded_channel();
+    let backend = FakeBackend {
+        input: receiver,
+        shared: Arc::new(FakeShared::default()),
+    };
+    let sink = Arc::new(FakeSink::default());
+    let provider = Arc::new(SwitchRoots::default());
+    *provider.0.lock().expect("roots") = vec![claude_root(root.path())];
+    start(
+        backend,
+        Arc::clone(&provider),
+        Arc::clone(&sink),
+        CancellationToken::new(),
+        None,
+    )
+    .await;
+    let path = root.path().join("p/s.jsonl");
+
+    // The hint arrives just before the next pass is due, so its debounce
+    // outlasts the pass that removes the root.
+    let before_pass = TRANSCRIPT_WRITE_DEBOUNCE / 2;
+    advance(
+        RESCAN_MIN_INTERVAL
+            .checked_sub(before_pass)
+            .expect("the debounce is shorter than the pass spacing"),
+    )
+    .await;
+    provider.0.lock().expect("roots").clear();
+    let _ = input.send(Ok(vec![WatchEvent::Changed(path), WatchEvent::Rescan]));
+    settle().await;
+    // The pass runs first, then the debounce comes due.
+    advance(before_pass).await;
+    advance(TRANSCRIPT_WRITE_DEBOUNCE).await;
+
+    assert!(
+        sink.upserts.lock().expect("upserts").is_empty(),
+        "a path below a removed root is not parsed"
+    );
 }

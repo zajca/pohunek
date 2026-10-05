@@ -4817,10 +4817,8 @@ fn external_session_info(
     let now = timestamp_now();
     let agent = agent_kind_label(&agent_base).to_owned();
     let (native_session_id, native_session_path) = candidate.map_or((None, None), |candidate| {
-        (
-            candidate.native_session_id,
-            Some(candidate.native_session_path),
-        )
+        let path = candidate.publishable_path().map(ToOwned::to_owned);
+        (candidate.native_session_id, path)
     });
     let association = association.unwrap_or_default();
     SessionInfo {

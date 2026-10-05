@@ -50,6 +50,18 @@ before acting. Typed errors name the variable that supplied a refused value,
 never the value. A profile value that is not an absolute path is refused, not
 expanded against the daemon's home directory.
 
+## Config-home identifier in `host.inspect`
+
+`host.inspect` reports an opaque `config_home_id` per runtime entry so clients
+can group profiles that share an account. It is a truncated HMAC of the
+resolved config directory under the host's owner-private `profile-revision.key`
+secret, with a domain of its own. It is therefore safe for a relay or remote
+caller to read: it holds no path and no environment value, a guessed path
+cannot be confirmed without the key, and it differs between hosts. Never
+replace it with an unkeyed digest, and never copy the directory or the key
+record into prompts, snapshots or logs. The transcript observer logs a profile
+by name and an error code only, never the directory its environment names.
+
 ## Provider tokens
 
 The daemon and the CLI never hold Linear or GitHub provider tokens. Provider

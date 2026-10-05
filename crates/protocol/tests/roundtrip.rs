@@ -3689,6 +3689,7 @@ fn agent_runtime_json_shape_roundtrips_with_path() {
         path: Some("/usr/local/bin/codex".to_owned()),
         version: None,
         supported: None,
+        config_home_id: None,
     };
 
     let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
@@ -3715,6 +3716,7 @@ fn agent_runtime_omits_absent_path() {
         path: None,
         version: None,
         supported: None,
+        config_home_id: None,
     };
 
     let value = serde_json::to_value(&runtime).expect("serialize agent runtime");
@@ -3747,6 +3749,7 @@ fn agent_runtime_roundtrips_optional_version_support() {
         path: Some("/usr/local/bin/hermes".to_owned()),
         version: Some("0.20.0".to_owned()),
         supported: Some(true),
+        config_home_id: None,
     };
 
     assert_eq!(
@@ -3771,6 +3774,39 @@ fn agent_runtime_roundtrips_optional_version_support() {
     assert_eq!(legacy.version, None);
     assert_eq!(legacy.supported, None);
     assert_eq!(legacy.agent_base, None);
+    assert_eq!(legacy.config_home_id, None);
+}
+
+#[test]
+fn agent_runtime_config_home_id_is_additive_and_roundtrips() {
+    let runtime = AgentRuntime {
+        agent: "work".to_owned(),
+        agent_base: Some(RuntimeRef::claude()),
+        available: true,
+        path: None,
+        version: None,
+        supported: None,
+        config_home_id: Some("0123456789abcdef0123456789abcdef".to_owned()),
+    };
+
+    assert_eq!(
+        serde_json::to_value(&runtime).expect("serialize agent runtime"),
+        json!({
+            "agent": "work",
+            "agent_base": "claude",
+            "available": true,
+            "config_home_id": "0123456789abcdef0123456789abcdef"
+        })
+    );
+    assert_eq!(line_roundtrip(&runtime), runtime);
+
+    // An entry from a daemon without the field reads as no identifier.
+    let older: AgentRuntime = serde_json::from_value(json!({
+        "agent": "work",
+        "available": true
+    }))
+    .expect("an entry without config_home_id remains readable");
+    assert_eq!(older.config_home_id, None);
 }
 
 #[test]
@@ -3792,6 +3828,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 path: None,
                 version: None,
                 supported: None,
+                config_home_id: None,
             },
             AgentRuntime {
                 agent: "codex".to_owned(),
@@ -3800,6 +3837,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 path: Some("/usr/local/bin/codex".to_owned()),
                 version: None,
                 supported: None,
+                config_home_id: None,
             },
             AgentRuntime {
                 agent: "claude".to_owned(),
@@ -3808,6 +3846,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 path: None,
                 version: None,
                 supported: None,
+                config_home_id: None,
             },
             AgentRuntime {
                 agent: "hermes".to_owned(),
@@ -3816,6 +3855,7 @@ fn host_capabilities_json_shape_roundtrips() {
                 path: Some("/usr/local/bin/hermes".to_owned()),
                 version: Some("0.20.0".to_owned()),
                 supported: Some(true),
+                config_home_id: None,
             },
         ],
         git_available: true,

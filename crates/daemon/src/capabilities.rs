@@ -19,12 +19,14 @@ use protocol::{
     AgentRuntime, HostCapabilities, ProtocolError, RuntimeId, RuntimeRef, PROTOCOL_VERSION,
 };
 use serde::Deserialize;
+use tracing::debug;
 
 use crate::agent::host::{
     LaunchProgram, RuntimeDefinition, RuntimeRegistry, VersionProbePolicy, RESERVED_RUNTIME_IDS,
     SEMVER_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
+use crate::integration::Home;
 use crate::runtime::environment::effective_variable;
 use pohunek_worker_protocol::BaseEnv;
 
@@ -171,11 +173,15 @@ fn host_capabilities_for(
                 path: None,
                 version: None,
                 supported: None,
+                config_home_id: None,
             },
             LaunchProgram::Fixed(program) => {
                 probe_definition(agent, agent_base, definition, program, base_env, &[])
             }
         });
+        if let Some(entry) = runtimes.last_mut() {
+            entry.config_home_id = config_home_id(profiles, definition, base_env, &[]);
+        }
         supported_agents.push(agent.to_owned());
     }
 
@@ -205,6 +211,13 @@ fn host_capabilities_for(
                 &[],
             ),
         };
+        let mut runtime = runtime;
+        if launchable.is_ok() {
+            if let Some(profile) = agent.profile.as_ref() {
+                runtime.config_home_id =
+                    config_home_id(profiles, &agent.definition, base_env, &profile.env);
+            }
+        }
         runtimes.push(runtime);
         supported_agents.push(agent.name);
     }
@@ -233,6 +246,37 @@ fn host_capabilities_for(
     }
 }
 
+/// The opaque identifier of the config home a launch of `definition` with
+/// the profile environment `profile_env` gives its agent.
+///
+/// The home is resolved by the same rule the integration lifecycle and the
+/// transcript observer use ([`Home::resolve`]). `None` when the runtime
+/// declares no config home, the home cannot be resolved, or the host cannot
+/// key the identifier: an inventory never fails on it.
+fn config_home_id(
+    profiles: &ProfileRegistry,
+    definition: &RuntimeDefinition,
+    base_env: &BaseEnv,
+    profile_env: &[(String, String)],
+) -> Option<String> {
+    let declared = definition.config_home()?;
+    let home = match Home::resolve(declared, base_env, profile_env) {
+        Ok(home) => home,
+        Err(error) => {
+            debug!(
+                runtime = definition.runtime_id().as_str(),
+                code = %error.code,
+                "config home does not resolve; reporting no config_home_id"
+            );
+            return None;
+        }
+    };
+    profiles
+        .revision_keys()
+        .config_home_id(&home.identity())
+        .ok()
+}
+
 /// The entry of an agent name that has nothing to launch right now.
 fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
     AgentRuntime {
@@ -242,6 +286,7 @@ fn unavailable_runtime(agent: &str, agent_base: RuntimeRef) -> AgentRuntime {
         path: None,
         version: None,
         supported: None,
+        config_home_id: None,
     }
 }
 
@@ -283,6 +328,7 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
             path: Some(path.display().to_string()),
             version: None,
             supported: None,
+            config_home_id: None,
         },
         None => AgentRuntime {
             agent: agent.to_owned(),
@@ -291,6 +337,7 @@ fn probe_runtime(agent: &str, agent_base: RuntimeRef, binary: &str) -> AgentRunt
             path: None,
             version: None,
             supported: None,
+            config_home_id: None,
         },
     }
 }
@@ -316,6 +363,7 @@ fn probe_versioned_runtime(
             path: None,
             version: None,
             supported: None,
+            config_home_id: None,
         };
     };
 
@@ -331,6 +379,7 @@ fn probe_versioned_runtime(
         path: Some(program.as_path().display().to_string()),
         version,
         supported: Some(supported),
+        config_home_id: None,
     }
 }
 
@@ -1921,3 +1970,6 @@ strategy = "none"
         parse(r#"{ parser = "hermes-v1" }"#).expect("the compiled probe parses");
     }
 }
+
+#[cfg(test)]
+mod config_home_tests;

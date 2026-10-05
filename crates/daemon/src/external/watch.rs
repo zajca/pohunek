@@ -8,11 +8,13 @@
 //! fast path is only logged, because the next pass repairs it; a stream that
 //! silently stopped delivering costs latency, never correctness.
 //!
-//! Every pass re-resolves the configured roots (aliases, retargeted symlinks,
-//! nested roots), registers them with the backend, and scans them. Registration
-//! failures and incomplete scans are published as degraded states.
+//! Every pass asks the [`RootProvider`] for the roots to watch, so a root that
+//! appears or disappears between passes is followed without a restart, then
+//! re-resolves them (aliases, retargeted symlinks, nested roots), registers them
+//! with the backend, and scans them. Registration failures and incomplete scans
+//! are published as degraded states.
 
-// Rust guideline compliant 2026-09-29
+// Rust guideline compliant 2026-10-05
 
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
@@ -22,7 +24,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use protocol::RuntimeRef;
 use tokio::sync::{watch, Notify};
 use tokio::task::{Id, JoinError, JoinSet};
 use tokio::time::{sleep_until, Instant};
@@ -30,7 +31,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::time::DelayQueue;
 use tracing::{debug, info, warn};
 
-use super::{canonical_roots, is_jsonl_path, owning_root, platform, TranscriptRoot};
+use super::{
+    canonical_roots, is_jsonl_path, owning_root, platform, TranscriptRoot, PRIVATE_PATH_LABEL,
+};
 
 /// Debounce applied to the first hint for a transcript path before it is parsed.
 ///
@@ -258,7 +261,7 @@ pub(super) trait TranscriptSink: Send + Sync + 'static {
     /// Parses one transcript and returns whether the index changed.
     fn upsert(
         &self,
-        agent_base: RuntimeRef,
+        owner: TranscriptRoot,
         path: PathBuf,
     ) -> impl Future<Output = io::Result<bool>> + Send;
 
@@ -268,6 +271,22 @@ pub(super) trait TranscriptSink: Send + Sync + 'static {
 
     /// Signals that the index changed and observers should re-sweep.
     fn index_changed(&self);
+}
+
+/// Where the roots of each reconciliation pass come from.
+pub(super) trait RootProvider: Send + Sync + 'static {
+    /// The roots to watch in the pass that is starting.
+    ///
+    /// Called at the start of every pass, so an implementation may do bounded
+    /// filesystem work and must answer from the current state of the host.
+    fn roots(&self) -> impl Future<Output = Vec<TranscriptRoot>> + Send;
+}
+
+/// A fixed set of roots.
+impl RootProvider for Vec<TranscriptRoot> {
+    fn roots(&self) -> impl Future<Output = Vec<TranscriptRoot>> + Send {
+        std::future::ready(self.clone())
+    }
 }
 
 /// Handle to a running transcript watcher.
@@ -365,16 +384,19 @@ enum Phase {
 
 #[derive(Debug)]
 struct PathState {
-    agent_base: RuntimeRef,
+    /// The root that owns the path in the current pass; the parse is made and
+    /// classified for it.
+    owner: TranscriptRoot,
     phase: Phase,
 }
 
 type ParseDone = io::Result<bool>;
 
-struct Watcher<B, S> {
+struct Watcher<B, S, P> {
     /// Absent only while an offloaded operation owns it.
     backend: Option<B>,
-    configured: Vec<TranscriptRoot>,
+    /// Supplies the roots of every pass.
+    provider: P,
     /// The configured roots that survived alias resolution in the last pass.
     roots: Vec<TranscriptRoot>,
     /// The canonical directory of each entry of `roots`.
@@ -402,9 +424,9 @@ struct Watcher<B, S> {
 /// `open_error` carries the failure of opening the backend, in which case the
 /// runner starts unavailable and keeps trying to restart it while the passes
 /// continue.
-pub(super) async fn start<B, S>(
+pub(super) async fn start<B, S, P>(
     backend: B,
-    roots: Vec<TranscriptRoot>,
+    roots: P,
     sink: Arc<S>,
     shutdown: CancellationToken,
     open_error: Option<io::Error>,
@@ -412,13 +434,14 @@ pub(super) async fn start<B, S>(
 where
     B: WatchBackend,
     S: TranscriptSink,
+    P: RootProvider,
 {
     let (state_tx, state_rx) = watch::channel(TranscriptWatch::Active);
     let nudge = Arc::new(Notify::new());
     let now = Instant::now();
     let mut watcher = Watcher {
         backend: Some(backend),
-        configured: roots,
+        provider: roots,
         roots: Vec::new(),
         canonical: Vec::new(),
         sink,
@@ -451,7 +474,7 @@ where
     }
 }
 
-impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
+impl<B: WatchBackend, S: TranscriptSink, P: RootProvider> Watcher<B, S, P> {
     async fn run(mut self) {
         loop {
             tokio::select! {
@@ -556,9 +579,7 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
         if !is_jsonl_path(&path) {
             return;
         }
-        let Some(agent_base) =
-            owning_root(&self.roots, &self.canonical, &path).map(|root| root.agent_base.clone())
-        else {
+        let Some(owner) = owning_root(&self.roots, &self.canonical, &path).cloned() else {
             return;
         };
         if let Some(state) = self.paths.get_mut(&path) {
@@ -575,7 +596,7 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
         self.paths.insert(
             path,
             PathState {
-                agent_base,
+                owner,
                 phase: Phase::Queued,
             },
         );
@@ -590,11 +611,11 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
                 continue;
             };
             state.phase = Phase::InFlight { dirty: false };
-            let agent_base = state.agent_base.clone();
+            let owner = state.owner.clone();
             let sink = Arc::clone(&self.sink);
             let task_path = path.clone();
             let handle = self.parses.spawn(async move {
-                let result = sink.upsert(agent_base, task_path.clone()).await;
+                let result = sink.upsert(owner, task_path.clone()).await;
                 (task_path, result)
             });
             self.parse_paths.insert(handle.id(), path);
@@ -623,7 +644,7 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
             Some(Ok(false)) | None => {}
             Some(Err(error)) => {
                 debug!(
-                    path = %path.display(),
+                    path = %self.log_path(&path),
                     error = %error,
                     "failed to parse external transcript candidate"
                 );
@@ -637,6 +658,31 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
             state.phase = Phase::Queued;
             self.paths.insert(path, state);
         }
+    }
+
+    /// Forgets every pending parse whose path lies below no current root, so a
+    /// root that left the configuration is never parsed again, and hands the
+    /// others to the root that owns them now. Timer and queue entries that
+    /// outlive their path are skipped when they come due.
+    fn drop_unowned_paths(&mut self) {
+        let (roots, canonical) = (&self.roots, &self.canonical);
+        self.paths
+            .retain(|path, state| match owning_root(roots, canonical, path) {
+                Some(owner) => {
+                    state.owner.clone_from(owner);
+                    true
+                }
+                None => false,
+            });
+    }
+
+    /// The path as a log line may show it, by the provenance of its pending
+    /// parse; a path no parse is pending for is shown by label.
+    fn log_path(&self, path: &Path) -> String {
+        self.paths.get(path).map_or_else(
+            || PRIVATE_PATH_LABEL.to_owned(),
+            |state| state.owner.log_path_of(path),
+        )
     }
 
     /// Brings the next pass forward, spaced from the previous one.
@@ -697,15 +743,17 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
         }
     }
 
-    /// One reconciliation pass: resolve the configured roots, register them with
-    /// the backend when it is available, then scan them.
+    /// One reconciliation pass: ask the provider for the roots, resolve them,
+    /// register them with the backend when it is available, then scan them.
     ///
     /// Registration happens before the scan so a transcript created in between
     /// is seen by at least one of them. Nothing resolved here outlives the pass.
     async fn reconcile(&mut self) {
         self.drain_parses().await;
-        self.roots = resolve_roots(&self.configured);
+        let configured = self.provider.roots().await;
+        self.roots = resolve_roots(&configured);
         self.canonical = canonical_roots(&self.roots);
+        self.drop_unowned_paths();
         self.health = vec![
             RootHealth {
                 registration: Registration::Complete,
@@ -755,7 +803,7 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
             } => warn!(
                 name: "external.transcript_watcher.register.partial",
                 agent = ?root.agent_base,
-                root = %root.path.display(),
+                root = %root.log_path(),
                 failed_dirs = *failed_dirs,
                 error = %first_error,
                 "cannot watch {{failed_dirs}} directories below transcript root {{root}}: {{error}}; check directory permissions and the OS file watch limit"
@@ -763,7 +811,7 @@ impl<B: WatchBackend, S: TranscriptSink> Watcher<B, S> {
             RootRegistration::Failed(error) => warn!(
                 name: "external.transcript_watcher.register.failed",
                 agent = ?root.agent_base,
-                root = %root.path.display(),
+                root = %root.log_path(),
                 error = %error,
                 "cannot watch transcript root {{root}}: {{error}}; check directory permissions and the OS file watch limit"
             ),
@@ -849,7 +897,7 @@ pub(super) fn resolve_roots(configured: &[TranscriptRoot]) -> Vec<TranscriptRoot
         });
         if duplicate {
             debug!(
-                root = %root.path.display(),
+                root = %root.log_path(),
                 "ignoring transcript root that duplicates another configured root"
             );
         } else {

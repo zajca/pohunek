@@ -438,15 +438,15 @@ async fn external_observer_reports_fake_agent_and_pidfd_removes_it() {
 
     let mut process_env = ProcessEnv::lock();
     let env = TestEnv::new().expect("create the test environment");
-    let claude_config = env.config_home().join("claude");
-    let codex_home = env.config_home().join("codex");
+    // The observer watches the config homes a launch gives its agents: with
+    // the default allowlist that is `$HOME/.claude` and `$HOME/.codex`.
+    let claude_config = env.home().join(".claude");
+    let codex_home = env.home().join(".codex");
     let claude_projects = claude_config.join("projects").join("work");
     let codex_sessions = codex_home.join("sessions");
     fs::create_dir_all(&claude_projects).expect("create claude projects");
     fs::create_dir_all(&codex_sessions).expect("create codex sessions");
-    process_env
-        .set("CLAUDE_CONFIG_DIR", &claude_config)
-        .set("CODEX_HOME", &codex_home);
+    process_env.set("HOME", env.home());
 
     let work_dir = env.cwd().to_path_buf();
     let bin_dir = env.data_home().join("bin");

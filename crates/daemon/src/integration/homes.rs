@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use pohunek_worker_protocol::BaseEnv;
 use protocol::{ErrorClass, IntegrationHome, IntegrationSelector, ProtocolError, RuntimeRef};
@@ -93,11 +93,45 @@ impl ConfigHomes {
             .config_home
             .as_ref()
             .ok_or_else(|| undeclared(&resolved.runtime))?;
-        let dir = resolve_declared(declared, &|name| {
-            effective_variable(&self.base, profile_env, name)
-        })?;
-        let canonical = std::fs::canonicalize(&dir).ok();
-        Ok(Home { dir, canonical })
+        Home::resolve(declared, &self.base, profile_env)
+    }
+
+    /// The config homes the host's agents launch with, for runtimes that
+    /// declare one.
+    ///
+    /// One entry per runtime's own home (in runtime id order) and per host
+    /// profile (in name order), each resolved exactly as a launch resolves it. A home that cannot be
+    /// resolved is reported with the profile that names it, never skipped
+    /// silently, so a caller decides what a missing home means. Entries are not
+    /// deduplicated: profiles that share a directory each appear.
+    pub(crate) fn launch_homes(&self) -> Vec<LaunchHome> {
+        let mut homes = Vec::new();
+        let registry = self.host().registry();
+        let mut definitions: Vec<_> = registry.definitions().collect();
+        definitions.sort_by(|a, b| a.runtime_id().as_str().cmp(b.runtime_id().as_str()));
+        for definition in definitions {
+            let Some(declared) = definition.config_home() else {
+                continue;
+            };
+            homes.push(LaunchHome {
+                runtime: RuntimeRef::from(definition.runtime_id().clone()),
+                profile: None,
+                home: Home::resolve(declared, &self.base, &[]),
+            });
+        }
+        for agent in self.profiles.enumerate() {
+            let (Some(declared), Some(profile)) =
+                (agent.definition.config_home(), agent.profile.as_ref())
+            else {
+                continue;
+            };
+            homes.push(LaunchHome {
+                runtime: RuntimeRef::from(agent.base.clone()),
+                profile: Some(agent.name.clone()),
+                home: Home::resolve(declared, &self.base, &profile.env),
+            });
+        }
+        homes
     }
 
     /// The runtimes `agent` selects: that runtime, else every runtime that
@@ -251,19 +285,54 @@ impl ConfigHomes {
     }
 }
 
+/// One config home a launch gives an agent, and whom it belongs to.
+#[derive(Debug)]
+pub(crate) struct LaunchHome {
+    /// The runtime the agent runs.
+    pub(crate) runtime: RuntimeRef,
+    /// The host profile that launches the agent; `None` for the runtime's own
+    /// home.
+    pub(crate) profile: Option<String>,
+    /// The resolved home, or why the launch environment names none.
+    pub(crate) home: Result<Home, ProtocolError>,
+}
+
 /// A config directory and its canonical identity.
 #[derive(Debug, Clone)]
-pub(super) struct Home {
+pub(crate) struct Home {
     /// The directory the agent is told, as the environment names it.
-    pub(super) dir: PathBuf,
+    pub(crate) dir: PathBuf,
     /// The directory with every symlink resolved, when it exists.
     canonical: Option<PathBuf>,
 }
 
 impl Home {
-    /// What two homes must share to be the same directory.
-    fn identity(&self) -> &Path {
-        self.canonical.as_deref().unwrap_or(&self.dir)
+    /// The home `declared` names in the environment a launch builds: the
+    /// profile's variables over the daemon's base environment.
+    ///
+    /// # Errors
+    ///
+    /// `missing_env` when neither the declared variable nor `HOME` is set and a
+    /// configuration error when the chosen value is not an absolute UTF-8 path.
+    pub(crate) fn resolve(
+        declared: &ConfigHome,
+        base: &BaseEnv,
+        profile_env: &[(String, String)],
+    ) -> Result<Self, ProtocolError> {
+        let dir = resolve_declared(declared, &|name| {
+            effective_variable(base, profile_env, name)
+        })?;
+        let canonical = std::fs::canonicalize(&dir).ok();
+        Ok(Self { dir, canonical })
+    }
+
+    /// What two homes must share to be the same directory: the canonical
+    /// directory when it exists, else the path with its `.` components
+    /// removed; an unresolved path with a `..` is never folded into another.
+    pub(crate) fn identity(&self) -> PathBuf {
+        self.canonical
+            .clone()
+            .unwrap_or_else(|| lexically_normalized(&self.dir))
     }
 
     /// Whether the directory itself is a symlink, which no handler writes
@@ -323,7 +392,7 @@ fn merge_shared(targets: Vec<Target>) -> Vec<Target> {
             .home
             .as_ref()
             .ok()
-            .map(|home| (target.resolved.handler.id(), home.identity().to_path_buf()));
+            .map(|home| (target.resolved.handler.id(), home.identity()));
         let Some(key) = key else {
             merged.push(target);
             continue;
@@ -348,6 +417,17 @@ fn merge_shared(targets: Vec<Target>) -> Vec<Target> {
         }
     }
     merged
+}
+
+/// `path` with every `.` component removed, without touching the filesystem.
+///
+/// A `..` stays: after a missing or symlinked component it does not name the
+/// lexical parent, so folding it could give two different directories one
+/// identity.
+fn lexically_normalized(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|component| *component != Component::CurDir)
+        .collect()
 }
 
 /// `agent_config_home_undeclared`: the runtime's descriptor has no
