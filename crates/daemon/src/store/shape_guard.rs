@@ -36,6 +36,7 @@ use super::{
 const SHAPE_SNAPSHOTS: &[(u32, &str)] = &[
     (2, include_str!("fixtures/shape/schema-2.txt")),
     (3, include_str!("fixtures/shape/schema-3.txt")),
+    (4, include_str!("fixtures/shape/schema-4.txt")),
 ];
 
 /// A profile revision: 64 lowercase hex digits.
@@ -209,7 +210,8 @@ fn session_json() -> Value {
             "runtime_id": "r-1",
             "pid": 4242,
             "pid_start_identity": 7,
-            "sequence": 9
+            "sequence": 9,
+            "worker_sequence": 11
         },
         "runtime": {
             "state": "live",
@@ -312,6 +314,7 @@ fn assert_every_field_is_reviewed(
         pid: _,
         pid_start_identity: _,
         sequence: _,
+        worker_sequence: _,
     }) = native_identity_ordering
     {}
     let RuntimeRecord {

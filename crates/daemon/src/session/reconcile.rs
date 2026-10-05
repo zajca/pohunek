@@ -38,6 +38,7 @@ use super::{
     SessionRegistry, SessionRuntime, SessionState, StateSource, UnconfirmedCleanup, Worker,
     WorkerError, WorkerMetadataApplyOutcome, WORKER_CONNECT_RETRY,
 };
+use crate::agent::NativeReferenceProvenance;
 use crate::procwatch::ProcessInspector;
 use crate::runtime::lifecycle::{
     journal_schema_supported, observation_live, require_supported_journal_schema, Lifecycle,
@@ -191,6 +192,19 @@ pub(super) struct JournalEvidence {
     /// Latest accepted release of an active identity.
     #[serde(default)]
     active_identity_release: Option<JournalReleasedIdentity>,
+    /// Latest native reference the verified launch process reported.
+    #[serde(default)]
+    native_reference_claim: Option<JournalNativeReference>,
+}
+
+/// The latest native reference a worker journaled for its launch process.
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct JournalNativeReference {
+    provider: String,
+    process: JournalProcess,
+    sequence: u64,
+    reference_kind: String,
+    native_reference: String,
 }
 
 /// The recovery facts of a worker's accepted launch identity.
@@ -306,6 +320,16 @@ impl JournalEvidence {
             }),
             None => None,
         };
+        let native_reference = match &self.native_reference_claim {
+            Some(claim) => Some(pohunek_worker_protocol::ReportedNativeReference {
+                provider: claim.provider.clone(),
+                process: wire(&claim.process)?,
+                sequence: claim.sequence,
+                reference_kind: claim.reference_kind.clone(),
+                native_reference: claim.native_reference.clone(),
+            }),
+            None => None,
+        };
         let phase = match self.phase {
             JournalPhase::Bootstrap => RuntimePhase::Uninitialized,
             JournalPhase::Starting => RuntimePhase::Starting,
@@ -337,6 +361,7 @@ impl JournalEvidence {
             launch_identity,
             active_identity,
             active_identity_release,
+            native_reference,
             subagents: self.subagents.clone(),
             hook_schema: self.hook_schema.clone(),
         })
@@ -410,6 +435,15 @@ impl SessionRegistry {
         id: &SessionId,
         snapshot: &InspectSnapshot,
     ) -> WorkerMetadataApplyOutcome {
+        #[cfg(test)]
+        if snapshot.phase == RuntimePhase::Running
+            && self
+                .inner
+                .worker_imports_blocked
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return WorkerMetadataApplyOutcome::Retryable(super::WorkerMetadataRetryCause::Commit);
+        }
         let expected_worker_id = snapshot.worker_id.to_string();
         let expected_worker_instance_id = snapshot
             .worker_instance_id
@@ -484,6 +518,9 @@ impl SessionRegistry {
         }
         let mut candidate = memory_base.clone();
         preserve_durable_worker_metadata(&durable_base, &mut candidate);
+        // The journaled reference is trusted by its generation binding, not by
+        // the liveness of the processes the identity claims name.
+        import_native_reference(&mut candidate, snapshot);
         let projection = if identities_accepted {
             match import_worker_identities(&mut candidate, snapshot) {
                 Ok(projection) => projection,
@@ -606,6 +643,14 @@ impl SessionRegistry {
                 );
                 let _ = self.inner.events.send(event);
             }
+        } else if identities_accepted
+            && (snapshot.launch_identity.is_some() || snapshot.active_identity.is_some())
+        {
+            // A concurrent applier may have committed the same identity to
+            // memory and still be writing its resume binding. Persisting here
+            // queues behind that write on the persist lock, so an applied
+            // snapshot always leaves the binding matching the record.
+            self.persist_resume_binding(id).await;
         }
         if identities_accepted {
             WorkerMetadataApplyOutcome::Applied
@@ -980,7 +1025,7 @@ impl SessionRegistry {
         lifecycle: Option<&Lifecycle<'_>>,
         retry: bool,
     ) -> bool {
-        let record = match self.roll_back_undelivered_create(record).await {
+        let mut record = match self.roll_back_undelivered_create(record).await {
             UndeliveredCreate::Proceed(record) => record,
             UndeliveredCreate::Pending(record) => {
                 self.hold_pending_unpersisted(record, retry).await;
@@ -1203,6 +1248,11 @@ impl SessionRegistry {
                 }
             }
         }
+        // A worker that cannot be reached may still have journaled a switch the
+        // daemon never imported; its own generation's journal is the evidence.
+        if let Some(snapshot) = journal.and_then(|journal| journal.snapshot().ok()) {
+            import_native_reference(&mut record, &snapshot);
+        }
         let worker = journal.map(JournalEvidence::worker);
         match classify_unreachable(
             &job,
@@ -1367,6 +1417,10 @@ impl SessionRegistry {
     /// ([`Self::stop_cleanup_confirmed`]) decides nothing; the session stays
     /// pending and the re-check sweeps again. Returns whether the session
     /// needs that re-check.
+    ///
+    /// The caller imported the generation journal's native reference into
+    /// `record` before classifying the unreachable worker, so the stop keeps
+    /// a switch the dead worker journaled.
     async fn settle_ended_stop(
         &self,
         mut record: SessionRecord,
@@ -2395,6 +2449,24 @@ impl SessionRegistry {
             .map(Option::<&JournalEvidence>::cloned)
     }
 
+    /// The snapshot the journal of exactly `record`'s runtime generation
+    /// stands for, or `None` when that journal is absent, ambiguous or
+    /// unreadable.
+    pub(super) async fn generation_journal_snapshot(
+        &self,
+        record: &SessionRecord,
+    ) -> Option<InspectSnapshot> {
+        let generation = record.runtime.generation.as_deref()?;
+        let journals = self.discover_worker_journals().await.ok()?;
+        let scan = journals.get(record.session_id.as_str())?;
+        scan.journal_of_generation(generation)
+            .ok()
+            .flatten()?
+            .snapshot()
+            .ok()
+    }
+
+    /// Scans every session's worker journals.
     /// Scans every session's worker journals.
     ///
     /// Returns why the scan failed instead of an empty map: a failed scan is
@@ -2523,6 +2595,12 @@ impl SessionRegistry {
             Ok(subagents) => record.info.subagents = subagents,
             Err(reason) => {
                 tracing::warn!(session_id = %record.session_id, reason, "rejected terminal worker subagent journal");
+            }
+        }
+        match evidence.snapshot() {
+            Ok(snapshot) => import_native_reference(&mut record, &snapshot),
+            Err(reason) => {
+                tracing::warn!(session_id = %record.session_id, reason, "unreadable terminal worker journal; its native reference is not imported");
             }
         }
         record.info.pid = evidence.child.as_ref().map_or(0, |child| child.pid);
@@ -2719,6 +2797,7 @@ impl SessionRegistry {
             }
         }
         terminalize_running_subagents(&mut record.info.subagents, current_time_millis());
+        import_native_reference(&mut record, snapshot);
         if let Some(exit) = &snapshot.exit {
             record.info.exit_code = exit.code;
             record.info.state = if exit.stopped_by_user {
@@ -2991,6 +3070,7 @@ impl SessionRegistry {
                 }
             }
         }
+        import_native_reference(&mut record, &snapshot);
         let identity_projection = if root_missing_during_drain || retry_identity {
             clear_active_identity(&mut record.info);
             WorkerIdentityProjection::unreported()
@@ -3431,6 +3511,9 @@ impl SessionRegistry {
         match worker.stop(transaction).await {
             Ok(Some(exit)) => {
                 let mut terminal = record;
+                if let Ok(final_snapshot) = worker.inspect().await {
+                    import_native_reference(&mut terminal, &final_snapshot);
+                }
                 terminal.transaction = None;
                 terminal.info.state = SessionState::Stopped;
                 terminal.info.exit_code = exit.code;
@@ -3694,7 +3777,8 @@ pub(super) fn merge_persisted_recovery(
     // A sequenced native identity in the session record is authoritative over
     // the separately persisted resume projection. The session write commits
     // first, so a crash or I/O failure can legitimately leave the resume
-    // projection one report behind.
+    // projection one report behind. Every replacement of the reference carries
+    // an ordering key, so a keyed record is the newer side.
     if record.native_identity_ordering.is_some() {
         if let Some(recovery) = record.recovery.as_ref().filter(|recovery| {
             recovery.native_session_id.is_some() || recovery.native_session_path.is_some()
@@ -3789,7 +3873,14 @@ fn apply_identity_projection(
     projection: &WorkerIdentityProjection,
     snapshot: &InspectSnapshot,
 ) -> bool {
-    let native_changed = entry.info.native_session_id != candidate.info.native_session_id
+    let provenance = candidate
+        .recovery
+        .as_ref()
+        .map(|binding| binding.native_reference_provenance);
+    let provenance_changed =
+        provenance.is_some_and(|provenance| provenance != entry.snapshot.reference_provenance);
+    let native_changed = provenance_changed
+        || entry.info.native_session_id != candidate.info.native_session_id
         || entry.info.native_session_path != candidate.info.native_session_path;
     let active_changed = projection.privately_reported
         && (entry.info.active_agent != candidate.info.active_agent
@@ -3808,6 +3899,9 @@ fn apply_identity_projection(
         .info
         .native_session_path
         .clone_from(&candidate.info.native_session_path);
+    if let Some(provenance) = provenance {
+        entry.snapshot.reference_provenance = provenance;
+    }
     if active_changed {
         entry
             .info
@@ -4071,7 +4165,17 @@ fn apply_worker_identities_with(
     if snapshot.active_identity.is_some() && snapshot.active_identity_release.is_some() {
         return Err("active_identity_state_ambiguous");
     }
-    apply_worker_launch_identity(record, snapshot.launch_identity.as_ref())?;
+    let instance = snapshot
+        .worker_instance_id
+        .as_ref()
+        .map(ToString::to_string);
+    let journaled = snapshot.native_reference.as_ref();
+    apply_worker_launch_identity(
+        record,
+        snapshot.launch_identity.as_ref(),
+        instance.as_deref(),
+        journaled.is_some(),
+    )?;
 
     let Some(identity) = &snapshot.active_identity else {
         let Some(release) = snapshot.active_identity_release.clone() else {
@@ -4120,6 +4224,9 @@ fn apply_worker_identities_with(
                 .ok_or("active_identity_reference_kind_invalid")?;
             let native = validate_native_reference(kind, reference)
                 .ok_or("active_identity_reference_invalid")?;
+            if journaled.is_none() {
+                apply_active_native_reference(record, snapshot, identity, kind, &native);
+            }
             match kind {
                 SessionRefKind::Id => (Some(native), None),
                 SessionRefKind::Path => (None, Some(native)),
@@ -4151,16 +4258,45 @@ fn apply_worker_identities_with(
 fn apply_worker_launch_identity(
     record: &mut SessionRecord,
     identity: Option<&pohunek_worker_protocol::ReportedLaunchIdentity>,
+    worker_instance_id: Option<&str>,
+    journaled_reference: bool,
 ) -> Result<(), &'static str> {
     let Some(identity) = identity else {
         return Ok(());
     };
-    apply_launch_identity(
+    let replaced = apply_launch_identity(
         record,
         &identity.provider,
         &identity.reference_kind,
         &identity.native_reference,
-    )
+        worker_instance_id,
+        journaled_reference,
+    )?;
+    // A claim has no sequence of its own: a reference it replaces is keyed to
+    // its generation with no report mark, which every real report outranks.
+    let keyed_here = record
+        .native_identity_ordering
+        .as_ref()
+        .is_some_and(|ordering| Some(ordering.worker_instance_id.as_str()) == worker_instance_id);
+    let assigned = record.recovery.as_ref().is_some_and(is_assigned_runtime);
+    if let (true, true, false, Some(instance)) =
+        (replaced, assigned, keyed_here, worker_instance_id)
+    {
+        record.native_identity_ordering = Some(crate::store::NativeIdentityOrdering::unsequenced(
+            instance,
+            identity.process.pid,
+            identity.process.start_identity,
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the recovery binding's runtime assigns its reference at launch.
+fn is_assigned_runtime(binding: &ResumeBinding) -> bool {
+    binding
+        .native_launch
+        .as_ref()
+        .is_some_and(|launch| launch.assigned().is_some())
 }
 
 /// Binds the launch identity a worker accepted to the record's recovery, or
@@ -4170,7 +4306,9 @@ pub(super) fn apply_launch_identity(
     provider: &str,
     reference_kind: &str,
     native_reference: &str,
-) -> Result<(), &'static str> {
+    worker_instance_id: Option<&str>,
+    journaled_reference: bool,
+) -> Result<bool, &'static str> {
     let expected_provider = super::agent_kind_label(&record.info.agent_base);
     if provider != expected_provider {
         return Err("launch_identity_provider_mismatch");
@@ -4202,9 +4340,36 @@ pub(super) fn apply_launch_identity(
         SessionRefKind::Id => record.info.native_session_id.as_deref(),
         SessionRefKind::Path => record.info.native_session_path.as_deref(),
     };
-    if existing.is_some_and(|existing| existing != native) {
-        return Err("launch_identity_reference_mismatch");
+    let differs = existing.is_some_and(|existing| existing != native);
+    // The worker's journaled native reference of an assigned runtime is the
+    // ordered record of every report of the launch process, the launch claim
+    // included, so the claim alone decides nothing.
+    if journaled_reference && is_assigned_runtime(binding) {
+        return Ok(false);
     }
+    // A reported reference always supersedes an assigned one, whether or not
+    // the values agree: the claim is bound to the launch process, the assigned
+    // value never was.
+    if binding.native_reference_provenance != NativeReferenceProvenance::Assigned && differs {
+        if !is_assigned_runtime(binding) {
+            return Err("launch_identity_reference_mismatch");
+        }
+        // The worker keeps its first launch claim for good. A report this
+        // generation already accepted (a switch after the claim) makes the
+        // claim superseded history; a stored reference that predates the
+        // generation (a recovered conversation, a switch before the first
+        // report) is what the claim supersedes.
+        if record
+            .native_identity_ordering
+            .as_ref()
+            .is_some_and(|ordering| {
+                Some(ordering.worker_instance_id.as_str()) == worker_instance_id
+            })
+        {
+            return Ok(false);
+        }
+    }
+    binding.native_reference_provenance = NativeReferenceProvenance::Reported;
     match kind {
         SessionRefKind::Id => {
             record.info.native_session_id = Some(native.clone());
@@ -4219,7 +4384,163 @@ pub(super) fn apply_launch_identity(
             binding.native_session_id = None;
         }
     }
+    Ok(true)
+}
+
+/// Imports the native reference the worker journaled for its launch process
+/// into `record`.
+///
+/// The reference is trusted by its generation binding, never by the liveness
+/// of any process: the snapshot must belong to the record's own worker
+/// instance and the reference must name the launch process the worker
+/// verified. Anything unprovable leaves the stored reference alone. Every
+/// path that applies a worker snapshot or commits terminal recovery metadata
+/// calls it exactly once.
+pub(super) fn import_native_reference(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+) {
+    let Some(reference) = snapshot.native_reference.as_ref() else {
+        return;
+    };
+    let recorded = record.runtime.worker_instance_id.as_deref();
+    let same_generation = recorded.is_some()
+        && snapshot
+            .worker_instance_id
+            .as_ref()
+            .map(pohunek_worker_protocol::WorkerInstanceId::as_str)
+            == recorded;
+    let bound_to_launch = snapshot
+        .launch_identity
+        .as_ref()
+        .is_some_and(|launch| launch.process == reference.process);
+    if same_generation && bound_to_launch {
+        let _ = apply_journaled_native_reference(record, snapshot, reference);
+    }
+}
+
+/// Imports the native reference the worker journaled for its verified launch
+/// process.
+///
+/// It is the ordered record of every report of the launch process and has no
+/// lease, so a switch made while the daemon was absent is still read. Runtimes
+/// that report their reference through a hook keep their existing import
+/// rules.
+fn apply_journaled_native_reference(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+    reference: &pohunek_worker_protocol::ReportedNativeReference,
+) -> Result<(), &'static str> {
+    let kind =
+        parse_reference_kind(&reference.reference_kind).ok_or("native_reference_kind_invalid")?;
+    let native = validate_native_reference(kind, &reference.native_reference)
+        .ok_or("native_reference_invalid")?;
+    adopt_worker_reference(
+        record,
+        snapshot,
+        &reference.provider,
+        &reference.process,
+        reference.sequence,
+        kind,
+        &native,
+    );
     Ok(())
+}
+
+/// Imports the reference the launch process reports as its active identity,
+/// for a worker that journals no separate native reference.
+///
+/// The worker rejects every launch claim after its first, so a conversation
+/// switch inside the agent (`/clear`, in-session resume) reaches such a daemon
+/// only as the active identity, for as long as its lease lasts.
+fn apply_active_native_reference(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+    identity: &pohunek_worker_protocol::ActiveIdentityClaim,
+    kind: SessionRefKind,
+    native: &str,
+) {
+    adopt_worker_reference(
+        record,
+        snapshot,
+        &identity.provider,
+        &identity.process,
+        identity.sequence,
+        kind,
+        native,
+    );
+}
+
+/// Supersedes the stored reference of an assigned runtime with one the launch
+/// process reported through the worker.
+///
+/// It applies when the report names the launch runtime, is bound to the
+/// verified launch process (never a nested agent), carries the frozen
+/// reference kind and is newer than the last worker report accepted for the
+/// runtime generation. The replacement carries its ordering key.
+fn adopt_worker_reference(
+    record: &mut SessionRecord,
+    snapshot: &pohunek_worker_protocol::InspectSnapshot,
+    provider: &str,
+    process: &pohunek_worker_protocol::ProcessIdentity,
+    sequence: u64,
+    kind: SessionRefKind,
+    native: &str,
+) {
+    let Some(binding) = record.recovery.as_mut() else {
+        return;
+    };
+    if !is_assigned_runtime(binding)
+        || binding.reference_kind() != Some(kind)
+        || provider != super::agent_kind_label(&record.info.agent_base)
+        || snapshot
+            .launch_identity
+            .as_ref()
+            .map_or(snapshot.child_process.as_ref(), |launch| {
+                Some(&launch.process)
+            })
+            != Some(process)
+    {
+        return;
+    }
+    let Some(worker_instance_id) = snapshot
+        .worker_instance_id
+        .as_ref()
+        .map(ToString::to_string)
+    else {
+        return;
+    };
+    if !super::native_report_is_current(
+        record.native_identity_ordering.as_ref(),
+        &worker_instance_id,
+        sequence,
+        crate::store::ReportTransport::Worker,
+    ) {
+        return;
+    }
+    match kind {
+        SessionRefKind::Id => {
+            record.info.native_session_id = Some(native.to_owned());
+            record.info.native_session_path = None;
+            binding.native_session_id = Some(native.to_owned());
+            binding.native_session_path = None;
+        }
+        SessionRefKind::Path => {
+            record.info.native_session_path = Some(native.to_owned());
+            record.info.native_session_id = None;
+            binding.native_session_path = Some(native.to_owned());
+            binding.native_session_id = None;
+        }
+    }
+    binding.native_reference_provenance = NativeReferenceProvenance::Reported;
+    record.native_identity_ordering = Some(crate::store::NativeIdentityOrdering::accepting(
+        record.native_identity_ordering.as_ref(),
+        &worker_instance_id,
+        process.pid,
+        process.start_identity,
+        crate::store::ReportTransport::Worker,
+        sequence,
+    ));
 }
 
 /// Prefix of the conflict reasons that say a record disagrees with its stored
@@ -4989,6 +5310,7 @@ mod tests {
 
     use pohunek_test_support::wait::{wait_until, HANG_GUARD};
 
+    use crate::agent::NativeReferenceProvenance;
     #[cfg(target_os = "linux")]
     use base64::Engine as _;
     use pohunek_session_worker::{
@@ -5733,6 +6055,137 @@ while os.getppid() == parent:
         assert!(!schema_in_window(4, 6, &[4, 5, 6]));
     }
 
+    /// The record of an assigned runtime whose worker instance is
+    /// `runtime-identity`, holding `assigned-ref`.
+    fn ended_assigned_record() -> SessionRecord {
+        assigned_record("assigned-ref")
+    }
+
+    #[test]
+    fn an_ended_worker_hands_its_journaled_reference_over_only_when_it_proves_its_binding() {
+        let reported = |snapshot: &mut InspectSnapshot, pid: u32| {
+            snapshot.native_reference = Some(pohunek_worker_protocol::ReportedNativeReference {
+                provider: "codex".to_owned(),
+                process: ProcessIdentity {
+                    pid,
+                    start_identity: u64::from(pid) * 10,
+                },
+                sequence: 8,
+                reference_kind: "id".to_owned(),
+                native_reference: "journaled-ref".to_owned(),
+            });
+        };
+        let held = |record: &SessionRecord| record.info.native_session_id.clone();
+
+        let mut snapshot = switch_snapshot(Some("assigned-ref"), None);
+        reported(&mut snapshot, 50);
+        let mut record = ended_assigned_record();
+        super::import_native_reference(&mut record, &snapshot);
+        assert_eq!(held(&record).as_deref(), Some("journaled-ref"));
+        assert_eq!(provenance_of(&record), NativeReferenceProvenance::Reported);
+
+        // Another worker instance, a reference of a process that is not the
+        // verified launch process, and a missing launch claim prove nothing.
+        let mut other_instance = snapshot.clone();
+        other_instance.worker_instance_id =
+            Some(WorkerInstanceId::new("another-instance").expect("instance id"));
+        let mut nested = switch_snapshot(Some("assigned-ref"), None);
+        reported(&mut nested, 60);
+        let mut unverified = snapshot.clone();
+        unverified.launch_identity = None;
+        for (name, snapshot) in [
+            ("another instance", other_instance),
+            ("not the launch process", nested),
+            ("no verified launch", unverified),
+        ] {
+            let mut record = ended_assigned_record();
+            super::import_native_reference(&mut record, &snapshot);
+            assert_eq!(held(&record).as_deref(), Some("assigned-ref"), "{name}");
+        }
+        let mut no_instance = ended_assigned_record();
+        no_instance.runtime.worker_instance_id = None;
+        super::import_native_reference(&mut no_instance, &snapshot);
+        assert_eq!(held(&no_instance).as_deref(), Some("assigned-ref"));
+    }
+
+    /// The terminal journal of the assigned runtime's worker, whose launch
+    /// process reported `journaled-ref` after the launch claim named
+    /// `assigned-ref`.
+    fn ended_evidence(record: &SessionRecord) -> super::JournalEvidence {
+        super::JournalEvidence {
+            schema_version: crate::runtime::lifecycle::WORKER_JOURNAL_SCHEMA_VERSION,
+            session_id: record.session_id.clone(),
+            worker_id: record.runtime.worker_id.clone().expect("worker id"),
+            generation: "abcd2345".to_owned(),
+            executable: PathBuf::from("/usr/libexec/pohunek-sessiond"),
+            worker_pid: 41,
+            worker_start_identity: "410".to_owned(),
+            boot_identity: "boot-test".to_owned(),
+            worker_instance_id: record.runtime.worker_instance_id.clone(),
+            child: Some(super::JournalChild {
+                pid: 50,
+                start_identity: "500".to_owned(),
+            }),
+            cols: Some(80),
+            rows: Some(24),
+            phase: super::JournalPhase::Terminal,
+            outcome: Some(super::JournalOutcome {
+                exit_code: Some(0),
+                signal: None,
+                success: true,
+            }),
+            subagents: Vec::new(),
+            hook_schema: None,
+            protocol_minimum: None,
+            protocol_maximum: None,
+            launch_identity: serde_json::from_value(serde_json::json!({
+                "provider": "codex", "reference_kind": "id",
+                "native_reference": "assigned-ref",
+                "process": {"pid": 50, "start_identity": "500"}
+            }))
+            .expect("launch identity"),
+            active_identity: None,
+            active_identity_release: None,
+            native_reference_claim: serde_json::from_value(serde_json::json!({
+                "provider": "codex", "sequence": 8, "reference_kind": "id",
+                "native_reference": "journaled-ref",
+                "process": {"pid": 50, "start_identity": "500"}
+            }))
+            .expect("native reference"),
+        }
+    }
+
+    #[test]
+    fn a_terminal_journal_carries_the_journaled_reference_into_its_snapshot() {
+        let record = ended_assigned_record();
+        let snapshot = ended_evidence(&record)
+            .snapshot()
+            .expect("a readable journal");
+        let reference = snapshot.native_reference.expect("journaled reference");
+        assert_eq!(reference.native_reference, "journaled-ref");
+        assert_eq!(reference.sequence, 8);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_journal_import_records_the_journaled_reference() {
+        let registry = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: crate::session::ShellCommand::new("/bin/sh", ["-c", "sleep 1"]),
+            ..SessionRegistryConfig::default()
+        });
+        let record = ended_assigned_record();
+        let id = SessionId(record.session_id.clone());
+        assert!(
+            registry
+                .import_terminal_journal(record.clone(), ended_evidence(&record))
+                .await
+        );
+        let info = registry
+            .inspect(&id)
+            .await
+            .expect("inspect the ended session");
+        assert_eq!(info.native_session_id.as_deref(), Some("journaled-ref"));
+    }
+
     #[test]
     fn terminal_journal_identity_mismatch_and_duplicates_fail_closed() {
         let record = identity_record();
@@ -5765,6 +6218,7 @@ while os.getppid() == parent:
             launch_identity: None,
             active_identity: None,
             active_identity_release: None,
+            native_reference_claim: None,
         };
         let mut mismatch = exact.clone();
         mismatch.worker_id = "different-worker".to_owned();
@@ -6250,7 +6704,8 @@ while os.getppid() == parent:
             worker_instance_id: worker_instance_id.to_string(),
             pid: child.pid,
             pid_start_identity: child.start_identity,
-            sequence: 1,
+            sequence: Some(1),
+            worker_sequence: None,
         });
         let recovery = record.recovery.as_mut().expect("recovery binding");
         recovery.session_id = session_id.to_owned();
@@ -6561,7 +7016,8 @@ while os.getppid() == parent:
                     worker_instance_id: worker_instance_id.to_string(),
                     pid: child.pid,
                     pid_start_identity: child.start_identity,
-                    sequence: 100,
+                    sequence: Some(100),
+                    worker_sequence: None,
                 }),
                 info: SessionInfo {
                     pid: 0,
@@ -7920,7 +8376,8 @@ while os.getppid() == parent:
             worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
-            sequence: 2,
+            sequence: Some(2),
+            worker_sequence: None,
         });
         record.info.native_session_id = Some("native-newer".to_owned());
         let recovery = record.recovery.as_mut().expect("recovery binding");
@@ -7943,6 +8400,443 @@ while os.getppid() == parent:
         );
     }
 
+    /// A record whose reference core assigned at launch, naming `reference`.
+    fn assigned_record(reference: &str) -> SessionRecord {
+        let mut record = identity_record();
+        record.info.native_session_id = Some(reference.to_owned());
+        let binding = record.recovery.as_mut().expect("recovery binding");
+        binding.native_session_id = Some(reference.to_owned());
+        binding.native_reference_provenance = NativeReferenceProvenance::Assigned;
+        binding.native_launch = Some(
+            test_native_launch(SessionRefKind::Id, false)
+                .with_assigned(crate::agent::AssignedReference::new(
+                    crate::agent::NativeArgs::from_template(&["--session-id", "{reference}"])
+                        .expect("launch template"),
+                    crate::agent::ReferenceExistence::Unchecked,
+                ))
+                .expect("an id spec accepts an assignment"),
+        );
+        record
+    }
+
+    /// A snapshot of the launch process (`codex`, pid 50) reporting `launch`
+    /// as its launch claim and, when given, `active` (process, sequence,
+    /// reference) as its active identity.
+    fn switch_snapshot(launch: Option<&str>, active: Option<(u32, u64, &str)>) -> InspectSnapshot {
+        let mut snapshot = identity_snapshot("unused");
+        snapshot.launch_identity = launch.map(|reference| ReportedLaunchIdentity {
+            provider: "codex".to_owned(),
+            process: ProcessIdentity {
+                pid: 50,
+                start_identity: 500,
+            },
+            reference_kind: "id".to_owned(),
+            native_reference: reference.to_owned(),
+        });
+        snapshot.active_identity = active.map(|(pid, sequence, reference)| ActiveIdentityClaim {
+            provider: "codex".to_owned(),
+            process: ProcessIdentity {
+                pid,
+                start_identity: u64::from(pid) * 10,
+            },
+            sequence,
+            expires_at: (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&Rfc3339)
+                .expect("format expiry"),
+            reference_kind: Some("id".to_owned()),
+            native_reference: Some(reference.to_owned()),
+        });
+        snapshot
+    }
+
+    fn provenance_of(record: &SessionRecord) -> NativeReferenceProvenance {
+        record
+            .recovery
+            .as_ref()
+            .expect("recovery binding")
+            .native_reference_provenance
+    }
+
+    #[test]
+    fn a_launch_claim_supersedes_an_assigned_reference_whether_or_not_the_values_agree() {
+        for claimed in ["assigned-ref", "reported-ref"] {
+            let mut record = assigned_record("assigned-ref");
+
+            import_worker_identities(&mut record, &switch_snapshot(Some(claimed), None))
+                .expect("a launch claim supersedes an assigned reference");
+
+            assert_eq!(
+                record.info.native_session_id.as_deref(),
+                Some(claimed),
+                "{claimed}: the session holds the claimed reference"
+            );
+            assert_eq!(
+                record
+                    .recovery
+                    .as_ref()
+                    .and_then(|binding| binding.native_session_id.as_deref()),
+                Some(claimed),
+                "{claimed}: the binding holds the claimed reference"
+            );
+            assert_eq!(
+                provenance_of(&record),
+                NativeReferenceProvenance::Reported,
+                "{claimed}: the claim is process-bound"
+            );
+            assert_eq!(
+                record
+                    .native_identity_ordering
+                    .as_ref()
+                    .map(|ordering| (ordering.sequence, ordering.worker_sequence)),
+                Some((None, None)),
+                "{claimed}: a launch claim keys its generation with no report mark"
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_claim_supersedes_a_reference_that_predates_its_generation_only() {
+        let ordered_in = |instance: &str| NativeIdentityOrdering {
+            worker_instance_id: instance.to_owned(),
+            pid: 50,
+            pid_start_identity: 500,
+            sequence: Some(4),
+            worker_sequence: None,
+        };
+
+        // A reported reference of an earlier generation (a recovered
+        // conversation) is what the new generation's first claim replaces.
+        let mut recovered = assigned_record("first");
+        import_worker_identities(&mut recovered, &switch_snapshot(Some("first"), None))
+            .expect("the first claim");
+        recovered.native_identity_ordering = Some(ordered_in("an-earlier-instance"));
+        import_worker_identities(&mut recovered, &switch_snapshot(Some("other"), None))
+            .expect("the claim of the new generation supersedes");
+        assert_eq!(recovered.info.native_session_id.as_deref(), Some("other"));
+        assert_eq!(
+            provenance_of(&recovered),
+            NativeReferenceProvenance::Reported
+        );
+
+        // A report this generation already accepted makes the claim history.
+        let mut reported = assigned_record("first");
+        import_worker_identities(&mut reported, &switch_snapshot(Some("first"), None))
+            .expect("the first claim");
+        reported.native_identity_ordering = Some(ordered_in("runtime-identity"));
+        import_worker_identities(&mut reported, &switch_snapshot(Some("other"), None))
+            .expect("a superseded launch claim is history");
+        assert_eq!(reported.info.native_session_id.as_deref(), Some("first"));
+
+        // A hook runtime keeps its immutable launch claim.
+        let mut hooked = identity_record();
+        hooked.info.native_session_id = Some("first".to_owned());
+        hooked
+            .recovery
+            .as_mut()
+            .expect("recovery binding")
+            .native_session_id = Some("first".to_owned());
+        hooked.native_identity_ordering = Some(ordered_in("runtime-identity"));
+        assert_eq!(
+            import_worker_identities(&mut hooked, &switch_snapshot(Some("other"), None))
+                .expect_err("a hook runtime keeps its immutable launch claim"),
+            "launch_identity_reference_mismatch"
+        );
+    }
+
+    #[test]
+    fn the_active_identity_of_the_launch_process_replaces_the_reference_in_sequence_order() {
+        let mut record = assigned_record("assigned-ref");
+        let claim = switch_snapshot(Some("assigned-ref"), Some((50, 9, "cleared-ref")));
+
+        import_worker_identities(&mut record, &claim).expect("import the switch");
+
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("cleared-ref")
+        );
+        assert_eq!(
+            record
+                .recovery
+                .as_ref()
+                .and_then(|binding| binding.native_session_id.as_deref()),
+            Some("cleared-ref")
+        );
+        assert_eq!(provenance_of(&record), NativeReferenceProvenance::Reported);
+        assert_eq!(
+            record.native_identity_ordering,
+            Some(NativeIdentityOrdering {
+                worker_instance_id: "runtime-identity".to_owned(),
+                pid: 50,
+                pid_start_identity: 500,
+                sequence: None,
+                worker_sequence: Some(9),
+            })
+        );
+
+        // The worker still holds its first launch claim; re-importing the same
+        // snapshot is neither a conflict nor a change.
+        let before = record.clone();
+        import_worker_identities(&mut record, &claim).expect("the same snapshot stays applied");
+        assert_eq!(record.info.native_session_id, before.info.native_session_id);
+        assert_eq!(
+            record.native_identity_ordering,
+            before.native_identity_ordering
+        );
+
+        let stale = switch_snapshot(Some("assigned-ref"), Some((50, 8, "older-ref")));
+        import_worker_identities(&mut record, &stale).expect("import a stale claim");
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("cleared-ref"),
+            "a lower sequence never replaces a newer reference"
+        );
+
+        let newer = switch_snapshot(Some("assigned-ref"), Some((50, 10, "newest-ref")));
+        import_worker_identities(&mut record, &newer).expect("import a newer claim");
+        assert_eq!(record.info.native_session_id.as_deref(), Some("newest-ref"));
+    }
+
+    #[test]
+    fn a_recovered_generations_first_report_with_sequence_zero_is_admitted() {
+        // A recovered runtime keeps its reported reference and holds no key of
+        // the new generation: its first worker report is numbered 0.
+        let mut record = assigned_record("assigned-ref");
+        record
+            .recovery
+            .as_mut()
+            .expect("recovery binding")
+            .native_reference_provenance = NativeReferenceProvenance::Reported;
+        let mut snapshot = switch_snapshot(Some("launch-ref"), None);
+        snapshot.native_reference = Some(pohunek_worker_protocol::ReportedNativeReference {
+            provider: "codex".to_owned(),
+            process: ProcessIdentity {
+                pid: 50,
+                start_identity: 500,
+            },
+            sequence: 0,
+            reference_kind: "id".to_owned(),
+            native_reference: "first-report".to_owned(),
+        });
+
+        super::import_native_reference(&mut record, &snapshot);
+        import_worker_identities(&mut record, &snapshot).expect("import the launch claim");
+
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("first-report")
+        );
+        assert_eq!(
+            record
+                .native_identity_ordering
+                .as_ref()
+                .map(|ordering| ordering.worker_sequence),
+            Some(Some(0)),
+            "only the accepted report sets the worker mark"
+        );
+    }
+
+    #[test]
+    fn the_verified_launch_process_below_a_wrapper_is_the_process_whose_switches_count() {
+        // The worker designates the provider process below a wrapper; the
+        // wrapper stays the root child.
+        let wrapped = |active_pid: u32| {
+            let mut snapshot =
+                switch_snapshot(Some("assigned-ref"), Some((active_pid, 9, "cleared-ref")));
+            snapshot
+                .launch_identity
+                .as_mut()
+                .expect("launch claim")
+                .process = ProcessIdentity {
+                pid: 55,
+                start_identity: 550,
+            };
+            snapshot
+        };
+        let mut record = assigned_record("assigned-ref");
+        import_worker_identities(&mut record, &wrapped(55)).expect("import the switch");
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("cleared-ref")
+        );
+
+        for (name, pid) in [("the wrapper", 50), ("another nested agent", 60)] {
+            let mut record = assigned_record("assigned-ref");
+            import_worker_identities(&mut record, &wrapped(pid)).expect("import the claim");
+            assert_eq!(
+                record.info.native_session_id.as_deref(),
+                Some("assigned-ref"),
+                "{name} is not the verified launch process"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_writer_never_demotes_a_newer_reference_of_the_other_transport() {
+        let ordered = |sequence: u64, worker_sequence: Option<u64>, reference: &str| {
+            let mut record = identity_record();
+            record.native_identity_ordering = Some(NativeIdentityOrdering {
+                worker_instance_id: "runtime-identity".to_owned(),
+                pid: 50,
+                pid_start_identity: 500,
+                sequence: Some(sequence),
+                worker_sequence,
+            });
+            record.info.native_session_id = Some(reference.to_owned());
+            record
+                .recovery
+                .as_mut()
+                .expect("recovery binding")
+                .native_session_id = Some(reference.to_owned());
+            record
+        };
+        // The store accepted a worker claim after the public report the
+        // writer's record was built from: the writer is behind in the worker
+        // domain and not ahead in the public one.
+        let durable = ordered(5, Some(900), "worker-conversation");
+        let mut stale = ordered(5, None, "public-conversation");
+        crate::store::preserve_newer_native_identity(&durable, &mut stale);
+        assert_eq!(
+            stale.info.native_session_id.as_deref(),
+            Some("worker-conversation")
+        );
+        assert_eq!(
+            stale.native_identity_ordering,
+            durable.native_identity_ordering
+        );
+
+        // A writer that accepted a newer public report keeps its reference and
+        // inherits the worker mark, so a late public report numbered like the
+        // old one is still stale.
+        let mut newer = ordered(6, None, "newer-public-conversation");
+        crate::store::preserve_newer_native_identity(&durable, &mut newer);
+        assert_eq!(
+            newer.info.native_session_id.as_deref(),
+            Some("newer-public-conversation")
+        );
+        let merged = newer.native_identity_ordering.expect("merged ordering");
+        assert_eq!(
+            (merged.sequence, merged.worker_sequence),
+            (Some(6), Some(900))
+        );
+        assert!(!merged.admits("runtime-identity", crate::store::ReportTransport::Public, 5));
+        assert!(!merged.admits(
+            "runtime-identity",
+            crate::store::ReportTransport::Worker,
+            900
+        ));
+    }
+
+    #[test]
+    fn report_sequences_are_compared_within_their_own_transport_only() {
+        use crate::store::ReportTransport::{Public, Worker};
+        let mut ordering = NativeIdentityOrdering::accepting(None, "gen", 1, 2, Worker, 5_000_000);
+        assert!(!ordering.admits("gen", Worker, 5_000_000));
+        assert!(ordering.admits("gen", Worker, 5_000_001));
+        assert!(
+            ordering.admits("gen", Public, 7),
+            "a public sequence is not older than a worker clock"
+        );
+        assert!(
+            ordering.admits("other-gen", Worker, 1),
+            "a new generation restarts"
+        );
+
+        ordering = NativeIdentityOrdering::accepting(Some(&ordering), "gen", 1, 2, Public, 7);
+        assert_eq!(
+            (ordering.sequence, ordering.worker_sequence),
+            (Some(7), Some(5_000_000))
+        );
+        assert!(!ordering.admits("gen", Public, 7));
+        assert!(
+            !ordering.admits("gen", Worker, 5_000_000),
+            "an accepted public report keeps the worker mark: the old claim is not newer"
+        );
+        // A worker claim leaves the public mark absent, not at zero, so the
+        // first public report of any number is admitted.
+        let worker_only = NativeIdentityOrdering::accepting(None, "gen", 1, 2, Worker, 9);
+        assert_eq!(worker_only.sequence, None);
+        assert!(worker_only.admits("gen", Public, 0));
+        let fresh = NativeIdentityOrdering::accepting(Some(&ordering), "next", 1, 2, Public, 3);
+        assert_eq!((fresh.sequence, fresh.worker_sequence), (Some(3), None));
+    }
+
+    #[test]
+    fn an_active_identity_that_is_not_the_launch_process_never_replaces_the_reference() {
+        // A nested process, another runtime's claim and a runtime whose
+        // reference comes from a hook all leave the stored reference alone.
+        let nested = switch_snapshot(None, Some((60, 9, "nested-ref")));
+        let mut other_provider = switch_snapshot(None, Some((50, 9, "claude-ref")));
+        other_provider
+            .active_identity
+            .as_mut()
+            .expect("active identity")
+            .provider = "claude".to_owned();
+        for (name, snapshot) in [("nested", nested), ("other provider", other_provider)] {
+            let mut record = assigned_record("assigned-ref");
+            import_worker_identities(&mut record, &snapshot).expect("import the claim");
+            assert_eq!(
+                record.info.native_session_id.as_deref(),
+                Some("assigned-ref"),
+                "{name}"
+            );
+            assert_eq!(
+                provenance_of(&record),
+                NativeReferenceProvenance::Assigned,
+                "{name}"
+            );
+            assert!(record.native_identity_ordering.is_none(), "{name}");
+        }
+
+        let mut hooked = identity_record();
+        import_worker_identities(
+            &mut hooked,
+            &switch_snapshot(None, Some((50, 9, "hook-ref"))),
+        )
+        .expect("import the claim");
+        assert_eq!(
+            hooked.info.native_session_id, None,
+            "a hook runtime keeps its import rules"
+        );
+    }
+
+    #[test]
+    fn a_resume_projection_naming_the_assigned_value_loses_to_the_reported_record() {
+        // The session record commits before the resume projection, so a crash
+        // between them leaves the projection on the replaced assigned value.
+        let mut record = assigned_record("assigned-ref");
+        import_worker_identities(&mut record, &switch_snapshot(Some("reported-ref"), None))
+            .expect("supersede the assigned reference");
+        let mut stale = record.recovery.clone().expect("recovery binding");
+        stale.native_session_id = Some("assigned-ref".to_owned());
+        stale.native_reference_provenance = NativeReferenceProvenance::Assigned;
+
+        merge_persisted_recovery(&mut record, stale).expect("the record wins");
+
+        assert_eq!(
+            record.info.native_session_id.as_deref(),
+            Some("reported-ref")
+        );
+        assert_eq!(
+            record
+                .recovery
+                .as_ref()
+                .and_then(|binding| binding.native_session_id.as_deref()),
+            Some("reported-ref")
+        );
+        assert_eq!(provenance_of(&record), NativeReferenceProvenance::Reported);
+
+        // Without an ordering key neither side is newer, so two values that
+        // disagree stay a conflict.
+        record.native_identity_ordering = None;
+        let mut conflicting = record.recovery.clone().expect("recovery binding");
+        conflicting.native_session_id = Some("another-ref".to_owned());
+        assert_eq!(
+            merge_persisted_recovery(&mut record, conflicting)
+                .expect_err("reported values must agree"),
+            "resume_binding_reference_mismatch"
+        );
+    }
+
     #[test]
     fn equal_native_ordering_fills_only_missing_durable_reference() {
         let root = temp_root();
@@ -7952,7 +8846,8 @@ while os.getppid() == parent:
             worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
-            sequence: 7,
+            sequence: Some(7),
+            worker_sequence: None,
         });
         assert_eq!(
             store.record_session(&existing).expect("seed session"),
@@ -7998,7 +8893,8 @@ while os.getppid() == parent:
             worker_instance_id: "runtime-identity".to_owned(),
             pid: 50,
             pid_start_identity: 500,
-            sequence: 7,
+            sequence: Some(7),
+            worker_sequence: None,
         });
         existing.info.native_session_id = Some("native-authoritative".to_owned());
         existing
@@ -8357,6 +9253,7 @@ while os.getppid() == parent:
                 native_reference: Some("nested-native".to_owned()),
             }),
             active_identity_release: None,
+            native_reference: None,
             subagents: Vec::new(),
             hook_schema: Some("identity-subagent-v1".to_owned()),
         }
@@ -13331,6 +14228,106 @@ handler = "codex-hook-v1"
                     .await
                     .expect("a further stop is idempotent")
                     .stopped
+            );
+        }
+
+        /// A stop interrupted after its job was retired keeps the conversation
+        /// its dead worker journaled: the startup replay reads that journal.
+        #[tokio::test]
+        async fn a_stop_replayed_at_startup_keeps_the_switch_the_dead_worker_journaled() {
+            let fixture = fixture(Arc::new(RetryInspector::default()));
+            let session = "s-5241";
+            interrupted_stop(&fixture, session).await;
+            let mut record = durable_record(&fixture.root, session);
+            let instance = record
+                .runtime
+                .worker_instance_id
+                .clone()
+                .expect("the record names its worker instance");
+            record.info.native_session_id = Some("assigned-ref".to_owned());
+            let binding = record.recovery.as_mut().expect("recovery binding");
+            binding.native_session_id = Some("assigned-ref".to_owned());
+            binding.native_reference_provenance = crate::agent::NativeReferenceProvenance::Assigned;
+            binding.native_launch = Some(
+                crate::agent::NativeSessionLaunch::from_templates(
+                    crate::agent::SessionRefKind::Id,
+                    &["--session", "{reference}"],
+                    None,
+                )
+                .expect("resume template")
+                .with_assigned(crate::agent::AssignedReference::new(
+                    crate::agent::NativeArgs::from_template(&["--session-id", "{reference}"])
+                        .expect("launch template"),
+                    crate::agent::ReferenceExistence::Unchecked,
+                ))
+                .expect("an id spec accepts an assignment"),
+            );
+            Store::new(fixture.root.join("data/metadata.jsonl"))
+                .record_session(&record)
+                .expect("persist the assigned record");
+            let existing: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    fixture
+                        .root
+                        .join("state/workers")
+                        .join(session)
+                        .join(format!("worker-{session}.json")),
+                )
+                .expect("read the worker journal"),
+            )
+            .expect("decode the worker journal");
+            let worker = (
+                u32::try_from(existing["worker_pid"].as_u64().expect("worker pid"))
+                    .expect("pid fits"),
+                existing["worker_start_identity"]
+                    .as_str()
+                    .expect("worker start identity")
+                    .parse::<u64>()
+                    .expect("start identity number"),
+            );
+            let provider = crate::session::agent_kind_label(&record.info.agent_base).to_owned();
+            let process = pohunek_session_worker::ChildIdentity {
+                pid: 50,
+                process_group: 50,
+                start_identity: "500".to_owned(),
+            };
+            write_journal_record(
+                &fixture.root,
+                session,
+                &format!("worker-{session}"),
+                TEST_GENERATION,
+                worker,
+                Some(&instance),
+                |journal| {
+                    journal.child = Some(process.clone());
+                    journal.launch_identity = Some(pohunek_session_worker::LaunchIdentity {
+                        provider: provider.clone(),
+                        process: process.clone(),
+                        reference_kind: "id".to_owned(),
+                        native_reference: "assigned-ref".to_owned(),
+                    });
+                    journal.native_reference_claim =
+                        Some(pohunek_session_worker::NativeReferenceClaim {
+                            provider: provider.clone(),
+                            process,
+                            sequence: 7,
+                            reference_kind: "id".to_owned(),
+                            native_reference: "switched-before-the-stop".to_owned(),
+                        });
+                },
+            );
+            // The restart starts from an empty registry.
+            fixture.registry.inner.sessions.lock().await.clear();
+
+            Box::pin(fixture.registry.reconcile_workers())
+                .await
+                .expect("reconcile after the restart");
+
+            assert_stopped(&fixture, session).await;
+            let durable = durable_record(&fixture.root, session);
+            assert_eq!(
+                durable.info.native_session_id.as_deref(),
+                Some("switched-before-the-stop")
             );
         }
 

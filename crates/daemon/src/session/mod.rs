@@ -52,8 +52,8 @@ use crate::project::{detect_at, ProjectManager};
 use crate::runtime::lifecycle::{Generation, LifecycleGuard, SessionLocks};
 use crate::runtime::{DimensionUpdate, SupervisionConfig, Worker, WorkerError, WorkerLauncher};
 use crate::store::{
-    DesiredState, ProjectRecord, ResumeBinding, RuntimeRecord, SessionRecord, SessionTransaction,
-    SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
+    DesiredState, ProjectRecord, ReportTransport, ResumeBinding, RuntimeRecord, SessionRecord,
+    SessionTransaction, SessionWriteOutcome, Store, TransactionKind, WorktreeStatus,
 };
 use crate::time::now_rfc3339;
 use crate::worktree::{
@@ -504,6 +504,14 @@ struct SessionRegistryInner {
     /// wins with the freshest size. Held across the (blocking) store I/O instead
     /// of the sessions lock, keeping that hot lock free of file writes.
     persist_lock: Mutex<()>,
+    /// Test hook that drops every resume-binding write, standing for a daemon
+    /// that died between the session record and its projection.
+    #[cfg(test)]
+    resume_writes_blocked: AtomicBool,
+    /// Test hook that makes every worker snapshot import retry later, standing
+    /// for a daemon that has not read the worker's journal yet.
+    #[cfg(test)]
+    worker_imports_blocked: AtomicBool,
     /// Shared by every fresh launch from verification until its durable record
     /// exists, exclusive for a package uninstall, so a launch cannot pin a
     /// package digest between the retained set being computed and the
@@ -1365,6 +1373,19 @@ impl SessionRegistry {
         )
     }
 
+    /// [`Self::new_with_runtimes`] over a caller-owned worker launcher, so a
+    /// second registry built over the same launcher, roots and store adopts the
+    /// first one's live workers like a restarted daemon.
+    #[cfg(test)]
+    pub(crate) fn new_with_runtimes_and_launcher(
+        config: SessionRegistryConfig,
+        runtimes: RuntimeHost,
+        launcher: Arc<dyn WorkerLauncher>,
+        inspector: Arc<dyn ProcessInspector>,
+    ) -> Self {
+        Self::build(config, Some(launcher), inspector, Some(runtimes))
+    }
+
     /// Creates a registry with explicit worker and process-observer backends.
     ///
     /// Integration tests use this surface with a separate-process worker
@@ -1447,6 +1468,10 @@ impl SessionRegistry {
                 events,
                 store,
                 persist_lock: Mutex::new(()),
+                #[cfg(test)]
+                resume_writes_blocked: AtomicBool::new(false),
+                #[cfg(test)]
+                worker_imports_blocked: AtomicBool::new(false),
                 package_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
@@ -2449,6 +2474,12 @@ impl SessionRegistry {
             return not_recorded;
         }
 
+        // The worker claim this daemon has observed is ordered before the public
+        // report accepted below, whether or not the claim was imported yet.
+        let observed_worker_sequence = worker_snapshot
+            .native_reference
+            .as_ref()
+            .map(|reference| reference.sequence);
         let validated = match ref_kind {
             SessionRefKind::Id => SessionRef::id(params.native_session_id()),
             SessionRefKind::Path => params
@@ -2495,6 +2526,7 @@ impl SessionRegistry {
                 entry.last_native_report.as_ref(),
                 params.worker_instance_id(),
                 incoming_sequence,
+                ReportTransport::Public,
             ) {
                 debug!(session_id = %session_id.0, "stale native-id report; ignoring");
                 return not_recorded;
@@ -2504,12 +2536,14 @@ impl SessionRegistry {
             let previous_native_path = entry.info.native_session_path.clone();
             let previous_provenance = entry.snapshot.reference_provenance;
             entry.snapshot.reference_provenance = NativeReferenceProvenance::Reported;
-            entry.last_native_report = Some(NativeIdentityReport {
-                worker_instance_id: params.worker_instance_id().to_owned(),
-                pid: params.pid(),
-                pid_start_identity: params.pid_start_identity().get(),
-                sequence: incoming_sequence,
-            });
+            entry.last_native_report = Some(NativeIdentityReport::accepting_public(
+                entry.last_native_report.as_ref(),
+                params.worker_instance_id(),
+                params.pid(),
+                params.pid_start_identity().get(),
+                incoming_sequence,
+                observed_worker_sequence,
+            ));
             // Store into the field chosen by kind, clearing the other so a session
             // resumes by exactly one mechanism (the persist literal copies both).
             match ref_kind {
@@ -2536,12 +2570,14 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, error = %error, "failed to persist native-id ordering; ignoring report");
             let mut sessions = self.inner.sessions.lock().await;
             if let Some(entry) = sessions.get_mut(&session_id) {
-                let accepted = NativeIdentityReport {
-                    worker_instance_id: params.worker_instance_id().to_owned(),
-                    pid: params.pid(),
-                    pid_start_identity: params.pid_start_identity().get(),
-                    sequence: params.sequence().get(),
-                };
+                let accepted = NativeIdentityReport::accepting_public(
+                    previous_ordering.as_ref(),
+                    params.worker_instance_id(),
+                    params.pid(),
+                    params.pid_start_identity().get(),
+                    params.sequence().get(),
+                    observed_worker_sequence,
+                );
                 if entry.last_native_report.as_ref() == Some(&accepted) {
                     entry.last_native_report = previous_ordering;
                     entry.info.native_session_id = previous_native_id;
@@ -4043,6 +4079,55 @@ impl SessionRegistry {
         outcome
     }
 
+    /// Reads the final snapshot of the generation `expected` names and imports
+    /// the native reference its worker journaled into `candidate`.
+    ///
+    /// Every commit of terminal recovery metadata (a PTY exit, an explicit
+    /// stop, a lost worker) passes through here, so a conversation switch the
+    /// worker accepted is never dropped by the transition that ends the
+    /// session. A worker that cannot be asked leaves the reference as is.
+    async fn import_final_native_reference(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        candidate: &mut SessionEntry,
+    ) {
+        let worker = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions.get(id).and_then(|entry| match &entry.runtime {
+                RuntimeHandle::Worker(worker) if expected.matches(entry) => Some(worker.clone()),
+                _ => None,
+            })
+        };
+        let mut record = Self::session_record(id, candidate, candidate.desired_state, None);
+        let live = match worker {
+            Some(worker) => worker.inspect().await.ok(),
+            None => None,
+        };
+        // A worker that cannot be asked (it crashed after journaling a switch)
+        // leaves its own generation's journal as the only evidence.
+        let snapshot = match live {
+            Some(snapshot) => snapshot,
+            None => match self.generation_journal_snapshot(&record).await {
+                Some(snapshot) => snapshot,
+                None => return,
+            },
+        };
+        reconcile::import_native_reference(&mut record, &snapshot);
+        candidate
+            .info
+            .native_session_id
+            .clone_from(&record.info.native_session_id);
+        candidate
+            .info
+            .native_session_path
+            .clone_from(&record.info.native_session_path);
+        if let Some(recovery) = &record.recovery {
+            candidate.snapshot.reference_provenance = recovery.native_reference_provenance;
+        }
+        candidate.last_native_report = record.native_identity_ordering;
+    }
+
     async fn commit_runtime_transition(
         &self,
         id: &SessionId,
@@ -4052,6 +4137,10 @@ impl SessionRegistry {
         mut candidate: SessionEntry,
         metadata_policy: RuntimeMetadataPolicy,
     ) -> RuntimeTransitionOutcome {
+        if metadata_policy == RuntimeMetadataPolicy::Terminal {
+            self.import_final_native_reference(id, expected, &mut candidate)
+                .await;
+        }
         preserve_durable_transition_metadata(durable_base, &mut candidate, metadata_policy);
         let mut record = Self::session_record(id, &candidate, candidate.desired_state, None);
         crate::store::preserve_newer_native_identity(durable_base, &mut record);
@@ -4632,6 +4721,7 @@ type WorkerMetadataFingerprint = (
     Option<pohunek_worker_protocol::ReportedLaunchIdentity>,
     Option<pohunek_worker_protocol::ActiveIdentityClaim>,
     Option<pohunek_worker_protocol::ReleasedIdentityClaim>,
+    Option<pohunek_worker_protocol::ReportedNativeReference>,
     Vec<pohunek_worker_protocol::SubagentSnapshot>,
 );
 
@@ -4749,12 +4839,17 @@ fn worker_metadata_fingerprint(
         snapshot.launch_identity.clone(),
         snapshot.active_identity.clone(),
         snapshot.active_identity_release.clone(),
+        snapshot.native_reference.clone(),
         snapshot.subagents.clone(),
     )
 }
 
 fn worker_metadata_is_empty(identity: &WorkerMetadataFingerprint) -> bool {
-    identity.0.is_none() && identity.1.is_none() && identity.2.is_none() && identity.3.is_empty()
+    identity.0.is_none()
+        && identity.1.is_none()
+        && identity.2.is_none()
+        && identity.3.is_none()
+        && identity.4.is_empty()
 }
 
 fn identity_claim_expiry_is_valid(value: &str) -> bool {
@@ -5359,14 +5454,18 @@ fn report_seq_is_newer(current: Option<u64>, incoming: Option<u64>) -> bool {
     }
 }
 
+/// Whether a report of `transport` stamped `sequence` is newer than the last
+/// accepted one.
+///
+/// A sequence is only compared with the high-water mark of its own transport
+/// in its own runtime generation.
 fn native_report_is_current(
     current: Option<&NativeIdentityReport>,
     worker_instance_id: &str,
     sequence: u64,
+    transport: ReportTransport,
 ) -> bool {
-    current.is_none_or(|current| {
-        current.worker_instance_id != worker_instance_id || sequence > current.sequence
-    })
+    current.is_none_or(|current| current.admits(worker_instance_id, transport, sequence))
 }
 
 fn release_matches(

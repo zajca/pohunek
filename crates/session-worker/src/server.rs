@@ -27,9 +27,9 @@ use protocol::{
     ControlWriter, Cursor, DaemonId, DataFrame, DataToken, Dimensions, EventKind, ExitStatus,
     FrameError, FrameHeader, FrameKind, HookAction, HookSchema, Initialize, InspectSnapshot,
     LeaseChallenge, LeaseId, OutputGap, ProcessIdentity as WireProcessIdentity, PtyRelation,
-    ReleasedIdentityClaim, ReportedLaunchIdentity, RequestKind, ResponseKind,
-    RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode, SubagentField,
-    SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
+    ReleasedIdentityClaim, ReportedLaunchIdentity, ReportedNativeReference, RequestKind,
+    ResponseKind, RuntimePhase as WireRuntimePhase, RuntimeScope, SessionId, StreamId, StreamMode,
+    SubagentField, SubagentPhase as WireSubagentPhase, SubagentSequence, SubagentSnapshot,
     TerminalSnapshot as WireTerminalSnapshot, TransactionId, Version, WorkerId, WorkerInstanceId,
     WriteAck, WriteId, ATTACH_SNAPSHOT_VERSION, SUPPORTED_RANGE,
 };
@@ -43,8 +43,8 @@ use tracing::{event, Level};
 
 use crate::identity::{PeerContext, RejectReason};
 use crate::journal::{
-    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, PendingLaunchClaim,
-    ReleasedIdentity, RuntimeOutcome, RuntimePhase as JournalPhase,
+    ActiveIdentity, ChildIdentity, JournalRecord, LaunchIdentity, NativeReferenceClaim,
+    PendingLaunchClaim, ReleasedIdentity, RuntimeOutcome, RuntimePhase as JournalPhase,
     SubagentPhase as JournalSubagentPhase, SubagentRecord, WorkerOrigin,
 };
 use crate::launch::{self, LaunchClaimStatus};
@@ -1691,6 +1691,26 @@ fn release_request(
     Ok(ResponseKind::ControllerReleased)
 }
 
+/// The launch process's latest native reference as the snapshot reports it.
+fn reported_native_reference(
+    state: &State,
+) -> Result<Option<ReportedNativeReference>, ControlError> {
+    state
+        .journal
+        .native_reference_claim
+        .as_ref()
+        .map(|claim| {
+            Ok(ReportedNativeReference {
+                provider: claim.provider.clone(),
+                process: wire_child_identity(&claim.process)?,
+                sequence: claim.sequence,
+                reference_kind: claim.reference_kind.clone(),
+                native_reference: claim.native_reference.clone(),
+            })
+        })
+        .transpose()
+}
+
 async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnapshot, ControlError> {
     let (child_process, dimensions, history_start_offset, next_offset) =
         if let Some(pty) = state.pty.as_ref() {
@@ -1747,6 +1767,7 @@ async fn inspect_snapshot(shared: &Shared, state: &State) -> Result<InspectSnaps
                 })
             })
             .transpose()?,
+        native_reference: reported_native_reference(state)?,
         active_identity_release: state
             .journal
             .active_identity_release
@@ -3157,6 +3178,13 @@ where
                         state.launch_agent_base.as_ref(),
                     ) {
                         if &provider == launch_base {
+                            let reported = NativeReferenceClaim {
+                                provider: provider.clone(),
+                                process: process.clone(),
+                                sequence,
+                                reference_kind: reference_kind.clone(),
+                                native_reference: native_reference.clone(),
+                            };
                             let claim = PendingLaunchClaim {
                                 retry_pending: true,
                                 worker_instance_id,
@@ -3168,6 +3196,8 @@ where
                                     native_reference,
                                 },
                                 expires_at,
+                                sequence,
+                                latest_reference: None,
                             };
                             launch_identity_status = launch::submit(
                                 &mut journal,
@@ -3183,6 +3213,15 @@ where
                                     result
                                 },
                             )?;
+                            // The verified launch process's latest reference is
+                            // journaled apart from the lease-bound active claim.
+                            if journal
+                                .launch_identity
+                                .as_ref()
+                                .is_some_and(|launch| launch.process == reported.process)
+                            {
+                                journal.native_reference_claim = Some(reported);
+                            }
                         }
                     }
                     journal.updated_at = timestamp();
@@ -4859,6 +4898,75 @@ mod tests {
                 .format(&time::format_description::well_known::Rfc3339).unwrap(),
             "reference_kind": "id", "native_reference": reference,
         })
+    }
+
+    #[tokio::test]
+    async fn the_launch_processs_latest_reference_outlives_the_claim_lease_and_its_release() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        assert!(send_hook(&server, &pty, launch_report(&pty, 1, "first")).await);
+        assert!(send_hook(&server, &pty, launch_report(&pty, 2, "switched")).await);
+
+        let state = server.shared.state.lock().await;
+        let claim = state.journal.native_reference_claim.as_ref().unwrap();
+        assert_eq!(
+            (claim.native_reference.as_str(), claim.sequence),
+            ("switched", 2)
+        );
+        assert_eq!(
+            state
+                .journal
+                .launch_identity
+                .as_ref()
+                .unwrap()
+                .native_reference,
+            "first",
+            "the launch identity stays the first claim"
+        );
+        drop(state);
+
+        // The active claim's lease ends and the claim is released: only the
+        // lease-bound projection disappears.
+        let release = serde_json::json!({
+            "type": "identity_release", "provider": "claude", "sequence": 3,
+        });
+        assert!(send_hook(&server, &pty, release).await);
+        let mut state = server.shared.state.lock().await;
+        assert!(state.journal.active_identity.is_none());
+        state.journal.active_identity = None;
+        let snapshot = super::inspect_snapshot(&server.shared, &state)
+            .await
+            .unwrap();
+        assert!(snapshot.active_identity.is_none());
+        let reference = snapshot.native_reference.expect("journaled reference");
+        assert_eq!(reference.native_reference, "switched");
+        assert_eq!(reference.sequence, 2);
+        drop(state);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_report_of_another_process_never_becomes_the_launch_reference() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        assert!(send_hook(&server, &pty, launch_report(&pty, 1, "first")).await);
+        let mut other = launch_report(&pty, 2, "nested");
+        other["provider"] = "codex".into();
+        send_hook(&server, &pty, other).await;
+        let state = server.shared.state.lock().await;
+        assert_eq!(
+            state
+                .journal
+                .native_reference_claim
+                .as_ref()
+                .unwrap()
+                .native_reference,
+            "first"
+        );
+        drop(state);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

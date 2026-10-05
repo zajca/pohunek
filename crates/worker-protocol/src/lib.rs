@@ -37,8 +37,8 @@ pub use control::{
     ControlMessage, ControlRequest, ControlResponse, ControlTypeError, Dimensions, EventKind,
     ExitStatus, Initialize, InitializeLimits, InputFragment, InputPlan, InspectSnapshot,
     LaunchIdentity, OutputGap, ProcessIdentity, ReleasedIdentityClaim, ReportedLaunchIdentity,
-    RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope, StopPolicy, StopRequest,
-    StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
+    ReportedNativeReference, RequestKind, ResizeRequest, ResponseKind, RuntimePhase, RuntimeScope,
+    StopPolicy, StopRequest, StreamMode, SubagentPhase, SubagentSnapshot, WriteAck,
 };
 #[doc(inline)]
 pub use data::{

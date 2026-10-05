@@ -234,7 +234,25 @@ impl RuntimeSource for FixtureSource {
 /// Panics when the registry cannot be built, which would be a defect of the
 /// fixture.
 pub(crate) fn pi_shaped_hooked_host(program: &Path, existence: &str) -> RuntimeHost {
-    let document = with_integration(&pi_shaped_document(program, existence));
+    pi_shaped_hooked_host_as(program, existence, PI_SHAPED_ID)
+}
+
+/// Like [`pi_shaped_hooked_host`], with the fixture runtime named
+/// `runtime_id`.
+///
+/// # Panics
+///
+/// Panics when the registry cannot be built, which would be a defect of the
+/// fixture.
+pub(crate) fn pi_shaped_hooked_host_as(
+    program: &Path,
+    existence: &str,
+    runtime_id: &str,
+) -> RuntimeHost {
+    let document = with_integration(&pi_shaped_document(program, existence).replace(
+        &format!("id = \"{PI_SHAPED_ID}\""),
+        &format!("id = \"{runtime_id}\""),
+    ));
     let definition = RuntimeDefinition::from_toml(
         &document,
         |package| DefinitionOrigin::Package {

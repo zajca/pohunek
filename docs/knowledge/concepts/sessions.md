@@ -657,9 +657,29 @@ closed with `agent_native_reference_missing` instead of launching an agent into
 an empty conversation; a runtime that declares `check = "none"` is relaunched
 unchecked. Recovery never falls back to another runtime, the shell or
 "continue latest". A fork of an assigned reference holds no reference of its
-own and is not resumable. That a later validated report supersedes an assigned
-reference, with `/clear` switching covered by tests, ships with the
-integration-report work; the public API reference has the field-level contract.
+own and is not resumable. A later validated report always supersedes an
+assigned reference: an assigned runtime that declares an integration handler and
+hook schema may report, and the report replaces the stored value and its
+provenance (`reported`) in the session, its durable record and its resume
+binding, so `/clear` and in-session resume are followed and `session.resume` and
+`session.fork` launch with the reported conversation. The existence check runs
+only for a still-assigned reference. A report must pass the usual checks (the
+process-identity, sequence and expiry checks for `session.report_native_id`, the
+launch process and sequence for the worker's active identity), a stale or
+refused one leaves the stored reference alone, and an assigned value never
+replaces a reported one, also across a daemon restart. Sequences are compared per
+transport (worker claim or public report) and per runtime generation, so one
+clock never makes the other stale, and a recovered generation's first claim
+supersedes the reference it was relaunched with. The worker journals the latest
+reference of the verified launch process apart from the active claim's lease, so
+a switch made while the daemon was down survives the lease, and every
+replacement carries an ordering key that decides record-versus-projection
+reconciliation: the newer key wins and an unkeyed side loses to a keyed one. A
+session whose runtime ended while the daemon was down imports that reference too,
+when it belongs to the record's own worker instance and the verified launch
+process; a report that arrives while the worker is still verifying the launch
+process is promoted with the claim. The public API reference
+has the field-level contract.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
 `session.fork` creates a new pohunek session id and PTY from the source session's

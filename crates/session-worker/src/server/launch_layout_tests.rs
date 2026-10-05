@@ -177,6 +177,8 @@ fn claim(provider: &str, pid: Pid, start: u64) -> PendingLaunchClaim {
             native_reference: "ref".to_owned(),
         },
         expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        sequence: 0,
+        latest_reference: None,
     }
 }
 

@@ -159,6 +159,37 @@ impl Debug for LaunchIdentity {
     }
 }
 
+/// Latest native reference the verified launch process reported.
+///
+/// Unlike [`ActiveIdentity`] it has no lease and survives an explicit release:
+/// it is the durable fact a daemon that was absent reads to learn a
+/// conversation switch.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeReferenceClaim {
+    /// Provider base.
+    pub provider: String,
+    /// Verified launch process that reported it.
+    pub process: ChildIdentity,
+    /// Monotonic hook sequence of the report.
+    pub sequence: u64,
+    /// Native recovery reference kind.
+    pub reference_kind: String,
+    /// Provider-native recovery reference.
+    pub native_reference: String,
+}
+
+impl Debug for NativeReferenceClaim {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeReferenceClaim")
+            .field("provider", &self.provider)
+            .field("process", &self.process)
+            .field("sequence", &self.sequence)
+            .field("reference_kind", &self.reference_kind)
+            .field("native_reference", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Latest sanitized active provider claim.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveIdentity {
@@ -209,6 +240,43 @@ pub struct PendingLaunchClaim {
     pub identity: LaunchIdentity,
     /// Original hook claim's RFC 3339 expiry.
     pub expires_at: String,
+    /// Hook sequence of the original claim; zero for a claim journaled before
+    /// the field existed.
+    #[serde(default)]
+    pub sequence: u64,
+    /// Latest reference the same process reported while verification was
+    /// pending; promoted with the claim when verification succeeds.
+    #[serde(default)]
+    pub latest_reference: Option<NativeReferenceClaim>,
+}
+
+impl PendingLaunchClaim {
+    /// The reference this claim journals as the launch process's latest once
+    /// it is verified.
+    #[must_use]
+    pub fn promoted_reference(&self) -> NativeReferenceClaim {
+        self.latest_reference
+            .clone()
+            .unwrap_or_else(|| NativeReferenceClaim {
+                provider: self.identity.provider.clone(),
+                process: self.identity.process.clone(),
+                sequence: self.sequence,
+                reference_kind: self.identity.reference_kind.clone(),
+                native_reference: self.identity.native_reference.clone(),
+            })
+    }
+
+    /// Records `reported` as the latest reference of this claim's process when
+    /// it is newer than the one held.
+    pub fn note_report(&mut self, reported: NativeReferenceClaim) {
+        let held = self
+            .latest_reference
+            .as_ref()
+            .map_or(self.sequence, |latest| latest.sequence);
+        if reported.sequence > held {
+            self.latest_reference = Some(reported);
+        }
+    }
 }
 
 /// Durable ordering tombstone for an accepted active-identity release.
@@ -324,6 +392,10 @@ pub struct JournalRecord {
     /// Latest accepted release, distinguishing explicit release from no report.
     #[serde(default)]
     pub active_identity_release: Option<ReleasedIdentity>,
+    /// Latest native reference of the verified launch process, independent of
+    /// the active claim's lease and release.
+    #[serde(default)]
+    pub native_reference_claim: Option<NativeReferenceClaim>,
     /// Worker-owned revision assigned to the next subagent mutation.
     #[serde(default)]
     pub subagent_revision: u64,
@@ -365,6 +437,7 @@ impl Debug for JournalRecord {
             .field("pending_launch_claims", &self.pending_launch_claims)
             .field("active_identity", &self.active_identity)
             .field("active_identity_release", &self.active_identity_release)
+            .field("native_reference_claim", &self.native_reference_claim)
             .field("subagent_revision", &self.subagent_revision)
             .field("subagents", &self.subagents)
             .field("hook_schema", &self.hook_schema)
@@ -413,6 +486,7 @@ impl JournalRecord {
             pending_launch_claims: Vec::new(),
             active_identity: None,
             active_identity_release: None,
+            native_reference_claim: None,
             subagent_revision: 0,
             subagents: Vec::new(),
             hook_schema: None,
@@ -663,6 +737,8 @@ mod tests {
                 root: record.launch_identity.as_ref().unwrap().process.clone(),
                 identity: record.launch_identity.as_ref().unwrap().clone(),
                 expires_at: "2026-07-23T00:01:00Z".to_owned(),
+                sequence: 0,
+                latest_reference: None,
             });
         record.active_identity_release = Some(ReleasedIdentity {
             provider: "claude".to_owned(),

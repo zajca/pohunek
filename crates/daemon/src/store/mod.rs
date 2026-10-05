@@ -586,8 +586,119 @@ pub struct NativeIdentityOrdering {
     pub pid: u32,
     /// Kernel start identity that protects against pid reuse.
     pub pid_start_identity: u64,
-    /// Highest accepted monotonic sequence for this runtime.
-    pub sequence: u64,
+    /// Highest accepted `session.report_native_id` sequence for this runtime;
+    /// absent while no public report was accepted, which is not sequence 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// Highest accepted worker identity-claim sequence for this runtime.
+    ///
+    /// The shipped adapters stamp worker claims and public reports from
+    /// different clocks, so each transport keeps its own high-water mark and
+    /// a sequence is only ever compared with the mark of its own transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_sequence: Option<u64>,
+}
+
+/// Path a provider-native identity report reached the daemon by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportTransport {
+    /// `session.report_native_id` on the daemon socket.
+    Public,
+    /// The worker's journaled identity claim, imported from its snapshot.
+    Worker,
+}
+
+impl NativeIdentityOrdering {
+    /// Whether a report of `transport` stamped `sequence` for runtime
+    /// generation `worker_instance_id` is newer than this key.
+    #[must_use]
+    pub fn admits(
+        &self,
+        worker_instance_id: &str,
+        transport: ReportTransport,
+        sequence: u64,
+    ) -> bool {
+        if self.worker_instance_id != worker_instance_id {
+            return true;
+        }
+        match transport {
+            ReportTransport::Public => self.sequence.is_none_or(|mark| sequence > mark),
+            ReportTransport::Worker => self.worker_sequence.is_none_or(|mark| sequence > mark),
+        }
+    }
+
+    /// The key after accepting such a report: the high-water mark of its
+    /// transport advances, the other transport's mark is kept for the same
+    /// generation and starts empty for a new one.
+    #[must_use]
+    pub fn accepting(
+        current: Option<&Self>,
+        worker_instance_id: &str,
+        pid: u32,
+        pid_start_identity: u64,
+        transport: ReportTransport,
+        sequence: u64,
+    ) -> Self {
+        let kept = current.filter(|current| current.worker_instance_id == worker_instance_id);
+        let (public, worker) =
+            kept.map_or((None, None), |kept| (kept.sequence, kept.worker_sequence));
+        let (public, worker) = match transport {
+            ReportTransport::Public => (Some(sequence), worker),
+            ReportTransport::Worker => (public, Some(sequence)),
+        };
+        Self {
+            worker_instance_id: worker_instance_id.to_owned(),
+            pid,
+            pid_start_identity,
+            sequence: public,
+            worker_sequence: worker,
+        }
+    }
+
+    /// The key after accepting a public report that the daemon ordered after
+    /// the worker claim it observed, numbered `observed_worker_sequence`.
+    ///
+    /// The worker mark rises to the observed claim, so that claim, imported
+    /// later, is older than the public report and never replaces it. The order
+    /// of the two transports is fixed here, at acceptance, not compared later.
+    #[must_use]
+    pub fn accepting_public(
+        current: Option<&Self>,
+        worker_instance_id: &str,
+        pid: u32,
+        pid_start_identity: u64,
+        sequence: u64,
+        observed_worker_sequence: Option<u64>,
+    ) -> Self {
+        let mut key = Self::accepting(
+            current,
+            worker_instance_id,
+            pid,
+            pid_start_identity,
+            ReportTransport::Public,
+            sequence,
+        );
+        key.worker_sequence = key.worker_sequence.max(observed_worker_sequence);
+        key
+    }
+
+    /// A key that names a runtime generation and holds no report mark yet, so
+    /// any real report of that generation is newer than it.
+    #[must_use]
+    pub fn unsequenced(worker_instance_id: &str, pid: u32, pid_start_identity: u64) -> Self {
+        Self {
+            worker_instance_id: worker_instance_id.to_owned(),
+            pid,
+            pid_start_identity,
+            sequence: None,
+            worker_sequence: None,
+        }
+    }
+
+    /// Whether `self` is ahead of `other` in at least one transport.
+    fn is_ahead_of(&self, other: &Self) -> bool {
+        self.sequence > other.sequence || self.worker_sequence > other.worker_sequence
+    }
 }
 
 /// Durable logical session authority.
@@ -1471,18 +1582,21 @@ pub(crate) fn preserve_newer_native_identity(
     }
     if let Some(candidate) = replacement
         .native_identity_ordering
-        .as_ref()
-        .filter(|candidate| {
-            candidate.worker_instance_id == ordering.worker_instance_id
-                && candidate.sequence >= ordering.sequence
-        })
+        .as_mut()
+        .filter(|candidate| candidate.worker_instance_id == ordering.worker_instance_id)
     {
-        if candidate.sequence > ordering.sequence {
+        if candidate.is_ahead_of(ordering) {
+            // The writer saw something newer; marks of the transport it did
+            // not advance still carry what the store already accepted.
+            candidate.sequence = candidate.sequence.max(ordering.sequence);
+            candidate.worker_sequence = candidate.worker_sequence.max(ordering.worker_sequence);
             return;
         }
-        replacement.native_identity_ordering = Some(ordering.clone());
-        preserve_nonempty_native_identity(existing, replacement);
-        return;
+        if !ordering.is_ahead_of(candidate) {
+            replacement.native_identity_ordering = Some(ordering.clone());
+            preserve_nonempty_native_identity(existing, replacement);
+            return;
+        }
     }
 
     replacement.native_identity_ordering = Some(ordering.clone());
@@ -1843,11 +1957,32 @@ mod tests {
             worker_instance_id: "instance-1".to_owned(),
             pid: 7,
             pid_start_identity: 9,
-            sequence: 3,
+            sequence: Some(3),
+            worker_sequence: None,
         };
         let encoded = serde_json::to_value(&ordering).expect("encode ordering");
         assert_eq!(encoded["runtime_id"], "instance-1");
         assert!(encoded.get("worker_instance_id").is_none());
+
+        // An ordering key written by schema 3 has a public mark and no worker
+        // mark; one that only saw a worker claim has no public mark at all.
+        let schema3: NativeIdentityOrdering = serde_json::from_value(serde_json::json!({
+            "runtime_id": "instance-1", "pid": 7, "pid_start_identity": 9, "sequence": 3
+        }))
+        .expect("decode a schema 3 ordering");
+        assert_eq!((schema3.sequence, schema3.worker_sequence), (Some(3), None));
+        let worker_only: NativeIdentityOrdering = serde_json::from_value(serde_json::json!({
+            "runtime_id": "instance-1", "pid": 7, "pid_start_identity": 9, "worker_sequence": 5
+        }))
+        .expect("decode a worker-only ordering");
+        assert_eq!(
+            (worker_only.sequence, worker_only.worker_sequence),
+            (None, Some(5))
+        );
+        assert!(serde_json::to_value(&worker_only)
+            .expect("encode")
+            .get("sequence")
+            .is_none());
 
         let transaction: SessionTransaction = serde_json::from_value(serde_json::json!({
             "id": "t-1",
@@ -2105,7 +2240,7 @@ mod tests {
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"}]}}"#,
             "\n"
@@ -2121,7 +2256,7 @@ mod tests {
     fn resume_line_pairing_an_assignment_with_a_path_kind_is_dropped() {
         let store = Store::new(temp_store_path("resume-assigned-path-corrupt"));
         let corrupt = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-bad","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
             r#""native_launch":{"reference_kind":"path","resume_args":[{"literal":"--session"},"reference"],"#,
             r#""assigned":{"launch_args":[{"literal":"--session-id"},"reference"],"existence":{"check":"none"}}}}"#,
@@ -2160,7 +2295,7 @@ mod tests {
     fn resume_provenance_defaults_to_reported_and_roundtrips_when_assigned() {
         let store = Store::new(temp_store_path("resume-provenance"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
             "\n"
         );
@@ -2195,7 +2330,7 @@ mod tests {
     fn profile_revision_is_absent_by_default_and_round_trips_as_hex() {
         let store = Store::new(temp_store_path("resume-profile-revision"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-legacy","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"n"}"#,
             "\n"
         );
@@ -2231,7 +2366,7 @@ mod tests {
         for malformed in ["\"nothex\"", "\"ABCDEF\"", "7"] {
             let line = format!(
                 concat!(
-                    r#"{{"kind":"resume","schema_version":3,"session_id":"s-bad","agent":"claude","#,
+                    r#"{{"kind":"resume","schema_version":4,"session_id":"s-bad","agent":"claude","#,
                     r#""agent_base":"claude","cwd":"/w","cols":80,"rows":24,"native_session_id":"n","#,
                     r#""profile_revision":{}}}"#,
                     "\n"
@@ -2286,7 +2421,7 @@ mod tests {
         // than inferring current compiled provider behavior.
         let store = Store::new(temp_store_path("resume-legacy"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-old"}"#,
             "\n"
         );
@@ -2310,10 +2445,10 @@ mod tests {
     fn resume_legacy_line_without_agent_base_infers_base_kind_from_agent_name() {
         let store = Store::new(temp_store_path("resume-legacy-agent-base"));
         let legacy = concat!(
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-codex","agent":"codex","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-codex","agent":"codex","#,
             r#""cwd":"/w","cols":80,"rows":24,"native_session_id":"native-codex"}"#,
             "\n",
-            r#"{"kind":"resume","schema_version":3,"session_id":"s-claude","agent":"claude","#,
+            r#"{"kind":"resume","schema_version":4,"session_id":"s-claude","agent":"claude","#,
             r#""cwd":"/w","cols":100,"rows":30,"native_session_id":"native-claude"}"#,
             "\n"
         );
@@ -2350,7 +2485,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":3,"session_id":"s-future","agent":"future-agent","#,
+                r#"{"kind":"resume","schema_version":4,"session_id":"s-future","agent":"future-agent","#,
                 r#""agent_base":"Future Agent","cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2391,7 +2526,7 @@ mod tests {
         write_private(
             &path,
             concat!(
-                r#"{"kind":"resume","schema_version":3,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
+                r#"{"kind":"resume","schema_version":4,"session_id":"s-old","agent":"claude","agent_base":"claude","#,
                 r#""cwd":"/w","cols":80,"rows":24}"#,
                 "\n"
             ),
@@ -2859,7 +2994,7 @@ mod tests {
         // still loads, defaulting project_id to None — the store's only
         // compatibility concession (serde default), not a guarantee.
         let legacy = concat!(
-            r#"{"kind":"worktree","schema_version":3,"session_id":"s-2","repository":"/r","branch":"feat/y","#,
+            r#"{"kind":"worktree","schema_version":4,"session_id":"s-2","repository":"/r","branch":"feat/y","#,
             r#""base_branch":"main","branch_slug":"feat-y","path":"/p","status":"active","#,
             r#""created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"}"#,
             "\n"

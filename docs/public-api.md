@@ -886,7 +886,9 @@ terminal launch and activity detection. It gets resume and fork only when its
 agent CLI accepts a caller-chosen session id and the definition declares
 `strategy = "assigned"`; with `hook` or `none` it is not resumable. A package
 cannot obtain a reference through `session.report_native_id`, because that
-method accepts only a report from the launch process itself.
+method accepts only a report from the launch process itself; an `assigned`
+runtime that declares an integration also takes reported references (see
+below).
 
 `assigned` takes, in addition to a supported `[resume]` with
 `reference_kind = "id"` (core can generate an id, not a path):
@@ -950,10 +952,43 @@ max_depth = 1                                    # directory levels below dir
 - A host profile on an `assigned` base inherits the assignment; one that
   restates `[resume]` is rejected with `invalid_profile`, and
   `resumable = false` switches recovery off (no reference is generated).
-- Not yet shipped: the handling of `/clear`-style conversation switches, where
-  a later `reported` reference supersedes an assigned one, with its fixture
-  tests, lands with the integration-report work (#144, #52). A package without
-  an integration cannot send a report.
+- A reported reference always supersedes an assigned one. An `assigned`
+  runtime that also declares an `[integration]` handler and hook schema may
+  report, and the report replaces the stored value and sets the provenance to
+  `reported` in the session, its durable record and its resume binding, so a
+  `/clear` or in-session resume inside the agent is followed instead of
+  leaving a stale id. Two reports reach the daemon. `session.report_native_id`
+  replaces the reference when it passes the usual process-identity, expiry and
+  sequence checks (a refused report leaves the assigned reference in place). The
+  worker's launch claim replaces it even when the value is equal, which only
+  confirms it, and the worker's journaled native reference replaces it: the
+  worker keeps the latest reference reported by the verified launch process
+  (below a wrapper process, the provider process it verified) with its hook
+  sequence, independently of the active claim's lease and of a release, so a
+  switch made while the daemon was down is still read when it returns. The
+  reference must name the runtime itself, never a nested process, carry the
+  declared reference kind and be newer than the last worker report accepted for
+  the runtime generation. The journaled reference is trusted by its generation binding (the record's own worker instance and the verified launch process), never by whether that process or its wrapper is still alive; an exit, an explicit stop and a lost worker read the generation's final snapshot before they commit. A public report is ordered against the worker's journaled claim at acceptance: the daemon inspects the worker first, and the observed claim is older than the report whether or not it was imported yet (a worker that cannot be inspected makes the report retryable). A worker that crashed or is unreachable still hands over the reference of its own generation's journal when the session is classified, stopped or reconciled. A report of the launch process that arrives while the
+  worker is still verifying it is kept and promoted with the claim, and a
+  session whose runtime ended while the daemon was down imports the journaled
+  reference too, when it belongs to the record's own worker instance and the
+  verified launch process. A worker that journals no such reference is read
+  through its launch and active claims instead, for as long as the active
+  claim's lease lasts. Every replacement carries an ordering key, and a
+  recovered session keeps the key of the reference it recovers. Sequences are compared only within one transport and one runtime generation
+  (the shipped adapters stamp worker claims and public reports from different
+  clocks), so a public report is never stale because of a worker claim or the
+  other way round, and a recovered or restarted generation starts fresh: its
+  first launch claim supersedes the reference it was relaunched with. A report
+  older than the stored one of its own transport, an expired or overlong
+  claim, or a claim from another runtime never replaces a reference, and
+  an assigned value never replaces a reported one: relaunches, daemon restarts
+  and rebinding start from the stored reported reference. Resume and fork then
+  launch with the reported reference. The existence check runs only for an
+  `assigned` reference, so a reported one is recovered unchecked, as the agent
+  vouched for it. A runtime that declares `hook` keeps its existing import
+  rules. A package without an integration cannot send a report, so its
+  reference stays `assigned`.
 - A forked session of an assigned reference still shows the frozen
   `capabilities.resume = true` but holds no reference, so `session.resume`
   answers `not_resumable` for it.
