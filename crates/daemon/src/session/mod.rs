@@ -5204,25 +5204,57 @@ impl SessionRegistry {
         agent_base: &RuntimeRef,
         pin: &crate::agent::host::LaunchPin,
     ) -> Option<&'static pohunek_worker_protocol::HookSchema> {
-        match self
-            .inner
-            .profiles
-            .runtimes()
-            .definition_for_pin(agent_base, pin)
-        {
-            Ok(definition) => definition.hook_schema(),
-            Err(error) => {
-                if let Some(schema) = self.inner.profiles.runtimes().legacy_hook_schema(pin) {
-                    return Some(schema);
-                }
-                debug!(
-                    runtime = %agent_kind_label(agent_base),
-                    error = %error,
-                    "the session runtime has no resolvable hook schema"
-                );
-                None
-            }
+        let lookup = runtime_hook_schema(self.inner.profiles.runtimes(), agent_base, pin);
+        if let HookSchemaLookup::Unresolved(error) = &lookup {
+            debug!(
+                runtime = %agent_kind_label(agent_base),
+                error = %error,
+                "the session runtime has no resolvable hook schema"
+            );
         }
+        lookup.schema()
+    }
+}
+
+/// What the runtime definitions say about a session's hook schema.
+#[derive(Debug)]
+enum HookSchemaLookup {
+    /// The runtime declares this schema.
+    Schema(&'static pohunek_worker_protocol::HookSchema),
+    /// The runtime resolves and declares no integration.
+    NoIntegration,
+    /// The runtime or its pinned definition cannot be resolved.
+    Unresolved(ProtocolError),
+}
+
+impl HookSchemaLookup {
+    /// The schema, if one was found.
+    fn schema(&self) -> Option<&'static pohunek_worker_protocol::HookSchema> {
+        match self {
+            Self::Schema(schema) => Some(schema),
+            Self::NoIntegration | Self::Unresolved(_) => None,
+        }
+    }
+}
+
+/// Resolves the hook schema of a session of `agent_base` pinned by `pin` from
+/// `runtimes` alone.
+///
+/// Startup adoption and the upgrade preflight both decide through this, so a
+/// worker that journals no schema is validated with the same one.
+fn runtime_hook_schema(
+    runtimes: &crate::agent::host::RuntimeHost,
+    agent_base: &RuntimeRef,
+    pin: &crate::agent::host::LaunchPin,
+) -> HookSchemaLookup {
+    match runtimes.definition_for_pin(agent_base, pin) {
+        Ok(definition) => definition
+            .hook_schema()
+            .map_or(HookSchemaLookup::NoIntegration, HookSchemaLookup::Schema),
+        Err(error) => runtimes.legacy_hook_schema(pin).map_or(
+            HookSchemaLookup::Unresolved(error),
+            HookSchemaLookup::Schema,
+        ),
     }
 }
 

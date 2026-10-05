@@ -91,13 +91,24 @@ impl Host {
 
     /// Writes a live session through the daemon's store and the worker's journal.
     fn seed_live_session(&self, broken_record: bool) {
+        self.seed_session(broken_record, false);
+    }
+
+    /// Like [`Self::seed_live_session`]; with `reported_identity` the session
+    /// is a `claude` agent whose worker journaled the active identity it reported.
+    fn seed_session(&self, broken_record: bool, reported_identity: bool) {
         let executable = self.root.join("libexec/pohunek-sessiond");
+        let mut info = session_info();
+        if reported_identity {
+            "claude".clone_into(&mut info.agent);
+            info.agent_base = RuntimeRef::claude();
+        }
         let record = SessionRecord {
             schema_version: pohunek_daemon::store::STORE_SCHEMA_VERSION,
             session_id: SESSION.to_owned(),
             desired_state: DesiredState::Running,
             transaction: None,
-            info: session_info(),
+            info,
             recovery: None,
             native_identity_ordering: None,
             runtime: RuntimeRecord {
@@ -145,6 +156,23 @@ impl Host {
             process_group: 0,
             start_identity: own.start_identity.to_string(),
         });
+        if reported_identity {
+            let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("format expiry");
+            journal.active_identity =
+                journal
+                    .child
+                    .clone()
+                    .map(|process| pohunek_session_worker::ActiveIdentity {
+                        provider: "claude".to_owned(),
+                        process,
+                        sequence: 1,
+                        expires_at,
+                        reference_kind: Some("id".to_owned()),
+                        native_reference: Some("native-reported".to_owned()),
+                    });
+        }
         let path = self
             .context
             .paths()
@@ -305,4 +333,29 @@ async fn a_missing_daemon_is_a_staged_binary_error() {
         .expect_err("no daemon to ask");
 
     assert!(matches!(error, Error::StagedBinary { .. }), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_live_agent_session_that_reported_its_identity_is_adoptable_under_the_real_daemon() {
+    let host = Host::new();
+    host.seed_session(false, true);
+    let archive = host.archive();
+
+    let gated = gate(&DaemonPreflight, &host.context, &archive, VERSION, false)
+        .await
+        .expect("a reported active identity is the normal case and passes the gate");
+
+    let verdicts: Vec<_> = gated
+        .report
+        .sessions
+        .iter()
+        .map(|session| {
+            (
+                session.session_id.as_str(),
+                session.verdict,
+                session.code.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(verdicts, [(SESSION, Verdict::Adoptable, "adoptable")]);
 }

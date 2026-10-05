@@ -15107,6 +15107,10 @@ handler = "codex-hook-v1"
 
     /// What startup reconciliation does with one worker and record, against
     /// what the upgrade preflight says about the same files.
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "each flag is one independent column of the case table"
+    )]
     struct Differential {
         name: &'static str,
         /// Whether the worker is initialized; an uninitialized one is still in
@@ -15118,6 +15122,9 @@ handler = "codex-hook-v1"
         damage_store: fn(&Path),
         /// Replaces the journal file with these bytes instead of editing it.
         journal_bytes: Option<&'static [u8]>,
+        /// Whether the worker runs a `claude` agent that reported its active
+        /// identity, so its journal carries one.
+        reports_identity: bool,
         /// Whether the preflight must call the session adoptable.
         preflight_adoptable: bool,
         /// Whether reconciliation adopts the worker live.
@@ -15125,6 +15132,33 @@ handler = "codex-hook-v1"
     }
 
     fn untouched_record(_: &mut SessionRecord) {}
+
+    /// Rebinds the record to the built-in `claude` runtime.
+    fn claude_record(record: &mut SessionRecord) {
+        record.info.agent = "claude".to_owned();
+        record.info.agent_base = RuntimeRef::claude();
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.agent = "claude".to_owned();
+        recovery.agent_base = RuntimeRef::claude();
+    }
+
+    /// Rebinds the record to a runtime no definition backs.
+    fn unreadable_runtime_record(record: &mut SessionRecord) {
+        let unknown = RuntimeRef::from_wire("acme-agent");
+        record.info.agent = "acme-agent".to_owned();
+        record.info.agent_base = unknown.clone();
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.agent = "acme-agent".to_owned();
+        recovery.agent_base = unknown;
+    }
+
+    /// Drops the hook schema id the worker journaled.
+    fn without_schema(journal: &mut serde_json::Value) {
+        journal
+            .as_object_mut()
+            .expect("journal object")
+            .remove("hook_schema");
+    }
 
     /// Cuts the store file in the middle of its only line.
     fn truncate_store(path: &Path) {
@@ -15154,6 +15188,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: true,
                 reconcile_live: true,
             },
@@ -15166,6 +15201,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15176,6 +15212,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15190,6 +15227,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15209,6 +15247,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15219,6 +15258,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15229,6 +15269,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15239,6 +15280,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15258,6 +15300,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15268,6 +15311,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: |_| {},
                 journal_bytes: Some(b"not json"),
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15278,6 +15322,7 @@ handler = "codex-hook-v1"
                 edit_journal: |journal| journal["schema_version"] = serde_json::json!(3),
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15288,6 +15333,7 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: truncate_store,
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
             },
@@ -15298,8 +15344,46 @@ handler = "codex-hook-v1"
                 edit_journal: untouched_journal,
                 damage_store: truncate_store,
                 journal_bytes: Some(b"not json"),
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: false,
+            },
+            Differential {
+                name: "a built-in runtime that reported its active identity",
+                initialized: true,
+                edit_record: claude_record,
+                edit_journal: untouched_journal,
+                damage_store: |_| {},
+                journal_bytes: None,
+                reports_identity: true,
+                preflight_adoptable: true,
+                reconcile_live: true,
+            },
+            // A worker that journals no schema is validated with the schema its
+            // runtime declares.
+            Differential {
+                name: "a built-in runtime whose journal carries no hook schema",
+                initialized: true,
+                edit_record: claude_record,
+                edit_journal: without_schema,
+                damage_store: |_| {},
+                journal_bytes: None,
+                reports_identity: true,
+                preflight_adoptable: true,
+                reconcile_live: true,
+            },
+            // The definition of an unresolvable runtime cannot supply a schema;
+            // reconciliation still holds the live worker's own.
+            Differential {
+                name: "a runtime whose definition cannot be read and a journal without a schema",
+                initialized: true,
+                edit_record: unreadable_runtime_record,
+                edit_journal: without_schema,
+                damage_store: |_| {},
+                journal_bytes: None,
+                reports_identity: true,
+                preflight_adoptable: false,
+                reconcile_live: true,
             },
             // The preflight reads the journal only; reconciliation asks the
             // live worker, so it stays more pessimistic here.
@@ -15326,6 +15410,7 @@ handler = "codex-hook-v1"
                 },
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: true,
             },
@@ -15339,6 +15424,7 @@ handler = "codex-hook-v1"
                 },
                 damage_store: |_| {},
                 journal_bytes: None,
+                reports_identity: false,
                 preflight_adoptable: false,
                 reconcile_live: true,
             },
@@ -15348,7 +15434,57 @@ handler = "codex-hook-v1"
             let root = temp_root();
             let runtime_root = root.join("runtime/workers");
             let session_id = DIFFERENTIAL_SESSION;
-            let (instance, child_pid, controller, task) = if case.initialized {
+            let (instance, child_pid, controller, task) = if case.reports_identity {
+                let (script, reporters) = identity_reporters(&root, &["agent"]);
+                let command = format!(
+                    "{} printf ready; while :; do sleep 1; done",
+                    reporters[0].launch(&script)
+                );
+                let launch = LaunchIdentity {
+                    agent: "claude".to_owned(),
+                    agent_base: "claude".to_owned(),
+                    reference_kind: None,
+                };
+                let (controller, instance, child_pid, task) = spawn_initialized_worker_with_launch(
+                    &root,
+                    &runtime_root,
+                    session_id,
+                    DIFFERENTIAL_WORKER,
+                    launch,
+                    PathBuf::from("/bin/sh"),
+                    command,
+                )
+                .await;
+                wait_for_directory(&reporters[0].inbox).await;
+                let child = controller
+                    .inspect()
+                    .await
+                    .expect("inspect initialized worker")
+                    .child_process
+                    .expect("worker child identity");
+                let expires_at = (OffsetDateTime::now_utc() + time::Duration::seconds(30))
+                    .format(&Rfc3339)
+                    .expect("format identity expiry");
+                assert!(
+                    send_identity_hook_from(
+                        &reporters[0],
+                        serde_json::json!({
+                            "type": "identity_report",
+                            "runtime_id": instance.as_str(),
+                            "provider": "claude",
+                            "pid": child.pid,
+                            "start_identity": child.start_identity,
+                            "sequence": 1,
+                            "expires_at": expires_at,
+                            "reference_kind": null,
+                            "native_reference": null
+                        }),
+                    )
+                    .await,
+                    "the worker accepts a report from inside the managed PTY"
+                );
+                (Some(instance), child_pid, Some(controller), task)
+            } else if case.initialized {
                 let (controller, instance, child_pid, task) =
                     spawn_initialized_worker(&root, &runtime_root, session_id, DIFFERENTIAL_WORKER)
                         .await;
@@ -15417,6 +15553,7 @@ handler = "codex-hook-v1"
                 &PreflightInputs {
                     store_path: store_path.clone(),
                     worker_state_root: state_root.clone(),
+                    plugins_dir: root.join("state/plugins"),
                 },
                 &crate::procwatch::HostInspector::new(),
             );
@@ -15533,6 +15670,7 @@ handler = "codex-hook-v1"
         let inputs = PreflightInputs {
             store_path,
             worker_state_root: state_root,
+            plugins_dir: root.join("state/plugins"),
         };
         let verdict = |inspector: &dyn ProcessInspector| {
             run(&inputs, inspector)

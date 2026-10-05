@@ -120,6 +120,7 @@ impl Host {
         PreflightInputs {
             store_path: self.store.clone(),
             worker_state_root: self.workers.clone(),
+            plugins_dir: self.env.state_home().join("pohunek").join("plugins"),
         }
     }
 
@@ -705,4 +706,95 @@ fn a_journal_root_that_cannot_be_scanned_is_never_an_empty_adoptable_report() {
         (&Verdict::WouldNotBeAdopted, "evidence_unavailable")
     );
     assert_eq!(report.at_risk().count(), 1);
+}
+
+/// Journals an active identity of `provider` on the PTY root of `journal`, as a
+/// live agent session that reported its native id does.
+fn with_active_identity(journal: &mut Value, provider: &str) {
+    use time::format_description::well_known::Rfc3339;
+    let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(30))
+        .format(&Rfc3339)
+        .expect("format expiry");
+    journal["active_identity"] = json!({
+        "provider": provider,
+        "process": journal["child"].clone(),
+        "sequence": 1,
+        "expires_at": expires_at,
+        "reference_kind": "id",
+        "native_reference": "native-reported",
+    });
+}
+
+/// Rebinds the record of `line` to the runtime `agent`.
+fn rebind_agent(line: &mut Value, agent: &str) {
+    line["info"]["agent"] = json!(agent);
+    line["info"]["agent_base"] = json!(agent);
+    line["recovery"]["agent"] = json!(agent);
+    line["recovery"]["agent_base"] = json!(agent);
+}
+
+#[test]
+fn a_built_in_runtime_that_reported_its_identity_is_adoptable_with_or_without_a_journaled_schema() {
+    for journaled_schema in [false, true] {
+        let host = Host::new();
+        host.write_store(&[session_line("s-1", "w-fixture")]);
+        let mut reported = journal("s-1", "w-fixture");
+        with_active_identity(&mut reported, "claude");
+        if journaled_schema {
+            reported["hook_schema"] = json!("identity-subagent-v1");
+        }
+        host.write_journal("s-1", "w-fixture", &reported);
+
+        let report = host.report();
+
+        assert_eq!(
+            verdict_of(&report, "s-1"),
+            (&Verdict::Adoptable, CODE_ADOPTABLE),
+            "journaled schema: {journaled_schema}: {:?}",
+            report.sessions
+        );
+    }
+}
+
+#[test]
+fn a_runtime_whose_definition_cannot_be_read_stays_unverified() {
+    let host = Host::new();
+    let mut line = session_line("s-1", "w-fixture");
+    rebind_agent(&mut line, "acme-agent");
+    host.write_store(&[line]);
+    let mut reported = journal("s-1", "w-fixture");
+    with_active_identity(&mut reported, "acme-agent");
+    host.write_journal("s-1", "w-fixture", &reported);
+
+    let report = host.report();
+
+    assert_eq!(
+        verdict_of(&report, "s-1"),
+        (&Verdict::WouldNotBeAdopted, "worker_identity_unverified")
+    );
+}
+
+#[test]
+fn reading_runtime_definitions_creates_nothing_even_in_an_existing_plugin_root() {
+    let host = Host::new();
+    host.write_store(&[session_line("s-1", "w-fixture")]);
+    let mut reported = journal("s-1", "w-fixture");
+    with_active_identity(&mut reported, "claude");
+    host.write_journal("s-1", "w-fixture", &reported);
+    let plugins = host.env.state_home().join("pohunek").join("plugins");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&plugins)
+        .expect("create plugin root");
+    let before = host.snapshot();
+
+    let report = host.report();
+
+    assert_eq!(verdict_of(&report, "s-1").0, &Verdict::Adoptable);
+    assert_eq!(
+        host.snapshot(),
+        before,
+        "no packages directory or lock appears"
+    );
 }

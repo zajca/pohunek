@@ -450,6 +450,34 @@ impl Registry {
         Self::open(root, limits)
     }
 
+    /// Opens the registry of an existing plugin root without creating anything.
+    ///
+    /// Returns `None` when the plugin root or its `packages` directory does not
+    /// exist, which is the registry of a host that never installed a package.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError::Unsafe`] or [`RegistryError::Filesystem`] when
+    /// an existing directory cannot be opened safely.
+    pub fn open_existing_at(path: &Path, limits: Limits) -> Result<Option<Self>, RegistryError> {
+        let absent = |error: &FsError| error.io_kind() == Some(ErrorKind::NotFound);
+        let root = match TrustedDir::open_absolute(path, DIRECTORY_MODE) {
+            Ok(root) => root,
+            Err(error) if absent(&error) => return Ok(None),
+            Err(error) => return Err(registry_fs(&error)),
+        };
+        let packages = match root.open_child(PACKAGES_DIR, DIRECTORY_MODE) {
+            Ok(packages) => packages,
+            Err(error) if absent(&error) => return Ok(None),
+            Err(error) => return Err(registry_fs(&error)),
+        };
+        Ok(Some(Self {
+            root,
+            packages,
+            limits,
+        }))
+    }
+
     /// Reads the current record without taking the lock.
     ///
     /// The record is replaced atomically, so the result is one whole
