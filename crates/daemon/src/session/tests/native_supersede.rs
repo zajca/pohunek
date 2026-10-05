@@ -164,6 +164,9 @@ impl Rig {
             .native_session_id
             .clone()
             .expect("the session holds its assigned reference at once");
+        // The launch records its argv line by line; later launches are counted
+        // against a settled first one.
+        wait_for_file_contains(&marker, &format!("{assigned}\n")).await;
         Self {
             marker,
             acks,
