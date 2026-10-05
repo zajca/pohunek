@@ -23,7 +23,7 @@ use tracing::debug;
 
 use crate::agent::host::{
     LaunchProgram, RuntimeDefinition, RuntimeRegistry, VersionProbePolicy, RESERVED_RUNTIME_IDS,
-    SEMVER_PARSER_ID,
+    SEMVER_LINE_PARSER_ID, SEMVER_PARSER_ID,
 };
 use crate::agent::{which_executable, ProfileRegistry, ValidatedLaunchProgram};
 use crate::integration::Home;
@@ -58,9 +58,10 @@ enum VersionProbe<'a> {
     /// Parser id `hermes-v1`: `hermes --version` pinned to the checked-in
     /// compatibility lock release.
     HermesV1,
-    /// Parser id `semver-v1`: the declared arguments print one
-    /// `MAJOR.MINOR.PATCH` release that must lie in the declared range.
-    SemverV1(&'a VersionProbePolicy),
+    /// Parser ids `semver-v1` and `semver-line-v1`: the declared arguments
+    /// print one `MAJOR.MINOR.PATCH` release, bare or inside the declared line
+    /// template, that must lie in the declared range.
+    Declared(&'a VersionProbePolicy),
 }
 
 impl<'a> VersionProbe<'a> {
@@ -69,7 +70,9 @@ impl<'a> VersionProbe<'a> {
     fn for_definition(definition: &'a RuntimeDefinition) -> Option<Self> {
         match definition.version_probe_parser()?.as_str() {
             "hermes-v1" => Some(Self::HermesV1),
-            SEMVER_PARSER_ID => definition.version_probe_policy().map(Self::SemverV1),
+            SEMVER_PARSER_ID | SEMVER_LINE_PARSER_ID => {
+                definition.version_probe_policy().map(Self::Declared)
+            }
             _ => None,
         }
     }
@@ -84,9 +87,11 @@ impl<'a> VersionProbe<'a> {
             Self::HermesV1 => {
                 run_hermes_version_probe(path).and_then(|output| parse_hermes_version(&output))
             }
-            Self::SemverV1(policy) => {
+            Self::Declared(policy) => {
                 run_semver_version_probe(path, policy, launch_path).and_then(|output| {
-                    VersionProbePolicy::parse_output(&output).map(|version| version.to_string())
+                    policy
+                        .read_output(&output)
+                        .map(|version| version.to_string())
                 })
             }
         }
@@ -96,7 +101,7 @@ impl<'a> VersionProbe<'a> {
     fn accepts(self, version: &str) -> bool {
         match self {
             Self::HermesV1 => version == supported_hermes_version(),
-            Self::SemverV1(policy) => crate::agent::host::ProbeVersion::parse(version)
+            Self::Declared(policy) => crate::agent::host::ProbeVersion::parse(version)
                 .is_some_and(|version| policy.supports(version)),
         }
     }
@@ -1926,6 +1931,156 @@ strategy = "none"
         assert_eq!(
             std::fs::read_to_string(&marker).expect("marker"),
             "isolated"
+        );
+    }
+
+    #[test]
+    fn line_probe_reports_each_official_banner_inside_the_declared_range() {
+        let dir = temp_agents_dir();
+        let tool = dir.join("tool");
+        let binary = tool.display().to_string();
+        for (line, banner, version) in [
+            ("codex-cli {version}", "codex-cli 0.160.0", "0.160.0"),
+            (
+                "{version} (Claude Code)",
+                "2.1.289 (Claude Code)",
+                "2.1.289",
+            ),
+            (
+                "Hermes Agent v{version} {annotation}",
+                "Hermes Agent v0.20.0 (2026.8.3)\nProject: /x",
+                "0.20.0",
+            ),
+        ] {
+            let definition = probed_definition(&format!(
+                r#"{{ parser = "semver-line-v1", args = ["--version"], min = "0.1.0", below = "3.0.0", line = "{line}" }}"#
+            ));
+            write_test_executable(&tool, &format!("#!/bin/sh\nprintf '%s\\n' '{banner}'\n"));
+            let runtime = probe_versioned_runtime(
+                "tool",
+                RuntimeRef::from_wire("tool"),
+                &binary,
+                &definition,
+                process_path().as_deref(),
+            );
+            assert_eq!(runtime.version.as_deref(), Some(version), "{line}");
+            assert_eq!(runtime.supported, Some(true), "{line}");
+            assert!(
+                validate_definition_launch(&definition, &binary, process_path().as_deref()).is_ok(),
+                "{line}"
+            );
+
+            let below = probed_definition(&format!(
+                r#"{{ parser = "semver-line-v1", args = ["--version"], min = "0.1.0", below = "0.2.0", line = "{line}" }}"#
+            ));
+            let out_of_range = probe_versioned_runtime(
+                "tool",
+                RuntimeRef::from_wire("tool"),
+                &binary,
+                &below,
+                process_path().as_deref(),
+            );
+            assert_eq!(out_of_range.version.as_deref(), Some(version), "{line}");
+            assert_eq!(out_of_range.supported, Some(false), "{line}");
+        }
+
+        let definition = probed_definition(
+            r#"{ parser = "semver-line-v1", args = ["--version"], min = "0.1.0", below = "3.0.0", line = "codex-cli {version}" }"#,
+        );
+        for banner in ["2.1.289 (Claude Code)", "codex-cli 0.160.0-rc.1", ""] {
+            write_test_executable(&tool, &format!("#!/bin/sh\necho '{banner}'\n"));
+            let runtime = probe_versioned_runtime(
+                "tool",
+                RuntimeRef::from_wire("tool"),
+                &binary,
+                &definition,
+                process_path().as_deref(),
+            );
+            assert_eq!(runtime.version, None, "{banner:?}");
+            assert_eq!(runtime.supported, Some(false), "{banner:?}");
+            let error = validate_definition_launch(&definition, &binary, process_path().as_deref())
+                .expect_err("an unreadable banner is refused");
+            assert_eq!(error.code, "agent_runtime_unsupported");
+        }
+    }
+
+    #[test]
+    fn line_probe_descriptors_are_validated_with_the_package() {
+        let document = |probe: &str| {
+            format!(
+                "schema = 1\nid = \"acme.runtime.tool\"\nversion = \"1.0.0\"\nruntime_api = 1\n\n\
+                 [runtime]\nid = \"tool\"\nname = \"Tool\"\nprogram = \"tool\"\nargs = []\n\
+                 detect_manifest = \"any\"\nversion_probe = {probe}\n\n\
+                 [input]\nbracketed_paste = false\nsubmit_delay_ms = 0\ntext_policy = \"unrestricted\"\n\n\
+                 [resume]\nsupported = false\n\n[fork]\nsupported = false\n\n\
+                 [native_reference]\nstrategy = \"none\"\n"
+            )
+        };
+        let parse = |probe: &str| {
+            RuntimeDefinition::from_toml(
+                &document(probe),
+                |package| DefinitionOrigin::Package {
+                    package,
+                    digest: protocol::PackageDigest::parse(&format!("sha256:{}", "3".repeat(64)))
+                        .expect("digest"),
+                },
+                |_| Ok(Arc::new(crate::detect::generic_shell_manifest().clone())),
+            )
+        };
+        let common = r#"args = ["--version"], min = "1.0.0", below = "2.0.0""#;
+        parse(&format!(
+            r#"{{ parser = "semver-line-v1", {common}, line = "codex-cli {{version}}" }}"#
+        ))
+        .expect("a valid template parses");
+
+        let rejected = [
+            // The parser needs its template; the bare parser takes none.
+            format!(r#"{{ parser = "semver-line-v1", {common} }}"#),
+            format!(r#"{{ parser = "semver-v1", {common}, line = "codex-cli {{version}}" }}"#),
+            format!(r#"{{ parser = "hermes-v1", {common}, line = "codex-cli {{version}}" }}"#),
+            r#"{ parser = "semver-line-v1", line = "codex-cli {version}" }"#.to_owned(),
+            // Over-broad or unparsable templates.
+            format!(r#"{{ parser = "semver-line-v1", {common}, line = "{{version}}" }}"#),
+            format!(r#"{{ parser = "semver-line-v1", {common}, line = "" }}"#),
+            format!(r#"{{ parser = "semver-line-v1", {common}, line = "codex-cli" }}"#),
+            format!(r#"{{ parser = "semver-line-v1", {common}, line = "a {{version}} {{x}}" }}"#),
+            format!(
+                r#"{{ parser = "semver-line-v1", {common}, line = "a {{version}} {{annotation}} b" }}"#
+            ),
+            // Unknown keys stay refused.
+            format!(
+                r#"{{ parser = "semver-line-v1", {common}, line = "a {{version}}", regex = "x" }}"#
+            ),
+        ];
+        for invalid in &rejected {
+            assert!(
+                matches!(
+                    parse(invalid),
+                    Err(crate::agent::host::DefinitionError::Field { .. }
+                        | crate::agent::host::DefinitionError::Malformed { .. })
+                ),
+                "{invalid}"
+            );
+        }
+        let field = |probe: &str| match parse(probe) {
+            Err(crate::agent::host::DefinitionError::Field { field, .. }) => field,
+            other => panic!("expected a field error for {probe}, got {other:?}"),
+        };
+        assert_eq!(
+            field(&format!(
+                r#"{{ parser = "semver-line-v1", {common}, line = "{{version}}" }}"#
+            )),
+            "runtime.version_probe.line"
+        );
+        assert_eq!(
+            field(&format!(r#"{{ parser = "semver-line-v1", {common} }}"#)),
+            "runtime.version_probe.line"
+        );
+        assert_eq!(
+            field(&format!(
+                r#"{{ parser = "semver-v1", {common}, line = "a {{version}}" }}"#
+            )),
+            "runtime.version_probe.line"
         );
     }
 

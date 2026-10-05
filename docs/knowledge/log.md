@@ -1,5 +1,16 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, line version probe)
+
+- Runtime descriptors can declare `version_probe = { parser = "semver-line-v1",
+  args, min, below, line }`, where `line` is a literal template
+  (`codex-cli {version}`, `{version} (Claude Code)`, `Hermes Agent v{version}
+  {annotation}`) the first output line must match, so the official runtimes'
+  real `--version` banners are readable by a package descriptor. Pre-release
+  suffixes never match. Templates are validated with the package. `semver-v1`
+  is unchanged. Documented in the public API reference, the agent profiles
+  concept and the source map.
+
 ## Unreleased (2026-10-05, preflight hook schema)
 
 - The upgrade preflight resolves the hook schema of a worker whose journal

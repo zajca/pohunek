@@ -137,6 +137,25 @@ they need `--yes`.
 - Under `--json` without `--yes` only the error envelope is printed; its
   message names the package, so omit `--json` to see the full review.
 
+## Declaring a version probe
+
+A descriptor names the supported release range with `version_probe` in
+`[runtime]` (full reference in `docs/public-api.md`). Pick the parser by what
+`<program> <args>` prints on its first line:
+
+- `semver-v1` when it prints exactly `MAJOR.MINOR.PATCH` (Pi).
+- `semver-line-v1` with a `line` template when the release sits inside fixed
+  text: `line = "codex-cli {version}"` for `codex-cli 0.160.0`,
+  `line = "{version} (Claude Code)"` for `2.1.289 (Claude Code)`,
+  `line = "Hermes Agent v{version} {annotation}"` for
+  `Hermes Agent v0.20.0 (2026.8.3)`.
+
+The template is literal text, not a regular expression, and an invalid or
+over-broad one (no literal next to `{version}`, an unknown placeholder, a
+repeated `{version}`) fails package validation. A pre-release banner such as
+`codex-cli 0.161.0-rc.1` never matches, so the runtime reports unsupported.
+Verify the real banner of the runtime before declaring the template.
+
 ## Selecting a package version
 
 `<package>` is a package id. Several versions of one id can be installed side by
