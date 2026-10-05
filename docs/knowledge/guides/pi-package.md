@@ -62,7 +62,10 @@ so no catalog is needed.
   can be a single `─`; the `── <spinner>` start alone marks a busy border at any
   width, and it means `working`. A plain upper border (a rule of 20 or more `─`,
   or a `↑ N more` / `↓ N more` marker between runs of four or more) means
-  `idle`. Terminals narrower than 20 columns are never read as idle. Draft and
+  `idle`. Terminals narrower than 20 columns are never read as idle. Body and footer lines
+  are never borders, so the lower border is the last border on the screen and the
+  working and idle rules cannot both match; `scripts/pi-detect-regex` generates
+  and checks the patterns. Draft and
   transcript text never decides: a rule above the editor cannot stand in for the
   upper border, a line that starts with `─` is text, and a draft line that
   starts `── <spinner>` or is itself a complete plain border cannot be told from

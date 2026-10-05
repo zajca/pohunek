@@ -23,13 +23,17 @@
 # runs of four or more (what Pi draws from 20 columns up). Narrower terminals
 # are not recognised, which only ever withholds idle.
 #
-# The upper border is the nearest border above the lower one, so body lines are
-# exactly the lines that are neither: text that merely starts with "─", or
-# looks like a status without the "── <spinner>" start, is body text, while a
-# draft line that starts "── <spinner>" or is itself a complete plain border
-# cannot be told from the frame in plain text. Transcript lines are never
-# consulted, so a column-zero rule above the editor cannot stand in for the
-# upper border of a busy frame.
+# Footer lines and body lines are, by the same classes, never borders. So the
+# lower border is the last border on the screen and the upper border the nearest
+# one above it: the frame is unique, and the working rule (busy upper border)
+# and the idle rule (plain upper border) can never both match, whatever the
+# transcript holds. Text that merely starts with "─", or looks like a status
+# without the "── <spinner>" start, is body or footer text; a draft or footer
+# line that starts "── <spinner>" or is itself a complete plain border cannot be
+# told from the frame in plain text. Transcript lines are never consulted, so a
+# column-zero rule above the editor cannot stand in for the upper border of a
+# busy frame. The regexes are generated, and the complement property is checked
+# exhaustively, by scripts/pi-detect-regex.
 #
 # working: the upper border is a busy border.
 # idle:    the upper border is a plain border. A screen that is not the editor
@@ -55,11 +59,11 @@ id = "working_rule"
 state = "working"
 priority = 700
 region = "whole_recent"
-regex = ['(?m)^── [⠀-⣿][^\n]*\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n[^\n]+){1,4}\z']
+regex = ['(?m)^── [⠀-⣿][^\n]*\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n(?:[^─\n][^\n]*|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)){1,4}\z']
 
 [[rules]]
 id = "idle_editor_rule"
 state = "idle"
 priority = 300
 region = "whole_recent"
-regex = ['(?m)^(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n[^\n]+){1,4}\z']
+regex = ['(?m)^(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)\n)*(?:─{20,}|─{4,} [↑↓] [^\n]*─{4,})(?:\n(?:[^─\n][^\n]*|─(?:[^─\n][^\n]*)?|──(?:[^─ \n][^\n]*| (?:[^⠀-⣿\n][^\n]*)?)?|─{3,3}(?:[^─\n][^\n]*)?|─{4,19}|─{4,}[^─ \n][^\n]*|─{4,} (?:[^↑↓\n][^\n]*|[↑↓](?:[^ \n][^\n]*| (?:[^\n]*[^─\n])?─{0,3})?)?)){1,4}\z']

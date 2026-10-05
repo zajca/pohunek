@@ -6,7 +6,8 @@
   (upper border, draft, lower border, footer) read for both states, with busy
   borders recognised at every terminal width (their closing rule can be one
   column), the busy indicators (`Working`, compaction, retry), the 20-column
-  floor for idle, and the rule that draft and transcript text never decides. It
+  floor for idle, the rule that draft and transcript text never decides, and
+  that the working and idle rules cannot both match. It
   also states that the version probe runs under the launch `PATH`, profile
   override included.
 
