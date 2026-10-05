@@ -2386,6 +2386,29 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
+    /// Whether the session may still own a live PTY runtime.
+    ///
+    /// An external observe-only entry owns none. Otherwise the session may own
+    /// one while its runtime is starting, live, reconnecting, in conflict or
+    /// incompatible, or while the session itself is starting or running.
+    #[must_use]
+    pub fn may_own_runtime(&self) -> bool {
+        if self.external == Some(true) {
+            return false;
+        }
+        let runtime_live = self.runtime.as_ref().is_some_and(|runtime| {
+            matches!(
+                runtime.state,
+                RuntimeState::Starting
+                    | RuntimeState::Live
+                    | RuntimeState::Reconnecting
+                    | RuntimeState::Conflict
+                    | RuntimeState::Incompatible
+            )
+        });
+        runtime_live || matches!(self.state, SessionState::Starting | SessionState::Running)
+    }
+
     /// Whether `session.stop` can still act on this session.
     ///
     /// An external observe-only entry has no PTY to stop, a terminal session has

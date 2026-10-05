@@ -38,6 +38,17 @@
   sources. `pohunek integration --agent` accepts any
   runtime id (built-in names unchanged), and status and doctor recovery commands
   name the runtime that was addressed.
+## Unreleased (2026-10-05, upgrade preflight)
+
+- The update runbook describes the read-only upgrade preflight that
+  `pohunek service check|upgrade` run with the new binaries: the store dry run,
+  the per-session verdicts (`adoptable`, `would_lose_recovery`,
+  `would_not_be_adopted`) and their reason codes, what it cannot see, the error
+  codes `service_upgrade_sessions_at_risk`, `service_upgrade_store_unusable` and
+  `service_upgrade_preflight_failed`, and that `--accept-runtime-loss` is the
+  one consent flag shared with the legacy migration path.
+- The CLI reference, the setup guide, the macOS runbook, the session-runtime
+  runbook and the public API cross-reference it.
 
 ## Unreleased (2026-10-05, hook schemas)
 

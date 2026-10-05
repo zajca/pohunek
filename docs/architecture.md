@@ -633,6 +633,37 @@ states the contract and then the current state.
 
 Everything else stays unshimmed. A record that cannot be migrated or adopted is
 logged at WARN, surfaced to the operator, and carries a recovery hint.
+The operator-facing gate of the window is the upgrade preflight. `pohunek
+service check` and `pohunek service upgrade` of an existing service run
+`pohunekd upgrade-preflight` of the new archive before any effect; it prints a
+`PreflightReport` (`crates/service-config/src/preflight.rs`) with the dry-run
+store migration (`crates/daemon/src/store/dry_run.rs`) and one verdict per live
+session (`adoptable`, `would_lose_recovery`, `would_not_be_adopted`, each with a
+stable reason code; `crates/daemon/src/session/reconcile/upgrade_preflight.rs`).
+It decides with the same store loader, journal reader, resume-binding merge and
+launch-identity check that startup reconciliation uses, from the store, the
+worker journals and the process table. It takes no lock, writes nothing, stops
+nothing and never connects to a worker socket, because the running previous
+daemon holds each worker's single controller slot; the identity claims, subagent
+state and protocol range a socket would give are judged from what the journal
+recorded, through the same functions adoption uses (process-tree ancestry of the
+launch and active identity processes included; an unreadable process table
+fails closed). The remaining blind spots are the supervisor job's identity and
+socket failures at connect time. A binding that needs the
+runtime registry to complete its launch spec is reported as
+`native_recovery_unverified`. A live worker journal without a store record is
+listed as an unmanaged worker and does not refuse the upgrade, unless a store
+line that names no session cannot be read (`worker_without_session_record`).
+Sessions at risk refuse the upgrade with
+`service_upgrade_sessions_at_risk` unless `--accept-runtime-loss`, the single
+loss-accepting flag, is given; a store the new daemon would refuse
+(`service_upgrade_store_unusable`) and a preflight that cannot run
+(`service_upgrade_preflight_failed`) are never overridable. The preflight runs before any effect and again right
+before the daemon is replaced (the previous daemon cannot be paused, and its own
+adoption fails closed for what remains); a resumed upgrade whose daemon replacement
+has not completed is judged again. A rerun for the active version and a resume
+after the replacement skip it.
+
 `scripts/release` diffs `STORE_SCHEMA_VERSION`, the protocol and worker
 protocol constants, `WORKER_JOURNAL_SCHEMA_VERSION` and
 `EXPECTED_INTEGRATION_VERSION` against the previous tag and requires a
@@ -660,6 +691,10 @@ Startup order in `crates/daemon/src/main.rs`:
 3. Only then does the session registry start, so reconciliation and worker
    adoption only ever see a store at the current schema. Every other store
    access refuses a store that is not at the current schema.
+
+`Store::dry_run_migration` (`crates/daemon/src/store/dry_run.rs`) performs the
+same classification and migration in memory only, with no lock, backup or
+write, for the upgrade preflight (see "Upgrade window").
 
 A pending legacy migration manifest (`pohunek migration preflight`) is
 validated against the original store bytes: the importer accepts a store whose

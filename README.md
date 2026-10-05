@@ -148,7 +148,9 @@ Rules:
    extracted archive on Linux), show me what will be installed where, and wait
    for my approval. Then install the login service (`./packaging/install-daemon.sh`
    on Linux, `pohunek service install` on macOS). Never pass
-   --accept-runtime-loss, --stop-sessions, or --purge.
+   --accept-runtime-loss, --stop-sessions, or --purge. When an upgrade refuses
+   with `service_upgrade_sessions_at_risk`, show me the listed sessions and
+   reason codes instead of overriding it.
 4. Verify with `pohunek doctor --json`, `pohunek service status --json`,
    `pohunek health --json`, and `pohunek host inspect local --json`. Report
    every warning; fix only what I approve.

@@ -65,6 +65,7 @@ use crate::agent::host::{LaunchPin, RESERVED_RUNTIME_IDS};
 use crate::agent::{InputRules, NativeReferenceProvenance, NativeSessionLaunch, SessionRefKind};
 use crate::project::detect::project_id;
 
+mod dry_run;
 mod legacy_binding;
 mod schema;
 #[cfg(test)]
@@ -73,6 +74,8 @@ mod shape_guard;
 #[cfg(test)]
 mod legacy_binding_tests;
 
+pub(crate) use dry_run::{DryRun, DryRunState};
+pub(crate) use legacy_binding::RecoveryOutcome;
 pub use schema::{migrate_at_startup, SchemaMigration, StoreSchemaError, STORE_SCHEMA_VERSION};
 
 #[cfg(unix)]
@@ -1284,43 +1287,7 @@ impl Store {
             return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
         };
         let lines = self.checked_lines(&content)?;
-        let mut resume = Vec::new();
-        let mut worktrees = Vec::new();
-        let mut projects = Vec::new();
-        let mut sessions = Vec::new();
-        for line in lines {
-            let (text, parsed) = match line {
-                schema::ParsedLine::Record { text, value, .. } => (
-                    text,
-                    serde_json::from_value::<Record>(value).map_err(|e| e.to_string()),
-                ),
-                schema::ParsedLine::Corrupt { text, error } => (text, Err(error)),
-            };
-            match parsed {
-                Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
-                    mirror_worker_instance_id(&mut record);
-                    sessions.push(*record);
-                }
-                Ok(Record::Resume(binding)) if kind_is_persistable(&binding.agent_base) => {
-                    resume.push(binding);
-                }
-                Ok(Record::Session(_) | Record::Resume(_)) => {
-                    warn!("skipping metadata-store record whose agent kind is not a runtime id");
-                }
-                Ok(Record::Worktree(binding)) => worktrees.push(binding),
-                Ok(Record::Project(record)) => projects.push(record),
-                // Skip a corrupt line so it cannot block loading the rest, but
-                // surface it: a silently-dropped resume line means a session
-                // never comes back, a dropped worktree line loses its restored
-                // metadata, and a dropped project line forgets a known repo. The
-                // store holds no secrets, so logging the offending line is safe
-                // and aids debugging.
-                Err(error) => {
-                    warn!(error = %error, line = %text, "skipping unparseable metadata-store line");
-                }
-            }
-        }
-        Ok((resume, worktrees, projects, sessions))
+        Ok(partition_lines(lines).0)
     }
 
     /// Serialize all records (resume, then worktree, then project) to a temp file
@@ -1369,14 +1336,7 @@ impl Store {
     /// One `rename(2)` commits the whole body; a body over the durable read
     /// limit is refused so the store never becomes unreadable.
     fn commit_body(&self, body: &str) -> io::Result<MetadataWriteOutcome> {
-        if body.len() > MAX_METADATA_STORE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "metadata store exceeds the {MAX_METADATA_STORE_BYTES}-byte durable read limit"
-                ),
-            ));
-        }
+        check_body_size(body)?;
 
         let tmp = self.temp_path();
         #[cfg(test)]
@@ -1613,6 +1573,144 @@ fn stale_runtime_snapshot(existing: &SessionRecord, replacement: &SessionRecord)
         .as_deref()
         .or(candidate.worker_instance_id.as_deref());
     current_id.is_some() && candidate_id != current_id
+}
+
+/// A store body larger than the durable read limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("metadata store exceeds the {MAX_METADATA_STORE_BYTES}-byte durable read limit")]
+pub(crate) struct StoreBodyTooLarge {
+    /// Size of the refused body.
+    pub(crate) size: usize,
+}
+
+impl StoreBodyTooLarge {
+    /// The size error carried by `error`, when it came from [`check_body_size`].
+    pub(crate) fn from_io(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref::<Self>()
+    }
+}
+
+/// Refuses a body the store could not read back, so it never becomes unreadable.
+///
+/// Writes and the dry run of the startup migration apply the same limit.
+fn check_body_size(body: &str) -> io::Result<()> {
+    if body.len() > MAX_METADATA_STORE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            StoreBodyTooLarge { size: body.len() },
+        ));
+    }
+    Ok(())
+}
+
+/// A store line that is not part of any loaded record list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RejectedLine {
+    /// The record kind the line names, when it is a JSON object that does.
+    pub(crate) kind: Option<String>,
+    /// The session the line names, when it does.
+    pub(crate) session_id: Option<String>,
+    /// Whether the session the line holds may own a live runtime. A line whose
+    /// state cannot be read counts as live.
+    pub(crate) may_own_runtime: bool,
+    /// Why the line was rejected.
+    pub(crate) reason: String,
+}
+
+/// Partitions the lines of a store at the current schema into its record
+/// lists, and returns every line that was skipped.
+///
+/// A skipped line is logged and never blocks the rest: a dropped resume line
+/// means a session never comes back, a dropped worktree line loses its
+/// restored metadata, and a dropped project line forgets a known repo. The
+/// store holds no secrets, so logging the offending line is safe and aids
+/// debugging.
+fn partition_lines(lines: Vec<schema::ParsedLine<'_>>) -> (StoreRecords, Vec<RejectedLine>) {
+    let mut resume = Vec::new();
+    let mut worktrees = Vec::new();
+    let mut projects = Vec::new();
+    let mut sessions = Vec::new();
+    let mut rejected = Vec::new();
+    for line in lines {
+        let (text, hint, parsed) = match line {
+            schema::ParsedLine::Record { text, value, .. } => {
+                let hint = rejected_hint(&value);
+                (
+                    text,
+                    hint,
+                    serde_json::from_value::<Record>(value).map_err(|e| e.to_string()),
+                )
+            }
+            schema::ParsedLine::Corrupt { text, error } => (text, (None, None, false), Err(error)),
+        };
+        let reason = match parsed {
+            Ok(Record::Session(mut record)) if record_agents_are_persistable(&record) => {
+                mirror_worker_instance_id(&mut record);
+                sessions.push(*record);
+                continue;
+            }
+            Ok(Record::Resume(binding)) if kind_is_persistable(&binding.agent_base) => {
+                resume.push(binding);
+                continue;
+            }
+            Ok(Record::Session(_) | Record::Resume(_)) => {
+                warn!("skipping metadata-store record whose agent kind is not a runtime id");
+                "the agent kind is not a runtime id".to_owned()
+            }
+            Ok(Record::Worktree(binding)) => {
+                worktrees.push(binding);
+                continue;
+            }
+            Ok(Record::Project(record)) => {
+                projects.push(record);
+                continue;
+            }
+            Err(error) => {
+                warn!(error = %error, line = %text, "skipping unparseable metadata-store line");
+                error
+            }
+        };
+        let (kind, session_id, may_own_runtime) = hint;
+        rejected.push(RejectedLine {
+            kind,
+            session_id,
+            may_own_runtime,
+            reason,
+        });
+    }
+    ((resume, worktrees, projects, sessions), rejected)
+}
+
+/// Record kinds that never hold a session.
+const NON_SESSION_KINDS: [&str; 3] = ["resume", "worktree", "project"];
+
+/// Whether a rejected line with this `kind` may hold a session record: one
+/// whose discriminator is missing or unreadable still may.
+pub(crate) fn may_hold_session(kind: Option<&str>) -> bool {
+    kind.is_none_or(|kind| !NON_SESSION_KINDS.contains(&kind))
+}
+
+/// The kind, session id and liveness a rejected line still names.
+fn rejected_hint(value: &serde_json::Value) -> (Option<String>, Option<String>, bool) {
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    let kind = text("kind");
+    let ended = |state: Option<&str>| matches!(state, Some("lost" | "terminal"));
+    let may_own_runtime = may_hold_session(kind.as_deref())
+        && !ended(
+            value
+                .pointer("/runtime/state")
+                .and_then(serde_json::Value::as_str),
+        )
+        && value
+            .get("info")
+            .and_then(|info| serde_json::from_value::<SessionInfo>(info.clone()).ok())
+            .is_none_or(|info| info.may_own_runtime());
+    (kind, text("session_id"), may_own_runtime)
 }
 
 fn record_agents_are_persistable(record: &SessionRecord) -> bool {

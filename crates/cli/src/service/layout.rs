@@ -637,7 +637,7 @@ pub(crate) fn is_exec_busy(error: &io::Error) -> bool {
 ///
 /// Every other result, and the busy error once `wait` is exhausted, is
 /// returned unchanged. `poll` separates the attempts.
-async fn retry_while_exec_busy<T>(
+pub(crate) async fn retry_while_exec_busy<T>(
     wait: Duration,
     poll: Duration,
     mut attempt: impl FnMut() -> io::Result<T>,
@@ -654,7 +654,7 @@ async fn retry_while_exec_busy<T>(
 }
 
 /// Runs `<binary> --version` with an empty environment and checks its answer.
-async fn probe(binary: &Path, name: &str, version: &str) -> Result<(), Error> {
+pub(crate) async fn probe(binary: &Path, name: &str, version: &str) -> Result<(), Error> {
     let failure = |detail: String| Error::VersionProbe {
         binary: binary.to_path_buf(),
         detail,

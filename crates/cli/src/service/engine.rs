@@ -131,7 +131,7 @@ use pohunek_platform::supervisor::{
     self, JobDefinition, Namespace, ServiceObservation, ServiceState, WorkerKey,
 };
 use pohunek_service_config::ServiceConfig;
-use protocol::{RuntimeState, SessionInfo, SessionState};
+use protocol::SessionInfo;
 
 use super::backend::Backend;
 use super::context::Context;
@@ -140,6 +140,7 @@ use super::definition::{
 };
 use super::error::{supervisor_error, Error, LiveSession, OutdatedWorker};
 use super::layout::{self, Staged};
+use super::preflight::{self, AdoptionPreflight, DaemonPreflight, Gated};
 use super::record::{self, Operation, Record, Step, Store, TransactionLock};
 use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
@@ -178,6 +179,26 @@ pub struct UninstallOptions {
     pub purge: bool,
 }
 
+/// What the adoption gate right before the daemon swap left for the caller.
+#[derive(Debug, Default)]
+struct LateGate {
+    /// The preflight that let the swap proceed.
+    gated: Option<Gated>,
+    /// Whether the gate itself failed, which leaves the daemon untouched.
+    refused: bool,
+}
+
+/// A test action run just before the adoption preflight of the daemon swap.
+#[cfg(test)]
+struct SwapHook(Box<dyn Fn() + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for SwapHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SwapHook(..)")
+    }
+}
+
 /// Runs service transactions against one backend.
 #[derive(Debug)]
 pub struct Engine<'a> {
@@ -192,11 +213,21 @@ pub struct Engine<'a> {
     inherited: Option<TransactionLock>,
     ready_timeout: Duration,
     stop_timeout: Duration,
+    /// Judges whether the new daemon adopts the live sessions; the new
+    /// daemon's own `upgrade-preflight` in production.
+    preflight: Box<dyn AdoptionPreflight>,
+    /// Whether the operator accepted losing the runtime or native recovery of
+    /// the sessions the preflight lists (`--accept-runtime-loss`).
+    accept_runtime_loss: bool,
     /// Verifies the rendered units before they are registered.
     #[cfg(target_os = "linux")]
     unit_verifier: UnitVerifier,
     #[cfg(test)]
     interrupt_after: Option<Step>,
+    /// Runs between the last step before the daemon swap and its adoption
+    /// preflight, standing in for the old daemon accepting work meanwhile.
+    #[cfg(test)]
+    before_swap: Option<SwapHook>,
     #[cfg(feature = "test-util")]
     reported_version: Option<String>,
 }
@@ -213,10 +244,14 @@ impl<'a> Engine<'a> {
             inherited: None,
             ready_timeout: settings::DAEMON_READY_TIMEOUT,
             stop_timeout: settings::SESSION_STOP_TIMEOUT,
+            preflight: Box::new(DaemonPreflight),
+            accept_runtime_loss: false,
             #[cfg(target_os = "linux")]
             unit_verifier: UnitVerifier::default(),
             #[cfg(test)]
             interrupt_after: None,
+            #[cfg(test)]
+            before_swap: None,
             #[cfg(feature = "test-util")]
             reported_version: None,
         }
@@ -229,6 +264,28 @@ impl<'a> Engine<'a> {
     #[must_use]
     pub fn with_inherited_lock(mut self, lock: TransactionLock) -> Self {
         self.inherited = Some(lock);
+        self
+    }
+
+    /// Lets an upgrade proceed over the sessions its adoption preflight lists
+    /// as at risk (`--accept-runtime-loss`).
+    ///
+    /// A store the new daemon cannot start with is refused either way.
+    #[must_use]
+    pub fn with_runtime_loss_accepted(mut self, accepted: bool) -> Self {
+        self.accept_runtime_loss = accepted;
+        self
+    }
+
+    /// Judges adoption with `preflight` instead of the new daemon's
+    /// `upgrade-preflight` process.
+    ///
+    /// Test-only: an alternative judge could approve sessions the new daemon
+    /// would lose, so release builds cannot reach it.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_adoption_preflight(mut self, preflight: Box<dyn AdoptionPreflight>) -> Self {
+        self.preflight = preflight;
         self
     }
 
@@ -403,7 +460,10 @@ impl<'a> Engine<'a> {
             }
             Err(error) => return Err(error),
         };
-        let result = self.run_steps(&mut record, &layout, staged, &config).await;
+        let mut unused = LateGate::default();
+        let result = self
+            .run_steps(&mut record, &layout, staged, &config, &mut unused)
+            .await;
         self.settle(&record, result).await?;
         Ok(InstallReport {
             version: version.to_owned(),
@@ -434,12 +494,18 @@ impl<'a> Engine<'a> {
     /// Returns the environment errors [`Self::install`] returns before any
     /// effect, [`Error::PendingInstall`] while an interrupted install's record
     /// exists, [`Error::NotInstalled`] without `service.toml`, staging and
-    /// probe errors, and the failing step's error after a rollback.
+    /// probe errors, the failing step's error after a rollback, and, before
+    /// any effect of a daemon swap, [`Error::UpgradeAtRisk`] for live sessions
+    /// the new daemon would not adopt (unless the runtime loss is accepted),
+    /// [`Error::UpgradeStoreUnusable`] for a store it cannot start with, and
+    /// [`Error::UpgradePreflightFailed`] when the preflight gives no report.
     pub async fn upgrade(&self, from: &Path, version: &str) -> Result<UpgradeReport, Error> {
         let _transaction = self.transaction().await?;
         upgrade_preflight(self.context)?;
         let config_path = self.context.config_path();
-        let (resume, rolled_back) = match upgrade_plan(self.store.load()?, version)? {
+        let plan = upgrade_plan(self.store.load()?, version)?;
+        let gated = self.adoption_gate(&plan, from, version).await?;
+        let (resume, rolled_back) = match plan {
             Plan::Fresh => (None, None),
             Plan::Resume(record) => (Some(record), None),
             Plan::RollBack(record) => {
@@ -475,6 +541,8 @@ impl<'a> Engine<'a> {
                 removed_versions,
                 kept_versions,
                 gc_error,
+                preflight: None,
+                accepted_runtime_loss: false,
             });
         }
         let mut record = if let Some(record) = resume {
@@ -496,8 +564,20 @@ impl<'a> Engine<'a> {
             }
         };
         let target = with_version(&config, version)?;
-        let result = self.run_steps(&mut record, &layout, staged, &target).await;
+        let mut late = LateGate::default();
+        let result = self
+            .run_steps(&mut record, &layout, staged, &target, &mut late)
+            .await;
+        // A refusal never touches the running daemon. Rolling back a record
+        // at `Registering` would replace it, and the replacement may not have
+        // happened yet, so that record is kept for a resume instead.
+        let result = match result {
+            Err(error) if late.refused && record.step >= Step::Registering => return Err(error),
+            other => other,
+        };
         self.settle(&record, result).await?;
+        // The preflight right before the swap is the one that counts.
+        let gated = late.gated.or(gated);
         let (removed_versions, kept_versions, gc_error) =
             self.collect_garbage_reported(&layout, version).await;
         Ok(UpgradeReport {
@@ -509,7 +589,43 @@ impl<'a> Engine<'a> {
             removed_versions,
             kept_versions,
             gc_error,
+            accepted_runtime_loss: gated.as_ref().is_some_and(|gated| gated.accepted),
+            preflight: gated.map(|Gated { report, .. }| report),
         })
+    }
+
+    /// Asks the new daemon's adoption preflight about the live sessions when
+    /// `plan` swaps the daemon, and applies the operator's choice.
+    ///
+    /// Runs before any effect of the plan, a rollback included.
+    async fn adoption_gate(
+        &self,
+        plan: &Plan,
+        from: &Path,
+        version: &str,
+    ) -> Result<Option<Gated>, Error> {
+        // Only a fresh plan needs the installed version, which a rollback
+        // would otherwise replace.
+        let installed = match plan {
+            Plan::Fresh => load_config(&self.context.config_path())?,
+            Plan::Resume(_) | Plan::RollBack(_) => None,
+        };
+        if !swaps_daemon(
+            plan,
+            installed.as_ref().map(ServiceConfig::active_version),
+            version,
+        ) {
+            return Ok(None);
+        }
+        preflight::gate(
+            &*self.preflight,
+            self.context,
+            from,
+            self.reported(version),
+            self.accept_runtime_loss,
+        )
+        .await
+        .map(Some)
     }
 
     /// Uninstalls the service following `options`.
@@ -717,6 +833,7 @@ impl<'a> Engine<'a> {
         layout: &InstallLayout,
         staged: Staged,
         config: &ServiceConfig,
+        late: &mut LateGate,
     ) -> Result<(), Error> {
         let version = record.version.clone();
         if record.step < Step::Binaries {
@@ -741,7 +858,35 @@ impl<'a> Engine<'a> {
         }
         self.checkpoint(Step::Definition)?;
 
-        if record.step < Step::Registered {
+        // The old daemon keeps accepting sessions until it is replaced and no
+        // facility pauses it, so the adoption preflight runs here, after
+        // staging and as close to the replacement as the steps allow. A transaction
+        // past registration has replaced it, and the new daemon's own adoption
+        // decides.
+        if record.operation == Operation::Upgrade && replaces_daemon(record.step) {
+            #[cfg(test)]
+            if let Some(hook) = &self.before_swap {
+                (hook.0)();
+            }
+            if let Some(dir) = config.daemon_executable().parent() {
+                match preflight::gate(
+                    &*self.preflight,
+                    self.context,
+                    dir,
+                    self.reported(&version),
+                    self.accept_runtime_loss,
+                )
+                .await
+                {
+                    Ok(gated) => late.gated = Some(gated),
+                    Err(error) => {
+                        late.refused = true;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        if replaces_daemon(record.step) {
             let resuming = record.step == Step::Registering;
             self.advance(record, Step::Registering)?;
             self.checkpoint(Step::Registering)?;
@@ -1380,24 +1525,7 @@ fn layout_log_dir(context: &Context) -> Result<(), Error> {
 
 /// Returns whether a session may still own a live PTY.
 fn is_live(session: &SessionInfo) -> bool {
-    if session.external == Some(true) {
-        return false;
-    }
-    let runtime_live = session.runtime.as_ref().is_some_and(|runtime| {
-        matches!(
-            runtime.state,
-            RuntimeState::Starting
-                | RuntimeState::Live
-                | RuntimeState::Reconnecting
-                | RuntimeState::Conflict
-                | RuntimeState::Incompatible
-        )
-    });
-    runtime_live
-        || matches!(
-            session.state,
-            SessionState::Starting | SessionState::Running
-        )
+    session.may_own_runtime()
 }
 
 /// Returns whether a worker job may still own a live PTY.
@@ -1538,6 +1666,32 @@ pub(crate) fn plan_discovers(plan: &Plan) -> bool {
         Plan::Fresh => true,
         Plan::RollBack(record) => record.operation == Operation::Install,
         Plan::Resume(record) => record.step < Step::Config,
+    }
+}
+
+/// Whether a transaction recorded at `step` still has the daemon to replace.
+///
+/// `run_steps` replaces the daemon exactly when this holds, and the adoption
+/// preflight gates exactly then, so the two cannot drift apart. `Registering`
+/// is recorded before the service-manager call, so an interrupted transaction
+/// at that step may not have replaced it yet.
+fn replaces_daemon(step: Step) -> bool {
+    step < Step::Registered
+}
+
+/// Whether upgrading to `version` under `plan` swaps the daemon, so the
+/// adoption preflight judges the live sessions first.
+///
+/// A resumed upgrade that has not registered the daemon still has to replace
+/// it, a later one already has, a rerun of the active version
+/// swaps nothing, and a rolled-back one starts over.
+pub(crate) fn swaps_daemon(plan: &Plan, installed: Option<&str>, version: &str) -> bool {
+    match plan {
+        Plan::Resume(record) => replaces_daemon(record.step),
+        // The rollback restores the previous version, so asking for it again
+        // swaps in nothing new.
+        Plan::RollBack(record) => record.previous_version.as_deref() != Some(version),
+        Plan::Fresh => installed.is_some_and(|active| active != version),
     }
 }
 

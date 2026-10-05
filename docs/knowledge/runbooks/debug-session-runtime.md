@@ -346,7 +346,9 @@ recording the affected ids and accepting that shell and uncaptured agent
 sessions cannot be reconstructed. The same installer refuses to retire an
 older template-unit install while any `pohunek-session@<id>.service` worker
 outside the `inactive` state survives its post-stop re-check; stop those
-sessions first.
+sessions first. The flag also gates `pohunek service upgrade` of an installed
+service, whose live-session preflight is described in
+[update after release](update-after-release.md#upgrade-preflight).
 
 A worker-aware daemon started over a legacy store without that preflight (for
 example after replacing the binary by hand) finds legacy resume bindings but no

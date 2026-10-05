@@ -59,6 +59,16 @@ surfaced to the operator, and carries a recovery hint. A store newer than the
 binary, or older than every kept migration, makes the daemon refuse to start
 and leaves the store untouched.
 
+The operator-facing gate of the window is the upgrade preflight: `pohunek
+service check|upgrade` run `pohunekd upgrade-preflight` of the new archive
+before any effect. It judges the dry-run store migration and every live session
+(`adoptable`, `would_lose_recovery`, `would_not_be_adopted`) from the store,
+worker journals and process table only (`crates/service-config/src/preflight.rs`,
+`crates/daemon/src/session/reconcile/upgrade_preflight.rs`,
+`crates/daemon/src/store/dry_run.rs`); it never connects to a worker socket and
+never writes. Sessions at risk refuse the upgrade unless `--accept-runtime-loss`,
+the single loss-accepting flag, is given; a refused store never is overridable.
+
 `scripts/release` compares these constants with the previous tag and requires
 a release-notes line for each changed one (see the `release` skill).
 
@@ -171,7 +181,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
 | `crates/test-support` | Test-only fixture roots that are symlink-free and short enough for Unix sockets on Linux and macOS, the hermetic per-test `TestEnv`, readiness waits bounded by one hang-guard ceiling (`wait`), the binary-wide unwind-safe process-environment override (`process_env`), the paused-clock auto-advance inhibitor (`time`), and fixture writers (`fs`) that cannot cause `ETXTBSY`. |
 | `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
-| `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`. |
+| `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`; also the upgrade preflight report that the installer and the daemon exchange. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, and pinned Hermes compatibility evidence). |
 | `sdk/ts/`         | TypeScript SDK packages in the Bun workspace: `protocol` (generated protocol types), `sdk` (runtime client and runtime-path resolver), and `testkit` (fixture daemon and loopback test relay). |
 

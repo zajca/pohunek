@@ -78,6 +78,7 @@ mod procwatch;
 mod profile_pin_tests;
 mod read;
 mod reconcile;
+pub use reconcile::upgrade_preflight;
 mod resume;
 mod retention;
 mod supervision;

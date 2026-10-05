@@ -641,7 +641,16 @@ pub(crate) mod tests {
             (5, 6),
             "2026-09-24T00:00:00Z".to_owned(),
         );
+        // A live worker owns a PTY child, which its journal records.
+        let live = phase == RuntimePhase::Live;
         record.phase = phase;
+        if live {
+            record.child = Some(pohunek_session_worker::ChildIdentity {
+                pid,
+                process_group: 0,
+                start_identity: start_identity.to_owned(),
+            });
+        }
         let path = paths
             .worker_journal(session, worker)
             .expect("valid journal path");

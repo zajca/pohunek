@@ -386,6 +386,9 @@ Daemon, sessions, integrations, and project state:
   runtime generation.
 - `crates/service-config/src/lib.rs` — `service.toml` schema, trust, and
   validation.
+- `crates/service-config/src/preflight.rs` — the upgrade preflight report
+  (`PreflightReport`, verdicts, store state) and its reason-code constants,
+  shared by `pohunek service` and `pohunekd upgrade-preflight`.
 - `crates/worker-protocol/src/env.rs` — `BaseEnv`, the default environment
   allowlist, and the service-manager denylist.
 - `crates/worker-protocol/src/hook_schema.rs` — the closed registry of hook
@@ -395,6 +398,8 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/store/mod.rs`
 - `crates/daemon/src/store/schema.rs` — `STORE_SCHEMA_VERSION`, the `MIGRATIONS`
   table, the `.pre-schema-<old>` backup, and `StoreSchemaError`.
+- `crates/daemon/src/store/dry_run.rs` — read-only in-memory run of the startup
+  migration used by the upgrade preflight.
 - `crates/daemon/src/store/shape_guard.rs` — persisted-shape guard test and its
   `fixtures/shape/schema-<N>.txt` snapshots.
 - `crates/protocol/src/version.rs`
@@ -417,6 +422,9 @@ Daemon, sessions, integrations, and project state:
 - `crates/daemon/src/session/hooks.rs`
 - `crates/daemon/src/session/detector.rs`
 - `crates/daemon/src/session/reconcile.rs`
+- `crates/daemon/src/session/reconcile/upgrade_preflight.rs` — per-session
+  adoption verdicts from the store, journals and process table, without a
+  worker socket.
 - `crates/daemon/src/session/native_repair.rs`
 - `crates/daemon/src/session/target.rs`
 - `crates/daemon/src/session/procwatch.rs`

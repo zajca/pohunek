@@ -113,6 +113,9 @@ whole `gui/$(id -u)` domain: that ends every worker.
 ## Upgrade
 
 With Homebrew, run `brew upgrade pohunek` and then `pohunek service upgrade`.
+The upgrade first runs a read-only preflight of the live sessions and refuses
+(`service_upgrade_sessions_at_risk`) while one would lose recovery or not be
+adopted; see [update after release](update-after-release.md#upgrade-preflight).
 From an archive, extract the new daemon archive and run its installer again. The installer runs
 `pohunek service upgrade`, which stages the new versioned directory, probes every
 binary, and then restarts only the daemon agent. Live workers keep their process,

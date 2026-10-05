@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Subcommand, ValueHint};
+use pohunek_service_config::preflight::{PreflightReport, StoreState};
 
 use crate::commands::render_json;
 use crate::error::CliError;
@@ -49,6 +50,15 @@ pub(crate) enum Action {
         /// this `pohunek`].
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         from: Option<PathBuf>,
+        /// Upgrade even if live sessions would lose their runtime or native
+        /// recovery.
+        ///
+        /// The new daemon's adoption preflight lists every live session it
+        /// would not adopt or would adopt without native recovery, and the
+        /// upgrade refuses them without this flag. It never overrides a
+        /// metadata store the new daemon cannot start with.
+        #[arg(long)]
+        accept_runtime_loss: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -84,13 +94,19 @@ pub(crate) enum Action {
     /// Runs the checks `install` (while an install is pending or nothing is
     /// installed) or `upgrade` makes before their first effect: `HOME` and
     /// the XDG roots, the prefix, every directory they write, a pending
-    /// transaction, the recorded installation, and the prefix owner. Fails
-    /// with the error that command would fail with; changes nothing.
+    /// transaction, the recorded installation, and the prefix owner. An
+    /// upgrade also asks the new daemon's adoption preflight about every live
+    /// session. Fails with the error that command would fail with; changes
+    /// nothing.
     Check {
         /// Absolute installation prefix of an install [default:
         /// `$HOME/.local`]; an upgrade keeps the installed prefix.
         #[arg(long, value_name = "DIR", value_hint = ValueHint::DirPath)]
         prefix: Option<PathBuf>,
+        /// Pass the check although live sessions would lose their runtime or
+        /// native recovery, as `service upgrade --accept-runtime-loss` would.
+        #[arg(long)]
+        accept_runtime_loss: bool,
         /// Emit machine-readable JSON instead of human text.
         #[arg(long)]
         json: bool,
@@ -146,12 +162,20 @@ pub(crate) async fn run(action: Action) -> Result<ExitCode, CliError> {
             let report = service::install(from, prefix).await?;
             emit(json, &report, render_install)
         }
-        Action::Upgrade { from, json } => {
-            let report = service::upgrade(from).await?;
+        Action::Upgrade {
+            from,
+            accept_runtime_loss,
+            json,
+        } => {
+            let report = service::upgrade(from, accept_runtime_loss).await?;
             emit(json, &report, render_upgrade)
         }
-        Action::Check { prefix, json } => {
-            let report = service::check(prefix).await?;
+        Action::Check {
+            prefix,
+            accept_runtime_loss,
+            json,
+        } => {
+            let report = service::check(prefix, accept_runtime_loss).await?;
             emit(json, &report, render_check)
         }
         Action::Uninstall {
@@ -240,6 +264,55 @@ fn render_search_path(text: &mut String, report: &report::SearchPathReport) {
     }
 }
 
+/// Appends what the adoption preflight found: the store dry run, and every
+/// live session with its verdict, reason code and evidence.
+fn render_preflight(text: &mut String, preflight: &PreflightReport, accepted_runtime_loss: bool) {
+    let store = &preflight.store;
+    match (store.state, store.schema_from) {
+        (StoreState::WouldMigrate, Some(from)) => {
+            let _ = writeln!(
+                text,
+                "store      schema {from} -> {} ({} records) migrated at the new daemon's startup",
+                store.schema_to, store.records
+            );
+        }
+        (StoreState::UpToDate, _) => {
+            let _ = writeln!(text, "store      schema {} is current", store.schema_to);
+        }
+        _ => {}
+    }
+    if preflight.sessions.is_empty() {
+        let _ = writeln!(text, "sessions   no live sessions");
+        return;
+    }
+    let at_risk = preflight.at_risk().count();
+    let _ = writeln!(
+        text,
+        "sessions   {} live, {} adoptable{}",
+        preflight.sessions.len(),
+        preflight.sessions.len() - at_risk,
+        if at_risk == 0 {
+            String::new()
+        } else if accepted_runtime_loss {
+            format!(", {at_risk} at risk (accepted with --accept-runtime-loss)")
+        } else {
+            format!(", {at_risk} at risk")
+        }
+    );
+    for session in &preflight.sessions {
+        let name = session
+            .name
+            .as_deref()
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            text,
+            "  {}{name}: {} [{}] {}",
+            session.session_id, session.verdict, session.code, session.detail
+        );
+    }
+}
+
 fn render_upgrade(report: &report::UpgradeReport) -> String {
     let mut text = String::new();
     if let Some(pending) = &report.rolled_back {
@@ -264,6 +337,9 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
     }
     if let Some(error) = &report.gc_error {
         let _ = writeln!(text, "warning: old versions were not cleaned up: {error}");
+    }
+    if let Some(preflight) = &report.preflight {
+        render_preflight(&mut text, preflight, report.accepted_runtime_loss);
     }
     text
 }
@@ -297,6 +373,9 @@ fn render_check(report: &report::CheckReport) -> String {
                 "rolled back first"
             }
         );
+    }
+    if let Some(preflight) = &report.preflight {
+        render_preflight(&mut text, preflight, report.accepted_runtime_loss);
     }
     text
 }
@@ -577,7 +656,16 @@ mod tests {
             parse(&["upgrade", "--from", "/a"]),
             Action::Upgrade {
                 from: Some(_),
+                accept_runtime_loss: false,
                 json: false
+            }
+        ));
+        assert!(matches!(
+            parse(&["upgrade", "--accept-runtime-loss", "--json"]),
+            Action::Upgrade {
+                from: None,
+                accept_runtime_loss: true,
+                json: true
             }
         ));
         assert!(matches!(
@@ -596,15 +684,28 @@ mod tests {
             .expect_err("upgrade takes no --prefix");
         assert!(matches!(
             parse(&["check", "--prefix", "/p", "--json"]),
-            Action::Check { prefix: Some(prefix), json: true } if prefix == Path::new("/p")
+            Action::Check { prefix: Some(prefix), json: true, accept_runtime_loss: false }
+                if prefix == Path::new("/p")
         ));
         assert!(matches!(
             parse(&["check"]),
             Action::Check {
                 prefix: None,
+                accept_runtime_loss: false,
                 json: false
             }
         ));
+        assert!(matches!(
+            parse(&["check", "--accept-runtime-loss"]),
+            Action::Check {
+                accept_runtime_loss: true,
+                ..
+            }
+        ));
+        Harness::try_parse_from(["service", "install", "--accept-runtime-loss"])
+            .expect_err("install has no sessions to lose");
+        Harness::try_parse_from(["service", "uninstall", "--accept-runtime-loss"])
+            .expect_err("uninstall keeps its own --stop-sessions rule");
     }
 
     #[test]
@@ -634,6 +735,8 @@ mod tests {
             }),
             pending_action: Some("roll_back"),
             locked: true,
+            preflight: None,
+            accepted_runtime_loss: false,
         });
         assert!(
             text.contains("install of pohunek 1.0.0 would pass its preflight (namespace ns), checked under the transaction lock"),
@@ -686,6 +789,8 @@ mod tests {
                 reason: "a worker may still run it".to_owned(),
             }],
             gc_error: Some("journals unreadable".to_owned()),
+            preflight: None,
+            accepted_runtime_loss: false,
         });
         assert!(text.contains("pohunek 2.0.0 is already active"), "{text}");
         assert!(!text.contains("upgraded"), "{text}");

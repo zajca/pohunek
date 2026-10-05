@@ -214,7 +214,9 @@ Recover by upgrading forward to the matching M2-or-newer component set.
 
 For a daemon archive upgrade, run its installer
 (`packaging/install-daemon.sh`, which runs
-`pohunek service upgrade --from <archive-dir>`) rather than replacing only `pohunekd`. The upgrade copies the new
+`pohunek service upgrade --from <archive-dir>`) rather than replacing only `pohunekd`. Before it changes anything, the upgrade
+runs the [upgrade preflight](#upgrade-preflight) with the new binaries and
+refuses when a live session would not survive the switch. It then copies the new
 binaries into their own `<prefix>/libexec/pohunek/<version>/` directory,
 switches `active_version` in `service.toml`, rewrites the daemon job to the new
 version, and restarts only the daemon. Worker jobs are separate native jobs
@@ -335,7 +337,8 @@ first effect — `HOME` and the XDG roots, the prefix, every directory it writes
 a pending transaction it would refuse, the recorded installation, the prefix
 owner, and, for an install that starts over, a daemon job registered without
 `service.toml` (`service_daemon_job_present`) — and fails with the error and
-code that command would fail with.
+code that command would fail with. For an upgrade it also runs the
+[upgrade preflight](#upgrade-preflight) and accepts `--accept-runtime-loss`.
 `packaging/install-daemon.sh` runs its whole legacy retirement and the final
 `service install|upgrade` under `pohunek service lock -- <installer>`, and runs
 `service check` before it touches the legacy install.
@@ -396,8 +399,101 @@ and only then stops the daemon and re-checks template workers in every state
 except `inactive`; any surviving worker aborts without removing legacy files.
 `--accept-runtime-loss` is informed consent to lose those existing PTYs and to
 proceed after the post-stop check, not a recovery command. See
-[debug session runtime](debug-session-runtime.md).
+[debug session runtime](debug-session-runtime.md). The same flag is the one
+consent for the service-managed upgrade below; there is no second flag.
 
 When the assistant feature is available, its update intent should use bundle
 version metadata and `changed_in` frontmatter to explain version-specific
 changes before recommending edits.
+
+## Upgrade preflight
+
+`pohunek service upgrade` and `pohunek service check` of an existing service
+run a read-only preflight with the new binaries before any effect: the new
+`pohunek` runs the new `pohunekd upgrade-preflight`, an internal command of the
+one release archive that prints a single JSON report. It reads the metadata
+store (migrated in memory only), the worker journals and the process table. It
+takes no lock and writes, signals and stops nothing, so it is safe while the
+previous daemon runs. It does not connect to worker sockets, because the
+running daemon holds each worker's single controller slot; it judges the
+identity, subagent state and protocol a worker would report from what its
+journal recorded, with the same functions adoption applies (including the check
+that the launch and active identity processes are still in the PTY tree,
+`launch_identity_process_invalid`, `active_identity_process_invalid`,
+`identity_process_root_missing`; a process table that cannot be read fails
+closed with `identity_process_inspection_failed`). A record with a pending stop,
+removal or undelivered create is reported too (`stop_or_removal_intent_pending`,
+`create_rolled_back`), because startup finishes those instead of adopting. The
+real blind spots are what only a service manager or the live socket can show:
+the supervisor job's identity, a hook schema only the runtime registry can
+supply (`worker_identity_unverified`), and socket failures at connect time. The previous daemon has no facility that pauses
+session creation, so the upgrade runs the preflight twice: once before any
+effect, and again after staging, immediately before the daemon is replaced. A
+session created in between is caught by the second run; the window that remains
+is the replacement itself, where the new daemon's own adoption decides and fails
+closed (conflict or lost, with a WARN and a recovery hint). An interrupted
+upgrade whose daemon replacement has not completed (including one interrupted
+just before the service-manager call) is judged again when it is resumed, so
+state that changed meanwhile needs consent. A refusal never touches the running
+daemon: one that happens before the replacement is rolled back without
+restarting it, and one at a resumed upgrade that may still replace it keeps the
+transaction, so rerunning with `--accept-runtime-loss` (or after the sessions
+end) resumes it. A rerun for the already active
+version skip it, as does a resume after the replacement.
+
+Cancelling or rolling back an interrupted upgrade restores the previous daemon
+and is not gated by the adoption preflight: only a command that replaces the
+daemon with the new version is. The previous release must be able to read the
+store the new daemon wrote (a store the new daemon migrated has a
+`<store>.pre-schema-<n>` backup beside it); a downgrade over a migrated store
+is not supported. Worker journals that cannot be read are never treated as
+"no live workers": a journal root that cannot be scanned yields an
+`evidence_unavailable` entry, and while a store line that names no session
+cannot be read, an unreadable or unsupported journal of an unknown session is
+listed as at risk. `service uninstall` keeps its own `--stop-sessions` rule.
+
+The report has two parts. The store part is the dry-run startup migration:
+`missing`, `up_to_date`, `would_migrate` (with the schema it migrates from and
+to, and the record count) or `refused`. A refused store (newer than the
+binary, no migration path, an invalid `schema_version`, a migrated body over the
+16 MiB store limit, or unreadable) means
+the new daemon would not start. The upgrade then fails with
+`service_upgrade_store_unusable`, and `--accept-runtime-loss` never overrides
+it: fix or restore the store, or install the matching newer release.
+
+The sessions part lists every live session with one verdict and a stable reason
+code. A session whose stored runtime is already lost or terminal is not listed:
+the upgrade is not what ends it.
+
+- `adoptable`: the new daemon adopts the worker and keeps its native recovery.
+- `would lose recovery`: the worker is adopted but the session cannot resume
+  natively (`native_recovery_unmappable`, `resume_record_unreadable`,
+  `native_recovery_unverified`). A binding that needs the runtime registry to
+  complete its launch spec is `native_recovery_unverified`, because the
+  preflight cannot build the registry.
+- `would not be adopted`: the new daemon would not manage the worker
+  (`record_unreadable`, `worker_without_session_record`, `store_unusable`,
+  `worker_generation_missing`,
+  `worker_journal_schema_unsupported`, `worker_journal_unreadable`,
+  `worker_journal_missing`, `worker_journal_ambiguous`,
+  `worker_already_ended`, `worker_not_running`, `worker_process_unverifiable`,
+  `runtime_identity_mismatch`, `worker_generation_not_advanced`,
+  `worker_child_missing`, `worker_not_initialized`,
+  `worker_protocol_incompatible`). Evidence the
+  preflight cannot read counts against the session.
+  `worker_without_session_record` applies to a live worker journal with no
+  store record only while a store line that names no session cannot be read,
+  because that line may be the worker's own record.
+
+A live worker journal with no store record and no such unreadable line is
+listed under `unmanaged_workers`: the running daemon does not manage that
+worker either, so the upgrade leaves it as it is and does not refuse.
+
+When any session is not adoptable, the command exits non-zero with
+`service_upgrade_sessions_at_risk` and lists each session with its code and
+detail. Let those sessions finish (or end them) and rerun, or pass
+`--accept-runtime-loss` after reviewing the list. With the flag the upgrade
+proceeds, and the `--json` report carries the full `preflight` object and
+`accepted_runtime_loss: true`. A preflight that cannot run at all (missing or
+failing `pohunekd`, an unparsable report) fails with
+`service_upgrade_preflight_failed`, which the flag does not override.
