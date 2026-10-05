@@ -1042,6 +1042,24 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
 }
 
 #[test]
+fn fetch_disables_automatic_maintenance() {
+    let repo = init_repo("fetch-maintenance");
+    let cmd = super::fetch_command(&repo, "main", "refs/pohunek/fetch/x").expect("command");
+    let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
+    let fetch = args
+        .iter()
+        .position(|arg| arg == "fetch")
+        .expect("fetch verb");
+    for setting in ["gc.auto=0", "maintenance.auto=false"] {
+        let at = args
+            .iter()
+            .position(|arg| arg == setting)
+            .unwrap_or_else(|| panic!("{setting} missing: {args:?}"));
+        assert!(at < fetch, "{setting} must precede the verb: {args:?}");
+    }
+}
+
+#[test]
 fn second_session_on_same_branch_gets_a_clear_in_use_error() {
     let mgr = manager("same-branch");
     let repo = init_repo("same-branch-repo");

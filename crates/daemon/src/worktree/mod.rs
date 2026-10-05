@@ -1309,6 +1309,21 @@ fn fetch_origin(repo: &Path, base_branch: &str) -> Result<FetchedBase, String> {
     fetch_into_ref(repo, base_branch, &fetch_ref_name()?)
 }
 
+/// The `git fetch` of `base_branch` from `origin` into `fetch_ref`.
+///
+/// Automatic maintenance is disabled: its `git gc` runs `worktree prune`, which
+/// can overlap a locked add and inspect its incomplete admin entry.
+fn fetch_command(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Command, String> {
+    let mut cmd = git_command(repo)?;
+    cmd.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+        .arg("fetch")
+        .arg("--no-tags")
+        .arg("origin")
+        .arg("--end-of-options")
+        .arg(format!("{base_branch}:{fetch_ref}"));
+    Ok(cmd)
+}
+
 /// [`fetch_origin`] into the named destination ref.
 ///
 /// The refspec has no `+` and the destination must not exist beforehand, so a
@@ -1326,12 +1341,7 @@ fn fetch_into_ref(repo: &Path, base_branch: &str, fetch_ref: &str) -> Result<Fet
         Some(0) => return Err(format!("fetch ref {fetch_ref} already exists")),
         _ => return Err(output_failure_message(&probed)),
     }
-    let mut cmd = git_command(repo)?;
-    cmd.arg("fetch")
-        .arg("--no-tags")
-        .arg("origin")
-        .arg("--end-of-options")
-        .arg(format!("{base_branch}:{fetch_ref}"));
+    let cmd = fetch_command(repo, base_branch, fetch_ref)?;
     run_command(cmd)?;
     // The fetch created the ref (it was absent above), so this request owns it
     // even when it does not resolve to a commit.
