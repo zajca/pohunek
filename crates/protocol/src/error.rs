@@ -176,6 +176,25 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/runtime_package_changed` error.
+    ///
+    /// The package version a launch resolved is no longer the one selected for
+    /// its runtime, because a package change committed while the launch was
+    /// starting. Nothing was launched; a new request resolves the version that
+    /// is selected now. The identity is a validated [`RuntimeId`], so echoing it
+    /// is safe.
+    #[must_use]
+    pub fn runtime_package_changed(runtime: &RuntimeId) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "runtime_package_changed",
+            format!(
+                "runtime `{runtime}` changed its selected package while the session was starting"
+            ),
+            Some("retry the request".to_owned()),
+        )
+    }
+
     /// Creates one payload-free M1 observation error.
     #[must_use]
     pub fn observation(code: &'static str, msg: &'static str) -> Self {

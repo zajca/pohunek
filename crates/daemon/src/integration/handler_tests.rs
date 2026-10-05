@@ -17,11 +17,12 @@ use protocol::{
 use super::commit::StepGate;
 use super::doctor::doctor_for_with;
 use super::handler::{
-    handler, handlers, managed, resolve, update, Handler, Resolved, UPDATE_INCOMPATIBLE_CODE,
+    handler, handlers, managed, resolve, update, Handler, Resolved, RetainedSchemas,
+    UPDATE_INCOMPATIBLE_CODE,
 };
 use super::tests::{scoped_dir, tree_snapshot, with_config_dirs};
 use super::{
-    install_claude, install_codex, install_for, status_for, uninstall_for,
+    install_claude, install_codex, install_for, install_for_retained, status_for, uninstall_for,
     INSTALL_IN_PROGRESS_CODE, INSTALL_LOCK_NAME, INTEGRATION_VERSION_PREFIX,
     NOTIFY_HOOK_INSTALL_NAME, STATE_HOOK_INSTALL_NAME,
 };
@@ -290,6 +291,78 @@ fn a_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active() {
 }
 
 #[test]
+fn a_retained_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active() {
+    let narrowed: &'static pohunek_worker_protocol::HookSchema =
+        Box::leak(Box::new(pohunek_worker_protocol::HookSchema {
+            actions: &[HookAction::IdentityReport],
+            ..*hook_schema("identity-subagent-v1").expect("registered")
+        }));
+    for agent in agents() {
+        let dir = scoped_dir("retained-schema");
+        write_user_config(&agent, &dir);
+        install_current(&agent, &dir);
+        let before = content_snapshot(&dir);
+        let resolved = builtin(&agent);
+        let handler_id = resolved.handler.id();
+
+        let mut retained = RetainedSchemas::default();
+        retained.push(handler_id.to_owned(), narrowed);
+        let refused = update(&resolved, &dir, &retained, &mut ok_gate)
+            .expect_err("a session launched under the narrow schema would lose its reports");
+        assert_eq!(refused.code, UPDATE_INCOMPATIBLE_CODE, "{agent:?}");
+        assert!(refused.msg.contains("still in use"), "{refused:?}");
+        assert_eq!(content_snapshot(&dir), before, "{agent:?}");
+
+        let mut other = RetainedSchemas::default();
+        other.push("acme-hook-v1".to_owned(), narrowed);
+        update(&resolved, &dir, &other, &mut ok_gate)
+            .expect("a schema of another handler takes no part");
+
+        let mut same = RetainedSchemas::default();
+        same.push(handler_id.to_owned(), resolved.schema);
+        update(&resolved, &dir, &same, &mut ok_gate)
+            .expect("the runtime's own schema admits the set");
+    }
+}
+
+#[test]
+fn an_undetermined_retained_version_refuses_every_handler_update() {
+    let package = protocol::PackageId::parse("acme.runtime.other").expect("package id");
+    let mut undetermined = RetainedSchemas::default();
+    undetermined.push_unresolvable(package);
+    let pi_host =
+        pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
+    let pi = RuntimeRef::from_wire("pi");
+
+    for agent in agents() {
+        let dir = scoped_dir("retained-unresolvable");
+        write_user_config(&agent, &dir);
+        install_current(&agent, &dir);
+        let before = content_snapshot(&dir);
+        let resolved = builtin(&agent);
+        let refused = update(&resolved, &dir, &undetermined, &mut ok_gate)
+            .expect_err("the unknown version may drive this handler");
+        assert_eq!(refused.code, UPDATE_INCOMPATIBLE_CODE, "{agent:?}");
+        assert_eq!(content_snapshot(&dir), before, "{agent:?}");
+    }
+
+    let claude = scoped_dir("retained-unresolvable-claude");
+    let codex = scoped_dir("retained-unresolvable-codex");
+    for (host, agent) in [
+        (&pi_host, Some(&pi)),
+        (&builtin_host(), Some(&RuntimeRef::claude())),
+        (&builtin_host(), None),
+    ] {
+        let refused = with_config_dirs(&claude, &codex, || {
+            install_for_retained(host, agent, &undetermined)
+        })
+        .expect_err("an undetermined retained version");
+        assert_eq!(refused.code, UPDATE_INCOMPATIBLE_CODE, "{agent:?}");
+    }
+    assert!(!claude.join("hooks").join(STATE_HOOK_INSTALL_NAME).exists());
+}
+
+#[test]
 fn an_active_set_newer_than_the_update_is_replaced_by_it() {
     for agent in agents() {
         let dir = scoped_dir("compat-newer-active");
@@ -336,7 +409,7 @@ fn a_failing_activation_restores_the_exact_prior_tree() {
                     }
                 };
 
-                let outcome = update(&resolved, &dir, &mut gate);
+                let outcome = update(&resolved, &dir, &RetainedSchemas::default(), &mut gate);
 
                 let Err(error) = outcome else {
                     break;

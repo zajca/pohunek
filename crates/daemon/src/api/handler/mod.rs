@@ -381,8 +381,7 @@ async fn handle_negotiated(
         }
         method::ASSISTANT_MATERIALIZE => assistant::handle_assistant_materialize(request).await,
         method::INTEGRATION_INSTALL => {
-            integration::handle_integration_install(request, state.sessions.profiles().runtimes())
-                .await
+            integration::handle_integration_install(request, &state.sessions).await
         }
         method::INTEGRATION_STATUS => {
             integration::handle_integration_status(request, state.sessions.profiles().runtimes())

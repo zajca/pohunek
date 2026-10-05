@@ -10,17 +10,22 @@
 //!    from anything the caller says about the package;
 //! 3. the registry records the change and the runtime registry is rebuilt.
 //!
+//! A package whose integration is not compatible with a version that something
+//! still references is installed but never selected ([`selection`]).
+//!
 //! Reads take no guard: the registry record is replaced atomically, so a read
 //! sees one committed state.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 mod bind;
 mod error;
 mod fault;
+mod selection;
 mod source;
 mod trust;
 
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use package::catalog_state::CatalogState;
@@ -37,12 +42,14 @@ use protocol::{
     PackageFindingKind, PackageId, PackageIdentity, PackageInfo, PackageInspectResult,
     PackageInstallParams, PackageInstallResult, PackageInstallStatus, PackageLinkParams,
     PackageListResult, PackageOrigin, PackageRuntimeInfo, PackageSelectParams,
-    PackageSetEnabledParams, PackageTrust, PackageUninstallParams, PackageUninstallResult,
+    PackageSelectionBlock, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
+    PackageUninstallResult, ProtocolError,
 };
 use tracing::warn;
 
 use self::error::{registry_kind, rejection_kind};
 use self::fault::fault_of;
+use self::selection::{block_of, conflict, declared_by, Integrations};
 use self::source::{build_directory, read_archive_file, read_regular_file};
 pub use self::trust::HostTrustAnchor;
 use super::packages::PackageUninstallError;
@@ -52,12 +59,15 @@ use crate::agent::host::{
     PackageReport, PackageStore, RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
+use crate::integration::RetainedSchemas;
 
 /// What a package method needs from the session registry.
 struct Context {
     store: PackageStore,
     runtimes: RuntimeHost,
     anchor: Option<HostTrustAnchor>,
+    /// Integrations read from installed packages during this request.
+    integrations: Mutex<Integrations>,
 }
 
 /// An archive that passed every check an install makes before it writes.
@@ -164,6 +174,16 @@ impl SessionRegistry {
                     continue;
                 }
                 let info = inspect_record(&context, &state, record, &retained, &report).info;
+                if let Some(block) = info.selection_blocked {
+                    findings.push(PackageFinding {
+                        kind: PackageFindingKind::SelectionBlocked,
+                        digest: info.digest.clone(),
+                        package: Some(info.package.clone()),
+                        fault: None,
+                        referenced: info.referenced,
+                        blocked_by: Some(block.retained),
+                    });
+                }
                 if let Some(fault) = info.fault {
                     findings.push(PackageFinding {
                         kind: PackageFindingKind::Fault,
@@ -171,6 +191,7 @@ impl SessionRegistry {
                         package: Some(info.package),
                         fault: Some(fault),
                         referenced: info.referenced,
+                        blocked_by: None,
                     });
                 }
             }
@@ -188,6 +209,7 @@ impl SessionRegistry {
                         package: None,
                         fault: None,
                         referenced,
+                        blocked_by: None,
                     });
                 }
                 for digest in retained.iter().filter(|d| state.package(d).is_none()) {
@@ -197,6 +219,7 @@ impl SessionRegistry {
                         package: None,
                         fault: None,
                         referenced: true,
+                        blocked_by: None,
                     });
                 }
             }
@@ -219,11 +242,31 @@ impl SessionRegistry {
         T: Send + 'static,
         F: FnOnce(&Context, &RetainedDigests) -> Result<T, PackageErrorKind> + Send + 'static,
     {
+        self.package_transaction_excluding(None, work).await
+    }
+
+    /// [`Self::package_transaction`] whose retained set leaves out the pin of
+    /// the host profile `profile`, because the work replaces that pin.
+    async fn package_transaction_excluding<T, F>(
+        &self,
+        profile: Option<String>,
+        work: F,
+    ) -> Result<T, PackageErrorKind>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Context, &RetainedDigests) -> Result<T, PackageErrorKind> + Send + 'static,
+    {
         let context = self.package_context()?;
         let registry = self.clone();
         tokio::spawn(async move {
             let _exclusive = registry.inner.package_lifecycle.write().await;
-            let retained = registry.package_retained().await?;
+            let retained = registry
+                .retained_digests_excluding_profile(profile)
+                .await
+                .map_err(|error| {
+                    warn!(%error, "the sessions that pin packages cannot be listed");
+                    PackageErrorKind::RegistryFailed
+                })?;
             blocking(move || work(&context, &retained)).await
         })
         .await
@@ -312,6 +355,12 @@ impl SessionRegistry {
 
     /// Makes a package the one bare requests of its package id resolve to.
     ///
+    /// A package whose integration handler or hook schema differs from a
+    /// version of the same package that a live, lost or resumable session or a
+    /// host profile still references is refused with
+    /// [`PackageErrorKind::IntegrationIncompatible`]; it stays installed and the
+    /// selection is unchanged.
+    ///
     /// # Errors
     ///
     /// Returns the [`PackageErrorKind`] naming the first failed check.
@@ -320,7 +369,8 @@ impl SessionRegistry {
         params: PackageSelectParams,
     ) -> Result<PackageChangeResult, PackageErrorKind> {
         self.package_transaction(move |context, retained| {
-            prove_loadable(context, &params.digest)?;
+            let definition = prove_loadable(context, &params.digest)?;
+            ensure_selectable(context, retained, &params.digest, &definition)?;
             context
                 .store
                 .registry()
@@ -369,7 +419,58 @@ impl SessionRegistry {
             store,
             runtimes,
             anchor: self.inner.config.catalog_trust_anchor.clone(),
+            integrations: Mutex::default(),
         })
+    }
+
+    /// Runs an integration update under the shared lifecycle guard with the
+    /// hook schemas of the package versions that sessions and profile pins
+    /// still reference.
+    ///
+    /// The work runs in a task of its own that owns the guard until the work
+    /// ends, so a caller that stops waiting cannot release it while the asset
+    /// set is still being written, and a package selection or uninstall cannot
+    /// interleave with the activation. A host without a package store has no
+    /// package version to retain.
+    ///
+    /// # Errors
+    ///
+    /// Returns `package_registry_failed` when the sessions that pin packages
+    /// or the registry cannot be read, `integration_install_task_panicked`
+    /// when the work panics, and otherwise the error of `work`.
+    pub async fn integration_install<T, F>(&self, work: F) -> Result<T, ProtocolError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&RetainedSchemas) -> Result<T, ProtocolError> + Send + 'static,
+    {
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let _shared = registry.inner.package_lifecycle.read().await;
+            let schemas = if registry.inner.profiles.runtimes().package_store().is_none() {
+                RetainedSchemas::default()
+            } else {
+                let context = registry.package_context()?;
+                let retained = registry.package_retained().await?;
+                blocking(move || {
+                    let state = read_state(&context)?;
+                    Ok(selection::retained_schemas(&context, &state, &retained))
+                })
+                .await?
+            };
+            tokio::task::spawn_blocking(move || work(&schemas))
+                .await
+                .map_err(|error| {
+                    warn!(%error, "an integration install task failed");
+                    ProtocolError::new(
+                        protocol::ErrorClass::Daemon,
+                        "integration_install_task_panicked",
+                        "integration installation task panicked",
+                        Some("retry the request; if it repeats, inspect daemon logs".to_owned()),
+                    )
+                })?
+        })
+        .await
+        .map_err(|_join_error| ProtocolError::from(PackageErrorKind::RegistryFailed))?
     }
 
     async fn package_retained(&self) -> Result<RetainedDigests, PackageErrorKind> {
@@ -484,6 +585,7 @@ fn runtime_info(definition: &RuntimeDefinition) -> PackageRuntimeInfo {
         integration_handler: definition
             .integration_handler()
             .map(|handler| handler.as_str().to_owned()),
+        hook_schema: definition.hook_schema().map(|schema| schema.id.to_owned()),
     }
 }
 
@@ -497,22 +599,24 @@ fn inspect_record(
     report: &PackageReport,
 ) -> Inspected {
     let digest = record.digest();
-    let (runtime, fault) = match context.store.read_definition(digest, record.identity()) {
-        Ok(definition) => {
-            let fault = if is_reserved(definition.runtime_id()) {
-                fault_of(&PackageRejection::ReservedRuntimeId)
-            } else if report.rejected.iter().any(|rejected| {
-                &rejected.digest == digest
-                    && matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
-            }) {
-                fault_of(&PackageRejection::RuntimeIdConflict)
-            } else {
-                None
-            };
-            (Some(runtime_info(&definition)), fault)
-        }
-        Err(rejection) => (None, fault_of(&rejection)),
-    };
+    let (runtime, fault, selection_blocked) =
+        match context.store.read_definition(digest, record.identity()) {
+            Ok(definition) => {
+                let fault = if is_reserved(definition.runtime_id()) {
+                    fault_of(&PackageRejection::ReservedRuntimeId)
+                } else if report.rejected.iter().any(|rejected| {
+                    &rejected.digest == digest
+                        && matches!(rejected.reason, PackageRejection::RuntimeIdConflict)
+                }) {
+                    fault_of(&PackageRejection::RuntimeIdConflict)
+                } else {
+                    None
+                };
+                let blocked = block_of(context, state, retained, record, &declared_by(&definition));
+                (Some(runtime_info(&definition)), fault, blocked)
+            }
+            Err(rejection) => (None, fault_of(&rejection), None),
+        };
     Inspected {
         info: PackageInfo {
             digest: digest.clone(),
@@ -524,6 +628,7 @@ fn inspect_record(
             runtime_id: runtime.as_ref().map(|runtime| runtime.runtime_id.clone()),
             fault,
             referenced: retained.contains(digest),
+            selection_blocked,
         },
         runtime,
     }
@@ -560,8 +665,12 @@ fn check_claim(
 }
 
 /// Proves that the installed package `digest` still loads and may serve its
-/// runtime id, so enabling or selecting it cannot create a conflict.
-fn prove_loadable(context: &Context, digest: &PackageDigest) -> Result<(), PackageErrorKind> {
+/// runtime id, so enabling or selecting it cannot create a conflict, and
+/// returns the definition it loaded.
+fn prove_loadable(
+    context: &Context,
+    digest: &PackageDigest,
+) -> Result<RuntimeDefinition, PackageErrorKind> {
     let state = read_state(context)?;
     let record = state
         .package(digest)
@@ -578,7 +687,47 @@ fn prove_loadable(context: &Context, digest: &PackageDigest) -> Result<(), Packa
         &definition,
         &record.identity().id,
         authority_of(record.source()),
-    )
+    )?;
+    Ok(definition)
+}
+
+/// Refuses the selection of the installed package `digest` while a retained
+/// reference uses a version of the same package with another integration.
+///
+/// Selecting the package that is already selected changes nothing and is
+/// always accepted. Must run under the exclusive lifecycle authority, with
+/// `retained` computed under it.
+fn ensure_selectable(
+    context: &Context,
+    retained: &RetainedDigests,
+    digest: &PackageDigest,
+    definition: &RuntimeDefinition,
+) -> Result<(), PackageErrorKind> {
+    let state = read_state(context)?;
+    let record = state
+        .package(digest)
+        .ok_or(PackageErrorKind::NotInstalled)?;
+    let id = &record.identity().id;
+    if state.selected(id) == Some(digest) {
+        return Ok(());
+    }
+    match conflict(
+        context,
+        &state,
+        retained,
+        (digest, id),
+        &declared_by(definition),
+    ) {
+        None => Ok(()),
+        Some(blocking) => {
+            warn!(
+                package = %id,
+                retained = %blocking,
+                "a package is not selected: its integration is not compatible with a retained version"
+            );
+            Err(PackageErrorKind::IntegrationIncompatible)
+        }
+    }
 }
 
 /// Rebuilds the runtime registry and describes the package as it is now.
@@ -728,6 +877,17 @@ fn commit_install(
     )?;
     let runtime = runtime_info(&prepared.definition);
     let now = unix_now()?;
+    // A package whose integration is incompatible with a retained version is
+    // installed without being selected, so the install itself never fails on
+    // it and the selected version keeps serving.
+    let held_back = conflict(
+        context,
+        &read_state(context)?,
+        retained,
+        (&prepared.digest, &prepared.identity.id),
+        &declared_by(&prepared.definition),
+    );
+    let select = plan.select && held_back.is_none();
     if plan.dry_run {
         return Ok(PackageInstallResult {
             status: PackageInstallStatus::Preview,
@@ -736,15 +896,28 @@ fn commit_install(
                 package: prepared.identity,
                 origin: origin_of(prepared.source),
                 enabled: plan.enable,
-                selected: plan.select,
+                selected: select,
                 installed_at_unix_seconds: now,
                 runtime_id: Some(runtime.runtime_id.clone()),
                 fault: None,
                 referenced: retained.contains(&prepared.digest),
+                selection_blocked: held_back.map(|retained| PackageSelectionBlock {
+                    reason: protocol::PackageSelectionBlockReason::IncompatibleWithRetained,
+                    retained,
+                }),
             },
             runtime,
             reloaded: false,
         });
+    }
+    if let Some(blocking) = &held_back {
+        if plan.select {
+            warn!(
+                package = %prepared.identity.id,
+                retained = %blocking,
+                "a package is installed but not selected: its integration is not compatible with a retained version"
+            );
+        }
     }
 
     let registry = context.store.registry();
@@ -765,7 +938,7 @@ fn commit_install(
             identity: prepared.identity.clone(),
             source: prepared.source,
             enabled: plan.enable,
-            select: plan.select,
+            select,
             installed_at_unix_seconds: now,
         })
         .map_err(|error| mutation_kind(context, &error))?;
@@ -812,6 +985,8 @@ fn commit_install(
 mod bind_tests;
 #[cfg(test)]
 mod catalog_tests;
+#[cfg(test)]
+mod selection_tests;
 #[cfg(test)]
 mod test_fixture;
 #[cfg(test)]

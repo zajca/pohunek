@@ -50,6 +50,7 @@ fn info(id: &str, digest: &str, runtime: Option<&str>) -> PackageInfo {
         runtime_id: runtime.map(|value| RuntimeId::parse(value).expect("runtime")),
         fault: None,
         referenced: false,
+        selection_blocked: None,
     }
 }
 
@@ -483,6 +484,7 @@ fn bind_result(
             resumable: false,
             forkable: false,
             integration_handler: None,
+            hook_schema: None,
         },
         reloaded,
     }

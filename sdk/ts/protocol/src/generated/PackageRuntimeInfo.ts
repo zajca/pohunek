@@ -67,4 +67,10 @@ export type PackageRuntimeInfo = {
    * The core-owned integration handler the runtime names, if any.
    */
   integration_handler?: string;
+  /**
+   * The core-owned hook schema the runtime names, if any. It decides which
+   * hook reports sessions of the runtime may make and must be driven by
+   * `integration_handler`.
+   */
+  hook_schema?: string;
 };

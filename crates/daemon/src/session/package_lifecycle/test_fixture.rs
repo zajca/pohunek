@@ -1,8 +1,9 @@
 //! Fixtures of the package lifecycle tests: real archives, a real plugin root
 //! and a session registry over a host that serves it.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -45,7 +46,19 @@ impl Package {
     /// Builds the archive of a package `package` at `version` serving
     /// `runtime`, launching `program`.
     pub(super) fn build(package: &str, version: &str, runtime: &str, program: &str) -> Self {
-        let document = pi_shaped_document(Path::new(program), PI_SHAPED_NO_CHECK)
+        Self::build_with(package, version, runtime, program, None)
+    }
+
+    /// Like [`Self::build`], declaring `integration` as the handler id and the
+    /// hook schema id of the descriptor's `[integration]` table.
+    pub(super) fn build_with(
+        package: &str,
+        version: &str,
+        runtime: &str,
+        program: &str,
+        integration: Option<(&str, &str)>,
+    ) -> Self {
+        let mut document = pi_shaped_document(Path::new(program), PI_SHAPED_NO_CHECK)
             .replace("id = \"acme.runtime.pi\"", &format!("id = \"{package}\""))
             .replace("version = \"1.0.0\"", &format!("version = \"{version}\""))
             .replace("id = \"pi\"", &format!("id = \"{runtime}\""))
@@ -53,6 +66,12 @@ impl Package {
                 "detect_manifest = \"any\"",
                 "detect_manifest = \"detect.toml\"",
             );
+        if let Some((handler, schema)) = integration {
+            let _ = write!(
+                document,
+                "\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{schema}\"\n"
+            );
+        }
         Self::from_entries(&files(document))
     }
 
@@ -128,6 +147,7 @@ pub(super) struct Fixture {
     pub(super) agents: PathBuf,
     pub(super) host: RuntimeHost,
     pub(super) registry: SessionRegistry,
+    store_path: Option<PathBuf>,
 }
 
 impl Fixture {
@@ -146,8 +166,17 @@ impl Fixture {
         Self::build(tag, None, Some(store_path))
     }
 
+    /// A second daemon over the plugin root, agents directory and session
+    /// store of this fixture, as after a restart.
+    pub(super) fn reopen(&self) -> Self {
+        Self::at(self.dir.clone(), None, self.store_path.clone())
+    }
+
     fn build(tag: &str, anchor: Option<HostTrustAnchor>, store_path: Option<PathBuf>) -> Self {
-        let dir = temp_dir(tag);
+        Self::at(temp_dir(tag), anchor, store_path)
+    }
+
+    fn at(dir: PathBuf, anchor: Option<HostTrustAnchor>, store_path: Option<PathBuf>) -> Self {
         let plugins = dir.join("plugins");
         let agents = dir.join("agents");
         let state = dir.join("state");
@@ -165,7 +194,7 @@ impl Fixture {
             SessionRegistryConfig {
                 shell_command: hermetic_shell(),
                 stop_grace: std::time::Duration::from_millis(50),
-                store_path,
+                store_path: store_path.clone(),
                 catalog_trust_anchor: anchor,
                 agents_dir: Some(agents.clone()),
                 host_state_dir: Some(state),
@@ -179,6 +208,7 @@ impl Fixture {
             agents,
             host,
             registry,
+            store_path,
         }
     }
 

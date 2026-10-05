@@ -4,6 +4,7 @@ import type { PackageDigest } from "./PackageDigest";
 import type { PackageFault } from "./PackageFault";
 import type { PackageIdentity } from "./PackageIdentity";
 import type { PackageOrigin } from "./PackageOrigin";
+import type { PackageSelectionBlock } from "./PackageSelectionBlock";
 import type { RuntimeId } from "./RuntimeId";
 
 /**
@@ -49,4 +50,10 @@ export type PackageInfo = {
    * digest, which keeps it from being uninstalled.
    */
   referenced: boolean;
+  /**
+   * Why an installed, unselected package cannot be selected yet; absent
+   * when it is selected or may be selected now. The package stays installed
+   * and never serves a fresh launch while this is present.
+   */
+  selection_blocked?: PackageSelectionBlock;
 };

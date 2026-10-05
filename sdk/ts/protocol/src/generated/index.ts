@@ -105,6 +105,8 @@ export type { PackageListResult } from "./PackageListResult";
 export type { PackageOrigin } from "./PackageOrigin";
 export type { PackageRuntimeInfo } from "./PackageRuntimeInfo";
 export type { PackageSelectParams } from "./PackageSelectParams";
+export type { PackageSelectionBlock } from "./PackageSelectionBlock";
+export type { PackageSelectionBlockReason } from "./PackageSelectionBlockReason";
 export type { PackageSetEnabledParams } from "./PackageSetEnabledParams";
 export type { PackageTrust } from "./PackageTrust";
 export type { PackageUninstallParams } from "./PackageUninstallParams";

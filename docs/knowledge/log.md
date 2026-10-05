@@ -1,5 +1,21 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-05, compatibility-gated selection)
+
+- A package version whose integration (handler id and hook schema id, or none)
+  differs from a version of the same package that a live, lost or resumable
+  session or a host profile pin still references stays installed but unselected:
+  `package.select` is refused with `package_integration_incompatible`,
+  `package.install` with `select: true` installs it unselected, and
+  `package.list`, `inspect` and `doctor` report `selection_blocked`. The state
+  is derived from the registry and the retention scan, clears when the last
+  reference is gone, and never selects the package on its own. The runtime
+  packages guide and the public API describe the rule, `PackageRuntimeInfo`
+  gained `hook_schema`, a profile pin of an incompatible version is refused, a
+  launch that raced a select gets `runtime_package_changed`, and the
+  integration update path checks the asset set against the schemas of retained
+  versions as well.
+
 ## Unreleased (2026-10-05, integration handlers)
 
 - Integration install, status, doctor, and uninstall dispatch through the

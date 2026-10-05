@@ -5,13 +5,13 @@
 
 use protocol::{
     IntegrationDoctorParams, IntegrationDoctorResult, IntegrationInstallParams,
-    IntegrationInstallResult, IntegrationStatusParams, IntegrationStatusResult,
-    IntegrationUninstallParams, IntegrationUninstallResult, ProtocolError, Request, Response,
-    RuntimeRef,
+    IntegrationStatusParams, IntegrationStatusResult, IntegrationUninstallParams,
+    IntegrationUninstallResult, ProtocolError, Request, Response, RuntimeRef,
 };
 
 use super::util::{error_value, parse_optional_params, parse_params};
 use crate::agent::host::RuntimeHost;
+use crate::session::SessionRegistry;
 
 /// Classifies the agent a hook request names against the runtime registry.
 ///
@@ -27,20 +27,28 @@ fn check_agent(runtimes: &RuntimeHost, agent: Option<&RuntimeRef>) -> Result<(),
 
 pub(super) async fn handle_integration_install(
     request: &Request,
-    runtimes: &RuntimeHost,
+    sessions: &SessionRegistry,
 ) -> Response {
     let params = match parse_params::<IntegrationInstallParams>(request) {
         Ok(params) => params,
         Err(err) => return error_value(request, err),
     };
-    if let Err(err) = check_agent(runtimes, params.agent.as_ref()) {
+    let runtimes = sessions.profiles().runtimes().clone();
+    if let Err(err) = check_agent(&runtimes, params.agent.as_ref()) {
         return error_value(request, err);
     }
-    let runtimes = runtimes.clone();
-    run_integration_install_blocking(request, move || {
-        crate::integration::install_for(&runtimes, params.agent.as_ref())
-    })
-    .await
+    // The update runs under the shared lifecycle guard, owned by a task the
+    // caller's disconnect cannot cancel.
+    let agent = params.agent;
+    match sessions
+        .integration_install(move |retained| {
+            crate::integration::install_for_retained(&runtimes, agent.as_ref(), retained)
+        })
+        .await
+    {
+        Ok(result) => super::util::ok_value(request, &result),
+        Err(err) => error_value(request, err),
+    }
 }
 
 pub(super) async fn handle_integration_uninstall(
@@ -99,11 +107,15 @@ pub(super) async fn handle_integration_status(
 
 /// Run integration installation off the Tokio request task.
 ///
+/// Test helper for the join path; the handler runs the install through
+/// `SessionRegistry::integration_install`.
+///
 /// A blocking-task panic becomes a typed daemon error. The helper is exposed to
 /// handler tests that assert the join path.
+#[cfg(test)]
 pub(super) async fn run_integration_install_blocking<F>(request: &Request, op: F) -> Response
 where
-    F: FnOnce() -> Result<IntegrationInstallResult, ProtocolError> + Send + 'static,
+    F: FnOnce() -> Result<protocol::IntegrationInstallResult, ProtocolError> + Send + 'static,
 {
     super::util::run_blocking(
         request,

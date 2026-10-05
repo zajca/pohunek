@@ -46,7 +46,12 @@ mod uninstall;
 pub use doctor::doctor;
 #[cfg(unix)]
 pub use doctor::doctor_for;
-pub use handler::{install_for, status_for, AssetManifest, DaemonHandler, Handler, StagedUpdate};
+#[cfg(test)]
+pub use handler::install_for;
+pub use handler::{
+    install_for_retained, status_for, AssetManifest, DaemonHandler, Handler, RetainedSchemas,
+    StagedUpdate,
+};
 #[cfg(all(test, unix))]
 pub use uninstall::uninstall;
 #[cfg(unix)]

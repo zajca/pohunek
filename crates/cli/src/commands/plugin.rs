@@ -7,7 +7,7 @@
 //! the package in a dry run, the CLI prints what it declares, and nothing
 //! changes until the owner repeats the command with `--yes`.
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-05
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -21,8 +21,8 @@ use protocol::{
     PackageDoctorResult, PackageFault, PackageFindingKind, PackageId, PackageInfo,
     PackageInspectParams, PackageInspectResult, PackageInstallParams, PackageInstallResult,
     PackageInstallStatus, PackageLinkParams, PackageListResult, PackageOrigin, PackageRuntimeInfo,
-    PackageSelectParams, PackageSetEnabledParams, PackageTrust, PackageUninstallParams,
-    PackageUninstallResult, PackageVersion,
+    PackageSelectParams, PackageSelectionBlockReason, PackageSetEnabledParams, PackageTrust,
+    PackageUninstallParams, PackageUninstallResult, PackageVersion,
 };
 
 use crate::client::Client;
@@ -804,7 +804,12 @@ async fn ingest_package(
     };
     if !yes {
         if !json {
-            print!("{}", render_install_review(&preview, enable, select));
+            let recorded = installed
+                .packages
+                .iter()
+                .find(|info| info.digest == preview.package.digest);
+            let selected = selection_after(ingest, select, &preview.package, recorded);
+            print!("{}", render_install_review(&preview, enable, selected));
         }
         return Err(Error::ConsentRequired {
             verb: ingest.verb(),
@@ -971,7 +976,22 @@ pub(super) fn state_label(info: &PackageInfo) -> String {
     if info.referenced {
         parts.push("pinned");
     }
+    if info.selection_blocked.is_some() {
+        parts.push("selection blocked");
+    }
     parts.join(" ")
+}
+
+/// Why the package cannot be selected yet, worded for the owner; `None` when
+/// nothing holds it back.
+fn selection_note(info: &PackageInfo) -> Option<String> {
+    let block = info.selection_blocked.as_ref()?;
+    Some(match block.reason {
+        PackageSelectionBlockReason::IncompatibleWithRetained => format!(
+            "its integration handler or hook schema differs from version {} of the same package, which a session or profile still uses; the package stays installed and unselected until that reference is gone, then select it with `pohunek plugin select`",
+            short_digest(&block.retained)
+        ),
+    })
 }
 
 fn yes_no(value: bool) -> &'static str {
@@ -1113,6 +1133,14 @@ fn render_runtime_details(output: &mut String, runtime: &PackageRuntimeInfo) {
             .as_deref()
             .map_or_else(|| "none".to_owned(), sanitize)
     );
+    let _ = writeln!(
+        output,
+        "Hook schema: {}",
+        runtime
+            .hook_schema
+            .as_deref()
+            .map_or_else(|| "none".to_owned(), sanitize)
+    );
 }
 
 fn render_inspect(result: &PackageInspectResult) -> String {
@@ -1125,6 +1153,9 @@ fn render_inspect(result: &PackageInspectResult) -> String {
         "Health:      {}",
         info.fault.map_or("ok", fault_label)
     );
+    if let Some(note) = selection_note(info) {
+        let _ = writeln!(output, "Selection:   blocked: {note}");
+    }
     match &result.runtime {
         Some(runtime) => render_runtime_details(&mut output, runtime),
         None => {
@@ -1134,13 +1165,44 @@ fn render_inspect(result: &PackageInspectResult) -> String {
     output
 }
 
-/// The review printed before an install-like command asks for consent.
-fn render_install_review(preview: &PackageInstallResult, enable: bool, select: bool) -> String {
+/// Whether the package is selected after the command succeeds.
+///
+/// `preview` comes from a dry run that never selects, so the outcome is
+/// derived from what the command does: an archive that is already installed
+/// keeps its recorded selection under `install` and `link`, `update` selects
+/// it unless the selection is held back, and a fresh install selects when
+/// `requested` and not held back. `recorded` is the installed package of the
+/// archive's digest, if any.
+fn selection_after(
+    ingest: Ingest,
+    requested: bool,
+    preview: &PackageInfo,
+    recorded: Option<&PackageInfo>,
+) -> bool {
+    let held_back = preview.selection_blocked.is_some();
+    match (recorded, ingest) {
+        (Some(_), Ingest::Update) => !held_back,
+        (Some(recorded), _) => recorded.selected,
+        (None, _) => requested && !held_back,
+    }
+}
+
+/// The review printed before an install-like command asks for consent;
+/// `selected` is the outcome of [`selection_after`].
+fn render_install_review(preview: &PackageInstallResult, enable: bool, selected: bool) -> String {
     let mut output = String::from("The package declares:\n");
     render_package_details(&mut output, &preview.package);
     render_runtime_details(&mut output, &preview.runtime);
     let _ = writeln!(output, "Enabled:     {} after install", yes_no(enable));
-    let _ = writeln!(output, "Selected:    {} after install", yes_no(select));
+    let _ = writeln!(output, "Selected:    {} after install", yes_no(selected));
+    if !selected {
+        if let Some(note) = selection_note(&preview.package) {
+            let _ = writeln!(
+                output,
+                "Note:        it is installed but not selected: {note}"
+            );
+        }
+    }
     if preview.status == PackageInstallStatus::AlreadyInstalled {
         let _ = writeln!(output, "Note:        this archive is already installed");
     }
@@ -1167,7 +1229,12 @@ fn render_install_result(result: &PackageInstallResult, ingest: Ingest) -> Strin
             short_digest(&info.digest).trim_start_matches(DIGEST_PREFIX)
         );
     }
-    if !info.selected {
+    if let Some(note) = selection_note(info) {
+        let _ = writeln!(
+            output,
+            "Not selected: {note}. Bare requests keep resolving to the selected version."
+        );
+    } else if !info.selected {
         let _ = writeln!(
             output,
             "Bare requests do not resolve to it yet; select it with `pohunek plugin select {} --digest {}`.",
@@ -1239,6 +1306,10 @@ fn render_doctor(result: &PackageDoctorResult) -> String {
                 PackageFindingKind::Fault => finding.fault.map_or("fault", fault_label).to_owned(),
                 PackageFindingKind::UnregisteredRoot => "unregistered root".to_owned(),
                 PackageFindingKind::PinnedNotInstalled => "pinned but not installed".to_owned(),
+                PackageFindingKind::SelectionBlocked => finding.blocked_by.as_ref().map_or_else(
+                    || "selection blocked".to_owned(),
+                    |retained| format!("selection blocked by {}", short_digest(retained)),
+                ),
             };
             [
                 kind,
@@ -1290,6 +1361,7 @@ mod tests {
             runtime_id: Some(RuntimeId::parse("pi").expect("runtime")),
             fault: None,
             referenced: false,
+            selection_blocked: None,
         }
     }
 
@@ -1720,6 +1792,7 @@ mod tests {
             resumable: true,
             forkable: false,
             integration_handler: None,
+            hook_schema: None,
         }
     }
 
@@ -1795,6 +1868,7 @@ mod tests {
                     }),
                     fault: Some(PackageFault::RootModified),
                     referenced: true,
+                    blocked_by: None,
                 },
                 PackageFinding {
                     kind: PackageFindingKind::UnregisteredRoot,
@@ -1802,12 +1876,150 @@ mod tests {
                     package: None,
                     fault: None,
                     referenced: false,
+                    blocked_by: None,
                 },
             ],
         });
         assert!(text.contains("root modified"), "{text}");
         assert!(text.contains("unregistered root"), "{text}");
         assert!(text.contains("2 finding(s)"), "{text}");
+    }
+
+    fn held_back(version: &str, digest: &str) -> PackageInfo {
+        let mut blocked = info("acme.pi", version, digest, false);
+        blocked.selection_blocked = Some(protocol::PackageSelectionBlock {
+            reason: PackageSelectionBlockReason::IncompatibleWithRetained,
+            retained: PackageDigest::parse(DIGEST_A).expect("digest"),
+        });
+        blocked
+    }
+
+    #[test]
+    fn a_withheld_selection_is_visible_in_every_view() {
+        let blocked = held_back("2.0.0", DIGEST_B);
+        assert_eq!(state_label(&blocked), "enabled selection blocked");
+        let list = render_list(&PackageListResult {
+            generation: 1,
+            packages: vec![blocked.clone()],
+        });
+        assert!(list.contains("enabled selection blocked"), "{list}");
+
+        let mut declared = runtime("Pi");
+        declared.integration_handler = Some("codex-hook-v1".to_owned());
+        declared.hook_schema = Some("identity-subagent-v1".to_owned());
+        let inspect = render_inspect(&PackageInspectResult {
+            package: blocked.clone(),
+            runtime: Some(declared.clone()),
+        });
+        assert!(inspect.contains("Selection:   blocked"), "{inspect}");
+        assert!(inspect.contains("sha256:aaaaaaaaaaaa"), "{inspect}");
+        assert!(
+            inspect.contains("Hook schema: identity-subagent-v1"),
+            "{inspect}"
+        );
+
+        let installed = render_install_result(
+            &PackageInstallResult {
+                status: PackageInstallStatus::Installed,
+                package: blocked.clone(),
+                runtime: declared.clone(),
+                reloaded: true,
+            },
+            Ingest::Install { enable: true },
+        );
+        assert!(
+            installed.contains("Not selected: its integration"),
+            "{installed}"
+        );
+        assert!(
+            !installed.contains("Bare requests do not resolve to it yet"),
+            "{installed}"
+        );
+
+        let review = render_install_review(
+            &PackageInstallResult {
+                status: PackageInstallStatus::Preview,
+                package: blocked,
+                runtime: declared,
+                reloaded: false,
+            },
+            true,
+            false,
+        );
+        assert!(review.contains("Selected:    no after install"), "{review}");
+        assert!(review.contains("installed but not selected"), "{review}");
+
+        let doctor = render_doctor(&PackageDoctorResult {
+            generation: 2,
+            findings: vec![PackageFinding {
+                kind: PackageFindingKind::SelectionBlocked,
+                digest: PackageDigest::parse(DIGEST_B).expect("digest"),
+                package: None,
+                fault: None,
+                referenced: false,
+                blocked_by: Some(PackageDigest::parse(DIGEST_A).expect("digest")),
+            }],
+        });
+        assert!(
+            doctor.contains("selection blocked by sha256:aaaaaaaaaaaa"),
+            "{doctor}"
+        );
+    }
+
+    #[test]
+    fn the_review_shows_the_selection_the_command_will_make() {
+        let after = |ingest, requested, package: &PackageInfo, recorded: Option<&PackageInfo>| {
+            selection_after(ingest, requested, package, recorded)
+        };
+        let install = Ingest::Install { enable: true };
+        // The dry run never selects, so its `selected` says nothing.
+        let fresh = info("acme.pi", "2.0.0", DIGEST_B, false);
+        assert!(
+            after(install, true, &fresh, None),
+            "fresh compatible install"
+        );
+        assert!(after(Ingest::Update, true, &fresh, None), "fresh update");
+        assert!(
+            !after(install, false, &fresh, None),
+            "selection not requested"
+        );
+        let held = held_back("2.0.0", DIGEST_B);
+        assert!(!after(install, true, &held, None), "held back");
+        assert!(
+            !after(Ingest::Update, true, &held, None),
+            "update held back"
+        );
+
+        // Reviewer scenario: the archive is installed and unselected, and no
+        // other version is installed.
+        let unselected = info("acme.pi", "2.0.0", DIGEST_B, false);
+        assert!(
+            !after(install, true, &fresh, Some(&unselected)),
+            "install keeps it"
+        );
+        assert!(!after(Ingest::Link, false, &fresh, Some(&unselected)));
+        assert!(
+            after(Ingest::Update, true, &fresh, Some(&unselected)),
+            "update selects it"
+        );
+        assert!(!after(Ingest::Update, true, &held, Some(&unselected)));
+        let selected = info("acme.pi", "2.0.0", DIGEST_B, true);
+        assert!(after(install, true, &fresh, Some(&selected)));
+
+        let review = |selected| {
+            render_install_review(
+                &PackageInstallResult {
+                    status: PackageInstallStatus::Preview,
+                    package: fresh.clone(),
+                    runtime: runtime("Pi"),
+                    reloaded: false,
+                },
+                true,
+                selected,
+            )
+        };
+        assert!(review(true).contains("Selected:    yes after install"));
+        assert!(review(false).contains("Selected:    no after install"));
     }
 
     #[test]

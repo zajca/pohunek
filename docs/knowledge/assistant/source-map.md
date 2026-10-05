@@ -498,7 +498,7 @@ Runtime package archive format:
 - `crates/package/src/hash.rs` — SHA-256 helpers.
 - `crates/package/src/directory.rs` — directory-to-archive builder behind `plugin link` and `cargo xtask package build`.
 - `crates/package/src/catalog_state.rs` — persisted catalog high-water mark and revoked key ids.
-- `crates/daemon/src/session/package_lifecycle/` — the `package.*` operations: validate from the verified archive, claim rules, catalog trust, record, reload.
+- `crates/daemon/src/session/package_lifecycle/` — the `package.*` operations: validate from the verified archive, claim rules, catalog trust, record, reload, and the compatibility-gated selection (`selection.rs`).
 - `crates/daemon/src/agent/host/claim.rs` — which package may serve which runtime id.
 - `crates/daemon/src/api/handler/package.rs` — `package.*` handlers and the local-only gate.
 - `crates/daemon/src/agent/profile.rs` — profile `package`/`digest` pins and `pinned_digests`.

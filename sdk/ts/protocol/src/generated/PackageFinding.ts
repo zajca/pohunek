@@ -30,4 +30,9 @@ export type PackageFinding = {
    * Whether a session or host profile pins the digest.
    */
   referenced: boolean;
+  /**
+   * The retained digest a [`PackageFindingKind::SelectionBlocked`] finding
+   * waits on.
+   */
+  blocked_by?: PackageDigest;
 };
