@@ -436,7 +436,7 @@ All params and result type names below refer to structs exported by
 | Method | Params | `ok` result | Notes |
 |---|---|---|---|
 | `daemon.health` | `null` | `{status, daemon_version, protocol_version}` | Liveness and version probe. |
-| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. The list is platform specific: Linux reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, `netbird_cli` and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `worker_executable`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. |
+| `daemon.doctor` | `null` | `DaemonDoctorResult` | Runs daemon-local checks. Non-null params are `daemon/bad_request`. Each check is `{name, status, detail}`: `name` is the stable code and `detail` carries the remediation. The list is platform specific: Linux reports `bin:git`, `bin:codex`, `bin:claude`, the socket, state and log directory writability checks, `netbird_cli` and `schema_version`; macOS adds `runtime_dir_private`, `socket_path_length`, `filesystem_access`, `worker_executable`, `login_shell`, `launchd_domain`, `desktop_notifications` and `keychain`. The daemon also reports `catalog_trust_anchor` (`ok` when the release's catalog trust anchor is loaded, `warn` when the installation ships none, `fail` when it cannot be trusted). Hook interpreter readiness (`python3`) is reported by `integration.doctor`, not here. `overall` is `fail` only for required failures. |
 | `host.inspect` | `null` | `HostCapabilities` | Live capability snapshot for the daemon's host. |
 | `host.discover` | `HostDiscoverParams` or `null` | `Vec<HostRecord>` | Enumerates peers from configured overlay transports and classifies daemon reachability. |
 | `host.governance.inspect` | `null` | `HostGovernanceStatus` | Owner-safe, read-only snapshot of the daemon's stable host identity and local governance state. Explicit `null` and omitted params both succeed; every non-null JSON value returns `daemon/bad_request`. The method never changes enrollment, ownership, or sessions. On unavailable governance it returns the fixed redacted `daemon/host_governance_unavailable` error; reload or restart the daemon, then retry. |
@@ -655,8 +655,15 @@ now cannot be resumed or forked: the request is refused with
 package), and the stored binding is kept unchanged. A live session keeps being
 observed with the built-in definition it was launched from.
 Catalog trust fails closed with
-`official_trust_unavailable` on a host without a trust anchor, which is every
-production host today.
+`official_trust_unavailable` on a host without a trust anchor and with
+`official_trust_anchor_invalid` on a host whose anchor cannot be trusted. The
+daemon reads the anchor once at startup from `runtime-catalog-anchor.json` in
+the directory of its executable (public keys, validity windows and revoked key
+ids; see the runtime catalog concept page); the file must be a regular,
+non-linked, size-bounded file that only the daemon's user or root can write,
+under directories only they can write. `daemon.doctor` reports the state as the
+`catalog_trust_anchor` check: `ok` when loaded, `warn` when absent, `fail` when
+untrusted.
 
 A catalog install checks the catalog signature, the persisted high-water
 sequence and revoked key ids, then that an entry binds the package id, runtime
@@ -681,6 +688,7 @@ Errors use the error contract below. Every code has fixed message and
 | `package_source_unreadable` | `runtime` | The archive file, package directory or catalog could not be read or is not an absolute path. |
 | `package_untrusted` | `runtime` | The trust does not authorize the archive. |
 | `official_trust_unavailable` | `configuration` | The host has no catalog trust anchor, so an official package cannot be authorized. |
+| `official_trust_anchor_invalid` | `configuration` | The host's catalog trust anchor exists but cannot be trusted (unsafe location, permissions or ownership, or invalid content), so an official package cannot be authorized. |
 | `package_incompatible` | `runtime` | The package does not support this core version or platform. |
 | `package_descriptor_invalid` | `runtime` | The package's runtime descriptor is not a valid runtime definition. |
 | `package_runtime_not_claimable` | `runtime` | The package claims a runtime id it may not serve. |

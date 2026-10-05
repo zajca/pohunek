@@ -14,6 +14,7 @@ use protocol::{PackageInstallParams, PackageTrust, RuntimeId};
 use super::HostTrustAnchor;
 use crate::agent::host::fixture::{pi_shaped_document, PI_SHAPED_NO_CHECK};
 use crate::agent::host::{BuiltinSource, PackageSource, PackageStore, RuntimeHost};
+use crate::catalog_anchor::CatalogTrust;
 use crate::session::tests::{hermetic_shell, temp_dir};
 use crate::session::{SessionRegistry, SessionRegistryConfig};
 
@@ -175,12 +176,17 @@ pub(super) struct Fixture {
 impl Fixture {
     /// A fixture without a trust anchor and without a session store.
     pub(super) fn new(tag: &str) -> Self {
-        Self::build(tag, None, None)
+        Self::build(tag, CatalogTrust::Absent, None)
     }
 
     /// A fixture with a catalog trust anchor.
     pub(super) fn with_anchor(tag: &str, anchor: HostTrustAnchor) -> Self {
-        Self::build(tag, Some(anchor), None)
+        Self::build(tag, CatalogTrust::Loaded(anchor), None)
+    }
+
+    /// A fixture whose catalog trust is `trust`.
+    pub(super) fn with_trust(tag: &str, trust: CatalogTrust) -> Self {
+        Self::build(tag, trust, None)
     }
 
     /// A fixture with a catalog trust anchor whose registry persists sessions
@@ -190,18 +196,23 @@ impl Fixture {
         anchor: HostTrustAnchor,
         store_path: PathBuf,
     ) -> Self {
-        Self::build(tag, Some(anchor), Some(store_path))
+        Self::build(tag, CatalogTrust::Loaded(anchor), Some(store_path))
     }
 
     /// A fixture whose registry persists sessions to `store_path`.
     pub(super) fn with_store(tag: &str, store_path: PathBuf) -> Self {
-        Self::build(tag, None, Some(store_path))
+        Self::build(tag, CatalogTrust::Absent, Some(store_path))
     }
 
     /// A second daemon over the plugin root, agents directory and session
     /// store of this fixture, as after a restart.
     pub(super) fn reopen(&self) -> Self {
-        Self::at(self.dir.clone(), None, self.store_path.clone(), None)
+        Self::at(
+            self.dir.clone(),
+            CatalogTrust::Absent,
+            self.store_path.clone(),
+            None,
+        )
     }
 
     /// Like [`Self::reopen`], over the worker runtime and state roots of this
@@ -234,16 +245,21 @@ impl Fixture {
             .worker_runtime_root
             .clone()
             .zip(config.worker_state_root.clone());
-        Self::at(self.dir.clone(), None, self.store_path.clone(), roots)
+        Self::at(
+            self.dir.clone(),
+            CatalogTrust::Absent,
+            self.store_path.clone(),
+            roots,
+        )
     }
 
-    fn build(tag: &str, anchor: Option<HostTrustAnchor>, store_path: Option<PathBuf>) -> Self {
-        Self::at(temp_dir(tag), anchor, store_path, None)
+    fn build(tag: &str, trust: CatalogTrust, store_path: Option<PathBuf>) -> Self {
+        Self::at(temp_dir(tag), trust, store_path, None)
     }
 
     fn at(
         dir: PathBuf,
-        anchor: Option<HostTrustAnchor>,
+        trust: CatalogTrust,
         store_path: Option<PathBuf>,
         worker_roots: Option<(PathBuf, PathBuf)>,
     ) -> Self {
@@ -266,7 +282,7 @@ impl Fixture {
                 shell_command: hermetic_shell(),
                 stop_grace: std::time::Duration::from_millis(50),
                 store_path: store_path.clone(),
-                catalog_trust_anchor: anchor,
+                catalog_trust: trust,
                 agents_dir: Some(agents.clone()),
                 host_state_dir: Some(state),
                 worker_runtime_root,

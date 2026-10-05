@@ -59,13 +59,14 @@ use crate::agent::host::{
     ClaimRefusal, PackageRejection, PackageReport, PackageStore, RuntimeDefinition, RuntimeHost,
 };
 use crate::agent::{NativeArg, NativeArgs, NativeSessionLaunch, REFERENCE_PLACEHOLDER};
+use crate::catalog_anchor::CatalogTrust;
 use crate::integration::{ConfigHomes, RetainedSchemas};
 
 /// What a package method needs from the session registry.
 struct Context {
     store: PackageStore,
     runtimes: RuntimeHost,
-    anchor: Option<HostTrustAnchor>,
+    trust: CatalogTrust,
     /// Integrations read from installed packages during this request.
     integrations: Mutex<Integrations>,
 }
@@ -94,6 +95,17 @@ struct InstallPlan {
 struct Inspected {
     info: PackageInfo,
     runtime: Option<PackageRuntimeInfo>,
+}
+
+impl Context {
+    /// The host trust anchor, or why official packages cannot be authorized.
+    fn catalog_anchor(&self) -> Result<&HostTrustAnchor, PackageErrorKind> {
+        match &self.trust {
+            CatalogTrust::Loaded(anchor) => Ok(anchor),
+            CatalogTrust::Absent => Err(PackageErrorKind::TrustUnavailable),
+            CatalogTrust::Invalid(_fault) => Err(PackageErrorKind::TrustAnchorInvalid),
+        }
+    }
 }
 
 impl SessionRegistry {
@@ -418,7 +430,7 @@ impl SessionRegistry {
         Ok(Context {
             store,
             runtimes,
-            anchor: self.inner.config.catalog_trust_anchor.clone(),
+            trust: self.inner.config.catalog_trust.clone(),
             integrations: Mutex::default(),
         })
     }
@@ -797,12 +809,7 @@ fn prepare_archive(
 ) -> Result<Prepared, PackageErrorKind> {
     let limits = Limits::DEFAULT;
     let anchor = match trust {
-        PackageTrust::Catalog { .. } => Some(
-            context
-                .anchor
-                .as_ref()
-                .ok_or(PackageErrorKind::TrustUnavailable)?,
-        ),
+        PackageTrust::Catalog { .. } => Some(context.catalog_anchor()?),
         PackageTrust::ExplicitDigest { .. } => None,
     };
     let bytes = read_archive_file(path, &limits)?;

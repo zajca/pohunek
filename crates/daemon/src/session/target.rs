@@ -464,6 +464,11 @@ impl SessionRegistry {
             })
     }
 
+    /// What this registry trusts to authorize official packages.
+    pub(crate) fn catalog_trust(&self) -> &crate::catalog_anchor::CatalogTrust {
+        &self.inner.config.catalog_trust
+    }
+
     /// Returns the lifecycle engine, or `worker_backend_required` when this
     /// registry cannot launch workers.
     pub(super) fn lifecycle(&self) -> Result<Lifecycle<'_>, ProtocolError> {

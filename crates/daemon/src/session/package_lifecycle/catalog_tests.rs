@@ -24,6 +24,7 @@ use sha2::{Digest as _, Sha256};
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
 use super::trust::host_platform;
 use super::HostTrustAnchor;
+use crate::catalog_anchor::{AnchorFault, CatalogTrust};
 
 /// Start of every signing window: the first second after the epoch.
 const WINDOW_START: u64 = 1;
@@ -145,6 +146,43 @@ async fn a_host_without_a_trust_anchor_fails_closed() {
 
     assert_eq!(refused, PackageErrorKind::TrustUnavailable);
     assert!(!fixture.root(&package.digest).exists());
+}
+
+#[tokio::test]
+async fn an_untrusted_anchor_fails_closed_with_its_own_diagnostic() {
+    let fixture = Fixture::with_trust(
+        "catalog-invalid-anchor",
+        CatalogTrust::Invalid(AnchorFault::UnsafeFile),
+    );
+    let package = Package::pi();
+    let key = signing_key("root");
+    let document = signed_by(&key, default_catalog(&package, 1));
+
+    for dry_run in [true, false] {
+        let refused = fixture
+            .registry
+            .package_install(catalog_install(&fixture, &package, &document, dry_run))
+            .await
+            .expect_err("an untrusted anchor authorizes nothing");
+        assert_eq!(refused, PackageErrorKind::TrustAnchorInvalid);
+    }
+    assert!(!fixture.root(&package.digest).exists());
+    assert_eq!(state(&fixture).high_water(), None);
+}
+
+#[tokio::test]
+async fn an_untrusted_anchor_does_not_affect_explicit_digest_installs() {
+    let fixture = Fixture::with_trust(
+        "catalog-invalid-anchor-local",
+        CatalogTrust::Invalid(AnchorFault::TooLarge),
+    );
+    let package = Package::pi();
+    let path = fixture.write_archive(&package);
+    fixture
+        .registry
+        .package_install(explicit(&path, &package, true, true))
+        .await
+        .expect("local trust needs no anchor");
 }
 
 #[tokio::test]

@@ -22,8 +22,9 @@ the registry and the CLI are separate layers.
 
 - The **trust anchor** is supplied by the caller: root Ed25519 public keys with
   a validity window (`not_before <= now < not_after`, Unix seconds) and the
-  key ids revoked so far. The crate embeds no production key; the release
-  bundle provides the anchor.
+  key ids revoked so far. The crate embeds no production key; the daemon reads
+  the anchor from the file the release bundle ships beside it (see
+  [Trust anchor file](#trust-anchor-file)).
 - A **key id** is the lowercase hex SHA-256 of the 32 raw public key bytes.
 - A catalog may carry a `key_chain` of key records. Each record names a new key
   (id, public key, window) and the earlier key that endorses it
@@ -108,6 +109,91 @@ rejected before any signature is considered.
   digest equals the owner-supplied one and its runtime id is not `shell`,
   `codex`, `claude` or `hermes`. Its result type is `LocalAuthorization::Local`,
   which cannot be confused with `Authorization::Official`.
+
+## Trust anchor file
+
+The daemon reads its anchor once at startup from `runtime-catalog-anchor.json`
+in the directory of its own executable (`<prefix>/libexec/pohunek/<version>/`
+of an installed layout). No environment variable or option selects another
+file, and no key is compiled in. The file holds public keys only:
+
+```json
+{
+  "schema_version": 1,
+  "roots": [
+    {
+      "key_id": "<64 hex>",
+      "public_key": "<64 hex>",
+      "not_before": 1,
+      "not_after": 4102444800
+    }
+  ],
+  "revoked_key_ids": []
+}
+```
+
+Every object rejects unknown fields; the strict JSON subset of the catalog
+applies and the file is at most 16 KiB. `key_id` is a cross-check: it must equal
+the SHA-256 of `public_key`, otherwise the whole anchor is refused. Up to 8
+roots and 64 revoked key ids.
+
+The daemon distinguishes three states, reported by `daemon.doctor` as the
+`catalog_trust_anchor` check:
+
+- **Absent** (no file): `plugin install --catalog` answers
+  `official_trust_unavailable`; the doctor check is `warn`. Development builds
+  and any install without a bundled anchor are here.
+- **Invalid** (the file or its location cannot be trusted): `--catalog` answers
+  `official_trust_anchor_invalid`, the doctor check is `fail`, and the rest of
+  the daemon keeps running, including installs trusted by explicit digest. An
+  anchor is never partly used and never treated as absent. Causes: the daemon
+  executable location is unknown, the file or directory cannot be read, a
+  directory on the executable's path or the file is writable by another
+  account or owned by one (only the daemon's user and root are accepted, and
+  directories must not be group or world writable), the file is a symbolic
+  link, not a regular file, hard-linked, group or world writable, larger than
+  the limit, malformed, has a key id that does not match its key, an empty
+  validity window or repeated roots.
+- **Loaded**: the check is `ok`.
+
+The integrity bar equals the daemon binary's: whoever can rewrite the anchor
+can replace `pohunekd`. The file is public, so unlike the owner-private stores
+it may be `0644` or `0444`; only group or other write permission is refused.
+The anchor is read at startup, so changing it requires a daemon restart.
+
+## Release tooling
+
+`cargo xtask catalog` builds, signs and verifies catalogs; it embeds no key and
+the signing key never appears in a command line, an environment variable, a
+log or an output:
+
+- `catalog build --spec <file> --output <file>` turns a spec (`schema_version`
+  1, `sequence`, `expires_at`, `revoked_key_ids`, `revoked_digests` and
+  `packages`, each `{archive, platforms, core}` with `archive` relative to the
+  spec) into the unsigned catalog body. Digest, package id, runtime id and
+  version are read from the archive and its `runtime.toml`; entries are sorted
+  by package id and version, so the output is deterministic.
+- `catalog sign --catalog <file> --key-file <file> --key-id <hex> --output
+  <file>` signs the body. The key file holds the 32-byte Ed25519 seed as 64
+  lowercase hex characters; it must be a regular file owned by the caller with
+  no group or other permission bits, one link and no symlink, judged on the
+  opened handle, or the command refuses it. `--key-id` must equal the id
+  derived from the key. The result is verified against an anchor of the
+  signer's own key before it is written, so an expired catalog or an invalid
+  entry is refused instead of emitted. Signatures are deterministic.
+- `catalog verify --catalog <file> --anchor <file> [--high-water N]` checks a
+  catalog against an anchor file exactly as the daemon does and lists its
+  entries.
+- `catalog anchor --public-key-file <file> --not-before N --not-after N
+  [--revoked-key-id <hex>]... --output <file>` writes the anchor file for one
+  public key.
+- `catalog public-key --key-file <file>` prints the key id and public key.
+
+A catalog has no per-entry expiry: `expires_at` covers the whole document, and a
+catalog that lists a digest it also revokes is invalid as a whole. Signing-key
+custody, the production anchor content and root windows, and staging the anchor
+and the catalog into the release archives belong to the release assembly
+(#150); this tooling does not decide them.
 
 ## Limits
 

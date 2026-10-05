@@ -120,12 +120,17 @@ launch on that machine, so it is never a remote operation.
   supplies (`sha256:<64 hex>` or the bare hex `sha256sum` prints). The archive
   carries no signature; the owner vouches for these exact bytes. This trust can
   never authorize an official runtime id such as `codex`, `claude`, or `hermes`.
-- `--catalog <file>` authorizes an official package through the signed catalog.
-  A host without a catalog trust anchor refuses it (`official_trust_unavailable`).
-  Only a package whose catalog entry binds its package id, runtime id and
-  digest may serve `codex`, `claude` or `hermes`; a catalog that authorizes a
-  different id, package or digest for the archive is refused
-  (`package_untrusted`).
+- `--catalog <file>` authorizes an official package through the signed catalog,
+  verified against the trust anchor file shipped beside the daemon (see the
+  [runtime catalog](../concepts/runtime-catalog.md#trust-anchor-file)). A host
+  without an anchor refuses it (`official_trust_unavailable`); a host whose
+  anchor exists but cannot be trusted refuses it with
+  `official_trust_anchor_invalid`, and `pohunek doctor` reports the
+  `catalog_trust_anchor` check as `warn` or `fail` respectively. Only a package
+  whose catalog entry binds its package id, runtime id and digest may serve
+  `codex`, `claude` or `hermes`; a catalog that authorizes a different id,
+  package or digest for the archive is refused (`package_untrusted`). Installs
+  trusted by `--sha256` are unaffected.
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 

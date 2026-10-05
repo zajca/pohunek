@@ -123,7 +123,7 @@ const OFFICIAL_RUNTIMES: [&str; 3] = [RuntimeId::CODEX, RuntimeId::CLAUDE, Runti
 /// Lowercase hexadecimal digits.
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(crate) fn encode_hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         text.push(char::from(HEX_DIGITS[usize::from(byte >> 4)]));
@@ -133,7 +133,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 /// Decodes exactly `N` bytes of lowercase hexadecimal.
-fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+pub(crate) fn decode_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     let bytes = text.as_bytes();
     if bytes.len() != N * 2 {
         return None;
@@ -494,6 +494,24 @@ impl RootKey {
     pub fn id(&self) -> &KeyId {
         &self.id
     }
+
+    /// The raw 32-byte public key.
+    #[must_use]
+    pub fn public_key(&self) -> [u8; PUBLIC_KEY_BYTES] {
+        self.key.to_bytes()
+    }
+
+    /// First Unix second the root may sign.
+    #[must_use]
+    pub fn not_before(&self) -> u64 {
+        self.not_before
+    }
+
+    /// Unix second from which the root may no longer sign.
+    #[must_use]
+    pub fn not_after(&self) -> u64 {
+        self.not_after
+    }
 }
 
 /// Root keys and revocations the caller trusts independently of any catalog.
@@ -837,6 +855,12 @@ impl VerifiedEntry {
     #[must_use]
     pub fn platforms(&self) -> &[String] {
         &self.platforms
+    }
+
+    /// Supported core version range.
+    #[must_use]
+    pub fn core(&self) -> &VersionReq {
+        &self.core
     }
 
     /// Whether the package supports `platform`.

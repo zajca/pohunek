@@ -2,6 +2,8 @@
 
 mod affected;
 mod agent_skill;
+mod catalog;
+mod catalog_key;
 mod checks;
 mod eval;
 mod generators;
@@ -78,6 +80,15 @@ pub enum XtaskError {
     Json(serde_json::Error),
     Yaml(serde_yaml::Error),
     Package(::package::ArchiveError),
+    /// A catalog could not be built, signed or verified.
+    Catalog(::package::CatalogError),
+    /// A trust anchor could not be built or read.
+    Anchor(::package::AnchorFileError),
+    /// A key file was refused; never carries key material.
+    KeyFile {
+        path: PathBuf,
+        fault: catalog_key::KeyFileFault,
+    },
     /// The archive output path lies inside the package directory it packs.
     OutputInsideInput(PathBuf),
     /// The archive output path is a symbolic link.
@@ -127,8 +138,13 @@ impl fmt::Display for XtaskError {
             Self::Json(error) => write!(f, "failed to serialize json: {error}"),
             Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
             Self::Package(error) => write!(f, "package archive: {error}"),
+            Self::Catalog(error) => write!(f, "catalog: {error}"),
+            Self::Anchor(error) => write!(f, "trust anchor: {error}"),
+            Self::KeyFile { path, fault } => {
+                write!(f, "key file `{}` was refused: {fault}", path.display())
+            }
             Self::OutputIsSymlink(path) => {
-                write!(f, "archive output `{}` is a symbolic link", path.display())
+                write!(f, "output `{}` is a symbolic link", path.display())
             }
             Self::OutputInsideInput(path) => write!(
                 f,
@@ -153,7 +169,10 @@ impl Error for XtaskError {
             Self::Json(error) => Some(error),
             Self::Yaml(error) => Some(error),
             Self::Package(error) => Some(error),
+            Self::Catalog(error) => Some(error),
+            Self::Anchor(error) => Some(error),
             Self::Usage(_)
+            | Self::KeyFile { .. }
             | Self::UnsupportedFileType(_)
             | Self::InvalidPath(_)
             | Self::OutputInsideInput(_)
@@ -354,6 +373,7 @@ where
         TopCommand::Hermes { action } => run_hermes(action, &root),
         TopCommand::Affected(options) => affected::run(&root, &options),
         TopCommand::Package { action } => run_package(action),
+        TopCommand::Catalog { action } => run_catalog(action),
         TopCommand::AgentSkill { action } => match action {
             AgentSkillAction::Generate => {
                 agent_skill::generate(&root)?;
@@ -446,10 +466,90 @@ enum TopCommand {
     /// files plus their dependents, and escalates to every test for
     /// workspace-wide or unmapped paths. Never a substitute for the full gates.
     Affected(affected::Options),
+    /// Build, sign and verify the runtime catalog and its trust anchor.
+    ///
+    /// A signing key is read only from a file named by `--key-file`: it must
+    /// be a regular file owned by the caller with mode 0600 or stricter and
+    /// holds the 32-byte seed as 64 lowercase hex characters. Key material
+    /// is never read from arguments or the environment and never printed.
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
+    },
     /// Build and check canonical runtime package archives.
     Package {
         #[command(subcommand)]
         action: PackageAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CatalogAction {
+    /// Build the unsigned catalog body from a package spec.
+    ///
+    /// The spec is JSON: `schema_version` 1, `sequence`, `expires_at`,
+    /// `revoked_key_ids`, `revoked_digests` and `packages`, each package an
+    /// object with `archive` (path relative to the spec), `platforms` and
+    /// `core`. Package id, runtime id, version and digest come from the
+    /// archive.
+    Build {
+        /// Package spec file.
+        #[arg(long, value_name = "FILE")]
+        spec: PathBuf,
+        /// Unsigned catalog file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Sign an unsigned catalog and verify the result before writing it.
+    Sign {
+        /// Unsigned catalog file from `catalog build`.
+        #[arg(long, value_name = "FILE")]
+        catalog: PathBuf,
+        /// Signing key file (owner-private, 64 hex characters).
+        #[arg(long, value_name = "FILE")]
+        key_file: PathBuf,
+        /// Key id the key file must have (64 hex characters).
+        #[arg(long, value_name = "HEX")]
+        key_id: String,
+        /// Signed catalog file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Verify a signed catalog against a trust anchor file.
+    Verify {
+        /// Signed catalog file.
+        #[arg(long, value_name = "FILE")]
+        catalog: PathBuf,
+        /// Trust anchor file.
+        #[arg(long, value_name = "FILE")]
+        anchor: PathBuf,
+        /// Lowest acceptable catalog sequence.
+        #[arg(long, value_name = "N")]
+        high_water: Option<u64>,
+    },
+    /// Write the trust anchor file for a public key.
+    Anchor {
+        /// File holding the 64-hex public key (see `catalog public-key`).
+        #[arg(long, value_name = "FILE")]
+        public_key_file: PathBuf,
+        /// First Unix second the root may sign.
+        #[arg(long, value_name = "UNIX_SECONDS")]
+        not_before: u64,
+        /// Unix second from which the root may no longer sign.
+        #[arg(long, value_name = "UNIX_SECONDS")]
+        not_after: u64,
+        /// Key id the anchor revokes; repeatable.
+        #[arg(long = "revoked-key-id", value_name = "HEX")]
+        revoked_key_ids: Vec<String>,
+        /// Anchor file to write.
+        #[arg(short, long, value_name = "FILE")]
+        output: PathBuf,
+    },
+    /// Print the key id and public key of a signing key file.
+    PublicKey {
+        /// Signing key file (owner-private, 64 hex characters).
+        #[arg(long, value_name = "FILE")]
+        key_file: PathBuf,
     },
 }
 
@@ -526,6 +626,64 @@ fn run_package(action: PackageAction) -> Result<(), XtaskError> {
         PackageAction::Verify { dir } => {
             let digest = runtime_package::verify(&dir)?;
             println!("package verify ok: reproducible build, {digest}");
+        }
+    }
+    Ok(())
+}
+
+fn run_catalog(action: CatalogAction) -> Result<(), XtaskError> {
+    match action {
+        CatalogAction::Build { spec, output } => {
+            let entries = catalog::build_to(&spec, &output)?;
+            println!("catalog build ok: {entries} entries");
+        }
+        CatalogAction::Sign {
+            catalog,
+            key_file,
+            key_id,
+            output,
+        } => {
+            let signer =
+                catalog::sign_to(&catalog, &key_file, &key_id, &output, catalog::unix_now()?)?;
+            println!("catalog sign ok: signed by {signer}");
+        }
+        CatalogAction::Verify {
+            catalog,
+            anchor,
+            high_water,
+        } => {
+            let verified = catalog::verify(&catalog, &anchor, high_water, catalog::unix_now()?)?;
+            println!(
+                "catalog verify ok: sequence {}, expires_at {}, signer {}, {} entries",
+                verified.sequence,
+                verified.expires_at,
+                verified.signer,
+                verified.entries.len()
+            );
+            for entry in &verified.entries {
+                println!("  {entry}");
+            }
+        }
+        CatalogAction::Anchor {
+            public_key_file,
+            not_before,
+            not_after,
+            revoked_key_ids,
+            output,
+        } => {
+            catalog::anchor_to(
+                &public_key_file,
+                not_before,
+                not_after,
+                &revoked_key_ids,
+                &output,
+            )?;
+            println!("catalog anchor ok");
+        }
+        CatalogAction::PublicKey { key_file } => {
+            let (key_id, public_key) = catalog::public_key_of(&key_file)?;
+            println!("key_id: {key_id}");
+            println!("public_key: {public_key}");
         }
     }
     Ok(())

@@ -525,6 +525,9 @@ pub enum PackageErrorKind {
     /// The host has no catalog trust anchor, so an official package cannot
     /// be authorized.
     TrustUnavailable,
+    /// The host's catalog trust anchor exists but cannot be trusted, so an
+    /// official package cannot be authorized.
+    TrustAnchorInvalid,
     /// The package does not support this core version or platform.
     Incompatible,
     /// The package's runtime descriptor is not a valid runtime definition.
@@ -583,6 +586,7 @@ impl PackageErrorKind {
             Self::SourceUnreadable => "package_source_unreadable",
             Self::Untrusted => "package_untrusted",
             Self::TrustUnavailable => "official_trust_unavailable",
+            Self::TrustAnchorInvalid => "official_trust_anchor_invalid",
             Self::Incompatible => "package_incompatible",
             Self::DescriptorInvalid => "package_descriptor_invalid",
             Self::RuntimeNotClaimable => "package_runtime_not_claimable",
@@ -617,6 +621,9 @@ impl PackageErrorKind {
             }
             Self::Untrusted => "the package is not authorized by the supplied trust",
             Self::TrustUnavailable => "this host has no catalog trust anchor for official packages",
+            Self::TrustAnchorInvalid => {
+                "this host's catalog trust anchor cannot be trusted, so official packages are refused"
+            }
             Self::Incompatible => "the package does not support this core version or platform",
             Self::DescriptorInvalid => "the package runtime descriptor is not valid",
             Self::RuntimeNotClaimable => "the package may not serve the runtime id it claims",
@@ -663,6 +670,9 @@ impl PackageErrorKind {
             Self::SourceUnreadable => "pass an absolute path the daemon user can read",
             Self::Untrusted => "check the digest or catalog, or install with an explicit digest",
             Self::TrustUnavailable => "install with an explicit digest instead",
+            Self::TrustAnchorInvalid => {
+                "run `pohunek doctor` for the fault, fix or reinstall the release bundle's trust anchor file, and restart the daemon"
+            }
             Self::Incompatible => "install a package built for this release",
             Self::DescriptorInvalid => "fix the package's runtime.toml and rebuild it",
             Self::RuntimeNotClaimable => {
@@ -699,7 +709,7 @@ impl PackageErrorKind {
     pub const fn class(self) -> ErrorClass {
         match self {
             Self::LocalOnly | Self::Busy | Self::ReloadFailed => ErrorClass::Daemon,
-            Self::TrustUnavailable => ErrorClass::Configuration,
+            Self::TrustUnavailable | Self::TrustAnchorInvalid => ErrorClass::Configuration,
             _ => ErrorClass::Runtime,
         }
     }
@@ -795,6 +805,7 @@ mod tests {
             PackageErrorKind::SourceUnreadable,
             PackageErrorKind::Untrusted,
             PackageErrorKind::TrustUnavailable,
+            PackageErrorKind::TrustAnchorInvalid,
             PackageErrorKind::Incompatible,
             PackageErrorKind::DescriptorInvalid,
             PackageErrorKind::RuntimeNotClaimable,
