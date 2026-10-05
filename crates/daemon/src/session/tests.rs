@@ -18643,6 +18643,7 @@ fn adapter_script(dir: &std::path::Path, public_only: bool) -> (PathBuf, PathBuf
              printf '%s' '{{\"session_id\":\"native-public\",\"transcript_path\":\"/t/public.jsonl\"}}' | {hide} sh '{a}/codex/pohunek-agent-state.sh' session\n\
              printf '%s' '{{}}' | {first} sh '{a}/codex/pohunek-agent-notify.sh' stop\n\
              printf '%s' '{{}}' | {hide} sh '{a}/claude/pohunek-agent-notify.sh' stop\n\
+             command -v python3 > '{done}.python'\n\
              : > '{done}'\n\
              exec sleep 30\n",
             done = done.display(),
@@ -18741,6 +18742,41 @@ async fn wait_for_adapters(done: &std::path::Path) {
         done.exists().then_some(())
     })
     .await;
+    // Each adapter answers only after the worker or daemon handled its report,
+    // so state is settled once the script is done. A rejection test proves
+    // nothing if the adapters could not run, so the interpreter must exist.
+    let python = fs::read_to_string(format!("{}.python", done.display())).unwrap_or_default();
+    assert!(
+        !python.trim().is_empty(),
+        "the adapters need python3 on PATH"
+    );
+}
+
+/// Asserts that the worker journaled the adapters' identity and subagent and
+/// that the daemon imports that snapshot.
+///
+/// The daemon's own `active_agent` projection is not observed: procwatch
+/// releases a claim that no foreground process backs within a tick, so it is
+/// transient. The worker journal is written before the adapter is answered,
+/// and applying the snapshot returns once the daemon has committed it.
+#[cfg(unix)]
+async fn assert_worker_state_imported(registry: &SessionRegistry, id: &SessionId) {
+    let (worker, _identity) = live_worker_and_identity(registry, id).await;
+    let snapshot = worker.inspect().await.expect("inspect worker");
+    assert!(snapshot.active_identity.is_some(), "identity journaled");
+    assert_eq!(snapshot.subagents.len(), 1, "subagent journaled");
+    let outcome = wait_until("the daemon to settle the worker snapshot", || async {
+        match Box::pin(registry.apply_worker_metadata_snapshot(id, &snapshot)).await {
+            WorkerMetadataApplyOutcome::Retryable(_) => None,
+            settled => Some(settled),
+        }
+    })
+    .await;
+    assert_eq!(
+        outcome,
+        WorkerMetadataApplyOutcome::Applied,
+        "the daemon imports the admitted claims"
+    );
 }
 
 /// The public notification request a hook of `provider` sends for `session`.
@@ -18855,15 +18891,7 @@ async fn a_runtime_with_a_hook_schema_accepts_the_adapter_reports_on_both_socket
         .expect("create session");
     wait_for_adapters(&done).await;
 
-    let info = rig.registry.inspect(&created.id).await.expect("inspect");
-    assert!(
-        info.active_agent.is_some(),
-        "an adapter report set the identity"
-    );
-    let (worker, _identity) = live_worker_and_identity(&rig.registry, &created.id).await;
-    let snapshot = worker.inspect().await.expect("inspect worker");
-    assert!(snapshot.active_identity.is_some());
-    assert_eq!(snapshot.subagents.len(), 1);
+    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
     let notification = rig
         .request(
             method::NOTIFICATION_CREATE,
@@ -18937,12 +18965,7 @@ async fn a_shell_session_accepts_the_adapter_reports_of_the_agents_it_hosts() {
         .expect("create session");
     wait_for_adapters(&done).await;
 
-    let info = rig.registry.inspect(&created.id).await.expect("inspect");
-    assert!(info.active_agent.is_some());
-    let (worker, _identity) = live_worker_and_identity(&rig.registry, &created.id).await;
-    let snapshot = worker.inspect().await.expect("inspect worker");
-    assert!(snapshot.active_identity.is_some());
-    assert_eq!(snapshot.subagents.len(), 1);
+    Box::pin(assert_worker_state_imported(&rig.registry, &created.id)).await;
     for provider in ["codex", "claude"] {
         let response = rig
             .request(
