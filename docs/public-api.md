@@ -636,13 +636,24 @@ Install and link validate the package in memory before anything is extracted:
 `runtime.toml` is parsed from the verified archive, and the package identity
 (id and version) comes from that descriptor. `shell` is never claimable. The
 official aliases (the reserved runtime ids other than `shell`) are served only
-by a package the signed catalog authorizes as official, and only while no
-built-in runtime serves them. A runtime id served by a loaded package of a
-different package id is a conflict. The runtime registry reserves the official
-aliases for built-in runtimes, so an alias claim is answered with
-`package_runtime_conflict` even for an official package, and a claim by an
-explicit-digest or linked package with `package_runtime_not_claimable`; a
-descriptor that names `shell` is `package_runtime_not_claimable` as well.
+by a package the signed catalog authorizes as official for that exact package
+id, runtime id and archive digest; such a package takes the alias over from the
+built-in runtime while it is installed, enabled and selected, and disabling or
+uninstalling it returns the alias to the built-in. A runtime id served by a
+loaded package of a different package id is a conflict. A claim of an alias by
+an explicit-digest or linked package is answered with
+`package_runtime_not_claimable`, and so is a descriptor that names `shell`; a
+catalog that does not authorize the alias for the archive is
+`package_untrusted`. The package that serves an alias is the selected, enabled
+official package whose `runtime_id` is that alias in `package.list` and
+`package.inspect`; no such package means the built-in serves it.
+
+A session launched from the built-in runtime of an alias that a package serves
+now cannot be resumed or forked: the request is refused with
+`runtime/runtime_served_by_package`, its recovery hint names the way back
+(disable or uninstall the official package, or start a new session on the
+package), and the stored binding is kept unchanged. A live session keeps being
+observed with the built-in definition it was launched from.
 Catalog trust fails closed with
 `official_trust_unavailable` on a host without a trust anchor, which is every
 production host today.

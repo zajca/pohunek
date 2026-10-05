@@ -117,6 +117,10 @@ launch on that machine, so it is never a remote operation.
   never authorize an official runtime id such as `codex`, `claude`, or `hermes`.
 - `--catalog <file>` authorizes an official package through the signed catalog.
   A host without a catalog trust anchor refuses it (`official_trust_unavailable`).
+  Only a package whose catalog entry binds its package id, runtime id and
+  digest may serve `codex`, `claude` or `hermes`; a catalog that authorizes a
+  different id, package or digest for the archive is refused
+  (`package_untrusted`).
 - `link <dir>` copies a developer directory. The copy is installed disabled and
   unselected, and is recorded with the `link` origin.
 
@@ -208,6 +212,21 @@ read counts as incompatible.
   reference next to an incompatible selected version.
 - A launch that resolved the previously selected version just before a select
   committed is refused with `runtime_package_changed`; retry it.
+
+## Official aliases
+
+An official package serves `codex`, `claude` or `hermes` in place of the
+built-in runtime as soon as it is installed, enabled and selected;
+`plugin disable` or `plugin uninstall` returns the alias to the built-in.
+`plugin list` shows the serving package: the selected, enabled `official`
+package whose runtime is the alias; without one the built-in serves it.
+A session launched from the built-in runtime keeps its binding but cannot be
+resumed or forked while the package serves the alias: the request fails with
+`runtime_served_by_package`. Disable or uninstall the official package to resume
+it from the built-in, or start a new session on the package. A host profile on
+that base can be pinned with `plugin profile migrate` once the package serves
+the base (`package_profile_base_builtin` before). A migrated schema-1 binding
+stays unpinned, so it is refused the same way.
 
 ## Disable
 

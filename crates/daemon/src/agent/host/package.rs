@@ -62,7 +62,7 @@ pub enum PackageRejection {
     /// The descriptor is not a valid runtime definition.
     #[error("the runtime descriptor is invalid: {0}")]
     Descriptor(DefinitionError),
-    /// The package claims a runtime id only built-in runtimes may use.
+    /// The package claims a reserved runtime id without official authority.
     #[error("the package claims a reserved runtime id")]
     ReservedRuntimeId,
     /// Another loaded package claims the same runtime id.
@@ -121,8 +121,11 @@ pub struct RejectedPackage {
 /// The outcome of loading every package fresh launches may use.
 #[derive(Debug, Clone, Default)]
 pub struct PackageLoad {
-    /// Definitions of the packages that verified and parsed.
+    /// Definitions of the locally trusted packages that verified and parsed.
     pub definitions: Vec<RuntimeDefinition>,
+    /// Definitions of the catalog-authorized packages that verified and
+    /// parsed; they may serve an official runtime id.
+    pub official: Vec<RuntimeDefinition>,
     /// Packages that were selected and enabled but cannot serve a runtime.
     pub rejected: Vec<RejectedPackage>,
 }
@@ -260,8 +263,8 @@ impl PackageStore {
         digest: &PackageDigest,
         identity: &PackageIdentity,
     ) -> Result<RuntimeDefinition, PackageRejection> {
-        self.record(digest, identity)?;
-        let definition = self.load_definition(digest, identity)?;
+        let record = self.record(digest, identity)?;
+        let definition = self.load_definition(&record)?;
         if definition.runtime_id() == runtime_id {
             Ok(definition)
         } else {
@@ -367,19 +370,32 @@ impl PackageStore {
             .map_err(PackageRejection::Descriptor)
     }
 
-    /// [`Self::read_definition`] for a package a fresh launch may use: a
-    /// reserved runtime id is refused outright.
+    /// [`Self::read_definition`] for a package a fresh launch may use.
+    ///
+    /// A reserved runtime id is served only by a package the signed official
+    /// catalog authorized when it was installed; every other package that
+    /// claims one is refused outright.
     fn load_definition(
         &self,
-        digest: &PackageDigest,
-        identity: &PackageIdentity,
+        record: &package::registry::PackageRecord,
     ) -> Result<RuntimeDefinition, PackageRejection> {
-        let definition = self.read_definition(digest, identity)?;
-        if is_reserved(definition.runtime_id()) {
+        let definition = self.read_definition(record.digest(), record.identity())?;
+        if is_reserved(definition.runtime_id()) && !may_serve_reserved(record, &definition) {
             return Err(PackageRejection::ReservedRuntimeId);
         }
         Ok(definition)
     }
+}
+
+/// Whether the package of `record` may serve the reserved runtime id of
+/// `definition`: only a catalog-authorized package, and never the shell.
+#[must_use]
+pub(crate) fn may_serve_reserved(
+    record: &package::registry::PackageRecord,
+    definition: &RuntimeDefinition,
+) -> bool {
+    matches!(record.source(), package::registry::PackageSource::Official)
+        && definition.runtime_id().as_str() != protocol::RuntimeId::SHELL
 }
 
 /// Builds the definition a package archive declares, from the archive entries
@@ -516,6 +532,15 @@ fn detection_manifest(
         .map_err(|_error| invalid())
 }
 
+/// A selected, enabled package whose definition loaded.
+struct Loaded {
+    digest: PackageDigest,
+    identity: PackageIdentity,
+    /// Whether the signed official catalog authorized the package.
+    official: bool,
+    definition: RuntimeDefinition,
+}
+
 /// Supplies the runtimes of installed, enabled and selected packages.
 #[derive(Debug, Clone)]
 pub struct PackageSource {
@@ -541,7 +566,8 @@ impl PackageSource {
     /// package that fails is reported in [`PackageLoad::rejected`] and left
     /// out; it never fails the load of another package. A runtime id two
     /// packages claim is refused for both, so the outcome does not depend on
-    /// install order, and a reserved id is refused outright.
+    /// install order, and a reserved id is refused unless the package is
+    /// catalog-authorized.
     ///
     /// # Errors
     ///
@@ -549,23 +575,24 @@ impl PackageSource {
     /// read; no package is loaded then.
     pub fn load_report(&self) -> Result<PackageLoad, RegistryError> {
         let state = self.store.registry.state()?;
-        let mut loaded: Vec<(PackageDigest, PackageIdentity, RuntimeDefinition)> = Vec::new();
+        let mut loaded: Vec<Loaded> = Vec::new();
         let mut rejected = Vec::new();
         for record in state.packages() {
             let selected = state.selected(&record.identity().id) == Some(record.digest());
             if !record.enabled() || !selected {
                 continue;
             }
-            match self
-                .store
-                .load_definition(record.digest(), record.identity())
-            {
+            match self.store.load_definition(record) {
                 Ok(definition) => {
-                    loaded.push((
-                        record.digest().clone(),
-                        record.identity().clone(),
+                    loaded.push(Loaded {
+                        digest: record.digest().clone(),
+                        identity: record.identity().clone(),
+                        official: matches!(
+                            record.source(),
+                            package::registry::PackageSource::Official
+                        ),
                         definition,
-                    ));
+                    });
                 }
                 Err(reason) => rejected.push(RejectedPackage {
                     digest: record.digest().clone(),
@@ -575,23 +602,34 @@ impl PackageSource {
             }
         }
         let mut claims: BTreeMap<RuntimeId, usize> = BTreeMap::new();
-        for (_digest, _identity, definition) in &loaded {
-            *claims.entry(definition.runtime_id().clone()).or_default() += 1;
+        for entry in &loaded {
+            *claims
+                .entry(entry.definition.runtime_id().clone())
+                .or_default() += 1;
         }
         let mut definitions = Vec::with_capacity(loaded.len());
-        for (digest, identity, definition) in loaded {
-            if claims.get(definition.runtime_id()).copied().unwrap_or(0) > 1 {
+        let mut official = Vec::new();
+        for entry in loaded {
+            if claims
+                .get(entry.definition.runtime_id())
+                .copied()
+                .unwrap_or(0)
+                > 1
+            {
                 rejected.push(RejectedPackage {
-                    digest,
-                    identity,
+                    digest: entry.digest,
+                    identity: entry.identity,
                     reason: PackageRejection::RuntimeIdConflict,
                 });
+            } else if entry.official {
+                official.push(entry.definition);
             } else {
-                definitions.push(definition);
+                definitions.push(entry.definition);
             }
         }
         Ok(PackageLoad {
             definitions,
+            official,
             rejected,
         })
     }

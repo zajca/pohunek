@@ -7,10 +7,12 @@ use protocol::{BindingProvenance, LaunchBinding, ProtocolError, RuntimeId};
 
 use super::definition::{DefinitionError, RuntimeDefinition};
 
-/// Runtime ids only a [`SourceTrust::Builtin`] source may register.
+/// Runtime ids only a [`SourceTrust::Builtin`] source may register, except that
+/// a [`SourceTrust::Official`] source may take over the three official agents.
 ///
-/// `shell` and the three official agents are reserved so no installed or
-/// third-party definition can shadow them.
+/// `shell` and the three official agents are reserved so no local or
+/// third-party definition can shadow them; only a catalog-authorized package
+/// serves an official agent in place of its built-in.
 pub const RESERVED_RUNTIME_IDS: [&str; 4] = ["shell", "codex", "claude", "hermes"];
 
 /// How far the registry trusts the definitions a source returns.
@@ -22,6 +24,11 @@ pub enum SourceTrust {
     /// Anything else; must not register reserved ids and must return package
     /// provenance.
     External,
+    /// A package authorized by the signed official catalog. It returns
+    /// package provenance, may register any unreserved id and takes the
+    /// official agent ids (never `shell`) over from the built-in runtime,
+    /// whatever the order of the sources.
+    Official,
 }
 
 /// A supplier of runtime definitions.
@@ -43,8 +50,8 @@ pub enum RegistryError {
     /// A source returned an invalid definition.
     #[error(transparent)]
     Definition(#[from] DefinitionError),
-    /// A non-built-in source claimed a reserved id.
-    #[error("runtime id `{runtime_id}` is reserved for built-in runtimes")]
+    /// A source without the authority to claim a reserved id claimed it.
+    #[error("runtime id `{runtime_id}` is reserved and the source may not claim it")]
     Reserved {
         /// The claimed id.
         runtime_id: RuntimeId,
@@ -78,19 +85,26 @@ pub struct InventoryEntry {
 #[derive(Debug, Clone)]
 pub struct RuntimeRegistry {
     definitions: BTreeMap<RuntimeId, Arc<RuntimeDefinition>>,
+    /// Built-in definitions an official package serves in place of, by id.
+    shadowed: BTreeMap<RuntimeId, Arc<RuntimeDefinition>>,
 }
 
 impl RuntimeRegistry {
     /// Builds a registry from `sources`, enforcing reserved ids, provenance
     /// and uniqueness.
     ///
+    /// An [`SourceTrust::Official`] definition of an official agent id
+    /// replaces the built-in definition of that id, whichever source comes
+    /// first; the replaced built-in is kept for [`Self::shadowed_builtin`].
+    ///
     /// # Errors
     ///
     /// Returns a [`RegistryError`] for an invalid definition, a reserved id
-    /// claimed by a non-built-in source, a provenance its source may not
-    /// provide, or a duplicate id.
+    /// claimed by a source that may not claim it, a provenance its source may
+    /// not provide, or a duplicate id.
     pub fn from_sources(sources: &[&dyn RuntimeSource]) -> Result<Self, RegistryError> {
         let mut definitions = BTreeMap::new();
+        let mut official = Vec::new();
         for source in sources {
             let trust = source.trust();
             for definition in source.load()? {
@@ -102,10 +116,20 @@ impl RuntimeRegistry {
                 if builtin != (trust == SourceTrust::Builtin) {
                     return Err(RegistryError::ProvenanceMismatch { runtime_id });
                 }
-                if trust == SourceTrust::External
-                    && RESERVED_RUNTIME_IDS.contains(&runtime_id.as_str())
-                {
-                    return Err(RegistryError::Reserved { runtime_id });
+                match trust {
+                    SourceTrust::Official => {
+                        if runtime_id.as_str() == RuntimeId::SHELL {
+                            return Err(RegistryError::Reserved { runtime_id });
+                        }
+                        official.push(definition);
+                        continue;
+                    }
+                    SourceTrust::External
+                        if RESERVED_RUNTIME_IDS.contains(&runtime_id.as_str()) =>
+                    {
+                        return Err(RegistryError::Reserved { runtime_id });
+                    }
+                    SourceTrust::Builtin | SourceTrust::External => {}
                 }
                 if definitions
                     .insert(runtime_id.clone(), Arc::new(definition))
@@ -115,7 +139,35 @@ impl RuntimeRegistry {
                 }
             }
         }
-        Ok(Self { definitions })
+        let mut shadowed = BTreeMap::new();
+        for definition in official {
+            let runtime_id = definition.runtime_id().clone();
+            let reserved = RESERVED_RUNTIME_IDS.contains(&runtime_id.as_str());
+            if let Some(existing) = definitions.get(&runtime_id) {
+                let replaceable = reserved
+                    && matches!(
+                        existing.binding().provenance,
+                        BindingProvenance::Builtin { .. }
+                    );
+                if !replaceable {
+                    return Err(RegistryError::Duplicate { runtime_id });
+                }
+            }
+            if let Some(builtin) = definitions.insert(runtime_id.clone(), Arc::new(definition)) {
+                shadowed.insert(runtime_id, builtin);
+            }
+        }
+        Ok(Self {
+            definitions,
+            shadowed,
+        })
+    }
+
+    /// The built-in definition of `runtime_id` when an official package
+    /// serves the id instead.
+    #[must_use]
+    pub fn shadowed_builtin(&self, runtime_id: &RuntimeId) -> Option<&Arc<RuntimeDefinition>> {
+        self.shadowed.get(runtime_id)
     }
 
     /// Resolves an installed runtime.

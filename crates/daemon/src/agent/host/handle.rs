@@ -36,6 +36,20 @@ pub struct RuntimeHost {
     state: Arc<RwLock<Arc<HostState>>>,
     shell_command: Arc<ShellLaunch>,
     packages: Option<Arc<Packages>>,
+    #[cfg(test)]
+    snapshot_hook: Arc<SnapshotHook>,
+}
+
+#[cfg(test)]
+impl RuntimeHost {
+    /// Runs `hook` after `definition_for_pin` took its registry snapshot.
+    pub(crate) fn set_snapshot_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .snapshot_hook
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
+    }
 }
 
 /// One consistent view of the host: the registry and what the package layer
@@ -83,17 +97,18 @@ pub enum ReloadError {
     Registry(#[from] RegistryError),
 }
 
-/// Adapts the definitions a package load returned to a registry source.
+/// Adapts the definitions a package load returned to a registry source of the
+/// given trust.
 #[derive(Debug)]
-struct LoadedPackages(Vec<RuntimeDefinition>);
+struct LoadedPackages(SourceTrust, Vec<RuntimeDefinition>);
 
 impl RuntimeSource for LoadedPackages {
     fn trust(&self) -> SourceTrust {
-        SourceTrust::External
+        self.0
     }
 
     fn load(&self) -> Result<Vec<RuntimeDefinition>, DefinitionError> {
-        Ok(self.0.clone())
+        Ok(self.1.clone())
     }
 }
 
@@ -138,6 +153,8 @@ impl RuntimeHost {
                 args: Vec::new(),
             }),
             packages,
+            #[cfg(test)]
+            snapshot_hook: Arc::default(),
         }
     }
 
@@ -451,7 +468,9 @@ impl RuntimeHost {
     ///
     /// A package pin resolves from exactly its digest, verified again, so a
     /// disabled package or another selected version never changes how a
-    /// session is observed. Every other pin resolves through the registry.
+    /// session is observed. Every other pin resolves through the registry,
+    /// except that a built-in or unpinned session of a runtime an official
+    /// package serves is observed with the shadowed built-in definition.
     ///
     /// # Errors
     ///
@@ -467,17 +486,27 @@ impl RuntimeHost {
             Some(BindingProvenance::Package { .. })
         );
         if packaged && self.package_store().is_some() {
-            self.resolve_pinned(reference, pin)
-        } else {
-            self.resolve_ref(reference)
+            return self.resolve_pinned(reference, pin);
         }
+        // One registry snapshot decides both the served and the shadowed
+        // definition, so a reload between two reads cannot mix them.
+        let registry = self.registry();
+        #[cfg(test)]
+        self.snapshot_hook.run();
+        launch_definition(&registry, reference.launchable()?)
     }
 
-    /// The verified definition of the package `pin` froze, or `None` for a
-    /// built-in or unpinned runtime and for a package that cannot be resolved
-    /// from its digest now.
+    /// The verified definition the launch provenance of `pin` names for a
+    /// live session: the package of a package pin, the built-in runtime of a
+    /// built-in or unpinned snapshot (also while an official package serves
+    /// its id). `None` for a runtime no definition of that provenance backs
+    /// and for a package that cannot be resolved from its digest now.
+    ///
+    /// Callbacks, process recognition and detection of the session use it
+    /// instead of resolving its runtime id against whatever the registry
+    /// serves now.
     #[must_use]
-    pub fn pinned_package_definition(
+    pub fn pinned_definition(
         &self,
         reference: &RuntimeRef,
         pin: &LaunchPin,
@@ -487,10 +516,15 @@ impl RuntimeHost {
             Some(BindingProvenance::Package { .. })
         );
         if packaged {
-            self.definition_for_pin(reference, pin).ok()
-        } else {
-            None
+            return self.definition_for_pin(reference, pin).ok();
         }
+        let registry = self.registry();
+        let definition = launch_definition(&registry, reference.launchable().ok()?).ok()?;
+        matches!(
+            definition.binding().provenance,
+            BindingProvenance::Builtin { .. }
+        )
+        .then_some(definition)
     }
 
     /// The hook schema of a session pinned to a package whose descriptor
@@ -525,6 +559,51 @@ impl RuntimeHost {
     }
 }
 
+/// The definition a built-in or unpinned snapshot of `runtime_id` is described
+/// by in `registry`: the served definition, or the built-in an official
+/// package replaced.
+fn launch_definition(
+    registry: &RuntimeRegistry,
+    runtime_id: &RuntimeId,
+) -> Result<Arc<RuntimeDefinition>, ProtocolError> {
+    let current = registry.resolve(runtime_id)?;
+    if matches!(
+        current.binding().provenance,
+        BindingProvenance::Package { .. }
+    ) {
+        if let Some(builtin) = registry.shadowed_builtin(runtime_id) {
+            return Ok(Arc::clone(builtin));
+        }
+    }
+    Ok(Arc::clone(current))
+}
+
+/// Test hook run after a method took its registry snapshot.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct SnapshotHook(Mutex<Option<Arc<dyn Fn() + Send + Sync>>>);
+
+#[cfg(test)]
+impl SnapshotHook {
+    fn run(&self) {
+        let hook = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for SnapshotHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SnapshotHook")
+    }
+}
+
 /// Logs the typed cause of a refused package runtime and returns the stable
 /// protocol error.
 fn refuse(runtime_id: &RuntimeId, reason: &super::package::PackageRejection) -> ProtocolError {
@@ -539,15 +618,17 @@ fn refuse(runtime_id: &RuntimeId, reason: &super::package::PackageRejection) -> 
 /// Builds one registry snapshot from the built-in runtimes and the packages
 /// installed now.
 fn build_state(packages: &Packages) -> Result<HostState, RegistryError> {
-    let (definitions, report) = match packages.source.load_report() {
+    let (definitions, official, report) = match packages.source.load_report() {
         Ok(load) => (
             load.definitions,
+            load.official,
             PackageReport {
                 rejected: load.rejected,
                 fault: None,
             },
         ),
         Err(fault) => (
+            Vec::new(),
             Vec::new(),
             PackageReport {
                 rejected: Vec::new(),
@@ -570,8 +651,11 @@ fn build_state(packages: &Packages) -> Result<HostState, RegistryError> {
             "the package registry cannot be read; serving built-in runtimes only"
         );
     }
-    let registry =
-        RuntimeRegistry::from_sources(&[&packages.builtin, &LoadedPackages(definitions)])?;
+    let registry = RuntimeRegistry::from_sources(&[
+        &packages.builtin,
+        &LoadedPackages(SourceTrust::External, definitions),
+        &LoadedPackages(SourceTrust::Official, official),
+    ])?;
     Ok(HostState {
         registry: Arc::new(registry),
         report: Arc::new(report),

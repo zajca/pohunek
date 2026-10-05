@@ -24,7 +24,6 @@ use sha2::{Digest as _, Sha256};
 use super::test_fixture::{explicit, Fixture, Package, INERT_PROGRAM, PACKAGE, RUNTIME};
 use super::trust::host_platform;
 use super::HostTrustAnchor;
-use crate::agent::host::RESERVED_RUNTIME_IDS;
 
 /// Start of every signing window: the first second after the epoch.
 const WINDOW_START: u64 = 1;
@@ -35,7 +34,7 @@ const WINDOW_END: u64 = 4_102_444_800;
 /// A core range every released version satisfies.
 const ANY_CORE: &str = ">=0.0.0";
 
-fn signing_key(label: &str) -> SigningKey {
+pub(super) fn signing_key(label: &str) -> SigningKey {
     let seed: [u8; 32] = Sha256::digest(label.as_bytes()).into();
     SigningKey::from_bytes(&seed)
 }
@@ -48,7 +47,7 @@ fn root(key: &SigningKey) -> RootKey {
     RootKey::new(key.verifying_key().to_bytes(), WINDOW_START, WINDOW_END).expect("valid root")
 }
 
-fn anchor(keys: &[&SigningKey], revoked: Vec<KeyId>) -> HostTrustAnchor {
+pub(super) fn anchor(keys: &[&SigningKey], revoked: Vec<KeyId>) -> HostTrustAnchor {
     HostTrustAnchor::new(keys.iter().map(|key| root(key)).collect(), revoked).expect("anchor")
 }
 
@@ -61,7 +60,12 @@ fn hex(bytes: &[u8]) -> String {
 
 /// A catalog entry that binds `package` to `package_id`, `runtime` and
 /// `version`.
-fn entry(package: &Package, package_id: &str, runtime: &str, version: &str) -> CatalogEntry {
+pub(super) fn entry(
+    package: &Package,
+    package_id: &str,
+    runtime: &str,
+    version: &str,
+) -> CatalogEntry {
     CatalogEntry {
         package_id: PackageId::parse(package_id).expect("package id"),
         runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
@@ -72,7 +76,7 @@ fn entry(package: &Package, package_id: &str, runtime: &str, version: &str) -> C
     }
 }
 
-fn catalog(sequence: u64, entries: Vec<CatalogEntry>) -> Catalog {
+pub(super) fn catalog(sequence: u64, entries: Vec<CatalogEntry>) -> Catalog {
     Catalog {
         schema_version: CATALOG_SCHEMA_VERSION,
         sequence,
@@ -83,7 +87,7 @@ fn catalog(sequence: u64, entries: Vec<CatalogEntry>) -> Catalog {
     }
 }
 
-fn signed_by(key: &SigningKey, catalog: Catalog) -> Vec<u8> {
+pub(super) fn signed_by(key: &SigningKey, catalog: Catalog) -> Vec<u8> {
     let message = catalog_signing_message(&catalog).expect("signing message");
     let signature = CatalogSignature {
         key_id: key_id(key),
@@ -98,7 +102,7 @@ fn signed_by(key: &SigningKey, catalog: Catalog) -> Vec<u8> {
     .expect("serialize")
 }
 
-fn catalog_install(
+pub(super) fn catalog_install(
     fixture: &Fixture,
     package: &Package,
     document: &[u8],
@@ -122,7 +126,7 @@ fn state(fixture: &Fixture) -> package::catalog_state::CatalogState {
         .expect("catalog state")
 }
 
-fn default_catalog(package: &Package, sequence: u64) -> Catalog {
+pub(super) fn default_catalog(package: &Package, sequence: u64) -> Catalog {
     catalog(sequence, vec![entry(package, PACKAGE, RUNTIME, "1.0.0")])
 }
 
@@ -369,34 +373,6 @@ async fn an_entry_for_another_core_or_platform_is_incompatible() {
         assert_eq!(refused, PackageErrorKind::Incompatible, "{name}");
     }
     assert!(!fixture.root(&package.digest).exists());
-}
-
-#[tokio::test]
-async fn an_official_alias_conflicts_while_a_built_in_serves_it() {
-    let key = signing_key("root");
-    let fixture = Fixture::with_anchor("catalog-alias", anchor(&[&key], Vec::new()));
-    for alias in RESERVED_RUNTIME_IDS
-        .into_iter()
-        .filter(|id| *id != RuntimeId::SHELL)
-    {
-        let package = Package::build("acme.runtime.alias", "1.0.0", alias, INERT_PROGRAM);
-        let document = signed_by(
-            &key,
-            catalog(
-                5,
-                vec![entry(&package, "acme.runtime.alias", alias, "1.0.0")],
-            ),
-        );
-
-        let refused = fixture
-            .registry
-            .package_install(catalog_install(&fixture, &package, &document, false))
-            .await
-            .expect_err(alias);
-
-        assert_eq!(refused, PackageErrorKind::RuntimeConflict, "{alias}");
-        assert!(!fixture.root(&package.digest).exists());
-    }
 }
 
 #[tokio::test]

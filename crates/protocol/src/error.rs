@@ -219,6 +219,28 @@ impl ProtocolError {
         )
     }
 
+    /// The canonical `runtime/runtime_served_by_package` error.
+    ///
+    /// The session was launched from the built-in runtime of `runtime`, which
+    /// an official runtime package serves now. Nothing is launched and the
+    /// stored session keeps its binding: no other provenance stands in for
+    /// the one it was launched from. The identity is a validated
+    /// [`RuntimeId`], so echoing it is safe.
+    #[must_use]
+    pub fn runtime_served_by_package(runtime: &RuntimeId) -> Self {
+        Self::new(
+            ErrorClass::Runtime,
+            "runtime_served_by_package",
+            format!(
+                "runtime `{runtime}` is served by an official package now, but the session was launched from the built-in runtime"
+            ),
+            Some(
+                "disable or uninstall the official package to resume the session from the built-in runtime, or start a new session on the package"
+                    .to_owned(),
+            ),
+        )
+    }
+
     /// The canonical `runtime/runtime_package_changed` error.
     ///
     /// The package version a launch resolved is no longer the one selected for

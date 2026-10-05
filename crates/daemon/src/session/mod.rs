@@ -620,11 +620,12 @@ struct SessionEntry {
     detector_config: watch::Sender<DetectorConfigUpdate>,
     detector_preview: mpsc::Sender<DetectionPreviewRequest>,
     default_detector_config: DetectorConfig,
-    /// Definition of the installed package this session was launched from,
-    /// loaded and verified when its runtime was registered. Callbacks and
-    /// observation of the session's own runtime use it instead of whatever the
-    /// registry serves now. `None` for a built-in runtime or a package that
-    /// did not verify.
+    /// Definition this session was launched from: the verified installed
+    /// package, or the built-in runtime (also once an official package serves
+    /// its id). Callbacks and observation of the session's own runtime use it
+    /// instead of whatever the registry serves now. `None` for a runtime no
+    /// definition of its provenance backs and for a package that did not
+    /// verify.
     pinned: Option<Arc<RuntimeDefinition>>,
     procwatch_cancel: CancellationToken,
     runtime_watch_cancel: CancellationToken,
@@ -779,14 +780,47 @@ struct ActiveAgentReport {
 
 type NativeIdentityReport = crate::store::NativeIdentityOrdering;
 
+/// The definition whose process matchers recognized an observed process.
+/// Two are equal when they carry the same binding.
+#[derive(Debug, Clone)]
+struct MatchedDefinition(Arc<RuntimeDefinition>);
+
+impl PartialEq for MatchedDefinition {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.binding() == other.0.binding()
+    }
+}
+
+impl Eq for MatchedDefinition {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedAgent {
     pid: Pid,
     pgid: Pid,
     start_identity: u64,
     agent_base: RuntimeRef,
+    /// The definition the process matched; its rules, not those of another
+    /// definition with the same runtime id, apply to the process.
+    definition: MatchedDefinition,
     first_seen: Instant,
     cwd: Option<PathBuf>,
+}
+
+impl ObservedAgent {
+    /// Replaces every per-process field with the ones of a fresh match of the
+    /// same pid, so no field describes the previous occupant of the pid.
+    /// `first_seen` is kept while the process identity and runtime are the
+    /// same. Returns whether the start identity changed.
+    fn refresh_from(&mut self, observation: Self) -> bool {
+        let identity_changed = self.start_identity != observation.start_identity;
+        let base_changed = self.agent_base != observation.agent_base;
+        let first_seen = self.first_seen;
+        *self = observation;
+        if !(identity_changed || base_changed) {
+            self.first_seen = first_seen;
+        }
+        identity_changed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

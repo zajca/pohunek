@@ -810,6 +810,23 @@ mod tests {
     }
 
     #[test]
+    fn runtime_served_by_package_error_is_stable_and_names_the_migration_step() {
+        let error = ProtocolError::runtime_served_by_package(&RuntimeId::parse("codex").unwrap());
+        assert_eq!(error.class, crate::ErrorClass::Runtime);
+        assert_eq!(error.code, "runtime_served_by_package");
+        assert!(error.msg.contains("`codex`"));
+        assert!(!error.msg.contains('/'));
+        let recover = error.recover.as_deref().expect("a recovery hint");
+        assert!(recover.contains("disable or uninstall"));
+        assert!(recover.contains("start a new session"));
+        let json = serde_json::to_string(&error).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<ProtocolError>(&json).expect("roundtrip"),
+            error
+        );
+    }
+
+    #[test]
     fn runtime_incompatible_error_is_stable_and_never_echoes_paths() {
         let error = ProtocolError::runtime_incompatible(&RuntimeId::parse("acme").unwrap());
         assert_eq!(error.class, crate::ErrorClass::Runtime);

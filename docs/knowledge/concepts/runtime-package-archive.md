@@ -221,7 +221,8 @@ and is reported by the host (package-pinned sessions are then incompatible).
 - `PackageSource` loads, for fresh launches, the selected digest of each
   package id when it is enabled, re-verifying the root first. A package that
   fails (modified root, bad descriptor, descriptor identity differing from the
-  record, a reserved runtime id, or a runtime id claimed by two packages) is
+  record, a reserved runtime id of a package that is not catalog-authorized, or
+  a runtime id claimed by two packages) is
   left out and reported with a typed reason; it never fails other packages or
   the built-ins.
 - Reload is explicit (`SessionRegistry::reload_runtimes`); nothing watches the
@@ -268,12 +269,16 @@ and is reported by the host (package-pinned sessions are then incompatible).
   unselected; the directory itself is never loaded.
 - Claim rules: `shell` is never claimable. An official alias (a reserved runtime
   id other than `shell`) is served only by a package the signed catalog
-  authorizes as official and only while no built-in runtime serves it. A runtime
-  id served by a loaded package of a different package id is a conflict. Trust
-  `explicit_digest` requires the archive digest to equal the supplied digest and
-  is never official. The runtime registry reserves the aliases for built-in
-  runtimes, so an alias claim is a conflict even for an official package; trust `catalog` fails closed with
-  `official_trust_unavailable` on a host without a trust anchor.
+  authorizes as official for that exact package id, runtime id and digest; it
+  takes the alias over from the built-in runtime (`SourceTrust::Official` in the
+  runtime registry, whatever the source order), and disabling or uninstalling it
+  returns the alias to the built-in. A runtime id served by a loaded package of
+  a different package id is a conflict. Trust `explicit_digest` requires the
+  archive digest to equal the supplied digest and is never official, and a
+  linked directory is never official, so both are refused for an alias; trust
+  `catalog` fails closed with `official_trust_unavailable` on a host without a
+  trust anchor. Loading a recorded package re-checks that its record is
+  `official` before it may serve a reserved id.
 - `package.uninstall` is refused with `package_referenced` while a live, lost or
   resumable session or a host profile pins the digest. `remove_modified` removes
   only a root that fails verification; a verified root answers

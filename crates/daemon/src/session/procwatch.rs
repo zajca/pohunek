@@ -3,21 +3,22 @@
 // Rust guideline compliant 2026-09-14
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use protocol::{event, CwdSource, RuntimeRef, SessionInfo};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
+use crate::agent::host::LaunchProgram;
 use crate::agent::host::RuntimeDefinition;
-use crate::agent::host::{LaunchProgram, RuntimeHost};
-use crate::detect::{identify_agent, DetectorConfig};
+use crate::detect::{identify_definition, DetectorConfig};
 use crate::procwatch::{ExitWatch, Pid, ProcessFact, ProcessIdentity, StartIdentity};
 
 use super::{
     agent_kind_label, clear_active_agent, is_terminal, report_is_current, send_detector_config,
-    timestamp_now, ActiveAgentReport, CancellationToken, Notify, ObservedAgent, Ordering,
-    RuntimeWatchIdentity, SessionEntry, SessionId, SessionRegistry,
+    timestamp_now, ActiveAgentReport, CancellationToken, MatchedDefinition, Notify, ObservedAgent,
+    Ordering, RuntimeWatchIdentity, SessionEntry, SessionId, SessionRegistry,
 };
 
 const PROCWATCH_SOURCE: &str = "pohunek:procwatch";
@@ -164,7 +165,7 @@ impl SessionRegistry {
                     .await
                     .get(id)
                     .and_then(|entry| entry.pinned.clone());
-                Some(self.observed_agents_from_facts(id, facts, now, pinned.as_deref()))
+                Some(self.observed_agents_from_facts(id, facts, now, pinned.as_ref()))
             }
             Err(err) => {
                 warn!(
@@ -360,12 +361,12 @@ impl SessionRegistry {
         }
     }
 
-    fn observed_agents_from_facts(
+    pub(super) fn observed_agents_from_facts(
         &self,
         id: &SessionId,
         facts: Vec<ProcessFact>,
         now: Instant,
-        pinned: Option<&RuntimeDefinition>,
+        pinned: Option<&Arc<RuntimeDefinition>>,
     ) -> HashMap<Pid, ObservedAgent> {
         facts
             .into_iter()
@@ -379,10 +380,11 @@ impl SessionRegistry {
                         .process_matchers()
                         .is_some_and(|matchers| matchers.matches(&fact))
                 });
-                let agent_base = match own {
-                    Some(definition) => RuntimeRef::from(definition.runtime_id().clone()),
-                    None => identify_agent(self.inner.profiles.runtimes(), &fact)?,
+                let definition = match own {
+                    Some(definition) => Arc::clone(definition),
+                    None => identify_definition(self.inner.profiles.runtimes(), &fact)?,
                 };
+                let agent_base = RuntimeRef::from(definition.runtime_id().clone());
                 if self.is_foreign_owned_agent(id, fact.pid) {
                     return None;
                 }
@@ -394,6 +396,7 @@ impl SessionRegistry {
                         pgid: fact.pgid,
                         start_identity: fact.start_identity.get(),
                         agent_base,
+                        definition: MatchedDefinition(definition),
                         first_seen: now,
                         cwd,
                     },
@@ -598,13 +601,7 @@ impl SessionRegistry {
             reported_at: now,
             activity_reported: false,
         };
-        Some(apply_observed_transition(
-            self.inner.profiles.runtimes(),
-            entry,
-            observed,
-            report,
-            agent,
-        ))
+        Some(apply_observed_transition(entry, observed, report, agent))
     }
 
     fn procwatch_tombstone_for(
@@ -679,13 +676,7 @@ impl SessionRegistry {
                 reported_at: now,
                 activity_reported: false,
             };
-            let _ = apply_observed_transition(
-                self.inner.profiles.runtimes(),
-                entry,
-                &observed,
-                report,
-                agent,
-            );
+            let _ = apply_observed_transition(entry, &observed, report, agent);
             return ForegroundDecision::Updated;
         }
 
@@ -759,17 +750,9 @@ fn apply_observed_refresh(
             .iter_mut()
             .find(|agent| agent.pid == observation.pid)
         {
-            let identity_changed = existing.start_identity != observation.start_identity;
-            let base_changed = existing.agent_base != observation.agent_base;
-            existing.pgid = observation.pgid;
-            existing.start_identity = observation.start_identity;
-            existing.cwd = observation.cwd;
-            existing.agent_base = observation.agent_base;
-            if identity_changed || base_changed {
-                existing.first_seen = observation.first_seen;
-            }
+            let identity = (observation.pid, observation.start_identity);
+            let identity_changed = existing.refresh_from(observation);
             if identity_changed {
-                let identity = (observation.pid, observation.start_identity);
                 if let Some(watch) = exit_watches.remove(&identity) {
                     to_spawn.push((identity, watch, entry.procwatch_cancel.clone()));
                 }
@@ -857,8 +840,7 @@ fn bind_matching_observed_identity(entry: &mut SessionEntry, observed: &Observed
     true
 }
 
-fn apply_observed_transition(
-    runtimes: &RuntimeHost,
+pub(super) fn apply_observed_transition(
     entry: &mut SessionEntry,
     observed: &ObservedAgent,
     report: ActiveAgentReport,
@@ -879,12 +861,7 @@ fn apply_observed_transition(
         entry.info.activity = None;
         entry.info.state_source = protocol::StateSource::Process;
     }
-    let config = match &entry.pinned {
-        Some(pinned) if RuntimeRef::from(pinned.runtime_id().clone()) == observed.agent_base => {
-            DetectorConfig::for_definition(pinned)
-        }
-        _ => DetectorConfig::for_agent(runtimes, &observed.agent_base),
-    };
+    let config = DetectorConfig::for_definition(&observed.definition.0);
     send_detector_config(entry, config);
     entry.info.updated_at = timestamp_now();
     entry.info.clone()

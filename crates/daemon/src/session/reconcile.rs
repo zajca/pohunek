@@ -3221,7 +3221,7 @@ impl SessionRegistry {
                 .inner
                 .profiles
                 .runtimes()
-                .pinned_package_definition(&record.info.agent_base, &pin),
+                .pinned_definition(&record.info.agent_base, &pin),
             procwatch_cancel: procwatch_cancel.clone(),
             runtime_watch_cancel: runtime_watch_cancel.clone(),
             procwatch_rescan: Arc::clone(&procwatch_rescan),
@@ -3457,7 +3457,7 @@ impl SessionRegistry {
                 .inner
                 .profiles
                 .runtimes()
-                .pinned_package_definition(&record.info.agent_base, &pin),
+                .pinned_definition(&record.info.agent_base, &pin),
             procwatch_cancel: CancellationToken::new(),
             runtime_watch_cancel: CancellationToken::new(),
             procwatch_rescan: Arc::new(Notify::new()),

@@ -95,7 +95,9 @@ rejected before any signature is considered.
 ## Entry rules
 
 - `shell` is never a valid `runtime_id` in a catalog and is never authorized.
-- A catalog is the only way to authorize `codex`, `claude` or `hermes`:
+- A catalog is the only way to authorize `codex`, `claude` or `hermes`; the
+  daemon records such a package as `official` and lets only an `official` record
+  serve the id (see the runtime packages guide):
   `VerifiedCatalog::authorize(package_id, runtime_id, digest)` returns
   `Official` only for an entry matching all three, and `NotAuthorized`
   otherwise (including revoked digests).

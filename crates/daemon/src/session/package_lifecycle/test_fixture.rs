@@ -76,6 +76,27 @@ impl Package {
         Self::from_entries(&files(document))
     }
 
+    /// Like [`Self::build`], shipping `manifest` as its detection manifest.
+    pub(super) fn build_with_detect(
+        package: &str,
+        version: &str,
+        runtime: &str,
+        program: &str,
+        manifest: &str,
+    ) -> Self {
+        let base = Self::build(package, version, runtime, program);
+        let mut entries = read_archive(&base.bytes, &Limits::DEFAULT)
+            .expect("the fixture archive reads")
+            .entries()
+            .to_vec();
+        for entry in &mut entries {
+            if entry.path == "detect.toml" {
+                entry.contents = manifest.as_bytes().to_vec();
+            }
+        }
+        Self::from_entries(&entries)
+    }
+
     /// The default package at 1.0.0.
     pub(super) fn pi() -> Self {
         Self::build(PACKAGE, "1.0.0", RUNTIME, INERT_PROGRAM)
@@ -160,6 +181,16 @@ impl Fixture {
     /// A fixture with a catalog trust anchor.
     pub(super) fn with_anchor(tag: &str, anchor: HostTrustAnchor) -> Self {
         Self::build(tag, Some(anchor), None)
+    }
+
+    /// A fixture with a catalog trust anchor whose registry persists sessions
+    /// to `store_path`.
+    pub(super) fn with_anchor_and_store(
+        tag: &str,
+        anchor: HostTrustAnchor,
+        store_path: PathBuf,
+    ) -> Self {
+        Self::build(tag, Some(anchor), Some(store_path))
     }
 
     /// A fixture whose registry persists sessions to `store_path`.

@@ -50,8 +50,9 @@ pub fn is_reserved(runtime_id: &RuntimeId) -> bool {
 ///
 /// - The shell is never claimable.
 /// - An official alias (a reserved id other than the shell) is claimable only
-///   by an [`Authority::Official`] package, and only while no built-in serves
-///   it.
+///   by an [`Authority::Official`] package. It takes the alias over from the
+///   built-in that serves it, and conflicts with a loaded package of another
+///   package id.
 /// - Any other id is claimable unless a built-in or a loaded package of a
 ///   different package id serves it; another version of the same package id
 ///   may take it over.
@@ -73,6 +74,7 @@ pub fn decide_claim(
     }
     match served_by {
         None => Ok(()),
+        Some(ServedBy::Builtin) if is_reserved(runtime_id) => Ok(()),
         Some(ServedBy::Builtin) => Err(ClaimRefusal::Conflict),
         Some(ServedBy::Package(other)) if other != package => Err(ClaimRefusal::Conflict),
         Some(ServedBy::Package(_same)) => Ok(()),
@@ -131,11 +133,11 @@ mod tests {
                     "{alias} local {served:?}"
                 );
             }
-            // An official package takes it only while no built-in serves it.
+            // An official package takes it, including from the built-in.
             assert_eq!(decide_claim(&id, &own, Authority::Official, None), Ok(()));
             assert_eq!(
                 decide_claim(&id, &own, Authority::Official, Some(&builtin)),
-                Err(ClaimRefusal::Conflict),
+                Ok(()),
                 "{alias}"
             );
             assert_eq!(

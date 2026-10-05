@@ -203,6 +203,27 @@ fn legacy_modes_of_every_built_in_agent_keep_their_argv() {
 }
 
 #[test]
+fn a_migrated_legacy_binding_never_gains_a_launch_pin() {
+    for agent in ["codex", "claude", "hermes"] {
+        let line = legacy_resume_line(
+            agent,
+            agent,
+            &[],
+            &json!({"resume_mode": "flag", "ref_kind": "id", "resumable": true}),
+        );
+        let (store, path) = migrated(&format!("unpinned-{agent}"), &line);
+
+        let raw = &raw_lines(&path)[0];
+        assert!(
+            raw.get("launch_binding").is_none_or(Value::is_null),
+            "{agent} is still unpinned on disk"
+        );
+        let bindings = store.load_resume().expect("load resume");
+        assert!(bindings[0].launch_binding.is_unpinned(), "{agent}");
+    }
+}
+
+#[test]
 fn a_legacy_binding_frozen_as_not_resumable_stays_not_resumable() {
     let line = legacy_resume_line(
         "work",

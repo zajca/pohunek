@@ -3,7 +3,8 @@
 //! A [`RuntimeRegistry`] resolves a protocol [`protocol::RuntimeId`] to an
 //! immutable [`RuntimeDefinition`]. Definitions come from [`RuntimeSource`]s;
 //! the [`BuiltinSource`] supplies the shell, Codex, Claude and Hermes
-//! descriptors, which reserve their ids against every other source.
+//! descriptors; local and third-party sources cannot claim their ids, while a
+//! catalog-authorized package serves one in place of its built-in.
 
 mod builtin;
 mod claim;
@@ -31,6 +32,7 @@ pub use handle::{PackageReport, ReloadError, RuntimeHost};
 pub(crate) use launch::check_pin;
 pub use launch::LaunchPin;
 pub(crate) use launch::{launch_command, validate_launch_runtime};
+pub(crate) use package::may_serve_reserved;
 pub use package::{
     definition_from_archive, PackageLoad, PackageRejection, PackageSource, PackageStore,
     RejectedPackage, RUNTIME_DESCRIPTOR_PATH,
