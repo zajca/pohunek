@@ -65,7 +65,7 @@ restores the exact prior tree if any step fails, so the old set stays active
 until activation succeeds. The check covers the hook schema of every package
 version that a live, lost or resumable session or a host profile pin still
 references for that handler, not only the schema of the selected version, and an
-update is refused while such a version of the runtime's package cannot be read.
+update of any handler is refused while such a version cannot be read.
 `hermes-hook-v1` is registered but its lifecycle runs
 in the CLI; the daemon answers `agent_not_installable` for it.
 `pohunek integration --agent` takes the runtime id of a package runtime that
@@ -156,7 +156,7 @@ read counts as incompatible.
   nothing selects it for you: run `plugin select` (or `plugin update` again).
 - `package.bind_profile` (the wire method behind `plugin profile migrate`)
   refuses to pin a version whose integration differs from the selected version
-  of its package, with the same error, because the pin would be a retained
+  of its package or from another referenced version (the pin being replaced does not count), with the same error, because the pin would be a retained
   reference next to an incompatible selected version.
 - A launch that resolved the previously selected version just before a select
   committed is refused with `runtime_package_changed`; retry it.

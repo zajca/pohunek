@@ -534,6 +534,74 @@ async fn a_profile_cannot_pin_a_version_whose_integration_differs_from_the_selec
         .expect("pinning the selected version is fine");
 }
 
+fn bind_to(profile: &str, digest: &PackageDigest) -> PackageBindProfileParams {
+    PackageBindProfileParams {
+        profile: profile.to_owned(),
+        digest: Some(digest.clone()),
+        dry_run: false,
+    }
+}
+
+#[tokio::test]
+async fn profiles_cannot_pin_incompatible_versions_even_when_none_is_selected() {
+    let fixture = Fixture::new("selection-bind-unselected");
+    let old = Package::build_with(PACKAGE, "1.0.0", RUNTIME, INERT_PROGRAM, Some(SUBAGENT));
+    let new = update("2.0.0", Some(IDENTITY));
+    install(&fixture, &old, false).await;
+    install(&fixture, &new, false).await;
+    assert_eq!(fixture.serving(RUNTIME), None, "nothing is selected");
+    let text = format!("base = \"{RUNTIME}\"\nprogram = \"{INERT_PROGRAM}\"\n");
+    for name in ["first", "second", "third"] {
+        fixture.write_profile(name, &text);
+    }
+
+    fixture
+        .registry
+        .package_bind_profile(bind_to("first", &old.digest))
+        .await
+        .expect("the first pin has nothing to conflict with");
+    let before = fs::read(fixture.agents.join("second.toml")).expect("read");
+    for dry_run in [true, false] {
+        let mut request = bind_to("second", &new.digest);
+        request.dry_run = dry_run;
+        assert_eq!(
+            fixture
+                .registry
+                .package_bind_profile(request)
+                .await
+                .expect_err("the other pin is an incompatible referenced version"),
+            PackageErrorKind::IntegrationIncompatible,
+            "dry_run {dry_run}"
+        );
+    }
+    assert_eq!(
+        fs::read(fixture.agents.join("second.toml")).expect("read"),
+        before
+    );
+    fixture
+        .registry
+        .package_bind_profile(bind_to("third", &old.digest))
+        .await
+        .expect("a compatible pin of the same version");
+
+    // The only pin of the old version is being replaced, so it is not a
+    // reference the new pin must be compatible with; `third` still pins it.
+    assert_eq!(
+        fixture
+            .registry
+            .package_bind_profile(bind_to("first", &new.digest))
+            .await
+            .expect_err("another profile still pins the old version"),
+        PackageErrorKind::IntegrationIncompatible
+    );
+    fs::remove_file(fixture.agents.join("third.toml")).expect("drop the other pin");
+    fixture
+        .registry
+        .package_bind_profile(bind_to("first", &new.digest))
+        .await
+        .expect("the replaced pin does not count against itself");
+}
+
 #[tokio::test]
 async fn the_verdict_is_recomputed_from_the_registry_and_the_sessions_after_a_restart() {
     let mut v = versions("selection-restart", Some(SUBAGENT)).await;

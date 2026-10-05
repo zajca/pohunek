@@ -71,14 +71,29 @@ impl SessionRegistry {
     /// Returns the I/O error when the durable store cannot be read or holds a
     /// record that cannot be interpreted.
     pub async fn retained_package_digests(&self) -> io::Result<RetainedDigests> {
+        self.retained_digests_excluding_profile(None).await
+    }
+
+    /// [`Self::retained_package_digests`] without the pin of the host profile
+    /// `profile`, for a change that replaces that pin.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::retained_package_digests`].
+    pub(super) async fn retained_digests_excluding_profile(
+        &self,
+        profile: Option<String>,
+    ) -> io::Result<RetainedDigests> {
         let mut retained = RetainedDigests::new();
         let profiles = self.inner.profiles.clone();
         retained.extend(
-            tokio::task::spawn_blocking(move || profiles.pinned_digests())
-                .await
-                .map_err(|join_error| io::Error::other(join_error.to_string()))??
-                .iter()
-                .cloned(),
+            tokio::task::spawn_blocking(move || {
+                profiles.pinned_digests_excluding(profile.as_deref())
+            })
+            .await
+            .map_err(|join_error| io::Error::other(join_error.to_string()))??
+            .iter()
+            .cloned(),
         );
         if let Some(store) = self.inner.store.clone() {
             let pinned = tokio::task::spawn_blocking(move || store.pinned_package_digests())

@@ -16,7 +16,7 @@ use protocol::{
 };
 use tracing::warn;
 
-use super::selection::differs;
+use super::selection::{conflict, differs, integration_of};
 use super::{inspect_record, prove_loadable, read_state, Context, Inspected};
 use crate::agent::host::ServedBy;
 use std::sync::Arc;
@@ -41,7 +41,9 @@ impl SessionRegistry {
         params: PackageBindProfileParams,
     ) -> Result<PackageBindProfileResult, PackageErrorKind> {
         let profiles = self.inner.profiles.clone();
-        self.package_transaction(move |context, retained| {
+        // The pin being replaced is not a reference to compare the new pin with.
+        let replaced = Some(params.profile.clone());
+        self.package_transaction_excluding(replaced, move |context, retained| {
             bind_profile(context, &profiles, retained, &params)
         })
         .await
@@ -128,30 +130,39 @@ fn resolve_target(
 }
 
 /// Refuses a pin of a version whose integration differs from the selected
-/// version of the same package.
+/// version of the same package or from another version that is still
+/// referenced.
 ///
-/// A pin is a retained reference, so it must not make an unselected version
-/// with another handler or hook schema coexist with the selected one, which is
-/// the state the selection gate keeps from arising in the other order.
-fn ensure_coexists_with_selected(
+/// A pin is a retained reference, so it must not make versions with another
+/// handler or hook schema launchable together against one active asset set,
+/// whether or not a version is selected. `retained` leaves out the pin this
+/// bind replaces, so rebinding a profile never compares the new pin with the
+/// old one.
+fn ensure_coexists(
     context: &Context,
     state: &RegistryState,
+    retained: &RetainedDigests,
     digest: &PackageDigest,
 ) -> Result<(), PackageErrorKind> {
     let record = state
         .package(digest)
         .ok_or(PackageErrorKind::NotInstalled)?;
-    let Some(selected) = state
+    let selected = state
         .selected(&record.identity().id)
         .filter(|selected| *selected != digest)
-        .and_then(|selected| state.package(selected))
-    else {
-        return Ok(());
-    };
-    if differs(context, record, selected) {
+        .and_then(|selected| state.package(selected));
+    let differs_from_selected = selected.is_some_and(|selected| differs(context, record, selected));
+    let referenced_conflict = conflict(
+        context,
+        state,
+        retained,
+        (digest, &record.identity().id),
+        &integration_of(context, record),
+    );
+    if differs_from_selected || referenced_conflict.is_some() {
         warn!(
             package = %record.identity().id,
-            "a profile cannot pin a version whose integration differs from the selected one"
+            "a profile cannot pin a version whose integration differs from a selected or referenced one"
         );
         return Err(PackageErrorKind::IntegrationIncompatible);
     }
@@ -196,7 +207,7 @@ fn bind_profile(
     if head.pin().as_ref() == Some(&pin) {
         return Ok(result(PackageBindStatus::Unchanged, false, true));
     }
-    ensure_coexists_with_selected(context, &read_state(context)?, &pin.digest)?;
+    ensure_coexists(context, &read_state(context)?, retained, &pin.digest)?;
     let rewritten = apply_pin(file.text(), &pin).map_err(|detail| unusable(name, &detail))?;
     // The candidate must resolve against the target exactly as a launch of it
     // would (size bound, structure, resume and fork overrides against the

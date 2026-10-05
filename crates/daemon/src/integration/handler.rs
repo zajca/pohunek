@@ -189,8 +189,8 @@ impl RetainedSchemas {
     }
 
     /// Records a retained version of `package` whose integration cannot be
-    /// determined, which no update of that package's runtime may proceed
-    /// without.
+    /// determined. The version may drive any handler, so no handler's asset
+    /// set is updated while it is retained.
     pub fn push_unresolvable(&mut self, package: PackageId) {
         self.unresolvable.insert(package);
     }
@@ -206,8 +206,9 @@ impl RetainedSchemas {
             .map(|(_named, schema)| *schema)
     }
 
-    fn unresolvable_for(&self, package: Option<&PackageId>) -> bool {
-        package.is_some_and(|package| self.unresolvable.contains(package))
+    /// Whether a retained version exists whose handler and schema are unknown.
+    fn has_unresolvable(&self) -> bool {
+        !self.unresolvable.is_empty()
     }
 }
 
@@ -329,8 +330,6 @@ pub(super) struct Resolved {
     pub(super) handler: &'static dyn DaemonHandler,
     /// The compiled hook schema the definition names.
     pub(super) schema: &'static HookSchema,
-    /// The package serving the runtime; `None` for a built-in runtime.
-    package: Option<PackageId>,
 }
 
 /// Resolves the runtime `agent` names to its daemon-run handler.
@@ -358,10 +357,6 @@ fn resolved(
         display_name: definition.display_name().to_owned(),
         handler,
         schema: definition.hook_schema()?,
-        package: match &definition.binding().provenance {
-            BindingProvenance::Package { package, .. } => Some(package.id.clone()),
-            BindingProvenance::Builtin { .. } => None,
-        },
     })
 }
 
@@ -411,15 +406,17 @@ pub(super) fn update(
 }
 
 /// Proves that `staged` is admitted by every retained schema of the handler
-/// and that no retained version of the runtime's package is undetermined.
+/// and that no retained version is undetermined: its handler is unknown, so it
+/// may be the one whose asset set is being replaced, whichever runtime the
+/// update addresses.
 fn verify_retained(
     resolved: &Resolved,
     staged: &dyn StagedUpdate,
     retained: &RetainedSchemas,
 ) -> Result<(), ProtocolError> {
-    if retained.unresolvable_for(resolved.package.as_ref()) {
+    if retained.has_unresolvable() {
         return Err(update_incompatible(
-            "a package version still in use has an integration that cannot be determined",
+            "a package version still in use has an integration that cannot be determined, so no handler's asset set can be proven compatible with it",
         ));
     }
     let handler = resolved.handler.id();

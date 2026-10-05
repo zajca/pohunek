@@ -468,11 +468,27 @@ impl ProfileRegistry {
     /// under the package lifecycle authority, and an unbounded or unreadable
     /// listing must refuse the change rather than be assumed to pin nothing.
     pub(crate) fn pinned_digests(&self) -> std::io::Result<RetainedDigests> {
+        self.pinned_digests_excluding(None)
+    }
+
+    /// [`Self::pinned_digests`] without the pin of the profile named `skip`,
+    /// for a change that replaces that pin.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::pinned_digests`].
+    pub(crate) fn pinned_digests_excluding(
+        &self,
+        skip: Option<&str>,
+    ) -> std::io::Result<RetainedDigests> {
         let mut pinned = RetainedDigests::new();
         let Some(dir) = &self.dir else {
             return Ok(pinned);
         };
         for (stem, path) in scanned_profile_files(dir)? {
+            if skip == Some(stem.as_str()) {
+                continue;
+            }
             match read_binding(dir, &stem, &path) {
                 Ok(Some(binding)) => pinned.insert(binding.digest),
                 Ok(None) => {}

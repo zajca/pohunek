@@ -169,6 +169,15 @@ pub(super) fn block_of(
     })
 }
 
+/// The integration of the installed package `record`.
+pub(super) fn integration_of(context: &Context, record: &PackageRecord) -> Integration {
+    context
+        .integrations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .of(context, record)
+}
+
 /// Whether the installed package `candidate` and the installed package
 /// `other` declare different integrations.
 ///

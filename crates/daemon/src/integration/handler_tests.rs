@@ -326,34 +326,40 @@ fn a_retained_schema_that_does_not_admit_the_asset_set_keeps_the_old_set_active(
 }
 
 #[test]
-fn an_undetermined_retained_version_of_the_runtimes_package_refuses_the_update() {
-    let claude = scoped_dir("retained-unresolvable-claude");
-    let codex = scoped_dir("retained-unresolvable-codex");
-    let host = pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
-    let pi = RuntimeRef::from_wire("pi");
-    let package = protocol::PackageId::parse("acme.runtime.pi").expect("package id");
-    let other = protocol::PackageId::parse("acme.runtime.other").expect("package id");
-
-    let mut unrelated = RetainedSchemas::default();
-    unrelated.push_unresolvable(other);
-    with_config_dirs(&claude, &codex, || {
-        install_for_retained(&host, Some(&pi), &unrelated)
-    })
-    .expect("another package's undetermined version takes no part");
-
+fn an_undetermined_retained_version_refuses_every_handler_update() {
+    let package = protocol::PackageId::parse("acme.runtime.other").expect("package id");
     let mut undetermined = RetainedSchemas::default();
     undetermined.push_unresolvable(package);
-    let refused = with_config_dirs(&claude, &codex, || {
-        install_for_retained(&host, Some(&pi), &undetermined)
-    })
-    .expect_err("an undetermined version of the runtime's own package");
-    assert_eq!(refused.code, UPDATE_INCOMPATIBLE_CODE);
+    let pi_host =
+        pi_shaped_integration_host(Path::new("/bin/sh"), CLAUDE_ID, "identity-subagent-v1");
+    let pi = RuntimeRef::from_wire("pi");
 
-    // A built-in runtime has no package, so the same set does not concern it.
-    with_config_dirs(&claude, &codex, || {
-        install_for_retained(&builtin_host(), Some(&RuntimeRef::claude()), &undetermined)
-    })
-    .expect("a built-in runtime has no package version to retain");
+    for agent in agents() {
+        let dir = scoped_dir("retained-unresolvable");
+        write_user_config(&agent, &dir);
+        install_current(&agent, &dir);
+        let before = content_snapshot(&dir);
+        let resolved = builtin(&agent);
+        let refused = update(&resolved, &dir, &undetermined, &mut ok_gate)
+            .expect_err("the unknown version may drive this handler");
+        assert_eq!(refused.code, UPDATE_INCOMPATIBLE_CODE, "{agent:?}");
+        assert_eq!(content_snapshot(&dir), before, "{agent:?}");
+    }
+
+    let claude = scoped_dir("retained-unresolvable-claude");
+    let codex = scoped_dir("retained-unresolvable-codex");
+    for (host, agent) in [
+        (&pi_host, Some(&pi)),
+        (&builtin_host(), Some(&RuntimeRef::claude())),
+        (&builtin_host(), None),
+    ] {
+        let refused = with_config_dirs(&claude, &codex, || {
+            install_for_retained(host, agent, &undetermined)
+        })
+        .expect_err("an undetermined retained version");
+        assert_eq!(refused.code, UPDATE_INCOMPATIBLE_CODE, "{agent:?}");
+    }
+    assert!(!claude.join("hooks").join(STATE_HOOK_INSTALL_NAME).exists());
 }
 
 #[test]

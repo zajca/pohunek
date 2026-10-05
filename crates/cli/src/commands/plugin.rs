@@ -1169,7 +1169,7 @@ fn render_install_review(preview: &PackageInstallResult, enable: bool, select: b
     let _ = writeln!(
         output,
         "Selected:    {} after install",
-        yes_no(select && preview.package.selected)
+        yes_no(select && preview.package.selection_blocked.is_none())
     );
     if select {
         if let Some(note) = selection_note(&preview.package) {
@@ -1940,6 +1940,30 @@ mod tests {
             doctor.contains("selection blocked by sha256:aaaaaaaaaaaa"),
             "{doctor}"
         );
+    }
+
+    #[test]
+    fn the_review_shows_the_selection_the_requested_flags_will_make() {
+        let review = |package: PackageInfo, select: bool| {
+            render_install_review(
+                &PackageInstallResult {
+                    status: PackageInstallStatus::Preview,
+                    package,
+                    runtime: runtime("Pi"),
+                    reloaded: false,
+                },
+                true,
+                select,
+            )
+        };
+        // The preview is requested without selection, so the daemon reports
+        // `selected: false` for a package that will be selected after consent.
+        let compatible = info("acme.pi", "2.0.0", DIGEST_B, false);
+        assert!(review(compatible.clone(), true).contains("Selected:    yes after install"));
+        assert!(review(compatible, false).contains("Selected:    no after install"));
+        let held = held_back("2.0.0", DIGEST_B);
+        assert!(review(held.clone(), true).contains("Selected:    no after install"));
+        assert!(review(held, true).contains("installed but not selected"));
     }
 
     #[test]

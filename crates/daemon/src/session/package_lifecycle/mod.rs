@@ -242,11 +242,31 @@ impl SessionRegistry {
         T: Send + 'static,
         F: FnOnce(&Context, &RetainedDigests) -> Result<T, PackageErrorKind> + Send + 'static,
     {
+        self.package_transaction_excluding(None, work).await
+    }
+
+    /// [`Self::package_transaction`] whose retained set leaves out the pin of
+    /// the host profile `profile`, because the work replaces that pin.
+    async fn package_transaction_excluding<T, F>(
+        &self,
+        profile: Option<String>,
+        work: F,
+    ) -> Result<T, PackageErrorKind>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Context, &RetainedDigests) -> Result<T, PackageErrorKind> + Send + 'static,
+    {
         let context = self.package_context()?;
         let registry = self.clone();
         tokio::spawn(async move {
             let _exclusive = registry.inner.package_lifecycle.write().await;
-            let retained = registry.package_retained().await?;
+            let retained = registry
+                .retained_digests_excluding_profile(profile)
+                .await
+                .map_err(|error| {
+                    warn!(%error, "the sessions that pin packages cannot be listed");
+                    PackageErrorKind::RegistryFailed
+                })?;
             blocking(move || work(&context, &retained)).await
         })
         .await
