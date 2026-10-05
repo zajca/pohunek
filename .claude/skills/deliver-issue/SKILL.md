@@ -136,7 +136,12 @@ head; checking only CI loses review rounds.
    re-trigger it by pushing a new head — rebase onto the current `main` when it moved,
    otherwise `git commit --amend --no-edit --date=now` and
    `--force-with-lease` with the old head SHA — and record the retrigger on
-   the issue. Repeat at most three times; after that record the blocker on
+   the issue. In a stack, keep the ancestry: rebase onto `main` only the
+   bottom slice, rebase any other slice onto its rewritten parent, amend in
+   place, and restack every slice above the rewritten one with the
+   pr-handoff restack procedure (`git rebase --update-refs`, gates on each
+   rebased slice, push all with `--force-with-lease`) before restarting the
+   review watches. Repeat at most three times; after that record the blocker on
    the issue and keep waiting with long wakeups. Never merge without the
    review of the final head.
 3. **CI failure triage** — before changing anything:
