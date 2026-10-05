@@ -173,9 +173,28 @@ pub(crate) fn pi_shaped_integration_host(
     handler: &str,
     hook_schema: &str,
 ) -> RuntimeHost {
+    pi_shaped_integration_host_as(program, PI_SHAPED_ID, handler, hook_schema)
+}
+
+/// Like [`pi_shaped_integration_host`], with the fixture runtime named
+/// `runtime_id`.
+///
+/// # Panics
+///
+/// Panics when the document or the registry is invalid, which would be a
+/// defect of the fixture.
+pub(crate) fn pi_shaped_integration_host_as(
+    program: &Path,
+    runtime_id: &str,
+    handler: &str,
+    hook_schema: &str,
+) -> RuntimeHost {
     let document = format!(
         "{}\n[integration]\nhandler = \"{handler}\"\nhook_schema = \"{hook_schema}\"\n",
-        pi_shaped_document(program, PI_SHAPED_NO_CHECK)
+        pi_shaped_document(program, PI_SHAPED_NO_CHECK).replace(
+            &format!("id = \"{PI_SHAPED_ID}\""),
+            &format!("id = \"{runtime_id}\"")
+        )
     );
     let definition = RuntimeDefinition::from_toml(
         &document,

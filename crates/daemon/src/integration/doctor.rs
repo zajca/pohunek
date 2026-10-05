@@ -335,11 +335,24 @@ fn expected_when_not_installed(warning: &str) -> bool {
 }
 
 /// Derives one agent's findings from its status and the shared runtime findings.
+#[cfg(test)]
 pub(super) fn diagnose(
     status: IntegrationAgentStatus,
     runtime: &[IntegrationFinding],
 ) -> IntegrationAgentDoctor {
     let label = status.agent.as_wire().to_owned();
+    diagnose_as(status, &label, runtime)
+}
+
+/// [`diagnose`] naming `label` in recovery commands and prose.
+///
+/// The warnings are classified exactly as the handler worded them, so the label
+/// never takes part in classification.
+pub(super) fn diagnose_as(
+    status: IntegrationAgentStatus,
+    label: &str,
+    runtime: &[IntegrationFinding],
+) -> IntegrationAgentDoctor {
     let mut findings = Vec::new();
     if status.state == IntegrationInstallState::NotInstalled {
         findings.push(if status.available {
@@ -366,12 +379,12 @@ pub(super) fn diagnose(
                     .warnings
                     .iter()
                     .filter(|warning| !expected_when_not_installed(warning))
-                    .map(|warning| classify_warning(warning, &label, status.recovery)),
+                    .map(|warning| classify_warning(warning, label, status.recovery)),
             );
         }
     } else {
         for warning in &status.warnings {
-            findings.push(classify_warning(warning, &label, status.recovery));
+            findings.push(classify_warning(warning, label, status.recovery));
         }
         if status.state == IntegrationInstallState::Outdated && findings.is_empty() {
             findings.push(error_finding(
@@ -391,6 +404,20 @@ pub(super) fn diagnose(
         status: Some(status),
         findings,
     }
+}
+
+/// Reports `diagnosis` for `runtime`, after its findings were classified.
+fn retarget_diagnosis(diagnosis: &mut IntegrationAgentDoctor, runtime: &RuntimeRef) {
+    let from = diagnosis.agent.as_wire().to_owned();
+    if let Some(status) = &mut diagnosis.status {
+        handler::retarget_status(status, runtime);
+    }
+    if from != runtime.as_wire() {
+        for finding in &mut diagnosis.findings {
+            finding.summary = handler::retarget_text(&finding.summary, &from, runtime.as_wire());
+        }
+    }
+    diagnosis.agent = runtime.clone();
 }
 
 /// Quarantine-prefixed names in `directory`, and whether the scan of it was
@@ -617,7 +644,12 @@ pub(super) fn doctor_for_with(
                 return operation_in_progress(agent.runtime.clone());
             }
             super::commit::race_point("doctor.inspecting", agent.runtime.as_wire());
-            let mut diagnosis = diagnose(agent.handler.inspect(&agent.runtime), &runtime);
+            let mut diagnosis = diagnose_as(
+                agent.handler.inspect_provider(),
+                agent.runtime.as_wire(),
+                &runtime,
+            );
+            retarget_diagnosis(&mut diagnosis, &agent.runtime);
             if let Some(dir) = &config_dir {
                 diagnosis.findings.extend(quarantine_findings_in(
                     dir,

@@ -87,11 +87,21 @@ pub trait DaemonHandler: Send + Sync + Debug {
     /// quarantine entries.
     fn quarantine_subdirs(&self) -> &'static [&'static str];
 
-    /// Read-only status of the active set, reported for `runtime`.
+    /// Read-only status of the active set, worded for the provider the handler
+    /// manages and reported for that provider's own runtime.
     ///
     /// A failure to resolve the config directory degrades into a warning of
-    /// the report.
-    fn inspect(&self, runtime: &RuntimeRef) -> IntegrationAgentStatus;
+    /// the report. The warnings are the diagnostic text diagnosis classifies, so
+    /// they carry no id of the runtime a request addressed.
+    fn inspect_provider(&self) -> IntegrationAgentStatus;
+
+    /// Read-only status of the active set, reported for `runtime`, with the
+    /// recovery commands in its warnings naming `runtime`.
+    fn inspect(&self, runtime: &RuntimeRef) -> IntegrationAgentStatus {
+        let mut status = self.inspect_provider();
+        retarget_status(&mut status, runtime);
+        status
+    }
 
     /// Computes the asset set for the config directory `dir` and holds the
     /// installer lock; nothing in `dir` changes.
@@ -206,6 +216,33 @@ pub(super) fn handler(id: &str) -> Option<Handler> {
 #[must_use]
 pub(super) fn handlers() -> &'static [Handler] {
     super::provider_handlers::REGISTRY.as_slice()
+}
+
+/// Command-line flag the recovery commands in diagnostic text select a runtime
+/// with.
+const AGENT_FLAG: &str = "--agent";
+
+/// Rewrites the recovery commands in `text` that select the runtime `from` to
+/// select `to`.
+///
+/// Only the flag and its value are rewritten, so diagnostic wording is never
+/// changed by a runtime id.
+pub(super) fn retarget_text(text: &str, from: &str, to: &str) -> String {
+    text.replace(
+        &format!("{AGENT_FLAG} {from}"),
+        &format!("{AGENT_FLAG} {to}"),
+    )
+}
+
+/// Reports `status` for `runtime` instead of the provider's own runtime.
+pub(super) fn retarget_status(status: &mut IntegrationAgentStatus, runtime: &RuntimeRef) {
+    let from = status.agent.as_wire().to_owned();
+    if from != runtime.as_wire() {
+        for warning in &mut status.warnings {
+            *warning = retarget_text(warning, &from, runtime.as_wire());
+        }
+    }
+    status.agent = runtime.clone();
 }
 
 /// `integration_update_incompatible` with the broken condition.

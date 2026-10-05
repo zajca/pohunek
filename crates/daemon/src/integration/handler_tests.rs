@@ -25,7 +25,10 @@ use super::{
     INSTALL_IN_PROGRESS_CODE, INSTALL_LOCK_NAME, INTEGRATION_VERSION_PREFIX,
     NOTIFY_HOOK_INSTALL_NAME, STATE_HOOK_INSTALL_NAME,
 };
-use crate::agent::host::fixture::{builtin_host, pi_shaped_integration_host};
+use crate::agent::host::fixture::{
+    builtin_host, pi_shaped_integration_host, pi_shaped_integration_host_as,
+};
+use crate::agent::host::RuntimeHost;
 
 /// Error code raised by the injected gate failures below.
 const INJECTED_CODE: &str = "injected_step_failure";
@@ -597,4 +600,134 @@ fn a_package_runtime_is_named_in_every_recovery_command_of_status_and_doctor() {
         "{:?}",
         absent.agents[0].findings
     );
+}
+
+/// Runtime ids made of the words `classify_warning` and the not-installed
+/// filter look for in free text.
+const KEYWORD_RUNTIME_IDS: [&str; 9] = [
+    "acme-trust",
+    "version-pkg",
+    "owned",
+    "trust",
+    "version",
+    "registration",
+    "permissions",
+    "managed-pkg",
+    "missing",
+];
+
+/// Doctor findings of `agent` as `(code, summary, remediation)` with the
+/// addressed runtime id replaced by a fixed word.
+fn doctor_findings(
+    host: &RuntimeHost,
+    agent: &RuntimeRef,
+    dir: &Path,
+    other: &Path,
+) -> Vec<(String, String, Option<String>)> {
+    let result = with_config_dirs(dir, other, || {
+        doctor_for_with(
+            host,
+            IntegrationDoctorParams {
+                agent: Some(agent.clone()),
+            },
+            &[],
+            &[],
+        )
+    })
+    .expect("doctor");
+    let flag = format!("--agent {}", agent.as_wire());
+    result.agents[0]
+        .findings
+        .iter()
+        .map(|finding| {
+            (
+                serde_json::to_string(&finding.code).expect("code"),
+                finding
+                    .summary
+                    .strip_prefix(&format!("{} ", agent.as_wire()))
+                    .map_or_else(
+                        || finding.summary.replace(&flag, "--agent ID"),
+                        |rest| format!("ID {}", rest.replace(&flag, "--agent ID")),
+                    ),
+                finding
+                    .remediation
+                    .as_deref()
+                    .map(|text| text.replace(&flag, "--agent ID")),
+            )
+        })
+        .collect()
+}
+
+/// Number of states [`break_claude_state`] can put the directory in.
+const BROKEN_STATES: usize = 8;
+
+/// Puts the claude config directory `dir` in one of the states whose warnings
+/// the doctor classifies by their wording.
+fn break_claude_state(dir: &Path, state: usize) {
+    let hooks = dir.join("hooks");
+    match state {
+        0 => fs::set_permissions(&hooks, fs::Permissions::from_mode(0o777)).expect("loosen"),
+        1 => fs::write(hooks.join(STATE_HOOK_INSTALL_NAME), "tampered\n").expect("tamper"),
+        2 => fs::remove_file(dir.join("settings.json")).expect("remove settings"),
+        3 => fs::remove_file(hooks.join(NOTIFY_HOOK_INSTALL_NAME)).expect("remove hook"),
+        4 => fs::write(dir.join("settings.json"), "[1]").expect("break settings"),
+        5 => fs::set_permissions(
+            hooks.join(STATE_HOOK_INSTALL_NAME),
+            fs::Permissions::from_mode(0o666),
+        )
+        .expect("make the hook writable"),
+        6 => fs::set_permissions(
+            hooks.join(STATE_HOOK_INSTALL_NAME),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("drift the hook mode"),
+        _ => fs::write(dir.join("settings.json"), "{}").expect("drop the registrations"),
+    }
+}
+
+#[test]
+fn a_runtime_id_never_changes_how_the_doctor_classifies_a_warning() {
+    let other = scoped_dir("classify-other");
+    for state in 0..BROKEN_STATES {
+        let dir = scoped_dir("classify");
+        install_claude(&dir).expect("install");
+        break_claude_state(&dir, state);
+        let expected = doctor_findings(&builtin_host(), &RuntimeRef::claude(), &dir, &other);
+        assert!(!expected.is_empty(), "state {state} produces findings");
+
+        for id in KEYWORD_RUNTIME_IDS {
+            let host = pi_shaped_integration_host_as(
+                Path::new("/bin/sh"),
+                id,
+                CLAUDE_ID,
+                "identity-subagent-v1",
+            );
+            let agent = RuntimeRef::from_wire(id);
+            assert_eq!(
+                doctor_findings(&host, &agent, &dir, &other),
+                expected,
+                "state {state} runtime {id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_runtime_id_never_changes_the_not_installed_filter() {
+    let other = scoped_dir("not-installed-other");
+    let dir = scoped_dir("not-installed");
+    let expected = doctor_findings(&builtin_host(), &RuntimeRef::claude(), &dir, &other);
+    for id in KEYWORD_RUNTIME_IDS {
+        let host = pi_shaped_integration_host_as(
+            Path::new("/bin/sh"),
+            id,
+            CLAUDE_ID,
+            "identity-subagent-v1",
+        );
+        assert_eq!(
+            doctor_findings(&host, &RuntimeRef::from_wire(id), &dir, &other),
+            expected,
+            "runtime {id}"
+        );
+    }
 }
