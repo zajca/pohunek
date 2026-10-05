@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 use protocol::{SessionRetentionHold, SessionWarningKind};
 
 use super::{
+    admin_lock, git_command, lock_within, run_admin_command_within, worktree_add_new,
+    worktree_prune,
+};
+use super::{
     branch_slug, hook_env, is_valid_worktree, run_output_bounded, HookContext, HookEvent,
     WorktreeCleanup, WorktreeManager, WorktreeRequest, WorktreeWork,
 };
@@ -674,6 +678,230 @@ fn concurrent_creates_in_one_repository_each_start_from_their_own_base() {
     assert_eq!(leftover_fetch_refs(&downstream), "");
 }
 
+/// Barrier-aligned rounds of concurrent adds in the raw-git race test.
+const RAW_ADD_ROUNDS: usize = 6;
+
+/// Concurrent `git worktree add` calls per round in the raw-git race test.
+const RAW_ADDS_PER_ROUND: usize = 12;
+
+#[test]
+fn concurrent_worktree_adds_and_prunes_in_one_repository_all_succeed() {
+    let repo = init_repo("raw-race");
+    let checkouts = unique_dir("raw-race-checkouts");
+
+    for round in 0..RAW_ADD_ROUNDS {
+        // One extra participant prunes while the adds run: prune reads and may
+        // delete admin entries, so it must not observe a half-written one.
+        let barrier = std::sync::Barrier::new(RAW_ADDS_PER_ROUND + 1);
+        let (adds, prune) = std::thread::scope(|scope| {
+            let prune = scope.spawn(|| {
+                barrier.wait();
+                worktree_prune(&repo)
+            });
+            let handles: Vec<_> = (0..RAW_ADDS_PER_ROUND)
+                .map(|index| {
+                    let (repo, barrier) = (&repo, &barrier);
+                    let path = checkouts.join(format!("wt-{round}-{index}"));
+                    scope.spawn(move || {
+                        barrier.wait();
+                        worktree_add_new(repo, &path, &format!("b/{round}-{index}"), "main")
+                            .map(|()| path)
+                    })
+                })
+                .collect();
+            let adds: Vec<_> = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("add thread"))
+                .collect();
+            (adds, prune.join().expect("prune thread"))
+        });
+
+        prune.expect("concurrent prune succeeds");
+        for added in adds {
+            let path = added.expect("concurrent worktree add succeeds");
+            assert!(
+                is_valid_worktree(&path),
+                "{} must stay valid",
+                path.display()
+            );
+        }
+    }
+    let listed = git_stdout(&repo, &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        listed.matches("\nworktree ").count(),
+        RAW_ADD_ROUNDS * RAW_ADDS_PER_ROUND,
+        "every added worktree is still registered:\n{listed}"
+    );
+}
+
+#[test]
+fn admin_lock_is_shared_per_repository_and_independent_across_repositories() {
+    let first = init_repo("lock-first");
+    let second = init_repo("lock-second");
+    let linked = unique_dir("lock-linked").join("wt");
+    worktree_add_new(&first, &linked, "feat/linked", "main").expect("add a linked worktree");
+
+    let first_lock = admin_lock(&first).expect("lock for the first repository");
+    let via_linked = admin_lock(&linked).expect("lock via a linked worktree");
+    let second_lock = admin_lock(&second).expect("lock for the second repository");
+    assert!(
+        Arc::ptr_eq(&first_lock, &via_linked),
+        "the main checkout and its linked worktree share one lock"
+    );
+    assert!(
+        !Arc::ptr_eq(&first_lock, &second_lock),
+        "distinct repositories use distinct locks"
+    );
+
+    let held = lock_within(&first_lock, Duration::ZERO).expect("take the first lock");
+    assert!(
+        lock_within(&via_linked, Duration::ZERO).is_err(),
+        "a second operation on the same repository waits for the holder"
+    );
+    // Another repository is unaffected while the first is held.
+    let other = std::thread::scope(|scope| {
+        scope
+            .spawn(|| lock_within(&second_lock, Duration::ZERO).map(drop))
+            .join()
+            .expect("lock thread")
+    });
+    other.expect("a different repository is not serialized behind the first");
+    drop(held);
+    drop(lock_within(&first_lock, Duration::ZERO).expect("the lock is free after release"));
+}
+
+#[test]
+fn admin_lock_wait_reports_a_timeout_instead_of_blocking_forever() {
+    let repo = init_repo("lock-timeout");
+    let lock = admin_lock(&repo).expect("lock");
+    let _held = lock_within(&lock, Duration::ZERO).expect("take the lock");
+
+    let message = lock_within(&lock, Duration::ZERO).expect_err("lock is held");
+
+    assert!(
+        message.contains("timed out"),
+        "unexpected message: {message}"
+    );
+}
+
+#[test]
+fn admin_commands_wait_for_the_repository_lock_before_running_git() {
+    let repo = init_repo("lock-wiring");
+    let checkout = unique_dir("lock-wiring-checkout").join("wt");
+    let lock = admin_lock(&repo).expect("lock");
+    let held = lock_within(&lock, Duration::ZERO).expect("take the lock");
+
+    let mut cmd = git_command(&repo).expect("git command");
+    cmd.args(["worktree", "add", "-b", "feat/locked", "--end-of-options"])
+        .arg(&checkout)
+        .arg("main");
+    let message = run_admin_command_within(&repo, cmd, Duration::ZERO)
+        .expect_err("the held lock keeps the command from running");
+
+    assert!(
+        message.contains("timed out"),
+        "unexpected message: {message}"
+    );
+    assert!(
+        !checkout.exists(),
+        "git must not have run while the lock was held"
+    );
+    drop(held);
+}
+
+/// Writes the signal file on drop so a failing test still ends the hook's
+/// background job.
+#[cfg(unix)]
+struct ReleaseOnDrop(PathBuf);
+
+#[cfg(unix)]
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, "go\n");
+    }
+}
+
+/// Bound on the second add's wait for the repository lock; only reached when
+/// the lock is wrongly held for as long as the first call is joining output.
+#[cfg(unix)]
+const TEST_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+#[cfg(unix)]
+#[test]
+fn repository_lock_is_released_when_git_exits_even_if_a_hook_descendant_holds_the_output() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = init_repo("lock-exit");
+    let state = unique_dir("lock-exit-state");
+    let started = state.join("started");
+    let release = state.join("release");
+    let hook = repo.join(".git").join("hooks").join("post-checkout");
+    fs::create_dir_all(hook.parent().expect("hooks dir")).expect("hooks dir");
+    // Only the first checkout leaves a background job; it inherits git's output
+    // pipes and exits when the test writes the release file.
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif [ ! -e '{started}' ]; then\n  : > '{started}'\n  \
+             (while [ ! -e '{release}' ]; do sleep 0.05; done) &\nfi\nexit 0\n",
+            started = started.display(),
+            release = release.display(),
+        ),
+    )
+    .expect("write hook");
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).expect("chmod hook");
+    let first_path = unique_dir("lock-exit-first").join("wt");
+    let second_path = unique_dir("lock-exit-second").join("wt");
+    let add = |path: &Path, branch: &str, lock_wait: Duration| {
+        let mut cmd = git_command(&repo).expect("git command");
+        cmd.args(["worktree", "add", "-b", branch, "--end-of-options"])
+            .arg(path)
+            .arg("main");
+        run_admin_command_within(&repo, cmd, lock_wait)
+    };
+
+    std::thread::scope(|scope| {
+        // Dropped on unwind too, before the scope waits for the first call.
+        let _release = ReleaseOnDrop(release.clone());
+        let first = scope.spawn(|| add(&first_path, "feat/first", TEST_LOCK_WAIT));
+        pohunek_test_support::wait::poll_until("the first hook started its background job", || {
+            started.exists().then_some(())
+        });
+
+        // The first call keeps joining output while its descendant lives, yet
+        // git has exited, so the lock must be free for the second add.
+        add(&second_path, "feat/second", TEST_LOCK_WAIT)
+            .expect("second add proceeds while the first call is still joining output");
+        assert!(
+            !first.is_finished(),
+            "the first call is still blocked on the descendant's output"
+        );
+
+        fs::write(&release, "go\n").expect("release the descendant");
+        first
+            .join()
+            .expect("first add thread")
+            .expect("first add succeeds");
+    });
+    assert!(is_valid_worktree(&first_path));
+    assert!(is_valid_worktree(&second_path));
+}
+
+#[test]
+fn admin_lock_survives_a_panicking_holder() {
+    let repo = init_repo("lock-poison");
+    let lock = admin_lock(&repo).expect("lock");
+    let poisoner = Arc::clone(&lock);
+    let panicked = std::thread::spawn(move || {
+        let _guard = poisoner.lock().expect("take the lock");
+        panic!("holder panics while holding the admin lock");
+    })
+    .join();
+    assert!(panicked.is_err(), "the holder thread panicked");
+
+    drop(lock_within(&lock, Duration::ZERO).expect("a poisoned lock is still usable"));
+}
+
 #[test]
 fn successful_fetch_leaves_no_temporary_ref_and_keeps_the_logical_base_name() {
     let upstream = init_repo("pin-upstream");
@@ -810,6 +1038,24 @@ fn fetch_never_overwrites_or_deletes_an_existing_destination_ref() {
         super::fetch_into_ref(&downstream, "main", dest)
             .expect_err("an existing destination must fail the fetch");
         assert_eq!(&git_stdout(&downstream, &["rev-parse", dest]), oid);
+    }
+}
+
+#[test]
+fn fetch_disables_automatic_maintenance() {
+    let repo = init_repo("fetch-maintenance");
+    let cmd = super::fetch_command(&repo, "main", "refs/pohunek/fetch/x").expect("command");
+    let args: Vec<_> = cmd.get_args().map(|arg| arg.to_string_lossy()).collect();
+    let fetch = args
+        .iter()
+        .position(|arg| arg == "fetch")
+        .expect("fetch verb");
+    for setting in ["gc.auto=0", "maintenance.auto=false"] {
+        let at = args
+            .iter()
+            .position(|arg| arg == setting)
+            .unwrap_or_else(|| panic!("{setting} missing: {args:?}"));
+        assert!(at < fetch, "{setting} must precede the verb: {args:?}");
     }
 }
 
