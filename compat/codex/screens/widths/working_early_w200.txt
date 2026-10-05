@@ -1,0 +1,24 @@
+  >_ OpenAI Codex (v0.160.0)
+     /tmp/cxw
+
+  What’s the first thing on our napkin sketch?
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+› HOLD EARLY a
+
+
+• Working (2s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  stub-model default · /tmp/cxw · ⠴
+  ← for agents · ? for shortcuts                                                                                                                                               ⚠ 1 warning · f2 to view

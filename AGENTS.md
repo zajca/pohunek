@@ -321,6 +321,18 @@ POHUNEK_PI_E2E=1 POHUNEK_PI_PACKAGE_ARCHIVE=ABS/pi.tar.zst \
 Moving the supported Pi range means changing the descriptor's `min`/`below`
 and the lock together; the pure test fails when they differ.
 
+The Codex runtime package source (`runtime-packages/codex`, lock and captured
+screens in `compat/codex/`) has the same shape in
+`crates/cli/tests/codex_package.rs`: always-running descriptor and manifest
+parity with the built-in Codex files, the supported range against the lock, and
+the manifest on real screens, plus `#[ignore]`d tests that drive a real `codex`
+with a loopback Responses stub and a fresh `CODEX_HOME`. The package cannot be
+installed until the official-alias claim for the reserved `codex` id lands, so
+those tests launch through the built-in descriptor. Run them with
+`POHUNEK_CODEX_E2E=1 cargo test -p pohunek-cli --test codex_package --
+--include-ignored --test-threads 1`; the `codex-package` CI job installs the
+locked release from npm. Never point a manual run at `~/.codex`.
+
 The TypeScript SDK is released as three npm-pack tarballs
 (`pohunek-ts-protocol-X.Y.Z.tgz`, `pohunek-ts-sdk-X.Y.Z.tgz`,
 `pohunek-ts-testkit-X.Y.Z.tgz`, each with a `.sha256`) built by

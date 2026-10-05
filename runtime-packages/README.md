@@ -26,6 +26,10 @@ runtime-packages/<runtime>/
   runs its manifest on the captured screens, and with an opt-in test that
   drives the real agent through the installed package (see
   `crates/cli/tests/pi_package.rs` and the `pi-package` CI job).
+- A package never carries the hook reporter scripts of an agent integration: the
+  integration handler it names is compiled core code that owns them.
 
 Packages: [`pi`](pi) (Pi coding agent 1.0.x; install steps in
-`docs/install.md`).
+`docs/install.md`) and [`codex`](codex) (Codex 0.160.x; source and tests only,
+not installable until the official-alias claim for the reserved `codex` id lands;
+see `docs/knowledge/guides/codex-package.md`).

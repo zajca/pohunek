@@ -27,7 +27,10 @@ Start here:
   [runtime packages guide](guides/runtime-packages.md) covers installing,
   updating, selecting, disabling, and removing runtime packages with
   `pohunek plugin`; the [Pi runtime package](guides/pi-package.md) documents
-  the official Pi package, what was verified against a real Pi, and its limits.
+  the official Pi package, what was verified against a real Pi, and its limits;
+  the [Codex runtime package](guides/codex-package.md) documents the Codex
+  package source, its parity with the built-in Codex runtime, and the gaps found
+  against a real Codex.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

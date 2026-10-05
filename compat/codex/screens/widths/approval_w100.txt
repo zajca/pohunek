@@ -1,0 +1,24 @@
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+› RUNTOOL please
+
+
+• Running touch approved.txt
+
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Create the marker file
+
+  $ touch approved.txt
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `touch approved.txt` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

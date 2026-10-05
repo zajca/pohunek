@@ -72,6 +72,8 @@ pohunek-daemon = { path = "../daemon" }
 pohunek-package = { workspace = true }
 # `plugin_catalog_install.rs` signs catalogs with a key generated in the test.
 ed25519-dalek = { workspace = true }
+# `codex_package.rs` compares the package files with the built-in Codex files as data.
+toml = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["async-secret-service", "tokio", "crypto-rust"] }
