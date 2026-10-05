@@ -134,6 +134,10 @@ pub(super) enum PtyRegistration {
         previous_runtime_generation: protocol::RuntimeGeneration,
         /// Original logical-session creation time.
         created_at: String,
+        /// Ordering key of the reference the superseded runtime accepted. The
+        /// recovered record keeps it, so the keyed record stays the newer side
+        /// of any record-versus-projection reconciliation.
+        previous_native_report: Option<Box<crate::store::NativeIdentityOrdering>>,
         /// Cancels reconnect attempts owned by the superseded runtime.
         runtime_watch_cancel: CancellationToken,
     },
@@ -635,6 +639,13 @@ impl SessionRegistry {
                 .as_ref()
                 .is_some_and(NativeSessionLaunch::supports_fork),
         };
+        let carried_native_report = match &registration {
+            PtyRegistration::Create => None,
+            PtyRegistration::Recover {
+                previous_native_report,
+                ..
+            } => previous_native_report.clone(),
+        };
         let runtime_generation =
             next_runtime_generation(&registration).map_err(LaunchFailure::Cleaned)?;
         let lifecycle = self.lifecycle().map_err(LaunchFailure::Cleaned)?;
@@ -735,7 +746,7 @@ impl SessionRegistry {
                 daemon_instance_id: None,
             }),
             info: preparing_info,
-            native_identity_ordering: None,
+            native_identity_ordering: carried_native_report.as_deref().cloned(),
             recovery: Some(ResumeBinding {
                 session_id: id.0.clone(),
                 name: name.clone(),
@@ -892,7 +903,7 @@ impl SessionRegistry {
             active_agent: None,
             foreground_process_group: None,
             last_agent_report: None,
-            last_native_report: None,
+            last_native_report: carried_native_report.as_deref().cloned(),
             observed_agents: Vec::new(),
             cwd_observed_at: crate::time::now(),
             initial_input_owner: initial_input_pending
@@ -1242,6 +1253,7 @@ mod tests {
             previous_runtime_generation: protocol::RuntimeGeneration::new(u64::MAX),
             previous_job: None,
             created_at: "2026-08-04T00:00:00Z".to_owned(),
+            previous_native_report: None,
             runtime_watch_cancel: CancellationToken::new(),
         };
 

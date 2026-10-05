@@ -184,6 +184,37 @@ impl Debug for ReportedLaunchIdentity {
     }
 }
 
+/// Latest native reference the designated launch process reported.
+///
+/// The worker journals it when it accepts a report of the launch provider from
+/// the verified launch process, and keeps it independently of the claim's
+/// lease, so a conversation switch survives a daemon outage.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedNativeReference {
+    /// Stable provider base.
+    pub provider: String,
+    /// Verified launch process identity that reported it.
+    pub process: ProcessIdentity,
+    /// Monotonic hook sequence of the report.
+    pub sequence: u64,
+    /// Native recovery reference kind.
+    pub reference_kind: String,
+    /// Provider-native recovery reference.
+    pub native_reference: String,
+}
+
+impl Debug for ReportedNativeReference {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReportedNativeReference")
+            .field("provider", &self.provider)
+            .field("process", &self.process)
+            .field("sequence", &self.sequence)
+            .field("reference_kind", &self.reference_kind)
+            .field("native_reference", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Latest active provider claim recorded by the worker.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveIdentityClaim {
@@ -701,6 +732,12 @@ pub struct InspectSnapshot {
     /// Explicit release tombstone, absent when no private release was accepted.
     #[serde(default)]
     pub active_identity_release: Option<ReleasedIdentityClaim>,
+    /// Latest native reference the verified launch process reported, kept
+    /// beyond the active claim's lease and release. Absent for a worker that
+    /// predates it, whose snapshot the daemon then reads through the launch
+    /// and active claims alone.
+    #[serde(default)]
+    pub native_reference: Option<ReportedNativeReference>,
     /// Durable provider-managed subagent state.
     #[serde(default)]
     pub subagents: Vec<SubagentSnapshot>,

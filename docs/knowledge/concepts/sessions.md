@@ -670,7 +670,11 @@ refused one leaves the stored reference alone, and an assigned value never
 replaces a reported one, also across a daemon restart. Sequences are compared per
 transport (worker claim or public report) and per runtime generation, so one
 clock never makes the other stale, and a recovered generation's first claim
-supersedes the reference it was relaunched with. The public API reference
+supersedes the reference it was relaunched with. The worker journals the latest
+reference of the verified launch process apart from the active claim's lease, so
+a switch made while the daemon was down survives the lease, and every
+replacement carries an ordering key that decides record-versus-projection
+reconciliation: the newer key wins and an unkeyed side loses to a keyed one. The public API reference
 has the field-level contract.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 

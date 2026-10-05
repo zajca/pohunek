@@ -504,6 +504,10 @@ struct SessionRegistryInner {
     /// wins with the freshest size. Held across the (blocking) store I/O instead
     /// of the sessions lock, keeping that hot lock free of file writes.
     persist_lock: Mutex<()>,
+    /// Test hook that drops every resume-binding write, standing for a daemon
+    /// that died between the session record and its projection.
+    #[cfg(test)]
+    resume_writes_blocked: AtomicBool,
     /// Shared by every fresh launch from verification until its durable record
     /// exists, exclusive for a package uninstall, so a launch cannot pin a
     /// package digest between the retained set being computed and the
@@ -1464,6 +1468,8 @@ impl SessionRegistry {
                 events,
                 store,
                 persist_lock: Mutex::new(()),
+                #[cfg(test)]
+                resume_writes_blocked: AtomicBool::new(false),
                 package_lifecycle: Arc::new(tokio::sync::RwLock::new(())),
                 lifecycle_locks: SessionLocks::default(),
                 creates: CreateTasks::default(),
@@ -5706,18 +5712,11 @@ fn preserve_durable_transition_metadata(
             None => replacement.info.subagents.push(durable.clone()),
         }
     }
-    if preserve_durable_launch_identity(
+    let _ = preserve_durable_launch_identity(
         existing,
         &mut replacement.info,
         replacement.last_native_report.is_some(),
-    ) {
-        // The reference and its provenance are one fact: an unsequenced
-        // launch claim cannot be re-protected by an ordering key, so the
-        // durable provenance travels with the durable reference.
-        if let Some(recovery) = &existing.recovery {
-            replacement.snapshot.reference_provenance = recovery.native_reference_provenance;
-        }
-    }
+    );
     if policy == RuntimeMetadataPolicy::Terminal {
         terminalize_running_subagents(&mut replacement.info.subagents, current_time_millis());
     } else {

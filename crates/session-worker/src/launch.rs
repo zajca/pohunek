@@ -5,7 +5,7 @@
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::journal::{JournalRecord, PendingLaunchClaim, RuntimePhase};
+use crate::journal::{JournalRecord, NativeReferenceClaim, PendingLaunchClaim, RuntimePhase};
 use crate::WorkerError;
 
 /// Launch-specific disposition, separate from acceptance of active identity.
@@ -47,6 +47,13 @@ pub(crate) fn submit(
     }
     match verify(&claim) {
         Ok(true) => {
+            journal.native_reference_claim = Some(NativeReferenceClaim {
+                provider: claim.identity.provider.clone(),
+                process: claim.identity.process.clone(),
+                sequence: claim.sequence,
+                reference_kind: claim.identity.reference_kind.clone(),
+                native_reference: claim.identity.native_reference.clone(),
+            });
             journal.launch_identity = Some(claim.identity);
             journal.pending_launch_claims.clear();
             Ok(LaunchClaimStatus::Accepted)
@@ -95,6 +102,42 @@ pub(crate) fn retry(
         }
         match verify(&claim) {
             Ok(true) => {
+                // A retried claim is the first the worker could verify; a
+                // newer report of the same process that arrived while it was
+                // pending is the launch process's latest reference.
+                if journal.native_reference_claim.is_none() {
+                    let newer = journal.active_identity.as_ref().filter(|active| {
+                        active.provider == claim.identity.provider
+                            && active.process == claim.identity.process
+                            && active.sequence > claim.sequence
+                    });
+                    journal.native_reference_claim = Some(
+                        match newer.and_then(|active| {
+                            Some((
+                                active.reference_kind.clone()?,
+                                active.native_reference.clone()?,
+                                active.sequence,
+                            ))
+                        }) {
+                            Some((reference_kind, native_reference, sequence)) => {
+                                NativeReferenceClaim {
+                                    provider: claim.identity.provider.clone(),
+                                    process: claim.identity.process.clone(),
+                                    sequence,
+                                    reference_kind,
+                                    native_reference,
+                                }
+                            }
+                            None => NativeReferenceClaim {
+                                provider: claim.identity.provider.clone(),
+                                process: claim.identity.process.clone(),
+                                sequence: claim.sequence,
+                                reference_kind: claim.identity.reference_kind.clone(),
+                                native_reference: claim.identity.native_reference.clone(),
+                            },
+                        },
+                    );
+                }
                 journal.launch_identity = Some(claim.identity);
                 changed = true;
             }
@@ -155,6 +198,7 @@ mod tests {
             expires_at: (now + time::Duration::seconds(60))
                 .format(&Rfc3339)
                 .unwrap(),
+            sequence: 0,
         };
         (journal, claim, now)
     }

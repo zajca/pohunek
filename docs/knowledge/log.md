@@ -237,7 +237,10 @@
   assigned value never replaces a reported one. Report sequences are ordered
   per transport (worker claim or public report) and per runtime generation, the
   worker's verified launch process (not only the root child) is the process
-  whose conversation switches count, and the session store schema is 3.
+  whose conversation switches count, and the session store schema is 3. The
+  worker journals the launch process's latest reference apart from the claim
+  lease, every replacement carries an ordering key, and a recovered session
+  keeps the key of its record.
 
 ## Unreleased (2026-10-04, assigned native references)
 

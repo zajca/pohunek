@@ -315,6 +315,11 @@ impl Rig {
     /// A restarted daemon: a second registry over the same store, roots and
     /// workers adopts the live session after the first one is gone.
     async fn restart(&mut self) -> SessionRegistry {
+        // The replaced registry stands for the dead daemon: once its last
+        // in-flight projection write is done, the lock stays held so a late
+        // write of its own cannot remove the binding the new daemon owns.
+        let barrier = self.registry.inner.persist_lock.lock().await;
+        std::mem::forget(barrier);
         let entry = self
             .registry
             .inner
@@ -906,6 +911,7 @@ async fn a_transition_that_captured_the_assigned_entry_keeps_the_reported_proven
     let entry = sessions.get_mut(rig.id()).expect("session entry");
     entry.runtime_watch_cancel.cancel();
     entry.snapshot.reference_provenance = NativeReferenceProvenance::Assigned;
+    entry.last_native_report = None;
     drop(sessions);
     // A concurrent live-state commit may make the transition retry.
     wait_until("the exit transition to commit", || async {
@@ -1073,5 +1079,368 @@ async fn worker_and_public_reports_are_ordered_within_their_own_clock() {
     let public = public_report(&rig, "public-five", |_| {}).await;
     assert!(rig.registry.report_native_id(public).await.recorded);
     held("public-five").await;
+    rig.finish(&rig.registry).await;
+}
+
+/// Lines of a recovery launch the fixture agent records: `--model fast`, the
+/// recovery flag and the reference.
+const LAUNCH_ARGV_LINES: usize = 4;
+
+/// One step of a generated history of a session whose reference core assigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The agent reports a new conversation through the worker.
+    Switch,
+    /// Like [`Step::Switch`], read after the active claim's lease expired.
+    SwitchAfterLease,
+    /// A new conversation reaches the daemon socket directly.
+    PublicReport,
+    /// A public report numbered like the last accepted one.
+    StalePublicReport,
+    /// A worker snapshot from before the latest report is applied again.
+    ReplayOlderSnapshot,
+    /// Every later resume-binding write is lost, as in a crash after the
+    /// record write.
+    LoseProjectionWrites,
+    /// The daemon restarts and adopts the live worker.
+    Restart,
+    /// The daemon is down while the agent switches, then restarts.
+    SwitchWhileDown,
+    /// The agent exits and is resumed from its latest reference.
+    ExitAndResume,
+    /// The latest conversation is forked.
+    Fork,
+}
+
+const STEPS: [Step; 10] = [
+    Step::Switch,
+    Step::SwitchAfterLease,
+    Step::PublicReport,
+    Step::StalePublicReport,
+    Step::ReplayOlderSnapshot,
+    Step::LoseProjectionWrites,
+    Step::Restart,
+    Step::SwitchWhileDown,
+    Step::ExitAndResume,
+    Step::Fork,
+];
+
+/// Deterministic generator of step histories: a 64-bit xorshift stream, so a
+/// failing case is reproduced by its seed alone.
+struct Generator(u64);
+
+impl Generator {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn history(&mut self, length: usize) -> Vec<Step> {
+        (0..length)
+            .map(|_| STEPS[usize::try_from(self.next() % 10).expect("index")])
+            .collect()
+    }
+}
+
+impl Rig {
+    /// Quiesces the registry standing for the dead daemon, optionally has the
+    /// agent switch to `reference` while no daemon runs, then starts a new
+    /// daemon over the same store and workers.
+    async fn restart_with(&mut self, while_down: Option<&str>) -> SessionRegistry {
+        let barrier = self.registry.inner.persist_lock.lock().await;
+        std::mem::forget(barrier);
+        // Every session of the dead daemon lets go of its worker, forks
+        // included, or a worker would keep serving its former controller.
+        let entries: Vec<_> = self
+            .registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .drain()
+            .map(|(_, entry)| entry)
+            .collect();
+        for entry in entries {
+            entry.cancel_runtime_watchers();
+        }
+        if let Some(reference) = while_down {
+            self.report(reference).await;
+        }
+        let restarted = Self::registry(&self.config, &self.launcher, &self.script, self.existence);
+        restarted
+            .reconcile_workers()
+            .await
+            .expect("startup reconciliation");
+        drop(std::mem::replace(&mut self.registry, restarted.clone()));
+        restarted
+    }
+
+    fn launches(&self) -> usize {
+        fs::read_to_string(&self.marker).map_or(0, |text| text.matches("launch\n").count())
+    }
+
+    /// The session's ordering key as the registry holds it.
+    async fn last_report(&self) -> Option<crate::store::NativeIdentityOrdering> {
+        self.registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .get(self.id())
+            .and_then(|entry| entry.last_native_report.clone())
+    }
+}
+
+/// The reference the session holds, in memory and in its durable record, and
+/// whether its runtime is in conflict.
+async fn held_reference(rig: &Rig) -> (Option<String>, Option<String>, bool) {
+    let info = rig.registry.inspect(rig.id()).await.expect("inspect");
+    let durable = rig
+        .durable_record()
+        .recovery
+        .and_then(|recovery| recovery.native_session_id);
+    let conflict = info
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.state == RuntimeState::Conflict);
+    (info.native_session_id, durable, conflict)
+}
+
+/// Replays `history` against a fresh session and checks, after every step,
+/// that the session holds the latest accepted conversation, that no write of
+/// its own left a record the next startup rejects, and that resume and fork
+/// launch the latest conversation.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match drives every step kind so the invariants read in one place"
+)]
+async fn run_history(seed: u64, history: &[Step]) {
+    let mut rig = Rig::new(
+        &format!("supersede-property-{seed}"),
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    let mut latest = rig.assigned.clone();
+    let mut older: Vec<pohunek_worker_protocol::InspectSnapshot> = Vec::new();
+    let mut fresh = 0_u32;
+    let mut name = |kind: &str| {
+        fresh += 1;
+        format!("{kind}-{seed}-{fresh}")
+    };
+    for (index, step) in history.iter().enumerate() {
+        let at = format!("seed {seed} step {index} {step:?} of {history:?}");
+        match step {
+            Step::Switch | Step::SwitchAfterLease => {
+                let next = name("worker");
+                rig.report(&next).await;
+                let mut snapshot = rig.snapshot(&rig.registry).await;
+                if *step == Step::SwitchAfterLease {
+                    snapshot.active_identity = None;
+                    snapshot.active_identity_release = None;
+                }
+                let outcome = rig.settle_with(&rig.registry, &snapshot).await;
+                assert_eq!(outcome, WorkerMetadataApplyOutcome::Applied, "{at}");
+                older.push(snapshot);
+                latest = next;
+            }
+            Step::PublicReport => {
+                let next = name("public");
+                let report = public_report(&rig, &next, |_| {}).await;
+                assert!(rig.registry.report_native_id(report).await.recorded, "{at}");
+                latest = next;
+            }
+            Step::StalePublicReport => {
+                if let Some(mark) = rig
+                    .last_report()
+                    .await
+                    .map(|key| key.sequence)
+                    .filter(|mark| *mark > 0)
+                {
+                    let report = public_report(&rig, &name("stale"), |report| {
+                        report.sequence = mark;
+                    })
+                    .await;
+                    assert!(
+                        !rig.registry.report_native_id(report).await.recorded,
+                        "{at}"
+                    );
+                }
+            }
+            Step::ReplayOlderSnapshot => {
+                // Snapshots of an earlier generation are discarded; a current
+                // one must never bring back what it said.
+                if let Some(snapshot) = older.first() {
+                    let _ = rig.settle_with(&rig.registry, snapshot).await;
+                }
+            }
+            Step::LoseProjectionWrites => {
+                rig.registry
+                    .inner
+                    .resume_writes_blocked
+                    .store(true, Ordering::Relaxed);
+            }
+            Step::Restart => {
+                rig.restart_with(None).await;
+                older.clear();
+            }
+            Step::SwitchWhileDown => {
+                let next = name("down");
+                rig.restart_with(Some(&next)).await;
+                older.clear();
+                latest = next;
+            }
+            Step::ExitAndResume => {
+                let before = rig.launches();
+                rig.exit(&rig.registry).await;
+                rig.registry.resume(rig.id()).await.expect("resume");
+                wait_until("the resumed launch", || async {
+                    (rig.launch_argv(before).len() >= LAUNCH_ARGV_LINES).then_some(())
+                })
+                .await;
+                assert_eq!(
+                    rig.launch_argv(before),
+                    ["--model", "fast", "--session", latest.as_str()],
+                    "resume uses the latest reference: {at}"
+                );
+                older.clear();
+            }
+            Step::Fork => {
+                let before = rig.launches();
+                let forked = rig
+                    .registry
+                    .fork(fork_params(rig.id()))
+                    .await
+                    .expect("fork");
+                wait_until("the forked launch", || async {
+                    (rig.launch_argv(before).len() >= LAUNCH_ARGV_LINES).then_some(())
+                })
+                .await;
+                assert_eq!(
+                    rig.launch_argv(before),
+                    ["--model", "fast", "--fork", latest.as_str()],
+                    "fork uses the latest reference: {at}"
+                );
+                let _ = rig.registry.stop(&forked.id).await;
+            }
+        }
+        let (memory, durable, conflict) = held_reference(&rig).await;
+        assert_eq!(memory.as_deref(), Some(latest.as_str()), "session: {at}");
+        assert_eq!(durable.as_deref(), Some(latest.as_str()), "record: {at}");
+        assert!(!conflict, "no live worker is quarantined: {at}");
+    }
+    // A last restart must adopt whatever the history left behind.
+    rig.restart_with(None).await;
+    let (memory, durable, conflict) = held_reference(&rig).await;
+    assert_eq!(memory.as_deref(), Some(latest.as_str()), "final: {seed}");
+    assert_eq!(durable.as_deref(), Some(latest.as_str()), "final: {seed}");
+    assert!(!conflict, "final restart: {seed} {history:?}");
+    rig.finish(&rig.registry).await;
+}
+
+/// Declares one test per fixed seed, so a failure names its seed and the
+/// histories run in parallel.
+macro_rules! generated_history {
+    ($($name:ident: $seed:expr,)+) => {$(
+        #[tokio::test]
+        async fn $name() {
+            let history = Generator($seed).history(8);
+            run_history($seed, &history).await;
+        }
+    )+};
+}
+
+generated_history! {
+    generated_history_one_keeps_the_latest_conversation: 0x9E37_79B9_7F4A_7C15,
+    generated_history_two_keeps_the_latest_conversation: 0xD1B5_4A32_D192_ED03,
+    generated_history_three_keeps_the_latest_conversation: 0x8CB9_2BA7_2F3D_8DD7,
+    generated_history_four_keeps_the_latest_conversation: 0xA076_1D64_78BD_642F,
+    generated_history_five_keeps_the_latest_conversation: 0xE703_7ED1_A0B4_28DB,
+    generated_history_six_keeps_the_latest_conversation: 0x1D8E_4E27_C47D_124F,
+    generated_history_seven_keeps_the_latest_conversation: 0x94D0_49BB_1331_11EB,
+    generated_history_eight_keeps_the_latest_conversation: 0xBF58_476D_1CE4_E5B9,
+}
+
+#[tokio::test]
+async fn generated_histories_over_many_seeds_keep_the_latest_conversation() {
+    // Seeds are derived from a fixed one, so a failure names its seed and steps.
+    let mut seeds = Generator(0x00C0_FFEE_D15E_A5E5);
+    for _ in 0..24 {
+        let seed = seeds.next();
+        let history = Generator(seed).history(10);
+        run_history(seed, &history).await;
+    }
+}
+
+#[tokio::test]
+async fn orderings_found_in_review_hold() {
+    use Step::{
+        ExitAndResume, Fork, LoseProjectionWrites, PublicReport, ReplayOlderSnapshot, Restart,
+        Switch, SwitchAfterLease, SwitchWhileDown,
+    };
+    let histories: [&[Step]; 6] = [
+        // A crash after the record write, then a resume, then another crash.
+        &[Switch, LoseProjectionWrites, Switch, ExitAndResume, Restart],
+        &[
+            LoseProjectionWrites,
+            PublicReport,
+            ExitAndResume,
+            Restart,
+            Fork,
+        ],
+        // A switch made while the daemon was down, past the lease.
+        &[
+            Switch,
+            SwitchWhileDown,
+            SwitchAfterLease,
+            Restart,
+            ExitAndResume,
+        ],
+        // A switch before the first report of a recovered generation.
+        &[ExitAndResume, SwitchWhileDown, Restart, Fork],
+        &[
+            Switch,
+            ExitAndResume,
+            SwitchAfterLease,
+            LoseProjectionWrites,
+            Restart,
+        ],
+        &[
+            Switch,
+            PublicReport,
+            ReplayOlderSnapshot,
+            Restart,
+            ReplayOlderSnapshot,
+        ],
+    ];
+    for (index, history) in histories.iter().enumerate() {
+        run_history(1000 + u64::try_from(index).expect("index"), history).await;
+    }
+}
+
+#[tokio::test]
+async fn a_recovery_from_the_stored_binding_keeps_the_ordering_key_of_the_record() {
+    let rig = Rig::new(
+        "supersede-stored-binding",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.report("conversation-kept").await;
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    assert!(rig.durable_record().native_identity_ordering.is_some());
+    rig.exit(&rig.registry).await;
+    let binding = durable_recovery(&rig.store_path, rig.id());
+    rig.registry
+        .resume_binding(binding)
+        .await
+        .expect("recover from the stored binding");
+    assert!(
+        rig.durable_record().native_identity_ordering.is_some(),
+        "the recovered record stays the keyed side of a later reconciliation"
+    );
     rig.finish(&rig.registry).await;
 }

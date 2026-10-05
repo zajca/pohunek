@@ -961,11 +961,17 @@ max_depth = 1                                    # directory levels below dir
   replaces the reference when it passes the usual process-identity, expiry and
   sequence checks (a refused report leaves the assigned reference in place). The
   worker's launch claim replaces it even when the value is equal, which only
-  confirms it, and the worker's active identity replaces it when it names the
-  runtime itself, is bound to the launch process (a nested process never
-  qualifies; below a wrapper process it is the provider process the worker
-  verified as the launch process), carries the declared reference kind and is
-  newer than the last worker claim accepted for the runtime generation. Sequences are compared only within one transport and one runtime generation
+  confirms it, and the worker's journaled native reference replaces it: the
+  worker keeps the latest reference reported by the verified launch process
+  (below a wrapper process, the provider process it verified) with its hook
+  sequence, independently of the active claim's lease and of a release, so a
+  switch made while the daemon was down is still read when it returns. The
+  reference must name the runtime itself, never a nested process, carry the
+  declared reference kind and be newer than the last worker report accepted for
+  the runtime generation. A worker that journals no such reference is read
+  through its launch and active claims instead, for as long as the active
+  claim's lease lasts. Every replacement carries an ordering key, and a
+  recovered session keeps the key of the reference it recovers. Sequences are compared only within one transport and one runtime generation
   (the shipped adapters stamp worker claims and public reports from different
   clocks), so a public report is never stale because of a worker claim or the
   other way round, and a recovered or restarted generation starts fresh: its

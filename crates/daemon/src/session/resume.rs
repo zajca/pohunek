@@ -205,6 +205,10 @@ impl SessionRegistry {
             return;
         };
         let _persist = self.inner.persist_lock.lock().await;
+        #[cfg(test)]
+        if self.inner.resume_writes_blocked.load(Ordering::Relaxed) {
+            return;
+        }
         let desired = {
             let sessions = self.inner.sessions.lock().await;
             sessions.get(id).and_then(|entry| {
@@ -330,6 +334,7 @@ impl SessionRegistry {
                             runtime.runtime_generation
                         }),
                     created_at: entry.info.created_at.clone(),
+                    previous_native_report: entry.last_native_report.clone().map(Box::new),
                     runtime_watch_cancel: entry.runtime_watch_cancel.clone(),
                 },
             )
@@ -788,6 +793,7 @@ impl SessionRegistry {
                         runtime.runtime_generation
                     }),
                 created_at: record.info.created_at,
+                previous_native_report: record.native_identity_ordering.map(Box::new),
                 runtime_watch_cancel: tokio_util::sync::CancellationToken::new(),
             },
             None => super::target::PtyRegistration::Create,
