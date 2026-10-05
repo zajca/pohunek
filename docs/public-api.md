@@ -1746,7 +1746,15 @@ selection. `all_profiles` covers the runtime's own home and the home of each of
 its resolvable host profiles (a profile that does not resolve is skipped and
 logged, as `host.inspect` does). Selectors that resolve to the same canonical
 directory share one home and one transaction; the report's `home`
-(`{profiles, bare}`) names every selector it stands for. Install under
+(`{profiles, bare, selector}`) names every selector it stands for and carries
+`selector` (`{kind: "default"}` or `{kind: "profile", name}`), the one the
+daemon verified reaches the directory the installer uses: an alias can resolve
+through a symlink the installer refuses, so recovery commands are built from
+`selector`, never from the order of `profiles` or from `bare`.
+`IntegrationStatusResult` and `IntegrationDoctorResult` carry
+`home_selectors: true`; a daemon that predates the selectors omits it (and an
+older `integration.install` silently ignores the selector fields), so a client
+checks the marker before it sends a mutation that carries a selector. Install under
 `all_profiles` skips homes whose directory does not exist and fails with
 `agent_config_dir_missing` only when none exists. Each home is its own
 transaction under its own installer lock, so a failing home rolls back to its

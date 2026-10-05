@@ -673,6 +673,7 @@ pub(super) fn doctor_in_with(
     Ok(IntegrationDoctorResult {
         ok: agents.iter().all(|agent| agent.ok),
         agents,
+        home_selectors: true,
     })
 }
 

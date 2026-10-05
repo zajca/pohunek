@@ -1930,6 +1930,7 @@ fn integration_doctor_params_and_result_roundtrip() {
     );
 
     let result = IntegrationDoctorResult {
+        home_selectors: false,
         ok: false,
         agents: vec![IntegrationAgentDoctor {
             home: None,

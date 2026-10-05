@@ -15,7 +15,8 @@ use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 use protocol::{
     IntegrationDoctorParams, IntegrationHome, IntegrationInstallResult, IntegrationInstallState,
-    IntegrationStatusParams, IntegrationUninstallState, ProtocolError, RuntimeRef,
+    IntegrationSelector, IntegrationStatusParams, IntegrationUninstallState, ProtocolError,
+    RuntimeRef,
 };
 
 use super::{ConfigHomes, HomeSelection};
@@ -206,6 +207,9 @@ fn a_profile_home_is_the_profile_variable_and_not_the_runtime_home() {
     assert_eq!(
         targets[0].label,
         Some(IntegrationHome {
+            selector: Some(IntegrationSelector::Profile {
+                name: "work".to_owned()
+            }),
             profiles: vec!["work".to_owned()],
             bare: false,
         })
@@ -230,6 +234,9 @@ fn two_profiles_install_and_remove_independently() {
     assert_eq!(
         installed.installed[0].home,
         Some(IntegrationHome {
+            selector: Some(IntegrationSelector::Profile {
+                name: "work".to_owned()
+            }),
             profiles: vec!["work".to_owned()],
             bare: false,
         })
@@ -294,11 +301,15 @@ fn doctor_diagnoses_the_selected_profile_home_and_addresses_recovery_to_it() {
     )
     .expect("doctor");
 
+    assert!(report.home_selectors);
     let diagnosis = &report.agents[0];
     assert!(!diagnosis.ok, "{diagnosis:?}");
     assert_eq!(
         diagnosis.home,
         Some(IntegrationHome {
+            selector: Some(IntegrationSelector::Profile {
+                name: "work".to_owned()
+            }),
             profiles: vec!["work".to_owned()],
             bare: false,
         })
@@ -591,6 +602,9 @@ fn profiles_resolving_to_one_canonical_home_share_one_transaction() {
     assert_eq!(
         result.installed[0].home,
         Some(IntegrationHome {
+            selector: Some(IntegrationSelector::Profile {
+                name: "b-real".to_owned()
+            }),
             profiles: vec!["a-link".to_owned(), "b-real".to_owned()],
             bare: false,
         })
@@ -658,6 +672,30 @@ fn recovery_commands_of_a_shared_home_name_the_selector_that_reaches_the_real_di
 }
 
 #[test]
+fn a_symlinked_runtime_home_hands_the_selector_to_the_profile_with_the_real_directory() {
+    let rig = Rig::new(&[], &[]);
+    let real = rig.dir("real-home");
+    symlink(&real, rig.root.join("home/.claude")).expect("link the default home to it");
+    fs::write(rig.root.join("agents/real.toml"), claude_profile(&real)).expect("write");
+
+    let result = install(&rig, Some(&claude()), &HomeSelection::All).expect("install");
+
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    let home = result.installed[0].home.clone().expect("labeled");
+    assert!(
+        home.bare,
+        "the default home resolves to the shared directory"
+    );
+    assert_eq!(
+        home.selector,
+        Some(IntegrationSelector::Profile {
+            name: "real".to_owned()
+        }),
+        "the default path is the refused symlink, so recovery must name the profile"
+    );
+}
+
+#[test]
 fn the_missing_directory_error_names_each_directory_and_runtime_once() {
     let rig = Rig::new(&[], &[]);
     for name in ["one", "two"] {
@@ -692,6 +730,7 @@ fn the_runtime_home_and_a_profile_naming_it_are_one_home() {
     assert_eq!(
         result.installed[0].home,
         Some(IntegrationHome {
+            selector: Some(IntegrationSelector::Default),
             profiles: vec!["same".to_owned()],
             bare: true,
         })
@@ -784,7 +823,7 @@ fn status_all_profiles_labels_every_home_and_degrades_an_unresolvable_one() {
     )
     .expect("write a profile");
 
-    let reports = status_in(
+    let result = status_in(
         &rig.homes,
         IntegrationStatusParams {
             agent: Some(claude()),
@@ -792,8 +831,12 @@ fn status_all_profiles_labels_every_home_and_degrades_an_unresolvable_one() {
             ..IntegrationStatusParams::default()
         },
     )
-    .expect("status")
-    .agents;
+    .expect("status");
+    assert!(
+        result.home_selectors,
+        "a client proves selector support from this marker"
+    );
+    let reports = result.agents;
 
     let labeled: Vec<(Vec<String>, bool, bool)> = reports
         .iter()

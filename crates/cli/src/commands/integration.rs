@@ -16,9 +16,9 @@ use clap::ValueEnum;
 use protocol::{
     method, ErrorClass, IntegrationDoctorParams, IntegrationDoctorResult,
     IntegrationFindingSeverity, IntegrationHome, IntegrationHomeFailure, IntegrationInstallParams,
-    IntegrationInstallResult, IntegrationInstallState, IntegrationStatusParams,
-    IntegrationStatusResult, IntegrationUninstallParams, IntegrationUninstallResult,
-    IntegrationUninstallState, ProtocolError, RuntimeId, RuntimeRef,
+    IntegrationInstallResult, IntegrationInstallState, IntegrationSelector,
+    IntegrationStatusParams, IntegrationStatusResult, IntegrationUninstallParams,
+    IntegrationUninstallResult, IntegrationUninstallState, ProtocolError, RuntimeId, RuntimeRef,
 };
 use serde::Serialize;
 
@@ -320,6 +320,59 @@ impl HomeSelectionArgs {
     }
 }
 
+/// `integration_home_selectors_unsupported`: the daemon predates `--profile` and
+/// `--all-profiles`, so it would act on the runtime's own home.
+fn selectors_unsupported() -> CliError {
+    CliError::Protocol(ProtocolError::new(
+        ErrorClass::Configuration,
+        "integration_home_selectors_unsupported",
+        "the daemon does not support `--profile` and `--all-profiles`; it would act on the default config home instead"
+            .to_owned(),
+        Some("update and restart the pohunek daemon to the release of this CLI".to_owned()),
+    ))
+}
+
+/// The unsupported-selector error for a daemon that rejected the selectors as
+/// unknown fields; any other error is unchanged.
+fn unsupported_if_rejected(error: CliError, home: &HomeSelectionArgs) -> CliError {
+    match error {
+        CliError::Protocol(inner) if home.is_selected() && inner.code == "bad_request" => {
+            selectors_unsupported()
+        }
+        other => other,
+    }
+}
+
+/// Proves, with a read-only request on `client`, that the daemon honors the
+/// home selectors before a mutation that carries them is sent.
+///
+/// A daemon that predates the selectors ignores them on install and returns no
+/// `home_selectors` marker (or rejects them as unknown fields), and a request
+/// it ignored the selectors of would change the wrong home. Nothing is sent
+/// when no selector is set.
+async fn require_selector_support(
+    client: &mut Client,
+    agent: Option<RuntimeRef>,
+    home: &HomeSelectionArgs,
+) -> Result<(), CliError> {
+    if !home.is_selected() {
+        return Ok(());
+    }
+    let probe = IntegrationStatusParams {
+        agent,
+        profile: home.profile.clone(),
+        all_profiles: home.all_profiles,
+    };
+    match client.call::<method::IntegrationStatus>(probe).await {
+        Ok(result) if result.home_selectors => Ok(()),
+        Ok(_) => Err(selectors_unsupported()),
+        Err(CliError::Protocol(error)) if error.code == "bad_request" => {
+            Err(selectors_unsupported())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// How a result names the config home it describes.
 fn home_label(home: &IntegrationHome) -> String {
     let mut parts = Vec::new();
@@ -357,6 +410,7 @@ pub(crate) async fn run_install(
     // this machine's agent config dirs. Always use the local transport regardless
     // of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    require_selector_support(&mut client, params.agent.clone(), home).await?;
     let result: IntegrationInstallResult =
         client.call::<method::IntegrationInstall>(params).await?;
 
@@ -386,7 +440,13 @@ pub(crate) async fn run_status(
         all_profiles: home.all_profiles,
     };
     let mut client = Client::connect(host, paths).await?;
-    let result: IntegrationStatusResult = client.call::<method::IntegrationStatus>(params).await?;
+    let result: IntegrationStatusResult = client
+        .call::<method::IntegrationStatus>(params)
+        .await
+        .map_err(|error| unsupported_if_rejected(error, home))?;
+    if home.is_selected() && !result.home_selectors {
+        return Err(selectors_unsupported());
+    }
 
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -418,6 +478,7 @@ pub(crate) async fn run_uninstall(
     // Removal edits this machine's agent config dirs, so it always uses the
     // local transport regardless of any `--host` flag.
     let mut client = Client::connect(LOCAL_HOST, paths).await?;
+    require_selector_support(&mut client, Some(params.agent.clone()), home).await?;
     let result: IntegrationUninstallResult =
         client.call::<method::IntegrationUninstall>(params).await?;
 
@@ -449,7 +510,13 @@ pub(crate) async fn run_doctor(
         all_profiles: home.all_profiles,
     };
     let mut client = Client::connect(host, paths).await?;
-    let result: IntegrationDoctorResult = client.call::<method::IntegrationDoctor>(params).await?;
+    let result: IntegrationDoctorResult = client
+        .call::<method::IntegrationDoctor>(params)
+        .await
+        .map_err(|error| unsupported_if_rejected(error, home))?;
+    if home.is_selected() && !result.home_selectors {
+        return Err(selectors_unsupported());
+    }
 
     if json {
         print!("{}", crate::commands::render_json(&result)?);
@@ -916,16 +983,13 @@ fn render_status_human(host: &str, result: &IntegrationStatusResult) -> String {
     output
 }
 
-/// The `--agent` value of a recovery command, followed by the `--profile` that
-/// reaches the home the report describes when that home is a profile's.
+/// The `--agent` value of a recovery command, followed by the `--profile` the
+/// daemon verified reaches the home the report describes.
 fn recovery_selector(report: &protocol::IntegrationAgentStatus) -> String {
     let agent = agent_label(&report.agent);
-    match report.home.as_ref() {
-        Some(home) if !home.bare => home.profiles.first().map_or_else(
-            || agent.to_owned(),
-            |profile| format!("{agent} --profile {profile}"),
-        ),
-        _ => agent.to_owned(),
+    match report.home.as_ref().and_then(|home| home.selector.as_ref()) {
+        Some(IntegrationSelector::Profile { name }) => format!("{agent} --profile {name}"),
+        Some(IntegrationSelector::Default) | None => agent.to_owned(),
     }
 }
 
@@ -1073,6 +1137,7 @@ mod status_tests {
     #[test]
     fn renders_status_table_with_paths_warnings_and_versions() {
         let result = IntegrationStatusResult {
+            home_selectors: false,
             agents: vec![
                 IntegrationAgentStatus {
                     home: None,
@@ -1139,6 +1204,7 @@ mod status_tests {
     #[test]
     fn configuration_recovery_never_recommends_reinstall() {
         let result = IntegrationStatusResult {
+            home_selectors: false,
             agents: vec![IntegrationAgentStatus {
                 home: None,
                 agent: RuntimeRef::codex(),
@@ -1164,7 +1230,7 @@ mod status_tests {
 
     #[test]
     fn remote_status_qualifies_install_commands_with_the_daemon_host() {
-        let result = IntegrationStatusResult {
+        let result = IntegrationStatusResult { home_selectors: false,
             agents: vec![IntegrationAgentStatus { home: None,
                 agent: RuntimeRef::codex(),
                 available: true,
@@ -1344,10 +1410,12 @@ mod tests {
     #[test]
     fn renders_the_home_of_each_report_and_the_failed_homes() {
         let work = IntegrationHome {
+            selector: None,
             profiles: vec!["work".to_owned()],
             bare: false,
         };
         let shared = IntegrationHome {
+            selector: None,
             profiles: vec!["alt".to_owned(), "work".to_owned()],
             bare: true,
         };
@@ -1854,6 +1922,7 @@ mod tests {
             warnings: vec![],
         };
         let result = IntegrationDoctorResult {
+            home_selectors: false,
             ok: false,
             agents: vec![IntegrationAgentDoctor {
                 home: None,

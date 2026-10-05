@@ -19,7 +19,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use pohunek_worker_protocol::BaseEnv;
-use protocol::{ErrorClass, IntegrationHome, ProtocolError, RuntimeRef};
+use protocol::{ErrorClass, IntegrationHome, IntegrationSelector, ProtocolError, RuntimeRef};
 
 use super::handler::{self, Resolved};
 use super::{config_dir_invalid, config_path_kind, ConfigPath};
@@ -127,6 +127,7 @@ impl ConfigHomes {
                 .into_iter()
                 .collect(),
             bare: profile.is_none(),
+            selector: None,
         });
         Target {
             resolved,
@@ -234,7 +235,19 @@ impl ConfigHomes {
                 targets
             }
         };
-        Ok(merge_shared(targets))
+        let mut merged = merge_shared(targets);
+        for target in &mut merged {
+            let selector = target
+                .scope
+                .as_ref()
+                .map_or(IntegrationSelector::Default, |name| {
+                    IntegrationSelector::Profile { name: name.clone() }
+                });
+            if let Some(label) = target.label.as_mut() {
+                label.selector = Some(selector);
+            }
+        }
+        Ok(merged)
     }
 }
 

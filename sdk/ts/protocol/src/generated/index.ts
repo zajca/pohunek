@@ -51,6 +51,7 @@ export type { IntegrationInstallReport } from "./IntegrationInstallReport";
 export type { IntegrationInstallResult } from "./IntegrationInstallResult";
 export type { IntegrationInstallState } from "./IntegrationInstallState";
 export type { IntegrationRecovery } from "./IntegrationRecovery";
+export type { IntegrationSelector } from "./IntegrationSelector";
 export type { IntegrationStatusParams } from "./IntegrationStatusParams";
 export type { IntegrationStatusResult } from "./IntegrationStatusResult";
 export type { IntegrationUninstallParams } from "./IntegrationUninstallParams";

@@ -306,6 +306,14 @@ name directories derived from the profile's environment. Without `--agent`,
 `--profile NAME` selects the profile's own runtime. A profile value that is not
 an absolute path (`~/x`) is refused, never expanded.
 
+Before an install or uninstall that carries a selector the CLI sends a
+read-only `integration.status` with the same selector and proceeds only when the
+daemon answers `home_selectors: true`. A daemon that predates the selectors would
+ignore them and change the default home, so the CLI refuses with
+`integration_home_selectors_unsupported` (update and restart the daemon) and
+sends nothing mutating; `status` and `doctor` apply the same check to their own
+reply. Recovery hints name the `--profile` the daemon verified for the home.
+
 The directory is resolved from the environment a launched agent sees, not from
 the daemon's own process environment: a `CLAUDE_CONFIG_DIR` or `CODEX_HOME` set
 only in the daemon's service environment does not steer `integration install`

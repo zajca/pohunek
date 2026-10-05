@@ -596,6 +596,7 @@ pub fn status_in(
     let targets = homes.targets(agent.as_ref(), &selection)?;
     Ok(IntegrationStatusResult {
         agents: targets.iter().map(inspect_target).collect(),
+        home_selectors: true,
     })
 }
 

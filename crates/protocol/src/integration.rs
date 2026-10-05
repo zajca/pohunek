@@ -91,6 +91,21 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// The launch selector a recovery command passes to reach a config home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(export, export_to = "IntegrationSelector.ts"))]
+pub enum IntegrationSelector {
+    /// The runtime launched without a profile (no `--profile`).
+    Default,
+    /// The named host profile (`--profile <name>`).
+    Profile {
+        /// Host profile name.
+        name: String,
+    },
+}
+
 /// The config home a profile-aware report describes: which launch
 /// selector(s) resolve to it.
 ///
@@ -108,6 +123,13 @@ pub struct IntegrationHome {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
     pub bare: bool,
+    /// The selector the daemon verified reaches the directory the installer
+    /// uses for this home. Aliases listed above can resolve through a symlink
+    /// the installer refuses, so a recovery command is built from this field
+    /// and never from the order of `profiles` or from `bare`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub selector: Option<IntegrationSelector>,
 }
 
 /// One config home whose transaction failed while the others ran.
@@ -175,6 +197,12 @@ pub struct IntegrationStatusParams {
 pub struct IntegrationStatusResult {
     /// One read-only report per requested (or supported) hook agent.
     pub agents: Vec<IntegrationAgentStatus>,
+    /// Whether the daemon honors the `profile` and `all_profiles` selectors.
+    /// A daemon that predates them ignores the selectors and omits this field,
+    /// so a client that must not act on the wrong home checks it first.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub home_selectors: bool,
 }
 
 /// Read-only installation state for one managed hook integration.
@@ -496,6 +524,11 @@ pub struct IntegrationDoctorResult {
     pub ok: bool,
     /// One diagnosis per requested (or supported) hook agent.
     pub agents: Vec<IntegrationAgentDoctor>,
+    /// Whether the daemon honors the `profile` and `all_profiles` selectors;
+    /// see `IntegrationStatusResult::home_selectors`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+    pub home_selectors: bool,
 }
 
 #[cfg(test)]
@@ -630,6 +663,50 @@ mod tests {
         }))
         .expect("a result without labels or failures parses");
         assert!(older.failed.is_empty() && older.installed[0].home.is_none());
+    }
+
+    #[test]
+    fn a_result_proves_selector_support_only_when_the_marker_is_present() {
+        let older: super::IntegrationStatusResult =
+            serde_json::from_value(serde_json::json!({ "agents": [] })).expect("older result");
+        assert!(!older.home_selectors, "an older daemon omits the marker");
+        let newer = super::IntegrationStatusResult {
+            agents: vec![],
+            home_selectors: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&newer).expect("serialize"),
+            serde_json::json!({ "agents": [], "home_selectors": true })
+        );
+        let doctor: super::IntegrationDoctorResult =
+            serde_json::from_value(serde_json::json!({ "ok": true, "agents": [] }))
+                .expect("older doctor result");
+        assert!(!doctor.home_selectors);
+    }
+
+    #[test]
+    fn the_recovery_selector_round_trips_with_a_stable_shape() {
+        let home = super::IntegrationHome {
+            profiles: vec!["b-real".to_owned()],
+            bare: false,
+            selector: Some(super::IntegrationSelector::Profile {
+                name: "b-real".to_owned(),
+            }),
+        };
+        let wire = serde_json::to_value(&home).expect("serialize");
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "profiles": ["b-real"],
+                "selector": { "kind": "profile", "name": "b-real" }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<super::IntegrationHome>(wire).expect("parse"),
+            home
+        );
+        let default = serde_json::to_value(super::IntegrationSelector::Default).expect("ser");
+        assert_eq!(default, serde_json::json!({ "kind": "default" }));
     }
 
     #[test]
