@@ -227,8 +227,13 @@ core keeps the schemas as a closed compiled set. The daemon passes the schema
 id to the worker at initialization, the worker journals it, and both the
 worker (when a hook reports) and the daemon (when it imports worker state)
 check the provider, the action, the native-reference kind, the nested-agent
-rule, and the subagent fields against it, on top of the process, ancestry,
-sequence, and expiry checks every schema shares. Codex, Claude, and the shell
+rule, the ancestry matcher and the subagent fields against it. The worker also
+applies the schema's subagent sequence rule (a stop must be ordered after its
+start; a schema without one admits no subagent record), and the daemon refuses
+imported subagents whose fields or outcome the schema does not admit. Peer
+binding and expiry checks are shared by every schema. The schema the worker
+journaled outranks the one the pinned runtime resolves to, and reports of a
+newer asset set are refused by a session on an older schema. Codex, Claude, and the shell
 use the schema with subagents, Hermes the identity-only schema, and a runtime
 without an integration, such as Pi, has none and accepts no hook report. The
 daemon applies the same admission on the public socket, which the managed

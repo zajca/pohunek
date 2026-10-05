@@ -219,7 +219,7 @@ const CODEX_REPORTED_ACTIONS: &[HookAction] = &[
 /// Env var overriding Claude's config dir (else `~/.claude`).
 const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 /// Env var overriding Codex's config dir (else `~/.codex`).
-const CODEX_HOME_ENV: &str = "CODEX_HOME";
+pub(crate) const CODEX_HOME_ENV: &str = "CODEX_HOME";
 
 /// Files the installer wrote for one agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1696,7 +1696,19 @@ fn stage_claude(claude_dir: &Path) -> Result<StagedClaude, ProtocolError> {
             STATE_HOOK_INSTALL_NAME,
             "Claude state hook",
         ),
-        actions: CLAUDE_REPORTED_ACTIONS,
+        actions: registered_actions(
+            &settings,
+            &[
+                ManagedScript {
+                    path: &hook_path,
+                    asset: CLAUDE_HOOK_ASSET,
+                },
+                ManagedScript {
+                    path: &notify_hook_path,
+                    asset: CLAUDE_NOTIFY_HOOK_ASSET,
+                },
+            ],
+        )?,
     };
 
     Ok(StagedClaude {
@@ -2011,7 +2023,19 @@ fn stage_codex(codex_dir: &Path) -> Result<StagedCodex, ProtocolError> {
             STATE_HOOK_INSTALL_NAME,
             "Codex state hook",
         ),
-        actions: CODEX_REPORTED_ACTIONS,
+        actions: registered_actions(
+            &hooks_file,
+            &[
+                ManagedScript {
+                    path: &hook_path,
+                    asset: CODEX_HOOK_ASSET,
+                },
+                ManagedScript {
+                    path: &notify_hook_path,
+                    asset: CODEX_NOTIFY_HOOK_ASSET,
+                },
+            ],
+        )?,
     };
 
     Ok(StagedCodex {
@@ -2353,6 +2377,138 @@ fn hook_command_with_args(hook_path: &Path, args: &[&str]) -> String {
         command.push_str(arg);
     }
     command
+}
+
+/// The hook operation a managed script reports for its action argument
+/// `argument`.
+fn script_action(argument: &str) -> Option<HookAction> {
+    match argument {
+        HOOK_ACTION => Some(HookAction::IdentityReport),
+        HOOK_RELEASE_ACTION => Some(HookAction::IdentityRelease),
+        SUBAGENT_START_ACTION => Some(HookAction::SubagentStart),
+        SUBAGENT_STOP_ACTION => Some(HookAction::SubagentStop),
+        PERMISSION_REQUEST_ACTION | NOTIFICATION_ACTION | STOP_ACTION | STOP_FAILURE_ACTION => {
+            Some(HookAction::Notification)
+        }
+        _ => None,
+    }
+}
+
+/// The action arguments a managed script accepts: the patterns of the first
+/// `case "$action" in` block other than the catch-all.
+///
+/// Returns `None` when the script has no such block or the block lists no
+/// argument, so a layout the parser does not know never reads as an empty
+/// table.
+fn script_accepted_arguments(script: &str) -> Option<Vec<&str>> {
+    let mut lines = script.lines();
+    lines.find(|line| line.trim() == r#"case "$action" in"#)?;
+    let mut arguments = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line == "esac" {
+            break;
+        }
+        let Some((patterns, _body)) = line.split_once(')') else {
+            continue;
+        };
+        arguments.extend(
+            patterns
+                .split('|')
+                .map(str::trim)
+                .filter(|pattern| *pattern != "*"),
+        );
+    }
+    (!arguments.is_empty()).then_some(arguments)
+}
+
+/// A managed script together with the path it is installed at.
+struct ManagedScript<'a> {
+    /// Installed path the registered command runs.
+    path: &'a Path,
+    /// The embedded script that is written to `path`.
+    asset: &'a str,
+}
+
+/// The hook operations a registration document makes the managed scripts
+/// report: every command hook that runs a managed script and passes an
+/// argument that script accepts, mapped through [`script_action`].
+///
+/// A hook of the user that runs a managed script counts like a hook the
+/// installer wrote, because the script reports for either. An argument the
+/// script ignores reports nothing.
+///
+/// # Errors
+///
+/// Fails closed when an embedded script's argument table cannot be read or
+/// accepts an argument that maps to no operation.
+fn registered_actions(
+    registration: &Value,
+    scripts: &[ManagedScript<'_>],
+) -> Result<Vec<HookAction>, ProtocolError> {
+    let mut tables = Vec::with_capacity(scripts.len());
+    for script in scripts {
+        let accepted = script_accepted_arguments(script.asset)
+            .ok_or_else(|| unreadable_action_table(script.path))?;
+        let prefix = hook_command_with_args(script.path, &[]) + " ";
+        tables.push((prefix, accepted));
+    }
+    let commands = registration
+        .get("hooks")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(Map::values)
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|handler| handler.get("type").and_then(Value::as_str) == Some("command"))
+        .filter_map(|handler| handler.get("command").and_then(Value::as_str));
+    let mut actions = Vec::new();
+    for command in commands {
+        for (prefix, accepted) in &tables {
+            let Some(argument) = command
+                .strip_prefix(prefix.as_str())
+                .and_then(|rest| rest.split_whitespace().next())
+                .filter(|argument| accepted.contains(argument))
+            else {
+                continue;
+            };
+            let action = script_action(argument)
+                .ok_or_else(|| unmapped_script_argument(prefix, argument))?;
+            if !actions.contains(&action) {
+                actions.push(action);
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// The error of an embedded script whose argument table cannot be read.
+fn unreadable_action_table(path: &Path) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "integration_asset_unreadable",
+        format!(
+            "the managed script {} has no readable action table",
+            path.display()
+        ),
+        None,
+    )
+}
+
+/// The error of an embedded script that accepts an argument no hook
+/// operation is defined for.
+fn unmapped_script_argument(prefix: &str, argument: &str) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "integration_asset_unreadable",
+        format!(
+            "the managed script `{}` accepts the action {argument}, which maps to no hook operation",
+            prefix.trim_end()
+        ),
+        None,
+    )
 }
 
 fn claude_notify_hook_commands(notify_hook_path: &Path) -> Vec<String> {

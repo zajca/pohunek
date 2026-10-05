@@ -632,6 +632,142 @@ async fn the_verdict_is_recomputed_from_the_registry_and_the_sessions_after_a_re
     assert_selectable_then_select(&restarted, &new, &v.old).await;
 }
 
+/// Runs the Codex integration update of the fixture package's runtime in `dir`
+/// through the registry, as the daemon does: under the lifecycle guard and with
+/// the schemas of the package versions sessions still reference.
+///
+/// Returns the retained schema ids of the Codex handler and the number of
+/// activated asset sets.
+async fn activate_integration(
+    fixture: &Fixture,
+    dir: &std::path::Path,
+) -> Result<(Vec<&'static str>, usize), protocol::ProtocolError> {
+    use pohunek_test_support::process_env::ProcessEnv;
+
+    let host = fixture.host.clone();
+    let runtime = protocol::RuntimeRef::from_wire(RUNTIME);
+    let dir = dir.to_path_buf();
+    fixture
+        .registry
+        .integration_install(move |retained| {
+            let mut env = ProcessEnv::lock();
+            env.set(crate::integration::CODEX_HOME_ENV, &dir);
+            assert_eq!(
+                crate::integration::codex_config_dir().expect("config dir"),
+                dir,
+                "the activation targets the fixture directory"
+            );
+            let schemas: Vec<&'static str> = retained
+                .for_handler(SUBAGENT.0)
+                .map(|schema| schema.id)
+                .collect();
+            let installed =
+                crate::integration::install_for_retained(&host, Some(&runtime), retained)?;
+            Ok((schemas, installed.installed.len()))
+        })
+        .await
+}
+
+#[tokio::test]
+async fn a_restart_with_a_live_old_version_worker_keeps_the_newer_incompatible_version_held_back() {
+    let v = versions("selection-live-restart", Some(SUBAGENT)).await;
+    let created = v
+        .fixture
+        .registry
+        .create(new_params(&v.dir))
+        .await
+        .expect("create");
+    let new = update("2.0.0", Some(IDENTITY));
+    install(&v.fixture, &new, true).await;
+    assert_held_back(&v.fixture, &new, &v.old).await;
+
+    let restarted = v.fixture.reopen_with_workers().await;
+    restarted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+    let adopted = restarted
+        .registry
+        .inspect(&created.id)
+        .await
+        .expect("the live session survives the restart");
+    assert_eq!(
+        adopted.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live),
+        "the worker of the old version is adopted, not lost"
+    );
+    assert_held_back(&restarted, &new, &v.old).await;
+
+    end(&restarted, &created.id).await;
+    assert_selectable_then_select(&restarted, &new, &v.old).await;
+}
+
+#[tokio::test]
+async fn a_restart_after_an_integration_activation_still_sees_the_schema_of_the_live_worker() {
+    let v = versions("selection-activation-restart", Some(SUBAGENT)).await;
+    let created = v
+        .fixture
+        .registry
+        .create(new_params(&v.dir))
+        .await
+        .expect("create");
+    let codex = crate::test_support::scoped_dir("ph-selection-codex-");
+    let asset_set = |dir: &std::path::Path| {
+        ["hooks.json", "config.toml", "pohunek-agent-state.sh"].map(|name| {
+            fs::read(dir.join(name)).unwrap_or_else(|error| panic!("read {name}: {error}"))
+        })
+    };
+
+    let (schemas, installed) = activate_integration(&v.fixture, &codex)
+        .await
+        .expect("activation");
+    assert_eq!(schemas, [SUBAGENT.1], "the live session retains its schema");
+    assert_eq!(installed, 1);
+    let activated = asset_set(&codex);
+    let new = update("2.0.0", Some(IDENTITY));
+    install(&v.fixture, &new, true).await;
+    assert_held_back(&v.fixture, &new, &v.old).await;
+
+    let restarted = v.fixture.reopen_with_workers().await;
+    restarted
+        .registry
+        .reconcile_workers()
+        .await
+        .expect("startup reconciliation");
+    let adopted = restarted
+        .registry
+        .inspect(&created.id)
+        .await
+        .expect("the live session survives the restart");
+    assert_eq!(
+        adopted.runtime.as_ref().map(|runtime| runtime.state),
+        Some(protocol::RuntimeState::Live)
+    );
+
+    let (schemas, installed) = activate_integration(&restarted, &codex)
+        .await
+        .expect("activation after restart");
+    assert_eq!(
+        schemas,
+        [SUBAGENT.1],
+        "the restarted daemon recomputes the retained schema from the adopted worker"
+    );
+    assert_eq!(installed, 1);
+    assert_eq!(asset_set(&codex), activated, "the activation is idempotent");
+    assert_held_back(&restarted, &new, &v.old).await;
+
+    end(&restarted, &created.id).await;
+    let (schemas, _) = activate_integration(&restarted, &codex)
+        .await
+        .expect("activation without sessions");
+    assert!(
+        schemas.is_empty(),
+        "nothing retains the schema once the session is gone"
+    );
+    assert_selectable_then_select(&restarted, &new, &v.old).await;
+}
+
 #[tokio::test]
 async fn a_launch_resolved_before_a_select_is_refused_instead_of_pinning_the_previous_version() {
     let v = versions("selection-stale", Some(SUBAGENT)).await;

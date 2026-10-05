@@ -169,14 +169,53 @@ impl Fixture {
     /// A second daemon over the plugin root, agents directory and session
     /// store of this fixture, as after a restart.
     pub(super) fn reopen(&self) -> Self {
-        Self::at(self.dir.clone(), None, self.store_path.clone())
+        Self::at(self.dir.clone(), None, self.store_path.clone(), None)
+    }
+
+    /// Like [`Self::reopen`], over the worker runtime and state roots of this
+    /// fixture, so the second daemon finds the workers the first one started
+    /// and can adopt them once this daemon has handed them over.
+    ///
+    /// Every worker of this daemon releases its controller lease first, as a
+    /// daemon does before another instance takes its workers.
+    pub(super) async fn reopen_with_workers(&self) -> Self {
+        let workers: Vec<_> = self
+            .registry
+            .inner
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter_map(|entry| match &entry.runtime {
+                crate::session::RuntimeHandle::Worker(worker) => Some(worker.clone()),
+                crate::session::RuntimeHandle::Unavailable(_) => None,
+            })
+            .collect();
+        for worker in workers {
+            worker
+                .release_controller()
+                .await
+                .expect("hand the worker over");
+        }
+        let config = &self.registry.inner.config;
+        let roots = config
+            .worker_runtime_root
+            .clone()
+            .zip(config.worker_state_root.clone());
+        Self::at(self.dir.clone(), None, self.store_path.clone(), roots)
     }
 
     fn build(tag: &str, anchor: Option<HostTrustAnchor>, store_path: Option<PathBuf>) -> Self {
-        Self::at(temp_dir(tag), anchor, store_path)
+        Self::at(temp_dir(tag), anchor, store_path, None)
     }
 
-    fn at(dir: PathBuf, anchor: Option<HostTrustAnchor>, store_path: Option<PathBuf>) -> Self {
+    fn at(
+        dir: PathBuf,
+        anchor: Option<HostTrustAnchor>,
+        store_path: Option<PathBuf>,
+        worker_roots: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
+        let (worker_runtime_root, worker_state_root) = worker_roots.unzip();
         let plugins = dir.join("plugins");
         let agents = dir.join("agents");
         let state = dir.join("state");
@@ -198,6 +237,8 @@ impl Fixture {
                 catalog_trust_anchor: anchor,
                 agents_dir: Some(agents.clone()),
                 host_state_dir: Some(state),
+                worker_runtime_root,
+                worker_state_root,
                 ..SessionRegistryConfig::default()
             },
             host.clone(),

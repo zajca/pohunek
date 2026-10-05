@@ -5,9 +5,10 @@
 //! accepts when it re-imports that state. A runtime descriptor names a schema
 //! by id and never carries its contents; the registry below is the closed set
 //! of ids. The schema only selects which core validators apply and with which
-//! finite enumeration: process ancestry, sequence ordering, expiry, and
-//! self-target checks stay in the worker and the daemon and are never relaxed
-//! by a schema.
+//! finite enumeration: the ancestry matcher, the subagent sequence rule, and
+//! the optional subagent fields are declared by the schema and applied by the
+//! worker and the daemon through the types below. Expiry and self-target
+//! checks stay in the worker and the daemon and are never relaxed by a schema.
 
 // Rust guideline compliant 2026-10-05
 
@@ -81,8 +82,66 @@ impl ReferenceKind {
 /// How a reporting process must relate to the managed PTY tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AncestryMatcher {
-    /// The reported process is a descendant of the PTY's root process.
+    /// The reported process is the PTY's root process or one of its
+    /// descendants.
     ManagedPtyDescendant,
+}
+
+/// Where a reported process sits relative to the managed PTY tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyRelation {
+    /// The process is the PTY's root process or one of its descendants.
+    InTree,
+    /// The process is not part of the PTY's tree.
+    Outside,
+}
+
+impl PtyRelation {
+    /// The relation of a process that is, or is not, in the PTY's tree.
+    #[must_use]
+    pub const fn from_in_tree(in_tree: bool) -> Self {
+        if in_tree {
+            Self::InTree
+        } else {
+            Self::Outside
+        }
+    }
+}
+
+impl AncestryMatcher {
+    /// The matcher every claim is held to when no schema names one, such as a
+    /// launch identity reported by a session without a hook schema.
+    pub const CORE: Self = Self::ManagedPtyDescendant;
+
+    /// Whether a process in `relation` to the PTY satisfies the matcher.
+    #[must_use]
+    pub const fn admits(self, relation: PtyRelation) -> bool {
+        match self {
+            Self::ManagedPtyDescendant => matches!(relation, PtyRelation::InTree),
+        }
+    }
+}
+
+/// Ordering a schema requires between the claims of one subagent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentSequence {
+    /// A start is admitted once per subagent. A stop is admitted when no start
+    /// was recorded or when its sequence is greater than the recorded one.
+    StopAfterStart,
+}
+
+impl SubagentSequence {
+    /// Whether a stop claim carrying `reported` is ordered after the claim
+    /// recorded for the same subagent, if any.
+    #[must_use]
+    pub const fn admits_stop(self, recorded: Option<u64>, reported: u64) -> bool {
+        match self {
+            Self::StopAfterStart => match recorded {
+                Some(recorded) => reported > recorded,
+                None => true,
+            },
+        }
+    }
 }
 
 /// Optional field of a subagent claim that a schema may admit.
@@ -163,6 +222,9 @@ pub struct HookSchema {
     pub nested_active: bool,
     /// Optional subagent claim fields the schema admits.
     pub subagent_fields: &'static [SubagentField],
+    /// Ordering rule of subagent claims. A schema that admits subagent
+    /// operations declares one; a schema without one admits no subagent record.
+    pub subagent_sequence: Option<SubagentSequence>,
 }
 
 impl HookSchema {
@@ -194,6 +256,13 @@ impl HookSchema {
     #[must_use]
     pub fn admits_reference_kind(&self, kind: &str) -> bool {
         ReferenceKind::parse(kind).is_some_and(|kind| self.reference_kinds.contains(&kind))
+    }
+
+    /// Whether the schema admits subagent records at all: it admits a subagent
+    /// provider and declares how their claims are ordered.
+    #[must_use]
+    pub fn admits_subagents(&self) -> bool {
+        self.subagent_sequence.is_some() && !self.subagent_providers.is_empty()
     }
 
     /// Whether the schema admits the optional subagent `field`.
@@ -247,6 +316,7 @@ const IDENTITY_V1: HookSchema = HookSchema {
     ancestry: AncestryMatcher::ManagedPtyDescendant,
     nested_active: true,
     subagent_fields: &[],
+    subagent_sequence: None,
 };
 
 /// Identity, release, notification, and subagent lifecycle reports.
@@ -264,6 +334,7 @@ const IDENTITY_SUBAGENT_V1: HookSchema = HookSchema {
         SubagentField::AgentType,
         SubagentField::Outcome,
     ],
+    subagent_sequence: Some(SubagentSequence::StopAfterStart),
 };
 
 /// The closed set of hook schemas, in a stable order.
@@ -308,7 +379,8 @@ pub fn is_known_hook_handler(handler: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        hook_schema, hook_schemas, is_known_hook_handler, HookAction, ReferenceKind, SubagentField,
+        hook_schema, hook_schemas, is_known_hook_handler, AncestryMatcher, HookAction, PtyRelation,
+        ReferenceKind, SubagentField, SubagentSequence,
     };
 
     #[test]
@@ -420,5 +492,75 @@ mod tests {
         assert!(schema.admits_identity_provider("codex", Some("codex")));
         assert!(!schema.admits_identity_provider("claude", Some("codex")));
         assert!(!schema.admits_identity_provider("codex", None));
+    }
+
+    #[test]
+    fn a_schema_admits_subagent_operations_only_with_a_declared_sequence_rule() {
+        for schema in hook_schemas() {
+            let operations =
+                schema.allows(HookAction::SubagentStart) || schema.allows(HookAction::SubagentStop);
+            assert_eq!(
+                schema.allows(HookAction::SubagentStart),
+                schema.allows(HookAction::SubagentStop),
+                "{} admits both subagent operations or neither",
+                schema.id
+            );
+            assert_eq!(
+                operations,
+                schema.subagent_sequence.is_some(),
+                "{}",
+                schema.id
+            );
+            assert_eq!(operations, schema.admits_subagents(), "{}", schema.id);
+            assert_eq!(
+                operations,
+                !schema.subagent_providers.is_empty(),
+                "{}",
+                schema.id
+            );
+            assert_eq!(
+                operations,
+                !schema.subagent_fields.is_empty(),
+                "{}",
+                schema.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_sequence_rule_or_provider_set_admits_no_subagents() {
+        let mut schema = super::HookSchema {
+            ..*hook_schema("identity-subagent-v1").expect("registered")
+        };
+        assert!(schema.admits_subagents());
+        schema.subagent_sequence = None;
+        assert!(!schema.admits_subagents());
+        schema.subagent_sequence = Some(SubagentSequence::StopAfterStart);
+        schema.subagent_providers = &[];
+        assert!(!schema.admits_subagents());
+    }
+
+    #[test]
+    fn a_stop_must_be_ordered_after_its_recorded_claim() {
+        let rule = SubagentSequence::StopAfterStart;
+        assert!(rule.admits_stop(None, 0));
+        assert!(rule.admits_stop(Some(5), 6));
+        assert!(!rule.admits_stop(Some(5), 5));
+        assert!(!rule.admits_stop(Some(5), 4));
+        assert!(rule.admits_stop(Some(0), 1));
+        assert!(!rule.admits_stop(Some(u64::MAX), u64::MAX));
+    }
+
+    #[test]
+    fn the_ancestry_matcher_admits_the_pty_tree_only() {
+        for matcher in [AncestryMatcher::ManagedPtyDescendant, AncestryMatcher::CORE] {
+            assert!(matcher.admits(PtyRelation::InTree));
+            assert!(!matcher.admits(PtyRelation::Outside));
+        }
+        assert_eq!(PtyRelation::from_in_tree(true), PtyRelation::InTree);
+        assert_eq!(PtyRelation::from_in_tree(false), PtyRelation::Outside);
+        for schema in hook_schemas() {
+            assert_eq!(schema.ancestry, AncestryMatcher::ManagedPtyDescendant);
+        }
     }
 }

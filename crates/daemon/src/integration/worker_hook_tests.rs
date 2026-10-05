@@ -108,7 +108,12 @@ impl DaemonStub {
     }
 }
 
-fn initialize(root: &Path, script: &str, public_protocol_version: u32) -> Initialize {
+fn initialize(
+    root: &Path,
+    script: &str,
+    public_protocol_version: u32,
+    hook_schema: &str,
+) -> Initialize {
     Initialize {
         session_id: SessionId::new(SESSION_ID).expect("session id"),
         transaction_id: TransactionId::new("transaction-notify").expect("transaction id"),
@@ -134,7 +139,7 @@ fn initialize(root: &Path, script: &str, public_protocol_version: u32) -> Initia
         stop_policy: StopPolicy::new(500).expect("stop policy"),
         hook_protocol_version: CURRENT_VERSION,
         public_protocol_version,
-        hook_schema: Some("identity-subagent-v1".to_owned()),
+        hook_schema: Some(hook_schema.to_owned()),
     }
 }
 
@@ -145,11 +150,28 @@ fn notify_asset(agent: &str) -> PathBuf {
         .join("pohunek-agent-notify.sh")
 }
 
+/// Hook schema the notification tests launch their worker with.
+const NOTIFY_SCHEMA: &str = "identity-subagent-v1";
+
 /// Starts a real worker whose PTY child runs `script`, wired to the stub daemon.
 async fn start_worker(
     root: &Path,
     script: &str,
     public_protocol_version: u32,
+) -> (
+    Worker,
+    tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
+    PathBuf,
+) {
+    start_worker_with_schema(root, script, public_protocol_version, NOTIFY_SCHEMA).await
+}
+
+/// Starts a real worker initialized with the hook schema `hook_schema`.
+async fn start_worker_with_schema(
+    root: &Path,
+    script: &str,
+    public_protocol_version: u32,
+    hook_schema: &str,
 ) -> (
     Worker,
     tokio::task::JoinHandle<Result<(), pohunek_session_worker::WorkerError>>,
@@ -172,7 +194,12 @@ async fn start_worker(
         .await
         .expect("control handshake");
     worker
-        .initialize(initialize(root, script, public_protocol_version))
+        .initialize(initialize(
+            root,
+            script,
+            public_protocol_version,
+            hook_schema,
+        ))
         .await
         .expect("initialize runtime");
     (worker, task, socket_path)
@@ -397,5 +424,81 @@ async fn prebump_notify_hooks_fall_back_to_the_daemon_in_their_launch_version() 
             "{agent}: {}",
             replies[0]
         );
+    }
+}
+
+fn state_asset(agent: &str) -> PathBuf {
+    pohunek_test_support::manifest_dir()
+        .join("src/integration/assets/")
+        .join(agent)
+        .join("pohunek-agent-state.sh")
+}
+
+/// Runs the real Claude state asset inside a real worker initialized with
+/// `hook_schema`: a subagent start, then an identity report.
+///
+/// The identity report is admitted by every schema, and the PTY child runs
+/// the hooks one after the other, so once the worker shows the identity the
+/// subagent start has been decided too. Returns the worker's snapshot at that
+/// point.
+async fn report_through_worker(hook_schema: &str) -> pohunek_worker_protocol::InspectSnapshot {
+    let root = crate::test_support::scoped_dir("ph-state-worker-");
+    let asset = state_asset("claude");
+    let script = format!(
+        concat!(
+            "printf '{{\"agent_id\":\"sub-1\",\"agent_type\":\"Explore\"}}' | /bin/sh {asset} subagent-start; ",
+            "printf '{{\"session_id\":\"native-1\"}}' | /bin/sh {asset} session; ",
+            "sleep 30"
+        ),
+        asset = asset.display()
+    );
+    let (worker, task, _socket) = start_worker_with_schema(
+        &root,
+        &script,
+        protocol::PROTOCOL_VERSION.get(),
+        hook_schema,
+    )
+    .await;
+    let snapshot = Box::pin(pohunek_test_support::wait::wait_until(
+        "the worker records the identity report",
+        || async {
+            let snapshot = worker.inspect().await.expect("inspect");
+            snapshot.active_identity.is_some().then_some(snapshot)
+        },
+    ))
+    .await;
+    worker
+        .stop(TransactionId::new("transaction-state-stop").expect("transaction id"))
+        .await
+        .expect("stop the retained PTY");
+    drop(worker);
+    task.abort();
+    snapshot
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_report_of_a_newer_asset_set_is_refused_by_a_session_on_an_older_schema() {
+    let older = report_through_worker("identity-v1").await;
+    assert!(
+        older.subagents.is_empty(),
+        "the older schema admits no subagent report: {:?}",
+        older.subagents
+    );
+    assert_eq!(older.hook_schema.as_deref(), Some("identity-v1"));
+
+    let current = report_through_worker("identity-subagent-v1").await;
+    let [subagent] = current.subagents.as_slice() else {
+        panic!("the same hooks reach a session on the newer schema: {current:?}");
+    };
+    assert_eq!(subagent.id, "sub-1");
+    assert_eq!(subagent.provider, "claude");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn identity_reports_of_an_older_asset_set_stay_admitted_after_a_schema_update() {
+    for schema in ["identity-v1", "identity-subagent-v1"] {
+        let snapshot = report_through_worker(schema).await;
+        let identity = snapshot.active_identity.expect("the identity report");
+        assert_eq!(identity.provider, "claude", "{schema}");
     }
 }

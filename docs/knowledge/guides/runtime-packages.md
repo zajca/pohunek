@@ -59,8 +59,9 @@ and modes it may write, conflict detection, rollback, and the commands it may
 run; a package cannot ship shell installers, JSON patch programs, or filesystem
 targets. Re-installing is an update transaction: the handler stages the new
 assets against the active ones without changing them, checks that the hook
-schema admits everything the new set reports
-(`integration_update_incompatible` otherwise), activates atomically, and
+schema admits everything the new set reports, derived from the staged
+registration and the embedded scripts' action tables rather than from a
+declaration (`integration_update_incompatible` otherwise), activates atomically, and
 restores the exact prior tree if any step fails, so the old set stays active
 until activation succeeds. The check covers the hook schema of every package
 version that a live, lost or resumable session or a host profile pin still

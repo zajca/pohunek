@@ -47,8 +47,9 @@ pub struct AssetManifest {
     /// and carries a valid marker. An active set of any version is replaceable,
     /// so rolling a release back reinstalls its older set.
     pub active_version: Option<u32>,
-    /// Hook operations the new asset set reports to the daemon.
-    pub actions: &'static [HookAction],
+    /// Hook operations the new asset set reports to the daemon, derived from
+    /// the registration the staged set would activate.
+    pub actions: Vec<HookAction>,
 }
 
 /// A computed, verified-or-not asset set that is not active yet.
@@ -120,7 +121,8 @@ pub trait DaemonHandler: Send + Sync + Debug {
     /// runtime definition names.
     ///
     /// The schema must be driven by this handler and admit every operation the
-    /// new set reports.
+    /// staged registration makes the scripts report, as derived from the staged
+    /// content and not from the handler's declaration.
     ///
     /// # Errors
     ///
