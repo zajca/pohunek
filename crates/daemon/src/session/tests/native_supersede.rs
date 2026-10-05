@@ -11,6 +11,59 @@ use crate::agent::NativeReferenceProvenance;
 /// agent sees it.
 const ASSIGNED_FLAG: &str = "--session-id";
 
+/// How long a test waits for the worker to journal a reference its agent
+/// reported. Process verification answers within milliseconds when it can
+/// succeed, so a longer wait only delays the diagnostic.
+const JOURNAL_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The pending launch claims journaled for `session`: whether each may still be
+/// retried, which process it names and when it expires.
+fn pending_claims(config: &SessionRegistryConfig, session: &str) -> String {
+    let Some(root) = config.worker_state_root.as_ref() else {
+        return "no worker state root".to_owned();
+    };
+    let mut found = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(journal) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                if journal["session_id"] == session {
+                    let claims = journal["pending_launch_claims"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|claim| {
+                            format!(
+                                "retry_pending={} process={} expires_at={}",
+                                claim["retry_pending"],
+                                claim["identity"]["process"],
+                                claim["expires_at"]
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    found.push(format!("{}: {claims:?}", path.display()));
+                }
+            }
+        }
+    }
+    found.join("; ")
+}
+
 /// The runtime the fixture agent is registered as.
 const RUNTIME: &str = "pi";
 
@@ -225,19 +278,88 @@ impl Rig {
             Some(worker) => worker.clone(),
             None => live_worker_and_identity(&self.registry, self.id()).await.0,
         };
-        wait_until("the worker to journal the reported reference", || async {
-            let snapshot = worker.inspect().await.ok()?;
-            snapshot
-                .native_reference
-                .filter(|journaled| journaled.native_reference == reference)
-                .map(|_| ())
-        })
+        let journaled = tokio::time::timeout(
+            JOURNAL_DEADLINE,
+            wait_until("the worker to journal the reported reference", || async {
+                let snapshot = worker.inspect().await.ok()?;
+                snapshot
+                    .native_reference
+                    .filter(|journaled| journaled.native_reference == reference)
+                    .map(|_| ())
+            }),
+        )
         .await;
+        assert!(
+            journaled.is_ok(),
+            "the worker did not journal the reported reference within {JOURNAL_DEADLINE:?}\n{}",
+            self.launch_diagnostic(&worker).await
+        );
         let python = fs::read_to_string(&self.python).unwrap_or_default();
         assert!(
             !python.trim().is_empty(),
             "the adapter needs python3 on PATH"
         );
+    }
+
+    /// What the worker and the host process table say about the launch
+    /// process, for a failure that must explain itself.
+    async fn launch_diagnostic(&self, worker: &Worker) -> String {
+        use std::fmt::Write as _;
+
+        let mut report = String::new();
+        match worker.inspect().await {
+            Ok(snapshot) => {
+                let _ = writeln!(
+                    report,
+                    "snapshot: phase={:?} child={:?}\n  launch_identity={:?}\n  native_reference={:?}\n  active_identity={:?}",
+                    snapshot.phase,
+                    snapshot.child_process,
+                    snapshot.launch_identity,
+                    snapshot.native_reference,
+                    snapshot.active_identity,
+                );
+                if let Some(root) = snapshot.child_process {
+                    let inspector = crate::procwatch::HostInspector::new();
+                    let identity = ProcessIdentity {
+                        pid: root.pid,
+                        start_identity: StartIdentity::new(root.start_identity),
+                    };
+                    let _ = writeln!(
+                        report,
+                        "host: identity({})={:?}, root start identity {}",
+                        root.pid,
+                        inspector.identity(root.pid),
+                        root.start_identity
+                    );
+                    let mut processes = vec![identity];
+                    match inspector.descendant_identities(identity) {
+                        Ok(descendants) => processes.extend(descendants),
+                        Err(error) => {
+                            let _ = writeln!(report, "host: descendants failed: {error}");
+                        }
+                    }
+                    for process in processes {
+                        let _ = writeln!(
+                            report,
+                            "host: pid {} start {} executable={:?} parent={:?}",
+                            process.pid,
+                            process.start_identity.get(),
+                            inspector.executable(process.pid),
+                            inspector.parent_pid(process.pid),
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(report, "snapshot unavailable: {error}");
+            }
+        }
+        let _ = writeln!(
+            report,
+            "pending claims in the worker journal: {}",
+            pending_claims(&self.config, &self.session.id.0)
+        );
+        report
     }
 
     /// The worker's current snapshot, as the daemon polls it.
@@ -1694,4 +1816,27 @@ async fn an_adopted_worker_whose_launch_process_just_exited_hands_over_its_journ
         Some("conversation-before-exit")
     );
     let _ = restarted.stop(rig.id()).await;
+}
+
+#[tokio::test]
+async fn the_launch_diagnostic_names_the_worker_and_host_view_of_the_launch_process() {
+    let rig = Rig::new(
+        "supersede-diagnostic",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    let (worker, _identity) = live_worker_and_identity(&rig.registry, rig.id()).await;
+
+    let report = rig.launch_diagnostic(&worker).await;
+
+    for expected in [
+        "launch_identity=",
+        "native_reference=",
+        "host: identity(",
+        "executable=",
+        "pending claims in the worker journal",
+    ] {
+        assert!(report.contains(expected), "{expected}: {report}");
+    }
+    rig.finish(&rig.registry).await;
 }
