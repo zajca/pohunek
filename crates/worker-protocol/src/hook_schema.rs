@@ -96,6 +96,50 @@ pub enum SubagentField {
     Outcome,
 }
 
+/// Why a schema refuses a hook operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookDenial {
+    /// The session has no schema, or the schema does not admit the action.
+    ActionNotAllowed,
+    /// The provider is outside the schema's provider set for the action.
+    ProviderNotAllowed,
+}
+
+/// Checks one hook operation against a session's schema.
+///
+/// This is the single admission rule the worker applies to its socket and the
+/// daemon applies to the public socket, so a refusal on one path cannot be
+/// bypassed through the other. A session without a schema admits nothing.
+///
+/// # Errors
+///
+/// Returns [`HookDenial::ActionNotAllowed`] when `schema` is absent or does
+/// not admit `action`, and [`HookDenial::ProviderNotAllowed`] when `provider`
+/// may not report that action for a session launched as `launch_runtime`.
+pub fn admit_hook(
+    schema: Option<&'static HookSchema>,
+    action: HookAction,
+    provider: &str,
+    launch_runtime: Option<&str>,
+) -> Result<&'static HookSchema, HookDenial> {
+    let schema = schema
+        .filter(|schema| schema.allows(action))
+        .ok_or(HookDenial::ActionNotAllowed)?;
+    let admitted = match action {
+        HookAction::SubagentStart | HookAction::SubagentStop => {
+            schema.admits_subagent_provider(provider)
+        }
+        HookAction::IdentityReport | HookAction::IdentityRelease | HookAction::Notification => {
+            schema.admits_identity_provider(provider, launch_runtime)
+        }
+    };
+    if admitted {
+        Ok(schema)
+    } else {
+        Err(HookDenial::ProviderNotAllowed)
+    }
+}
+
 /// One compiled hook schema.
 #[derive(Debug, PartialEq, Eq)]
 pub struct HookSchema {
@@ -103,7 +147,8 @@ pub struct HookSchema {
     pub id: &'static str,
     /// Integration handler ids that drive this schema.
     pub handlers: &'static [&'static str],
-    /// Provider ids allowed to report identity and notifications.
+    /// Provider ids other than the session's own runtime that may report
+    /// identity and notifications while hosted in the foreground.
     pub identity_providers: &'static [&'static str],
     /// Provider ids allowed to report subagent lifecycle.
     pub subagent_providers: &'static [&'static str],
@@ -130,12 +175,13 @@ impl HookSchema {
     /// Whether `provider` may report identity for a session launched as
     /// `launch_runtime`.
     ///
-    /// A provider other than the launch runtime is a nested active identity,
-    /// which the schema must enable.
+    /// The launch runtime itself is always the session's own provider. Any
+    /// other provider is a nested active identity, which the schema must
+    /// enable and list.
     #[must_use]
     pub fn admits_identity_provider(&self, provider: &str, launch_runtime: Option<&str>) -> bool {
-        self.identity_providers.contains(&provider)
-            && (self.nested_active || launch_runtime == Some(provider))
+        launch_runtime == Some(provider)
+            || (self.nested_active && self.identity_providers.contains(&provider))
     }
 
     /// Whether `provider` may report subagent lifecycle.

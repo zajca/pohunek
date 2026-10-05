@@ -53,8 +53,8 @@ pub use env::{
 };
 #[doc(inline)]
 pub use hook_schema::{
-    hook_schema, hook_schema_for_handler, hook_schemas, is_known_hook_handler, AncestryMatcher,
-    HookAction, HookSchema, ReferenceKind, SubagentField,
+    admit_hook, hook_schema, hook_schema_for_handler, hook_schemas, is_known_hook_handler,
+    AncestryMatcher, HookAction, HookDenial, HookSchema, ReferenceKind, SubagentField,
 };
 #[doc(inline)]
 pub use id::{

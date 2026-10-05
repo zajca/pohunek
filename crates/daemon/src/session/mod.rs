@@ -2347,6 +2347,17 @@ impl SessionRegistry {
             debug!(session_id = %session_id.0, "native-id report provider mismatch; ignoring");
             return not_recorded;
         }
+        if !self
+            .hook_report_admitted(
+                &session_id,
+                pohunek_worker_protocol::HookAction::IdentityReport,
+                &expected_base,
+                "native-id report",
+            )
+            .await
+        {
+            return not_recorded;
+        }
         let worker_snapshot = match worker.inspect().await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -2503,6 +2514,10 @@ impl SessionRegistry {
     }
 
     /// Record the active nested agent currently owning a live session.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "ordered admission, ordering and projection checks stay linear so every rejection precedes mutation"
+    )]
     pub async fn report_agent(&self, params: SessionReportAgentParams) -> SessionReportAgentResult {
         let not_recorded = SessionReportAgentResult { recorded: false };
         let activity_epoch = self.daemon_instance_id().to_owned();
@@ -2521,6 +2536,17 @@ impl SessionRegistry {
                 return not_recorded;
             }
         };
+        if !self
+            .hook_report_admitted(
+                &params.session_id,
+                pohunek_worker_protocol::HookAction::IdentityReport,
+                resolved.base.as_str(),
+                "active-agent report",
+            )
+            .await
+        {
+            return not_recorded;
+        }
 
         let valid_session_id =
             validate_agent_session_id(&params.session_id, params.agent_session_id.as_deref());
@@ -2627,6 +2653,17 @@ impl SessionRegistry {
                 return not_released;
             }
         };
+        if !self
+            .hook_report_admitted(
+                &params.session_id,
+                pohunek_worker_protocol::HookAction::IdentityRelease,
+                resolved.base.as_str(),
+                "active-agent release",
+            )
+            .await
+        {
+            return not_released;
+        }
 
         let info = {
             let mut sessions = self.inner.sessions.lock().await;
@@ -4974,6 +5011,66 @@ fn agent_kind_label(agent: &RuntimeRef) -> &str {
 }
 
 impl SessionRegistry {
+    /// Checks a hook operation reported through the public socket against the
+    /// hook schema of session `id`'s runtime, with the admission rule the
+    /// worker applies on its own socket.
+    ///
+    /// A session this registry does not hold is admitted here: the callers
+    /// already ignore a report for an unknown session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`pohunek_worker_protocol::HookDenial`] when the session's
+    /// runtime has no schema, the schema does not admit `action`, or
+    /// `provider` may not report it.
+    pub async fn admit_session_hook(
+        &self,
+        id: &SessionId,
+        action: pohunek_worker_protocol::HookAction,
+        provider: &str,
+    ) -> Result<(), pohunek_worker_protocol::HookDenial> {
+        let (agent_base, pinned, pin) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(id) else {
+                return Ok(());
+            };
+            (
+                entry.info.agent_base.clone(),
+                entry.pinned.clone(),
+                entry.snapshot.launch_binding.clone(),
+            )
+        };
+        let schema = match pinned {
+            Some(definition) => definition.hook_schema(),
+            None => self.session_hook_schema(&agent_base, &pin),
+        };
+        pohunek_worker_protocol::admit_hook(
+            schema,
+            action,
+            provider,
+            Some(agent_kind_label(&agent_base)),
+        )
+        .map(|_schema| ())
+    }
+
+    /// Whether the hook schema of session `id` admits `action` from
+    /// `provider`; a refusal is logged with `report` naming the operation.
+    async fn hook_report_admitted(
+        &self,
+        id: &SessionId,
+        action: pohunek_worker_protocol::HookAction,
+        provider: &str,
+        report: &str,
+    ) -> bool {
+        match self.admit_session_hook(id, action, provider).await {
+            Ok(()) => true,
+            Err(denial) => {
+                debug!(session_id = %id.0, ?denial, "{report} refused by the hook schema; ignoring");
+                false
+            }
+        }
+    }
+
     /// The hook schema of the runtime a session of `agent_base` launched with
     /// `pin`, resolved through the runtime's integration.
     ///

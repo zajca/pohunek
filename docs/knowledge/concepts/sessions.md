@@ -230,9 +230,11 @@ check the provider, the action, the native-reference kind, the nested-agent
 rule, and the subagent fields against it, on top of the process, ancestry,
 sequence, and expiry checks every schema shares. Codex, Claude, and the shell
 use the schema with subagents, Hermes the identity-only schema, and a runtime
-without an integration, such as Pi, has none and accepts no hook report. A
-worker built before schema delivery journals no schema, so the daemon validates
-its state with the schema of the session's pinned runtime.
+without an integration, such as Pi, has none and accepts no hook report. The
+daemon applies the same admission on the public socket, which the managed
+hooks fall back to when the worker refuses a report, so a refused report cannot
+be replayed there. A worker built before schema delivery journals no schema, so
+the daemon validates its state with the schema of the session's pinned runtime.
 
 Current Claude and Codex integrations separately observe provider-managed
 subagents. Their `SubagentStart` and `SubagentStop` hooks report only lifecycle

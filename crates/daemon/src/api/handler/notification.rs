@@ -92,6 +92,9 @@ pub(super) async fn handle_notification_create(
         Ok(notifications) => notifications,
         Err(resp) => return resp,
     };
+    if let Err(response) = admit_hook_notification(request, &params, sessions).await {
+        return response;
+    }
     let params = enrich_notification_session_context(params, sessions).await;
 
     if is_debounced_create(params.kind, params.dedupe_key.as_deref()) {
@@ -121,6 +124,48 @@ pub(super) async fn handle_notification_create(
             .map_err(|err| err.to_protocol_error())
     })
     .await
+}
+
+/// Refuses a notification a provider hook reports for a session whose runtime
+/// hook schema does not admit it.
+///
+/// A create that names a session and a provider with a hook schema is a hook
+/// claim, so the public socket enforces the same admission as the worker
+/// socket and a refusal there cannot be bypassed by retrying here. Creates
+/// from other producers and creates without a session are not hook claims.
+async fn admit_hook_notification(
+    request: &Request,
+    params: &NotificationCreateParams,
+    sessions: &SessionRegistry,
+) -> Result<(), Response> {
+    let Some(session_id) = params.session_id.as_ref() else {
+        return Ok(());
+    };
+    let provider = params.source.provider.as_str();
+    let hook_provider = pohunek_worker_protocol::hook_schemas()
+        .iter()
+        .any(|schema| schema.identity_providers.contains(&provider));
+    if !hook_provider {
+        return Ok(());
+    }
+    sessions
+        .admit_session_hook(
+            session_id,
+            pohunek_worker_protocol::HookAction::Notification,
+            provider,
+        )
+        .await
+        .map_err(|_denial| {
+            error_value(
+                request,
+                ProtocolError::new(
+                    protocol::ErrorClass::Daemon,
+                    "hook_not_admitted",
+                    "the session runtime does not admit this hook report".to_owned(),
+                    None,
+                ),
+            )
+        })
 }
 
 /// Enrich producer params with live session context without making a missing

@@ -2,6 +2,10 @@
 
 ## Unreleased (2026-10-05, hook schemas)
 
+- The hook schema is enforced on the public socket (`session.report_agent`,
+  `session.release_agent`, `session.report_native_id`, hook-claim
+  `notification.create`) as well as on the worker socket.
+
 - Runtime descriptors name a core-owned hook schema next to the integration
   handler (`[integration] handler`, `hook_schema`). The runtime packages guide
   and the public API document the closed schema set (`identity-v1`,

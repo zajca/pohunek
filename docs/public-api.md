@@ -733,7 +733,18 @@ optional field of the private worker protocol), the worker journals it as
 `hook_schema` and returns it in its inspect snapshot, and the daemon validates
 the imported identity, release, and subagent state with it. A worker that
 predates the field journals none; the daemon then validates its state with the
-schema its session's pinned runtime resolves to. No public wire shape changes.
+schema its session's pinned runtime resolves to (for a package whose descriptor
+predates `hook_schema`, the schema its handler drives when exactly one does).
+
+The schema is also enforced on the public socket, the fallback the managed
+hooks use when the worker refuses a report. `session.report_agent`,
+`session.release_agent` and `session.report_native_id` answer `recorded: false`
+/ `released: false` for a session whose runtime has no schema, whose schema
+does not admit the action, or whose provider is not admitted, and
+`notification.create` answers `hook_not_admitted` for a create that
+names a session and a hooked provider (`shell`, `codex`, `claude`, `hermes`) on
+such a session. A session's own runtime is always an admitted provider for
+identity reports. No other public wire shape changes.
 
 Rule for runtime packages without an integration handler: such a package gets
 terminal launch and activity detection. It gets resume and fork only when its

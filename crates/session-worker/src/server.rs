@@ -3520,34 +3520,18 @@ where
         .map_err(|error| WorkerError::Protocol(error.to_string()))
 }
 
-/// Checks one hook operation against the session's hook schema.
-///
-/// Returns the schema when it admits `action` from `provider`, otherwise the
-/// reason: a session without a schema, or a schema without the action,
-/// admits nothing, and a provider outside the schema's provider set for the
-/// action is refused.
+/// Checks one hook operation against the session's hook schema with the rule
+/// the daemon applies on the public socket.
 fn admit_hook(
     schema: Option<&'static HookSchema>,
     action: HookAction,
     provider: &str,
     launch_runtime: Option<&str>,
 ) -> Result<&'static HookSchema, RejectReason> {
-    let schema = schema
-        .filter(|schema| schema.allows(action))
-        .ok_or(RejectReason::ActionNotAllowed)?;
-    let provider_admitted = match action {
-        HookAction::SubagentStart | HookAction::SubagentStop => {
-            schema.admits_subagent_provider(provider)
-        }
-        HookAction::IdentityReport | HookAction::IdentityRelease | HookAction::Notification => {
-            schema.admits_identity_provider(provider, launch_runtime)
-        }
-    };
-    if provider_admitted {
-        Ok(schema)
-    } else {
-        Err(RejectReason::ProviderNotAllowed)
-    }
+    protocol::admit_hook(schema, action, provider, launch_runtime).map_err(|denial| match denial {
+        protocol::HookDenial::ActionNotAllowed => RejectReason::ActionNotAllowed,
+        protocol::HookDenial::ProviderNotAllowed => RejectReason::ProviderNotAllowed,
+    })
 }
 
 /// Whether a reported native reference has the shape `schema` admits: both
@@ -5034,6 +5018,10 @@ mod tests {
         let identity = launch_report(&pty, 1, "ref");
         assert!(!send_hook(&server, &pty, identity).await);
         assert!(!send_hook(&server, &pty, subagent_start_claim(2, None)).await);
+        let notification = serde_json::json!({
+            "type": "notification_create", "provider": "codex", "sequence": 3, "params": {},
+        });
+        assert!(!send_hook(&server, &pty, notification).await);
         assert_eq!(server.shared.state.lock().await.journal, before);
         pty.stop("test-cleanup", server.shared.config.stop_grace)
             .await
