@@ -4067,6 +4067,48 @@ impl SessionRegistry {
         outcome
     }
 
+    /// Reads the final snapshot of the generation `expected` names and imports
+    /// the native reference its worker journaled into `candidate`.
+    ///
+    /// Every commit of terminal recovery metadata (a PTY exit, an explicit
+    /// stop, a lost worker) passes through here, so a conversation switch the
+    /// worker accepted is never dropped by the transition that ends the
+    /// session. A worker that cannot be asked leaves the reference as is.
+    async fn import_final_native_reference(
+        &self,
+        id: &SessionId,
+        expected: &RuntimeWatchIdentity,
+        candidate: &mut SessionEntry,
+    ) {
+        let worker = {
+            let sessions = self.inner.sessions.lock().await;
+            sessions.get(id).and_then(|entry| match &entry.runtime {
+                RuntimeHandle::Worker(worker) if expected.matches(entry) => Some(worker.clone()),
+                _ => None,
+            })
+        };
+        let Some(worker) = worker else {
+            return;
+        };
+        let Ok(snapshot) = worker.inspect().await else {
+            return;
+        };
+        let mut record = Self::session_record(id, candidate, candidate.desired_state, None);
+        reconcile::import_native_reference(&mut record, &snapshot);
+        candidate
+            .info
+            .native_session_id
+            .clone_from(&record.info.native_session_id);
+        candidate
+            .info
+            .native_session_path
+            .clone_from(&record.info.native_session_path);
+        if let Some(recovery) = &record.recovery {
+            candidate.snapshot.reference_provenance = recovery.native_reference_provenance;
+        }
+        candidate.last_native_report = record.native_identity_ordering;
+    }
+
     async fn commit_runtime_transition(
         &self,
         id: &SessionId,
@@ -4076,6 +4118,10 @@ impl SessionRegistry {
         mut candidate: SessionEntry,
         metadata_policy: RuntimeMetadataPolicy,
     ) -> RuntimeTransitionOutcome {
+        if metadata_policy == RuntimeMetadataPolicy::Terminal {
+            self.import_final_native_reference(id, expected, &mut candidate)
+                .await;
+        }
         preserve_durable_transition_metadata(durable_base, &mut candidate, metadata_policy);
         let mut record = Self::session_record(id, &candidate, candidate.desired_state, None);
         crate::store::preserve_newer_native_identity(durable_base, &mut record);

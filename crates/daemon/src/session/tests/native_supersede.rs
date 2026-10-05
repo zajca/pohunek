@@ -92,6 +92,7 @@ fn pi_adapter(dir: &std::path::Path) -> PathBuf {
 /// `exit` ends the agent. A start without `--session-id` (resume, fork) only
 /// stays alive.
 struct Rig {
+    dir: PathBuf,
     marker: PathBuf,
     acks: PathBuf,
     nested: PathBuf,
@@ -182,9 +183,10 @@ impl Rig {
             write_executable(
                 &shim,
                 &format!(
-                    "#!/bin/sh\n'{}' '{}' \"$@\"\n",
+                    "#!/bin/sh\n'{}' '{}' \"$@\"\nif [ -e '{}' ]; then exec sleep 30; fi\n",
                     interpreter.display(),
-                    inner.display()
+                    inner.display(),
+                    dir.join("linger").display()
                 ),
             );
             shim
@@ -223,6 +225,7 @@ impl Rig {
         // against a settled first one.
         wait_for_file_contains(&marker, &format!("{assigned}\n")).await;
         Self {
+            dir,
             marker,
             acks,
             nested,
@@ -1838,5 +1841,138 @@ async fn the_launch_diagnostic_names_the_worker_and_host_view_of_the_launch_proc
     ] {
         assert!(report.contains(expected), "{expected}: {report}");
     }
+    rig.finish(&rig.registry).await;
+}
+
+#[tokio::test]
+async fn a_switch_survives_the_provider_exiting_before_its_wrapper() {
+    let rig = Rig::wrapped(
+        "supersede-provider-exits",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.report(&rig.assigned).await;
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    // The registry's watcher is stopped so only the final import can see the
+    // switch the worker accepted.
+    rig.registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(rig.id())
+        .expect("session entry")
+        .runtime_watch_cancel
+        .cancel();
+    fs::write(rig.dir.join("linger"), "").expect("keep the wrapper alive");
+    rig.report("conversation-before-provider-exit").await;
+    let snapshot = rig.snapshot(&rig.registry).await;
+    rig.send("exit");
+
+    // The provider ends while its wrapper stays: the claim's process is gone
+    // and the worker still runs.
+    wait_until("the provider to exit", || async {
+        let launch = snapshot.launch_identity.as_ref()?.process;
+        let gone = !crate::procwatch::HostInspector::new()
+            .is_running(ProcessIdentity {
+                pid: launch.pid,
+                start_identity: StartIdentity::new(launch.start_identity),
+            })
+            .unwrap_or(true);
+        gone.then_some(())
+    })
+    .await;
+    let _ = rig.settle(&rig.registry).await;
+
+    let info = rig.registry.inspect(rig.id()).await.expect("inspect");
+    assert_eq!(
+        info.native_session_id.as_deref(),
+        Some("conversation-before-provider-exit"),
+        "the journaled reference needs no live process"
+    );
+    rig.finish(&rig.registry).await;
+}
+
+#[tokio::test]
+async fn an_explicit_stop_keeps_the_conversation_the_worker_accepted_before_it() {
+    let rig = Rig::new(
+        "supersede-stop",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.registry
+        .inner
+        .sessions
+        .lock()
+        .await
+        .get(rig.id())
+        .expect("session entry")
+        .runtime_watch_cancel
+        .cancel();
+    // The worker accepts a switch the daemon never imports before the stop.
+    rig.report("conversation-before-stop").await;
+
+    rig.registry.stop(rig.id()).await.expect("stop");
+
+    let info = rig.registry.inspect(rig.id()).await.expect("inspect");
+    assert_eq!(
+        info.native_session_id.as_deref(),
+        Some("conversation-before-stop")
+    );
+    let record = rig.durable_record();
+    assert_eq!(
+        record
+            .recovery
+            .expect("recovery")
+            .native_session_id
+            .as_deref(),
+        Some("conversation-before-stop")
+    );
+}
+
+#[tokio::test]
+async fn a_recovered_generations_first_worker_report_numbered_zero_is_imported() {
+    let rig = Rig::new(
+        "supersede-recovered-zero",
+        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
+    )
+    .await;
+    rig.report("conversation-before-recovery").await;
+    assert_eq!(
+        rig.settle(&rig.registry).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    rig.exit(&rig.registry).await;
+    rig.registry.resume(rig.id()).await.expect("resume");
+    wait_for_file_contains(&rig.marker, "--session\n").await;
+
+    let mut snapshot = rig.snapshot(&rig.registry).await;
+    let root = snapshot.child_process.expect("worker child");
+    snapshot.launch_identity = Some(pohunek_worker_protocol::ReportedLaunchIdentity {
+        provider: RUNTIME.to_owned(),
+        process: root,
+        reference_kind: "id".to_owned(),
+        native_reference: "conversation-before-recovery".to_owned(),
+    });
+    snapshot.native_reference = Some(pohunek_worker_protocol::ReportedNativeReference {
+        provider: RUNTIME.to_owned(),
+        process: root,
+        sequence: 0,
+        reference_kind: "id".to_owned(),
+        native_reference: "first-report-of-the-generation".to_owned(),
+    });
+    assert_eq!(
+        rig.settle_with(&rig.registry, &snapshot).await,
+        WorkerMetadataApplyOutcome::Applied
+    );
+    rig.assert_held(
+        &rig.registry,
+        "first-report-of-the-generation",
+        NativeReferenceProvenance::Reported,
+    )
+    .await;
     rig.finish(&rig.registry).await;
 }

@@ -655,6 +655,19 @@ impl NativeIdentityOrdering {
         }
     }
 
+    /// A key that names a runtime generation and holds no report mark yet, so
+    /// any real report of that generation is newer than it.
+    #[must_use]
+    pub fn unsequenced(worker_instance_id: &str, pid: u32, pid_start_identity: u64) -> Self {
+        Self {
+            worker_instance_id: worker_instance_id.to_owned(),
+            pid,
+            pid_start_identity,
+            sequence: None,
+            worker_sequence: None,
+        }
+    }
+
     /// Whether `self` is ahead of `other` in at least one transport.
     fn is_ahead_of(&self, other: &Self) -> bool {
         self.sequence > other.sequence || self.worker_sequence > other.worker_sequence
