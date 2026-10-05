@@ -804,7 +804,12 @@ async fn ingest_package(
     };
     if !yes {
         if !json {
-            print!("{}", render_install_review(&preview, enable, select));
+            let recorded = installed
+                .packages
+                .iter()
+                .find(|info| info.digest == preview.package.digest);
+            let selected = selection_after(ingest, select, &preview.package, recorded);
+            print!("{}", render_install_review(&preview, enable, selected));
         }
         return Err(Error::ConsentRequired {
             verb: ingest.verb(),
@@ -1160,18 +1165,37 @@ fn render_inspect(result: &PackageInspectResult) -> String {
     output
 }
 
-/// The review printed before an install-like command asks for consent.
-fn render_install_review(preview: &PackageInstallResult, enable: bool, select: bool) -> String {
+/// Whether the package is selected after the command succeeds.
+///
+/// `preview` comes from a dry run that never selects, so the outcome is
+/// derived from what the command does: an archive that is already installed
+/// keeps its recorded selection under `install` and `link`, `update` selects
+/// it unless the selection is held back, and a fresh install selects when
+/// `requested` and not held back. `recorded` is the installed package of the
+/// archive's digest, if any.
+fn selection_after(
+    ingest: Ingest,
+    requested: bool,
+    preview: &PackageInfo,
+    recorded: Option<&PackageInfo>,
+) -> bool {
+    let held_back = preview.selection_blocked.is_some();
+    match (recorded, ingest) {
+        (Some(_), Ingest::Update) => !held_back,
+        (Some(recorded), _) => recorded.selected,
+        (None, _) => requested && !held_back,
+    }
+}
+
+/// The review printed before an install-like command asks for consent;
+/// `selected` is the outcome of [`selection_after`].
+fn render_install_review(preview: &PackageInstallResult, enable: bool, selected: bool) -> String {
     let mut output = String::from("The package declares:\n");
     render_package_details(&mut output, &preview.package);
     render_runtime_details(&mut output, &preview.runtime);
     let _ = writeln!(output, "Enabled:     {} after install", yes_no(enable));
-    let _ = writeln!(
-        output,
-        "Selected:    {} after install",
-        yes_no(select && preview.package.selection_blocked.is_none())
-    );
-    if select {
+    let _ = writeln!(output, "Selected:    {} after install", yes_no(selected));
+    if !selected {
         if let Some(note) = selection_note(&preview.package) {
             let _ = writeln!(
                 output,
@@ -1920,7 +1944,7 @@ mod tests {
                 reloaded: false,
             },
             true,
-            true,
+            false,
         );
         assert!(review.contains("Selected:    no after install"), "{review}");
         assert!(review.contains("installed but not selected"), "{review}");
@@ -1943,27 +1967,59 @@ mod tests {
     }
 
     #[test]
-    fn the_review_shows_the_selection_the_requested_flags_will_make() {
-        let review = |package: PackageInfo, select: bool| {
+    fn the_review_shows_the_selection_the_command_will_make() {
+        let after = |ingest, requested, package: &PackageInfo, recorded: Option<&PackageInfo>| {
+            selection_after(ingest, requested, package, recorded)
+        };
+        let install = Ingest::Install { enable: true };
+        // The dry run never selects, so its `selected` says nothing.
+        let fresh = info("acme.pi", "2.0.0", DIGEST_B, false);
+        assert!(
+            after(install, true, &fresh, None),
+            "fresh compatible install"
+        );
+        assert!(after(Ingest::Update, true, &fresh, None), "fresh update");
+        assert!(
+            !after(install, false, &fresh, None),
+            "selection not requested"
+        );
+        let held = held_back("2.0.0", DIGEST_B);
+        assert!(!after(install, true, &held, None), "held back");
+        assert!(
+            !after(Ingest::Update, true, &held, None),
+            "update held back"
+        );
+
+        // Reviewer scenario: the archive is installed and unselected, and no
+        // other version is installed.
+        let unselected = info("acme.pi", "2.0.0", DIGEST_B, false);
+        assert!(
+            !after(install, true, &fresh, Some(&unselected)),
+            "install keeps it"
+        );
+        assert!(!after(Ingest::Link, false, &fresh, Some(&unselected)));
+        assert!(
+            after(Ingest::Update, true, &fresh, Some(&unselected)),
+            "update selects it"
+        );
+        assert!(!after(Ingest::Update, true, &held, Some(&unselected)));
+        let selected = info("acme.pi", "2.0.0", DIGEST_B, true);
+        assert!(after(install, true, &fresh, Some(&selected)));
+
+        let review = |selected| {
             render_install_review(
                 &PackageInstallResult {
                     status: PackageInstallStatus::Preview,
-                    package,
+                    package: fresh.clone(),
                     runtime: runtime("Pi"),
                     reloaded: false,
                 },
                 true,
-                select,
+                selected,
             )
         };
-        // The preview is requested without selection, so the daemon reports
-        // `selected: false` for a package that will be selected after consent.
-        let compatible = info("acme.pi", "2.0.0", DIGEST_B, false);
-        assert!(review(compatible.clone(), true).contains("Selected:    yes after install"));
-        assert!(review(compatible, false).contains("Selected:    no after install"));
-        let held = held_back("2.0.0", DIGEST_B);
-        assert!(review(held.clone(), true).contains("Selected:    no after install"));
-        assert!(review(held, true).contains("installed but not selected"));
+        assert!(review(true).contains("Selected:    yes after install"));
+        assert!(review(false).contains("Selected:    no after install"));
     }
 
     #[test]
