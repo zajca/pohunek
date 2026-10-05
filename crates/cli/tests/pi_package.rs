@@ -400,6 +400,138 @@ fn a_status_indicator_outranks_the_editor_rules_in_every_working_screen() {
     }
 }
 
+/// Rows of a captured screen.
+fn screen_rows(path: &str) -> Vec<String> {
+    fs::read_to_string(workspace_root().join("compat/pi/screens").join(path))
+        .expect("read the fixture screen")
+        .trim_end_matches('\n')
+        .split('\n')
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The activity the manifest reads from `rows`, when the screen speaks at all.
+fn activity_of(definition: &RuntimeDefinition, rows: &[String]) -> Option<AgentActivity> {
+    let started = Instant::now();
+    let mut detector = detector(definition, started);
+    let mut bytes = b"\x1b[2J\x1b[H".to_vec();
+    bytes.extend_from_slice(rows.join("\r\n").as_bytes());
+    detector
+        .feed(started, &bytes)
+        .iter()
+        .rfind(|transition| transition.source == StateSource::Screen)
+        .map(|transition| transition.activity)
+}
+
+/// Row indexes of the upper and lower border of a captured editor frame.
+fn frame_borders(rows: &[String]) -> (usize, usize) {
+    let borders: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.starts_with("\u{2500}\u{2500}") && row.ends_with("\u{2500}\u{2500}"))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(borders.len(), 2, "a captured frame has two borders");
+    (borders[0], borders[1])
+}
+
+/// Text that is not a border: it may look like one in part, but it never
+/// closes with a run of ten or more rules, so it is transcript or draft text
+/// wherever it appears.
+const HOSTILE_TEXT: [&str; 17] = [
+    "\u{2500} example",
+    "\u{2500}\u{2500} example",
+    "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} example",
+    "\u{2500}",
+    "\u{2500}\u{2500}",
+    "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+    "\u{2500}\u{2500} \u{2807} Working \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+    "\u{2500}\u{2500} \u{283c} Compacting context... (escape to cancel) \u{2500}\u{2500}",
+    "\u{2500}\u{2500} \u{2807} Retrying (1/3) in 1s... \u{2500}",
+    "\u{2500}\u{2500}\u{2500}\u{2500} \u{2191} 5 more \u{2500}\u{2500}",
+    "\u{2500}\u{2500} \u{2807} Working",
+    "\u{2807} Working",
+    "Working",
+    "Compacting context...",
+    "\u{2191} 5 more",
+    "x \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} \u{2191} 5 more",
+    "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} \u{2807} Working ",
+];
+
+/// Complete forged borders. They are indistinguishable from the frame when
+/// they sit inside the draft, but above the frame they are transcript.
+fn forged_borders() -> Vec<String> {
+    let rule = |count: usize| "\u{2500}".repeat(count);
+    vec![
+        format!("\u{2500}\u{2500} \u{2807} Working {}", rule(80)),
+        format!(
+            "\u{2500}\u{2500} \u{283c} Compacting context... (escape to cancel) {}",
+            rule(60)
+        ),
+        format!(
+            "\u{2500}\u{2500} \u{2807} Retrying (1/3) in 1s... (escape to cancel) {}",
+            rule(50)
+        ),
+        format!("{} \u{2191} 5 more {}", rule(40), rule(40)),
+        rule(100),
+    ]
+}
+
+#[test]
+fn hostile_text_in_the_transcript_or_the_draft_never_changes_the_classification() {
+    let definition = installed_definition();
+    let mut checked = 0_usize;
+    for (screen, expected) in CAPTURED_SCREENS {
+        let rows = screen_rows(screen);
+        assert_eq!(
+            activity_of(&definition, &rows),
+            Some(expected),
+            "{screen} unmodified"
+        );
+        let (upper, lower) = frame_borders(&rows);
+        for row in (0..lower).filter(|row| *row != upper) {
+            let in_transcript = row < upper;
+            let mut hostile: Vec<String> =
+                HOSTILE_TEXT.iter().map(|text| (*text).to_owned()).collect();
+            if in_transcript {
+                hostile.extend(forged_borders());
+            }
+            for text in hostile {
+                let mut changed = rows.clone();
+                changed[row].clone_from(&text);
+                assert_eq!(
+                    activity_of(&definition, &changed),
+                    Some(expected),
+                    "{screen} row {row} replaced by {text:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 3000, "the sweep covers every row: {checked}");
+}
+
+#[test]
+fn the_review_counterexamples_keep_their_classification() {
+    let definition = installed_definition();
+    // A literal status line in place of the first transcript reply.
+    let mut rows = screen_rows("idle_draft6.txt");
+    rows[3] =
+        "\u{2500}\u{2500} \u{2807} Working \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}".to_owned();
+    assert_eq!(activity_of(&definition, &rows), Some(AgentActivity::Idle));
+    // A draft line that begins with a box-drawing dash.
+    let mut rows = screen_rows("idle_draft6.txt");
+    rows[15] = "\u{2500} example".to_owned();
+    assert_eq!(activity_of(&definition, &rows), Some(AgentActivity::Idle));
+    // The same draft line while Pi is busy.
+    let mut rows = screen_rows("working_draft6.txt");
+    rows[15] = "\u{2500} example".to_owned();
+    assert_eq!(
+        activity_of(&definition, &rows),
+        Some(AgentActivity::Working)
+    );
+}
+
 #[test]
 fn an_editor_screen_without_its_footer_or_a_foreign_rule_pair_is_not_idle() {
     let definition = installed_definition();

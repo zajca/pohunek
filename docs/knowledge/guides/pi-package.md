@@ -54,18 +54,21 @@ so no catalog is needed.
   `$PI_CODING_AGENT_DIR/sessions/` (default `~/.pi/agent/sessions/`). Pi writes
   `sessions/--<cwd with / as ->--/<ISO time with : and . as ->_<id>.jsonl`, and
   only after the first model reply.
-- Detection: Pi frames its editor between two full-width rules with the footer
-  below. While Pi is busy, a braille spinner and its message (`Working`,
-  `Compacting context...`, `Auto-compacting...`, `Retrying (n/m) in Ns...`) sit
-  inside the upper rule; any such indicator means `working`, however tall the
-  draft is. `idle` needs a plain upper rule, the editor body, a plain lower rule
-  and only the footer after it; a `↑ N more` / `↓ N more` scroll marker in a rule
-  is allowed. Both rules read the whole visible screen because the editor grows
-  with the draft. The idle, working, compaction, retry and multi-line draft
-  screens in `compat/pi/screens/` were captured from a real Pi; no blocked
-  signal (extension dialogs, login) and no overlay (model or session selector)
-  was exercised, so no `blocked` rule exists and an unrecognized screen keeps
-  the byte-activity fallback. Process matchers accept the kernel name `pi` (Pi retitles its
+- Detection: both rules read the editor frame anchored at the bottom of the
+  screen: an upper border, the draft, a plain lower border, then one to four
+  footer lines. A border is a full-width run of `─` with an optional label (a
+  `↑ N more` / `↓ N more` scroll marker, or in the upper border a braille
+  spinner with its message: `Working`, `Compacting context...`,
+  `Auto-compacting...`, `Retrying (n/m) in Ns...`). A status indicator in the
+  upper border means `working`; a plain upper border means `idle`. Draft and
+  transcript text never decides: a line that starts with `─` or merely looks
+  like a status line is text unless it closes with a run of ten or more `─`,
+  and a draft line that is a complete border cannot be told from the frame. The
+  idle, working, compaction, retry and multi-line draft screens in
+  `compat/pi/screens/` were captured from a real Pi. No blocked signal
+  (extension dialogs, login) and no overlay (model or session selector) was
+  exercised, so no `blocked` rule exists and an unrecognized screen keeps the
+  byte-activity fallback. Process matchers accept the kernel name `pi` (Pi retitles its
   process shortly after start) and `node` running
   `…/coding-agent/dist/bundle/cli.js` for the first moments.
 

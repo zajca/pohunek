@@ -1,17 +1,29 @@
 # Pi 1.0.2 activity manifest, matched against a real terminal session.
 #
-# Pi paints its editor between two full-width rules, with the footer (working
-# directory and statistics) below. While Pi is busy, its status indicator (a
-# braille spinner and a message: `Working`, `Compacting context...`,
-# `Auto-compacting...`, `Retrying (n/m) in Ns...`) sits inside the upper rule.
-# The editor grows with the draft (up to 30% of the terminal rows, scrolling
-# beyond that) and puts `↑ N more` / `↓ N more` scroll markers into the rules,
-# so both rules are matched over the whole visible screen instead of a fixed
-# number of bottom lines.
+# Frame structure, anchored at the bottom of the visible screen (derived from
+# the captured screens in compat/pi/screens/):
 #
-# `idle` needs positive evidence: the lower rule is the last rule, the nearest
-# rule above it is a plain rule (no indicator), and only the footer follows. A
-# frame that carries an indicator never matches it. No blocked signal was
+#   transcript ...      anything, never inspected
+#   UPPER BORDER        a full-width rule that may carry one label
+#   body lines          the draft: blank or any text, zero or more
+#   LOWER BORDER        a plain rule
+#   footer              one to four non-empty lines up to the screen end
+#
+# A border is a line of two or more "─", an optional label, and a closing run
+# of ten or more "─". The label is a scroll marker ("↑ N more", "↓ N more") or,
+# in the upper border only, a status indicator: a braille spinner and a message
+# ("Working", "Compacting context...", "Auto-compacting...",
+# "Retrying (n/m) in Ns..."). The upper border of the frame is the nearest
+# border above the lower one, so body lines are exactly the lines that are not
+# borders: text that merely starts with "─", or a status-looking line that does
+# not close with a rule, is body text. Transcript lines are never consulted.
+#
+# working: the upper border carries a status indicator.
+# idle:    the upper border carries no indicator. A screen that is not the
+#          editor frame matches neither rule.
+#
+# Limit: a draft line that is itself a complete border (closing run of ten or
+# more "─") cannot be told from the frame in plain text. No blocked signal was
 # verified (extension dialogs and login overlays were not exercised), so no
 # blocked state is declared; a screen no rule matches (overlays, selectors)
 # keeps the byte-activity fallback.
@@ -30,15 +42,11 @@ id = "working_rule"
 state = "working"
 priority = 700
 region = "whole_recent"
-# Any status indicator in the upper rule: a spinner followed by its message.
-line_regex = ['^─+ [\x{2800}-\x{28FF}] \S']
+regex = ['(?m)^─{2,}(?: [⠀-⣿] [^─\s](?:[^\n]*[^─\n])?)─{10,}\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|─{2,11}|─{2,}[^─\n](?:[^\n]*[^─\n])?─{0,9}|─{2,}(?:[^ ─\n](?:[^\n]*[^─\n])?| | [^↑↓⠀-⣿─\n]| [^↑↓⠀-⣿\n][^\n]*[^─\n]| [↑↓⠀-⣿]| [↑↓⠀-⣿][^ ─\n]| [↑↓⠀-⣿][^ \n][^\n]*[^─\n]| [⠀-⣿] | [⠀-⣿]  (?:[^\n]*[^─\n])?| [⠀-⣿] ─[^\n]*[^─\n])─{10,})\n)*─{2,}(?: [↑↓] (?:[^\n]*[^─\n])?)?─{10,}(?:\n[^\n]+){1,4}\z']
 
 [[rules]]
 id = "idle_editor_rule"
 state = "idle"
 priority = 300
 region = "whole_recent"
-# Upper rule, editor body (blank or text lines, never a rule), lower rule, then
-# one to four footer lines to the end of the screen. A rule may carry a scroll
-# marker but no spinner.
-regex = ['(?m)^─{3,}(?: [↑↓] \d+ more ─+)?\n(?:(?:[^─\n][^\n]*)?\n)*─{3,}(?: [↑↓] \d+ more ─+)?(?:\n[^\n]+){1,4}\z']
+regex = ['(?m)^─{2,}(?: [↑↓] (?:[^\n]*[^─\n])?)?─{10,}\n(?:(?:(?:[^─\n][^\n]*)?|─(?:[^─\n][^\n]*)?|─{2,11}|─{2,}[^─\n](?:[^\n]*[^─\n])?─{0,9}|─{2,}(?:[^ ─\n](?:[^\n]*[^─\n])?| | [^↑↓⠀-⣿─\n]| [^↑↓⠀-⣿\n][^\n]*[^─\n]| [↑↓⠀-⣿]| [↑↓⠀-⣿][^ ─\n]| [↑↓⠀-⣿][^ \n][^\n]*[^─\n]| [⠀-⣿] | [⠀-⣿]  (?:[^\n]*[^─\n])?| [⠀-⣿] ─[^\n]*[^─\n])─{10,})\n)*─{2,}(?: [↑↓] (?:[^\n]*[^─\n])?)?─{10,}(?:\n[^\n]+){1,4}\z']

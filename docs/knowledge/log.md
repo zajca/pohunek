@@ -2,9 +2,10 @@
 
 ## Unreleased (2026-10-05, Pi detection and probe PATH)
 
-- The Pi package guide describes idle detection as positive evidence over the
-  whole screen, lists the busy indicators (`Working`, compaction, retry) and
-  states that the version probe runs under the launch `PATH`, profile override
+- The Pi package guide describes detection as one bottom-anchored editor frame
+  (upper border, draft, lower border, footer) read for both states, lists the
+  busy indicators (`Working`, compaction, retry), says draft and transcript text
+  never decides, and states that the version probe runs under the launch `PATH`, profile override
   included.
 
 ## Unreleased (2026-10-04, upgrade window and store schema)
