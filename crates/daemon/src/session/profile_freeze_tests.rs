@@ -787,3 +787,48 @@ async fn a_profile_added_over_the_name_of_a_bare_session_needs_the_override() {
     assert_eq!(frozen.wait_for_launches(2).await, ["unset", "late-profile"]);
     let _ = registry.stop(&created.id).await;
 }
+
+/// The exit of a run is observable only together with the removal of its
+/// resume binding: a daemon that dies right after publishing the exit, or a
+/// reader that opens the store meanwhile, never meets a terminal session next
+/// to the binding of the run that ended.
+#[tokio::test]
+async fn a_session_that_reads_as_done_has_already_dropped_its_resume_binding() {
+    let frozen = Frozen::new("exit-binding");
+    let registry = frozen.registry();
+    let created = registry
+        .create(frozen.new_params())
+        .await
+        .expect("create a profile session");
+    wait_for_file_contains(&frozen.marker, "--session-id").await;
+    let store = crate::store::Store::new(frozen.store_path.clone());
+    let id = created.id;
+    pohunek_test_support::wait::wait_until("the resume binding of the live run", || async {
+        store
+            .load_resume()
+            .expect("load the bindings")
+            .into_iter()
+            .find(|binding| binding.session_id == id.0)
+    })
+    .await;
+
+    // Every write that runs after the exit is published is held back, so
+    // whatever the store shows once the session reads as done was committed
+    // by the exit itself.
+    let late_writes = registry.inner.persist_lock.lock().await;
+    release(&frozen.gate);
+    registry
+        .wait_for_exit(&id, HANG_GUARD)
+        .await
+        .expect("session exits");
+
+    assert!(
+        store
+            .load_resume()
+            .expect("load the bindings")
+            .iter()
+            .all(|binding| binding.session_id != id.0),
+        "the exit left the resume binding of an ended run behind"
+    );
+    drop(late_writes);
+}
