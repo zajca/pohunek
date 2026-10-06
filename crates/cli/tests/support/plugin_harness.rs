@@ -10,7 +10,7 @@
     reason = "each test binary uses a different subset of these helpers"
 )]
 
-// Rust guideline compliant 2026-10-04
+// Rust guideline compliant 2026-10-06
 
 use std::fs;
 use std::net::IpAddr;
@@ -26,6 +26,7 @@ use overlay::{
 use package::registry::{Registry, RegistryState};
 use package::{Limits, PackageDigest};
 use pohunek_daemon::api::{ControlServer, DaemonState, HealthInfo};
+use pohunek_daemon::catalog_anchor::CatalogTrust;
 use pohunek_daemon::governance::HostGovernanceService;
 use pohunek_daemon::runtime::{
     EnvironmentSource, SubprocessWorkerEnvironment, SubprocessWorkerLauncher,
@@ -115,6 +116,12 @@ pub(crate) struct Harness {
 
 impl Harness {
     pub(crate) async fn start() -> Self {
+        Self::start_with_trust(CatalogTrust::Absent).await
+    }
+
+    /// Starts the daemon with `catalog_trust` as the host's catalog trust
+    /// anchor, the way a release daemon holds the one beside its executable.
+    pub(crate) async fn start_with_trust(catalog_trust: CatalogTrust) -> Self {
         let env = TestEnv::new().expect("create the hermetic test environment");
         let runtime = env.runtime_dir().join("pohunek");
         fs::create_dir_all(&runtime).expect("create the runtime directory");
@@ -144,6 +151,7 @@ impl Harness {
             // A profile-backed launch freezes a keyed revision, which needs the
             // host's revision key directory.
             host_state_dir: Some(env.root().join("host-state")),
+            catalog_trust,
             worker_runtime_root: Some(environment.runtime_home.join("pohunek/workers")),
             worker_state_root: Some(environment.state_home.join("pohunek/workers")),
             supervision: Some(

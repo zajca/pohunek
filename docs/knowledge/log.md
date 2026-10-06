@@ -1,5 +1,38 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-06, Codex hook reporter ancestry)
+
+- The real-Codex hook test requires the reporting process to descend from the
+  launched process instead of being its direct child, because an npm install
+  launches Node, then the native binary, then the app-server. The guide records
+  the observed process tree of both installs and which processes the package
+  matchers accept.
+
+## Unreleased (2026-10-06, Codex package tests install the package)
+
+- The Codex package tests install the built archive through a signed catalog
+  with a throwaway key and trust anchor, so the real-Codex tests launch through
+  the installed package and its version probe, and an always-running test drives
+  that probe with unsupported and supported banners. The fixture kills every
+  process it started (worker, Codex, detached app-server) on success and on
+  failure. The guide and the package README state that the package is official
+  only through a signed catalog and that no release catalog or key exists.
+
+## Unreleased (2026-10-05, Codex runtime package source)
+
+- Added the Codex runtime package guide and the package source
+  (`runtime-packages/codex`, `compat/codex/compatibility-lock.json`,
+  `compat/codex/screens/`): the descriptor and detection manifest equal the
+  built-in Codex files, plus a `semver-line-v1` probe for `codex-cli 0.160.x`.
+  The package can be served as the official `codex` runtime only through a signed
+  catalog, and no release catalog or signing key exists yet. The guide
+  records what was verified against a real Codex 0.160.0 and two gaps: the real
+  folder-trust dialog wording is not matched by `workspace_trust_prompt`, and
+  Codex runs its hooks from an app-server process below the launched one, so the
+  hook-reported conversation id is not recorded as the native reference.
+- The source map lists the package source, the lock, the screens, the tests, the
+  Responses stub and the `codex-package` CI job.
+
 ## Unreleased (2026-10-06, trust anchor ACL policy)
 
 - The catalog trust anchor and the catalog signing key file are judged on macOS

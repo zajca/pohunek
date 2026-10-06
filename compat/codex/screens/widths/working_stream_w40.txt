@@ -1,0 +1,24 @@
+  /model - choose what model and
+reasoning effort to use
+  /review - review any changes and find
+issues
+
+
+› HOLD EARLY a
+
+
+• working done
+
+  Worked for 3s • 9:53 PM
+
+
+› HOLD b
+
+
+• Working (2s • esc to interrupt)
+
+
+› Ask Codex to do anything
+
+  stub-model default · /tmp/cxw · ⠦
+  ← for agents · ? for shortc  ⚠ 1 · f2

@@ -207,8 +207,18 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("compat/codex"),
-        Effect::Packages(&["pohunek-daemon"]),
-        "Codex subagent hook contract embedded by the daemon",
+        Effect::Packages(&["pohunek-daemon", "pohunek-cli"]),
+        "Codex subagent hook contract embedded by the daemon; compatibility lock and captured screens read by pohunek-cli's codex_package test",
+    ),
+    rule(
+        Pattern::Dir("compat/pi"),
+        Effect::Packages(&["pohunek-cli"]),
+        "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests",
+    ),
+    rule(
+        Pattern::Dir("runtime-packages"),
+        Effect::Packages(&["pohunek-cli"]),
+        "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties and codex_package tests; the Codex tests also read the built-in Codex files the daemon embeds",
     ),
     reminding(
         Pattern::Dir("scripts"),
@@ -982,7 +992,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 8] = [
+        let cases: [(&str, &[&str]); 12] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -991,7 +1001,17 @@ mod tests {
                 "compat/hermes/compatibility-lock.json",
                 &["pohunek-daemon", "xtask"],
             ),
-            ("compat/codex/subagent-hooks.json", &["pohunek-daemon"]),
+            (
+                "compat/codex/subagent-hooks.json",
+                &["pohunek-daemon", "pohunek-cli"],
+            ),
+            (
+                "compat/codex/screens/idle.txt",
+                &["pohunek-daemon", "pohunek-cli"],
+            ),
+            ("compat/pi/screens/widths/idle_w20.txt", &["pohunek-cli"]),
+            ("runtime-packages/codex/detect.toml", &["pohunek-cli"]),
+            ("runtime-packages/README.md", &["pohunek-cli"]),
             (
                 "scripts/tests/smoke-hermes-plugin-release.sh",
                 &["pohunek-cli"],

@@ -9,7 +9,7 @@
 //! end. Signing keys are generated inside each test process from random bytes
 //! and never leave it.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-06
 
 #![cfg(unix)]
 
@@ -18,11 +18,9 @@ use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use ed25519_dalek::SigningKey;
 use package::{
-    build_archive, catalog_document_bytes, read_archive, sign_catalog, AnchorFile, ArchiveEntry,
-    Catalog, CatalogEntry, KeyId, Limits, PackageDigest, RootKey, ANCHOR_FILE_NAME,
-    CATALOG_SCHEMA_VERSION, MAX_ANCHOR_BYTES,
+    build_archive, read_archive, ArchiveEntry, CatalogEntry, Limits, PackageDigest,
+    ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES,
 };
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::fs::{write_executable, write_file};
@@ -32,6 +30,14 @@ use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde_json::Value;
 use tokio::net::UnixStream;
 
+#[path = "support/catalog_fixture.rs"]
+mod catalog_fixture;
+
+use catalog_fixture::{
+    anchor_for, anchor_with, catalog_of, host_platform, key_id, signed, test_key, ANY_CORE,
+    WINDOW_END, WINDOW_START,
+};
+
 /// Package id of the fixture archive; it serves a non-reserved runtime id.
 const PACKAGE_ID: &str = "acme.runtime.pi";
 
@@ -40,15 +46,6 @@ const RUNTIME: &str = "pi";
 
 /// Program the fixture runtime launches; it only has to exist.
 const PROGRAM: &str = "/bin/sh";
-
-/// Start of every signing window.
-const WINDOW_START: u64 = 1;
-
-/// End of every signing window and of a fresh catalog: 2100-01-01.
-const WINDOW_END: u64 = 4_102_444_800;
-
-/// A core range every released version satisfies.
-const ANY_CORE: &str = ">=0.0.0";
 
 /// Name of the daemon executable copied into the scenario's directory.
 const DAEMON_NAME: &str = "pohunekd";
@@ -60,44 +57,6 @@ priority = 100
 region = "whole_recent"
 any = [{ contains = "ready" }]
 "#;
-
-/// A fresh test keypair; the seed is random and exists only in this process.
-fn test_key() -> SigningKey {
-    let mut seed = [0_u8; 32];
-    getrandom::getrandom(&mut seed).expect("operating system randomness");
-    SigningKey::from_bytes(&seed)
-}
-
-fn key_id(key: &SigningKey) -> KeyId {
-    KeyId::derive(&key.verifying_key())
-}
-
-fn root_of(key: &SigningKey, not_before: u64, not_after: u64) -> RootKey {
-    RootKey::new(key.verifying_key().to_bytes(), not_before, not_after).expect("root key")
-}
-
-fn anchor_for(key: &SigningKey) -> Vec<u8> {
-    anchor_with(key, WINDOW_START, WINDOW_END, Vec::new())
-}
-
-fn anchor_with(key: &SigningKey, not_before: u64, not_after: u64, revoked: Vec<KeyId>) -> Vec<u8> {
-    AnchorFile::new(vec![root_of(key, not_before, not_after)], revoked)
-        .expect("anchor")
-        .to_bytes()
-        .expect("anchor bytes")
-}
-
-/// The platform name the daemon matches catalog entries against.
-fn host_platform() -> String {
-    let arch = std::env::consts::ARCH;
-    if cfg!(target_os = "macos") {
-        format!("{arch}-apple-darwin")
-    } else if cfg!(target_env = "musl") {
-        format!("{arch}-unknown-linux-musl")
-    } else {
-        format!("{arch}-unknown-linux-gnu")
-    }
-}
 
 fn runtime_document(version: &str) -> String {
     format!(
@@ -143,17 +102,6 @@ struct Built {
     digest: PackageDigest,
 }
 
-fn catalog_of(sequence: u64, expires_at: u64, entries: Vec<CatalogEntry>) -> Catalog {
-    Catalog {
-        schema_version: CATALOG_SCHEMA_VERSION,
-        sequence,
-        expires_at,
-        revoked_key_ids: Vec::new(),
-        revoked_digests: Vec::new(),
-        entries,
-    }
-}
-
 fn entry_for(built: &Built, version: &str, platform: &str, core: &str) -> CatalogEntry {
     CatalogEntry {
         package_id: PackageId::parse(PACKAGE_ID).expect("package id"),
@@ -163,10 +111,6 @@ fn entry_for(built: &Built, version: &str, platform: &str, core: &str) -> Catalo
         platforms: vec![platform.to_owned()],
         core: core.to_owned(),
     }
-}
-
-fn signed(key: &SigningKey, catalog: Catalog) -> Vec<u8> {
-    catalog_document_bytes(&sign_catalog(catalog, key).expect("sign")).expect("document")
 }
 
 /// What a scenario puts beside the daemon executable.

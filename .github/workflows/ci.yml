@@ -587,6 +587,7 @@ jobs:
       sdk_macos: ${{ steps.filter.outputs.sdk_macos }}
       hermes: ${{ steps.filter.outputs.hermes }}
       pi_package: ${{ steps.filter.outputs.pi_package }}
+      codex_package: ${{ steps.filter.outputs.codex_package }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
@@ -762,6 +763,23 @@ jobs:
             pi_package:
               - 'runtime-packages/**'
               - 'compat/pi/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/cli/**'
+              - 'crates/daemon/**'
+              - 'crates/package/**'
+              - 'crates/protocol/**'
+              - 'crates/session-worker/**'
+              - 'crates/worker-protocol/**'
+              - 'crates/terminal/**'
+              - 'crates/platform/**'
+              - 'crates/paths/**'
+            # Official Codex runtime package: same inputs as the Pi package
+            # with its own lock and captured screens. The real-Codex tests also
+            # drive the daemon's integration install and the hook reporters.
+            codex_package:
+              - 'runtime-packages/**'
+              - 'compat/codex/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'crates/cli/**'
@@ -1342,6 +1360,85 @@ jobs:
 
       - name: Drive the real Pi through the installed package
         run: cargo test --locked -p pohunek-cli --test pi_package -- --include-ignored --test-threads 1
+
+  # Official Codex runtime package against the real, locked Codex release. The
+  # job installs exactly `compat/codex/compatibility-lock.json`'s release from
+  # npm, builds the package with `cargo xtask package build`, and runs the
+  # always-on parity tests plus the real-Codex tests: a real `codex` with a
+  # fresh CODEX_HOME, a loopback Responses stub, hook trust written by pohunek's
+  # own integration install, and every live screen and title read through the
+  # package manifest. The tests install the built archive through a signed
+  # catalog with a throwaway key and trust anchor generated in the test process,
+  # so the launches go through the installed package and its version probe. The
+  # job has not run on a hosted runner yet: the bubblewrap sandbox and the Node
+  # of the runner image are the assumptions to check on its first run.
+  codex-package:
+    name: Codex runtime package (locked release, model-free)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.codex_package == 'true' }}
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+      POHUNEK_CODEX_E2E: "1"
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read the Codex lock
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=compat/codex/compatibility-lock.json
+          {
+            echo "npm=$(jq -er '.upstream.npm' "$lock")"
+            echo "release=$(jq -er '.upstream.release' "$lock")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install the locked Codex release
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/codex"
+          npm install --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund \
+            "${{ steps.lock.outputs.npm }}@${{ steps.lock.outputs.release }}"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          installed="$(env -i PATH="$prefix/bin:$PATH" HOME="$RUNNER_TEMP" CODEX_HOME="$RUNNER_TEMP/codex-version-home" codex --version)"
+          test "$installed" = "codex-cli ${{ steps.lock.outputs.release }}" \
+            || { echo "installed Codex '$installed' is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
+
+      - name: Install mold linker
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: codex-package
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the package deterministically
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo xtask package verify runtime-packages/codex
+          cargo xtask package build runtime-packages/codex --output "$RUNNER_TEMP/codex.tar.zst"
+          echo "POHUNEK_CODEX_PACKAGE_ARCHIVE=$RUNNER_TEMP/codex.tar.zst" >> "$GITHUB_ENV"
+
+      - name: Build the session worker
+        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+
+      - name: Drive the real Codex
+        run: cargo test --locked -p pohunek-cli --test codex_package -- --include-ignored --test-threads 1
 
   # Native Apple Silicon counterpart of `hermes-compatibility`. It provisions
   # the same locked Hermes runtime under the runner's /bin/bash 3.2 and BSD

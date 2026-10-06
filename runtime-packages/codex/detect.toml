@@ -1,0 +1,86 @@
+# Codex 0.160.0 activity manifest.
+#
+# Codex reports its state through the terminal title, so the idle, working and
+# blocked rules read the title; the screen rules cover prompts that block the
+# turn. The rules are verified against screens captured from a real Codex
+# (compat/codex/screens/, terminal widths 20 to 200); the unverified and
+# non-matching cases are listed in docs/knowledge/guides/codex-package.md.
+#
+# - osc_title_blocked: the title carries "Action Required" while a tool approval
+#   or a question waits for the user.
+# - osc_title_working: the title starts with a braille spinner while a turn runs.
+# - osc_title_idle: any other non-empty title means idle. Idle is read from the
+#   absence of the spinner and of "Action Required", not from a title of its own.
+# - workspace_trust_prompt: the first-run trust dialog pinned at the top of the
+#   screen.
+# - live_strong_blocker and weak_blocker: confirmation prompts on screen.
+
+[process]
+comm = ["^codex$"]
+cmdline = ['(^|/)codex($| )']
+
+[[rules]]
+id = "osc_title_blocked"
+state = "blocked"
+priority = 1100
+region = "osc_title"
+visible_blocker = true
+contains = ["Action Required"]
+
+[[rules]]
+id = "osc_title_working"
+state = "working"
+priority = 1050
+region = "osc_title"
+regex = ['^[\x{2800}-\x{28FF}] ']
+
+# The first-run workspace trust dialog is pinned at the top of the visible
+# screen. Require the exact question and both numbered choices so transcript
+# prose that merely discusses trusting a repository cannot trigger the rule.
+[[rules]]
+id = "workspace_trust_prompt"
+state = "blocked"
+priority = 1000
+region = "top_non_empty_lines(8)"
+visible_blocker = true
+all = [
+  { line_regex = ['(?i)^\s*(?:do you )?trust (?:the contents of this directory|this repository)\?\s*$'] },
+  { line_regex = ['(?i)^\s*(?:›|❯)?\s*1\.\s*yes\b'] },
+  { line_regex = ['(?i)^\s*2\.\s*no\b'] },
+]
+
+[[rules]]
+id = "live_strong_blocker"
+state = "blocked"
+priority = 900
+region = "after_last_prompt_marker"
+visible_blocker = true
+any = [
+  { contains = ["press enter to confirm or esc to cancel"] },
+  { contains = ["enter to submit answer"] },
+  { contains = ["enter to submit all"] },
+  { contains = ["allow command?"] },
+]
+
+[[rules]]
+id = "weak_blocker"
+state = "blocked"
+priority = 600
+region = "whole_recent"
+any = [
+  { contains = ["[y/n]"] },
+  { contains = ["yes (y)"] },
+  { contains = ["do you want to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
+  { contains = ["would you like to"], any = [{ contains = ["yes"] }, { contains = ["❯"] }] },
+]
+
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 100
+region = "osc_title"
+regex = ['\S']
+not = { any = [
+  { regex = ['^[\x{2800}-\x{28FF}]'] },
+  { contains = ["Action Required"] },
+] }

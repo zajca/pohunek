@@ -1,0 +1,51 @@
+# Runtime descriptor of the Codex CLI package.
+#
+# Verified against Codex 0.160.0 (compat/codex/compatibility-lock.json). The
+# supported release range below is `[min, below)`; the CI check keeps it equal
+# to the lock's range.
+
+schema = 1
+id = "pohunek.runtime.codex"
+version = "1.0.0"
+runtime_api = 1
+
+[runtime]
+id = "codex"
+name = "Codex"
+program = "codex"
+args = []
+detect_manifest = "detect.toml"
+prompt_arg = true
+# `codex --version` prints `codex-cli <release>` as its first stdout line;
+# warnings go to stderr, which the probe discards.
+version_probe = { parser = "semver-line-v1", args = ["--version"], min = "0.160.0", below = "0.161.0", line = "codex-cli {version}" }
+
+# Codex enables bracketed paste in its terminal UI; the submit key is a
+# separate Enter written after the paste.
+[input]
+bracketed_paste = true
+submit_delay_ms = 150
+text_policy = "unrestricted"
+
+[resume]
+supported = true
+reference_kind = "id"
+args = ["resume", "{reference}"]
+
+[fork]
+supported = false
+
+# Codex chooses the conversation id itself; the SessionStart hook of the
+# integration reports it.
+[native_reference]
+strategy = "hook"
+
+[integration]
+handler = "codex-hook-v1"
+hook_schema = "identity-subagent-v1"
+
+# Where Codex keeps its settings and hook registration: the variable it reads
+# to relocate its home, else this directory below the user's home.
+[config_home]
+env = "CODEX_HOME"
+default = ".codex"

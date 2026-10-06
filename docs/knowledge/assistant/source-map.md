@@ -528,13 +528,21 @@ Runtime package archive format:
 - `crates/cli/src/commands/plugin_profile.rs` — `pohunek plugin profile list|migrate`.
 - `docs/knowledge/guides/runtime-packages.md`
 - `docs/knowledge/guides/pi-package.md`
+- `docs/knowledge/guides/codex-package.md`
 - `runtime-packages/README.md` — layout convention of the official package sources.
 - `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference, existence check, version probe).
 - `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
 - `compat/pi/compatibility-lock.json` — pinned Pi release, supported range and Node requirement.
 - `compat/pi/screens/` — screens captured from a real Pi that the manifest test classifies.
 - `crates/cli/tests/pi_package.rs` — pure package tests and the opt-in real-Pi tests.
+- `runtime-packages/codex/runtime.toml` — Codex runtime descriptor (hook native reference, `semver-line-v1` version probe).
+- `runtime-packages/codex/detect.toml` — Codex detection manifest, equal to the built-in one.
+- `compat/codex/compatibility-lock.json` — pinned Codex release and supported range.
+- `compat/codex/screens/` — screens and terminal titles captured from a real Codex that the manifest test classifies.
+- `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the built-in), catalog-installed package launch and version-probe tests, and the opt-in real-Codex tests.
+- `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
+- `crates/cli/tests/support/catalog_fixture.rs` — throwaway signing key, trust anchor and signed catalog helpers shared by the catalog install tests.
 - `crates/cli/tests/support/model_stub.rs` — loopback chat-completions stub used instead of a model provider.
 - `crates/package/src/registry.rs` — owner-private registry record, transactions, retention and uninstall.
 - `crates/package/tests/archive.rs`

@@ -1,0 +1,24 @@
+current session
+configuration
+  /permissions -
+choose what Codex is
+allowed to do
+  /model - choose
+what model and
+reasoning effort to
+use
+  /review - review
+any changes and find
+issues
+
+
+› HOLD EARLY a
+
+
+• Working (2s • esc…
+
+
+› Ask Codex to do a
+
+  stub-model defaul…
+  ← for a  ⚠ 1 · f2
