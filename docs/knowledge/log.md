@@ -1,5 +1,13 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-06, Codex hook reporter ancestry)
+
+- The real-Codex hook test requires the reporting process to descend from the
+  launched process instead of being its direct child, because an npm install
+  launches Node, then the native binary, then the app-server. The guide records
+  the observed process tree of both installs and which processes the package
+  matchers accept.
+
 ## Unreleased (2026-10-06, Codex package tests install the package)
 
 - The Codex package tests install the built archive through a signed catalog
@@ -20,7 +28,7 @@
   catalog, and no release catalog or signing key exists yet. The guide
   records what was verified against a real Codex 0.160.0 and two gaps: the real
   folder-trust dialog wording is not matched by `workspace_trust_prompt`, and
-  Codex runs its hooks from an app-server child of the launched process, so the
+  Codex runs its hooks from an app-server process below the launched one, so the
   hook-reported conversation id is not recorded as the native reference.
 - The source map lists the package source, the lock, the screens, the tests, the
   Responses stub and the `codex-package` CI job.

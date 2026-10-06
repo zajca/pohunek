@@ -905,6 +905,29 @@ fn the_process_matchers_accept_the_observed_codex_process_forms() {
         "codex",
         &["/home/user/.codex/packages/app-server-daemon/releases/local-1"]
     )));
+    // An npm install starts `node …/@openai/codex/bin/codex.js`, which spawns
+    // the native binary below the package and that binary starts the
+    // app-server. The launcher matches neither pattern; the processes it
+    // starts do.
+    let native = "/opt/npm/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex";
+    assert!(!matchers.matches(&process(
+        "node",
+        &[
+            "node",
+            "/opt/npm/lib/node_modules/@openai/codex/bin/codex.js"
+        ]
+    )));
+    assert!(matchers.matches(&process("codex", &[native])));
+    assert!(matchers.matches(&process(
+        "codex",
+        &[
+            "/home/user/.codex/packages/app-server-daemon/releases/0.160.0-x86_64-unknown-linux-musl/bin/codex",
+            "app-server",
+            "--listen",
+            "unix://",
+            "--managed-daemon"
+        ]
+    )));
     for cmdline in [
         &["/usr/lib/openai-codex/bin/codex"][..],
         &["/usr/lib/openai-codex/bin/codex", "resume", "0197aaaa"],
@@ -1597,18 +1620,60 @@ fn parent_pid(pid: u64) -> u64 {
         .expect("a PPid line")
 }
 
+/// Deepest process tree [`ancestry`] follows.
+///
+/// A launcher, the agent and its helper are three levels; the bound keeps a
+/// walk that never meets its target finite.
+const MAX_ANCESTRY_DEPTH: usize = 16;
+
+/// The process ids from `pid` up through its parents, ending at `ancestor` or
+/// after [`MAX_ANCESTRY_DEPTH`] steps, and whether `ancestor` was reached.
+fn ancestry(pid: u64, ancestor: u64) -> (Vec<u64>, bool) {
+    let mut chain = vec![pid];
+    while chain.len() <= MAX_ANCESTRY_DEPTH {
+        let last = *chain.last().expect("a non-empty chain");
+        if last == ancestor {
+            return (chain, true);
+        }
+        if last <= 1 {
+            break;
+        }
+        chain.push(parent_pid(last));
+    }
+    (chain, false)
+}
+
+/// One line per process of `chain`: id, executable and command line.
+fn describe_chain(chain: &[u64]) -> String {
+    chain
+        .iter()
+        .map(|pid| {
+            let exe = fs::read_link(format!("/proc/{pid}/exe"))
+                .map_or_else(|_| "?".to_owned(), |path| path.display().to_string());
+            let command = fs::read(format!("/proc/{pid}/cmdline")).map_or_else(
+                |_| "?".to_owned(),
+                |bytes| String::from_utf8_lossy(&bytes).replace('\0', " "),
+            );
+            format!("{pid} exe={exe} cmdline={command}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Pins a gap of Codex 0.160.0 against the shared integration: Codex runs its
-/// hooks from a `codex app-server` child of the process pohunek launched, so
-/// the daemon records the conversation id as the nested active agent's and
+/// hooks from a `codex app-server` process below the one pohunek launched (a
+/// child of it, or of the native binary an npm launcher starts), so the daemon
+/// records the conversation id as the nested active agent's and
 /// never as the session's native reference, and `session resume` has nothing to
 /// resume with.
 ///
-/// When the daemon accepts the app-server child as the launch agent, this test
+/// When the daemon accepts the app-server process as the launch agent, this test
 /// fails on its first assertion and is replaced by a resume test that drives
 /// `codex resume <id>` through the package.
 #[tokio::test]
 #[ignore = "needs a real `codex` on PATH; run with POHUNEK_CODEX_E2E=1 and --ignored"]
-async fn a_real_codex_reports_hooks_from_its_app_server_child_so_resume_has_no_reference() {
+async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_so_resume_has_no_reference(
+) {
     require_real_codex();
     let fixture = Fixture::start().await;
     fixture.install_integration().await;
@@ -1648,10 +1713,12 @@ async fn a_real_codex_reports_hooks_from_its_app_server_child_so_resume_has_no_r
         reporter_pid, launch_pid,
         "Codex 0.160.0 runs hooks outside the launched process"
     );
-    assert_eq!(
-        parent_pid(reporter_pid),
-        launch_pid,
-        "the reporting process is the app-server child of the launched process"
+    let (chain, reached) = ancestry(reporter_pid, launch_pid);
+    let tree = describe_chain(&chain);
+    eprintln!("process chain from the reporter up to the launch process:\n{tree}");
+    assert!(
+        reached,
+        "the reporting process descends from the launched process; its ancestry:\n{tree}"
     );
     assert!(
         reported["native_session_id"].is_null(),
