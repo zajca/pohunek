@@ -915,12 +915,15 @@ impl Store {
     }
 
     /// Upserts one logical session and preserves every other record kind.
+    ///
+    /// A terminal record drops the session's resume binding in the same
+    /// rewrite.
     pub fn record_session(&self, record: &SessionRecord) -> io::Result<SessionWriteOutcome> {
         let _guard = self
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let (mut resume, worktrees, projects, mut sessions) = self.read_all()?;
         if let Some(existing) = sessions
             .iter_mut()
             .find(|existing| existing.session_id == record.session_id)
@@ -935,6 +938,7 @@ impl Store {
         } else {
             sessions.push(record.clone());
         }
+        drop_resume_of_terminal_session(&mut resume, record);
         match self.write_all(&resume, &worktrees, &projects, &sessions)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
             MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
@@ -948,6 +952,9 @@ impl Store {
     /// Conditionally replaces one session only when its durable record still
     /// equals `expected`, preventing a stale same-runtime snapshot from ever
     /// reaching the authoritative path.
+    ///
+    /// A terminal record drops the session's resume binding in the same
+    /// rewrite.
     pub fn record_session_if_current(
         &self,
         expected: &SessionRecord,
@@ -957,7 +964,7 @@ impl Store {
             .write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (resume, worktrees, projects, mut sessions) = self.read_all()?;
+        let (mut resume, worktrees, projects, mut sessions) = self.read_all()?;
         let Some(existing) = sessions
             .iter_mut()
             .find(|existing| existing.session_id == record.session_id)
@@ -974,6 +981,7 @@ impl Store {
         preserve_newer_native_identity(existing, &mut replacement);
         keep_initial_input_settled(existing, &mut replacement);
         *existing = replacement;
+        drop_resume_of_terminal_session(&mut resume, record);
         match self.write_all(&resume, &worktrees, &projects, &sessions)? {
             MetadataWriteOutcome::Synced => Ok(SessionWriteOutcome::Applied),
             MetadataWriteOutcome::CommittedDurabilityUncertain(error) => {
@@ -1531,6 +1539,18 @@ impl Store {
     }
 }
 
+/// Removes the resume binding of a session whose record is terminal.
+///
+/// A terminal session is recovered from its record, and its binding is
+/// removed with the same rewrite that stores the terminal record, so no
+/// reader or concurrent writer ever sees a terminal record next to the
+/// binding of a run that has ended.
+fn drop_resume_of_terminal_session(resume: &mut Vec<ResumeBinding>, record: &SessionRecord) {
+    if record.info.state.is_terminal() {
+        resume.retain(|binding| binding.session_id != record.session_id);
+    }
+}
+
 fn fs_error_to_io(error: FsError) -> io::Error {
     let kind = match &error {
         FsError::InvalidAbsolutePath { .. }
@@ -2034,6 +2054,72 @@ mod tests {
             loaded[0].runtime.worker_instance_id.as_deref(),
             Some("instance-1")
         );
+    }
+
+    /// A terminal record and the binding of its ended run never coexist in
+    /// the store, whichever write stores the record.
+    #[test]
+    fn a_terminal_session_record_drops_its_resume_binding_in_one_write() {
+        let session = |state: &str| -> super::SessionRecord {
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "session_id": "s-1",
+                "desired_state": "running",
+                "info": {
+                    "id": "s-1",
+                    "capabilities": {"resume": false, "fork": false},
+                    "agent": "claude",
+                    "agent_base": "claude",
+                    "cwd": "/workspace",
+                    "pid": 1,
+                    "runtime": {"state": "live", "runtime_generation": "1", "worker_id": "w-1"},
+                    "cols": 80,
+                    "rows": 24,
+                    "state": state,
+                    "state_source": "process",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                },
+                "runtime": {"state": "live", "worker_id": "w-1", "runtime_id": "instance-1"}
+            }))
+            .expect("decode session record")
+        };
+        let store = Store::new(temp_store_path("terminal-drops-binding"));
+        let running = session("running");
+        store.record_session(&running).expect("record running");
+        store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect("record binding");
+        assert_eq!(store.load_resume().expect("bindings").len(), 1);
+
+        store
+            .record_session(&running)
+            .expect("rewrite while running");
+        assert_eq!(
+            store.load_resume().expect("bindings").len(),
+            1,
+            "a live session keeps its binding"
+        );
+
+        let done = session("done");
+        let stored = store.load_sessions().expect("sessions").remove(0);
+        assert!(
+            matches!(
+                store
+                    .record_session_if_current(&stored, &done)
+                    .expect("commit the exit"),
+                super::SessionWriteOutcome::Applied
+            ),
+            "the conditional commit applies"
+        );
+        assert!(store.load_resume().expect("bindings").is_empty());
+
+        store
+            .record_resume(&resume("s-1", "native-1"))
+            .expect("record a stale binding");
+        let failed = session("failed");
+        store.record_session(&failed).expect("record failed");
+        assert!(store.load_resume().expect("bindings").is_empty());
     }
 
     fn launch(kind: SessionRefKind, resume: &[&str], fork: Option<&[&str]>) -> NativeSessionLaunch {
