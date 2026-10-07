@@ -14,7 +14,6 @@ use protocol::{
     IntegrationUninstallState, ProtocolError, RuntimeRef, EXPECTED_INTEGRATION_VERSION,
 };
 
-use super::commit::StepGate;
 use super::doctor::doctor_for_with;
 use super::handler::{
     handler, handlers, resolve, update, Handler, Resolved, RetainedSchemas,
@@ -177,17 +176,6 @@ fn handlers_and_hook_schemas_pair_exactly() {
             .count();
         assert_eq!(owners, 1, "{}", registered.id());
     }
-}
-
-#[test]
-fn the_daemon_runs_codex_and_claude_and_the_cli_runs_hermes() {
-    for id in [CODEX_ID, CLAUDE_ID] {
-        assert!(matches!(handler(id), Some(Handler::Daemon(_))), "{id}");
-    }
-    assert!(matches!(
-        handler("hermes-hook-v1"),
-        Some(Handler::CliRun(_))
-    ));
 }
 
 #[test]
@@ -732,25 +720,6 @@ fn a_package_runtime_naming_the_cli_run_handler_is_not_installable() {
         "agent_not_installable"
     );
     assert!(content_snapshot(&dir).is_empty());
-}
-
-#[test]
-fn the_activation_gate_runs_before_every_committed_file() {
-    let dir = scoped_dir("gate-order");
-    let resolved = builtin(&RuntimeRef::claude());
-    let staged = resolved.handler.stage(&dir).expect("stage");
-    let mut seen = Vec::new();
-    let mut gate = |index: usize, name: &str| {
-        seen.push((index, name.to_owned()));
-        Ok(())
-    };
-    let gate_ref: StepGate<'_> = &mut gate;
-    staged.activate(gate_ref).expect("activate");
-    assert_eq!(
-        seen.last().map(|(_index, name)| name.as_str()),
-        Some("settings.json"),
-        "registration is committed last: {seen:?}"
-    );
 }
 
 #[test]

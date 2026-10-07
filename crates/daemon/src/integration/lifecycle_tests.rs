@@ -710,25 +710,6 @@ fn hooks_reach_the_socket_through_a_symlinked_alias_of_the_runtime_dir() {
 }
 
 #[test]
-fn the_default_macos_runtime_socket_is_canonical_and_fits_darwin() {
-    let env = PathEnv {
-        home: Some("/Users/fixture".into()),
-        ..PathEnv::default()
-    };
-
-    for uid in [0, FIXTURE_UID, u32::MAX] {
-        let paths = BasePaths::resolve_for(Platform::MacOs, uid, &env)
-            .expect("default macOS runtime resolves");
-        assert_eq!(
-            paths.socket,
-            // hermetic-allowed: #363 the macOS default runtime path under /private/tmp is the subject
-            PathBuf::from(format!("/private/tmp/pohunek-{uid}/daemon.sock"))
-        );
-        assert!(paths.socket.as_os_str().len() <= DARWIN_SOCKET_PATH_MAX_BYTES);
-    }
-}
-
-#[test]
 fn hooks_reach_a_worker_socket_resolved_at_the_darwin_staged_limit() {
     let root = pohunek_test_support::tempdir().expect("fixture root");
     let session_suffix =

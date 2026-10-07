@@ -479,6 +479,14 @@ async fn a_report_of_a_newer_asset_set_is_refused_by_a_session_on_an_older_schem
         older.subagents
     );
     assert_eq!(older.hook_schema.as_deref(), Some("identity-v1"));
+    assert_eq!(
+        older
+            .active_identity
+            .as_ref()
+            .map(|identity| identity.provider.as_str()),
+        Some("claude"),
+        "the older schema still admits the identity report"
+    );
 
     let current = report_through_worker("identity-subagent-v1").await;
     let [subagent] = current.subagents.as_slice() else {
@@ -486,13 +494,11 @@ async fn a_report_of_a_newer_asset_set_is_refused_by_a_session_on_an_older_schem
     };
     assert_eq!(subagent.id, "sub-1");
     assert_eq!(subagent.provider, "claude");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn identity_reports_of_an_older_asset_set_stay_admitted_after_a_schema_update() {
-    for schema in ["identity-v1", "identity-subagent-v1"] {
-        let snapshot = report_through_worker(schema).await;
-        let identity = snapshot.active_identity.expect("the identity report");
-        assert_eq!(identity.provider, "claude", "{schema}");
-    }
+    assert_eq!(
+        current
+            .active_identity
+            .as_ref()
+            .map(|identity| identity.provider.as_str()),
+        Some("claude")
+    );
 }

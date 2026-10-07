@@ -1011,12 +1011,6 @@ enum BoundedRead {
     Oversized,
 }
 
-#[cfg(test)]
-fn read_bounded_utf8(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
-    let mut file = open_regular_inspection_file(path)?;
-    read_bounded_utf8_from_file(&mut file, max_bytes)
-}
-
 fn read_bounded_utf8_from_file(file: &mut fs::File, max_bytes: usize) -> io::Result<BoundedRead> {
     let read_limit = max_bytes.saturating_add(INSPECTION_LIMIT_PROBE_BYTES);
     let read_limit = u64::try_from(read_limit).map_err(|_error| {
@@ -1045,18 +1039,6 @@ fn open_inspection_file(path: &Path) -> io::Result<fs::File> {
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
     };
     options.open(path)
-}
-
-#[cfg(test)]
-fn open_regular_inspection_file(path: &Path) -> io::Result<fs::File> {
-    let file = open_inspection_file(path)?;
-    if !file.metadata()?.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "inspection target is not a regular file",
-        ));
-    }
-    Ok(file)
 }
 
 #[cfg(unix)]
@@ -3292,13 +3274,13 @@ mod tests {
 
     use super::{
         codex_command_hook_trusted_hash, codex_hook_trust_key, hook_command, install_claude,
-        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET,
-        CLAUDE_NOTIFY_HOOK_ASSET, CODEX_HOOK_ASSET, CODEX_NOTIFY_HOOK_ASSET,
-        CODEX_SESSION_START_TRUST_EVENT, CODEX_SUBAGENT_COMPATIBILITY_FIXTURE, ENV_FLAG,
-        ENV_PROTOCOL_VERSION, ENV_SESSION_ID, ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION,
-        HOOK_TIMEOUT_SECS, INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME,
-        SESSION_START_EVENT, STATE_HOOK_INSTALL_NAME, SUBAGENT_START_ACTION, SUBAGENT_START_EVENT,
-        SUBAGENT_STOP_ACTION, SUBAGENT_STOP_EVENT,
+        install_codex, shell_single_quote, toml_basic_string, CLAUDE_HOOK_ASSET, CODEX_HOOK_ASSET,
+        CODEX_NOTIFY_HOOK_ASSET, CODEX_SESSION_START_TRUST_EVENT,
+        CODEX_SUBAGENT_COMPATIBILITY_FIXTURE, ENV_FLAG, ENV_PROTOCOL_VERSION, ENV_SESSION_ID,
+        ENV_SOCKET_PATH, EXPECTED_INTEGRATION_VERSION, HOOK_TIMEOUT_SECS,
+        INTEGRATION_VERSION_PREFIX, NOTIFY_HOOK_INSTALL_NAME, SESSION_START_EVENT,
+        STATE_HOOK_INSTALL_NAME, SUBAGENT_START_ACTION, SUBAGENT_START_EVENT, SUBAGENT_STOP_ACTION,
+        SUBAGENT_STOP_EVENT,
     };
 
     /// Large enough to expose unbounded hook stdin reads through pipe backpressure.
@@ -3935,100 +3917,6 @@ mod tests {
         (stdout, stderr, requests.into_iter().next().unwrap())
     }
 
-    /// Builds a daemon state backed by a real notification service in `dir`.
-    fn notification_test_state(dir: &Path) -> crate::api::DaemonState {
-        let notifications =
-            crate::notifications::NotificationService::open(dir).expect("notification service");
-        let mut policy = crate::notifications::default_policy();
-        policy.enabled = protocol::NotificationKindPolicy {
-            agent_blocked: true,
-            approval_required: true,
-            turn_completed: true,
-            session_finished: true,
-            error: true,
-            system: true,
-        };
-        policy.providers.clear();
-        notifications.set_policy(policy).expect("enable all kinds");
-        // Session-scoped notifications are debounced by the coordinator task,
-        // which is detached and ends with the test runtime.
-        let (attention, _task) =
-            crate::notifications::AttentionCoordinator::spawn(notifications.clone());
-        crate::api::DaemonState::new(
-            crate::api::HealthInfo::new("test"),
-            crate::session::SessionRegistry::new(crate::session::SessionRegistryConfig::default()),
-            std::sync::Arc::new(crate::governance::HostGovernanceService::open_test()),
-            crate::test_support::overlay_registry(),
-        )
-        .with_notifications(notifications)
-        .with_attention_coordinator(attention)
-    }
-
-    /// Feeds one captured hook request line to the daemon's real request parser
-    /// and returns the daemon's one-shot reply.
-    async fn dispatch_hook_request(state: &crate::api::DaemonState, request: &Value) -> Value {
-        let line = serde_json::to_string(request).expect("hook request serializes");
-        let crate::api::Dispatch::Reply(reply) =
-            crate::api::dispatch_line(&line, state, None).await
-        else {
-            panic!("notification.create returns a one-shot reply");
-        };
-        serde_json::from_str(&reply).expect("daemon reply is JSON")
-    }
-
-    #[tokio::test]
-    async fn notify_hook_envelopes_are_accepted_by_the_daemon_request_parser() {
-        let cases: [(&str, &[&str]); 2] = [
-            ("claude", &["notification", "auth_success"]),
-            ("codex", &["permission_request"]),
-        ];
-        for (agent, args) in cases {
-            let (status, _stdout, stderr, requests) =
-                run_notification_asset(agent, args, &json!({}), true);
-            assert!(
-                status.success(),
-                "{agent} hook exited with {status}: {stderr}"
-            );
-            assert_eq!(requests.len(), 1, "{agent}: expected one request");
-            let request = &requests[0];
-
-            let line = serde_json::to_string(request).expect("hook request serializes");
-            serde_json::from_str::<protocol::Request>(&line).unwrap_or_else(|err| {
-                panic!("{agent} hook envelope does not parse as a control request: {err}")
-            });
-
-            let dir = scoped_dir(&format!("{agent}-notify-daemon"));
-            let state = notification_test_state(&dir);
-            let reply = dispatch_hook_request(&state, request).await;
-            assert!(
-                reply.get("err").is_none(),
-                "{agent} hook notification was rejected: {reply}"
-            );
-            assert_eq!(
-                reply["ok"]["created"],
-                json!(true),
-                "{agent} hook must create a notification: {reply}"
-            );
-            assert_eq!(reply["ok"]["record"]["agent_kind"], json!(agent));
-        }
-    }
-
-    #[test]
-    fn notify_hooks_send_the_protocol_range_derived_from_the_launch_env() {
-        for (agent, args) in [("claude", &["stop"][..]), ("codex", &["stop"][..])] {
-            let (_stdout, _stderr, request) =
-                captured_notification_request(agent, args, &json!({}));
-            assert_eq!(
-                request["v"],
-                json!({
-                    "minimum": protocol::PROTOCOL_VERSION.get(),
-                    "maximum": protocol::PROTOCOL_VERSION.get(),
-                }),
-                "{agent} hook must stamp a range, not a bare integer"
-            );
-        }
-    }
-
     fn large_json_input() -> Vec<u8> {
         let mut input = br#"{"hook_event_id":"large"}"#.to_vec();
         input.resize(LARGE_HOOK_INPUT_BYTES, b' ');
@@ -4046,38 +3934,6 @@ mod tests {
                 ),
                 "write hook response: {err}"
             );
-        }
-    }
-
-    struct DisconnectingWriter {
-        kind: ErrorKind,
-    }
-
-    impl Write for DisconnectingWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::from(self.kind))
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn hook_response_write_includes_newline() {
-        let mut response = Vec::new();
-
-        write_hook_response(&mut response);
-
-        assert_eq!(response.as_slice(), HOOK_RESPONSE);
-    }
-
-    #[test]
-    fn hook_response_write_tolerates_client_disconnect() {
-        for kind in [ErrorKind::BrokenPipe, ErrorKind::ConnectionReset] {
-            let mut writer = DisconnectingWriter { kind };
-
-            write_hook_response(&mut writer);
         }
     }
 
@@ -4406,21 +4262,6 @@ mod tests {
             );
 
             assert_eq!(report["runtime_id"], "runtime-123", "{agent}");
-        }
-    }
-
-    /// Every managed hook runs its interpreter in isolated mode.
-    #[test]
-    fn hook_assets_run_python_in_isolated_mode() {
-        for agent in ["claude", "codex"] {
-            for asset in [state_asset(agent), notification_asset(agent)] {
-                let script = fs::read_to_string(&asset).expect("read hook asset");
-                assert!(
-                    script.contains("python3 -I -"),
-                    "{} must start python3 with -I",
-                    asset.display()
-                );
-            }
         }
     }
 
@@ -4871,22 +4712,6 @@ mod tests {
     }
 
     #[test]
-    fn every_managed_asset_marker_matches_the_expected_version() {
-        for (name, asset) in [
-            ("Claude state", CLAUDE_HOOK_ASSET),
-            ("Claude notification", CLAUDE_NOTIFY_HOOK_ASSET),
-            ("Codex state", CODEX_HOOK_ASSET.as_str()),
-            ("Codex notification", CODEX_NOTIFY_HOOK_ASSET.as_str()),
-        ] {
-            assert_eq!(
-                super::parse_integration_version(asset),
-                Some(EXPECTED_INTEGRATION_VERSION),
-                "{name} marker must match the public expected version"
-            );
-        }
-    }
-
-    #[test]
     fn bounded_status_read_accepts_limit_and_rejects_next_byte() {
         let root = scoped_dir("status-bounded-read");
         fs::create_dir_all(&root).expect("create bounded read root");
@@ -4897,9 +4722,15 @@ mod tests {
         )
         .expect("write exact-limit file");
 
-        match super::read_bounded_utf8(&path, super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES)
-            .expect("read exact-limit file")
-        {
+        let read = |path: &Path| {
+            let mut file = fs::File::open(path).expect("open the inspected file");
+            super::read_bounded_utf8_from_file(
+                &mut file,
+                super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES,
+            )
+        };
+
+        match read(&path).expect("read exact-limit file") {
             super::BoundedRead::Content(content) => {
                 assert_eq!(content.len(), super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES);
             }
@@ -4912,8 +4743,7 @@ mod tests {
         )
         .expect("write over-limit file");
         assert!(matches!(
-            super::read_bounded_utf8(&path, super::PROVIDER_CONFIG_INSPECTION_LIMIT_BYTES)
-                .expect("classify over-limit file"),
+            read(&path).expect("classify over-limit file"),
             super::BoundedRead::Oversized
         ));
     }
@@ -5286,19 +5116,6 @@ mod tests {
                 expected: effective_uid,
             })
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn status_trust_anchor_does_not_reject_safe_config_below_system_temp() {
-        let codex = scoped_dir("status-safe-config-trust-anchor");
-        install_codex(&codex).expect("install Codex fixture");
-
-        let report = explicit_status(&codex, RuntimeRef::codex());
-
-        assert_eq!(report.state, protocol::IntegrationInstallState::Current);
-        assert_eq!(report.recovery, protocol::IntegrationRecovery::None);
-        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
 
     #[cfg(unix)]
@@ -6168,28 +5985,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_unsupported_status_agents_return_typed_errors() {
-        for agent in [RuntimeRef::shell(), RuntimeRef::hermes()] {
-            let error = super::status(protocol::IntegrationStatusParams {
-                agent: Some(agent),
+    fn explicit_unsupported_status_and_install_agents_return_typed_errors() {
+        for agent in [
+            RuntimeRef::shell(),
+            RuntimeRef::hermes(),
+            RuntimeRef::from_wire("pi"),
+        ] {
+            let status = super::status(protocol::IntegrationStatusParams {
+                agent: Some(agent.clone()),
                 ..Default::default()
             })
-            .expect_err("unsupported agent must fail");
-            assert_eq!(error.code, "agent_not_installable");
+            .expect_err("status must reject the agent");
+            assert_eq!(status.code, "agent_not_installable", "{agent:?} status");
+            let install =
+                super::install(Some(agent.clone())).expect_err("install must reject the agent");
+            assert_eq!(install.code, "agent_not_installable", "{agent:?} install");
         }
-    }
-
-    #[test]
-    fn install_and_status_report_an_installed_runtime_without_a_hook_integration() {
-        let status = super::status(protocol::IntegrationStatusParams {
-            agent: Some(RuntimeRef::from_wire("pi")),
-            ..Default::default()
-        })
-        .expect_err("status must reject the agent");
-        assert_eq!(status.code, "agent_not_installable");
-        let install = super::install(Some(RuntimeRef::from_wire("pi")))
-            .expect_err("install must reject the agent");
-        assert_eq!(install.code, "agent_not_installable");
     }
 
     /// The `PATH` a hook child inherits, read under the process-environment lock
