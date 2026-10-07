@@ -56,7 +56,7 @@ use catalog_fixture::{
 };
 use messages_stub::MessagesStub;
 use plugin_harness::{path_str, Harness};
-use process_guard::ProcessGuard;
+use process_guard::{ChildGuard, ProcessGuard};
 
 /// Directory of the package source, relative to the workspace root.
 const PACKAGE_DIR: &str = "runtime-packages/claude";
@@ -2291,7 +2291,7 @@ async fn the_package_version_probe_refuses_an_unsupported_claude_and_starts_the_
 /// Starts a same-user process below `root` that hides its environment from
 /// procfs (`PR_SET_DUMPABLE` off), the way a non-dumpable helper or another
 /// test's process caught between images does, and returns it.
-fn spawn_non_dumpable(root: &Path) -> std::process::Child {
+fn spawn_non_dumpable(root: &Path) -> ChildGuard {
     /// `prctl` option that clears the dumpable flag.
     const PR_SET_DUMPABLE: u32 = 4;
     /// Seconds the helper sleeps; the process guard ends it earlier.
@@ -2299,13 +2299,15 @@ fn spawn_non_dumpable(root: &Path) -> std::process::Child {
     let code = format!(
         "import ctypes, time; ctypes.CDLL(None).prctl({PR_SET_DUMPABLE}, 0, 0, 0, 0); time.sleep({HELPER_LIFETIME_SECS})"
     );
-    std::process::Command::new("python3")
-        .args(["-c", &code])
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .expect("start the non-dumpable helper")
+    ChildGuard::new(
+        std::process::Command::new("python3")
+            .args(["-c", &code])
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("start the non-dumpable helper"),
+    )
 }
 
 /// A session removal is judged on the runtime's own processes: a same-user
@@ -2325,12 +2327,11 @@ async fn a_session_removal_ignores_an_unreadable_process_of_the_test_host() {
         .as_str()
         .expect("session id")
         .to_owned();
-    let mut helper = spawn_non_dumpable(&root);
+    // Ends the helper on every path out of the test, a panic included.
+    let _helper = spawn_non_dumpable(&root);
     fixture.stop(&id).await;
 
     let (code, removed) = fixture.harness.json(&["session", "rm", &id]).await;
-    let _ = helper.kill();
-    let _ = helper.wait();
     assert_eq!(code, 0, "{removed}");
     fixture.finish().await;
 }
@@ -2363,6 +2364,24 @@ fn spawn_detached_sleeper(env: &pohunek_test_support::env::TestEnv) -> i32 {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn the_child_guard_terminates_a_non_dumpable_helper_when_the_test_unwinds() {
+    let env = pohunek_test_support::env::TestEnv::new().expect("create the environment");
+    let pid = std::cell::Cell::new(0);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let helper = spawn_non_dumpable(env.root());
+        pid.set(i32::try_from(helper.id()).expect("a process id"));
+        assert!(is_alive(pid.get()), "the helper runs");
+        panic!("a failing step after the helper started");
+    }));
+    assert!(outcome.is_err(), "the closure panicked");
+    assert!(
+        !is_alive(pid.get()),
+        "the guard terminated the helper during the unwind"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn the_process_guard_terminates_a_detached_process_when_the_test_unwinds() {
     let env = pohunek_test_support::env::TestEnv::new().expect("create the environment");
     let pid = std::cell::Cell::new(0);
@@ -2385,10 +2404,12 @@ fn the_process_guard_leaves_a_process_of_another_environment_alone() {
     let ours = pohunek_test_support::env::TestEnv::new().expect("create the environment");
     let other = pohunek_test_support::env::TestEnv::new().expect("create the environment");
     let foreign = spawn_detached_sleeper(&other);
+    // Ends the foreign process if an assertion fails before the explicit reap.
+    let foreign_guard = ProcessGuard::new(other.root());
     let guard = ProcessGuard::new(ours.root());
     guard.reap();
     assert!(is_alive(foreign), "a process below another root survives");
-    ProcessGuard::new(other.root()).reap();
+    foreign_guard.reap();
     assert!(!is_alive(foreign));
 }
 

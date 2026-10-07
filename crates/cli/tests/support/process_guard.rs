@@ -104,3 +104,34 @@ impl Drop for ProcessGuard {
         }
     }
 }
+
+/// A spawned child that is killed and waited for when dropped, also while a
+/// panic unwinds.
+///
+/// For helpers [`ProcessGuard`] cannot find: a process that hides its
+/// executable, working directory and environment (non-dumpable) is invisible to
+/// the `/proc` scan, and dropping a bare [`std::process::Child`] leaves the
+/// process running. Create it right after the spawn, before any fallible step.
+pub(crate) struct ChildGuard {
+    child: std::process::Child,
+}
+
+impl ChildGuard {
+    pub(crate) fn new(child: std::process::Child) -> Self {
+        Self { child }
+    }
+
+    /// The child's process id.
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        // The child may have exited already; a failed kill or wait leaves
+        // nothing further to do.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
