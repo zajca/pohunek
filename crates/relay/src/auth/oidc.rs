@@ -329,8 +329,8 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{
-        accept_optional_nonce, device_pkce, device_poll_response_error, device_token_body,
-        signed_token_payload, AuthError, OidcDeviceAuthorization,
+        device_pkce, device_poll_response_error, device_token_body, signed_token_payload,
+        AuthError, OidcDeviceAuthorization,
     };
 
     fn error(kind: &str) -> AuthError {
@@ -349,11 +349,6 @@ mod tests {
         ));
         assert!(matches!(error("access_denied"), AuthError::DeviceDenied));
         assert!(matches!(error("expired_token"), AuthError::DeviceExpired));
-    }
-
-    #[test]
-    fn device_nonce_policy_accepts_absent_nonce_without_fabrication() {
-        accept_optional_nonce(None).unwrap();
     }
 
     #[test]

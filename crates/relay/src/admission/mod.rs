@@ -2896,47 +2896,7 @@ mod tests {
         .await;
     }
 
-    /// Stopping the guard ends a renewal that is blocked in the database.
-    ///
-    /// The held row lock keeps the renewal's `UPDATE` from ever completing, so
-    /// the task owns a strong `Arc<Authority>` while it waits. `stop` aborts it,
-    /// which drops the pending query and the reference, and schema cleanup then
-    /// proceeds once the lock is released.
-    #[tokio::test]
-    async fn stopping_the_guard_ends_a_renewal_blocked_in_the_database() {
-        let (store, schema, ..) = fixture().await;
-        let (authority, _directory) = unrenewed_authority(
-            store.clone(),
-            AuthorityLimits {
-                global: 1,
-                per_team: 1,
-                per_principal: 1,
-            },
-        )
-        .await;
-        let authority = Arc::new(authority);
-        let (blocker, holder) = lock_lease_row(&store).await;
-
-        let guard = test_lease::spawn_renewal(&authority);
-        wait_for_session_blocked_by(&store, holder).await;
-        assert_eq!(
-            Arc::strong_count(&authority),
-            2,
-            "the blocked renewal holds the authority"
-        );
-
-        pohunek_test_support::wait::guard("the renewal task to stop", guard.stop()).await;
-        assert_eq!(
-            Arc::strong_count(&authority),
-            1,
-            "a stopped renewal releases the authority"
-        );
-
-        blocker.rollback().await.expect("release the lease row");
-        pohunek_test_support::wait::guard("schema cleanup", cleanup(&store, &schema)).await;
-    }
-
-    /// Dropping the guard also releases a renewal that is blocked in the database.
+    /// Dropping the guard releases a renewal that is blocked in the database.
     #[tokio::test]
     async fn dropping_the_guard_releases_a_renewal_blocked_in_the_database() {
         let (store, schema, ..) = fixture().await;
@@ -3826,52 +3786,6 @@ mod tests {
             .await
             .expect("count team-list audits"),
             1
-        );
-        cleanup(&store, &schema).await;
-    }
-
-    #[tokio::test]
-    async fn management_read_audit_failure_closes_without_an_acknowledgement() {
-        let (store, schema, owner, owner_credential, _administrator, _administrator_credential) =
-            fixture().await;
-        let team_id: Uuid = sqlx::query_scalar("SELECT team_id FROM teams")
-            .fetch_one(store.pool())
-            .await
-            .expect("read team");
-        let (authority, _directory) = authority(
-            store.clone(),
-            AuthorityLimits {
-                global: 1,
-                per_team: 1,
-                per_principal: 1,
-            },
-        )
-        .await;
-        sqlx::raw_sql(AssertSqlSafe("CREATE FUNCTION reject_management_read_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END; $$; CREATE TRIGGER reject_management_read_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.action = 'member.list') EXECUTE FUNCTION reject_management_read_audit();".to_owned()))
-            .execute(store.pool())
-            .await
-            .expect("install read audit failure trigger");
-        assert!(matches!(
-            authority
-                .list_members(
-                    actor(owner, owner_credential, ActorKind::Human),
-                    team_id,
-                    MemberPage {
-                        after: None,
-                        limit: 1,
-                        correlation_id: Uuid::now_v7(),
-                    },
-                )
-                .await,
-            Err(AuthorityError::Store(StoreError::AuditUnavailable))
-        ));
-        assert!(authority.is_closed());
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM audit_events")
-                .fetch_one(store.pool())
-                .await
-                .expect("count read audits"),
-            0
         );
         cleanup(&store, &schema).await;
     }

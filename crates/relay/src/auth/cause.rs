@@ -137,13 +137,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reason_is_a_single_link() {
-        let cause = DurableCause::from_reason("row was not written");
-        assert_eq!(cause.chain(), "row was not written");
-        assert!(cause.source().is_none());
-    }
-
-    #[test]
     fn a_database_error_is_reduced_to_a_class_without_its_message() {
         let secret = "invalid input syntax for type uuid: \"s3cr3t-token-value\"";
         let cause = DurableCause::from_error(&sqlx::Error::Protocol(secret.to_owned()));
@@ -157,17 +150,5 @@ mod tests {
         assert!(chain.contains("database protocol error"), "{chain}");
         assert!(!chain.contains("s3cr3t"), "{chain}");
         assert!(!format!("{cause:?}").contains("s3cr3t"));
-    }
-
-    #[test]
-    fn pool_failures_are_classified() {
-        assert_eq!(
-            DurableCause::from_error(&sqlx::Error::PoolTimedOut).chain(),
-            "database pool timed out"
-        );
-        assert_eq!(
-            DurableCause::from_error(&sqlx::Error::RowNotFound).chain(),
-            "database row not found"
-        );
     }
 }

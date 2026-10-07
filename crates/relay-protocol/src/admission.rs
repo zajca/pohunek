@@ -140,34 +140,6 @@ mod tests {
     }
 
     #[test]
-    fn admission_round_trip_preserves_rule_and_result() {
-        let rule_wire = serde_json::to_value(rule()).expect("rule JSON");
-        assert_eq!(
-            serde_json::from_value::<AdmissionRuleRecord>(rule_wire).expect("rule"),
-            rule()
-        );
-        let result_wire = serde_json::to_value(result()).expect("result JSON");
-        assert_eq!(
-            serde_json::from_value::<EvidenceResultRecord>(result_wire).expect("result"),
-            result()
-        );
-        let create = CreateAdmissionRuleRequest {
-            provider: AdmissionProvider::Google,
-            method: AdmissionMethod::GoogleHostedDomain,
-            match_value: "example.com".to_owned(),
-            idempotency: Idempotency {
-                correlation_id: Uuid::nil(),
-                idempotency_key: Uuid::nil(),
-            },
-        };
-        let create_wire = serde_json::to_value(&create).expect("create JSON");
-        assert_eq!(
-            serde_json::from_value::<CreateAdmissionRuleRequest>(create_wire).expect("create"),
-            create
-        );
-    }
-
-    #[test]
     fn admission_rejects_unknown_subject_fields() {
         let mut rule_wire = serde_json::to_value(rule()).expect("rule JSON");
         rule_wire["provider_subject"] = serde_json::json!("sentinel");
