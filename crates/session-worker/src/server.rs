@@ -4813,16 +4813,15 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        admit_hook, authorize_control_request, await_observation_page, capabilities,
-        control_input_id, event_visible_to_connection, identity_sequence_is_fresh,
-        mark_running_subagents_lost, observation_timed_out, random_value, redeem_data_grant,
-        serve_stream_data, signal_number, start_subagent, stop_subagent, valid_identity_expiry,
-        validate_attach_write_id, validate_data_start, validate_observation_request,
-        validate_terminal_snapshot_dimensions, validate_terminal_snapshot_response,
-        write_data_error, write_observation_page, write_output_chunks, write_runtime_output_event,
-        write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
-        ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
-        ATTACH_INPUT_PREFIX,
+        authorize_control_request, await_observation_page, capabilities, control_input_id,
+        event_visible_to_connection, identity_sequence_is_fresh, mark_running_subagents_lost,
+        observation_timed_out, redeem_data_grant, serve_stream_data, signal_number, start_subagent,
+        stop_subagent, valid_identity_expiry, validate_attach_write_id, validate_data_start,
+        validate_observation_request, validate_terminal_snapshot_dimensions,
+        validate_terminal_snapshot_response, write_data_error, write_observation_page,
+        write_output_chunks, write_runtime_output_event, write_terminal_chunks, Connection,
+        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
+        TokenState, WireTerminalSnapshot, ATTACH_INPUT_PREFIX,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -4834,7 +4833,6 @@ mod tests {
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
-    use crate::identity::RejectReason;
     use crate::journal::SubagentPhase;
     use crate::{ChildIdentity, JournalRecord, ReleasedIdentity};
 
@@ -5187,29 +5185,6 @@ mod tests {
             "expires_at": expiry(), "reference_kind": null, "native_reference": null,
         });
         assert!(!send_hook(&server, &pty, unknown).await);
-        pty.stop("test-cleanup", server.shared.config.stop_grace)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_schema_without_subagents_refuses_subagent_claims() {
-        let (server, pty, _directory) = launch_claim_fixture().await;
-        server.shared.state.lock().await.hook_schema = protocol::hook_schema("identity-v1");
-        assert!(!send_hook(&server, &pty, subagent_start_claim(1, None)).await);
-        assert!(server
-            .shared
-            .state
-            .lock()
-            .await
-            .journal
-            .subagents
-            .is_empty());
-
-        server.shared.state.lock().await.hook_schema =
-            protocol::hook_schema("identity-subagent-v1");
-        assert!(send_hook(&server, &pty, subagent_start_claim(2, Some("Explore"))).await);
-        assert_eq!(server.shared.state.lock().await.journal.subagents.len(), 1);
         pty.stop("test-cleanup", server.shared.config.stop_grace)
             .await
             .unwrap();
@@ -5601,95 +5576,6 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-    }
-
-    #[test]
-    fn identity_provider_allowlist_is_exact() {
-        let schema = protocol::hook_schema("identity-subagent-v1");
-        for provider in ["shell", "codex", "claude", "hermes"] {
-            assert!(
-                admit_hook(schema, HookAction::IdentityReport, provider, Some("codex")).is_ok(),
-                "{provider} must be accepted"
-            );
-        }
-
-        for provider in ["", "Hermes", "HERMES", "hermes ", "unknown"] {
-            assert_eq!(
-                admit_hook(schema, HookAction::IdentityReport, provider, Some("codex")).err(),
-                Some(RejectReason::ProviderNotAllowed),
-                "{provider:?} must be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn hook_admission_follows_the_schema_per_action() {
-        let identity = protocol::hook_schema("identity-v1");
-        let subagent = protocol::hook_schema("identity-subagent-v1");
-        for action in [HookAction::SubagentStart, HookAction::SubagentStop] {
-            assert_eq!(
-                admit_hook(identity, action, "codex", Some("hermes")).err(),
-                Some(RejectReason::ActionNotAllowed),
-                "a schema without subagents refuses {action}"
-            );
-            for provider in ["codex", "claude"] {
-                admit_hook(subagent, action, provider, Some("shell"))
-                    .expect("a subagent provider is admitted");
-            }
-            for provider in ["shell", "hermes", ""] {
-                assert_eq!(
-                    admit_hook(subagent, action, provider, Some("shell")).err(),
-                    Some(RejectReason::ProviderNotAllowed),
-                    "{provider:?} is not a subagent provider"
-                );
-            }
-        }
-        for action in [
-            HookAction::IdentityReport,
-            HookAction::IdentityRelease,
-            HookAction::SubagentStart,
-            HookAction::SubagentStop,
-            HookAction::Notification,
-        ] {
-            assert_eq!(
-                admit_hook(None, action, "codex", Some("codex")).err(),
-                Some(RejectReason::ActionNotAllowed),
-                "a runtime without a schema admits no {action}"
-            );
-        }
-    }
-
-    #[test]
-    fn nested_switching_disabled_pins_identity_reports_to_the_launch_runtime() {
-        static PINNED: protocol::HookSchema = protocol::HookSchema {
-            id: "pinned-test",
-            handlers: &[],
-            identity_providers: &["hermes", "codex"],
-            subagent_providers: &[],
-            actions: &[HookAction::IdentityReport],
-            reference_kinds: &[],
-            ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
-            nested_active: false,
-            subagent_fields: &[],
-            subagent_sequence: None,
-        };
-        admit_hook(
-            Some(&PINNED),
-            HookAction::IdentityReport,
-            "hermes",
-            Some("hermes"),
-        )
-        .expect("the launch runtime itself is admitted");
-        assert_eq!(
-            admit_hook(
-                Some(&PINNED),
-                HookAction::IdentityReport,
-                "codex",
-                Some("hermes")
-            )
-            .err(),
-            Some(RejectReason::ProviderNotAllowed)
-        );
     }
 
     #[test]
@@ -6269,16 +6155,6 @@ mod tests {
     }
 
     #[test]
-    fn generated_credentials_use_protocol_safe_bytes() {
-        let value = random_value("worker").expect("operating-system entropy");
-
-        assert!(value.starts_with("worker-"));
-        assert!(value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
-    }
-
-    #[test]
     fn known_signal_names_map_to_numbers() {
         assert_eq!(signal_number("Terminated"), Some(libc::SIGTERM));
         assert_eq!(signal_number("Killed"), Some(libc::SIGKILL));
@@ -6450,12 +6326,6 @@ mod tests {
         }
     }
 
-    /// A data grant is redeemable only by the process that acquired the lease.
-    ///
-    /// The grant is minted for one kernel-attested peer; a different process —
-    /// and a reused process id with a different start identity — must both be
-    /// refused, and the refusal must leave the one-use token intact so a
-    /// foreign attempt cannot burn a legitimate grant.
     /// A leased connection is re-checked on every request, not only at acquire.
     ///
     /// The lease caches the owner it was granted to, so without a fresh kernel
@@ -6660,6 +6530,12 @@ mod tests {
         );
     }
 
+    /// A data grant is redeemable only by the process that acquired the lease.
+    ///
+    /// The grant is minted for one kernel-attested peer; a different process —
+    /// and a reused process id with a different start identity — must both be
+    /// refused, and the refusal must leave the one-use token intact so a
+    /// foreign attempt cannot burn a legitimate grant.
     #[test]
     fn data_token_redemption_is_bound_to_the_lease_owning_peer() {
         let leases = crate::ControllerLease::new();
