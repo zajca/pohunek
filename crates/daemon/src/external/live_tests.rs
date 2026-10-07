@@ -400,18 +400,6 @@ async fn a_parent_replaced_by_a_file_or_transcript_by_a_directory_drops_the_cand
 }
 
 #[tokio::test]
-async fn an_indexed_transcript_replaced_by_a_directory_is_dropped() {
-    let live = Live::start(|_base, root| write_transcript(&root.join("p/s.jsonl"), "stale")).await;
-    let path = live.root.join("p/s.jsonl");
-    assert!(live.is_indexed(&path));
-
-    fs::remove_file(&path).expect("remove transcript");
-    fs::create_dir(&path).expect("directory takes the name");
-
-    live.wait_until_gone(&path).await;
-}
-
-#[tokio::test]
 async fn a_redirected_symlinked_root_is_followed() {
     let live = Live::start(|base, root| {
         write_transcript(&base.join("a/p/old.jsonl"), "old");

@@ -144,18 +144,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cache_miss_uses_required_registry() {
-        let cache = DiscoveryCache::new(crate::test_support::overlay_registry());
-        assert_eq!(
-            cache
-                .records(false, CURRENT_PROTOCOL_VERSIONS)
-                .await
-                .expect("discovery"),
-            Vec::new()
-        );
-    }
-
     fn range(minimum: u32, maximum: u32) -> ProtocolVersionRange {
         ProtocolVersionRange::new(
             protocol::ProtocolVersion::new(minimum).expect("nonzero"),

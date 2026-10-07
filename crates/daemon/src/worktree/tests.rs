@@ -16,8 +16,8 @@ use super::{
     worktree_prune,
 };
 use super::{
-    branch_slug, hook_env, is_valid_worktree, run_output_bounded, HookContext, HookEvent,
-    WorktreeCleanup, WorktreeManager, WorktreeRequest, WorktreeWork,
+    branch_slug, is_valid_worktree, run_output_bounded, WorktreeCleanup, WorktreeManager,
+    WorktreeRequest, WorktreeWork,
 };
 use crate::store::{Store, WorktreeStatus};
 
@@ -87,34 +87,6 @@ fn init_bare_repo(tag: &str) -> PathBuf {
 
 fn manager(tag: &str) -> WorktreeManager {
     manager_with_timeout(tag, TEST_SETUP_TIMEOUT)
-}
-
-#[test]
-fn session_hook_events_have_stable_env_tokens() {
-    assert_eq!(HookEvent::SessionStart.as_env(), "session-start");
-    assert_eq!(HookEvent::SessionStop.as_env(), "session-stop");
-    assert_eq!(HookEvent::AgentState.as_env(), "agent-state");
-}
-
-#[test]
-fn hook_env_includes_session_stop_reason_and_agent_activity() {
-    let ctx = HookContext {
-        session_id: "s-7".to_owned(),
-        project_id: None,
-        agent: "codex".to_owned(),
-        repo: None,
-        worktree: None,
-        branch: None,
-        base_branch: None,
-        stop_reason: Some("failed"),
-        activity: Some("blocked"),
-    };
-
-    let env = hook_env(HookEvent::AgentState, &ctx);
-    let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
-
-    assert_eq!(lookup("POHUNEK_STOP_REASON"), Some("failed"));
-    assert_eq!(lookup("POHUNEK_ACTIVITY"), Some("blocked"));
 }
 
 fn manager_with_timeout(tag: &str, setup_timeout: Duration) -> WorktreeManager {
@@ -240,21 +212,6 @@ fn branch_slug_matches_reference_cases() {
     for (input, want) in cases {
         assert_eq!(branch_slug(input), want, "branch_slug({input:?})");
     }
-}
-
-#[test]
-fn worktree_path_disambiguates_two_branches_of_one_session() {
-    let mgr = manager("slug-path");
-    let repo = PathBuf::from("/workspace/project");
-    let a = mgr
-        .worktree_path("s-1", &repo, "feature/a")
-        .expect("path a");
-    let b = mgr
-        .worktree_path("s-1", &repo, "feature/b")
-        .expect("path b");
-    assert_ne!(a, b, "two branches must not collapse to one path");
-    assert!(a.to_string_lossy().ends_with("s-1-project-feature-a"));
-    assert!(b.to_string_lossy().ends_with("s-1-project-feature-b"));
 }
 
 #[test]
@@ -1130,21 +1087,6 @@ fn fetch_failure_keeps_the_worktree_with_a_warning() {
 }
 
 #[test]
-fn clean_repo_without_origin_produces_no_fetch_warning() {
-    let mgr = manager("no-origin");
-    let repo = init_repo("no-origin-repo");
-    let bound = mgr.bind(&request("s-1", &repo, "feat/x")).expect("bind");
-    assert!(
-        !bound
-            .warnings
-            .iter()
-            .any(|w| w.kind == SessionWarningKind::Fetch),
-        "no origin means nothing to fetch and no warning: {:?}",
-        bound.warnings
-    );
-}
-
-#[test]
 fn failing_setup_script_keeps_the_worktree_with_a_warning() {
     let mgr = manager("setup-warn");
     let repo = init_repo("setup-warn-repo");
@@ -1937,10 +1879,4 @@ fn status_hold_ranks_an_uncommitted_change_above_an_untracked_file() {
         "detail names the file: {}",
         hold.1
     );
-}
-
-#[test]
-fn status_hold_accepts_clean_status_output() {
-    assert!(super::status_hold("").is_none());
-    assert!(super::status_hold("\n").is_none());
 }

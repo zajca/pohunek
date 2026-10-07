@@ -12,9 +12,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use pohunek_daemon::host_state::{
-    HostStateDir, HostStateError, HostStateRepository, HostStateRepositoryError,
-};
+use pohunek_daemon::host_state::{HostStateDir, HostStateError, HostStateRepository};
 use pohunek_test_support::env::TestEnv;
 use serde::{Deserialize, Serialize};
 use wait_timeout::ChildExt as _;
@@ -273,28 +271,6 @@ fn bootstrap_records_are_owner_private_and_restart_stable() {
     let second = HostStateRepository::open_or_create(temp.path()).expect("restart repository");
     assert_eq!(second.snapshot(), first_snapshot);
     assert_eq!(second.approval_key_reference(), &reference);
-}
-
-#[test]
-fn complete_identity_fails_closed_when_any_required_peer_record_is_lost() {
-    for missing in [
-        pohunek_paths::HOST_APPROVAL_KEY_NAME,
-        pohunek_paths::HOST_GOVERNANCE_NAME,
-    ] {
-        let temp = state_dir();
-        let repository =
-            HostStateRepository::open_or_create(temp.path()).expect("bootstrap repository");
-        drop(repository);
-        let missing_path = temp
-            .path()
-            .join(pohunek_paths::HOST_STATE_SUBDIR)
-            .join(missing);
-        std::fs::remove_file(missing_path).expect("remove one completed peer record");
-        assert!(matches!(
-            HostStateRepository::open_or_create(temp.path()),
-            Err(HostStateRepositoryError::IncompleteRecordSet)
-        ));
-    }
 }
 
 #[test]

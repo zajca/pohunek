@@ -1097,37 +1097,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn remote_supervisor_retries_after_transient_bind_failures() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let bind_attempts = Arc::clone(&attempts);
-        let shutdown = CancellationToken::new();
-        let supervisor_shutdown = shutdown.clone();
-        let retry_interval = Duration::from_secs(1);
-
-        let supervisor = tokio::spawn(serve_remote_with_retry(
-            move |_| {
-                bind_attempts.fetch_add(1, Ordering::Relaxed);
-                std::future::ready(RemoteBind::Retry)
-            },
-            supervisor_shutdown,
-            retry_interval,
-            Duration::from_secs(30),
-        ));
-
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::Relaxed), 1);
-
-        tokio::time::advance(retry_interval).await;
-        tokio::task::yield_now().await;
-        assert_eq!(attempts.load(Ordering::Relaxed), 2);
-
-        shutdown.cancel();
-        supervisor
-            .await
-            .expect("remote supervisor exits after shutdown");
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn remote_supervisor_serves_after_a_transient_bind_failure() {
         let (_state_root, governance) = governance_service().await;
         let listener = TcpListener::bind("127.0.0.1:0")

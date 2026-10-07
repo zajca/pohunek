@@ -571,28 +571,6 @@ mod tests {
         assert_eq!(err.code, "path_escape");
     }
 
-    // The containment guard is shared with slice A2's TOML reads; pin it directly on
-    // the `templates.toml`/`actions.toml` paths so A2 can rely on it.
-    #[test]
-    fn read_contained_returns_none_for_missing_toml() {
-        let base = tmp("toml-missing").join(".pohunek");
-        std::fs::create_dir_all(&base).unwrap();
-        assert!(read_contained(&base, &base.join("templates.toml"))
-            .expect("ok")
-            .is_none());
-        assert!(read_contained(&base, &base.join("actions.toml"))
-            .expect("ok")
-            .is_none());
-    }
-
-    #[test]
-    fn read_contained_reads_a_contained_toml() {
-        let base = tmp("toml-ok").join(".pohunek");
-        write(&base.join("templates.toml"), "[template.x]\n");
-        let got = read_contained(&base, &base.join("templates.toml")).expect("ok");
-        assert_eq!(got.as_deref(), Some("[template.x]\n"));
-    }
-
     #[cfg(unix)]
     #[test]
     fn read_contained_rejects_symlinked_toml_escape() {

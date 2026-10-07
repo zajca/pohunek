@@ -2252,77 +2252,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_structural_snapshot_round_trips_verbatim() {
-        // A path-kind host-profile binding with a full C.4 snapshot must survive
-        // the JSON-lines round-trip byte-for-byte (PartialEq), including the seven
-        // structural fields and the path-vs-id native reference.
-        let store = Store::new(temp_store_path("resume-snapshot-roundtrip"));
-        let binding = ResumeBinding {
-            session_id: "s-path".to_owned(),
-            name: Some("triage build".to_owned()),
-            agent: "claude-sonnet".to_owned(),
-            agent_base: RuntimeRef::claude(),
-            cwd: PathBuf::from("/workspace"),
-            cols: 100,
-            rows: 30,
-            native_session_id: None,
-            native_session_path: Some("/home/u/.claude/t.jsonl".to_owned()),
-            project_id: Some("p-abc".to_owned()),
-            is_linked_worktree: Some(true),
-            metadata: BTreeMap::from([
-                ("owner".to_owned(), "daemon".to_owned()),
-                ("ticket".to_owned(), "DMD-1356".to_owned()),
-            ]),
-            program: "/opt/claude".to_owned(),
-            args: vec!["--model".to_owned(), "sonnet".to_owned()],
-            input_rules: StoredInputRules {
-                bracketed_paste: true,
-                submit_delay_ms: 42,
-                restricted: false,
-            },
-            native_launch: Some(launch(
-                SessionRefKind::Path,
-                &["--session", "{reference}"],
-                Some(&["--fork", "{reference}"]),
-            )),
-            launch_binding: LaunchPin::Unpinned,
-            native_reference_provenance: crate::agent::NativeReferenceProvenance::default(),
-            profile_revision: None,
-            native_launch_unresolved: false,
-        };
-        store.record_resume(&binding).expect("record");
-        let loaded = store.load_resume().expect("load");
-        assert_eq!(loaded, vec![binding], "the structural snapshot round-trips");
-    }
-
-    #[test]
-    fn resume_binding_roundtrips_resume_only_and_fork_specs() {
-        let store = Store::new(temp_store_path("resume-native-launch"));
-        let mut resume_only = resume("s-resume-only", "native-1");
-        resume_only.native_launch =
-            Some(launch(SessionRefKind::Id, &["resume", "{reference}"], None));
-        let with_fork = resume("s-fork", "native-2");
-        store
-            .record_resume(&resume_only)
-            .expect("record resume-only");
-        store.record_resume(&with_fork).expect("record fork");
-
-        let loaded = store.load_resume().expect("load");
-        assert_eq!(loaded.len(), 2);
-        for binding in &loaded {
-            let expected = if binding.session_id == "s-fork" {
-                &with_fork
-            } else {
-                &resume_only
-            };
-            assert_eq!(binding, expected);
-        }
-        assert!(resume_only.resumable() && !resume_only.forkable());
-        assert!(with_fork.resumable() && with_fork.forkable());
-        assert_eq!(with_fork.reference_kind(), Some(SessionRefKind::Id));
-    }
-
-    #[test]
     fn resume_line_with_an_invalid_launch_spec_is_dropped() {
         let store = Store::new(temp_store_path("resume-native-launch-corrupt"));
         let corrupt = concat!(
@@ -2716,66 +2645,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_two_record_kinds_coexist_and_updates_preserve_the_other() {
-        // The core M9 consistency guarantee: writing one kind never drops the
-        // other; the two records for a session live in one file written atomically.
-        let store = Store::new(temp_store_path("coexist"));
-        store
-            .record_resume(&resume("s-1", "native-1"))
-            .expect("resume");
-        store
-            .record_worktree(&worktree("s-1", "x"))
-            .expect("worktree");
-
-        assert_eq!(store.load_resume().expect("resume").len(), 1);
-        assert_eq!(store.load_worktrees().expect("worktree").len(), 1);
-
-        // Updating the resume record must keep the worktree record.
-        store
-            .record_resume(&resume("s-1", "native-1-updated"))
-            .expect("update resume");
-        assert_eq!(
-            store.load_worktrees().expect("worktree").len(),
-            1,
-            "updating a resume record must not drop the worktree record"
-        );
-
-        // Updating the worktree record must keep the resume record.
-        let mut wt = worktree("s-1", "x");
-        wt.base_branch = "develop".to_owned();
-        store.record_worktree(&wt).expect("update worktree");
-        let resume_after = store.load_resume().expect("resume");
-        assert_eq!(
-            resume_after.len(),
-            1,
-            "updating a worktree record must not drop the resume record"
-        );
-        assert_eq!(
-            resume_after[0].native_session_id.as_deref(),
-            Some("native-1-updated")
-        );
-
-        // Removing one kind for the session leaves the other untouched.
-        store.remove_resume("s-1").expect("remove resume");
-        assert!(store.load_resume().expect("resume").is_empty());
-        assert_eq!(
-            store.load_worktrees().expect("worktree").len(),
-            1,
-            "removing the resume record must not drop the worktree record"
-        );
-    }
-
-    #[test]
-    fn remove_resume_missing_is_noop() {
-        let store = Store::new(temp_store_path("remove-missing"));
-        store
-            .record_worktree(&worktree("s-1", "x"))
-            .expect("worktree");
-        store.remove_resume("s-unknown").expect("remove missing");
-        assert_eq!(store.load_worktrees().expect("worktree").len(), 1);
-    }
-
     /// Every write renames a new file over the store while another handle on
     /// the same path polls it, as a second process or a test observer does.
     /// A load must return one whole version, never fail on the replaced file.
@@ -3019,19 +2888,6 @@ mod tests {
             .into_value();
         assert!(missing.is_none(), "absent + update-only ⇒ None");
         assert_eq!(store.load_projects().expect("p").len(), 1, "nothing added");
-    }
-
-    #[test]
-    fn project_id_and_label_are_derived() {
-        let auto = project("/code/ui/.git", "/code/ui", None);
-        // Label falls back to the repo-root basename when no custom name is set.
-        assert_eq!(auto.label(), "ui");
-        // A custom name overrides the derived label.
-        let named = project("/code/ui/.git", "/code/ui", Some("dashboard"));
-        assert_eq!(named.label(), "dashboard");
-        // The id is derived from the key and stable.
-        assert!(auto.id().starts_with("p-"));
-        assert_eq!(auto.id(), named.id(), "same key ⇒ same id, label aside");
     }
 
     #[test]

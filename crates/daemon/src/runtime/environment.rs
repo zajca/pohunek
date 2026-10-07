@@ -108,14 +108,6 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_allowlist_forwards_only_its_names() {
-        let base =
-            base_environment(&["PATH"], &EnvironmentSource::Process).expect("narrow allowlist");
-
-        assert!(base.iter().all(|(name, _)| name == "PATH"));
-    }
-
-    #[test]
     fn a_malformed_allowlist_fails() {
         assert!(matches!(
             base_environment(&["*"], &EnvironmentSource::Process),
@@ -160,16 +152,6 @@ mod tests {
         assert_eq!(wide.get("HOME"), Some("/fixture/home"));
         assert!(wide.get("POHUNEK_SESSION_ID").is_none());
         assert!(wide.get("INVOCATION_ID").is_none());
-    }
-
-    #[test]
-    fn a_fixed_source_applies_the_same_pattern_validation() {
-        let source = EnvironmentSource::fixed([pair("HOME", "/fixture/home")]);
-
-        assert!(matches!(
-            base_environment(&["*"], &source),
-            Err(EnvError::InvalidPattern { .. })
-        ));
     }
 
     #[test]

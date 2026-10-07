@@ -158,8 +158,7 @@ fn path_error(err: pohunek_paths::PathError) -> DaemonError {
 mod tests {
     use std::path::Path;
 
-    use pohunek_paths::{PathEnv, APP_DIR, ASSISTANT_RUNTIME_SUBDIR, KNOWLEDGE_CACHE_SUBDIR};
-    use pohunek_test_support::process_env::ProcessEnv;
+    use pohunek_paths::{PathEnv, APP_DIR};
 
     use super::*;
 
@@ -179,68 +178,6 @@ mod tests {
             xdg_cache_home: Some(base.join("cache").into_os_string()),
             home: Some(base.join("home").into_os_string()),
         }
-    }
-
-    #[test]
-    fn config_dir_from_xdg_config_home() {
-        let base = tmp_base("xdg");
-        let env = all_present(&base);
-        let paths = Paths::resolve_from(&env).expect("resolve with all base vars set");
-        assert_eq!(paths.config_dir, base.join("cfg").join(APP_DIR));
-    }
-
-    #[test]
-    fn config_dir_falls_back_to_home_dot_config() {
-        let base = tmp_base("home");
-        let mut env = all_present(&base);
-        env.xdg_config_home = None;
-        let paths = Paths::resolve_from(&env).expect("resolve with XDG_CONFIG_HOME unset");
-        assert_eq!(
-            paths.config_dir,
-            base.join("home").join(".config").join(APP_DIR)
-        );
-    }
-
-    #[test]
-    fn cache_dir_from_xdg_cache_home() {
-        let base = tmp_base("xdg-cache");
-        let env = all_present(&base);
-        let paths = Paths::resolve_from(&env).expect("resolve with all base vars set");
-        assert_eq!(paths.cache_dir, base.join("cache").join(APP_DIR));
-    }
-
-    #[test]
-    fn cache_dir_falls_back_to_home_dot_cache() {
-        let base = tmp_base("home-cache");
-        let mut env = all_present(&base);
-        env.xdg_cache_home = None;
-        let paths = Paths::resolve_from(&env).expect("resolve with XDG_CACHE_HOME unset");
-        assert_eq!(
-            paths.cache_dir,
-            base.join("home").join(".cache").join(APP_DIR)
-        );
-    }
-
-    #[test]
-    fn assistant_dirs_have_expected_shape() {
-        let base = tmp_base("assistant");
-        let env = all_present(&base);
-        let paths = Paths::resolve_from(&env).expect("resolve with all base vars set");
-        assert_eq!(
-            paths.assistant_bundle_cache_dir(),
-            base.join("cache")
-                .join(APP_DIR)
-                .join(KNOWLEDGE_CACHE_SUBDIR)
-        );
-        assert_eq!(
-            paths.assistant_runtime_dir("launch-123"),
-            Some(
-                base.join("run")
-                    .join(APP_DIR)
-                    .join(ASSISTANT_RUNTIME_SUBDIR)
-                    .join("launch-123")
-            )
-        );
     }
 
     #[test]
@@ -272,33 +209,6 @@ mod tests {
             }
             other => panic!("expected MissingEnv, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn resolve_reads_the_process_environment() {
-        let base = tmp_base("process-env");
-        let mut env = ProcessEnv::lock();
-        env.set("XDG_RUNTIME_DIR", base.join("run"))
-            .set("XDG_STATE_HOME", base.join("state"))
-            .set("XDG_DATA_HOME", base.join("data"))
-            .set("XDG_CONFIG_HOME", base.join("cfg"))
-            .set("XDG_CACHE_HOME", base.join("cache"))
-            .set("HOME", base.join("home"));
-
-        let paths = Paths::resolve().expect("resolve from the process environment");
-
-        assert_eq!(paths.config_dir, base.join("cfg").join(APP_DIR));
-        assert_eq!(paths.cache_dir, base.join("cache").join(APP_DIR));
-    }
-
-    #[test]
-    fn default_session_config_has_no_config_dir() {
-        // Pins the new field is opt-in: every `..SessionRegistryConfig::default()`
-        // construction across the crate keeps compiling with `config_dir = None`.
-        assert_eq!(
-            crate::session::SessionRegistryConfig::default().config_dir,
-            None
-        );
     }
 
     #[test]

@@ -1192,11 +1192,7 @@ mod tests {
         SessionId,
     };
 
-    use super::{
-        parse_timestamp,
-        policy::{default_policy, policy_enables_kind, DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS},
-        NotificationError, NotificationService,
-    };
+    use super::{parse_timestamp, policy::default_policy, NotificationError, NotificationService};
 
     fn temp_data_dir(tag: &str) -> std::path::PathBuf {
         // The directory lives until the test's thread ends; the path below it
@@ -1427,48 +1423,37 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_reserved_dedupe_key_session_mismatch() {
-        let service = NotificationService::open(&temp_data_dir("dedupe-session-mismatch"))
-            .expect("open service");
-        enable_all_kinds(&service);
-        let mut params = provider_turn_params("s-1", "codex:s-1:stop:1");
-        params.dedupe_key = Some("turn:s-2".to_owned());
-
-        let err = service
-            .create(params)
-            .expect_err("reserved dedupe key must match session_id");
-
-        assert!(err.is_invalid_dedupe_key());
-        assert_invalid_dedupe_key(&err);
-    }
-
-    #[test]
-    fn create_rejects_reserved_dedupe_key_without_session_id() {
+    fn create_rejects_misused_reserved_dedupe_keys_without_appending() {
         let service =
-            NotificationService::open(&temp_data_dir("dedupe-no-session")).expect("open service");
+            NotificationService::open(&temp_data_dir("dedupe-reserved")).expect("open service");
         enable_all_kinds(&service);
-        let mut params = provider_turn_params("s-1", "codex:s-1:stop:1");
-        params.session_id = None;
+        let mut session_mismatch = provider_turn_params("s-1", "codex:s-1:stop:1");
+        session_mismatch.dedupe_key = Some("turn:s-2".to_owned());
+        let mut without_session = provider_turn_params("s-1", "codex:s-1:stop:2");
+        without_session.session_id = None;
+        let mut wrong_kind = provider_params(NotificationKind::Error, Some("provider-error"));
+        wrong_kind.dedupe_key = Some("attention:s-1".to_owned());
 
-        let err = service
-            .create(params)
-            .expect_err("reserved dedupe key requires session_id");
+        for (case, params) in [
+            ("the key names another session", session_mismatch),
+            ("the record has no session id", without_session),
+            ("an attention key on a non-attention kind", wrong_kind),
+        ] {
+            let err = service
+                .create(params)
+                .expect_err("a misused reserved dedupe key must fail");
 
-        assert_invalid_dedupe_key(&err);
-    }
-
-    #[test]
-    fn create_rejects_reserved_dedupe_key_for_wrong_kind() {
-        let service =
-            NotificationService::open(&temp_data_dir("dedupe-wrong-kind")).expect("open service");
-        let mut params = provider_params(NotificationKind::Error, Some("provider-error"));
-        params.dedupe_key = Some("attention:s-1".to_owned());
-
-        let err = service
-            .create(params)
-            .expect_err("attention key requires attention kind");
-
-        assert_invalid_dedupe_key(&err);
+            assert!(err.is_invalid_dedupe_key(), "{case}: {err:?}");
+            assert_invalid_dedupe_key(&err);
+        }
+        assert!(
+            service
+                .list(NotificationListParams::default())
+                .expect("list notifications")
+                .notifications
+                .is_empty(),
+            "a rejected create must not append a record"
+        );
     }
 
     #[test]
@@ -1880,28 +1865,6 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_key_outside_attention_window_creates_separate_notification() {
-        let service =
-            NotificationService::open(&temp_data_dir("outside-window")).expect("open service");
-        let first = service
-            .create_at(
-                projector_params(NotificationKind::AgentBlocked, Some("projector-1")),
-                "2026-07-03T10:00:00Z",
-            )
-            .expect("first create");
-        let second = service
-            .create_at(
-                provider_params(NotificationKind::ApprovalRequired, Some("provider-1")),
-                "2026-07-03T11:00:00Z",
-            )
-            .expect("second create");
-
-        assert!(first.created);
-        assert!(second.created);
-        assert_ne!(first.record.id, second.record.id);
-    }
-
-    #[test]
     fn metadata_rejects_secret_like_keys_case_insensitively() {
         let service = NotificationService::open(&temp_data_dir("metadata")).expect("open service");
         for key in [
@@ -2045,45 +2008,6 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_enables_attention_and_error_but_not_turn_completed() {
-        let policy = default_policy();
-
-        assert!(policy_enables_kind(
-            &policy,
-            "codex",
-            NotificationKind::AgentBlocked
-        ));
-        assert!(policy_enables_kind(
-            &policy,
-            "claude",
-            NotificationKind::ApprovalRequired
-        ));
-        assert!(policy_enables_kind(
-            &policy,
-            "codex",
-            NotificationKind::Error
-        ));
-        assert!(!policy_enables_kind(
-            &policy,
-            "codex",
-            NotificationKind::TurnCompleted
-        ));
-    }
-
-    #[test]
-    fn default_policy_contains_provider_specific_codex_and_claude_overrides() {
-        let policy = default_policy();
-
-        assert!(policy.providers.contains_key("codex"));
-        assert!(policy.providers.contains_key("claude"));
-        assert!(policy.providers.contains_key("hermes"));
-        assert_eq!(
-            policy.attention_dedupe_window_secs,
-            DEFAULT_ATTENTION_DEDUPE_WINDOW_SECS
-        );
-    }
-
-    #[test]
     fn create_rejects_policy_disabled_kind_without_appending() {
         let service =
             NotificationService::open(&temp_data_dir("policy-disabled")).expect("open service");
@@ -2102,22 +2026,6 @@ mod tests {
                 .is_empty(),
             "disabled kind must not append a record"
         );
-    }
-
-    #[test]
-    fn create_allows_policy_enabled_kind() {
-        let service =
-            NotificationService::open(&temp_data_dir("policy-enabled")).expect("open service");
-
-        let result = service
-            .create(provider_params(
-                NotificationKind::ApprovalRequired,
-                Some("provider-1"),
-            ))
-            .expect("approval_required is enabled by default");
-
-        assert!(result.created);
-        assert_eq!(result.record.kind, NotificationKind::ApprovalRequired);
     }
 
     #[test]

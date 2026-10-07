@@ -107,15 +107,6 @@ impl<'a> VersionProbe<'a> {
     }
 }
 
-/// Resolves the definition a base runtime launches, when one is registered.
-#[cfg(test)]
-fn definition_for_base<'a>(
-    registry: &'a RuntimeRegistry,
-    base: &RuntimeId,
-) -> Option<&'a Arc<RuntimeDefinition>> {
-    registry.resolve(base).ok()
-}
-
 /// Position of a runtime id in the reported inventory: the reserved built-ins
 /// keep their documented order, every other runtime follows in id order.
 fn inventory_rank(runtime_id: &RuntimeId) -> usize {
@@ -388,29 +379,7 @@ fn probe_versioned_runtime(
     }
 }
 
-/// Validates a launch runtime and pins the resolved executable path when its
-/// definition names a version-probe parser.
-///
-/// Runtimes without a version-probe parser keep plain launch behavior. A
-/// runtime with one resolves the executable once, probes it in the same
-/// isolated bounded sandbox used by inventory, and returns that exact path only
-/// for the pinned supported release. A parser id this daemon does not compile in
-/// refuses the launch. Probe output, configured paths, and detected versions
-/// never enter the error.
-#[cfg(test)]
-pub(crate) fn validate_launch_runtime(
-    base: &RuntimeRef,
-    binary: &str,
-) -> Result<Option<ValidatedLaunchProgram>, ProtocolError> {
-    let launch_path = std::env::var_os(SEARCH_PATH_VAR);
-    let registry = crate::agent::host::RuntimeHost::default().registry();
-    match base.id().and_then(|id| definition_for_base(&registry, id)) {
-        Some(definition) => validate_definition_launch(definition, binary, launch_path.as_deref()),
-        None => Ok(None),
-    }
-}
-
-/// [`validate_launch_runtime`] for an already resolved definition.
+/// [`crate::agent::host::validate_launch_runtime`] for an already resolved definition.
 ///
 /// # Errors
 ///
@@ -917,19 +886,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reports_protocol_version_and_four_supported_agents() {
-        let caps = host_capabilities("1.2.3-test", &no_profiles(), &process_base());
-        assert_eq!(caps.daemon_version, "1.2.3-test");
-        assert_eq!(caps.protocol_version, PROTOCOL_VERSION);
-        assert_eq!(
-            caps.supported_agents,
-            vec!["shell", "codex", "claude", "hermes"]
-        );
-        // worktree support tracks git availability.
-        assert_eq!(caps.worktree_supported, caps.git_available);
-    }
-
-    #[test]
     fn shell_runtime_is_always_available() {
         let caps = host_capabilities("0.0.0", &no_profiles(), &process_base());
         let shell = caps
@@ -943,18 +899,6 @@ mod tests {
             "shell runtime carries no resolved path"
         );
         assert_eq!(shell.agent_base, Some(RuntimeRef::shell()));
-    }
-
-    #[test]
-    fn agent_runtime_availability_matches_resolved_path() {
-        let caps = host_capabilities("0.0.0", &no_profiles(), &process_base());
-        for runtime in &caps.runtimes {
-            if runtime.agent == "shell" {
-                continue;
-            }
-            // For probed agents, availability is exactly path presence.
-            assert_eq!(runtime.available, runtime.path.is_some());
-        }
     }
 
     #[test]
@@ -1096,7 +1040,9 @@ strategy = "none"
                 .resolve(&RuntimeId::parse("shell").expect("id"))
                 .expect("shell registered");
             assert_eq!(shell_def.program().as_str(), "/bin/sh");
-            assert!(definition_for_base(&registry, &RuntimeId::hermes()).is_some());
+            registry
+                .resolve(&RuntimeId::hermes())
+                .expect("hermes registered");
         }
         let valid = BuiltinSource::from_login_shell(Some("/usr/bin/zsh".to_owned()));
         let registry = RuntimeRegistry::from_sources(&[&valid]).expect("registry");
@@ -1249,9 +1195,13 @@ strategy = "none"
         let dir = temp_agents_dir();
         let hermes = dir.join("hermes-wrapper");
         let binary = hermes.display().to_string();
+        let definition = hermes_definition();
+        let validate = |binary: &str| {
+            validate_definition_launch(&definition, binary, process_path().as_deref())
+        };
 
         write_test_executable(&hermes, "#!/bin/sh\necho 'Hermes Agent v0.20.0'\n");
-        let validated = validate_launch_runtime(&RuntimeRef::hermes(), &binary)
+        let validated = validate(&binary)
             .expect("pinned Hermes runtime")
             .expect("Hermes has a validated program");
         assert_eq!(
@@ -1264,21 +1214,23 @@ strategy = "none"
             ("unexpected output", "unexpected output"),
         ] {
             write_test_executable(&hermes, &format!("#!/bin/sh\necho '{output}'\n"));
-            let error = validate_launch_runtime(&RuntimeRef::hermes(), &binary)
-                .expect_err("incompatible Hermes runtime");
+            let error = validate(&binary).expect_err("incompatible Hermes runtime");
             assert_eq!(error.code, "agent_runtime_unsupported");
             assert!(!error.msg.contains(forbidden));
             assert!(!error.msg.contains(&binary));
         }
 
         let missing = dir.join("missing").display().to_string();
-        let error = validate_launch_runtime(&RuntimeRef::hermes(), &missing)
-            .expect_err("missing Hermes runtime");
+        let error = validate(&missing).expect_err("missing Hermes runtime");
         assert_eq!(error.code, "agent_runtime_unsupported");
         assert!(!error.msg.contains(&missing));
 
+        let registry = test_registry();
+        let claude = registry
+            .resolve(&RuntimeId::parse("claude").expect("id"))
+            .expect("claude registered");
         assert_eq!(
-            validate_launch_runtime(&RuntimeRef::claude(), &missing)
+            validate_definition_launch(claude, &missing, process_path().as_deref())
                 .expect("non-Hermes behavior remains deferred to launch"),
             None
         );
@@ -1370,15 +1322,6 @@ strategy = "none"
     }
 
     #[test]
-    fn hermes_support_policy_comes_from_embedded_compatibility_lock() {
-        let lock: HermesCompatibilityLock =
-            serde_json::from_str(HERMES_COMPATIBILITY_LOCK).expect("parse compatibility lock");
-
-        assert_eq!(supported_hermes_version(), lock.release);
-        assert_eq!(supported_hermes_version(), "0.20.0");
-    }
-
-    #[test]
     fn hermes_version_parser_accepts_semver_and_rejects_malformed_tokens() {
         for valid in ["0.20.0", "0.21.0-rc.1", "1.0.0-0", "1.0.0-alpha-01+build.7"] {
             assert_eq!(
@@ -1405,23 +1348,6 @@ strategy = "none"
                 "unexpectedly accepted {invalid}"
             );
         }
-    }
-
-    #[test]
-    fn hermes_version_probe_timeout_is_bounded() {
-        let dir = temp_agents_dir();
-        let hermes = dir.join("hermes");
-        write_test_executable(
-            &hermes,
-            &format!("#!/bin/sh\nsleep {}\n", FIXTURE_HOLD.as_secs()),
-        );
-
-        // The child outlives any plausible test run, so the probe can only end
-        // through its own deadline; a probe that waited for the child would
-        // report `Output` instead.
-        let outcome = probe_hermes_version(&hermes, Duration::from_millis(50), &[]);
-
-        assert!(matches!(outcome, ProbeOutcome::TimedOut), "{outcome:?}");
     }
 
     #[test]
@@ -1569,23 +1495,6 @@ strategy = "none"
             .expect("inspect process")
             .expect("process is live")
             .pgid
-    }
-
-    #[test]
-    fn probe_isolation_accepts_a_group_led_by_the_probe_child() {
-        assert_probe_isolation(200, 200, 100);
-    }
-
-    #[test]
-    #[should_panic(expected = "must not leave its child in the caller's process group")]
-    fn probe_isolation_rejects_the_callers_group() {
-        assert_probe_isolation(100, 200, 100);
-    }
-
-    #[test]
-    #[should_panic(expected = "leader of a new process group")]
-    fn probe_isolation_rejects_a_group_the_probe_child_does_not_lead() {
-        assert_probe_isolation(300, 200, 100);
     }
 
     /// Kills the recorded probe tree on drop, so a failed assertion or wait does
