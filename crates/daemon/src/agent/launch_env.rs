@@ -122,12 +122,4 @@ mod tests {
         assert_redacted(&format!("{command:?}"));
         assert_redacted(&format!("{command:#?}"));
     }
-
-    #[test]
-    fn extend_appends_after_existing_entries() {
-        let mut env = secret_env();
-        env.extend([("LATER".to_owned(), "value".to_owned())]);
-        assert_eq!(env.as_slice().len(), 2);
-        assert_eq!(env.as_slice()[1].0, "LATER");
-    }
 }

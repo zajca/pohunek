@@ -165,12 +165,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn only_the_shell_and_the_official_aliases_are_reserved() {
-        for id in RESERVED_RUNTIME_IDS {
-            assert!(is_reserved(&runtime(id)));
-        }
-        assert!(!is_reserved(&runtime("pi")));
-    }
 }

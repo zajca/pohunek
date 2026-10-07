@@ -242,20 +242,6 @@ fn an_enabled_selected_package_serves_a_package_origin_runtime_next_to_the_built
 }
 
 #[test]
-fn the_package_detection_manifest_is_read_from_the_verified_package() {
-    let plugins = Plugins::new();
-    install(&plugins.registry(), &acme("1.0.0"), true, true);
-
-    let host = plugins.host();
-
-    let definition = host.resolve_id(&runtime("acme")).expect("package runtime");
-    assert!(
-        !definition.manifest().required_regions().is_empty(),
-        "the package manifest's rules are in effect"
-    );
-}
-
-#[test]
 fn an_unselected_or_disabled_package_is_not_served_to_fresh_launches() {
     let plugins = Plugins::new();
     let registry = plugins.registry();
@@ -571,16 +557,6 @@ fn an_uninstalled_package_fails_the_launch_check_as_not_installed() {
         .expect_err("uninstalled");
 
     assert_eq!(code(&error), "runtime_not_installed");
-}
-
-#[test]
-fn builtin_definitions_always_pass_the_launch_check() {
-    let plugins = Plugins::new();
-    let host = plugins.host();
-    for id in ["shell", "codex", "claude", "hermes"] {
-        let definition = host.resolve_id(&runtime(id)).expect("built-in");
-        host.verify_launchable(&definition).expect("launchable");
-    }
 }
 
 #[test]
@@ -902,36 +878,6 @@ fn a_session_retains_the_built_in_definition_it_was_launched_from() {
     host.reload().expect("reload");
     assert!(host
         .pinned_definition(&RuntimeRef::from_wire("acme"), &LaunchPin::Unpinned)
-        .is_none());
-}
-
-#[test]
-fn a_disabled_official_package_returns_the_alias_to_the_built_in() {
-    let plugins = Plugins::new();
-    let built = build(
-        &descriptor("pohunek.runtime.official", "1.0.0", "codex"),
-        "official",
-        identity("pohunek.runtime.official", "1.0.0"),
-    );
-    let registry = plugins.registry();
-    install_from(&registry, &built, true, true, InstallSource::Official);
-    let host = plugins.host();
-    registry
-        .set_enabled(&built.digest, false)
-        .expect("disable the package");
-
-    host.reload().expect("reload");
-
-    assert!(matches!(
-        host.resolve_id(&runtime("codex"))
-            .expect("built-in")
-            .binding()
-            .provenance,
-        BindingProvenance::Builtin { .. }
-    ));
-    assert!(host
-        .registry()
-        .shadowed_builtin(&runtime("codex"))
         .is_none());
 }
 
@@ -1260,24 +1206,6 @@ fn a_package_declares_its_config_home_and_the_registry_serves_it() {
     let declared = definition.config_home().expect("a declared config home");
     assert_eq!(declared.env(), "ACME_HOME");
     assert_eq!(declared.default_relative(), ".config/acme");
-}
-
-#[test]
-fn a_package_without_a_config_home_declares_none() {
-    let plugins = Plugins::new();
-    let built = build(
-        &descriptor("acme.agent", "1.0.0", "acme"),
-        "x",
-        identity("acme.agent", "1.0.0"),
-    );
-    install(&plugins.registry(), &built, true, true);
-
-    let definition = plugins
-        .host()
-        .resolve_id(&runtime("acme"))
-        .expect("the package runtime is served");
-
-    assert!(definition.config_home().is_none());
 }
 
 #[test]

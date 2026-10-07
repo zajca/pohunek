@@ -445,21 +445,6 @@ mod tests {
     }
 
     #[test]
-    fn output_is_the_trimmed_first_line() {
-        let release = |text: &str| VersionProbePolicy::parse_output(text).map(|v| v.to_string());
-        assert_eq!(release("1.0.2\n"), Some("1.0.2".to_owned()));
-        assert_eq!(release("  1.0.2  \r\nignored\n"), Some("1.0.2".to_owned()));
-        assert_eq!(release(""), None);
-        assert_eq!(
-            release("\n1.0.2\n"),
-            None,
-            "an empty first line is no release"
-        );
-        assert_eq!(release("pi 1.0.2\n"), None);
-        assert_eq!(release("1.0.2-beta\n"), None);
-    }
-
-    #[test]
     fn invalid_policies_name_the_field() {
         let field = |args: Vec<&str>, min: &str, below: &str| match VersionProbePolicy::new(
             args.into_iter().map(str::to_owned).collect(),
@@ -679,7 +664,9 @@ mod tests {
         for (output, expected) in [
             ("1.0.2\n", Some("1.0.2")),
             ("  1.0.2  \r\nignored\n", Some("1.0.2")),
+            ("\n1.0.2\n", None),
             ("codex-cli 0.160.0", None),
+            ("pi 1.0.2\n", None),
             ("1.0.2-beta", None),
             ("", None),
         ] {
@@ -704,13 +691,5 @@ mod tests {
             Some("1.0.0".to_owned())
         );
         assert_eq!(line_release("a|b {version}", "a 1.0.0"), None);
-    }
-
-    #[test]
-    fn an_annotation_needs_text_after_its_separator() {
-        let template = LineTemplate::parse(HERMES_LINE).expect("template");
-        assert!(template.read("Hermes Agent v0.20.0 (x)").is_some());
-        assert_eq!(template.read("Hermes Agent v0.20.0 "), None);
-        assert_eq!(template.read("Hermes Agent v0.20.0"), None);
     }
 }

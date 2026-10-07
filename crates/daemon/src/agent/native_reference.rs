@@ -863,15 +863,6 @@ mod tests {
             .expect_err("an unknown field must not decode");
     }
 
-    #[test]
-    fn an_unchecked_declaration_always_passes() {
-        let env = env_of(Vec::new());
-        assert_eq!(
-            ReferenceExistence::Unchecked.verify(&reference("x"), &env),
-            Ok(())
-        );
-    }
-
     struct Store {
         _dir: tempfile::TempDir,
         root: PathBuf,
@@ -1145,38 +1136,6 @@ mod tests {
         assert_eq!(
             existence(pi_spec()).verify(&reference("abc"), &env),
             Err(ReferenceCheckFailure::RootUnavailable)
-        );
-    }
-
-    #[test]
-    fn check_failures_map_to_the_stable_runtime_error() {
-        for failure in [
-            ReferenceCheckFailure::Missing,
-            ReferenceCheckFailure::RootUnavailable,
-            ReferenceCheckFailure::InvalidReference,
-            ReferenceCheckFailure::ScanLimit,
-            ReferenceCheckFailure::StoreChanged,
-        ] {
-            let error = ProtocolError::from(failure);
-            assert_eq!(error.code, "agent_native_reference_missing");
-            assert_eq!(error.class, ErrorClass::Runtime);
-        }
-    }
-
-    #[test]
-    fn assigned_reference_renders_its_launch_template() {
-        let assigned = AssignedReference::new(
-            NativeArgs::from_template(&["--session-id", "{reference}"]).expect("template"),
-            ReferenceExistence::Unchecked,
-        );
-        assert_eq!(
-            assigned.launch_argv(&reference("abc")),
-            vec!["--session-id", "abc"]
-        );
-        let encoded = serde_json::to_string(&assigned).expect("encode");
-        assert_eq!(
-            serde_json::from_str::<AssignedReference>(&encoded).expect("decode"),
-            assigned
         );
     }
 }

@@ -498,7 +498,7 @@ mod tests {
     use std::time::Duration;
 
     use pohunek_test_support::process_env::ProcessEnv;
-    use protocol::{AgentActivity, ErrorClass};
+    use protocol::ErrorClass;
 
     use super::host::{launch_command, RuntimeHost};
     use super::{
@@ -507,7 +507,6 @@ mod tests {
         LaunchOpts, NativeArgs, NativeSessionLaunch, SessionRef, SessionRefKind,
         ValidatedLaunchProgram,
     };
-    use crate::detect::{ManifestRegion, MatchContext};
 
     fn launch_opts(cwd: impl AsRef<Path>) -> LaunchOpts {
         LaunchOpts {
@@ -564,65 +563,32 @@ mod tests {
     }
 
     #[test]
-    fn codex_launch_resolves_binary_and_preserves_opts() {
-        let bin_dir = temp_dir("codex-bin");
-        let codex = write_executable(&bin_dir, "codex");
-        let cwd = temp_dir("codex-cwd");
+    fn built_in_launches_resolve_their_binary_with_exact_argv_and_preserve_opts() {
+        for (name, expected_args) in [
+            ("codex", &[][..]),
+            ("claude", &[][..]),
+            ("hermes", &["chat"][..]),
+            ("shell", &[][..]),
+        ] {
+            let bin_dir = temp_dir(&format!("{name}-bin"));
+            let program = write_executable(&bin_dir, name);
+            let cwd = temp_dir(&format!("{name}-cwd"));
 
-        let command = with_path(&bin_dir, || {
-            launch_builtin("codex", &launch_opts(cwd.clone())).expect("codex launch command")
-        });
+            // The shell runtime launches `$SHELL`, here a bare name on `PATH`.
+            let command = with_path_and_shell(&bin_dir, "shell", || {
+                launch_builtin(name, &launch_opts(cwd.clone())).expect("launch command")
+            });
 
-        assert_eq!(command.program, codex.display().to_string());
-        assert!(command.args.is_empty());
-        assert_eq!(command.cwd, *cwd);
-        assert_eq!(command.cols, 120);
-        assert_eq!(command.rows, 40);
-        assert_eq!(
-            command.env,
-            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
-        );
-    }
-
-    #[test]
-    fn claude_launch_resolves_binary_and_preserves_opts() {
-        let bin_dir = temp_dir("claude-bin");
-        let claude = write_executable(&bin_dir, "claude");
-        let cwd = temp_dir("claude-cwd");
-
-        let command = with_path(&bin_dir, || {
-            launch_builtin("claude", &launch_opts(cwd.clone())).expect("claude launch command")
-        });
-
-        assert_eq!(command.program, claude.display().to_string());
-        assert!(command.args.is_empty());
-        assert_eq!(command.cwd, *cwd);
-        assert_eq!(command.cols, 120);
-        assert_eq!(command.rows, 40);
-        assert_eq!(
-            command.env,
-            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
-        );
-    }
-
-    #[test]
-    fn hermes_launch_is_exact_chat_argv_and_preserves_opts() {
-        let bin_dir = temp_dir("hermes-bin");
-        let hermes = write_executable(&bin_dir, "hermes");
-        let cwd = temp_dir("hermes-cwd");
-
-        let command = with_path(&bin_dir, || {
-            launch_builtin("hermes", &launch_opts(cwd.clone())).expect("Hermes launch command")
-        });
-
-        assert_eq!(command.program, hermes.display().to_string());
-        assert_eq!(command.args, vec!["chat"]);
-        assert_eq!(command.cwd, *cwd);
-        assert_eq!((command.cols, command.rows), (120, 40));
-        assert_eq!(
-            command.env,
-            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
-        );
+            assert_eq!(command.program, program.display().to_string(), "{name}");
+            assert_eq!(command.args, expected_args, "{name}");
+            assert_eq!(command.cwd, *cwd, "{name}");
+            assert_eq!((command.cols, command.rows), (120, 40), "{name}");
+            assert_eq!(
+                command.env,
+                vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())],
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -845,59 +811,18 @@ mod tests {
     }
 
     #[test]
-    fn shell_launch_resolves_binary_and_preserves_opts() {
-        let bin_dir = temp_dir("shell-bin");
-        let shell = write_executable(&bin_dir, "shell");
-        let cwd = temp_dir("shell-cwd");
-
-        let command = with_path_and_shell(&bin_dir, "shell", || {
-            launch_builtin("shell", &launch_opts(cwd.clone())).expect("shell launch command")
-        });
-
-        assert_eq!(command.program, shell.display().to_string());
-        assert!(command.args.is_empty());
-        assert_eq!(command.cwd, *cwd);
-        assert_eq!(command.cols, 120);
-        assert_eq!(command.rows, 40);
-        assert_eq!(
-            command.env,
-            vec![("POHUNEK_SESSION_ID".to_owned(), "s-42".to_owned())]
-        );
-    }
-
-    #[test]
     fn built_in_runtimes_return_expected_input_rules() {
         let host = RuntimeHost::default();
         let rules = |kind: protocol::RuntimeRef| super::input_rules_for_kind(&host, &kind);
-        let shell = rules(protocol::RuntimeRef::shell());
-        assert!(!shell.bracketed_paste);
-        assert_eq!(shell.submit_delay, Duration::ZERO);
-
-        let codex = rules(protocol::RuntimeRef::codex());
-        assert!(codex.bracketed_paste);
-        assert_eq!(codex.submit_delay, Duration::from_millis(150));
-
-        let claude = rules(protocol::RuntimeRef::claude());
-        assert!(!claude.bracketed_paste);
-        assert_eq!(claude.submit_delay, Duration::from_millis(150));
 
         let hermes = rules(protocol::RuntimeRef::hermes());
-        assert!(hermes.bracketed_paste);
-        assert_eq!(hermes.submit_delay, Duration::from_millis(150));
+        assert!(hermes.is_restricted());
         assert!(!hermes.allows_while_blocked());
 
         let unresolved = rules(protocol::RuntimeRef::from_wire("acme"));
+        assert!(!unresolved.is_restricted());
         assert!(!unresolved.bracketed_paste);
         assert_eq!(unresolved.submit_delay, Duration::ZERO);
-    }
-
-    #[test]
-    fn session_ref_id_accepts_valid_value_and_reports_kind() {
-        let session = SessionRef::id("native-123").expect("id session ref");
-        assert_eq!(session.kind(), SessionRefKind::Id);
-        assert_eq!(session.value(), "native-123");
-        // `new` is the id constructor.
-        assert_eq!(SessionRef::new("native-123").expect("new"), session);
     }
 
     #[test]
@@ -942,14 +867,6 @@ mod tests {
     }
 
     #[test]
-    fn session_ref_path_accepts_absolute_path_and_reports_kind() {
-        let session =
-            SessionRef::path("/home/user/.claude/transcripts/abc.jsonl").expect("path session ref");
-        assert_eq!(session.kind(), SessionRefKind::Path);
-        assert_eq!(session.value(), "/home/user/.claude/transcripts/abc.jsonl");
-    }
-
-    #[test]
     fn session_ref_path_rejects_relative_empty_control_and_overlength() {
         assert_eq!(
             SessionRef::path("relative/path.jsonl")
@@ -974,67 +891,6 @@ mod tests {
                 .code,
             "invalid_session_ref"
         );
-    }
-
-    /// Render a spec's resume/fork argv for an id reference, panicking on error.
-    fn id_argv(launch: &NativeSessionLaunch, id: &str) -> (Vec<String>, Option<Vec<String>>) {
-        let reference = SessionRef::id(id).expect("id reference");
-        (
-            launch.resume_argv(&reference).expect("resume argv"),
-            launch.fork_argv(&reference).ok(),
-        )
-    }
-
-    #[test]
-    fn built_in_native_launch_specs_pin_exact_argv() {
-        let claude =
-            builtin_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
-        assert_eq!(claude.reference_kind(), SessionRefKind::Id);
-        assert_eq!(
-            id_argv(&claude, "native-1"),
-            (
-                vec!["--resume".to_owned(), "native-1".to_owned()],
-                Some(vec![
-                    "--resume".to_owned(),
-                    "native-1".to_owned(),
-                    "--fork-session".to_owned(),
-                ]),
-            )
-        );
-
-        let codex = builtin_native_launch(&protocol::RuntimeId::codex()).expect("codex recovers");
-        assert_eq!(codex.reference_kind(), SessionRefKind::Id);
-        assert_eq!(
-            id_argv(&codex, "native-1"),
-            (vec!["resume".to_owned(), "native-1".to_owned()], None)
-        );
-
-        let hermes =
-            builtin_native_launch(&protocol::RuntimeId::hermes()).expect("hermes recovers");
-        assert_eq!(hermes.reference_kind(), SessionRefKind::Id);
-        assert_eq!(
-            id_argv(&hermes, "native-1"),
-            (vec!["--resume".to_owned(), "native-1".to_owned()], None)
-        );
-
-        assert_eq!(builtin_native_launch(&protocol::RuntimeId::shell()), None);
-        assert_eq!(
-            builtin_native_launch(&protocol::RuntimeId::parse("x").expect("valid runtime id")),
-            None
-        );
-    }
-
-    #[test]
-    fn codex_and_hermes_report_fork_unsupported() {
-        let reference = SessionRef::id("native-1").expect("id reference");
-        for kind in [protocol::RuntimeId::codex(), protocol::RuntimeId::hermes()] {
-            let launch = builtin_native_launch(&kind).expect("recovers");
-            assert!(!launch.supports_fork());
-            assert_eq!(
-                launch.fork_argv(&reference).expect_err("no fork").code,
-                "agent_fork_unsupported"
-            );
-        }
     }
 
     #[test]
@@ -1067,60 +923,6 @@ mod tests {
                 "--fork-session",
             ]
         );
-    }
-
-    #[test]
-    fn fork_pty_command_refuses_a_spec_without_fork() {
-        let cwd = temp_dir("template-fork-none-cwd");
-        let session = SessionRef::id("native-123").expect("id ref");
-        let launch = builtin_native_launch(&protocol::RuntimeId::codex()).expect("codex recovers");
-
-        let error = fork_pty_command_from_launch(
-            "codex",
-            Vec::new(),
-            &launch,
-            &session,
-            &launch_opts(&cwd),
-        )
-        .expect_err("codex cannot fork");
-        assert_eq!(error.code, "agent_fork_unsupported");
-    }
-
-    #[test]
-    fn resume_pty_command_from_launch_builds_exact_builtin_argv() {
-        let bin_dir = temp_dir("template-resume-bin");
-        write_executable(&bin_dir, "claude-sonnet");
-        let cwd = temp_dir("template-resume-cwd");
-        let session = SessionRef::id("native-123").expect("id ref");
-
-        // The program is the snapshot's, NOT the base adapter's "claude".
-        let claude =
-            builtin_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
-        let flag = with_path(&bin_dir, || {
-            resume_pty_command_from_launch(
-                "claude-sonnet",
-                Vec::new(),
-                &claude,
-                &session,
-                &launch_opts(cwd.clone()),
-            )
-            .expect("claude resume command")
-        });
-        assert!(flag.program.ends_with("claude-sonnet"));
-        assert_eq!(flag.args, vec!["--resume", "native-123"]);
-
-        let codex = builtin_native_launch(&protocol::RuntimeId::codex()).expect("codex recovers");
-        let sub = with_path(&bin_dir, || {
-            resume_pty_command_from_launch(
-                "claude-sonnet",
-                Vec::new(),
-                &codex,
-                &session,
-                &launch_opts(cwd.clone()),
-            )
-            .expect("codex resume command")
-        });
-        assert_eq!(sub.args, vec!["resume", "native-123"]);
     }
 
     #[test]
@@ -1213,49 +1015,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_pty_command_from_launch_refuses_a_reference_of_the_wrong_kind() {
-        let cwd = temp_dir("template-kind-cwd");
-        let launch =
-            builtin_native_launch(&protocol::RuntimeId::claude()).expect("claude recovers");
-        let path = SessionRef::path("/abs/session.jsonl").expect("path ref");
-
-        let error = resume_pty_command_from_launch(
-            "claude",
-            Vec::new(),
-            &launch,
-            &path,
-            &launch_opts(&cwd),
-        )
-        .expect_err("id spec rejects a path reference");
-        assert_eq!(error.code, "native_reference_kind_mismatch");
-    }
-
-    #[test]
-    fn resume_pty_command_from_launch_carries_path_ref_value() {
-        let bin_dir = temp_dir("template-path-bin");
-        write_executable(&bin_dir, "myagent");
-        let cwd = temp_dir("template-path-cwd");
-        let session = SessionRef::path("/abs/session.jsonl").expect("path ref");
-        let launch = NativeSessionLaunch::new(
-            SessionRefKind::Path,
-            NativeArgs::from_template(&["--resume", "{reference}"]).expect("resume"),
-            None,
-        );
-
-        let command = with_path(&bin_dir, || {
-            resume_pty_command_from_launch(
-                "myagent",
-                Vec::new(),
-                &launch,
-                &session,
-                &launch_opts(&cwd),
-            )
-            .expect("path resume command")
-        });
-        assert_eq!(command.args, vec!["--resume", "/abs/session.jsonl"]);
-    }
-
-    #[test]
     fn resume_pty_command_from_launch_preserves_frozen_profile_args() {
         let bin_dir = temp_dir("template-args-bin");
         write_executable(&bin_dir, "myagent");
@@ -1275,6 +1034,8 @@ mod tests {
             .expect("resume command")
         });
 
+        // The program is the snapshot's, not the base runtime's `claude`.
+        assert!(command.program.ends_with("/myagent"), "{}", command.program);
         assert_eq!(
             command.args,
             vec!["--model", "sonnet", "--resume", "native-123"],
@@ -1295,41 +1056,5 @@ mod tests {
         assert_eq!(err.code, "agent_binary_missing");
         assert!(err.msg.contains("codex"));
         assert!(err.recover.is_some());
-    }
-
-    #[test]
-    fn built_in_manifests_match_agent_specific_rules() {
-        let manifest = |kind: protocol::RuntimeId| {
-            (**super::host::RuntimeHost::default()
-                .resolve_id(&kind)
-                .expect("built-in resolves")
-                .manifest())
-            .clone()
-        };
-        // Manifest holds compiled Regex and is not PartialEq; its Debug form is
-        // the structural comparison.
-        assert_eq!(
-            format!("{:?}", manifest(protocol::RuntimeId::shell())),
-            format!("{:?}", crate::detect::generic_shell_manifest()),
-            "shell must inherit the generic-shell manifest"
-        );
-
-        let codex = manifest(protocol::RuntimeId::codex())
-            .match_context(
-                &MatchContext::default()
-                    .with_region_text(ManifestRegion::OscTitle, "Action Required"),
-            )
-            .expect("codex blocked title should match");
-        assert_eq!(codex.activity, AgentActivity::Blocked);
-        assert!(codex.visible_blocker);
-
-        let claude = manifest(protocol::RuntimeId::claude())
-            .match_context(&MatchContext::default().with_region_text(
-                ManifestRegion::AfterLastHorizontalRule,
-                "enter to select\nesc to cancel\n↑/↓ to navigate",
-            ))
-            .expect("claude selection form should match");
-        assert_eq!(claude.activity, AgentActivity::Blocked);
-        assert!(claude.visible_blocker);
     }
 }

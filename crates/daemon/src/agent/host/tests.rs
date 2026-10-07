@@ -292,37 +292,28 @@ fn descriptor_digest_tracks_structural_launch_fields_only() {
 
 #[test]
 fn descriptor_digest_changes_with_launch_fields() {
-    let build = |args: Vec<String>, prompt_arg: bool, name: &str| {
+    let build = |program: &str, args: Vec<String>, prompt_arg: bool, name: &str| {
         RuntimeDefinition::new(DefinitionParts {
-            runtime_id: id("demo"),
-            origin: DefinitionOrigin::Builtin {
-                package: Some(package("pohunek.runtime.demo")),
-            },
             display_name: name.to_owned(),
-            program: LaunchProgram::Fixed("demo".to_owned()),
+            program: LaunchProgram::Fixed(program.to_owned()),
             default_args: args,
-            input_rules: InputRules::unrestricted(false, Duration::ZERO),
-            submit_delay_configurable: false,
-            manifest: shell_manifest(),
-            native: None,
             prompt_arg,
-            version_probe_parser: None,
-            version_probe_policy: None,
-            integration: None,
+            ..builtin_parts()
         })
         .expect("valid")
         .binding()
         .clone()
     };
-    let base = build(Vec::new(), false, "Demo");
-    assert_eq!(base, build(Vec::new(), false, "Demo"));
+    let base = build("demo", Vec::new(), false, "Demo");
+    assert_eq!(base, build("demo", Vec::new(), false, "Demo"));
     assert_eq!(
         base,
-        build(Vec::new(), false, "Renamed"),
+        build("demo", Vec::new(), false, "Renamed"),
         "display text is not structural"
     );
-    assert_ne!(base, build(vec!["--x".to_owned()], false, "Demo"));
-    assert_ne!(base, build(Vec::new(), true, "Demo"));
+    assert_ne!(base, build("other", Vec::new(), false, "Demo"));
+    assert_ne!(base, build("demo", vec!["--x".to_owned()], false, "Demo"));
+    assert_ne!(base, build("demo", Vec::new(), true, "Demo"));
 }
 
 #[test]
@@ -357,25 +348,6 @@ fn resume_templates_cover_id_and_path_references() {
         .resume_argv(&SessionRef::id("abc").expect("id"))
         .expect_err("an id is not a path reference");
     assert_eq!(mismatch.code, "native_reference_kind_mismatch");
-}
-
-#[test]
-fn fork_uses_its_own_explicit_argv() {
-    let definition = parse(&document(
-        "supported = true\nreference_kind = \"id\"\nargs = [\"--resume\", \"{reference}\"]",
-        "supported = true\nargs = [\"--resume\", \"{reference}\", \"--fork-session\"]",
-    ))
-    .expect("valid");
-    let native = definition.native().expect("resumable");
-    let reference = SessionRef::id("abc").expect("id");
-    assert_eq!(
-        native.resume_argv(&reference).expect("renders"),
-        ["--resume", "abc"]
-    );
-    assert_eq!(
-        native.fork_argv(&reference).expect("renders"),
-        ["--resume", "abc", "--fork-session"]
-    );
 }
 
 #[test]
@@ -1001,21 +973,6 @@ fn package_origin() -> DefinitionOrigin {
         package: package("acme.runtime"),
         digest: PackageDigest::parse(DIGEST).expect("valid digest"),
     }
-}
-
-#[test]
-fn builtin_digest_differs_for_different_programs() {
-    let digest = |program: &str| {
-        RuntimeDefinition::new(DefinitionParts {
-            program: LaunchProgram::Fixed(program.to_owned()),
-            ..builtin_parts()
-        })
-        .expect("valid")
-        .binding()
-        .clone()
-    };
-    assert_ne!(digest("demo"), digest("other"));
-    assert_eq!(digest("demo"), digest("demo"));
 }
 
 fn builtin_definition(name: &str) -> Arc<RuntimeDefinition> {

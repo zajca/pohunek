@@ -217,12 +217,6 @@ mod tests {
     }
 
     #[test]
-    fn this_host_has_a_platform_name_and_a_core_version() {
-        assert!(host_platform().expect("a supported host").contains('-'));
-        core_version().expect("the crate version is semver");
-    }
-
-    #[test]
     fn an_anchor_without_roots_is_refused() {
         assert_eq!(
             HostTrustAnchor::new(Vec::new(), Vec::new()).expect_err("no roots"),

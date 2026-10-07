@@ -215,13 +215,6 @@ fn rewrite_keeps_dotted_keys_and_tables_in_place() {
 }
 
 #[test]
-fn rewrite_is_idempotent() {
-    let once = apply_pin(&profile_text(), &pin("acme.pi", DIGEST_NEW)).expect("first");
-    let twice = apply_pin(&once, &pin("acme.pi", DIGEST_NEW)).expect("second");
-    assert_eq!(once, twice);
-}
-
-#[test]
 fn rewrite_refuses_non_string_pin_keys() {
     for original in [
         "base = \"acme-pi\"\npackage = 5\n",

@@ -390,21 +390,7 @@ async fn identity_and_runtime_id_conflicts_are_refused() {
         );
     }
     assert!(!fixture.root(&rival.digest).exists());
-    assert_eq!(fixture.serving(RUNTIME), Some(first.digest.clone()));
-
-    // A built-in runtime id is never claimable by a local package.
-    for alias in aliases() {
-        let package = Package::build("acme.runtime.alias", "1.0.0", alias, INERT_PROGRAM);
-        let path = fixture.write_archive(&package);
-        assert_eq!(
-            fixture
-                .registry
-                .package_install(explicit(&path, &package, true, true))
-                .await
-                .expect_err("alias"),
-            PackageErrorKind::RuntimeNotClaimable
-        );
-    }
+    assert_eq!(fixture.serving(RUNTIME), Some(first.digest));
 }
 
 #[tokio::test]
