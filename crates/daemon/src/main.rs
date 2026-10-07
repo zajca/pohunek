@@ -1522,13 +1522,15 @@ mod tests {
 
 #[cfg(test)]
 mod supervision_tests {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
     use pohunek_daemon::DaemonError;
+    use pohunek_test_support::process_env::ProcessEnv;
 
     use super::{
-        parse_service_config, select_supervision, worker_working_directory, SupervisionMode,
+        env_bool, parse_service_config, select_supervision, worker_working_directory,
+        SupervisionMode, OBSERVE_EXTERNAL_AGENTS_ENV,
     };
 
     fn arguments(values: &[&str]) -> Vec<OsString> {
@@ -1588,6 +1590,52 @@ mod supervision_tests {
             select_supervision(None, Some(OsString::from("systemd"))),
             Err(DaemonError::InvalidEnv { .. })
         ));
+    }
+
+    #[test]
+    fn external_agent_observation_is_opt_in_and_rejects_unknown_spellings() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        // The variable name and the spellings are the documented contract in
+        // `docs/public-api.md` ("Daemon Runtime Configuration").
+        const DOCUMENTED_NAME: &str = "POHUNEK_OBSERVE_EXTERNAL_AGENTS";
+        let mut env = ProcessEnv::lock();
+
+        env.remove(DOCUMENTED_NAME);
+        assert!(
+            !env_bool(OBSERVE_EXTERNAL_AGENTS_ENV).expect("unset is valid"),
+            "unset must leave external observation off"
+        );
+
+        for (value, enabled) in [
+            ("1", true),
+            ("true", true),
+            ("yes", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+        ] {
+            env.set(DOCUMENTED_NAME, value);
+            assert_eq!(
+                env_bool(OBSERVE_EXTERNAL_AGENTS_ENV).ok(),
+                Some(enabled),
+                "{DOCUMENTED_NAME}={value}"
+            );
+        }
+
+        for (label, value) in [
+            ("unknown word", OsStr::new("maybe")),
+            ("non-UTF-8", OsStr::from_bytes(b"\xff")),
+        ] {
+            env.set(DOCUMENTED_NAME, value);
+            let error = env_bool(OBSERVE_EXTERNAL_AGENTS_ENV).expect_err(label);
+            assert!(
+                matches!(&error, DaemonError::InvalidEnv { var, .. } if var == DOCUMENTED_NAME),
+                "{label}: {error}"
+            );
+        }
     }
 
     fn environment(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
