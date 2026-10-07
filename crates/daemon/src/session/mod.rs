@@ -2189,9 +2189,12 @@ impl SessionRegistry {
         let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
         self.write_session_record(intent).await?;
         let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
-            Ok(target) => {
+            Ok(mut target) => {
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
+                target
+                    .warnings
+                    .extend(self.outdated_integration_warning(&resolved).await);
                 self.create_spec(
                     &id,
                     &params,
@@ -2214,6 +2217,45 @@ impl SessionRegistry {
         };
         let info = Box::pin(self.clone().run_pty_registration(spec, guard)).await?;
         Ok((info, pending_initial_input))
+    }
+
+    /// The warning a launch of `resolved` carries when its agent's managed hook
+    /// assets are outdated.
+    ///
+    /// The inspection reads a few small files off the async runtime and is best
+    /// effort: a home that cannot be resolved or a panicked inspection yields no
+    /// warning and never fails the launch.
+    async fn outdated_integration_warning(
+        &self,
+        resolved: &ResolvedAgent,
+    ) -> Option<SessionWarning> {
+        let homes = match self.integration_homes() {
+            Ok(homes) => homes,
+            Err(error) => {
+                debug!(
+                    name: "session.integration_outdated.homes_unresolved",
+                    error_code = %error.code,
+                    "skipped the outdated hook asset check: config homes unresolved"
+                );
+                return None;
+            }
+        };
+        let agent = RuntimeRef::from(resolved.base.clone());
+        let profile = resolved.profile.as_ref().map(|_| resolved.name.clone());
+        match tokio::task::spawn_blocking(move || {
+            crate::integration::outdated_assets_warning(&homes, agent, profile)
+        })
+        .await
+        {
+            Ok(warning) => warning,
+            Err(_join_error) => {
+                warn!(
+                    name: "session.integration_outdated.check_panicked",
+                    "the outdated hook asset check panicked; the launch carries no warning"
+                );
+                None
+            }
+        }
     }
 
     /// Parks a create at its bound target when a test armed the hold.

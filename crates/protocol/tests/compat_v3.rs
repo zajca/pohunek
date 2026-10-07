@@ -460,6 +460,11 @@ fn current_events_downgrade_to_the_protocol_3_golden() {
 /// real `NativeRecovery` warning appended; also returns the warnings of the
 /// golden, which are what a protocol 3 client must still receive.
 fn session_with_native_recovery_warning(method: &str) -> (Value, Value) {
+    session_with_warning(method, SessionWarningKind::NativeRecovery)
+}
+
+/// [`session_with_native_recovery_warning`] for a warning of `kind`.
+fn session_with_warning(method: &str, kind: SessionWarningKind) -> (Value, Value) {
     let results = fixtures(RESULTS, "results.json");
     let golden = results
         .entries
@@ -474,7 +479,7 @@ fn session_with_native_recovery_warning(method: &str) -> (Value, Value) {
         &mut current
     };
     let warning = serde_json::to_value(SessionWarning {
-        kind: SessionWarningKind::NativeRecovery,
+        kind,
         message: "native recovery is unavailable".to_owned(),
         detail: Some("native session id: native-1".to_owned()),
     })
@@ -489,6 +494,54 @@ fn session_with_native_recovery_warning(method: &str) -> (Value, Value) {
         &golden
     };
     (current, golden_session["warnings"].clone())
+}
+
+#[test]
+fn an_integration_outdated_warning_is_withheld_from_protocol_3_and_kept_on_protocol_4() {
+    for method in [method::SESSION_LIST, method::SESSION_NEW] {
+        let (current, golden_warnings) =
+            session_with_warning(method, SessionWarningKind::IntegrationOutdated);
+
+        let downgraded =
+            result(v3(), method, current.clone()).expect("adapter translates the result");
+        let session = if downgraded.is_array() {
+            &downgraded[0]
+        } else {
+            &downgraded
+        };
+        assert_eq!(
+            session.get("warnings").cloned().unwrap_or(json!([])),
+            if golden_warnings.is_null() {
+                json!([])
+            } else {
+                golden_warnings
+            },
+            "{method}: protocol 3 never knew the kind"
+        );
+        let kept = current_warning_kinds(&current);
+        assert!(
+            kept.contains(&"integration_outdated".to_owned()),
+            "{method}"
+        );
+    }
+}
+
+/// The warning kinds of the first session in `current`.
+fn current_warning_kinds(current: &Value) -> Vec<String> {
+    let session = if current.is_array() {
+        &current[0]
+    } else {
+        current
+    };
+    session["warnings"]
+        .as_array()
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(|warning| warning["kind"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[test]

@@ -332,6 +332,39 @@ pub fn status(
     status_for(&crate::agent::host::fixture::builtin_host(), params)
 }
 
+/// The session warning for a launch of `agent` whose managed hook assets are
+/// installed but differ from the ones this daemon embeds.
+///
+/// `profile` selects the config home the launch uses. The result is `None` when
+/// the integration is not installed, is current, or cannot be inspected: a
+/// launch is never refused or delayed by this diagnostic, and the doctor reports
+/// the cases it cannot name.
+#[must_use]
+pub fn outdated_assets_warning(
+    homes: &ConfigHomes,
+    agent: RuntimeRef,
+    profile: Option<String>,
+) -> Option<protocol::SessionWarning> {
+    let label = agent.as_wire().to_owned();
+    let params = protocol::IntegrationStatusParams {
+        agent: Some(agent),
+        profile: profile.clone(),
+        all_profiles: false,
+    };
+    let status = status_in(homes, params).ok()?.agents.into_iter().next()?;
+    if !status.available || status.state != IntegrationInstallState::Outdated {
+        return None;
+    }
+    let scope = profile.map_or_else(String::new, |name| format!(" --profile {name}"));
+    Some(protocol::SessionWarning {
+        kind: protocol::SessionWarningKind::IntegrationOutdated,
+        message: format!(
+            "the installed {label} hook assets do not match this daemon, so the agent's hooks may report nothing: run `pohunek integration install --agent {label}{scope}` on the daemon host"
+        ),
+        detail: (!status.warnings.is_empty()).then(|| status.warnings.join("; ")),
+    })
+}
+
 /// Degrade one supported agent's config-resolution failure into a warning.
 fn reported_agent_status(
     agent: StatusAgent,

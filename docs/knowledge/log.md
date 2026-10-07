@@ -10,6 +10,24 @@
   read-only. The public API reference and the agent-profiles concept page state
   the rule.
 
+## Unreleased (2026-10-07, outdated integration hook assets are flagged after an upgrade)
+
+- Decision: after a daemon upgrade the managed hook assets are flagged loudly and
+  reinstalled by one documented owner command; the daemon and the installer never
+  rewrite files in an agent's config home on their own, because those homes are
+  user-owned and an install also edits the provider's registration files.
+- Claude and Codex status already compared the full installed script with the
+  embedded one, so content drift at an unchanged version marker was reported as
+  outdated; the doctor classifies it as `asset_modified`. Hermes compared the
+  installed plugin only with the checksums its own ownership marker recorded, so
+  an untouched install from an older release passed. Hermes status now reports
+  `outdated`, and the Hermes doctor has an `asset_current` check (16 checks).
+- A launch whose agent has outdated Claude or Codex hook assets returns an
+  `integration_outdated` session warning naming the install command; protocol 3
+  connections never receive it. The installer wrapper prints the doctor and
+  install commands after a successful install or upgrade, and the update runbook
+  has a "Managed hook assets after an upgrade" section.
+
 ## Unreleased (2026-10-07, package test daemons use the test-host process view)
 
 - The shared package test harness builds its daemon with

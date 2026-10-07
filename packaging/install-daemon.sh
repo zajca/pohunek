@@ -28,6 +28,10 @@
 # it writes, a pending transaction, the recorded installation), so a host the
 # final command would refuse never has its legacy install retired.
 #
+# After a successful install or upgrade the wrapper prints the exact commands
+# that bring the managed agent hook assets in line with the new release; the
+# daemon itself never rewrites files in an agent's config home.
+#
 # `--accept-runtime-loss` is the single flag that accepts live sessions losing
 # their runtime. For the legacy migration it is passed to the migration
 # preflight. For a service-managed upgrade it is passed to both `service check`
@@ -623,5 +627,15 @@ status=0
 if [ "$status" -ne 0 ] && [ "$legacy_retired" -eq 1 ]; then
     echo "the legacy pohunekd.service install was already retired before \`pohunek $1 $2\` failed;" >&2
     echo "fix the reported problem and re-run $0 to finish the installation" >&2
+fi
+# The daemon never rewrites the hook assets in the agents' config homes. The
+# new daemon is running by now, so its doctor compares the installed assets with
+# the ones this release embeds.
+if [ "$status" -eq 0 ]; then
+    echo "next: check the agent hook assets against this release with" >&2
+    echo "\`pohunek integration doctor\`, and reinstall each agent it reports as" >&2
+    echo "outdated with \`pohunek integration install --agent <agent>\` (add" >&2
+    echo "\`--profile <name>\` for a host profile's home; Hermes: \`pohunek integration" >&2
+    echo "install --agent hermes\` with its target flags)" >&2
 fi
 exit "$status"

@@ -1037,6 +1037,7 @@ struct HermesResult {
     installed: bool,
     enabled: bool,
     modified: bool,
+    outdated: bool,
     stale_stage: bool,
     stale_backup: bool,
     access_mode: Option<AccessMode>,
@@ -1066,6 +1067,7 @@ fn result(
         installed: lifecycle.installed,
         enabled: lifecycle.enabled,
         modified: lifecycle.modified,
+        outdated: lifecycle.outdated,
         stale_stage: lifecycle.stale_stage,
         stale_backup: lifecycle.stale_backup,
         access_mode: policy.map(Policy::access_mode),
@@ -1086,6 +1088,8 @@ fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
         enabled: has_status("plugin_enabled", doctor::Status::Pass),
         modified: has_status("plugin_ownership", doctor::Status::Pass)
             && has_status("asset_integrity", doctor::Status::Fail),
+        outdated: has_status("plugin_ownership", doctor::Status::Pass)
+            && has_status("asset_current", doctor::Status::Fail),
         stale_stage: has_status("stale_stage", doctor::Status::Fail),
         stale_backup: has_status("stale_backup", doctor::Status::Fail),
     }
@@ -1093,13 +1097,14 @@ fn lifecycle_from_doctor(report: &doctor::Report) -> LifecycleState {
 
 fn render_hermes_human(result: &HermesResult) -> String {
     let mut output = format!(
-        "Hermes {}: {} {} (installed={}, enabled={}, modified={})\n",
+        "Hermes {}: {} {} (installed={}, enabled={}, modified={}, outdated={})\n",
         result.action,
         result.target_kind,
         result.target_label,
         result.installed,
         result.enabled,
         result.modified,
+        result.outdated,
     );
     if let (Some(access_mode), Some(allowed_host_count)) =
         (result.access_mode, result.allowed_host_count)
@@ -1752,6 +1757,7 @@ mod tests {
             installed: true,
             enabled: true,
             modified: false,
+            outdated: false,
             stale_stage: false,
             stale_backup: false,
             access_mode: None,

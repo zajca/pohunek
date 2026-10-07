@@ -246,7 +246,7 @@ the protocol 3 adapter: the daemon accepts the `runtime_id` spelling in its
 requests (a request that already carries the v4 spelling is `bad_request`) and
 answers, and streams events, in the `runtime_id` spelling, withholding warning
 kinds and events v3 never defined (a v3 connection never receives a
-`native_recovery` session warning; v4 connections do). A client whose range does not overlap the window
+`native_recovery` or `integration_outdated` session warning; v4 connections do). A client whose range does not overlap the window
 receives `daemon/version_mismatch` before any method runs; a client of this build
 negotiates v3 and translates as described above. The window covers
 the public daemon protocol only: the CLI's `--json` envelope reports `protocol`
@@ -1148,7 +1148,13 @@ Important fields:
   and `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to
   start a new session and resume the native conversation, and `detail` carries
-  the stored native reference.
+  the stored native reference. `integration_outdated` marks a launch whose
+  agent's installed Claude or Codex hook assets differ from the ones the daemon
+  embeds (an older version marker or changed content): `message` names the
+  `pohunek integration install --agent <agent>` command (with `--profile` for a
+  host profile's home) and `detail` carries the status warnings; the session
+  still starts, and an agent whose hooks are not installed carries no such
+  warning.
 - `metadata`: owner-controlled strings; must not contain secrets. The daemon
   treats every key opaquely; clients own the convention. One such
   client-defined convention is the `link.*` key family (`link.provider`,
@@ -2408,6 +2414,13 @@ pohunek integration install --agent hermes --hermes-profile default \
   --max-screen-bytes 65536 --max-concurrency 1 --json
 pohunek integration doctor --agent hermes --hermes-profile default --json
 ```
+
+Hermes status reports `installed`, `enabled`, `modified` (a managed file differs
+from the checksums its ownership marker records), `outdated` (the marker records
+assets this release does not embed, so an untouched install written by an older
+release is flagged) and the stale-sibling flags. The doctor's `asset_current`
+check fails for an outdated plugin; `integration update` replaces it without
+`--confirm-modified` unless `modified` is true.
 
 `--hermes-profile default`, a named `--hermes-profile`, and an absolute
 `--hermes-home` are explicit target selections; a profile and home cannot be

@@ -148,6 +148,9 @@ pub(crate) struct LifecycleState {
     pub(crate) enabled: bool,
     /// A recorded asset or its private mode differs from the ownership marker.
     pub(crate) modified: bool,
+    /// The assets the marker records are not the ones this binary embeds, so
+    /// the install predates the running release even though no file was touched.
+    pub(crate) outdated: bool,
     /// A matching Pohunek stage sibling remains from an interrupted transaction.
     pub(crate) stale_stage: bool,
     /// A matching Pohunek backup sibling remains from an interrupted transaction.
@@ -294,6 +297,7 @@ fn install_with(
         installed: true,
         enabled: true,
         modified: existing.is_some_and(|value| value.modified),
+        outdated: false,
         stale_stage: false,
         stale_backup: false,
     })
@@ -386,6 +390,7 @@ fn uninstall_with(
         installed: false,
         enabled: false,
         modified: false,
+        outdated: false,
         stale_stage: false,
         stale_backup: false,
     })
@@ -404,7 +409,8 @@ pub(crate) fn inspect(
     Ok(LifecycleState {
         installed: current.is_some(),
         enabled: control.is_enabled(target)?,
-        modified: current.is_some_and(|value| value.modified),
+        modified: current.as_ref().is_some_and(|value| value.modified),
+        outdated: current.as_ref().is_some_and(|value| value.outdated),
         stale_stage,
         stale_backup,
     })
@@ -414,6 +420,8 @@ pub(crate) fn inspect(
 struct Installed {
     ownership: Ownership,
     modified: bool,
+    /// The marker's recorded checksums differ from the embedded assets'.
+    outdated: bool,
 }
 
 /// Narrow filesystem seam for transactional writes and moves.
@@ -682,9 +690,13 @@ fn installed(
     }
     let ownership = read_matching_ownership(root, target, policy_path, expected_assets)?;
     let modified = managed_modified(root, &ownership)? || has_unmanaged_entries(root, &ownership)?;
+    let outdated = expected_assets
+        .iter()
+        .any(|asset| ownership.assets.get(asset.path()) != Some(&asset.checksum()));
     Ok(Some(Installed {
         ownership,
         modified,
+        outdated,
     }))
 }
 
@@ -1735,6 +1747,7 @@ mod tests {
                 installed: true,
                 enabled: true,
                 modified: false,
+                outdated: false,
                 stale_stage: false,
                 stale_backup: false,
             }
@@ -2378,6 +2391,7 @@ esac"#,
                 installed: false,
                 enabled: false,
                 modified: false,
+                outdated: false,
                 stale_stage: false,
                 stale_backup: false,
             }

@@ -33,18 +33,50 @@ v3 spelled it `runtime_id`. The daemon translates that spelling for protocol 3
 clients only; a v4 client or hook never sends it. Do not downgrade one peer
 independently: a v3 client is served by a v4 daemon, a v4 CLI or
 SDK client works against a v3 daemon. Managed Codex and Claude hook assets carry
-`POHUNEK_INTEGRATION_VERSION=11`; after the upgrade run
-`pohunek integration doctor` and reinstall every asset it reports as outdated,
-because an older hook still sends the old key, which the daemon accepts only
-inside a session whose launch baked protocol 3; in any other session its
-native-identity reports are rejected. Hooks of a session launched before the upgrade keep reporting with the
-protocol version baked into its launch environment while the daemon serves that
-version. State hooks older than version 11 sent an integer `seq` that the daemon
-rejects, so their public-socket reports were dropped, and always spelled the
-native-id worker key in the protocol 4 form. Notification hooks older than version 10 send a bare integer `v`
-instead of the `{minimum, maximum}` range, so the daemon drops their
+`POHUNEK_INTEGRATION_VERSION=11`, and the upgrade never rewrites them: follow
+"Managed hook assets after an upgrade" below. An older hook still sends the old
+key, which the daemon accepts only inside a session whose launch baked protocol
+3; in any other session its native-identity reports are rejected. Hooks of a
+session launched before the upgrade keep reporting with the protocol version
+baked into its launch environment while the daemon serves that version. State
+hooks older than version 11 sent an integer `seq` that the daemon rejects, so
+their public-socket reports were dropped, and always spelled the native-id worker
+key in the protocol 4 form. Notification hooks older than version 10 send a bare
+integer `v` instead of the `{minimum, maximum}` range, so the daemon drops their
 notifications until they are reinstalled. Earlier protocol transitions (integer-v1 to range negotiation,
 the v3 overlay-routing change) do not widen the supported range.
+
+## Managed hook assets after an upgrade
+
+The managed hook scripts and registrations in each agent's config home belong to
+the owner: neither the installer wrapper, `pohunek service upgrade` nor daemon
+start rewrites them. A release can change them without changing
+`POHUNEK_INTEGRATION_VERSION`, so after every upgrade compare the installed
+assets with the ones the new daemon embeds:
+
+1. Run `pohunek integration doctor` on the daemon host (add `--profile <name>`
+   or `--all-profiles` for a host profile's own config home). It exits non-zero
+   when any asset is outdated. An asset is outdated when its version marker
+   differs from the expected one and also when its bytes differ from the
+   embedded script at the same version, reported as `asset_modified` with the
+   install command as remediation.
+2. Reinstall each agent it names: `pohunek integration install --agent claude`
+   and `--agent codex` (with the same `--profile` or `--all-profiles` selector).
+   The install replaces the managed files atomically and keeps unrelated user
+   hooks.
+3. For Hermes, run `pohunek integration doctor --agent hermes --hermes-profile work`
+   (or `--hermes-home <absolute path>`; use the target you installed with). The
+   `asset_current` check fails when the installed plugin was written by an older
+   release even though no file was edited; `integration status` shows
+   `outdated=true`. Run `pohunek integration update --agent hermes --hermes-profile work`
+   with the same target; it needs `--confirm-modified` only when `modified=true`.
+
+The installer wrapper prints these commands after a successful install or
+upgrade. A launch whose agent has outdated Claude or Codex hook assets returns a
+session warning of kind `integration_outdated` (shown by `session new`,
+`session list` and `session inspect`) that names the exact install command; the
+session still starts. Files in a user-owned config home change only by an
+explicit owner command, never as a side effect of an upgrade or a launch.
 
 ## Mixed releases across hosts
 

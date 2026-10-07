@@ -332,7 +332,7 @@ esac"#,
     assert_eq!(doctor_ok["doctor"]["ok"], true);
     assert_eq!(
         doctor_ok["doctor"]["checks"].as_array().map(Vec::len),
-        Some(15)
+        Some(16)
     );
 
     fs::write(plugin_root.join("hooks.py"), b"# explicitly modified\n")

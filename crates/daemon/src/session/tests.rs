@@ -19148,3 +19148,90 @@ async fn the_identity_schema_admits_hermes_reports_and_refuses_unlisted_sessions
 
     rig.finish(&created.id).await;
 }
+
+/// The variable the Claude descriptor declares for its config home.
+#[cfg(unix)]
+const CLAUDE_CONFIG_DIR_VARIABLE: &str = "CLAUDE_CONFIG_DIR";
+
+/// A registry whose launch environment names `claude_dir` as the Claude config
+/// home and whose `resumable` profile launches a Claude-based shell command.
+#[cfg(unix)]
+fn claude_home_registry(tag: &str, claude_dir: &std::path::Path) -> SessionRegistry {
+    let crate::runtime::EnvironmentSource::Fixed(mut variables) =
+        crate::test_support::thread_environment_source()
+    else {
+        panic!("a test fixture supplies an explicit environment");
+    };
+    variables.insert(CLAUDE_CONFIG_DIR_VARIABLE.into(), claude_dir.into());
+    let agents_dir = temp_agents_dir_with(
+        tag,
+        "resumable",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"exit 0\"]\n",
+    );
+    let allowlist = pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
+        .iter()
+        .map(|name| (*name).to_owned())
+        .chain([CLAUDE_CONFIG_DIR_VARIABLE.to_owned()])
+        .collect();
+    SessionRegistry::new_with_runtimes_and_environment(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            agents_dir: Some(agents_dir),
+            ..SessionRegistryConfig::default()
+        },
+        crate::agent::host::fixture::builtin_host(),
+        crate::runtime::EnvironmentSource::Fixed(variables),
+        allowlist,
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_launch_over_outdated_hook_assets_carries_an_integration_outdated_warning() {
+    use protocol::{RuntimeRef, SessionWarningKind};
+
+    let claude_dir = temp_dir("outdated-assets-claude");
+    let cwd = temp_dir("outdated-assets-cwd");
+    let registry = claude_home_registry("outdated-assets", &claude_dir);
+    let warned = |info: &SessionInfo| {
+        info.warnings
+            .iter()
+            .any(|warning| warning.kind == SessionWarningKind::IntegrationOutdated)
+    };
+
+    // No install: the owner never opted in, so there is nothing to flag.
+    let none = create_in(&registry, "resumable", &cwd)
+        .await
+        .expect("create");
+    assert!(!warned(&none));
+
+    let homes = registry.integration_homes().expect("config homes");
+    crate::integration::install_in(
+        &homes,
+        Some(&RuntimeRef::claude()),
+        &crate::integration::HomeSelection::Runtime,
+        &crate::integration::RetainedSchemas::default(),
+    )
+    .expect("install the Claude hooks");
+    let current = create_in(&registry, "resumable", &cwd)
+        .await
+        .expect("create");
+    assert!(!warned(&current), "a current install carries no warning");
+
+    // Same version marker, different body: content drift of a managed asset.
+    let state_hook = claude_dir.join("hooks/pohunek-agent-state.sh");
+    let body = fs::read_to_string(&state_hook).expect("read the installed hook");
+    fs::write(&state_hook, format!("{body}\n# drifted\n")).expect("drift the hook");
+    let outdated = create_in(&registry, "resumable", &cwd)
+        .await
+        .expect("create");
+    let warning = outdated
+        .warnings
+        .iter()
+        .find(|warning| warning.kind == SessionWarningKind::IntegrationOutdated)
+        .expect("an integration_outdated warning");
+    assert!(warning
+        .message
+        .contains("pohunek integration install --agent claude"));
+}

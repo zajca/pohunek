@@ -26,12 +26,13 @@ const MANAGED_HOOK_COUNT: u8 = 7;
 /// Hooks must finish inside the one-second bound enforced by the Python probe.
 const HOOK_LATENCY_CEILING_MS: u32 = 1_000;
 /// The complete, stable report inventory in user-facing presentation order.
-const CHECK_CODES: [&str; 15] = [
+const CHECK_CODES: [&str; 16] = [
     "hermes_executable",
     "hermes_version",
     "target_safety",
     "plugin_ownership",
     "asset_integrity",
+    "asset_current",
     "plugin_enabled",
     "policy_schema_permissions",
     "pohunek_cli_compatibility",
@@ -159,6 +160,12 @@ pub(crate) fn inspect(
                 "asset_integrity",
                 state.installed && !state.modified,
                 "restore the embedded managed plugin assets",
+            );
+            set_result(
+                &mut checks,
+                "asset_current",
+                state.installed && !state.outdated,
+                "reinstall the managed plugin with `pohunek integration install --agent hermes` to replace assets from an older release",
             );
             set_result(
                 &mut checks,
@@ -624,6 +631,47 @@ mod tests {
         assert_eq!(check(&report, "asset_integrity"), Status::NotRun);
         assert_eq!(check(&report, "hook_registration"), Status::NotRun);
         assert_no_fixture_payload(&report, &invalid_marker);
+    }
+
+    #[test]
+    fn an_untouched_install_from_an_older_release_fails_the_currency_check_only() {
+        let mut current = fixture("current-assets", "enabled", "full");
+        let report = inspect(&mut current.runner, &current.target, &current.policy);
+        assert_eq!(check(&report, "asset_current"), Status::Pass);
+
+        let mut older = fixture("older-assets", "enabled", "full");
+        let root = older.target.plugin_root().to_owned();
+        let marker_path = root.join(assets::MARKER_NAME);
+        let mut marker =
+            assets::parse_marker(&fs::read(&marker_path).expect("read marker")).expect("marker");
+        // The older asset still loads, so the installed probe runs and the only
+        // difference from this release is the recorded checksum.
+        let mut older_bytes = assets::render(&older.policy)
+            .expect("render assets")
+            .into_iter()
+            .find(|asset| asset.path() == "tools.py")
+            .expect("tools asset")
+            .bytes()
+            .to_vec();
+        older_bytes.extend_from_slice(b"\n# an asset of an older release\n");
+        fs::write(root.join("tools.py"), &older_bytes).expect("older asset");
+        set_mode(&root.join("tools.py"), PRIVATE_FILE_MODE);
+        marker
+            .assets
+            .insert("tools.py".to_owned(), assets::checksum(&older_bytes));
+        fs::write(
+            &marker_path,
+            assets::marker_bytes(&marker).expect("marker bytes"),
+        )
+        .expect("record the older checksum");
+        set_mode(&marker_path, PRIVATE_FILE_MODE);
+
+        let report = inspect(&mut older.runner, &older.target, &older.policy);
+        assert_eq!(check(&report, "plugin_ownership"), Status::Pass);
+        assert_eq!(check(&report, "asset_integrity"), Status::Pass);
+        assert_eq!(check(&report, "asset_current"), Status::Fail);
+        assert!(!report.ok);
+        assert_no_fixture_payload(&report, &older);
     }
 
     #[test]
