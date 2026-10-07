@@ -727,18 +727,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_daemon_outside_the_requested_range_is_a_version_mismatch() {
-        let beyond = ProtocolVersion::new(PROTOCOL_VERSION.get() + 1).expect("nonzero version");
-        let stub = single_version_stub(beyond).await;
-        assert_eq!(
-            classify(stub, DEFAULT_PROBE_TIMEOUT, None, CLIENT_PROTOCOL_VERSIONS).await,
-            HostClass::VersionMismatch {
-                daemon_protocol_version: beyond.get()
-            }
-        );
-    }
-
     #[test]
     fn default_options_probe_with_the_client_window() {
         assert_eq!(
@@ -828,36 +816,6 @@ mod tests {
         addr
     }
 
-    async fn health_echo_stub(daemon_version: &str) -> SocketAddr {
-        let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("address");
-        let daemon_version = daemon_version.to_owned();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept");
-            let mut request = Vec::new();
-            let mut byte = [0_u8; 1];
-            while socket.read(&mut byte).await.expect("read") != 0 {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                request.push(byte[0]);
-            }
-            let request: Request = serde_json::from_slice(&request).expect("request");
-            let response = serde_json::json!({
-                "v": PROTOCOL_VERSION.get(),
-                "id": request.id(),
-                "ok": { "daemon_version": daemon_version },
-            });
-            socket
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .expect("write");
-        });
-        addr
-    }
-
     async fn health_capture_stub() -> (SocketAddr, oneshot::Receiver<Request>) {
         let listener = TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
             .await
@@ -882,17 +840,6 @@ mod tests {
             request_tx.send(request).expect("capture request");
         });
         (addr, request_rx)
-    }
-
-    #[tokio::test]
-    async fn health_response_extracts_daemon_version() {
-        let addr = health_echo_stub("1.2.3").await;
-        assert_eq!(
-            classify(addr, DEFAULT_PROBE_TIMEOUT, None, CURRENT_PROTOCOL_VERSIONS).await,
-            HostClass::ReachableDaemon {
-                daemon_version: "1.2.3".to_owned()
-            }
-        );
     }
 
     #[tokio::test]

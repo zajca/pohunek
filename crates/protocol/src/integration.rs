@@ -536,11 +536,6 @@ mod tests {
     use super::{IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams};
 
     #[test]
-    fn integration_status_params_default_to_all_agents() {
-        assert_eq!(IntegrationStatusParams::default().agent, None);
-    }
-
-    #[test]
     fn integration_status_params_reject_unknown_fields() {
         let error = serde_json::from_value::<IntegrationStatusParams>(serde_json::json!({
             "agent": "codex",

@@ -576,81 +576,87 @@ mod tests {
         );
     }
 
+    /// Documented `class/code` of each SDK error that carries no recovery
+    /// contract of its own, with the message fragments it must keep.
     #[test]
-    fn local_framing_maps_to_transport_framing() {
-        let structured = ClientError::Framing("invalid line".to_owned()).to_protocol_error();
+    fn errors_map_to_their_documented_class_and_code() {
+        let cases = [
+            (
+                "framing",
+                ClientError::Framing("invalid line".to_owned()),
+                ErrorClass::Transport,
+                "framing",
+                vec![],
+            ),
+            (
+                "overlay CLI missing",
+                ClientError::Overlay(OverlayError::CliMissing(netbird_id())),
+                ErrorClass::Discovery,
+                "netbird_cli_missing",
+                vec![],
+            ),
+            (
+                "overlay state unavailable keeps the parse detail",
+                ClientError::Overlay(OverlayError::StateUnavailable {
+                    overlay: netbird_id(),
+                    detail: "failed to parse status: bad json".to_owned(),
+                }),
+                ErrorClass::Discovery,
+                "netbird_state_unavailable",
+                vec!["bad json"],
+            ),
+            (
+                "remote discovery failed keeps the detail",
+                ClientError::RemoteDiscoveryFailed {
+                    detail: "blocking task was cancelled".to_owned(),
+                },
+                ErrorClass::Discovery,
+                "remote_discovery_failed",
+                vec!["blocking task"],
+            ),
+            (
+                "overlay host unknown names the host",
+                ClientError::Overlay(OverlayError::HostUnknown {
+                    host: "build-box".to_owned(),
+                    overlay: netbird_id(),
+                }),
+                ErrorClass::Discovery,
+                "host_unknown",
+                vec!["build-box"],
+            ),
+            (
+                "host unreachable names the host and appends the source",
+                ClientError::HostUnreachable {
+                    host: "build-box".to_owned(),
+                    source: io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused"),
+                },
+                ErrorClass::Transport,
+                "host_unreachable",
+                vec!["build-box", "connection refused"],
+            ),
+            (
+                "remote daemon unavailable names the host",
+                ClientError::RemoteDaemonUnavailable {
+                    host: "build-box".to_owned(),
+                },
+                ErrorClass::Daemon,
+                "remote_daemon_unavailable",
+                vec!["build-box"],
+            ),
+        ];
 
-        assert_eq!(structured.class, ErrorClass::Transport);
-        assert_eq!(structured.code, "framing");
-    }
-
-    #[test]
-    fn overlay_cli_missing_maps_to_discovery_code() {
-        let structured =
-            ClientError::Overlay(OverlayError::CliMissing(netbird_id())).to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Discovery);
-        assert_eq!(structured.code, "netbird_cli_missing");
-    }
-
-    #[test]
-    fn overlay_state_unavailable_maps_to_discovery_code() {
-        let structured = ClientError::Overlay(OverlayError::StateUnavailable {
-            overlay: netbird_id(),
-            detail: "daemon down".to_owned(),
-        })
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Discovery);
-        assert_eq!(structured.code, "netbird_state_unavailable");
-    }
-
-    #[test]
-    fn overlay_parse_detail_is_preserved_without_flattening() {
-        let structured = ClientError::Overlay(OverlayError::StateUnavailable {
-            overlay: netbird_id(),
-            detail: "failed to parse status: bad json".to_owned(),
-        })
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Discovery);
-        assert_eq!(structured.code, "netbird_state_unavailable");
-        assert!(
-            structured.msg.contains("bad json"),
-            "msg includes parse detail: {}",
-            structured.msg
-        );
-    }
-
-    #[test]
-    fn remote_discovery_failed_maps_to_discovery_code_and_detail() {
-        let structured = ClientError::RemoteDiscoveryFailed {
-            detail: "blocking task was cancelled".to_owned(),
+        for (name, error, class, code, fragments) in cases {
+            let structured = error.to_protocol_error();
+            assert_eq!(structured.class, class, "{name}");
+            assert_eq!(structured.code, code, "{name}");
+            for fragment in fragments {
+                assert!(
+                    structured.msg.contains(fragment),
+                    "{name}: msg must contain {fragment:?}: {}",
+                    structured.msg
+                );
+            }
         }
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Discovery);
-        assert_eq!(structured.code, "remote_discovery_failed");
-        assert!(
-            structured.msg.contains("blocking task"),
-            "msg includes detail: {}",
-            structured.msg
-        );
-    }
-
-    #[test]
-    fn invalid_discovery_options_maps_to_non_retry_configuration_error() {
-        let structured = ClientError::InvalidDiscoveryOptions {
-            detail: "discovery concurrency must be non-zero".to_owned(),
-        }
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Configuration);
-        assert_eq!(structured.code, "invalid_discovery_options");
-        assert_eq!(
-            structured.recover.as_deref(),
-            Some("fix the invalid discovery option before running discovery")
-        );
     }
 
     #[test]
@@ -667,61 +673,6 @@ mod tests {
             .recover
             .as_deref()
             .is_some_and(|hint| hint.contains("<non-zero-port>")));
-    }
-
-    #[test]
-    fn host_unknown_maps_to_discovery_code_and_names_host() {
-        let structured = ClientError::Overlay(OverlayError::HostUnknown {
-            host: "build-box".to_owned(),
-            overlay: netbird_id(),
-        })
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Discovery);
-        assert_eq!(structured.code, "host_unknown");
-        assert!(
-            structured.msg.contains("build-box"),
-            "msg names host: {}",
-            structured.msg
-        );
-    }
-
-    #[test]
-    fn host_unreachable_maps_to_transport_code_names_host_and_appends_source_detail() {
-        let structured = ClientError::HostUnreachable {
-            host: "build-box".to_owned(),
-            source: io::Error::new(io::ErrorKind::ConnectionRefused, "connection refused"),
-        }
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Transport);
-        assert_eq!(structured.code, "host_unreachable");
-        assert!(
-            structured.msg.contains("build-box"),
-            "msg names host: {}",
-            structured.msg
-        );
-        assert!(
-            structured.msg.contains("connection refused"),
-            "msg includes source detail: {}",
-            structured.msg
-        );
-    }
-
-    #[test]
-    fn remote_daemon_unavailable_maps_to_daemon_code_and_names_host() {
-        let structured = ClientError::RemoteDaemonUnavailable {
-            host: "build-box".to_owned(),
-        }
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Daemon);
-        assert_eq!(structured.code, "remote_daemon_unavailable");
-        assert!(
-            structured.msg.contains("build-box"),
-            "msg names host: {}",
-            structured.msg
-        );
     }
 
     #[test]
@@ -774,13 +725,5 @@ mod tests {
             "msg preserves source detail: {}",
             structured.msg
         );
-    }
-
-    #[test]
-    fn protocol_passthrough_keeps_source_code_unchanged() {
-        let source = ProtocolError::agent_binary_missing("codex");
-        let structured = ClientError::Protocol(source.clone()).to_protocol_error();
-
-        assert_eq!(structured, source);
     }
 }

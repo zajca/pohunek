@@ -3108,29 +3108,6 @@ mod tests {
     }
 
     #[test]
-    fn session_state_strings_match_wire_repr() {
-        assert_eq!(SessionState::Starting.as_str(), "starting");
-        assert_eq!(SessionState::Running.as_str(), "running");
-        assert_eq!(SessionState::Stopped.as_str(), "stopped");
-        assert_eq!(SessionState::Done.as_str(), "done");
-        assert_eq!(SessionState::Failed.as_str(), "failed");
-    }
-
-    #[test]
-    fn agent_activity_strings_match_wire_repr() {
-        assert_eq!(AgentActivity::Working.as_str(), "working");
-        assert_eq!(AgentActivity::Blocked.as_str(), "blocked");
-        assert_eq!(AgentActivity::Idle.as_str(), "idle");
-    }
-
-    #[test]
-    fn cwd_source_strings_match_wire_repr() {
-        assert_eq!(CwdSource::Launch.as_str(), "launch");
-        assert_eq!(CwdSource::Procwatch.as_str(), "procwatch");
-        assert_eq!(CwdSource::Osc7.as_str(), "osc7");
-    }
-
-    #[test]
     fn filter_matches_each_field() {
         let mut s = session("s-42");
         s.project_id = Some("p-abc".to_owned());

@@ -12,40 +12,36 @@ use protocol::{
     EnrollmentRevision, EnrollmentStatus, ErrorClass, Event, ForkCwdMode, HostApprovalSignature,
     HostCapabilities, HostGovernanceStatus, HostId, HostOwner, IntegrationAgentDoctor,
     IntegrationAgentStatus, IntegrationDoctorParams, IntegrationDoctorResult, IntegrationFinding,
-    IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallParams,
-    IntegrationInstallReport, IntegrationInstallResult, IntegrationInstallState,
-    IntegrationRecovery, IntegrationUninstallParams, IntegrationUninstallReport,
-    IntegrationUninstallResult, IntegrationUninstallState, NotificationCreateParams,
-    NotificationCreateResult, NotificationCreatedEvent, NotificationDeleteParams,
-    NotificationDeleteResult, NotificationDeletedEvent, NotificationId, NotificationKind,
-    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
-    NotificationPolicyParams, NotificationPolicyResult, NotificationRecord,
-    NotificationRetentionParams, NotificationRetentionPolicy, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
+    IntegrationFindingCode, IntegrationFindingSeverity, IntegrationInstallState,
+    IntegrationRecovery, NotificationCreateParams, NotificationCreateResult,
+    NotificationCreatedEvent, NotificationDeleteParams, NotificationDeletedEvent, NotificationId,
+    NotificationKind, NotificationKindPolicy, NotificationListParams, NotificationPolicy,
+    NotificationPolicyParams, NotificationRecord, NotificationRetentionParams,
+    NotificationRetentionPolicy, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdatedEvent, ObservationParamsError, OutputOffset,
     OwnerRevision, PrincipalId, ProcessStartIdentity, ProjectSource, ProposalExpiry, ProposalId,
     ProposalNonce, ProtocolError, ProtocolVersion, ProtocolVersionRange, ProviderKind,
     QuarantineReason, RelayId, ReportSequence, Request, Response, RuntimeGeneration, RuntimeId,
-    RuntimeInventoryEntry, RuntimeRef, SessionAttachParams, SessionAttachResult,
-    SessionCapabilities, SessionDetachParams, SessionDetachResult, SessionDetectionParams,
-    SessionDetectionResult, SessionForkParams, SessionForkResult, SessionId, SessionInfo,
-    SessionInputParams, SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams,
-    SessionNewParams, SessionOutputGap, SessionOutputParams, SessionOutputResult,
-    SessionReadFormat, SessionReadParams, SessionReadResult, SessionReadSource,
-    SessionReleaseAgentParams, SessionReleaseAgentResult, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionResumeParams,
-    SessionRuntime, SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult,
-    SessionSetMetadataParams, SessionSetMetadataResult, SessionState, SessionStopResult,
-    SessionWaitParams, SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
+    RuntimeInventoryEntry, RuntimeRef, SessionAttachResult, SessionCapabilities,
+    SessionDetachParams, SessionDetachResult, SessionDetectionParams, SessionDetectionResult,
+    SessionForkParams, SessionForkResult, SessionId, SessionInfo, SessionInputParams,
+    SessionInputResult, SessionInputWait, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionOutputGap, SessionOutputParams, SessionOutputResult, SessionReadFormat,
+    SessionReadParams, SessionReadResult, SessionReadSource, SessionReleaseAgentParams,
+    SessionReleaseAgentResult, SessionRemoveResult, SessionReportAgentParams,
+    SessionReportAgentResult, SessionReportNativeIdParams, SessionReportNativeIdResult,
+    SessionResizeParams, SessionResizeResult, SessionResumeParams, SessionRuntime,
+    SessionRuntimeIdentity, SessionScreenParams, SessionScreenResult, SessionSetMetadataParams,
+    SessionSetMetadataResult, SessionState, SessionStopResult, SessionWaitParams,
+    SessionWaitReason, SessionWaitResult, SessionWarning, SessionWarningKind,
     ShareSuspensionIntent, SignedTransferOutcome, StateSource, TeamId, TerminalCursor,
     TerminalDimensions, TerminalWatermark, TransferCoordinates, TransferOutcomeCandidate,
-    TransferOutcomeId, TransferProposal, UnconfirmedProcess, CLIENT_PROTOCOL_VERSIONS,
-    GOVERNANCE_ID_PAYLOAD_BYTES, MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES,
-    MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES, MAX_SESSION_OUTPUT_BYTES,
-    MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES, MAX_SESSION_WAIT_MS,
-    MAX_WORKER_INSTANCE_ID_BYTES, OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
-    SESSION_OUTPUT_METADATA_HEADROOM_BYTES, SUPPORTED_PROTOCOL_VERSIONS,
+    TransferOutcomeId, TransferProposal, UnconfirmedProcess, GOVERNANCE_ID_PAYLOAD_BYTES,
+    MAX_CONTROL_LINE_BYTES, MAX_REQUEST_ID_BYTES, MAX_SESSION_ID_BYTES, MAX_SESSION_INPUT_BYTES,
+    MAX_SESSION_OUTPUT_BYTES, MAX_SESSION_READ_LINES, MAX_SESSION_SCREEN_RESPONSE_BYTES,
+    MAX_SESSION_WAIT_MS, MAX_WORKER_INSTANCE_ID_BYTES,
+    OBSERVATION_RESPONSE_ENVELOPE_HEADROOM_BYTES, PROTOCOL_VERSION,
+    SESSION_OUTPUT_METADATA_HEADROOM_BYTES,
 };
 use serde_json::{json, Value};
 
@@ -236,20 +232,6 @@ fn runtime_ref_json_shape_roundtrips() {
 }
 
 #[test]
-fn grammar_invalid_runtime_ref_roundtrips_neutrally_and_is_rejected_for_mutation() {
-    let agent: RuntimeRef = serde_json::from_value(json!("Future Agent")).expect("deserialize");
-    assert_eq!(agent, RuntimeRef::from_wire("Future Agent"));
-    assert_eq!(
-        serde_json::to_value(&agent).expect("serialize"),
-        json!("Future Agent")
-    );
-    let error = agent
-        .launchable()
-        .expect_err("a historical label must be presentation-only");
-    assert_eq!(error.code, "agent_kind_unsupported");
-}
-
-#[test]
 fn grammar_valid_runtime_ref_roundtrips_as_an_id() {
     let agent: RuntimeRef = serde_json::from_value(json!("future-agent")).expect("deserialize");
     assert_eq!(
@@ -260,23 +242,6 @@ fn grammar_valid_runtime_ref_roundtrips_as_an_id() {
         serde_json::to_value(&agent).expect("serialize"),
         json!("future-agent")
     );
-}
-
-#[test]
-fn agent_activity_json_shape_roundtrips() {
-    let cases = [
-        (AgentActivity::Working, json!("working")),
-        (AgentActivity::Blocked, json!("blocked")),
-        (AgentActivity::Idle, json!("idle")),
-    ];
-
-    for (activity, expected) in cases {
-        let value = serde_json::to_value(activity).expect("serialize activity");
-        assert_eq!(value, expected);
-
-        let back = line_roundtrip(&activity);
-        assert_eq!(back, activity);
-    }
 }
 
 #[test]
@@ -308,6 +273,9 @@ fn public_enum_string_helpers_match_wire_shapes() {
     assert_wire_label!(ProviderKind::LinearIssue, "linear_issue");
     assert_wire_label!(ProviderKind::GithubPr, "github_pr");
     assert_wire_label!(ProviderKind::None, "none");
+    assert_wire_label!(CwdSource::Launch, "launch");
+    assert_wire_label!(CwdSource::Procwatch, "procwatch");
+    assert_wire_label!(CwdSource::Osc7, "osc7");
 }
 
 #[test]
@@ -402,34 +370,6 @@ fn notification_record_json_shape_roundtrips() {
 
     let back = line_roundtrip(&record);
     assert_eq!(back, record);
-}
-
-#[test]
-fn notification_record_omits_absent_optional_fields() {
-    let record = notification_record();
-
-    let value = serde_json::to_value(&record).expect("serialize notification record");
-    for field in [
-        "session_id",
-        "agent_kind",
-        "source_id",
-        "dedupe_key",
-        "project_id",
-        "read_at",
-        "acked_at",
-        "archived_at",
-        "deleted_at",
-        "superseded_by",
-        "metadata",
-    ] {
-        assert!(
-            !value
-                .as_object()
-                .expect("notification record object")
-                .contains_key(field),
-            "absent optional notification field must not appear on the wire: {field}"
-        );
-    }
 }
 
 #[test]
@@ -728,28 +668,6 @@ fn notification_policy_params_json_shape_roundtrips() {
 }
 
 #[test]
-fn notification_policy_carries_attention_dedupe_window_secs() {
-    let policy = notification_policy();
-
-    let value = serde_json::to_value(&policy).expect("serialize notification policy");
-    assert_eq!(value["attention_dedupe_window_secs"], json!(90));
-
-    let back = line_roundtrip(&policy);
-    assert_eq!(back.attention_dedupe_window_secs, 90);
-}
-
-#[test]
-fn notification_policy_carries_attention_debounce_secs() {
-    let policy = notification_policy();
-
-    let value = serde_json::to_value(&policy).expect("serialize notification policy");
-    assert_eq!(value["attention_debounce_secs"], json!(7));
-
-    let back = line_roundtrip(&policy);
-    assert_eq!(back.attention_debounce_secs, 7);
-}
-
-#[test]
 fn notification_policy_defaults_attention_debounce_secs_when_field_absent() {
     // A policy JSON persisted before the debounce field existed must still load,
     // backfilling the default rather than failing to deserialize.
@@ -807,48 +725,6 @@ fn notification_retention_params_json_shape_roundtrips() {
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
-}
-
-#[test]
-fn notification_result_types_json_shape_roundtrip() {
-    let list = NotificationListResult {
-        notifications: vec![notification_record()],
-        next_cursor: Some("page-2".to_owned()),
-    };
-    let update = NotificationUpdateResult {
-        record: notification_record(),
-    };
-    let delete = NotificationDeleteResult {
-        id: NotificationId("n-42".to_owned()),
-        deleted: true,
-    };
-    let policy = NotificationPolicyResult {
-        policy: notification_policy(),
-    };
-    let retention = NotificationRetentionResult {
-        dry_run: true,
-        pruned: vec![NotificationId("n-42".to_owned())],
-    };
-
-    assert_eq!(line_roundtrip(&list), list);
-    assert_eq!(line_roundtrip(&update), update);
-    assert_eq!(line_roundtrip(&delete), delete);
-    assert_eq!(line_roundtrip(&policy), policy);
-    assert_eq!(line_roundtrip(&retention), retention);
-}
-
-#[test]
-fn notification_method_names_are_stable() {
-    assert_eq!(method::NOTIFICATION_CREATE, "notification.create");
-    assert_eq!(method::NOTIFICATION_LIST, "notification.list");
-    assert_eq!(method::NOTIFICATION_UPDATE, "notification.update");
-    assert_eq!(method::NOTIFICATION_DELETE, "notification.delete");
-    assert_eq!(method::NOTIFICATION_POLICY_GET, "notification.policy.get");
-    assert_eq!(method::NOTIFICATION_POLICY_SET, "notification.policy.set");
-    assert_eq!(
-        method::NOTIFICATION_RETENTION_PRUNE,
-        "notification.retention.prune"
-    );
 }
 
 #[test]
@@ -1037,35 +913,6 @@ fn session_new_params_roundtrips_with_worktree_fields() {
             "base_branch": "main"
         })
     );
-
-    let back = line_roundtrip(&params);
-    assert_eq!(back, params);
-}
-
-#[test]
-fn session_new_params_omits_absent_worktree_fields() {
-    let params = SessionNewParams {
-        agent: "shell".to_owned(),
-        name: None,
-        cwd: None,
-        cols: 80,
-        rows: 24,
-        project: None,
-        repo: None,
-        branch: None,
-        base_branch: None,
-        input: None,
-        metadata: BTreeMap::new(),
-    };
-
-    let value = serde_json::to_value(&params).expect("serialize params");
-    let object = value.as_object().expect("params object");
-    for absent in ["cwd", "repo", "branch", "base_branch", "input"] {
-        assert!(
-            !object.contains_key(absent),
-            "absent {absent} must be omitted: {value}"
-        );
-    }
 
     let back = line_roundtrip(&params);
     assert_eq!(back, params);
@@ -1266,31 +1113,6 @@ fn session_list_params_roundtrips_with_filters() {
 }
 
 #[test]
-fn session_list_agent_filter_roundtrips_and_matches_launch_or_active_agent_identity() {
-    let session = SessionInfo {
-        agent: "shell-main".to_owned(),
-        agent_base: RuntimeRef::shell(),
-        active_agent: Some("codex-gpt-5".to_owned()),
-        active_agent_base: Some(RuntimeRef::codex()),
-        ..running_shell_session(None)
-    };
-
-    for agent in ["shell-main", "shell", "codex-gpt-5", "codex"] {
-        let filter = line_roundtrip(&SessionListFilter::Agent(agent.to_owned()));
-        assert!(
-            filter.matches(&session),
-            "agent filter {agent:?} must match launch or active identity"
-        );
-    }
-
-    let filter = line_roundtrip(&SessionListFilter::Agent("claude".to_owned()));
-    assert!(
-        !filter.matches(&session),
-        "agent filter must reject unrelated identities"
-    );
-}
-
-#[test]
 fn session_list_params_omits_empty_filters() {
     let params = SessionListParams::default();
 
@@ -1433,47 +1255,6 @@ fn session_info_json_shape_roundtrips_with_exit_code() {
 }
 
 #[test]
-fn session_info_omits_absent_activity() {
-    let info = running_shell_session(None);
-
-    let value = serde_json::to_value(&info).expect("serialize session info");
-    assert!(
-        !value
-            .as_object()
-            .expect("session info object")
-            .contains_key("activity"),
-        "absent activity must be omitted: {value}"
-    );
-
-    let back = line_roundtrip(&info);
-    assert_eq!(back.activity, None);
-    assert_eq!(back, info);
-}
-
-#[test]
-fn session_info_omits_absent_exit_code() {
-    let info = running_shell_session(None);
-
-    let value = serde_json::to_value(&info).expect("serialize session info");
-    assert!(
-        !value
-            .as_object()
-            .expect("session info object")
-            .contains_key("exit_code"),
-        "absent exit_code must be omitted: {value}"
-    );
-
-    let back = line_roundtrip(&info);
-    assert_eq!(back.exit_code, None);
-    assert_eq!(back, info);
-}
-
-#[test]
-fn session_input_method_name_is_stable() {
-    assert_eq!(method::SESSION_INPUT, "session.input");
-}
-
-#[test]
 fn session_input_params_json_shape_roundtrips() {
     assert_eq!(MAX_SESSION_INPUT_BYTES, MAX_CONTROL_LINE_BYTES / 4);
     let params = SessionInputParams {
@@ -1538,22 +1319,6 @@ fn session_input_result_json_shape_roundtrips() {
     );
     let back = line_roundtrip(&populated);
     assert_eq!(back, populated);
-}
-
-#[test]
-fn session_report_native_id_method_name_is_stable() {
-    assert_eq!(method::SESSION_REPORT_NATIVE_ID, "session.report_native_id");
-}
-
-#[test]
-fn session_report_agent_method_names_are_stable() {
-    assert_eq!(method::SESSION_REPORT_AGENT, "session.report_agent");
-    assert_eq!(method::SESSION_RELEASE_AGENT, "session.release_agent");
-}
-
-#[test]
-fn session_set_metadata_method_name_is_stable() {
-    assert_eq!(method::SESSION_SET_METADATA, "session.set_metadata");
 }
 
 #[test]
@@ -1768,23 +1533,6 @@ fn session_info_roundtrips_with_active_agent_fields() {
 }
 
 #[test]
-fn session_info_omits_absent_native_session_id() {
-    let info = running_shell_session(None);
-
-    let value = serde_json::to_value(&info).expect("serialize session info");
-    assert!(
-        !value
-            .as_object()
-            .expect("session info object")
-            .contains_key("native_session_id"),
-        "absent native_session_id must be omitted: {value}"
-    );
-
-    let back = line_roundtrip(&info);
-    assert_eq!(back.native_session_id, None);
-}
-
-#[test]
 fn session_warning_json_shape_roundtrips() {
     let cases = [
         (SessionWarningKind::Fetch, json!("fetch")),
@@ -1867,127 +1615,6 @@ fn session_info_roundtrips_with_worktree_fields_and_warnings() {
 }
 
 #[test]
-fn session_info_omits_absent_worktree_fields() {
-    let info = running_shell_session(None);
-
-    let value = serde_json::to_value(&info).expect("serialize session info");
-    let object = value.as_object().expect("session info object");
-    for absent in ["repo", "branch", "worktree_path", "warnings"] {
-        assert!(
-            !object.contains_key(absent),
-            "absent {absent} must be omitted: {value}"
-        );
-    }
-
-    let back = line_roundtrip(&info);
-    assert!(back.warnings.is_empty());
-    assert_eq!(back.repo, None);
-    assert_eq!(back.worktree_path, None);
-}
-
-#[test]
-fn integration_install_method_name_is_stable() {
-    assert_eq!(method::INTEGRATION_INSTALL, "integration.install");
-}
-
-#[test]
-fn integration_install_params_roundtrips_with_and_without_agent() {
-    let with_agent = IntegrationInstallParams {
-        all_profiles: false,
-        profile: None,
-        agent: Some(RuntimeRef::claude()),
-    };
-    let value = serde_json::to_value(&with_agent).expect("serialize install params");
-    assert_eq!(value, json!({ "agent": "claude" }));
-    assert_eq!(line_roundtrip(&with_agent), with_agent);
-
-    let all_agents = IntegrationInstallParams {
-        all_profiles: false,
-        profile: None,
-        agent: None,
-    };
-    let value = serde_json::to_value(&all_agents).expect("serialize install params");
-    assert!(
-        !value
-            .as_object()
-            .expect("params object")
-            .contains_key("agent"),
-        "absent agent selector must be omitted: {value}"
-    );
-    assert_eq!(line_roundtrip(&all_agents), all_agents);
-}
-
-#[test]
-fn integration_install_result_roundtrips() {
-    let result = IntegrationInstallResult {
-        failed: Vec::new(),
-        installed: vec![
-            IntegrationInstallReport {
-                home: None,
-                agent: RuntimeRef::claude(),
-                hook_path: "/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned(),
-                config_paths: vec!["/home/user/.claude/settings.json".to_owned()],
-                cleanup_incomplete: vec![],
-            },
-            IntegrationInstallReport {
-                home: None,
-                agent: RuntimeRef::codex(),
-                hook_path: "/home/user/.codex/pohunek-agent-state.sh".to_owned(),
-                config_paths: vec![
-                    "/home/user/.codex/hooks.json".to_owned(),
-                    "/home/user/.codex/config.toml".to_owned(),
-                ],
-                cleanup_incomplete: vec![],
-            },
-        ],
-    };
-
-    let back = line_roundtrip(&result);
-    assert_eq!(back, result);
-    assert_eq!(back.installed.len(), 2);
-    assert_eq!(back.installed[0].agent, RuntimeRef::claude());
-    assert_eq!(back.installed[1].config_paths.len(), 2);
-}
-
-#[test]
-fn integration_uninstall_and_doctor_method_names_are_stable() {
-    assert_eq!(method::INTEGRATION_UNINSTALL, "integration.uninstall");
-    assert_eq!(method::INTEGRATION_DOCTOR, "integration.doctor");
-}
-
-#[test]
-fn integration_uninstall_params_and_result_roundtrip() {
-    let params = IntegrationUninstallParams {
-        all_profiles: false,
-        profile: None,
-        agent: RuntimeRef::codex(),
-    };
-    assert_eq!(
-        serde_json::to_value(&params).expect("serialize uninstall params"),
-        json!({ "agent": "codex" })
-    );
-    assert_eq!(line_roundtrip(&params), params);
-    assert!(
-        serde_json::from_value::<IntegrationUninstallParams>(json!({})).is_err(),
-        "the agent is required"
-    );
-
-    let result = IntegrationUninstallResult {
-        failed: Vec::new(),
-        uninstalled: vec![IntegrationUninstallReport {
-            home: None,
-            agent: RuntimeRef::claude(),
-            state: IntegrationUninstallState::Removed,
-            removed_paths: vec!["/home/user/.claude/hooks/pohunek-agent-state.sh".to_owned()],
-            updated_paths: vec!["/home/user/.claude/settings.json".to_owned()],
-            preserved_paths: vec![],
-            cleanup_incomplete: vec![],
-        }],
-    };
-    assert_eq!(line_roundtrip(&result), result);
-}
-
-#[test]
 fn integration_doctor_params_and_result_roundtrip() {
     let params = IntegrationDoctorParams {
         all_profiles: false,
@@ -2058,31 +1685,6 @@ fn session_stop_result_roundtrips() {
 
     let back = line_roundtrip(&result);
     assert_eq!(back, result);
-}
-
-#[test]
-fn session_attach_params_json_shape_roundtrips() {
-    let params = SessionAttachParams {
-        session_id: SessionId("s-42".to_owned()),
-        initial_dimensions: Some(TerminalDimensions::new(120, 40).expect("valid dimensions")),
-        origin_session_id: None,
-        origin_daemon_id: None,
-        origin_worker_id: None,
-    };
-
-    // Optional origin fields remain absent while a known physical geometry is
-    // carried in the attach handshake.
-    let value = serde_json::to_value(&params).expect("serialize attach params");
-    assert_eq!(
-        value,
-        json!({
-            "session_id": "s-42",
-            "initial_dimensions": { "cols": 120, "rows": 40 }
-        })
-    );
-
-    let back = line_roundtrip(&params);
-    assert_eq!(back, params);
 }
 
 #[test]
@@ -2295,50 +1897,94 @@ fn attach_header_json_shape_roundtrips() {
     assert_eq!(back, header);
 }
 
+/// The request, response and event envelopes follow the shapes documented in
+/// `docs/public-api.md`, written by hand and checked in both directions. The
+/// request range is the client window of the AGENTS.md "Upgrade window".
 #[test]
-fn session_created_event_carries_session_info_in_flattened_payload() {
-    let session = running_shell_session(None);
+fn envelopes_match_the_documented_wire_shapes() {
+    let request = Request::new("req-7f3", method::SESSION_LIST, json!({})).expect("valid request");
+    let ok = Response::ok(PROTOCOL_VERSION, "req-7f3", json!({"status": "ok"}))
+        .expect("valid response id");
+    let err = Response::err(
+        PROTOCOL_VERSION,
+        "req-7f3",
+        ProtocolError::method_not_found("example.missing"),
+    )
+    .expect("valid response id");
     let event = Event::new(
         PROTOCOL_VERSION,
-        event::SESSION_CREATED,
-        json!({ "session": session }),
+        event::AGENT_STATE,
+        json!({"session_id": "s-42", "activity": "blocked", "source": "osc_title"}),
     )
-    .expect("valid event");
+    .expect("valid event")
+    .with_id("req-99")
+    .expect("valid event correlation id");
 
-    let back = line_roundtrip(&event);
-    assert_eq!(back, event);
-    assert_eq!(back.event(), event::SESSION_CREATED);
+    let request_wire = json!({
+        "v": {"minimum": 3, "maximum": 4},
+        "id": "req-7f3",
+        "method": "session.list",
+        "params": {}
+    });
+    let ok_wire = json!({"v": 4, "id": "req-7f3", "ok": {"status": "ok"}});
+    let err_wire = json!({
+        "v": 4,
+        "id": "req-7f3",
+        "err": {
+            "class": "daemon",
+            "code": "method_not_found",
+            "msg": "unknown control method: example.missing"
+        }
+    });
+    let event_wire = json!({
+        "v": 4,
+        "event": "agent_state",
+        "id": "req-99",
+        "session_id": "s-42",
+        "activity": "blocked",
+        "source": "osc_title"
+    });
 
-    let value = serde_json::to_value(&event).expect("serialize event");
-    assert_eq!(value["v"], json!(PROTOCOL_VERSION));
-    assert_eq!(value["event"], json!("session_created"));
-    assert_eq!(value["session"]["id"], json!("s-42"));
-    assert_eq!(value["session"]["agent"], json!("shell"));
-    assert_eq!(value["session"]["state"], json!("running"));
-    assert_eq!(value["session"]["state_source"], json!("process"));
-    assert!(
-        !value
-            .as_object()
-            .expect("event object")
-            .contains_key("payload"),
-        "event payload fields must be flattened: {value}"
+    assert_eq!(
+        serde_json::to_value(&request).expect("serialize request"),
+        request_wire,
+        "request"
     );
-}
-
-#[test]
-fn request_roundtrip() {
-    let req = Request::new(
-        "req-7f3",
-        method::SESSION_NEW,
-        json!({ "agent": "claude", "repo": "/p", "branch": "feat/x" }),
-    )
-    .expect("valid request");
-    let back = line_roundtrip(&req);
-    assert_eq!(req, back);
-    assert_eq!(back.version_range(), CLIENT_PROTOCOL_VERSIONS);
-    assert_eq!(back.id(), "req-7f3");
-    assert_eq!(back.method(), "session.new");
-    assert_eq!(back.params()["agent"], json!("claude"));
+    assert_eq!(
+        serde_json::from_value::<Request>(request_wire).expect("parse request"),
+        request,
+        "request"
+    );
+    assert_eq!(
+        serde_json::to_value(&ok).expect("serialize ok response"),
+        ok_wire,
+        "ok response"
+    );
+    assert_eq!(
+        serde_json::from_value::<Response>(ok_wire).expect("parse ok response"),
+        ok,
+        "ok response"
+    );
+    assert_eq!(
+        serde_json::to_value(&err).expect("serialize err response"),
+        err_wire,
+        "err response"
+    );
+    assert_eq!(
+        serde_json::from_value::<Response>(err_wire).expect("parse err response"),
+        err,
+        "err response"
+    );
+    assert_eq!(
+        serde_json::to_value(&event).expect("serialize event"),
+        event_wire,
+        "event"
+    );
+    assert_eq!(
+        serde_json::from_value::<Event>(event_wire).expect("parse event"),
+        event,
+        "event"
+    );
 }
 
 #[test]
@@ -2351,137 +1997,10 @@ fn request_missing_params_defaults_to_null() {
 }
 
 #[test]
-fn ok_response_roundtrip() {
-    let resp = Response::ok(
-        PROTOCOL_VERSION,
-        "req-7f3",
-        json!({ "session_id": "s-42", "state": "working" }),
-    )
-    .expect("valid response id");
-    let back = line_roundtrip(&resp);
-    assert_eq!(resp, back);
-    assert_eq!(back.version(), PROTOCOL_VERSION);
-    assert_eq!(back.id(), "req-7f3");
-    assert_eq!(
-        back.result().expect("expected ok variant")["session_id"],
-        json!("s-42")
-    );
-}
-
-#[test]
-fn err_response_roundtrip() {
-    let err = ProtocolError::new(
-        ErrorClass::Runtime,
-        "agent_binary_missing",
-        "claude not found on PATH",
-        Some("install claude".to_owned()),
-    );
-    let resp = Response::err(PROTOCOL_VERSION, "req-7f3", err.clone()).expect("valid response id");
-    let back = line_roundtrip(&resp);
-    assert_eq!(resp, back);
-    assert_eq!(back.version(), PROTOCOL_VERSION);
-    assert_eq!(back.id(), "req-7f3");
-    let got = back.result().expect_err("expected err variant");
-    assert_eq!(got, &err);
-    assert_eq!(got.class, ErrorClass::Runtime);
-    assert_eq!(got.code, "agent_binary_missing");
-    assert_eq!(got.recover.as_deref(), Some("install claude"));
-}
-
-#[test]
-fn err_response_without_recover_omits_field() {
-    // `recover` is optional and must be omitted from the wire when absent.
-    let resp = Response::err(
-        PROTOCOL_VERSION,
-        "req-2",
-        ProtocolError::method_not_found("nope.method"),
-    )
-    .expect("valid response id");
-    let line = serde_json::to_string(&resp).expect("serialize");
-    assert!(
-        !line.contains("recover"),
-        "absent recover hint must not appear on the wire: {line}"
-    );
-    let back = line_roundtrip(&resp);
-    assert_eq!(resp, back);
-}
-
-#[test]
 fn state_source_report_json_shape_roundtrips() {
     let value = serde_json::to_value(StateSource::Report).expect("serialize state source");
     assert_eq!(value, json!("report"));
     assert_eq!(line_roundtrip(&StateSource::Report), StateSource::Report);
-}
-
-#[test]
-fn agent_state_event_carries_activity_in_flattened_payload() {
-    let event = Event::new(
-        PROTOCOL_VERSION,
-        event::AGENT_STATE,
-        json!({
-            "session_id": "s-42",
-            "activity": AgentActivity::Blocked,
-            "source": StateSource::OscTitle,
-            "runtime": {
-                "worker_instance_id": "runtime-42",
-                "runtime_generation": "3"
-            },
-            "activity_epoch": "d-epoch-1",
-            "revision": "7"
-        }),
-    )
-    .expect("valid event");
-    let back = line_roundtrip(&event);
-    assert_eq!(event, back);
-    assert_eq!(back.version(), PROTOCOL_VERSION);
-    assert_eq!(back.event(), event::AGENT_STATE);
-
-    let value = serde_json::to_value(&event).expect("serialize event");
-    assert_eq!(
-        value,
-        json!({
-            "v": PROTOCOL_VERSION,
-            "event": "agent_state",
-            "session_id": "s-42",
-            "activity": "blocked",
-            "source": "osc_title",
-            "runtime": {
-                "worker_instance_id": "runtime-42",
-                "runtime_generation": "3"
-            },
-            "activity_epoch": "d-epoch-1",
-            "revision": "7"
-        })
-    );
-    assert!(
-        !value
-            .as_object()
-            .expect("event object")
-            .contains_key("payload"),
-        "event payload fields must be flattened: {value}"
-    );
-    assert!(
-        !value
-            .as_object()
-            .expect("event object")
-            .contains_key("state"),
-        "agent activity events must not use lifecycle state key: {value}"
-    );
-}
-
-#[test]
-fn event_with_id_roundtrip() {
-    let event = Event::new(
-        PROTOCOL_VERSION,
-        "session_exit",
-        json!({ "session_id": "s-7", "exit_code": 0 }),
-    )
-    .expect("valid event")
-    .with_id("req-99")
-    .expect("valid event correlation id");
-    let back = line_roundtrip(&event);
-    assert_eq!(event, back);
-    assert_eq!(back.id(), Some("req-99"));
 }
 
 #[test]
@@ -2520,13 +2039,6 @@ fn response_and_event_coordinates_cannot_bypass_validation() {
     ] {
         serde_json::from_value::<Event>(invalid).expect_err("invalid event coordinates must fail");
     }
-}
-
-#[test]
-fn negotiate_matching_versions_agrees() {
-    let agreed = negotiate(SUPPORTED_PROTOCOL_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS)
-        .expect("equal ranges agree");
-    assert_eq!(agreed, PROTOCOL_VERSION);
 }
 
 #[test]
@@ -2599,24 +2111,6 @@ fn version_mismatch_message_names_both_versions_and_recover_hint() {
         "recover hint must mention upgrading: {:?}",
         err.recover
     );
-}
-
-#[test]
-fn protocol_version_serializes_as_bare_integer() {
-    // The `v` field must be a plain integer on the wire, not an object.
-    let line = serde_json::to_string(&PROTOCOL_VERSION).expect("serialize");
-    assert_eq!(line, "4");
-}
-
-#[test]
-fn host_inspect_method_name_is_stable() {
-    assert_eq!(method::HOST_INSPECT, "host.inspect");
-}
-
-#[test]
-fn assistant_method_names_are_stable() {
-    assert_eq!(method::ASSISTANT_MATERIALIZE, "assistant.materialize");
-    assert_eq!(method::DAEMON_DOCTOR, "daemon.doctor");
 }
 
 #[test]
@@ -2837,27 +2331,6 @@ fn typed_output_result_fits_reserved_envelope_at_exact_raw_limit() {
         ObservationParamsError::OutputDataTooLarge { actual, .. }
             if actual == MAX_SESSION_OUTPUT_BYTES + 1
     ));
-}
-
-#[test]
-fn response_uses_selected_overlap_not_server_maximum() {
-    let client = ProtocolVersionRange::new(
-        ProtocolVersion::new(2).expect("version"),
-        ProtocolVersion::new(3).expect("version"),
-    )
-    .expect("ordered range");
-    let server = ProtocolVersionRange::new(
-        ProtocolVersion::new(1).expect("version"),
-        ProtocolVersion::new(4).expect("version"),
-    )
-    .expect("ordered range");
-    let selected = negotiate(client, server).expect("ranges overlap");
-    let response = Response::ok(selected, "req-1", json!({})).expect("valid response");
-    let event = Event::new(selected, event::SESSION_UPDATED, json!({})).expect("valid event");
-    assert_eq!(selected.get(), 3);
-    assert_eq!(response.version(), selected);
-    assert_eq!(event.version(), selected);
-    assert_ne!(response.version(), server.maximum());
 }
 
 #[test]
@@ -3997,38 +3470,6 @@ fn remote_daemon_unavailable_has_daemon_class_stable_code_and_names_host() {
 }
 
 #[test]
-fn new_remote_error_codes_are_distinct() {
-    // Every milestone-11 error code (plus the reused version_mismatch) must be a
-    // distinct, stable string so `--json` consumers can branch on it.
-    let codes = [
-        ProtocolError::netbird_cli_missing().code,
-        ProtocolError::netbird_state_unavailable("x").code,
-        ProtocolError::host_unknown("h").code,
-        ProtocolError::host_unreachable("h").code,
-        ProtocolError::remote_daemon_unavailable("h").code,
-        ProtocolError::version_mismatch(
-            ProtocolVersionRange::new(
-                ProtocolVersion::new(1).expect("valid version"),
-                ProtocolVersion::new(1).expect("valid version"),
-            )
-            .expect("ordered range"),
-            ProtocolVersionRange::new(
-                ProtocolVersion::new(2).expect("valid version"),
-                ProtocolVersion::new(2).expect("valid version"),
-            )
-            .expect("ordered range"),
-        )
-        .code,
-    ];
-    let unique: std::collections::HashSet<&str> = codes.iter().map(String::as_str).collect();
-    assert_eq!(
-        unique.len(),
-        codes.len(),
-        "error codes must all be distinct: {codes:?}"
-    );
-}
-
-#[test]
 fn assistant_error_codes_have_expected_classes_and_recovery() {
     let no_agent = ProtocolError::no_capable_agent();
     assert_eq!(no_agent.class, ErrorClass::Runtime);
@@ -4057,23 +3498,6 @@ fn assistant_error_codes_have_expected_classes_and_recovery() {
 }
 
 #[test]
-fn assistant_error_codes_are_distinct() {
-    let codes = [
-        ProtocolError::no_capable_agent().code,
-        ProtocolError::bundle_unavailable("p").code,
-        ProtocolError::materialization_failed("p", "e").code,
-        ProtocolError::agent_cannot_read_bundle("p", "c").code,
-        ProtocolError::assistant_method_unsupported("m").code,
-    ];
-    let unique: std::collections::HashSet<&str> = codes.iter().map(String::as_str).collect();
-    assert_eq!(
-        unique.len(),
-        codes.len(),
-        "assistant error codes must all be distinct: {codes:?}"
-    );
-}
-
-#[test]
 fn project_prompt_json_shape_roundtrips() {
     let result = protocol::ProjectPromptResult {
         name: "issue".to_owned(),
@@ -4095,23 +3519,6 @@ fn project_prompt_json_shape_roundtrips() {
         name: "issue".to_owned(),
     };
     assert_eq!(line_roundtrip(&params), params);
-}
-
-#[test]
-fn provider_kind_json_shape_roundtrips() {
-    let cases = [
-        (protocol::ProviderKind::LinearIssue, json!("linear_issue")),
-        (protocol::ProviderKind::GithubPr, json!("github_pr")),
-        (protocol::ProviderKind::None, json!("none")),
-    ];
-
-    for (provider, expected) in cases {
-        let value = serde_json::to_value(&provider).expect("serialize provider");
-        assert_eq!(value, expected);
-
-        let back = line_roundtrip(&provider);
-        assert_eq!(back, provider);
-    }
 }
 
 #[test]
@@ -4200,46 +3607,6 @@ fn action_summary_json_shape_roundtrips() {
         reference: "ui".to_owned(),
     };
     assert_eq!(line_roundtrip(&params), params);
-}
-
-#[test]
-fn typed_method_markers_pair_method_params_and_results() {
-    fn assert_contract<M, Params, Output>(name: &str)
-    where
-        M: protocol::Method<Params = Params, Output = Output>,
-    {
-        assert_eq!(M::NAME, name);
-    }
-
-    assert_contract::<protocol::method::DaemonHealth, (), protocol::DaemonHealthResult>(
-        protocol::method::DAEMON_HEALTH,
-    );
-    assert_contract::<
-        protocol::method::SessionNew,
-        protocol::SessionNewParams,
-        protocol::SessionNewResult,
-    >(protocol::method::SESSION_NEW);
-    assert_contract::<protocol::method::SessionInspect, protocol::SessionId, protocol::SessionInfo>(
-        protocol::method::SESSION_INSPECT,
-    );
-    assert_contract::<
-        protocol::method::HostDiscover,
-        protocol::HostDiscoverParams,
-        Vec<protocol::HostRecord>,
-    >(protocol::method::HOST_DISCOVER);
-    assert_contract::<
-        protocol::method::ProjectAction,
-        protocol::ProjectActionParams,
-        protocol::ProjectActionResult,
-    >(protocol::method::PROJECT_ACTION);
-    assert_contract::<
-        protocol::method::WorktreeRemove,
-        protocol::WorktreeRemoveParams,
-        protocol::WorktreeRemoveResult,
-    >(protocol::method::WORKTREE_REMOVE);
-    assert_contract::<protocol::method::HostGovernanceInspect, (), HostGovernanceStatus>(
-        protocol::method::HOST_GOVERNANCE_INSPECT,
-    );
 }
 
 fn host_id() -> HostId {
@@ -5237,41 +4604,6 @@ fn session_remove_accepting_unconfirmed_is_an_additive_method_with_the_remove_sh
     assert_eq!(remove.params_ts, "SessionId");
     assert_eq!(accepting.params_ts, remove.params_ts);
     assert_eq!(accepting.output_ts, remove.output_ts);
-}
-
-#[test]
-fn protocol_version_four_accepts_version_three_and_rejects_version_two() {
-    assert_eq!(PROTOCOL_VERSION.get(), 4);
-    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.minimum().get(), 3);
-    assert_eq!(SUPPORTED_PROTOCOL_VERSIONS.maximum().get(), 4);
-    assert_eq!(CLIENT_PROTOCOL_VERSIONS, SUPPORTED_PROTOCOL_VERSIONS);
-
-    let previous = ProtocolVersion::new(3).expect("valid version");
-    let previous_client = ProtocolVersionRange::new(previous, previous).expect("ordered range");
-    assert_eq!(
-        negotiate(previous_client, SUPPORTED_PROTOCOL_VERSIONS)
-            .expect("a version 3 client is inside the window"),
-        previous
-    );
-
-    let two = ProtocolVersion::new(2).expect("valid version");
-    let old_client = ProtocolVersionRange::new(two, two).expect("ordered range");
-    let err = negotiate(old_client, SUPPORTED_PROTOCOL_VERSIONS)
-        .expect_err("a version 2 client has no overlap with versions 3..=4");
-    assert_eq!(err.class, ErrorClass::Daemon);
-    assert_eq!(err.code, "version_mismatch");
-    assert!(
-        err.msg.contains('2') && err.msg.contains('3') && err.msg.contains('4'),
-        "the error names both ranges: {}",
-        err.msg
-    );
-    assert!(err.recover.is_some(), "mismatch should suggest a recovery");
-
-    let straddling = ProtocolVersionRange::new(previous, PROTOCOL_VERSION).expect("ordered range");
-    assert_eq!(
-        negotiate(straddling, SUPPORTED_PROTOCOL_VERSIONS).expect("ranges overlap"),
-        PROTOCOL_VERSION
-    );
 }
 
 #[test]

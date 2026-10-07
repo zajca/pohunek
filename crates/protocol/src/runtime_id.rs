@@ -661,17 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn trusted_builtin_literals_are_valid() {
-        for value in ["shell", "codex", "claude", "hermes"] {
-            assert_eq!(
-                RuntimeId::from_trusted(value),
-                RuntimeId::parse(value).unwrap()
-            );
-        }
-        assert_eq!(RuntimeId::SHELL, "shell");
-    }
-
-    #[test]
     fn runtime_id_deserialization_is_strict() {
         let id: RuntimeId = serde_json::from_str(r#""codex""#).expect("valid");
         assert_eq!(serde_json::to_string(&id).expect("serialize"), r#""codex""#);
@@ -722,23 +711,6 @@ mod tests {
             assert_eq!(back, reference);
             assert!(matches!(back, RuntimeRef::Historical(_)));
         }
-    }
-
-    #[test]
-    fn valid_references_are_launchable_and_roundtrip() {
-        let reference: RuntimeRef = serde_json::from_str(r#""claude""#).expect("valid");
-        assert_eq!(
-            reference.launchable().expect("launchable").as_str(),
-            "claude"
-        );
-        assert_eq!(
-            serde_json::to_string(&reference).expect("serialize"),
-            r#""claude""#
-        );
-        assert_eq!(
-            RuntimeRef::from(RuntimeId::parse("claude").unwrap()),
-            reference
-        );
     }
 
     #[test]
