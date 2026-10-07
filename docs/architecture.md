@@ -857,8 +857,9 @@ Hooks have two separate roles:
 - **Native recovery binding.** A launch-agent `SessionStart` hook prefers the
   worker socket and posts the agent's session ID or transcript path. The worker
   validates process ancestry and accepts this binding only for the designated
-  immutable launch agent or a provider-named process the launch agent started
-  directly (Codex runs its hooks from such an `app-server` child); it journals the accepted value before forwarding it
+  immutable launch agent or the provider's hook-helper process the launch agent started
+  directly (for Codex the `app-server` child it runs its hooks from; a
+  same-provider child in any other role is refused); it journals the accepted value before forwarding it
   to the daemon. This keeps recovery tied to the original launch identity and
   retains the claim across daemon outage. A notification hook uses the same
   endpoint: the worker attests the caller, binds the notification to its own

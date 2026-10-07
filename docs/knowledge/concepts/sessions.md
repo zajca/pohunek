@@ -687,10 +687,12 @@ A hook reports the conversation id through the worker, and the worker accepts it
 as the launch claim only from the launch process: the process named for the
 provider that started first below the PTY root, never an interpreter such as
 `node`. A process named for the provider that the launch process started
-directly is accepted as well, because Codex runs its hooks from a `codex
-app-server` child of the launched `codex`. A deeper process, a sibling, a
-process of another name, and a process whose PID or start time no longer matches
-are refused, so an agent a tool command starts never speaks for the session. The
+directly is accepted as well only in the provider's hook-helper role, which is
+a command line whose second argument is `app-server` for Codex (it runs its
+hooks from a `codex app-server` child of the launched `codex`); a provider
+without a declared helper role gets no exemption. An independent same-provider
+child, a deeper process, a sibling, a process of another name, and a process
+whose PID or start time no longer matches are refused, so an agent a tool command starts never speaks for the session. The
 first accepted claim is the session's reference and is never replaced by a
 different one. Only the `SessionStart` identity report carries a conversation
 id; a subagent's `SubagentStart` and `SubagentStop` reports are a separate

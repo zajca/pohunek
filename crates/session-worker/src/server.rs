@@ -4594,14 +4594,46 @@ fn executable_is_named_for(
     Ok(executable_name.contains(&provider.to_ascii_lowercase()))
 }
 
-/// Whether `candidate` is a provider-named process that `designated`, the
+/// The hook-helper role of a provider: the first argument of the process its
+/// launch process starts to run the provider's hooks.
+///
+/// Codex 0.160.0 runs its hooks from `codex app-server ...`, a direct child of
+/// the launched `codex`, so that child speaks for the conversation. A provider
+/// without an entry has no such helper, and only its launch process may report.
+/// An independent same-provider child (a second `codex` or `claude` the launch
+/// process started) carries no helper argument, so it never qualifies.
+const HOOK_HELPER_ARGV1: &[(&str, &str)] = &[("codex", "app-server")];
+
+/// Whether the command line of `candidate` is the hook-helper invocation of
+/// `provider`.
+///
+/// Fails closed: a process whose facts cannot be read, or that exited, is not
+/// the helper.
+fn is_hook_helper_invocation(
+    inspector: &dyn ProcessInspector,
+    pid: u32,
+    provider: &str,
+) -> Result<bool, WorkerError> {
+    let Some(role) = HOOK_HELPER_ARGV1
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, argument)| *argument)
+    else {
+        return Ok(false);
+    };
+    let fact = inspector
+        .process(pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    Ok(fact.is_some_and(|fact| fact.cmdline.get(1).map(String::as_str) == Some(role)))
+}
+
+/// Whether `candidate` is the provider's hook helper that `designated`, the
 /// launch process, started directly.
 ///
-/// Codex runs its hooks from a `codex app-server` child of the launch process,
-/// so that child speaks for the conversation. Only a direct child qualifies: a
-/// deeper process, such as an agent a tool command started, never does. Both
-/// generations are rechecked after the parent link is read, so a reused PID
-/// fails closed.
+/// Only a direct child in the helper role qualifies: a deeper process, such as
+/// an agent a tool command started, or an independent same-provider child never
+/// does. Both generations are rechecked after the parent link is read, so a
+/// reused PID fails closed.
 fn is_provider_child_of_launch(
     inspector: &dyn ProcessInspector,
     candidate: OsProcessIdentity,
@@ -4612,7 +4644,9 @@ fn is_provider_child_of_launch(
         pid: designated.pid,
         start_identity: StartIdentity::new(designated.start_identity),
     };
-    if !executable_is_named_for(inspector, candidate.pid, provider)? {
+    if !executable_is_named_for(inspector, candidate.pid, provider)?
+        || !is_hook_helper_invocation(inspector, candidate.pid, provider)?
+    {
         return Ok(false);
     }
     let parent = inspector

@@ -545,3 +545,55 @@ fn pid_reuse_of_the_child_or_the_launch_process_never_verifies() {
         );
     }
 }
+
+/// A same-provider child that is not the hook helper (a second agent the launch
+/// process started) never verifies, for either provider.
+#[test]
+fn an_independent_same_provider_child_never_verifies() {
+    for (provider, executable) in [
+        ("codex", NATIVE_CODEX),
+        ("claude", "/opt/homebrew/bin/claude"),
+    ] {
+        let table = Table::default()
+            .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+            .with(NATIVE_PID, ROOT_PID, NATIVE_START, executable, &[provider])
+            .with(
+                APP_SERVER_PID,
+                NATIVE_PID,
+                APP_SERVER_START,
+                executable,
+                &[provider, "exec", "app-server-not-first"],
+            );
+        assert!(
+            !verify_launch_claim_with(&table, &claim(provider, APP_SERVER_PID, APP_SERVER_START))
+                .unwrap(),
+            "{provider}"
+        );
+    }
+}
+
+/// `app-server` as the second argument is Codex's helper role only; another
+/// provider has no helper role, so the same command line grants nothing.
+#[test]
+fn the_helper_role_of_one_provider_grants_nothing_to_another() {
+    let table = Table::default()
+        .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+        .with(
+            NATIVE_PID,
+            ROOT_PID,
+            NATIVE_START,
+            "/bin/claude",
+            &["claude"],
+        )
+        .with(
+            APP_SERVER_PID,
+            NATIVE_PID,
+            APP_SERVER_START,
+            "/bin/claude",
+            &["claude", "app-server"],
+        );
+    assert!(
+        !verify_launch_claim_with(&table, &claim("claude", APP_SERVER_PID, APP_SERVER_START))
+            .unwrap()
+    );
+}

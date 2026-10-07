@@ -104,8 +104,10 @@ classifies every one of them through the package manifest.
   `codex app-server --listen unix:// --managed-daemon` process below the
   launched `codex`: a direct child of the native binary, which is itself a child
   of the Node launcher an npm install starts. The session worker accepts a launch
-  claim from the launch process itself and from a process named for the provider
-  that the launch process started directly (see "Which process may report the
+  claim from the launch process itself and from the `codex app-server` helper
+  (a process named for the provider, started directly by the launch process,
+  whose second argument is `app-server`; an independent `codex` child never
+  qualifies; see "Which process may report the
   conversation id" in [sessions](../concepts/sessions.md)), so the app-server's
   conversation id becomes `native_session_id` and `session resume` runs `codex
   resume <id>`. A real-Codex test pins this
