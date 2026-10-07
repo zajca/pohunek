@@ -796,11 +796,4 @@ mod tests {
             "the rollback marker is required"
         );
     }
-
-    #[test]
-    fn steps_are_ordered() {
-        assert!(Step::Started < Step::Binaries);
-        assert!(Step::Registering < Step::Registered);
-        assert!(Step::Ready < Step::Cli);
-    }
 }

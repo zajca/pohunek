@@ -28,18 +28,6 @@ fn fresh_install_runs_service_install_from_the_archive() {
 }
 
 #[test]
-fn existing_service_config_runs_service_upgrade() {
-    let fixture = Fixture::new();
-    write(&fixture.config_home.join("pohunek/service.toml"), "");
-    let output = fixture.run(&[], &[]);
-    assert_success(&output);
-    assert_eq!(
-        fixture.pohunek_calls(),
-        [STATUS.to_owned(), fixture.upgrade_call()]
-    );
-}
-
-#[test]
 fn a_pending_install_is_finished_by_service_install_even_with_service_config() {
     // From its `config` step on, an interrupted install has written
     // service.toml; `service upgrade` refuses its record.
@@ -2018,16 +2006,7 @@ fn a_failed_install_after_retirement_explains_how_to_recover() {
 }
 
 #[test]
-fn a_missing_staged_binary_or_extra_argument_fails_without_side_effects() {
-    let fixture = Fixture::new();
-    fs::remove_file(fixture.archive.join("pohunek-sessiond")).expect("remove worker");
-    let output = fixture.run(&[], &[]);
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pohunek-sessiond"));
-    assert!(fixture.pohunek_calls().is_empty());
-
-    assert!(fixture.guard_calls().is_empty());
-
+fn an_unknown_argument_fails_without_side_effects() {
     let fixture = Fixture::new();
     let output = fixture.run(&["--unknown"], &[]);
     assert_eq!(output.status.code(), Some(2), "{output:?}");

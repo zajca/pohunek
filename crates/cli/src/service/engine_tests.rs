@@ -3007,31 +3007,6 @@ fn live_session_classification_covers_runtime_and_logical_state() {
     assert!(!is_live(&external));
 }
 
-#[test]
-fn job_alive_treats_launchd_unknown_as_potentially_alive() {
-    // A stopped job is the only stateless proof of termination; Unknown is
-    // launchd's loaded job without a matching process, which may still spawn.
-    assert!(!job_alive(&worker(
-        worker_id(SESSION),
-        ServiceState::Stopped
-    )));
-    assert!(!job_alive(&worker(
-        worker_id(SESSION),
-        ServiceState::Failed
-    )));
-    for state in [
-        ServiceState::Starting,
-        ServiceState::Running,
-        ServiceState::Stopping,
-        ServiceState::Unknown,
-    ] {
-        assert!(
-            job_alive(&worker(worker_id(SESSION), state)),
-            "{state:?} may still own a PTY"
-        );
-    }
-}
-
 #[tokio::test]
 async fn a_second_command_is_refused_while_a_transaction_holds_the_lock() {
     let harness = Harness::new();

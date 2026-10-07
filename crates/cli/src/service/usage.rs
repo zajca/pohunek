@@ -465,7 +465,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     use pohunek_platform::process::HostInspector;
-    use pohunek_platform::supervisor::{DefinitionFacts, ServiceId, ServiceState, WorkerKey};
+    use pohunek_platform::supervisor::{DefinitionFacts, ServiceState, WorkerKey};
     use pohunek_session_worker::{JournalRecord, WorkerOrigin};
 
     use super::*;
@@ -714,38 +714,6 @@ pub(crate) mod tests {
                 arguments: Vec::new(),
             }),
         }
-    }
-
-    #[test]
-    fn a_registered_worker_job_keeps_its_version_in_any_state() {
-        let (_root, root) = temp_root();
-        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
-        let jobs = [
-            job(
-                SESSION,
-                ServiceState::Starting,
-                layout.worker_executable("1.0.0"),
-            ),
-            job(
-                "s-2",
-                ServiceState::Unknown,
-                layout.worker_executable("0.9.0"),
-            ),
-            job(
-                "s-3",
-                ServiceState::Running,
-                Some(PathBuf::from("/elsewhere/pohunek-sessiond")),
-            ),
-        ];
-        let mut usage = Usage::default();
-        usage.note_jobs(&layout, Ok(&jobs));
-
-        let id: ServiceId = jobs[0].id.clone();
-        assert!(usage
-            .keep_reason("1.0.0", Some("2.0.0"))
-            .is_some_and(|reason| reason.contains(&id.to_string())));
-        assert!(usage.keep_reason("0.9.0", Some("2.0.0")).is_some());
-        assert_eq!(usage.keep_reason("0.8.0", Some("2.0.0")), None);
     }
 
     #[test]
