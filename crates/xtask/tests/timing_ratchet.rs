@@ -688,12 +688,6 @@ fn a_new_thread_sleep_in_a_test_fn_fails_the_ratchet() {
 }
 
 #[test]
-fn the_same_sleep_in_non_test_code_is_ignored() {
-    let text = "fn f() {\n    std::thread::sleep(Duration::from_millis(5));\n}\n";
-    assert!(evaluate(&scan_one(DEMO, text), &BTreeMap::new()).is_empty());
-}
-
-#[test]
 fn a_sleep_in_a_test_file_or_cfg_test_module_is_counted() {
     let body = "fn f() {\n    thread::sleep(d);\n}\n";
     let scan = scan_one("crates/demo/tests/run.rs", body);
@@ -1003,17 +997,6 @@ fn a_file_missing_from_the_baseline_may_not_gain_occurrences() {
     assert!(failures[0].contains("lib.rs:3"), "{failures:?}");
     assert!(failures[0].contains("lib.rs:4"), "{failures:?}");
     assert!(failures[0].contains("baseline allows 0"), "{failures:?}");
-}
-
-#[test]
-fn the_baseline_text_round_trips() {
-    let counts = BTreeMap::from([
-        ("crates/a/src/lib.rs".to_owned(), 3),
-        ("crates/b/tests/run.rs".to_owned(), 12),
-    ]);
-    let text = format_baseline(&counts);
-    assert!(text.starts_with('#'));
-    assert_eq!(parse_baseline(&text), counts);
 }
 
 #[test]

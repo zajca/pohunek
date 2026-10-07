@@ -113,26 +113,22 @@ class DevBootstrapCase(unittest.TestCase):
         return status, out.getvalue()
 
 class ParseVersionTests(unittest.TestCase):
-    def test_real_outputs(self):
+    def test_parses_real_and_edge_version_shapes(self):
         cases = {
             CURRENT["cargo-nextest"]: (0, 9, 145),
             CURRENT["python3"]: (3, 13, 1),
             CURRENT["bacon"]: (3, 25, 0),
             CURRENT["hyperfine"]: (1, 20, 0),
             CURRENT["mold"]: (2, 42, 1),
+            # A two-part version pads the patch level.
+            "bacon 3.4": (3, 4, 0),
+            # A prerelease suffix keeps the numeric core.
+            "cargo-nextest 0.9.150-rc.1": (0, 9, 150),
+            "\n\nhyperfine 1.9.0\n": (1, 9, 0),
         }
         for text, expected in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(dev_bootstrap.parse_version(text), expected)
-
-    def test_two_part_version_pads_patch(self):
-        self.assertEqual(dev_bootstrap.parse_version("bacon 3.4"), (3, 4, 0))
-
-    def test_prerelease_suffix_keeps_numeric_core(self):
-        self.assertEqual(
-            dev_bootstrap.parse_version("cargo-nextest 0.9.150-rc.1"),
-            (0, 9, 150),
-        )
 
     def test_prerelease_of_the_minimum_is_below_it(self):
         minimum = dev_bootstrap.parse_version("0.9.115")
@@ -141,6 +137,8 @@ class ParseVersionTests(unittest.TestCase):
             ("cargo-nextest 0.9.115", False),
             ("cargo-nextest 0.9.116-rc.1", False),
             ("cargo-nextest 0.9.114", True),
+            # Numeric, not lexical: "99" sorts after "115" as text.
+            ("cargo-nextest 0.9.99", True),
         ):
             with self.subTest(text=text):
                 self.assertEqual(
@@ -152,27 +150,12 @@ class ParseVersionTests(unittest.TestCase):
                     below,
                 )
 
-    def test_leading_blank_lines_are_skipped(self):
-        self.assertEqual(
-            dev_bootstrap.parse_version("\n\nhyperfine 1.9.0\n"), (1, 9, 0)
-        )
-
-    def test_hash_on_a_later_line_is_ignored(self):
-        self.assertIsNone(
-            dev_bootstrap.parse_version("bacon unknown\ncommit 1.2.3")
-        )
-
     def test_unparseable_and_empty(self):
-        for text in ("bacon 3", "", "   \n", "mold (dev build)"):
+        # A version-like token on a later line is not the tool's version.
+        for text in ("bacon 3", "", "   \n", "mold (dev build)",
+                     "bacon unknown\ncommit 1.2.3"):
             with self.subTest(text=text):
                 self.assertIsNone(dev_bootstrap.parse_version(text))
-
-    def test_numeric_comparison_not_lexical(self):
-        self.assertLess((0, 9, 99), (0, 9, 115))
-        self.assertLess(
-            dev_bootstrap.parse_version("cargo-nextest 0.9.99"),
-            dev_bootstrap.parse_version("0.9.115"),
-        )
 
 
 class NextestConfigTests(DevBootstrapCase):
@@ -290,6 +273,8 @@ class CheckTests(DevBootstrapCase):
         status, output = self.run_main(host)
         self.assertEqual(status, 1, output)
         self.assertIn("cargo-nextest 0.9.100 is older than", output)
+        # The fix installs into $CARGO_HOME, where the stale copy lives.
+        self.assertIn("cargo install --root /fake/cargo-home --locked cargo-nextest", output)
 
         tools = dict(CURRENT)
         tools["cargo-nextest"] = old
@@ -319,12 +304,6 @@ class CheckTests(DevBootstrapCase):
         self.assertEqual(status, 1, output)
         self.assertIn("cargo-nextest version unknown", output)
         self.assertNotIn("shadowed", output)
-
-    def test_stale_cargo_home_nextest_gets_an_install_pinned_there(self):
-        host = FakeHost(in_cargo_bin={"cargo-nextest": "cargo-nextest 0.9.100\n"})
-        status, output = self.run_main(host)
-        self.assertEqual(status, 1, output)
-        self.assertIn("cargo install --root /fake/cargo-home --locked cargo-nextest", output)
 
     def test_two_stale_nextest_copies_get_install_and_path_fix(self):
         tools = dict(CURRENT)

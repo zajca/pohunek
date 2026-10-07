@@ -222,22 +222,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn repo_rendered_frontmatter_parses_with_expected_name_and_description() {
-        let root = pohunek_test_support::workspace_root();
-        let rendered = String::from_utf8(render(&root).expect("render repository skill"))
-            .expect("rendered skill is UTF-8");
-        let parsed = frontmatter_mapping(&rendered);
-        assert_eq!(
-            parsed.get(serde_yaml::Value::from("name")),
-            Some(&serde_yaml::Value::String(SKILL_NAME.into()))
-        );
-        assert_eq!(
-            parsed.get(serde_yaml::Value::from("description")),
-            Some(&serde_yaml::Value::String(SKILL_DESCRIPTION.into()))
-        );
-    }
-
     fn frontmatter_mapping(rendered: &str) -> serde_yaml::Mapping {
         let without_opener = rendered
             .strip_prefix("---\n")

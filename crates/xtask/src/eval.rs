@@ -1004,52 +1004,36 @@ $ pohunek health --json
     }
 
     #[test]
-    fn transcript_validation_rejects_invalid_placeholder_command() {
-        let fixture_root = temp_eval_dir("invalid-placeholder-command");
-        let output_root = fixture_root.path();
-        let fixtures = [test_fixture()];
-        write_transcript(
-            output_root,
-            "daemon-down",
-            "Start the daemon and check health with `pohunek made-up-command <arg>`.",
-        );
+    fn transcript_validation_rejects_invalid_and_pohunek_like_commands() {
+        for (case, transcript, command) in [
+            (
+                "invalid placeholder command",
+                "Start the daemon and check health with `pohunek made-up-command <arg>`.",
+                "pohunek made-up-command <arg>",
+            ),
+            (
+                "pohunek-like binary name",
+                "Start the daemon and check health with `pohunekd health --json`.",
+                "pohunekd health --json",
+            ),
+        ] {
+            let fixture_root = temp_eval_dir("rejected-command");
+            let output_root = fixture_root.path();
+            let fixtures = [test_fixture()];
+            write_transcript(output_root, "daemon-down", transcript);
 
-        let result = validate_transcripts(output_root, &fixtures);
+            let result = validate_transcripts(output_root, &fixtures);
 
-        assert!(!result.passed);
-        assert_eq!(result.checked, 1);
-        assert!(
-            result
-                .failures
-                .iter()
-                .any(|failure| failure.contains("pohunek made-up-command <arg>")),
-            "invalid placeholder command must fail strictly: {:?}",
-            result.failures
-        );
-    }
-
-    #[test]
-    fn transcript_validation_rejects_pohunek_like_binary_names() {
-        let fixture_root = temp_eval_dir("pohunekd-command");
-        let output_root = fixture_root.path();
-        let fixtures = [test_fixture()];
-        write_transcript(
-            output_root,
-            "daemon-down",
-            "Start the daemon and check health with `pohunekd health --json`.",
-        );
-
-        let result = validate_transcripts(output_root, &fixtures);
-
-        assert!(!result.passed);
-        assert_eq!(result.checked, 1);
-        assert!(
-            result
-                .failures
-                .iter()
-                .any(|failure| failure.contains("pohunekd health --json")),
-            "pohunek-like binary names must not parse as pohunek commands: {:?}",
-            result.failures
-        );
+            assert!(!result.passed, "{case}");
+            assert_eq!(result.checked, 1, "{case}");
+            assert!(
+                result
+                    .failures
+                    .iter()
+                    .any(|failure| failure.contains(command)),
+                "{case} must fail strictly: {:?}",
+                result.failures
+            );
+        }
     }
 }

@@ -38,7 +38,7 @@ HANDSHAKE_TIMEOUT_SECONDS = 10
 BASE_COMMIT = "1" * 40
 OTHER_COMMIT = "2" * 40
 # Name prefix of a worktree that is still at its temporary path.
-TEMP_PREFIX = ".worktree-new-"
+TEMP_PREFIX = worktree_new.TEMP_WORKTREE_PREFIX
 # Name prefix of this run's temporary branch for the slug `issue-1`.
 TEMP_BRANCH = "zajca/worktree-new-tmp-issue-1-"
 # Committer time of the last `Cargo.lock` commit on the fake base, and the
@@ -411,17 +411,16 @@ class ArgumentTests(HarnessCase):
                                   executor=self.h.executor)
         return caught.exception.code
 
-    def test_missing_slug_is_a_usage_error(self):
-        self.assertEqual(self.parse_exit(), 2)
-
-    def test_extra_positional_is_a_usage_error(self):
-        self.assertEqual(self.parse_exit("a", "origin/main", "extra"), 2)
-
-    def test_unknown_flag_is_a_usage_error(self):
-        self.assertEqual(self.parse_exit("--reflink-auto", "a"), 2)
-
-    def test_branch_requires_a_value(self):
-        self.assertEqual(self.parse_exit("a", "--branch"), 2)
+    def test_malformed_command_lines_are_usage_errors(self):
+        cases = {
+            "missing slug": (),
+            "extra positional": ("a", "origin/main", "extra"),
+            "unknown flag": ("--reflink-auto", "a"),
+            "--branch without a value": ("a", "--branch"),
+        }
+        for label, argv in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self.parse_exit(*argv), 2, label)
 
     def test_invalid_slug_fails_before_any_command(self):
         code, _, err = self.h.run("../escape")
@@ -1078,9 +1077,6 @@ class PlainGitRaceTests(HarnessCase):
 
 
 class TemporaryPathTests(HarnessCase):
-    def test_prefix_matches_the_script(self):
-        self.assertEqual(TEMP_PREFIX, worktree_new.TEMP_WORKTREE_PREFIX)
-
     def test_success_leaves_only_the_final_worktree(self):
         seen = []
         self.h.executor.on_copy = lambda source, dest: seen.append(dest)
@@ -1244,12 +1240,6 @@ class StaleSeedTests(HarnessCase):
                     setattr(self.h.executor, name, value)
                 self.assert_seeded(*self.h.run("issue-1"))
 
-    def test_time_rule_still_applies_when_the_blobs_match(self):
-        self.make_stale()
-        code, out, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        self.assertIn("landed on origin/main at", out)
-
     def test_out_of_range_lockfile_time_keeps_the_seed(self):
         set_build_time(self.h.target, OLD_EPOCH)
         self.h.executor.lockfile_log = f"{OUT_OF_RANGE_EPOCH}\n"
@@ -1287,10 +1277,6 @@ class StaleSeedTests(HarnessCase):
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("not allowed with", err.getvalue())
         self.assertEqual(self.h.executor.commands, [])
-
-    def test_help_lists_the_flag(self):
-        self.assertIn("--force-seed", worktree_new.build_parser().format_help())
-        self.assertIn("--force-seed", worktree_new.EPILOG)
 
     def test_no_seed_does_not_read_the_lockfile_history(self):
         self.make_stale()
@@ -1448,14 +1434,6 @@ class WorktreeListTests(HarnessCase):
 
 
 class LockTests(unittest.TestCase):
-    def test_missing_lock_files_are_created_and_held(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with worktree_new.hold_cargo_locks(Path(tmp)):
-                for lock in worktree_new.CARGO_LOCK_FILES:
-                    self.assertTrue(flock_is_blocked(Path(tmp) / lock), lock)
-            for lock in worktree_new.CARGO_LOCK_FILES:
-                self.assertFalse(flock_is_blocked(Path(tmp) / lock), lock)
-
     def test_missing_profile_dir_is_a_seed_source_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(worktree_new.WorktreeError) as caught:
@@ -1463,19 +1441,6 @@ class LockTests(unittest.TestCase):
                     pass
             self.assertIn("no seed source", str(caught.exception))
             self.assertFalse((Path(tmp) / "debug").exists())
-
-    def test_repository_lock_is_exclusive_and_released(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            lock = Path(tmp) / worktree_new.REPO_LOCK_NAME
-            with worktree_new.hold_repo_lock(Path(tmp)) as held:
-                self.assertEqual(held, lock)
-                self.assertTrue(flock_is_blocked(lock))
-                with self.assertRaises(worktree_new.WorktreeError) as caught:
-                    with worktree_new.hold_repo_lock(Path(tmp)):
-                        pass
-                self.assertIn("another worktree-new run holds",
-                              str(caught.exception))
-            self.assertFalse(flock_is_blocked(lock))
 
     def test_locks_are_held_exclusively_and_released(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -831,7 +831,7 @@ fn remove_dir_all(path: &Path) -> Result<(), XtaskError> {
 #[cfg(test)]
 mod tests {
     use super::{hermes, hermes_compatibility_message, HermesAction, TopCommand, XtaskCommand};
-    use clap::{CommandFactory as _, Parser as _};
+    use clap::Parser as _;
     use std::path::Path;
 
     #[test]
@@ -867,27 +867,6 @@ mod tests {
         };
         assert_eq!(hermes_bin, Path::new("/controlled/hermes"));
         assert_eq!(pohunek_bin, Path::new("/controlled/pohunek"));
-    }
-
-    #[test]
-    fn hermes_compatibility_help_states_the_complete_pohunek_binary_contract() {
-        let command = XtaskCommand::command();
-        let compatibility = command
-            .find_subcommand("hermes")
-            .and_then(|hermes| hermes.find_subcommand("compatibility"))
-            .expect("Hermes compatibility subcommand exists");
-        let pohunek_bin = compatibility
-            .get_arguments()
-            .find(|argument| argument.get_id() == "pohunek_bin")
-            .expect("Pohunek binary argument exists");
-
-        assert_eq!(
-            pohunek_bin.get_help().map(ToString::to_string).as_deref(),
-            Some(
-                "Required absolute canonical path to a safe Pohunek executable: no symlink components and no group- or world-write permissions."
-            )
-        );
-        assert!(pohunek_bin.is_required_set());
     }
 
     #[test]

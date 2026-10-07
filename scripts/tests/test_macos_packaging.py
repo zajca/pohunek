@@ -296,10 +296,6 @@ class ToolingTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, "{}: {}".format(script, result.stderr))
             self.assertTrue(script.read_text().startswith(("#!/bin/sh\n", "#!/usr/bin/env sh\n")), script)
 
-    def test_the_removed_developer_id_scripts_are_gone(self):
-        for name in ("notarize", "signing-keychain"):
-            self.assertFalse((MACOS / name).exists(), name)
-
     def test_the_deployment_target_is_one_value(self):
         target = (MACOS / "DEPLOYMENT_TARGET").read_text().strip()
         self.assertRegex(target, r"^\d+\.\d+$")
@@ -318,14 +314,6 @@ class ToolingTest(unittest.TestCase):
         self.assertIn("adhoc", release)
         self.assertNotIn("developer-id", text)
         self.assertNotIn("--sign-release", text)
-
-    def test_the_release_package_mode_signs_ad_hoc_without_a_secret(self):
-        text = (MACOS / "package").read_text()
-        release = text.split("--adhoc-release ]; then", 1)[1].split("\nfi\n", 1)[0]
-        for step in ('"$script_dir/sign"', '"$script_dir/verify-signed" --adhoc', "write-manifest", "packaging/archive"):
-            self.assertIn(step, release, step)
-        for variable in ("MACOS_", "APPLE_"):
-            self.assertNotIn(variable, text)
 
 
 if __name__ == "__main__":

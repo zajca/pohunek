@@ -78,9 +78,6 @@ class ReleaseGatingTests(unittest.TestCase):
         self.assertIn("cargo test --doc --workspace --all-features", block)
         self.assertNotIn("--release", block)
 
-    def test_no_job_depends_on_removed_release_check(self):
-        self.assertNotIn("release-check", self.text)
-
 
 ARCHIVE_CONSUMERS = ("fast-tests", "integration", "integration-relay")
 

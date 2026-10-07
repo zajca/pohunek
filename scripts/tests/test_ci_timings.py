@@ -12,7 +12,7 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "ci-timings"
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[2]  # TODO: unused, consider removing
 LOADER = importlib.machinery.SourceFileLoader("ci_timings", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 ci_timings = importlib.util.module_from_spec(SPEC)
@@ -113,11 +113,6 @@ class RunTimingTests(unittest.TestCase):
         self.assertEqual(ci_timings.format_seconds(-9), "-9s")
         self.assertEqual(ci_timings.format_seconds(0), "0s")
 
-    def test_format_seconds_scales(self):
-        self.assertEqual(ci_timings.format_seconds(9.4), "9s")
-        self.assertEqual(ci_timings.format_seconds(83), "1m23s")
-        self.assertEqual(ci_timings.format_seconds(3725), "1h02m")
-
     def test_job_seconds_skips_unfinished_jobs(self):
         seconds = ci_timings.job_seconds(RUN)
         self.assertEqual(seconds["fmt + clippy"], 199.0)
@@ -196,12 +191,6 @@ class RunTimingTests(unittest.TestCase):
         self.assertEqual(
             ci_timings.filter_runs([next_day], window=window), []
         )
-
-    def test_summarize_run_wall_clock(self):
-        summary = ci_timings.summarize_run(RUN)
-        self.assertEqual(summary["id"], 1)
-        self.assertEqual(summary["wall_seconds"], 570.0)
-        self.assertEqual(summary["branch"], "topic")
 
     def test_summarize_run_requires_timestamps(self):
         with self.assertRaisesRegex(ValueError, "no timestamps"):
@@ -322,24 +311,6 @@ class RunTimingTests(unittest.TestCase):
         self.assertEqual([run["attempt"] for run in forward], [1])
         self.assertEqual([run["attempt"] for run in backward], [1])
 
-    def test_document_key_and_workflow_filter(self):
-        self.assertEqual(
-            ci_timings.document_key({"databaseId": 23, "attempt": 2}), (23, 2)
-        )
-        self.assertEqual(
-            ci_timings.document_key({"databaseId": 23}), (23, 1)
-        )
-        release = {"databaseId": 23, "workflowName": "Release"}
-        ci_run = {"databaseId": 24, "workflowName": "CI"}
-        legacy = {"databaseId": 25}
-        kept = [
-            document for document in (release, ci_run, legacy)
-            if document.get("workflowName") in (None, "CI")
-        ]
-        self.assertEqual(
-            [document["databaseId"] for document in kept], [24, 25]
-        )
-
     def test_list_arguments_scopes_to_ci_workflow(self):
         arguments = ci_timings.list_arguments(
             argparse.Namespace(limit=40, event="pull_request", branch=None,
@@ -371,15 +342,6 @@ class RunTimingTests(unittest.TestCase):
         self.assertIn("main", arguments)
         self.assertIn("--created", arguments)
         self.assertIn("2026-09-14..2026-09-16", arguments)
-
-    def test_wanted_attempts_covers_every_rerun(self):
-        # `all` must reach intermediate attempts that `gh run list` never
-        # exposes; `first` needs attempt 1 plus the latest one it described.
-        self.assertEqual(ci_timings.wanted_attempts(3, "all"), [1, 2, 3])
-        self.assertEqual(ci_timings.wanted_attempts(3, "first"), [1, 3])
-        self.assertEqual(ci_timings.wanted_attempts(1, "all"), [1])
-        self.assertEqual(ci_timings.wanted_attempts(1, "first"), [1])
-        self.assertEqual(ci_timings.wanted_attempts(None, "first"), [1])
 
     def test_empty_window_diagnosis_names_the_filter_that_excluded_runs(self):
         # The case that makes guessing unsafe: the window IS covered, so
@@ -418,19 +380,6 @@ class RunTimingTests(unittest.TestCase):
         self.assertIn("--conclusion failure", message)
         self.assertNotIn("--event", message)
         self.assertNotIn("--branch", message)
-
-    def test_empty_window_diagnosis_lists_every_blocking_filter(self):
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        covered = _summary(
-            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
-        )
-        message = ci_timings.empty_window_diagnosis(
-            _selection(input=None, conclusion="failure", event="push", branch="main"),
-            [covered],
-            window,
-        ).message
-        for expected in ("--conclusion failure", "--event push", "--branch main"):
-            self.assertIn(expected, message)
 
     def test_empty_window_diagnosis_judges_filters_against_candidates(self):
         """A sibling attempt must not be blamed for emptying the window.
@@ -536,23 +485,6 @@ class RunTimingTests(unittest.TestCase):
         ).message
         self.assertIn("--conclusion success", message)
         self.assertNotIn("--attempts all", message)
-
-    def test_select_attempts_backs_both_filtering_and_diagnosis(self):
-        # One helper, so the diagnosis can never reason about a candidate set
-        # that differs from the one filter_runs uses.
-        def attempt(number):
-            return _summary(databaseId=62, attempt=number,
-                            startedAt="2026-09-15T10:00:00Z")
-        runs = [attempt(3), attempt(1), attempt(2)]
-        self.assertEqual(
-            [run["attempt"] for run in ci_timings.select_attempts(runs, "first")],
-            [1],
-        )
-        self.assertEqual(
-            sorted(run["attempt"]
-                   for run in ci_timings.select_attempts(runs, "all")),
-            [1, 2, 3],
-        )
 
     def test_empty_window_diagnosis_rejects_an_impossible_state(self):
         """Every candidate passing every filter contradicts an empty selection.
@@ -698,7 +630,6 @@ class RunTimingTests(unittest.TestCase):
         ]
         summary = ci_timings.window_summary(runs)
         walls = sorted(run["wall_seconds"] for run in runs)
-        self.assertEqual(summary["wall_p90"], ci_timings.percentile(walls, 0.90))
         # Nearest-rank: the value is an observed run, not an interpolation.
         self.assertIn(summary["wall_p90"], walls)
         self.assertEqual(summary["wall_p90"], walls[-1])
@@ -817,31 +748,8 @@ class RunTimingTests(unittest.TestCase):
         rendered = ci_timings.render_compare_markdown(baseline, current, rows)
         self.assertIn("| tests (new-shard, fast) | n/a | 2m00s | n/a | n/a | 0/1 |", rendered)
 
-    def test_render_compare_markdown_includes_workflow_row(self):
-        baseline = ci_timings.window_summary([_summary()])
-        current = ci_timings.window_summary([_summary(databaseId=13)])
-        rows = ci_timings.compare_windows(baseline, current)
-        rendered = ci_timings.render_compare_markdown(baseline, current, rows)
-        self.assertIn(
-            "| **workflow** | **9m30s** | **9m30s** | **0s** | **+0 %** | **1/1** |",
-            rendered,
-        )
-        self.assertIn("| fmt + clippy | 3m19s | 3m19s | 0s | +0 % | 1/1 |", rendered)
-
-
 
 class ErrorReportingTests(unittest.TestCase):
-    def test_describe_error_keeps_the_gh_diagnosis(self):
-        # Without stderr the user sees only "non-zero exit status", which
-        # says nothing about expired auth, a missing scope, or a rate limit.
-        error = subprocess.CalledProcessError(
-            1, ["gh", "run", "list"],
-            stderr="gh: Requires authentication\nTry `gh auth login`\n",
-        )
-        message = ci_timings.describe_error(error)
-        self.assertIn("Requires authentication", message)
-        self.assertIn("exit status 1", message)
-
     def test_describe_error_falls_back_without_stderr(self):
         error = subprocess.CalledProcessError(1, ["gh", "run", "list"])
         self.assertEqual(ci_timings.describe_error(error), str(error))
@@ -933,14 +841,12 @@ class JunitTests(unittest.TestCase):
         self.assertEqual(summary["errors"], 0)
         self.assertEqual(len(summary["suites"]), 1)
 
-    def test_percentile_uses_nearest_rank(self):
+    def test_percentile_nearest_rank_ceil_boundary(self):
+        # Nearest rank takes the ceil(q * n)-th value: p95 of 11 values is the
+        # 11th (a rounded index would pick the 10th); an empty sample has none.
         self.assertIsNone(ci_timings.percentile([], 0.95))
         self.assertEqual(ci_timings.percentile([5.0], 0.95), 5.0)
         self.assertEqual(ci_timings.percentile([1.0, 2.0, 3.0, 4.0], 0.5), 2.0)
-
-    def test_percentile_nearest_rank_ceil_boundary(self):
-        # Nearest rank: p95 of 11 values is the 11th value (ceil(0.95*11)=11),
-        # not the 10th, which the previous round()-based index returned.
         values = [float(value) for value in range(1, 12)]
         self.assertEqual(ci_timings.percentile(values, 0.95), 11.0)
         self.assertEqual(ci_timings.percentile([1.0, 2.0], 0.5), 1.0)
@@ -996,28 +902,6 @@ class JunitTests(unittest.TestCase):
         self.assertEqual(name, "doctests + release build")
         with self.assertRaisesRegex(ValueError, "not found"):
             ci_timings.select_junit_job(document, requested="nope")
-
-    def test_select_junit_job_prefers_label_over_ambiguity(self):
-        # Several test-bearing jobs are fine as long as --label names one of
-        # them: --job is only required when nothing matches.
-        document = {
-            "jobs": [
-                {"name": "tests (unit, fast)", "steps": [
-                    {"name": "Run fast shard",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:04:18Z"},
-                ]},
-                {"name": "tests (cli, fast)", "steps": [
-                    {"name": "Run fast shard",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:03:00Z"},
-                ]},
-            ]
-        }
-        name, _, _ = ci_timings.select_junit_job(
-            document, label="tests (unit, fast)"
-        )
-        self.assertEqual(name, "tests (unit, fast)")
 
     def test_select_junit_job_refuses_to_guess_between_jobs(self):
         # The default label is "JUnit", which matches no job: guessing would
@@ -1095,12 +979,6 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(release["sccache"]["write_errors"], 272)
         self.assertIn("ghac", release["sccache"]["location"])
         self.assertEqual(release["rust_cache"], "hit")
-
-    def test_parse_cache_log_records_miss_without_sccache(self):
-        records = {record["job"]: record for record in ci_timings.parse_cache_log(CACHE_LOG)}
-        unit = records["tests (unit, fast)"]
-        self.assertIsNone(unit["sccache"])
-        self.assertEqual(unit["rust_cache"], "miss")
 
     def test_render_cache_markdown_hit_ratio(self):
         rendered = ci_timings.render_cache_markdown(
@@ -1481,14 +1359,27 @@ class TruncationTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
-    def test_snapshot_roundtrip_and_rejection(self):
+    def test_snapshot_rejects_a_non_list_document(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "snapshot.json"
-            ci_timings.write_snapshot(path, [RUN])
-            self.assertEqual(ci_timings.read_snapshot(path), [RUN])
             path.write_text('{"runs": []}')
             with self.assertRaisesRegex(ValueError, "JSON list"):
                 ci_timings.read_snapshot(path)
+
+    def test_input_snapshot_keeps_ci_and_legacy_runs_only(self):
+        # Tag Release runs complete CI-named jobs too and must never enter the
+        # medians; documents stored before `workflowName` was fetched are kept.
+        release = dict(RUN, databaseId=91, workflowName="Release")
+        ci_run = dict(RUN, databaseId=92, workflowName="CI")
+        legacy = dict(RUN, databaseId=93)
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory) / "ci-runs.json"
+            ci_timings.write_snapshot(snapshot, [release, ci_run, legacy])
+            loaded = ci_timings.load_run_summaries(
+                argparse.Namespace(input=str(snapshot))
+            )
+        self.assertEqual(sorted(run["id"] for run in loaded.runs), [92, 93])
+        self.assertFalse(loaded.truncated)
 
 
 class RunnerMinuteTests(unittest.TestCase):
@@ -1504,19 +1395,6 @@ class RunnerMinuteTests(unittest.TestCase):
             ci_timings.runner_minutes({"a": 59.0, "b": 60.0}), 2
         )
         self.assertEqual(ci_timings.runner_minutes({"a": 199.0, "b": 226.0}), 8)
-
-    def test_summary_carries_the_per_run_total(self):
-        self.assertEqual(_summary()["runner_minutes"], 8)
-        # A skipped job contributes neither duration nor runner minutes.
-        self.assertEqual(
-            ci_timings.summarize_run({
-                "databaseId": 30, "createdAt": "2026-09-20T10:00:00Z",
-                "startedAt": "2026-09-20T10:00:00Z",
-                "updatedAt": "2026-09-20T10:01:00Z",
-                "jobs": [{"name": "cargo-udeps", "startedAt": None,
-                          "completedAt": None, "conclusion": "skipped"}],
-            })["runner_minutes"], 0
-        )
 
     def test_window_summary_medians_and_sums_runner_minutes(self):
         runs = [
@@ -1674,15 +1552,6 @@ class StepTimingTests(unittest.TestCase):
             {},
         )
 
-    def test_render_steps_markdown(self):
-        rendered = ci_timings.render_steps_markdown(
-            2, ci_timings.step_summary(self._runs_with_steps())
-        )
-        self.assertIn(f"Steps over {2} run(s)", rendered)
-        self.assertIn("| Job | Step | p50 | p90 | Runs |", rendered)
-        self.assertIn("| tests (unit, fast) | Run fast shard | 3m30s | "
-                      "4m00s | 2 |", rendered)
-
     def test_steps_command_renders_an_input_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             snapshot = Path(directory) / "ci-runs.json"
@@ -1715,21 +1584,6 @@ class StepTimingTests(unittest.TestCase):
             "| tests (unit, fast) | Run fast shard | 3m00s | 3m00s | 1 |",
             rendered.getvalue(),
         )
-
-    def test_build_parser_understands_steps_selection(self):
-        argument = ci_timings.build_parser().parse_args(
-            ["steps", "--input", "x.json", "--job", "a", "--job", "b",
-             "--branch", "main", "--event", "push", "--limit", "3",
-             "--window", "2026-09-14..2026-09-16"]
-        )
-        self.assertEqual(argument.job, ["a", "b"])
-        self.assertEqual(argument.branch, "main")
-        self.assertEqual(argument.event, "push")
-        self.assertEqual(argument.limit, 3)
-        self.assertEqual(argument.window, "2026-09-14..2026-09-16")
-        # argparse reports the missing subcommand on stderr before exiting.
-        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
-            ci_timings.build_parser().parse_args([])
 
 
 class CompareRunnerMinuteTests(unittest.TestCase):

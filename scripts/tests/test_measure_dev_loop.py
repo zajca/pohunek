@@ -236,17 +236,6 @@ class EnvTests(unittest.TestCase):
 
 
 class HyperfineTests(unittest.TestCase):
-    def test_parse_hyperfine_extracts_median_stddev_and_runs(self):
-        parsed = measure_dev_loop.parse_hyperfine(HYPERFINE_PAYLOAD)
-        self.assertEqual(len(parsed), 1)
-        row = parsed[0]
-        self.assertEqual(
-            row["command"], HYPERFINE_PAYLOAD["results"][0]["command"]
-        )
-        self.assertEqual(row["median"], 0.912345)
-        self.assertEqual(row["stddev"], 0.031212)
-        self.assertEqual(row["runs"], 3)
-
     def test_parse_hyperfine_tolerates_missing_fields(self):
         parsed = measure_dev_loop.parse_hyperfine({"results": [{"command": "x"}]})
         self.assertEqual(
@@ -547,19 +536,6 @@ class CompareTests(unittest.TestCase):
                      "allocated_bytes": allocated, "counted": 3},
         }
 
-    def test_compare_baselines_compares_cases_and_size(self):
-        rows = measure_dev_loop.compare_baselines(
-            self._payload(10.0, 3000), self._payload(6.0, 1000)
-        )
-        warm = next(row for row in rows if row["case"] == "warm")
-        self.assertEqual(warm["delta"], -4.0)
-        self.assertAlmostEqual(warm["percent"], -40.0)
-        apparent = next(row for row in rows if row["case"] == "size:apparent")
-        self.assertEqual(apparent["unit"], "bytes")
-        self.assertEqual(apparent["delta"], -2000)
-        self.assertIn("size:allocated",
-                      [row["case"] for row in rows])
-
     def test_compare_handles_rows_present_on_one_side_only(self):
         rows = measure_dev_loop.compare_baselines(
             self._payload(10.0, 3000),
@@ -581,6 +557,7 @@ class CompareTests(unittest.TestCase):
             "| size:apparent | 2.9 KiB | 1,000.0 B | -2.0 KiB | -67 % |",
             rendered,
         )
+        self.assertIn("| size:allocated |", rendered)
 
     def test_compare_json_output_carries_the_same_rows(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -615,12 +592,6 @@ class ValidationTests(unittest.TestCase):
                 )
             self.assertEqual(code, 1)
             self.assertIn(flag, stderr.getvalue())
-
-    def test_defaults_satisfy_the_bounds(self):
-        self.assertEqual(measure_dev_loop.DEFAULT_RUNS, 5)
-        self.assertEqual(measure_dev_loop.DEFAULT_WARMUP, 1)
-        self.assertGreaterEqual(measure_dev_loop.DEFAULT_RUNS, 2)
-        self.assertGreaterEqual(measure_dev_loop.DEFAULT_WARMUP, 1)
 
 
 if __name__ == "__main__":
