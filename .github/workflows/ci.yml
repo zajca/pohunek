@@ -588,6 +588,7 @@ jobs:
       hermes: ${{ steps.filter.outputs.hermes }}
       pi_package: ${{ steps.filter.outputs.pi_package }}
       codex_package: ${{ steps.filter.outputs.codex_package }}
+      claude_package: ${{ steps.filter.outputs.claude_package }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
@@ -780,6 +781,25 @@ jobs:
             codex_package:
               - 'runtime-packages/**'
               - 'compat/codex/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'crates/cli/**'
+              - 'crates/daemon/**'
+              - 'crates/package/**'
+              - 'crates/protocol/**'
+              - 'crates/session-worker/**'
+              - 'crates/worker-protocol/**'
+              - 'crates/terminal/**'
+              - 'crates/platform/**'
+              - 'crates/paths/**'
+              - 'crates/test-support/**'
+              - 'crates/xtask/src/runtime_package.rs'
+              - '.github/workflows/ci.yml'
+            # Official Claude Code runtime package: the Codex package's inputs
+            # with its own lock and captured screens.
+            claude_package:
+              - 'runtime-packages/**'
+              - 'compat/claude/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'crates/cli/**'
@@ -1439,6 +1459,94 @@ jobs:
 
       - name: Drive the real Codex
         run: cargo test --locked -p pohunek-cli --test codex_package -- --include-ignored --test-threads 1
+
+  # Official Claude Code runtime package against the real, locked Claude Code
+  # release. The job installs exactly `compat/claude/compatibility-lock.json`'s
+  # release from npm (the package's postinstall links the native binary, so
+  # scripts stay enabled), checks the native binary against the lock's SHA-256,
+  # builds the package with `cargo xtask package build`, and runs the always-on
+  # parity tests plus the real-Claude tests: a real `claude` with a throwaway
+  # CLAUDE_CONFIG_DIR, a dummy API key, a loopback Messages stub, hooks
+  # registered by pohunek's own integration install, and every live screen and
+  # title read through the package manifest. The tests install the built
+  # archive through a signed catalog with a throwaway key and trust anchor
+  # generated in the test process, so the launches go through the installed
+  # package and its version probe. The screen-capture tests do nothing without
+  # POHUNEK_CLAUDE_CAPTURE_DIR, which this job does not set. The job has not
+  # run on a hosted runner yet: the Node of the runner image and the npm
+  # postinstall are the assumptions to check on its first run.
+  claude-package:
+    name: Claude Code runtime package (locked release, model-free)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.claude_package == 'true' }}
+    env:
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+      POHUNEK_CLAUDE_E2E: "1"
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Read the Claude Code lock
+        id: lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock=compat/claude/compatibility-lock.json
+          {
+            echo "npm=$(jq -er '.upstream.npm' "$lock")"
+            echo "release=$(jq -er '.upstream.release' "$lock")"
+            echo "sha256=$(jq -er '.upstream.sha256["linux-x64"]' "$lock")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install the locked Claude Code release
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/claude"
+          npm install --global --prefix "$prefix" --ignore-scripts=false --no-audit --no-fund \
+            "${{ steps.lock.outputs.npm }}@${{ steps.lock.outputs.release }}"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          binary="$(readlink -f "$prefix/bin/claude")"
+          actual="$(sha256sum "$binary" | cut -d' ' -f1)"
+          test "$actual" = "${{ steps.lock.outputs.sha256 }}" \
+            || { echo "installed Claude Code binary $actual is not the locked ${{ steps.lock.outputs.sha256 }}" >&2; exit 1; }
+          installed="$(env -i PATH="$prefix/bin:$PATH" HOME="$RUNNER_TEMP" CLAUDE_CONFIG_DIR="$RUNNER_TEMP/claude-version-home" claude --version)"
+          test "$installed" = "${{ steps.lock.outputs.release }} (Claude Code)" \
+            || { echo "installed Claude Code '$installed' is not the locked ${{ steps.lock.outputs.release }}" >&2; exit 1; }
+
+      - name: Install mold linker
+        uses: ./.github/actions/setup-mold
+        with:
+          version: ${{ env.MOLD_VERSION }}
+          sha256: ${{ env.MOLD_SHA256 }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: claude-package
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the package deterministically
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo xtask package verify runtime-packages/claude
+          cargo xtask package build runtime-packages/claude --output "$RUNNER_TEMP/claude.tar.zst"
+          echo "POHUNEK_CLAUDE_PACKAGE_ARCHIVE=$RUNNER_TEMP/claude.tar.zst" >> "$GITHUB_ENV"
+
+      - name: Build the session worker
+        run: cargo build --locked -p pohunek-session-worker --bin pohunek-sessiond
+
+      - name: Drive the real Claude Code
+        run: cargo test --locked -p pohunek-cli --test claude_package -- --include-ignored --test-threads 1
 
   # Native Apple Silicon counterpart of `hermes-compatibility`. It provisions
   # the same locked Hermes runtime under the runner's /bin/bash 3.2 and BSD

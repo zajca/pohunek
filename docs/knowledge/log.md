@@ -1,5 +1,20 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-07, package test daemons use the test-host process view)
+
+- The shared package test harness builds its daemon with
+  `SessionRegistry::new_production_with_inspector` and the test-host process
+  view, so an unreadable same-user process of a loaded test host no longer makes
+  a session removal refuse. Production daemons keep the real host view.
+
+## Unreleased (2026-10-07, Claude hook reporter behind a wrapper shell)
+
+- The managed Claude hook scripts skip a wrapper shell when they pick the process
+  that reports: Claude runs hooks as `/bin/sh -c`, and where that is dash the
+  shell stays between Claude and the script, so the worker rejected the
+  SessionStart report and no native reference was recorded. The Claude package
+  guide records the finding.
+
 ## Unreleased (2026-10-07, Codex conversation id becomes the native reference)
 
 - The session worker verifies a launch claim from a provider-named direct child
@@ -8,6 +23,24 @@
   works. The sessions concept page states which process may report the id, and
   the Codex package guide replaces its known-gap statement with the verified
   behavior.
+
+## Unreleased (2026-10-07, Claude Code runtime package source)
+
+- Added the Claude Code runtime package guide and the package source
+  (`runtime-packages/claude`, `compat/claude/compatibility-lock.json`,
+  `compat/claude/screens/`): the descriptor and detection manifest equal the
+  built-in Claude files, plus a `semver-line-v1` probe for `<release> (Claude
+  Code)` from 2.1.289. The package can be served as the official `claude` runtime
+  only through a signed catalog, no release catalog or signing key exists yet,
+  and the built-in Claude runtime stays in the daemon. The guide records the
+  first-run state files of a Claude home, what was verified against a real
+  Claude Code 2.1.289 (hooks from the launched process, resume and fork argv,
+  subagent hooks) and the gaps found: the working title uses a glyph no rule
+  names, narrow question forms and the trust dialog are not classified, and a
+  forked session keeps its source's native reference so its own conversation id
+  is rejected.
+- The source map lists the package source, the lock, the screens, the tests, the
+  Messages stub, the shared process guard and the `claude-package` CI job.
 
 ## Unreleased (2026-10-06, Codex hook reporter ancestry)
 

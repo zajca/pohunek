@@ -30,7 +30,8 @@ Start here:
   the official Pi package, what was verified against a real Pi, and its limits;
   the [Codex runtime package](guides/codex-package.md) documents the Codex
   package source, its parity with the built-in Codex runtime, and the gaps found
-  against a real Codex.
+  against a real Codex; the [Claude Code runtime
+  package](guides/claude-package.md) does the same for Claude Code.
   [Environment and executable resolution](guides/environment-resolution.md)
   documents the macOS `PATH` policy. The
   [Hermes operator](guides/hermes-operator.md) documents the managed plugin,

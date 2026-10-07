@@ -1,0 +1,24 @@
+ ▝▝   ▝▝   Billing
+           /tmp/ph-I
+           SXO7q/wor
+           k
+
+
+❯ [question] ask
+────────────────────
+ ☐ Flavor
+
+Which flavor do you
+want?
+
+❯ 1. Vanilla
+     Plain
+  2. Chocolate
+     Sweet
+  3. Type something.
+────────────────────
+  4. Chat about this
+
+Enter to select ·
+↑/↓ to navigate ·
+Esc to cancel

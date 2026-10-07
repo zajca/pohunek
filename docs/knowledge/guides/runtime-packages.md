@@ -18,6 +18,9 @@ trust. The repository's own package, [Pi](pi-package.md), is installed this way.
 The [Codex package](codex-package.md) is the second official package source; it
 serves the reserved `codex` id only through a signed catalog, and no release
 catalog or signing key exists yet.
+The [Claude Code package](claude-package.md) is the third; it serves the
+reserved `claude` id the same way, and the built-in Claude runtime stays in the
+daemon until a production catalog key exists.
 
 ```bash
 pohunek plugin list

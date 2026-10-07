@@ -68,6 +68,8 @@ pub use uninstall::{uninstall_claude, uninstall_codex, uninstall_in};
 #[cfg(all(test, unix))]
 mod handler_tests;
 #[cfg(all(test, unix))]
+mod hook_pid_tests;
+#[cfg(all(test, unix))]
 mod lifecycle_tests;
 #[cfg(all(test, unix))]
 mod removal_tests;

@@ -529,6 +529,7 @@ Runtime package archive format:
 - `docs/knowledge/guides/runtime-packages.md`
 - `docs/knowledge/guides/pi-package.md`
 - `docs/knowledge/guides/codex-package.md`
+- `docs/knowledge/guides/claude-package.md`
 - `runtime-packages/README.md` — layout convention of the official package sources.
 - `runtime-packages/pi/runtime.toml` — Pi runtime descriptor (assigned reference, existence check, version probe).
 - `runtime-packages/pi/detect.toml` — Pi detection manifest verified against real screens.
@@ -541,6 +542,13 @@ Runtime package archive format:
 - `compat/codex/screens/` — screens and terminal titles captured from a real Codex that the manifest test classifies.
 - `crates/cli/tests/codex_package.rs` — pure package tests (descriptor and manifest parity with the built-in), catalog-installed package launch and version-probe tests, and the opt-in real-Codex tests.
 - `crates/cli/tests/support/responses_stub.rs` — loopback Responses-API stub used instead of a model provider.
+- `runtime-packages/claude/runtime.toml` — Claude Code runtime descriptor (hook native reference, resume and fork argv, `semver-line-v1` version probe).
+- `runtime-packages/claude/detect.toml` — Claude Code detection manifest, equal to the built-in one.
+- `compat/claude/compatibility-lock.json` — pinned Claude Code release, native binary SHA-256 and supported range.
+- `compat/claude/screens/` — screens and terminal titles captured from a real Claude Code that the manifest test classifies.
+- `crates/cli/tests/claude_package.rs` — pure package tests (descriptor and manifest parity with the built-in), catalog-installed package launch and version-probe tests, the opt-in real-Claude tests and the screen capture.
+- `crates/cli/tests/support/messages_stub.rs` — loopback Messages-API stub used instead of a model provider.
+- `crates/cli/tests/support/process_guard.rs` — process cleanup shared by the real-agent package tests.
 - `crates/cli/tests/support/plugin_harness.rs` — real-daemon harness shared by the package tests.
 - `crates/cli/tests/support/catalog_fixture.rs` — throwaway signing key, trust anchor and signed catalog helpers shared by the catalog install tests.
 - `crates/cli/tests/support/model_stub.rs` — loopback chat-completions stub used instead of a model provider.
