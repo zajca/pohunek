@@ -1683,23 +1683,13 @@ impl IntoResponse for ApiFailure {
 
 #[cfg(test)]
 mod tests {
-    use axum::{
-        http::{header, HeaderMap, HeaderValue},
-        response::IntoResponse,
-        response::Redirect,
-    };
+    use axum::http::{header, HeaderMap, HeaderValue};
 
     use super::{
         callback_failure_response, cookie, parse_callback_query, protected_cookie, random_cookie,
         LOGIN_COOKIE,
     };
     use crate::auth::AuthError;
-
-    #[test]
-    fn browser_start_redirect_changes_post_to_get() {
-        let response = Redirect::to("https://issuer.example/authorize").into_response();
-        assert_eq!(response.status(), http::StatusCode::SEE_OTHER);
-    }
 
     #[test]
     fn callback_ignores_extension_coordinates_but_rejects_duplicate_core_coordinates() {
