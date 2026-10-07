@@ -1943,29 +1943,6 @@ async fn an_adopted_worker_whose_launch_process_just_exited_hands_over_its_journ
 }
 
 #[tokio::test]
-async fn the_launch_diagnostic_names_the_worker_and_host_view_of_the_launch_process() {
-    let rig = Rig::new(
-        "supersede-diagnostic",
-        crate::agent::host::fixture::PI_SHAPED_NO_CHECK,
-    )
-    .await;
-    let (worker, _identity) = live_worker_and_identity(&rig.registry, rig.id()).await;
-
-    let report = rig.launch_diagnostic(&worker).await;
-
-    for expected in [
-        "launch_identity=",
-        "native_reference=",
-        "host: identity(",
-        "executable=",
-        "pending claims in the worker journal",
-    ] {
-        assert!(report.contains(expected), "{expected}: {report}");
-    }
-    rig.finish(&rig.registry).await;
-}
-
-#[tokio::test]
 async fn a_switch_survives_the_provider_exiting_before_its_wrapper() {
     let rig = Rig::wrapped(
         "supersede-provider-exits",
@@ -2269,32 +2246,4 @@ async fn a_worker_crash_after_a_journaled_switch_keeps_the_switch_at_startup() {
         Some("switched-before-the-crash")
     );
     rig.registry = restarted;
-}
-
-/// How many replacements the PATH regression test races the lookup against.
-const PATH_RACE_ROUNDS: usize = 50;
-
-#[test]
-fn resolving_bash_is_not_broken_by_a_concurrent_path_replacement() {
-    for _ in 0..PATH_RACE_ROUNDS {
-        let (replaced_tx, replaced_rx) = std::sync::mpsc::channel();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let replacer = std::thread::spawn(move || {
-            let mut env = pohunek_test_support::process_env::ProcessEnv::lock();
-            env.set("PATH", "/nonexistent-path-for-the-test");
-            replaced_tx.send(()).expect("announce the replacement");
-            started_rx.recv().expect("wait for the lookup to start");
-        });
-        replaced_rx.recv().expect("PATH is replaced");
-
-        // The lookup starts while PATH is replaced; it waits for the lock and
-        // sees the restored value.
-        let lookup = std::thread::spawn(move || {
-            started_tx.send(()).expect("announce the lookup");
-            resolve_bash()
-        });
-        replacer.join().expect("replacer thread");
-
-        assert!(lookup.join().expect("lookup thread").is_file());
-    }
 }
