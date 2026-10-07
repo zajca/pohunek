@@ -237,6 +237,12 @@ corresponding payload-free hook dry run and returns typed findings for missing
 files, policy, permissions, version compatibility, registration, host policy,
 or stale ownership state.
 
+After upgrading Pohunek, run `integration doctor` for the selected Hermes home:
+the `asset_current` check fails (and status shows `outdated=true`) when the
+installed plugin was written by an older release, even though no file was edited.
+`integration update` with the same target flags replaces it and needs
+`--confirm-modified` only when `modified=true`.
+
 When troubleshooting, start with `integration status` and `integration doctor`
 for the selected Hermes home. Use `integration update` only after reviewing the
 typed stale or compatibility finding. Use `integration uninstall` rather than

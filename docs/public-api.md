@@ -1148,7 +1148,13 @@ Important fields:
   and `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to
   start a new session and resume the native conversation, and `detail` carries
-  the stored native reference.
+  the stored native reference. `hook` also marks a launch (new, resume or fork)
+  whose agent's installed Claude or Codex hook assets differ from the ones the
+  daemon embeds (an older version marker or changed content): `message` names the
+  `pohunek integration install --agent <agent>` command (with `--profile` for a
+  host profile's home) and `detail` carries the status warnings; the session
+  still starts, and an agent whose hooks are not installed carries no such
+  warning.
 - `metadata`: owner-controlled strings; must not contain secrets. The daemon
   treats every key opaquely; clients own the convention. One such
   client-defined convention is the `link.*` key family (`link.provider`,
@@ -2408,6 +2414,13 @@ pohunek integration install --agent hermes --hermes-profile default \
   --max-screen-bytes 65536 --max-concurrency 1 --json
 pohunek integration doctor --agent hermes --hermes-profile default --json
 ```
+
+Hermes status reports `installed`, `enabled`, `modified` (a managed file differs
+from the checksums its ownership marker records), `outdated` (the marker records
+assets this release does not embed, so an untouched install written by an older
+release is flagged) and the stale-sibling flags. The doctor's `asset_current`
+check fails for an outdated plugin; `integration update` replaces it without
+`--confirm-modified` unless `modified` is true.
 
 `--hermes-profile default`, a named `--hermes-profile`, and an absolute
 `--hermes-home` are explicit target selections; a profile and home cannot be

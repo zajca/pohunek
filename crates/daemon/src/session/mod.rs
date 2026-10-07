@@ -2189,9 +2189,17 @@ impl SessionRegistry {
         let intent = create_intent_record(&id, &params, &resolved, &fallback_cwd)?;
         self.write_session_record(intent).await?;
         let prepared = match self.resolve_target(&id, &params, fallback_cwd).await {
-            Ok(target) => {
+            Ok(mut target) => {
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
+                let profile = resolved.profile.as_ref().map(|_| resolved.name.clone());
+                target.warnings.extend(
+                    self.outdated_integration_warning(
+                        RuntimeRef::from(resolved.base.clone()),
+                        profile,
+                    )
+                    .await,
+                );
                 self.create_spec(
                     &id,
                     &params,
@@ -2214,6 +2222,66 @@ impl SessionRegistry {
         };
         let info = Box::pin(self.clone().run_pty_registration(spec, guard)).await?;
         Ok((info, pending_initial_input))
+    }
+
+    /// [`Self::outdated_integration_warning`] for the agent `binding` relaunches
+    /// under `relaunch`, as the warnings of the relaunched session.
+    ///
+    /// A revision is frozen exactly when the relaunch resolved a host profile,
+    /// which then names the binding's agent; a profile may carry its runtime's
+    /// own name, so the name alone cannot tell.
+    async fn outdated_relaunch_warnings(
+        &self,
+        binding: &ResumeBinding,
+        relaunch: &resume::RelaunchPlan,
+    ) -> Vec<SessionWarning> {
+        let profile = relaunch
+            .profile
+            .revision
+            .is_some()
+            .then(|| binding.agent.clone());
+        self.outdated_integration_warning(binding.agent_base.clone(), profile)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// The warning a launch of `agent` (under host profile `profile`) carries when its agent's managed hook
+    /// assets are outdated.
+    ///
+    /// The inspection reads a few small files off the async runtime and is best
+    /// effort: a home that cannot be resolved or a panicked inspection yields no
+    /// warning and never fails the launch.
+    async fn outdated_integration_warning(
+        &self,
+        agent: RuntimeRef,
+        profile: Option<String>,
+    ) -> Option<SessionWarning> {
+        let homes = match self.integration_homes() {
+            Ok(homes) => homes,
+            Err(error) => {
+                debug!(
+                    name: "session.hook_assets_outdated.homes_unresolved",
+                    error_code = %error.code,
+                    "skipped the outdated hook asset check: config homes unresolved"
+                );
+                return None;
+            }
+        };
+        match tokio::task::spawn_blocking(move || {
+            crate::integration::outdated_assets_warning(&homes, agent, profile)
+        })
+        .await
+        {
+            Ok(warning) => warning,
+            Err(_join_error) => {
+                warn!(
+                    name: "session.hook_assets_outdated.check_panicked",
+                    "the outdated hook asset check panicked; the launch carries no warning"
+                );
+                None
+            }
+        }
     }
 
     /// Parks a create at its bound target when a test armed the hold.

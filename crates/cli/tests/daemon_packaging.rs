@@ -27,6 +27,62 @@ fn fresh_install_runs_service_install_from_the_archive() {
     );
 }
 
+/// The commands a finished install or upgrade tells the owner to run next.
+fn assert_hook_asset_next_steps(output: &Output) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("pohunek integration doctor"), "{stderr}");
+    assert!(
+        stderr.contains("pohunek integration install --agent <agent>`"),
+        "{stderr}"
+    );
+    // Hermes install needs --access-mode and --allow-host, so an existing
+    // plugin is brought current with `update`, which keeps the installed policy.
+    assert!(
+        stderr.contains(
+            "for an outdated Hermes plugin run `pohunek integration update --agent hermes`"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`--hermes-profile` or `--hermes-home`"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("integration install --agent hermes"),
+        "the Hermes recommendation must not name the install action: {stderr}"
+    );
+}
+
+#[test]
+fn a_finished_install_and_upgrade_name_the_hook_asset_commands() {
+    let install = Fixture::new();
+    let output = install.run(&[], &[]);
+    assert_success(&output);
+    assert_hook_asset_next_steps(&output);
+
+    let upgrade = Fixture::new();
+    write(&upgrade.config_home.join("pohunek/service.toml"), "");
+    let output = upgrade.run(&[], &[]);
+    assert_success(&output);
+    assert_hook_asset_next_steps(&output);
+}
+
+#[test]
+fn a_refused_upgrade_does_not_claim_a_finished_install() {
+    let fixture = Fixture::new();
+    write(&fixture.config_home.join("pohunek/service.toml"), "");
+    let output = fixture.run(
+        &[],
+        &[(
+            "POHUNEK_TEST_CHECK_ERROR",
+            "service_upgrade_sessions_at_risk",
+        )],
+    );
+    assert_ne!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("pohunek integration doctor"), "{stderr}");
+}
+
 #[test]
 fn a_pending_install_is_finished_by_service_install_even_with_service_config() {
     // From its `config` step on, an interrupted install has written

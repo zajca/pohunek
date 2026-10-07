@@ -175,7 +175,9 @@ For durable notification issues:
    finding (`asset_missing`, `asset_modified`, `asset_unsafe`,
    `registration_drift`, `provider_config_invalid`,
    `codex_hooks_feature_disabled`, `codex_trust_drift`, `config_root_invalid`)
-   with a remediation, reports a present agent without hooks as
+   with a remediation (`asset_modified` also covers a script whose bytes differ
+   from the embedded one at the same version marker, so an asset left over from
+   an earlier release is an error even when its version did not change), reports a present agent without hooks as
    `hooks_not_installed` and an absent optional agent as `agent_not_installed`
    (both informational; only the absence expected of a not-installed
    integration is muted, so an empty config with an unsafe, symlinked, or

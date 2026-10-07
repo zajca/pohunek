@@ -580,6 +580,58 @@ fn a_failing_activation_restores_the_exact_prior_tree() {
 }
 
 #[test]
+fn a_script_body_that_differs_at_the_current_version_is_outdated_and_the_doctor_fails() {
+    for agent in agents() {
+        let dir = scoped_dir("same-version-drift");
+        write_user_config(&agent, &dir);
+        let state_hook = install_current(&agent, &dir);
+        let body = fs::read_to_string(&state_hook).expect("read the installed script");
+        assert!(body.contains(&format!(
+            "{INTEGRATION_VERSION_PREFIX}{EXPECTED_INTEGRATION_VERSION}"
+        )));
+        fs::write(&state_hook, format!("{body}\n# edited after install\n"))
+            .expect("drift the script body");
+
+        let status = with_config_dirs(&dir, &dir, || {
+            builtin(&agent).handler.inspect(&agent, Ok(&dir))
+        });
+        assert_eq!(status.state, IntegrationInstallState::Outdated, "{agent:?}");
+        assert_eq!(
+            status.installed_version,
+            Some(EXPECTED_INTEGRATION_VERSION),
+            "the version marker alone cannot tell this drift"
+        );
+
+        let doctor = with_config_dirs(&dir, &dir, || {
+            doctor_for_with(
+                &builtin_host(),
+                IntegrationDoctorParams {
+                    agent: Some(agent.clone()),
+                    ..Default::default()
+                },
+                &[],
+                &[],
+            )
+        })
+        .expect("doctor");
+        assert!(!doctor.ok, "{agent:?}");
+        let finding = doctor.agents[0]
+            .findings
+            .iter()
+            .find(|finding| finding.code == protocol::IntegrationFindingCode::AssetModified)
+            .expect("an asset_modified finding");
+        assert_eq!(
+            finding.severity,
+            protocol::IntegrationFindingSeverity::Error
+        );
+        assert!(finding
+            .remediation
+            .as_deref()
+            .is_some_and(|text| text.contains("pohunek integration install --agent")));
+    }
+}
+
+#[test]
 fn updating_from_the_previous_asset_set_activates_atomically() {
     for agent in agents() {
         let dir = scoped_dir("update-previous");

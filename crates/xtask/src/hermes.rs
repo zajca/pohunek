@@ -854,12 +854,17 @@ struct PohunekIntegrationResult {
     installed: bool,
     enabled: bool,
     modified: bool,
+    outdated: bool,
     stale_stage: bool,
     stale_backup: bool,
     access_mode: Option<String>,
     allowed_host_count: Option<usize>,
     doctor: Option<PohunekDoctorReport>,
 }
+
+/// Checks in the Hermes doctor report of the CLI under test; it matches the
+/// `CHECK_CODES` inventory of `crates/cli/src/hermes_integration/doctor.rs`.
+const POHUNEK_DOCTOR_CHECK_COUNT: usize = 16;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2023,6 +2028,7 @@ fn validate_pohunek_envelope(
         || result.target_kind != "profile"
         || result.target_label != EXPECTED_NAMED_PROFILE
         || result.modified
+        || result.outdated
         || result.stale_stage
         || result.stale_backup
     {
@@ -2080,7 +2086,7 @@ fn validate_pohunek_envelope(
 
 fn doctor_is_healthy(report: &PohunekDoctorReport) -> bool {
     report.ok
-        && report.checks.len() == 15
+        && report.checks.len() == POHUNEK_DOCTOR_CHECK_COUNT
         && report.checks.iter().all(|check| {
             !check.code.is_empty() && check.status == "pass" && check.recovery_hint == "none"
         })
@@ -5206,6 +5212,7 @@ PY
                     "installed": installed,
                     "enabled": enabled,
                     "modified": false,
+                    "outdated": false,
                     "stale_stage": false,
                     "stale_backup": false,
                     "access_mode": access_mode,
@@ -5215,7 +5222,7 @@ PY
             })
             .to_string()
         };
-        let checks: Vec<_> = (0..15)
+        let checks: Vec<_> = (0..super::POHUNEK_DOCTOR_CHECK_COUNT)
             .map(|index| {
                 serde_json::json!({
                     "code": format!("controlled_{index}"),
@@ -5323,6 +5330,64 @@ PY
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// A status envelope as the CLI prints it for a current install, with
+    /// `extra` fields added to the result.
+    fn status_envelope(extra: &serde_json::Value) -> serde_json::Value {
+        let mut result = serde_json::json!({
+            "action": "status",
+            "target_kind": "profile",
+            "target_label": super::EXPECTED_NAMED_PROFILE,
+            "installed": true,
+            "enabled": true,
+            "modified": false,
+            "outdated": false,
+            "stale_stage": false,
+            "stale_backup": false,
+            "access_mode": "read_only",
+            "allowed_host_count": 1,
+            "doctor": null,
+        });
+        if let (Some(target), Some(added)) = (result.as_object_mut(), extra.as_object()) {
+            target.extend(added.clone());
+        }
+        serde_json::json!({
+            "cli_version": "controlled",
+            "protocol": {
+                "minimum": super::EXPECTED_POHUNEK_PROTOCOL,
+                "maximum": super::EXPECTED_POHUNEK_PROTOCOL,
+            },
+            "ok": result,
+        })
+    }
+
+    fn status_step() -> super::IntegrationStep {
+        super::IntegrationStep {
+            action: super::IntegrationAction::Status,
+            expected_state: super::IntegrationState::Installed,
+        }
+    }
+
+    #[test]
+    fn the_envelope_validator_accepts_a_current_install_and_rejects_an_outdated_one() {
+        let current: super::PohunekEnvelope =
+            serde_json::from_value(status_envelope(&serde_json::json!({}))).expect("parse");
+        super::validate_pohunek_envelope(&status_step(), &current).expect("current install");
+
+        let outdated: super::PohunekEnvelope =
+            serde_json::from_value(status_envelope(&serde_json::json!({"outdated": true})))
+                .expect("parse");
+        let error = super::validate_pohunek_envelope(&status_step(), &outdated)
+            .expect_err("an outdated plugin fails the compatibility run");
+        assert!(error.to_string().contains("invalid envelope"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_result_field_is_a_malformed_envelope() {
+        let unknown = status_envelope(&serde_json::json!({"a_new_field": false}));
+        let error = serde_json::from_value::<super::PohunekEnvelope>(unknown).unwrap_err();
+        assert!(error.to_string().contains("a_new_field"), "{error}");
     }
 
     #[test]

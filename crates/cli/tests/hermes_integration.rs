@@ -234,6 +234,7 @@ esac"#,
     status_json_arguments.push("--json");
     let status_json = parse_ok(&run(&fixture, &status_json_arguments));
     assert_eq!(status_json["modified"], false);
+    assert_eq!(status_json["outdated"], false);
 
     let policy_paths = fs::read_dir(fixture.root.join("state/pohunek/policies/hermes"))
         .expect("read policy directory")
@@ -307,6 +308,62 @@ esac"#,
         false
     );
 
+    // An untouched install written by an older release: the assets and the
+    // ownership marker agree with each other but not with this binary.
+    let older_tools = [
+        fs::read(plugin_root.join("tools.py")).expect("read tools"),
+        b"\n# written by an older release\n".to_vec(),
+    ]
+    .concat();
+    fs::write(plugin_root.join("tools.py"), &older_tools).expect("older asset");
+    set_mode(&plugin_root.join("tools.py"), 0o600);
+    let marker_path = plugin_root.join(".pohunek-owned.json");
+    let mut marker: Value =
+        serde_json::from_slice(&fs::read(&marker_path).expect("read marker")).expect("marker");
+    marker["assets"]["tools.py"] = json!(format!(
+        "{:x}",
+        <sha2::Sha256 as sha2::Digest>::digest(&older_tools)
+    ));
+    fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&marker).expect("marker bytes"),
+    )
+    .expect("record the older checksum");
+    set_mode(&marker_path, 0o600);
+    let outdated = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(outdated["outdated"], true);
+    assert_eq!(outdated["modified"], false);
+    let outdated_doctor = run(
+        &fixture,
+        &[
+            "integration",
+            "doctor",
+            "--agent",
+            "hermes",
+            "--hermes-profile",
+            "default",
+            "--hermes-bin",
+            hermes,
+            "--json",
+        ],
+    );
+    let doctor_text = String::from_utf8_lossy(&outdated_doctor.stdout).into_owned()
+        + String::from_utf8_lossy(&outdated_doctor.stderr).as_ref();
+    assert!(
+        doctor_text.contains("asset_current"),
+        "the doctor names the failing check: {doctor_text}"
+    );
+    // The command the doctor recommends, with the original target flags and no
+    // install-only options, is accepted and clears the outdated state.
+    assert!(
+        doctor_text.contains("pohunek integration update --agent hermes"),
+        "{doctor_text}"
+    );
+    let recommended = parse_ok(&run(&fixture, &modified_update));
+    assert_eq!(recommended["modified"], false);
+    let current = parse_ok(&run(&fixture, &status_json_arguments));
+    assert_eq!(current["outdated"], false);
+
     let doctor = run(
         &fixture,
         &[
@@ -332,7 +389,7 @@ esac"#,
     assert_eq!(doctor_ok["doctor"]["ok"], true);
     assert_eq!(
         doctor_ok["doctor"]["checks"].as_array().map(Vec::len),
-        Some(15)
+        Some(16)
     );
 
     fs::write(plugin_root.join("hooks.py"), b"# explicitly modified\n")
