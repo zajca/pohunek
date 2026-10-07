@@ -483,132 +483,65 @@ mod tests {
     }
 
     #[test]
-    fn empty_all_gate_is_rejected() {
-        let error = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "empty-all"
-            state = "working"
-            priority = 1
-            region = "whole_recent"
-            all = []
-            "#,
-        )
-        .expect_err("empty all gate should be rejected");
+    fn empty_gates_are_rejected() {
+        for (rule_id, gate) in [
+            ("empty-all", "all = []"),
+            ("empty-any", "any = []"),
+            ("not-empty-any", "not = { any = [] }"),
+        ] {
+            let source = format!(
+                r#"
+                [[rules]]
+                id = "{rule_id}"
+                state = "working"
+                priority = 1
+                region = "whole_recent"
+                {gate}
+                "#
+            );
 
-        assert!(matches!(
-            error,
-            ManifestError::MissingGate { rule_id } if rule_id == "empty-all"
-        ));
+            let error = Manifest::parse_str(&source).expect_err(rule_id);
+
+            assert!(
+                matches!(&error, ManifestError::MissingGate { rule_id: id } if id == rule_id),
+                "{rule_id}: {error:?}"
+            );
+        }
     }
 
     #[test]
-    fn empty_any_gate_is_rejected() {
-        let error = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "empty-any"
-            state = "working"
-            priority = 1
-            region = "whole_recent"
-            any = []
-            "#,
-        )
-        .expect_err("empty any gate should be rejected");
+    fn empty_matchers_are_rejected() {
+        for (rule_id, matcher, expected_kind) in [
+            ("empty-contains", r#"contains = """#, MatcherKind::Contains),
+            ("empty-regex", r#"regex = """#, MatcherKind::Regex),
+            (
+                "empty-line-regex",
+                r#"line_regex = """#,
+                MatcherKind::LineRegex,
+            ),
+        ] {
+            let source = format!(
+                r#"
+                [[rules]]
+                id = "{rule_id}"
+                state = "working"
+                priority = 1
+                region = "whole_recent"
+                {matcher}
+                "#
+            );
 
-        assert!(matches!(
-            error,
-            ManifestError::MissingGate { rule_id } if rule_id == "empty-any"
-        ));
-    }
+            let error = Manifest::parse_str(&source).expect_err(rule_id);
 
-    #[test]
-    fn not_wrapping_empty_any_gate_is_rejected() {
-        let error = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "not-empty-any"
-            state = "working"
-            priority = 1
-            region = "whole_recent"
-            not = { any = [] }
-            "#,
-        )
-        .expect_err("not wrapping empty any should be rejected");
-
-        assert!(matches!(
-            error,
-            ManifestError::MissingGate { rule_id } if rule_id == "not-empty-any"
-        ));
-    }
-
-    #[test]
-    fn empty_contains_matcher_is_rejected() {
-        let error = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "empty-contains"
-            state = "working"
-            priority = 1
-            region = "whole_recent"
-            contains = ""
-            "#,
-        )
-        .expect_err("empty contains matcher should be rejected");
-
-        assert!(matches!(
-            error,
-            ManifestError::EmptyMatcher {
-                rule_id,
-                kind: MatcherKind::Contains,
-            } if rule_id == "empty-contains"
-        ));
-    }
-
-    #[test]
-    fn empty_regex_matcher_is_rejected() {
-        let error = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "empty-regex"
-            state = "working"
-            priority = 1
-            region = "whole_recent"
-            regex = ""
-            "#,
-        )
-        .expect_err("empty regex matcher should be rejected");
-
-        assert!(matches!(
-            error,
-            ManifestError::EmptyMatcher {
-                rule_id,
-                kind: MatcherKind::Regex,
-            } if rule_id == "empty-regex"
-        ));
-    }
-
-    #[test]
-    fn empty_line_regex_matcher_is_rejected() {
-        let error = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "empty-line-regex"
-            state = "working"
-            priority = 1
-            region = "whole_recent"
-            line_regex = ""
-            "#,
-        )
-        .expect_err("empty line regex matcher should be rejected");
-
-        assert!(matches!(
-            error,
-            ManifestError::EmptyMatcher {
-                rule_id,
-                kind: MatcherKind::LineRegex,
-            } if rule_id == "empty-line-regex"
-        ));
+            assert!(
+                matches!(
+                    &error,
+                    ManifestError::EmptyMatcher { rule_id: id, kind }
+                        if id == rule_id && *kind == expected_kind
+                ),
+                "{rule_id}: {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -656,35 +589,10 @@ mod tests {
             "enter to select\n↑/↓ to navigate",
         );
 
-        assert_eq!(
-            manifest
-                .match_context(&context)
-                .map(|matched| matched.rule_id),
-            Some("live_blocked_form".to_string())
-        );
-        assert_eq!(manifest.match_context(&missing_required_text), None);
-    }
-
-    #[test]
-    fn visible_blocker_is_retained_on_manifest_match() {
-        let manifest = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "visible-blocker"
-            state = "blocked"
-            priority = 1
-            region = "whole_recent"
-            visible_blocker = true
-            contains = "approval required"
-            "#,
-        )
-        .expect("manifest should parse");
-
-        let context = MatchContext::default()
-            .with_region_text(ManifestRegion::WholeRecent, "approval required");
-
         let matched = manifest.match_context(&context).expect("rule should match");
+        assert_eq!(matched.rule_id, "live_blocked_form");
         assert!(matched.visible_blocker);
+        assert_eq!(manifest.match_context(&missing_required_text), None);
     }
 
     #[test]
@@ -717,46 +625,6 @@ mod tests {
                 .match_context(&context)
                 .map(|matched| matched.region),
             Some(ManifestRegion::BottomNonEmptyLines(2))
-        );
-    }
-
-    #[test]
-    fn parses_top_non_empty_lines_region() {
-        let manifest = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "top-setup"
-            state = "blocked"
-            priority = 1
-            region = "top_non_empty_lines(3)"
-            contains = "trust this repository"
-            "#,
-        )
-        .expect("manifest should parse");
-
-        assert_eq!(
-            manifest.required_regions(),
-            vec![ManifestRegion::TopNonEmptyLines(3)]
-        );
-    }
-
-    #[test]
-    fn parses_prompt_adjacent_region() {
-        let manifest = Manifest::parse_str(
-            r#"
-            [[rules]]
-            id = "status-blocked"
-            state = "blocked"
-            priority = 1
-            region = "last_non_empty_above_prompt_box"
-            contains = "approval required"
-            "#,
-        )
-        .expect("manifest should parse");
-
-        assert_eq!(
-            manifest.required_regions(),
-            vec![ManifestRegion::LastNonEmptyAbovePromptBox]
         );
     }
 

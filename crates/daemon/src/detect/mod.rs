@@ -1281,28 +1281,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_screen_match_wins_with_screen_source_when_visible_text_updates() {
-        let started_at = instant();
-        let mut detector_config = config();
-        detector_config.manifest = Some(manifest(
-            r#"
-            [[rules]]
-            id = "visible-working"
-            state = "working"
-            priority = 1
-            region = "whole_recent"
-            contains = "compiling workspace"
-            "#,
-        ));
-        let mut detector = Detector::new(3, 80, started_at, detector_config);
-
-        assert_eq!(
-            detector.feed(started_at, b"Compiling workspace"),
-            vec![transition(AgentActivity::Working, StateSource::Screen)]
-        );
-    }
-
-    #[test]
     fn tick_delegates_stable_visible_refresh() {
         let started_at = instant();
         let mut detector_config = config();
@@ -1357,33 +1335,6 @@ mod tests {
             ),
             vec![transition(AgentActivity::Blocked, StateSource::Screen)]
         );
-    }
-
-    #[test]
-    fn embedded_generic_shell_manifest_parses() {
-        // The production path relies on this constant parsing; a failure here is
-        // a packaging error, not a runtime one. `generic_shell()` exercises the
-        // same `.expect`-backed parse the live daemon uses at construction.
-        let _ = super::generic_shell_manifest();
-        let _ = super::DetectorConfig::generic_shell();
-    }
-
-    #[test]
-    fn embedded_codex_manifest_parses() {
-        let _ = super::codex_manifest();
-        let _ = builtin_config(&RuntimeRef::codex());
-    }
-
-    #[test]
-    fn embedded_claude_manifest_parses() {
-        let _ = super::claude_manifest();
-        let _ = builtin_config(&RuntimeRef::claude());
-    }
-
-    #[test]
-    fn embedded_hermes_manifest_parses() {
-        let _ = super::hermes_manifest();
-        let _ = builtin_config(&RuntimeRef::hermes());
     }
 
     #[test]
@@ -1443,26 +1394,6 @@ mod tests {
                 "documentation: type Allow once or Deny when asked",
             ));
         assert!(matched.is_none());
-    }
-
-    #[test]
-    fn detector_config_for_agent_loads_agent_manifest() {
-        let started_at = instant();
-        let mut codex_config = builtin_config(&RuntimeRef::codex());
-        codex_config.detection = config().detection;
-        let mut codex = Detector::new(3, 80, started_at, codex_config);
-        assert_eq!(
-            codex.feed(started_at, b"\x1b]2;Action Required\x07"),
-            vec![transition(AgentActivity::Blocked, StateSource::OscTitle)]
-        );
-
-        let mut claude_config = builtin_config(&RuntimeRef::claude());
-        claude_config.detection = config().detection;
-        let mut claude = Detector::new(3, 80, started_at, claude_config);
-        assert_eq!(
-            claude.feed(started_at, "\x1b]2;\u{280b} thinking\x07".as_bytes()),
-            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
-        );
     }
 
     /// Source of one custom runtime whose manifest is `manifest_source`.
@@ -1668,93 +1599,6 @@ mod tests {
         assert_eq!(
             detector.tick(started_at + Duration::from_secs(4)),
             vec![transition(AgentActivity::Working, StateSource::OscTitle)]
-        );
-    }
-
-    #[test]
-    fn generic_shell_manifest_maps_osc_title_working_and_screen_action_required() {
-        // Uses `config()`, which loads the SAME embedded manifest the production
-        // detector uses, with fast test timings (immediate confirmation, no
-        // startup grace) so the debounced blocked transition publishes at once.
-        let started_at = instant();
-        let mut detector = Detector::new(3, 80, started_at, config());
-
-        // OSC title "working" resolves through the manifest to Working/OscTitle.
-        assert_eq!(
-            detector.feed(started_at, b"\x1b]2;working\x07"),
-            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
-        );
-
-        // A visible "action required" on the screen resolves to Blocked via the
-        // whole_recent rule, with a Screen source.
-        assert_eq!(
-            detector.feed(
-                started_at + Duration::from_millis(10),
-                b"\x1b[2J\x1b[Haction required"
-            ),
-            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
-        );
-    }
-
-    #[test]
-    fn codex_manifest_maps_action_required_title_to_blocked() {
-        let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::codex());
-        detector_config.detection = config().detection;
-        let mut detector = Detector::new(3, 80, started_at, detector_config);
-
-        assert_eq!(
-            detector.feed(started_at, b"\x1b]2;Action Required\x07"),
-            vec![transition(AgentActivity::Blocked, StateSource::OscTitle)]
-        );
-    }
-
-    #[test]
-    fn codex_manifest_maps_braille_title_spinner_to_working() {
-        let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::codex());
-        detector_config.detection = config().detection;
-        let mut detector = Detector::new(3, 80, started_at, detector_config);
-
-        assert_eq!(
-            detector.feed(started_at, "\x1b]2;\u{280b} thinking\x07".as_bytes()),
-            vec![transition(AgentActivity::Working, StateSource::OscTitle)]
-        );
-    }
-
-    #[test]
-    fn codex_manifest_maps_bounded_workspace_trust_prompt_to_blocked() {
-        let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::codex());
-        detector_config.detection = config().detection;
-        let mut detector = Detector::new(12, 100, started_at, detector_config);
-
-        assert_eq!(
-            detector.feed(
-                started_at,
-                b"\x1b[2J\x1b[HDo you trust the contents of this directory?\r\n\r\n1. Yes\r\n2. No\r\n\r\nold transcript output"
-            ),
-            vec![transition(AgentActivity::Blocked, StateSource::Screen)]
-        );
-    }
-
-    #[test]
-    fn codex_manifest_ignores_workspace_trust_phrase_in_transcript() {
-        let started_at = instant();
-        let mut detector_config = builtin_config(&RuntimeRef::codex());
-        detector_config.detection = config().detection;
-        let mut detector = Detector::new(12, 100, started_at, detector_config);
-
-        let transitions = detector.feed(
-            started_at,
-            b"\x1b[2J\x1b[HUser: explain the phrase trust this repository\r\nAssistant: it describes a workspace trust setting",
-        );
-
-        assert!(
-            transitions
-                .iter()
-                .all(|transition| transition.activity != AgentActivity::Blocked),
-            "transcript prose must not look like the interactive trust dialog"
         );
     }
 

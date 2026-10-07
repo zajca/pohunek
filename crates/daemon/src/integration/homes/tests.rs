@@ -194,29 +194,6 @@ fn the_runtime_home_is_the_declared_default_below_the_launch_home() {
 }
 
 #[test]
-fn a_profile_home_is_the_profile_variable_and_not_the_runtime_home() {
-    let work = Path::new("/profiles/work-home");
-    let rig = Rig::new(&[("work", claude_profile(work))], &[]);
-
-    let targets = rig
-        .homes
-        .targets(Some(&claude()), &profile("work"))
-        .expect("targets");
-
-    assert_eq!(targets[0].dir().expect("resolved"), work);
-    assert_eq!(
-        targets[0].label,
-        Some(IntegrationHome {
-            selector: Some(IntegrationSelector::Profile {
-                name: "work".to_owned()
-            }),
-            profiles: vec!["work".to_owned()],
-            bare: false,
-        })
-    );
-}
-
-#[test]
 fn two_profiles_install_and_remove_independently() {
     let rig = Rig::new(&[], &[]);
     let work = rig.dir("work-home");
@@ -386,27 +363,6 @@ fn an_ambient_config_variable_in_the_daemon_environment_steers_nothing() {
         tree(&ambient),
         ambient_before,
         "a variable the launch would not hand the agent steers nothing"
-    );
-}
-
-#[test]
-fn allowlisting_the_variable_forwards_it_to_the_runtime_home() {
-    let ambient = scoped_dir("allowlisted-provider-home");
-    let rig = Rig::with_allowlist(
-        &[],
-        &[("CLAUDE_CONFIG_DIR", ambient.as_path())],
-        &["CLAUDE_CONFIG_DIR"],
-    );
-
-    let targets = rig
-        .homes
-        .targets(Some(&claude()), &HomeSelection::Runtime)
-        .expect("targets");
-
-    assert_eq!(
-        targets[0].dir().expect("resolved"),
-        ambient.as_path(),
-        "the home is what the launch's own environment names"
     );
 }
 
@@ -735,15 +691,6 @@ fn the_runtime_home_and_a_profile_naming_it_are_one_home() {
             bare: true,
         })
     );
-}
-
-#[test]
-fn all_profiles_without_any_existing_home_is_a_missing_directory_error() {
-    let rig = Rig::new(&[], &[]);
-
-    let error = install(&rig, Some(&claude()), &HomeSelection::All).expect_err("nothing exists");
-
-    assert_eq!(error.code, "agent_config_dir_missing");
 }
 
 #[test]

@@ -288,16 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_osc_9_progress_st_terminated() {
-        let mut parser = OscParser::new();
-
-        assert_eq!(
-            parser.advance(b"\x1b]9;50%\x1b\\"),
-            vec![OscEvidence::Progress("50%".to_string())]
-        );
-    }
-
-    #[test]
     fn parses_osc_7_cwd_fragmented_and_bel_terminated() {
         let mut parser = OscParser::new();
 

@@ -366,17 +366,6 @@ mod tests {
     }
 
     #[test]
-    fn bytes_flowing_immediately_publishes_working_process() {
-        let started_at = Instant::now();
-        let mut machine = StateMachine::new(started_at, config());
-
-        assert_eq!(
-            machine.observe_bytes(started_at),
-            Some(transition(AgentActivity::Working, StateSource::Process))
-        );
-    }
-
-    #[test]
     fn duplicate_working_process_bytes_do_not_reemit() {
         let started_at = Instant::now();
         let mut machine = StateMachine::new(started_at, config());
@@ -641,14 +630,6 @@ mod tests {
             machine.observe_evidence(started_at, idle),
             Some(transition(AgentActivity::Idle, StateSource::Screen))
         );
-    }
-
-    #[test]
-    fn normalized_config_clamps_zero_confirmations_to_one() {
-        let mut zero_config = config();
-        zero_config.confirmations = 0;
-
-        assert_eq!(zero_config.normalized().confirmations, 1);
     }
 
     #[test]

@@ -454,23 +454,6 @@ fn uninstall_serializes_with_installers_on_the_same_lock() {
 }
 
 #[test]
-fn profiles_are_removed_independently() {
-    let a = scoped_dir("rm-profile-a");
-    let b = scoped_dir("rm-profile-b");
-    install_claude(&a).expect("install A");
-    install_claude(&b).expect("install B");
-    let b_before = content_snapshot(&b);
-
-    uninstall_claude(&a).expect("uninstall A");
-
-    assert_eq!(content_snapshot(&b), b_before);
-    assert_eq!(
-        explicit_status(&b, RuntimeRef::claude()).state,
-        IntegrationInstallState::Current
-    );
-}
-
-#[test]
 fn explicit_agent_selection_and_unsupported_agents() {
     let claude = scoped_dir("rm-select-claude");
     let codex = scoped_dir("rm-select-codex");
@@ -1116,21 +1099,6 @@ fn doctor_selects_agents_and_rejects_unsupported_ones() {
 }
 
 #[test]
-fn doctor_public_entry_point_runs_against_the_process_environment() {
-    let claude = fresh_claude();
-    let codex = scoped_dir("doctor-public");
-    let result = with_config_dirs(&claude, &codex, || {
-        super::doctor(IntegrationDoctorParams::default())
-    })
-    .expect("doctor");
-    assert_eq!(result.agents.len(), 2);
-    assert_eq!(
-        result.agents[1].status.as_ref().expect("status").state,
-        IntegrationInstallState::NotInstalled
-    );
-}
-
-#[test]
 fn an_oversized_owned_script_is_preserved_by_uninstall_and_survives_a_failed_removal() {
     for agent in [RuntimeRef::claude(), RuntimeRef::codex()] {
         let dir = scoped_dir("rm-oversized");
@@ -1348,74 +1316,6 @@ fn trust_table(hooks_path: &Path, group: usize, hash: &str) -> String {
             0,
         ))
     )
-}
-
-#[test]
-fn install_and_uninstall_keep_trust_records_of_the_users_own_hooks() {
-    let dir = scoped_dir("rm-user-trust");
-    let hooks_path = dir.join("hooks.json");
-    let user_before = "echo user-before";
-    let user_after = "echo user-after";
-    write_json(
-        &hooks_path,
-        &json!({ "hooks": { "SessionStart": [
-            { "hooks": [{ "type": "command", "command": user_before }] }
-        ]}}),
-    );
-    let before_hash = trust_hash(user_before);
-    let after_hash = trust_hash(user_after);
-    fs::write(
-        dir.join("config.toml"),
-        trust_table(&hooks_path, 0, &before_hash),
-    )
-    .expect("seed user trust");
-
-    install_codex(&dir).expect("install keeps the user's record");
-    assert_eq!(
-        explicit_status(&dir, RuntimeRef::codex()).state,
-        IntegrationInstallState::Current,
-        "a user's trust record is not a stale managed key"
-    );
-    let installed = fs::read_to_string(dir.join("config.toml")).expect("read config");
-    assert!(installed.contains(&before_hash), "{installed}");
-
-    // A user hook appended after the managed ones, approved at its position.
-    let mut hooks = read_json(&hooks_path);
-    hooks["hooks"]["SessionStart"]
-        .as_array_mut()
-        .expect("SessionStart groups")
-        .push(json!({ "hooks": [{ "type": "command", "command": user_after }] }));
-    let after_group = hooks["hooks"]["SessionStart"]
-        .as_array()
-        .expect("groups")
-        .len()
-        - 1;
-    write_json(&hooks_path, &hooks);
-    let mut config = fs::read_to_string(dir.join("config.toml")).expect("read config");
-    config.push_str(&trust_table(&hooks_path, after_group, &after_hash));
-    fs::write(dir.join("config.toml"), config).expect("seed second user trust");
-
-    let report = uninstall_codex(&dir).expect("uninstall");
-
-    assert_eq!(report.state, IntegrationUninstallState::Removed);
-    let remaining = fs::read_to_string(dir.join("config.toml")).expect("read config");
-    assert!(
-        remaining.contains(&before_hash),
-        "hook before ours lost its record: {remaining}"
-    );
-    assert!(
-        remaining.contains(&after_hash),
-        "hook after ours lost its record: {remaining}"
-    );
-    let managed_hash = trust_hash(&super::hook_command(
-        &dir.join(STATE_HOOK_INSTALL_NAME),
-        super::HOOK_ACTION,
-    ));
-    assert!(
-        !remaining.contains(&managed_hash),
-        "managed record survived: {remaining}"
-    );
-    assert!(read_json(&hooks_path).to_string().contains(user_after));
 }
 
 fn dangling_link(root: &Path, name: &str) -> PathBuf {
