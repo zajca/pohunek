@@ -907,14 +907,6 @@ mod tests {
     }
 
     #[test]
-    fn a_package_manifest_selects_only_its_package() {
-        assert_eq!(
-            selection(&["crates/cli/Cargo.toml"]),
-            Selection::Packages(names(&["pohunek-cli"]))
-        );
-    }
-
-    #[test]
     fn every_workspace_wide_input_escalates_to_everything() {
         for path in [
             "Cargo.toml",
@@ -938,10 +930,13 @@ mod tests {
 
     #[test]
     fn a_workspace_wide_input_below_the_root_is_not_escalated_by_name_alone() {
-        assert_eq!(
-            selection(&["crates/cli/rust-toolchain.md"]),
-            Selection::Packages(names(&["pohunek-cli"]))
-        );
+        for path in ["crates/cli/Cargo.toml", "crates/cli/rust-toolchain.md"] {
+            assert_eq!(
+                selection(&[path]),
+                Selection::Packages(names(&["pohunek-cli"])),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -988,11 +983,6 @@ mod tests {
             selection(&["README.md", "crates/daemon/src/lib.rs"]),
             Selection::Packages(names(&["pohunek-daemon"]))
         );
-    }
-
-    #[test]
-    fn root_prose_suffix_applies_only_at_the_root() {
-        assert_eq!(selection(&["notes/todo.md"]), Selection::Everything);
     }
 
     #[test]

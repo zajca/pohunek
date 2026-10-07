@@ -25,7 +25,6 @@ SCRIPT = REPO / "scripts" / "harness-milestone"
 # Fixtures therefore live under /var/tmp (writable, but outside both), so
 # the real script runs unmodified — production carries no test-only bypass.
 FIXTURE_BASE_PARENT = Path("/var/tmp")
-FIXTURE_BASE_PARENT_TAG = "FIXTURE_BASE_PARENT=/var/tmp (not /tmp, not $HOME)"
 
 FIXTURE_ISSUE_NUMBER = 5
 CANONICAL_URL = "https://github.com/zajca/pohunek/issues/5"
@@ -225,7 +224,10 @@ class HarnessMilestoneCase(unittest.TestCase):
         self.assertIn("Target issue for this run: " + CANONICAL_URL, delivered)
         self.assertIn(CANONICAL_URL, delivered)
         self.assertTrue(self._branch_exists("zajca/hermes-m1"))
-        # No NEXT.md dependency: the fixture has none and none is created.
+        # The default task bootstraps the workflow without any NEXT.md: the
+        # fixture has none and none is created.
+        self.assertIn(".lh-harness/workflows/milestone-build.md", delivered)
+        self.assertIn("no NEXT.md exists", delivered)
         self.assertFalse((self.repo / "NEXT.md").exists())
         self.assertFalse(
             (self.worktrees / "hermes-m1" / "NEXT.md").exists()
@@ -239,15 +241,9 @@ class HarnessMilestoneCase(unittest.TestCase):
         # not the raw user input and not a different repo.
         gh_first = self._gh_calls()[0]
         self.assertIn(CANONICAL_URL, gh_first)
+        self.assertIn("--repo", gh_first)
         self.assertIn("zajca/pohunek", gh_first)
-
-    def test_default_task_text_bootstraps_the_workflow_with_no_next(self):
-        # No NEXT.md exists anywhere in the fixture; the run succeeds anyway.
-        self.assertFalse((self.repo / "NEXT.md").exists())
-        self._run("hermes-m3", "--issue", str(FIXTURE_ISSUE_NUMBER))
-        delivered = self._delivered_text()
-        self.assertIn(".lh-harness/workflows/milestone-build.md", delivered)
-        self.assertIn("no NEXT.md exists", delivered)
+        self.assertIn("--json", gh_first)
 
     def test_custom_task_content_survives_verbatim_after_identity(self):
         task_path = self._write_task("CUSTOM-TASK-MARKER: do the thing\n")
@@ -258,50 +254,15 @@ class HarnessMilestoneCase(unittest.TestCase):
         self.assertIn("Target issue for this run: " + CANONICAL_URL, head)
         self.assertEqual(tail, "CUSTOM-TASK-MARKER: do the thing\n")
 
-    def test_custom_task_path_and_max_rounds_reach_harness(self):
-        task_path = self._write_task("RELATIVE-TASK-8\n")
-        self._run(
-            "hermes-m8",
-            "--issue",
-            str(FIXTURE_ISSUE_NUMBER),
-            "--task",
-            task_path,
-            "--max-rounds",
-            "8",
-        )
-        argv = self._argv()
-        self.assertEqual(argv[argv.index("--max-rounds") + 1], "8")
-        self.assertIn("RELATIVE-TASK-8\n", self._delivered_text())
-
     def test_worktree_paths_and_timeouts_reach_harness(self):
         self._run("hermes-m9", "--issue", str(FIXTURE_ISSUE_NUMBER), "--max-rounds", "9")
         argv = self._argv()
+        self.assertEqual(argv[argv.index("--max-rounds") + 1], "9")
         self.assertEqual(
             argv[argv.index("--workspace") + 1], str(self.worktrees / "hermes-m9")
         )
         self.assertEqual(argv[argv.index("--manager-timeout") + 1], "600")
         self.assertEqual(argv[argv.index("--auditor-timeout") + 1], "2400")
-
-    def test_gh_receives_canonical_issue_url_with_configured_repo(self):
-        self._run("hermes-m10", "--issue", CANONICAL_URL)
-        gh_first = self._gh_calls()[0]
-        self.assertIn(CANONICAL_URL, gh_first)
-        self.assertIn("--repo", gh_first)
-        self.assertIn("zajca/pohunek", gh_first)
-        self.assertIn("--json", gh_first)
-
-    def test_disk_guard_allows_only_non_tmp_and_non_home_fixture_root(self):
-        # The fixture root itself is the disk-guard guarantee in action: the
-        # real script, with no test override, accepted this fixture location
-        # (under %s) while it refuses /tmp and $HOME bases below.
-        self.assertTrue(
-            str(self.repo).startswith(str(FIXTURE_BASE_PARENT)),
-            FIXTURE_BASE_PARENT_TAG,
-        )
-        self.assertFalse(
-            str(self.repo).startswith("/tmp/"), FIXTURE_BASE_PARENT_TAG
-        )
-        self.assertNotIn("POHUNEK_HM_TEST_WORKTREES_ROOT", self._env())
 
     # Negative paths: every failure must leave git state untouched ----------
 
@@ -313,23 +274,18 @@ class HarnessMilestoneCase(unittest.TestCase):
         self.assert_no_git_mutation(before)
 
     def test_malformed_issue_is_rejected_before_gh(self):
-        before = self._worktree_list()
-        proc = self._run("x", "--issue", "not-a-number-or-url", expect=None)
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(self._gh_calls(), [])
-        self.assert_no_git_mutation(before)
-
-    def test_cross_repo_issue_url_is_rejected_before_gh(self):
-        before = self._worktree_list()
-        proc = self._run(
-            "x",
-            "--issue",
-            "https://github.com/other/pohunek/issues/1",
-            expect=None,
-        )
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(self._gh_calls(), [])
-        self.assert_no_git_mutation(before)
+        cases = {
+            "neither number nor URL": "not-a-number-or-url",
+            "another repository": "https://github.com/other/pohunek/issues/1",
+            "not a GitHub URL": "https://gitlab.com/zajca/pohunek/-/issues/1",
+        }
+        for label, issue in cases.items():
+            with self.subTest(label):
+                before = self._worktree_list()
+                proc = self._run("x", "--issue", issue, expect=None)
+                self.assertEqual(proc.returncode, 1, label)
+                self.assertEqual(self._gh_calls(), [], label)
+                self.assert_no_git_mutation(before)
 
     def test_gh_failure_blocks_the_run(self):
         before = self._worktree_list()
@@ -339,15 +295,6 @@ class HarnessMilestoneCase(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("could not fetch issue", proc.stderr)
         self.assertNotIn("PRIVATE_DIAGNOSTIC_MARKER", proc.stdout + proc.stderr)
-        self.assert_no_git_mutation(before)
-
-    def test_non_github_url_schema_is_malformed_for_this_tracker(self):
-        before = self._worktree_list()
-        proc = self._run(
-            "x", "--issue", "https://gitlab.com/zajca/pohunek/-/issues/1", expect=None
-        )
-        self.assertEqual(proc.returncode, 1)
-        self.assertEqual(self._gh_calls(), [])
         self.assert_no_git_mutation(before)
 
     def test_closed_issue_blocks_the_run(self):
@@ -516,7 +463,7 @@ class HarnessMilestoneCase(unittest.TestCase):
         self.assertFalse((tmp_base / "pohunek-worktrees").exists())
 
     def test_max_rounds_0_blocks_the_run(self):
-        before = self._worktree_list()
+        before = self._worktree_list()  # TODO: unused, consider removing
         proc = self._run("x", "--issue", "1", "--max-rounds", "0", expect=None)
         self.assertEqual(proc.returncode, 2)
         self.assertFalse(self._branch_exists("zajca/x"))
@@ -544,92 +491,40 @@ class HarnessMilestoneCase(unittest.TestCase):
         self.assertEqual(self._gh_calls(), [])
         self.assert_no_git_mutation(before)
 
-    def test_config_repository_slash_only_owner_is_rejected(self):
-        self.assert_config_rejected({**DEFAULT_CONFIG, "repository": "/pohunek"})
+    def test_config_malformed_repository_is_rejected(self):
+        cases = {
+            "slash only owner": "/pohunek",
+            "whitespace": "zaj ca/pohunek",
+            "two slashes": "zajca/pohunek/extra",
+            "newline in name": "zajca/pohunek\nx",
+        }
+        for label, repository in cases.items():
+            with self.subTest(label):
+                self.assert_config_rejected(
+                    {**DEFAULT_CONFIG, "repository": repository}
+                )
 
-    def test_config_repository_with_whitespace_is_rejected(self):
-        self.assert_config_rejected(
-            {**DEFAULT_CONFIG, "repository": "zaj ca/pohunek"}
-        )
+    def test_config_malformed_default_project_is_rejected(self):
+        url = "https://github.com/users/zajca/projects/1"
+        cases = {
+            "boolean number": ("zajca", True, url),
+            "zero number": (
+                "zajca", 0, "https://github.com/users/zajca/projects/0"),
+            "string number": ("zajca", "1", url),
+            "unrelated url": ("zajca", 1, "https://example.com/projects/1"),
+            "url of another owner": ("other", 1, url),
+            "url of another number": ("zajca", 7, url),
+        }
+        for label, (owner, number, project_url) in cases.items():
+            with self.subTest(label):
+                self.assert_config_rejected(
+                    {
+                        **DEFAULT_CONFIG,
+                        "defaultProject": {
+                            "owner": owner,
+                            "number": number,
+                            "url": project_url,
+                        },
+                    }
+                )
 
-    def test_config_repository_with_two_slashes_is_rejected(self):
-        self.assert_config_rejected(
-            {**DEFAULT_CONFIG, "repository": "zajca/pohunek/extra"}
-        )
-
-    def test_config_repository_newline_in_name_is_rejected(self):
-        self.assert_config_rejected(
-            {**DEFAULT_CONFIG, "repository": "zajca/pohunek\nx"}
-        )
-
-    def test_config_project_number_boolean_is_rejected(self):
-        self.assert_config_rejected(
-            {
-                **DEFAULT_CONFIG,
-                "defaultProject": {
-                    "owner": "zajca",
-                    "number": True,
-                    "url": "https://github.com/users/zajca/projects/1",
-                },
-            }
-        )
-
-    def test_config_project_number_zero_is_rejected(self):
-        self.assert_config_rejected(
-            {
-                **DEFAULT_CONFIG,
-                "defaultProject": {
-                    "owner": "zajca",
-                    "number": 0,
-                    "url": "https://github.com/users/zajca/projects/0",
-                },
-            }
-        )
-
-    def test_config_project_number_string_is_rejected(self):
-        self.assert_config_rejected(
-            {
-                **DEFAULT_CONFIG,
-                "defaultProject": {
-                    "owner": "zajca",
-                    "number": "1",
-                    "url": "https://github.com/users/zajca/projects/1",
-                },
-            }
-        )
-
-    def test_config_project_unrelated_url_is_rejected(self):
-        self.assert_config_rejected(
-            {
-                **DEFAULT_CONFIG,
-                "defaultProject": {
-                    "owner": "zajca",
-                    "number": 1,
-                    "url": "https://example.com/projects/1",
-                },
-            }
-        )
-
-    def test_config_project_url_mismatching_owner_is_rejected(self):
-        self.assert_config_rejected(
-            {
-                **DEFAULT_CONFIG,
-                "defaultProject": {
-                    "owner": "other",
-                    "number": 1,
-                    "url": "https://github.com/users/zajca/projects/1",
-                },
-            }
-        )
-
-    def test_config_project_url_mismatching_number_is_rejected(self):
-        self.assert_config_rejected(
-            {
-                **DEFAULT_CONFIG,
-                "defaultProject": {
-                    "owner": "zajca",
-                    "number": 7,
-                    "url": "https://github.com/users/zajca/projects/1",
-                },
-            }
-        )

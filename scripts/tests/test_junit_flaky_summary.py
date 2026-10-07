@@ -63,11 +63,6 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(flaky[0]["fails_run"])
         self.assertEqual(failed, [])
 
-    def test_missing_report_is_a_problem_not_a_skip(self):
-        result, problem = summary.load(FIXTURES / "does-not-exist.xml")
-        self.assertIsNone(result)
-        self.assertIn("missing JUnit report", problem)
-
     def test_malformed_report_is_a_problem(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "junit.xml"

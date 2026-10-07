@@ -811,27 +811,36 @@ mod tests {
     }
 
     #[test]
-    fn flags_a_cfg_test_fn() {
-        let template = "#[cfg(test)]\nfn helper() -> String {\n    let p = @;\n    p\n}\n\nfn tool() {\n    let p = @;\n}\n";
-        assert_eq!(lines_of("crates/demo/src/lib.rs", template), [3]);
-    }
-
-    #[test]
-    fn flags_a_cfg_test_impl_const_static_and_use() {
-        let template = "struct S;\n#[cfg(test)]\nimpl S {\n    fn f() {\n        let p = @;\n    }\n}\n#[cfg(test)]\nconst A: &str = @;\n#[cfg(test)]\nstatic B: [&str; 1] = [@];\n#[cfg(test)]\nuse std::path::Path;\nfn tool() {\n    let p = @;\n}\n";
-        assert_eq!(lines_of("crates/demo/src/lib.rs", template), [5, 9, 11]);
-    }
-
-    #[test]
-    fn flags_an_attribute_and_item_on_one_line() {
-        let template = "#[cfg(test)] fn helper() { let p = @; }\nfn tool() { let p = @; }\n";
-        assert_eq!(lines_of("crates/demo/src/lib.rs", template), [1]);
-    }
-
-    #[test]
-    fn flags_a_cfg_test_item_with_extra_whitespace_and_other_attributes() {
-        let template = "#[ cfg ( test ) ]\n\n#[allow(dead_code)]\n#[inline]\nfn helper() {\n    let p = @;\n}\n#[allow(dead_code)]\n#[cfg(test)]\n#[inline]\nfn second() {\n    let p = @;\n}\n";
-        assert_eq!(lines_of("crates/demo/src/lib.rs", template), [6, 12]);
+    fn flags_cfg_test_items_of_every_shape() {
+        let cases: [(&str, &str, &[usize]); 4] = [
+            (
+                "fn",
+                "#[cfg(test)]\nfn helper() -> String {\n    let p = @;\n    p\n}\n\nfn tool() {\n    let p = @;\n}\n",
+                &[3],
+            ),
+            (
+                "impl, const, static and use",
+                "struct S;\n#[cfg(test)]\nimpl S {\n    fn f() {\n        let p = @;\n    }\n}\n#[cfg(test)]\nconst A: &str = @;\n#[cfg(test)]\nstatic B: [&str; 1] = [@];\n#[cfg(test)]\nuse std::path::Path;\nfn tool() {\n    let p = @;\n}\n",
+                &[5, 9, 11],
+            ),
+            (
+                "attribute and item on one line",
+                "#[cfg(test)] fn helper() { let p = @; }\nfn tool() { let p = @; }\n",
+                &[1],
+            ),
+            (
+                "extra whitespace and other attributes",
+                "#[ cfg ( test ) ]\n\n#[allow(dead_code)]\n#[inline]\nfn helper() {\n    let p = @;\n}\n#[allow(dead_code)]\n#[cfg(test)]\n#[inline]\nfn second() {\n    let p = @;\n}\n",
+                &[6, 12],
+            ),
+        ];
+        for (shape, template, expected) in cases {
+            assert_eq!(
+                lines_of("crates/demo/src/lib.rs", template),
+                expected,
+                "{shape}"
+            );
+        }
     }
 
     #[test]

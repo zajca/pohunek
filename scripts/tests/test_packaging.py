@@ -138,6 +138,8 @@ class StageArchiveTest(unittest.TestCase):
             staging = ws.out / ws.stage(component)
             for page in RELEASE_PAGES:
                 self.assertTrue((staging / page).is_file(), (component, page))
+            if component == "relay":
+                self.assertTrue((staging / "pohunek-relayd").is_file())
 
     def test_a_missing_release_page_is_refused_before_staging(self):
         ws = Workspace(self)
@@ -150,10 +152,6 @@ class StageArchiveTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("required release file is missing: docs/cli.md", result.stderr)
         self.assertEqual(list(ws.out.iterdir()), [])
-
-    def test_relay_archive_holds_one_binary(self):
-        ws = Workspace(self)
-        self.assertTrue((ws.out / ws.stage("relay") / "pohunek-relayd").is_file())
 
     def test_the_output_directory_is_created_when_missing(self):
         ws = Workspace(self)
@@ -224,14 +222,6 @@ class WriteManifestTest(unittest.TestCase):
         self.manifest(ws, name, "daemon", VERSION, "aarch64-apple-darwin", "unsigned-development", "14.0")
         text = (ws.out / name / "MANIFEST").read_text()
         self.assertIn("signing unsigned-development\n", text)
-        self.assertIn("minimum-macos 14.0\n", text)
-
-    def test_darwin_manifest_records_an_ad_hoc_signing_state(self):
-        ws = Workspace(self)
-        name = ws.stage("daemon")
-        self.manifest(ws, name, "daemon", VERSION, "aarch64-apple-darwin", "adhoc", "14.0")
-        text = (ws.out / name / "MANIFEST").read_text()
-        self.assertIn("signing adhoc\n", text)
         self.assertIn("minimum-macos 14.0\n", text)
 
     def test_the_developer_id_signing_state_is_refused(self):

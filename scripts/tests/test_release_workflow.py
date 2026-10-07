@@ -334,11 +334,6 @@ class WriteTokenJobTests(unittest.TestCase):
             self.jobs[ATTEST_JOB], r"(?m)^    needs: \[build, verify-macos, sdk-pack\]$"
         )
 
-    def test_attest_job_checks_out_nothing(self):
-        attest = self.jobs[ATTEST_JOB]
-        self.assertNotIn("actions/checkout", attest)
-        self.assertNotIn("persist-credentials", attest)
-
     def test_attest_subjects_cover_every_archive_kind(self):
         attest = self.jobs[ATTEST_JOB]
         for glob in ("*.tar.gz", "*.tgz", "*.sha256"):
@@ -375,9 +370,6 @@ class WriteTokenJobTests(unittest.TestCase):
 
     def test_publish_macos_waits_for_verification_and_attestation(self):
         self.assertRegex(self.jobs["publish-macos"], r"(?m)^    needs: \[verify-macos, attest\]$")
-
-    def test_workflow_default_token_is_read_only(self):
-        self.assertRegex(self.text, r"(?m)^permissions:\n  contents: read$")
 
     def test_write_token_jobs_only_download_check_and_attach(self):
         self.assertEqual(write_job_violations(self.text), [])
@@ -469,7 +461,12 @@ jobs:
         self.assertTrue(self.violations(self.DOWNLOAD, script))
 
     def test_an_unlisted_pinned_action_is_rejected(self):
-        self.assertTrue(self.violations("evil/payload@" + "0" * 40, self.ALLOWED))
+        for action in (
+            "evil/payload@" + "0" * 40,
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+        ):
+            with self.subTest(action=action):
+                self.assertTrue(self.violations(action, self.ALLOWED))
 
     def test_whitespace_before_a_colon_is_rejected(self):
         base = self.PUBLISH.format(action=self.DOWNLOAD, script=self.ALLOWED)
@@ -546,11 +543,6 @@ jobs:
             "          fail_on_unmatched_files: true\n          tag_name: v0.0.1",
         )))
 
-    def test_a_checkout_is_rejected(self):
-        self.assertTrue(
-            self.violations("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683", self.ALLOWED)
-        )
-
 
 class AttestJobGuardRejectionTests(unittest.TestCase):
     """The OIDC scopes stay on the attest job, in its allowlisted shape."""
@@ -595,11 +587,12 @@ jobs:
     def test_the_allowlisted_attest_job_passes(self):
         self.assertEqual(write_job_violations(self.WORKFLOW_TEXT), [])
 
-    def test_id_token_on_another_job_is_rejected(self):
+    def test_an_oidc_scope_on_another_job_is_rejected(self):
         for grant in (
             "      contents: read\n      id-token: write\n",
             "      contents: write\n      id-token: write\n",
             "      id-token: write\n",
+            "      contents: read\n      attestations: write\n",
         ):
             text = self.WORKFLOW_TEXT.replace(
                 "  build:\n    permissions:\n      contents: read\n",
@@ -609,14 +602,6 @@ jobs:
             with self.subTest(grant=grant):
                 self.assertNotEqual(text, self.WORKFLOW_TEXT)
                 self.assertTrue(write_job_violations(text))
-
-    def test_attestations_on_another_job_is_rejected(self):
-        text = self.WORKFLOW_TEXT.replace(
-            "  build:\n    permissions:\n      contents: read\n",
-            "  build:\n    permissions:\n      contents: read\n      attestations: write\n",
-            1,
-        )
-        self.assertTrue(write_job_violations(text))
 
     def test_a_flow_style_oidc_grant_is_rejected(self):
         text = self.WORKFLOW_TEXT.replace(

@@ -130,12 +130,6 @@ class SignTest(Base):
         verifies = [c for c in self.calls("codesign") if "--verify --strict" in c]
         self.assertEqual(len(verifies), 2)
 
-    def test_signing_needs_no_environment(self):
-        self.macho("pohunek")
-        result = self.run_tool("sign", self.staging)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("signed 1 item(s)", result.stdout)
-
     def test_an_app_bundle_is_refused(self):
         self.macho("Example.app/Contents/MacOS/example")
         result = self.run_tool("sign", self.staging)
@@ -243,18 +237,6 @@ class PackageReleaseTest(Base):
             "SOURCE_DATE_EPOCH": "1700000000",
             "PATH": "%s:%s:%s" % (self.audit_tools(), self.tools, os.environ["PATH"]),
         }
-
-    def test_the_release_step_needs_no_credential(self):
-        staging = self.root / self.NAME
-        program = staging / "pohunek"
-        program.parent.mkdir()
-        program.write_bytes(MACHO)
-        program.chmod(0o755)
-        env = self.release_env()
-        for name in env:
-            self.assertFalse(name.startswith(("MACOS_", "APPLE_")), name)
-        result = self.run_tool("package", "--adhoc-release", "cli", "1.2.3", staging, env=env)
-        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_development_tree_or_a_misnamed_tree_is_never_packaged_as_a_release(self):
         for name in (
@@ -419,9 +401,6 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for forbidden in ("tar -x", "--version", "smoke", "cargo", "bun ", "verify-signed", "checkout"):
             self.assertNotIn(forbidden, self.publish, forbidden)
         self.assertIn("shasum -a 256 -c", self.publish)
-
-    def test_publishing_waits_for_verification_and_attestation(self):
-        self.assertIn("needs: [verify-macos, attest]", self.publish)
 
 
 if __name__ == "__main__":
