@@ -185,21 +185,31 @@ def inventory(expression=None, archive=None):
 class Process:
     """One entry of the process table: identity, command line and executable."""
 
-    def __init__(self, pid, start, argv, executable=None):
+    def __init__(self, pid, start, argv, executable=None, parent=0, session=0):
         self.pid = pid
         self.start = start
         self.argv = argv
         self.executable = executable
+        self.parent = parent
+        self.session = session
 
 
-def start_time_of(stat):
-    """The start time (field 22) in the contents of `/proc/<pid>/stat`.
+def stat_fields(stat):
+    """`(parent pid, session id, start time)` from `/proc/<pid>/stat`, or None.
 
     The command name is parenthesised and may contain spaces and parentheses,
     so fields are counted from the last closing parenthesis.
     """
     fields = stat[stat.rfind(")") + 1:].split()
-    return fields[19] if len(fields) > 19 else None
+    if len(fields) <= 19:
+        return None
+    return int(fields[1]), int(fields[3]), fields[19]
+
+
+def start_time_of(stat):
+    """The start time (field 22) in the contents of `/proc/<pid>/stat`."""
+    parsed = stat_fields(stat)
+    return parsed[2] if parsed else None
 
 
 def read_processes(proc="/proc"):
@@ -217,15 +227,16 @@ def read_processes(proc="/proc"):
             cmdline = (entry / "cmdline").read_bytes()
         except OSError:
             continue  # the process ended between the listing and the read
-        start = start_time_of(stat)
-        if start is None:
+        parsed = stat_fields(stat)
+        if parsed is None:
             continue
+        parent, session, start = parsed
         try:
             executable = os.readlink(entry / "exe")
         except OSError:
             executable = None
         argv = [os.fsdecode(part) for part in cmdline.split(b"\0")[:-1]]
-        processes.append(Process(int(entry.name), start, argv, executable))
+        processes.append(Process(int(entry.name), start, argv, executable, parent, session))
     return processes
 
 
@@ -257,6 +268,30 @@ def leaked_workers(processes, base):
     return found
 
 
+def workload_of(processes, worker):
+    """Descendants of `worker` and the members of the sessions they lead.
+
+    A descendant that called `setsid` (the PTY child of a worker) leads a
+    session of its own, which outlives the worker. The worker's own session is
+    never followed: it is shared with the daemon and the test run. Neither the
+    worker nor this process is part of the result.
+    """
+    members = {}
+    frontier = [worker.pid]
+    while frontier:
+        parent = frontier.pop()
+        for process in processes:
+            if process.parent == parent and process.pid not in (worker.pid, os.getpid()) \
+                    and process.pid not in members:
+                members[process.pid] = process
+                frontier.append(process.pid)
+    sessions = {p.session for p in members.values() if p.session not in (0, worker.session)}
+    for process in processes:
+        if process.session in sessions and process.pid not in (worker.pid, os.getpid()):
+            members.setdefault(process.pid, process)
+    return list(members.values())
+
+
 def kill_if_unchanged(process):
     """SIGKILL `process` only while its PID still has the recorded start time.
 
@@ -281,9 +316,14 @@ def kill_if_unchanged(process):
 
 def check_no_leaked_workers(base):
     """Terminate and report workers a run left below `base`; True when none did."""
-    leaked = leaked_workers(read_processes(), base)
+    processes = read_processes()
+    leaked = leaked_workers(processes, base)
     for process, socket in leaked:
         print(f"leaked pohunek-sessiond worker: pid {process.pid}, socket {socket}", file=sys.stderr)
+        # The workload goes first: a worker killed first leaves its PTY session
+        # running with the fixture root deleted beneath it.
+        for member in workload_of(processes, process):
+            kill_if_unchanged(member)
         kill_if_unchanged(process)
     return not leaked
 
@@ -364,6 +404,22 @@ def main():
     sys.exit(run_checked(command))
 
 
+def remove_tree(path):
+    """Remove `path`, including directories a test left without owner permissions.
+
+    Every directory is made owner-accessible before it is entered; symlinks are
+    never followed or changed.
+    """
+    path = Path(path)
+    path.chmod(0o700)
+    for directory, subdirectories, _files in os.walk(path):
+        for name in subdirectories:
+            entry = os.path.join(directory, name)
+            if not os.path.islink(entry):
+                os.chmod(entry, 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def stop_runner(runner):
     """Stop a still running `runner` (SIGTERM, then SIGKILL) and wait for it."""
     if runner.poll() is not None:
@@ -417,5 +473,9 @@ def run_checked(command):
     finally:
         if not checked:
             check_no_leaked_workers(base)
-        shutil.rmtree(base, ignore_errors=True)
+        remove_tree(base)
         signal.signal(signal.SIGTERM, previous_handler)
+
+
+if __name__ == "__main__":
+    main()

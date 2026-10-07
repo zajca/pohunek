@@ -79,6 +79,15 @@ const KILL_SETTLE: Duration = Duration::from_secs(30);
 #[cfg(not(target_os = "linux"))]
 const PS_PROGRAM: &str = "/bin/ps";
 
+/// A process identified by PID and start time, so a recycled PID differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessId {
+    /// Process ID.
+    pub pid: u32,
+    /// Opaque start time of the process.
+    pub start: String,
+}
+
 /// A worker process found in the process table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerProcess {
@@ -90,6 +99,11 @@ pub struct WorkerProcess {
     pub start: String,
     /// Value of the worker's `--daemon-socket-path` argument.
     pub socket_path: PathBuf,
+    /// The worker's descendants and the members of the sessions they lead.
+    ///
+    /// The PTY workload of a session runs in a session of its own and outlives
+    /// a worker that is terminated, so it is stopped before the worker is.
+    pub workload: Vec<ProcessId>,
 }
 
 /// One process of the process table, before it is matched against a root.
@@ -97,6 +111,8 @@ pub struct WorkerProcess {
 struct ProcessEntry {
     pid: u32,
     parent_pid: u32,
+    /// Session ID; 0 when the platform's process listing does not report it.
+    session: u32,
     start: String,
     /// Target of the executable link, when it can be read.
     executable: Option<PathBuf>,
@@ -143,7 +159,53 @@ fn as_worker(entry: &ProcessEntry) -> Option<WorkerProcess> {
         parent_pid: entry.parent_pid,
         start: entry.start.clone(),
         socket_path,
+        workload: Vec::new(),
     })
+}
+
+/// Returns the processes that belong to the workload of `worker`: its
+/// descendants, and every member of a session that one of them leads.
+///
+/// A descendant that called `setsid` (the PTY child of a worker) leads a
+/// session of its own, and its members stay in it after the intermediate
+/// processes exit. The session of the worker itself is never followed: it is
+/// shared with the daemon and the test. The worker and this process are never
+/// part of the result.
+fn workload_of(entries: &[ProcessEntry], worker: &ProcessEntry) -> Vec<ProcessId> {
+    let own_pid = std::process::id();
+    let mut members: Vec<&ProcessEntry> = Vec::new();
+    let mut frontier = vec![worker.pid];
+    while let Some(parent) = frontier.pop() {
+        for entry in entries.iter().filter(|entry| entry.parent_pid == parent) {
+            if entry.pid != worker.pid
+                && entry.pid != own_pid
+                && !members.iter().any(|known| known.pid == entry.pid)
+            {
+                members.push(entry);
+                frontier.push(entry.pid);
+            }
+        }
+    }
+    let sessions: Vec<u32> = members
+        .iter()
+        .map(|entry| entry.session)
+        .filter(|session| *session != 0 && *session != worker.session)
+        .collect();
+    let session_members = entries.iter().filter(|entry| {
+        sessions.contains(&entry.session)
+            && entry.pid != worker.pid
+            && entry.pid != own_pid
+            && !members.iter().any(|known| known.pid == entry.pid)
+    });
+    let session_members: Vec<&ProcessEntry> = session_members.collect();
+    members
+        .into_iter()
+        .chain(session_members)
+        .map(|entry| ProcessId {
+            pid: entry.pid,
+            start: entry.start.clone(),
+        })
+        .collect()
 }
 
 /// Returns the workers among `entries` whose socket path is below `root`.
@@ -153,26 +215,42 @@ fn as_worker(entry: &ProcessEntry) -> Option<WorkerProcess> {
 fn workers_among(entries: &[ProcessEntry], root: &Path) -> Vec<WorkerProcess> {
     entries
         .iter()
-        .filter_map(as_worker)
-        .filter(|worker| worker.socket_path.starts_with(root))
+        .filter_map(|entry| as_worker(entry).map(|worker| (entry, worker)))
+        .filter(|(_, worker)| worker.socket_path.starts_with(root))
+        .map(|(entry, worker)| WorkerProcess {
+            workload: workload_of(entries, entry),
+            ..worker
+        })
         .collect()
 }
 
-/// Extracts the parent PID and the start time from the contents of `/proc/<pid>/stat`.
+/// Fields of `/proc/<pid>/stat` the process table uses.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+struct Stat {
+    parent_pid: u32,
+    session: u32,
+    start: String,
+}
+
+/// Extracts the parent PID, session and start time from the contents of `/proc/<pid>/stat`.
 ///
 /// The command name is parenthesised and may itself contain spaces and
 /// parentheses, so the fields are counted from the last closing parenthesis.
 #[cfg(any(target_os = "linux", test))]
-fn parse_stat(stat: &str) -> Option<(u32, String)> {
+fn parse_stat(stat: &str) -> Option<Stat> {
     /// Index of the parent PID after the command name (field 4 of `proc(5)`).
     const PARENT_FIELD: usize = 1;
+    /// Index of the session ID after the command name (field 6 of `proc(5)`).
+    const SESSION_FIELD: usize = 3;
     /// Index of the start time after the command name (field 22 of `proc(5)`).
     const START_FIELD: usize = 19;
     let fields: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
-    Some((
-        fields.get(PARENT_FIELD)?.parse().ok()?,
-        (*fields.get(START_FIELD)?).to_owned(),
-    ))
+    Some(Stat {
+        parent_pid: fields.get(PARENT_FIELD)?.parse().ok()?,
+        session: fields.get(SESSION_FIELD)?.parse().ok()?,
+        start: (*fields.get(START_FIELD)?).to_owned(),
+    })
 }
 
 /// Reads the process table from `/proc`.
@@ -198,7 +276,12 @@ fn process_table() -> io::Result<Vec<ProcessEntry>> {
         ) else {
             continue;
         };
-        let Some((parent_pid, start)) = parse_stat(&stat_line) else {
+        let Some(Stat {
+            parent_pid,
+            session,
+            start,
+        }) = parse_stat(&stat_line)
+        else {
             continue;
         };
         let argv = cmdline
@@ -210,6 +293,7 @@ fn process_table() -> io::Result<Vec<ProcessEntry>> {
         entries.push(ProcessEntry {
             pid,
             parent_pid,
+            session,
             start,
             executable: std::fs::read_link(directory.path().join("exe")).ok(),
             argv,
@@ -248,6 +332,9 @@ fn process_table() -> io::Result<Vec<ProcessEntry>> {
             Some(ProcessEntry {
                 pid,
                 parent_pid,
+                // `ps` has no portable session column; without one only
+                // descendants are part of a worker's workload.
+                session: 0,
                 start,
                 executable: None,
                 argv: words.map(OsString::from).collect(),
@@ -260,7 +347,7 @@ fn process_table() -> io::Result<Vec<ProcessEntry>> {
 #[cfg(target_os = "linux")]
 fn start_of(pid: u32) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    parse_stat(&stat).map(|(_, start)| start)
+    parse_stat(&stat).map(|stat| stat.start)
 }
 
 /// Returns the current start time of `pid`, or `None` when it is gone.
@@ -301,16 +388,16 @@ pub fn workers_under(root: &Path) -> Vec<WorkerProcess> {
     })
 }
 
-/// Sends `stop` to `worker` only if the process with its PID still has the
-/// start time recorded for it; returns whether a signal was sent.
+/// Sends `stop` to the process `pid` only if it still has the start time
+/// recorded for it; returns whether a signal was sent.
 ///
 /// On Linux a pidfd is opened first and the start time is checked afterwards,
 /// so the signal goes to the process that was verified even if the PID is
 /// recycled in between.
-fn signal_worker(worker: &WorkerProcess, stop: Stop) -> bool {
+fn signal_process(pid: u32, start: &str, stop: Stop) -> bool {
     use rustix::process::{Pid, Signal};
 
-    let Some(pid) = i32::try_from(worker.pid).ok().and_then(Pid::from_raw) else {
+    let Some(target) = i32::try_from(pid).ok().and_then(Pid::from_raw) else {
         return false;
     };
     let signal = match stop {
@@ -319,19 +406,37 @@ fn signal_worker(worker: &WorkerProcess, stop: Stop) -> bool {
     };
     #[cfg(target_os = "linux")]
     {
-        let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty())
+        let Ok(pidfd) = rustix::process::pidfd_open(target, rustix::process::PidfdFlags::empty())
         else {
             return false;
         };
-        if start_of(worker.pid).as_deref() != Some(worker.start.as_str()) {
+        if start_of(pid).as_deref() != Some(start) {
             return false;
         }
         rustix::process::pidfd_send_signal(&pidfd, signal).is_ok()
     }
     #[cfg(not(target_os = "linux"))]
     {
-        start_of(worker.pid).as_deref() == Some(worker.start.as_str())
-            && rustix::process::kill_process(pid, signal).is_ok()
+        start_of(pid).as_deref() == Some(start)
+            && rustix::process::kill_process(target, signal).is_ok()
+    }
+}
+
+/// Sends `stop` to `worker` under the identity check of [`signal_process`].
+fn signal_worker(worker: &WorkerProcess, stop: Stop) -> bool {
+    signal_process(worker.pid, &worker.start, stop)
+}
+
+/// Kills the workload of `worker`, each process under the identity check of
+/// [`signal_process`].
+///
+/// The workload is killed before the worker: a worker that is signalled first
+/// exits without ending the session it started, and the workload then outlives
+/// the fixture root. `SIGKILL` is used because a workload can ignore `SIGHUP`
+/// and `SIGTERM`.
+fn stop_workload(worker: &WorkerProcess) {
+    for process in &worker.workload {
+        signal_process(process.pid, &process.start, Stop::Kill);
     }
 }
 
@@ -353,7 +458,8 @@ fn wait_for_none(root: &Path, limit: Duration) -> bool {
 
 /// Terminates every worker below `root` and returns those that were running.
 ///
-/// Sends `SIGTERM`, then `SIGKILL` to whatever is still listed after
+/// Kills each worker's workload, sends the worker `SIGTERM`, then `SIGKILL` to
+/// whatever is still listed after
 /// [`TERMINATE_GRACE`], and returns once the process table shows none or after
 /// [`KILL_SETTLE`]. Every signal goes through [`signal_worker`], so only a
 /// process that still matches what was listed is signalled.
@@ -367,10 +473,12 @@ pub fn try_reap_workers_under(root: &Path) -> io::Result<Vec<WorkerProcess>> {
         return Ok(found);
     }
     for worker in &found {
+        stop_workload(worker);
         signal_worker(worker, Stop::Terminate);
     }
     if !wait_for_none(root, TERMINATE_GRACE) {
         for worker in try_workers_under(root)? {
+            stop_workload(&worker);
             signal_worker(&worker, Stop::Kill);
         }
         let _ = wait_for_none(root, KILL_SETTLE);
@@ -464,7 +572,7 @@ mod tests {
 
     use super::{
         as_worker, parse_stat, reap_workers_under, signal_worker, workers_among, workers_under,
-        ProcessEntry, Stop, WorkerGuard, WorkerProcess,
+        workload_of, ProcessEntry, Stat, Stop, WorkerGuard, WorkerProcess,
     };
     use crate::process_env::ProcessEnv;
     use crate::tempdir;
@@ -484,6 +592,7 @@ mod tests {
         ProcessEntry {
             pid: 10,
             parent_pid: 1,
+            session: 0,
             start: "100".to_owned(),
             executable: None,
             argv: std::iter::once(executable)
@@ -510,14 +619,19 @@ mod tests {
     /// Starts a stand-in worker named `executable` whose parent has exited, as
     /// a daemon's worker is after the daemon is killed, with its control socket
     /// at `socket`; returns it once the process table lists it below `root`.
-    fn spawn_orphan_at(root: &Path, executable: &Path, socket: &Path) -> WorkerProcess {
+    fn spawn_orphan_at(
+        root: &Path,
+        executable: &Path,
+        socket: &Path,
+        script: &str,
+    ) -> WorkerProcess {
         std::fs::create_dir_all(executable.parent().expect("executable directory"))
             .expect("create executable directory");
         symlink("/bin/sh", executable).expect("name the stand-in worker executable");
         Command::new("/bin/sh")
             .args(["-c", DETACH_SCRIPT])
             .arg(executable)
-            .arg(FAKE_WORKER_SCRIPT)
+            .arg(script)
             .arg(socket)
             .status()
             .expect("detach stand-in worker");
@@ -531,6 +645,7 @@ mod tests {
             root,
             &root.join("pohunek-sessiond"),
             &root.join("r/pohunek/daemon.sock"),
+            FAKE_WORKER_SCRIPT,
         )
     }
 
@@ -553,6 +668,7 @@ mod tests {
                 parent_pid: 1,
                 start: "100".to_owned(),
                 socket_path: "/tmp/pw-s-abc/d.sock".into(),
+                workload: Vec::new(),
             }
         );
     }
@@ -627,7 +743,14 @@ mod tests {
     #[test]
     fn stat_fields_are_counted_after_the_last_parenthesis() {
         let stat = "42 (we ird) name) S 7 42 42 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 987654 1 2";
-        assert_eq!(parse_stat(stat), Some((7, "987654".to_owned())));
+        assert_eq!(
+            parse_stat(stat),
+            Some(Stat {
+                parent_pid: 7,
+                session: 42,
+                start: "987654".to_owned()
+            })
+        );
         assert_eq!(parse_stat("42 (short) S 7"), None);
     }
 
@@ -675,6 +798,7 @@ mod tests {
             root.path(),
             &root.path().join("bin dir/pohunek-sessiond"),
             &root.path().join("run dir/pohunek/daemon.sock"),
+            FAKE_WORKER_SCRIPT,
         );
         assert_eq!(
             worker.socket_path,
@@ -712,6 +836,93 @@ mod tests {
         assert_eq!(reap_workers_under(root.path()).len(), 1);
         drop(env);
         assert!(workers_under(root.path()).is_empty());
+    }
+
+    fn process_in_table(pid: u32, parent_pid: u32, session: u32) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            parent_pid,
+            session,
+            start: format!("s{pid}"),
+            executable: None,
+            argv: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_workload_is_the_descendants_and_the_sessions_they_lead() {
+        let worker = process_in_table(100, 1, 50);
+        let entries = [
+            worker.clone(),
+            process_in_table(101, 100, 50),
+            // PTY child: its own session, with a straggler reparented to init.
+            process_in_table(102, 100, 102),
+            process_in_table(103, 102, 102),
+            process_in_table(104, 1, 102),
+            // Descendant of a descendant.
+            process_in_table(105, 101, 50),
+            // Unrelated: the worker's own session, init's child, another session.
+            process_in_table(106, 1, 50),
+            process_in_table(107, 1, 107),
+            process_in_table(std::process::id(), 100, 102),
+        ];
+        let mut pids: Vec<u32> = workload_of(&entries, &worker)
+            .iter()
+            .map(|process| process.pid)
+            .collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [101, 102, 103, 104, 105]);
+    }
+
+    /// Stand-in worker body whose workload ignores `SIGHUP` and `SIGTERM`, lives
+    /// in a session of its own and records its PID in `pid_file`.
+    #[cfg(target_os = "linux")]
+    fn resistant_workload_script(pid_file: &Path) -> String {
+        format!(
+            "setsid -w sh -c 'trap \"\" HUP TERM; echo $$ > {}; sleep 613; true' & wait",
+            pid_file.display()
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_exists(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| !stat.contains(") Z "))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_signal_resistant_workload_in_its_own_session_is_stopped_with_its_worker() {
+        let root = tempdir().expect("root");
+        let pid_file = root.path().join("workload.pid");
+        let worker = spawn_orphan_at(
+            root.path(),
+            &root.path().join("pohunek-sessiond"),
+            &root.path().join("r/pohunek/daemon.sock"),
+            &resistant_workload_script(&pid_file),
+        );
+        let workload: u32 = poll_until("the workload records its PID", || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+        });
+        poll_until("the worker lists its workload", || {
+            workers_under(root.path())
+                .first()
+                .filter(|listed| {
+                    listed
+                        .workload
+                        .iter()
+                        .any(|process| process.pid == workload)
+                })
+                .map(|_| ())
+        });
+        assert!(process_exists(workload));
+
+        assert_eq!(reap_workers_under(root.path()).len(), 1);
+        poll_until("the workload ends", || {
+            (!process_exists(workload) && !process_exists(worker.pid)).then_some(())
+        });
     }
 
     #[test]

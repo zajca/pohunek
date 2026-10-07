@@ -449,8 +449,9 @@ workers of the host or of another run. `scripts/test-partitions run` adds a run-
 check on Linux: the run gets a private `TMPDIR` base (at most 9 bytes, the budget of the
 deepest nested test root; derived next to `RUN_BASE_MAX_LENGTH`), and any worker below
 it after nextest exits, or after the run is cancelled, is terminated and fails the run.
-Both checks read the process table from `/proc` (never through `PATH`) and signal a
-worker only after re-verifying its start time. Plain `cargo nextest run` relies on
+Both checks read the process table from `/proc` (never through `PATH`), kill the
+worker's workload (descendants and the sessions they lead, which outlive a terminated
+worker) before the worker, and signal each process only after re-verifying its start time. Plain `cargo nextest run` relies on
 the guards alone.
 `crates/xtask/tests/hermetic_scan.rs` enforces all of this in test code with no
 baseline. A case where the host state is the subject carries
