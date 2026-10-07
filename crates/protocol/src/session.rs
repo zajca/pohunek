@@ -2256,7 +2256,9 @@ pub enum SessionWarningKind {
     /// The repository setup script failed; the worktree was kept without it.
     SetupScript,
     /// A lifecycle hook (worktree pre/post-create or -remove, or a session-level
-    /// hook) failed, timed out, or could not be run. Non-fatal: the session
+    /// hook) failed, timed out, or could not be run, or the managed hook assets
+    /// of the session's agent are installed but outdated (the `message` then
+    /// names the `pohunek integration install` command). Non-fatal: the session
     /// proceeds and the worktree is kept. The failing event name + reason ride in
     /// the warning's `message`/`detail`, not the kind (a **unit** variant, so the
     /// enum stays `Copy` and serializes to the bare string `"hook"`).
@@ -2266,12 +2268,6 @@ pub enum SessionWarningKind {
     /// stays listed; start a new session and resume the native conversation
     /// from the reference in the warning's `detail`.
     NativeRecovery,
-    /// The managed hook assets of the session's agent are installed but do not
-    /// match this daemon's embedded assets, so the agent's hooks may report
-    /// nothing or be rejected. The session itself launches normally; the
-    /// warning's `message` names the `pohunek integration install` command that
-    /// replaces the assets.
-    IntegrationOutdated,
 }
 
 /// A non-fatal warning surfaced for a session.

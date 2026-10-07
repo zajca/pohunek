@@ -357,7 +357,7 @@ pub fn outdated_assets_warning(
     }
     let scope = profile.map_or_else(String::new, |name| format!(" --profile {name}"));
     Some(protocol::SessionWarning {
-        kind: protocol::SessionWarningKind::IntegrationOutdated,
+        kind: protocol::SessionWarningKind::Hook,
         message: format!(
             "the installed {label} hook assets do not match this daemon, so the agent's hooks may report nothing: run `pohunek integration install --agent {label}{scope}` on the daemon host"
         ),

@@ -22,9 +22,13 @@
   installed plugin only with the checksums its own ownership marker recorded, so
   an untouched install from an older release passed. Hermes status now reports
   `outdated`, and the Hermes doctor has an `asset_current` check (16 checks).
-- A launch whose agent has outdated Claude or Codex hook assets returns an
-  `integration_outdated` session warning naming the install command; protocol 3
-  connections never receive it. The installer wrapper prints the doctor and
+- A launch (new, resume or fork) whose agent has outdated Claude or Codex hook
+  assets carries a session warning of the existing `hook` kind naming the install
+  command. Decision: no new `SessionWarningKind`, because warnings are persisted
+  in the session record and decoded as a closed enum by released clients and by
+  an older daemon reading the store, so a new variant would need a protocol and
+  store schema bump with an adapter; `hook` already means a hook that could not
+  do its job. The warning is recomputed at each launch, so it stays current. The installer wrapper prints the doctor and
   install commands after a successful install or upgrade, and the update runbook
   has a "Managed hook assets after an upgrade" section.
 

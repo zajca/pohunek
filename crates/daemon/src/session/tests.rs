@@ -19154,20 +19154,19 @@ async fn the_identity_schema_admits_hermes_reports_and_refuses_unlisted_sessions
 const CLAUDE_CONFIG_DIR_VARIABLE: &str = "CLAUDE_CONFIG_DIR";
 
 /// A registry whose launch environment names `claude_dir` as the Claude config
-/// home and whose `resumable` profile launches a Claude-based shell command.
+/// home and whose agent profiles come from `agents_dir`.
 #[cfg(unix)]
-fn claude_home_registry(tag: &str, claude_dir: &std::path::Path) -> SessionRegistry {
+fn claude_home_registry(
+    claude_dir: &std::path::Path,
+    agents_dir: PathBuf,
+    store_path: Option<PathBuf>,
+) -> SessionRegistry {
     let crate::runtime::EnvironmentSource::Fixed(mut variables) =
         crate::test_support::thread_environment_source()
     else {
         panic!("a test fixture supplies an explicit environment");
     };
     variables.insert(CLAUDE_CONFIG_DIR_VARIABLE.into(), claude_dir.into());
-    let agents_dir = temp_agents_dir_with(
-        tag,
-        "resumable",
-        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"exit 0\"]\n",
-    );
     let allowlist = pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST
         .iter()
         .map(|name| (*name).to_owned())
@@ -19178,6 +19177,8 @@ fn claude_home_registry(tag: &str, claude_dir: &std::path::Path) -> SessionRegis
             shell_command: hermetic_shell(),
             stop_grace: Duration::from_millis(50),
             agents_dir: Some(agents_dir),
+            store_path,
+            socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
             ..SessionRegistryConfig::default()
         },
         crate::agent::host::fixture::builtin_host(),
@@ -19186,52 +19187,180 @@ fn claude_home_registry(tag: &str, claude_dir: &std::path::Path) -> SessionRegis
     )
 }
 
+/// Whether `info` carries the warning that names the hook asset reinstall.
+#[cfg(unix)]
+fn warns_of_outdated_hooks(info: &SessionInfo) -> bool {
+    info.warnings.iter().any(|warning| {
+        warning.kind == protocol::SessionWarningKind::Hook
+            && warning
+                .message
+                .contains("pohunek integration install --agent claude")
+    })
+}
+
+/// Installs the Claude hooks into the registry's Claude home.
+#[cfg(unix)]
+fn install_claude_hooks(registry: &SessionRegistry) {
+    crate::integration::install_in(
+        &registry.integration_homes().expect("config homes"),
+        Some(&protocol::RuntimeRef::claude()),
+        &crate::integration::HomeSelection::Runtime,
+        &crate::integration::RetainedSchemas::default(),
+    )
+    .expect("install the Claude hooks");
+}
+
+/// Changes the installed state hook's body without touching its version marker.
+#[cfg(unix)]
+fn drift_claude_state_hook(claude_dir: &std::path::Path) {
+    let state_hook = claude_dir.join("hooks/pohunek-agent-state.sh");
+    let body = fs::read_to_string(&state_hook).expect("read the installed hook");
+    fs::write(&state_hook, format!("{body}\n# drifted\n")).expect("drift the hook");
+}
+
 #[cfg(unix)]
 #[tokio::test]
-async fn a_launch_over_outdated_hook_assets_carries_an_integration_outdated_warning() {
-    use protocol::{RuntimeRef, SessionWarningKind};
-
+async fn a_launch_over_outdated_hook_assets_carries_a_hook_warning() {
     let claude_dir = temp_dir("outdated-assets-claude");
     let cwd = temp_dir("outdated-assets-cwd");
-    let registry = claude_home_registry("outdated-assets", &claude_dir);
-    let warned = |info: &SessionInfo| {
-        info.warnings
-            .iter()
-            .any(|warning| warning.kind == SessionWarningKind::IntegrationOutdated)
-    };
+    let agents_dir = temp_agents_dir_with(
+        "outdated-assets",
+        "resumable",
+        "base = \"claude\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"exit 0\"]\n",
+    );
+    let registry = claude_home_registry(&claude_dir, agents_dir, None);
 
     // No install: the owner never opted in, so there is nothing to flag.
     let none = create_in(&registry, "resumable", &cwd)
         .await
         .expect("create");
-    assert!(!warned(&none));
+    assert!(!warns_of_outdated_hooks(&none));
 
-    let homes = registry.integration_homes().expect("config homes");
-    crate::integration::install_in(
-        &homes,
-        Some(&RuntimeRef::claude()),
-        &crate::integration::HomeSelection::Runtime,
-        &crate::integration::RetainedSchemas::default(),
-    )
-    .expect("install the Claude hooks");
+    install_claude_hooks(&registry);
     let current = create_in(&registry, "resumable", &cwd)
         .await
         .expect("create");
-    assert!(!warned(&current), "a current install carries no warning");
+    assert!(
+        !warns_of_outdated_hooks(&current),
+        "a current install carries no warning"
+    );
 
     // Same version marker, different body: content drift of a managed asset.
-    let state_hook = claude_dir.join("hooks/pohunek-agent-state.sh");
-    let body = fs::read_to_string(&state_hook).expect("read the installed hook");
-    fs::write(&state_hook, format!("{body}\n# drifted\n")).expect("drift the hook");
+    drift_claude_state_hook(&claude_dir);
     let outdated = create_in(&registry, "resumable", &cwd)
         .await
         .expect("create");
-    let warning = outdated
-        .warnings
-        .iter()
-        .find(|warning| warning.kind == SessionWarningKind::IntegrationOutdated)
-        .expect("an integration_outdated warning");
-    assert!(warning
-        .message
-        .contains("pohunek integration install --agent claude"));
+    assert!(
+        warns_of_outdated_hooks(&outdated),
+        "{:?}",
+        outdated.warnings
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fork_over_outdated_hook_assets_carries_a_hook_warning() {
+    let claude_dir = temp_dir("outdated-fork-claude");
+    let dir = temp_dir("outdated-fork-runtime");
+    let script = dir.join("fork-agent");
+    write_executable(&script, "#!/bin/sh\nsleep 30\n");
+    let agents_dir = temp_agents_dir_with(
+        "outdated-fork",
+        "forkable",
+        &format!("base = \"claude\"\nprogram = \"{}\"\n", script.display()),
+    );
+    let registry = claude_home_registry(&claude_dir, agents_dir, None);
+    install_claude_hooks(&registry);
+    let created = create_in(&registry, "forkable", &dir)
+        .await
+        .expect("create");
+    let recorded = registry
+        .report_native_id(native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: "native-fork".to_owned(),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded);
+    let fork = || {
+        registry.fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+            accept_profile_change: false,
+        })
+    };
+
+    let current = fork().await.expect("fork over current hooks");
+    assert!(!warns_of_outdated_hooks(&current));
+
+    drift_claude_state_hook(&claude_dir);
+    let outdated = fork().await.expect("fork over outdated hooks");
+    assert!(
+        warns_of_outdated_hooks(&outdated),
+        "{:?}",
+        outdated.warnings
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
+    let claude_dir = temp_dir("outdated-resume-claude");
+    let marker = temp_dir("outdated-resume-marker").join("argv.txt");
+    let (agents_dir, mut exit_gate) =
+        temp_agent_that_exits_then_resumes("outdated-resume", &marker);
+    let registry = claude_home_registry(
+        &claude_dir,
+        agents_dir,
+        Some(temp_store_path("outdated-resume")),
+    );
+    install_claude_hooks(&registry);
+    let created = registry
+        .create(resumable_params())
+        .await
+        .expect("create session");
+    let recorded = registry
+        .report_native_id(native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: "native-resume".to_owned(),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded);
+    exit_gate
+        .write_all(b"go\n")
+        .expect("release the agent exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("terminal entry");
+    entry.info.runtime = Some(SessionRuntime {
+        state: RuntimeState::Lost,
+        runtime_generation: protocol::RuntimeGeneration::new(1),
+        worker_id: Some("worker-before-recovery".to_owned()),
+        worker_instance_id: Some("runtime-before-recovery".to_owned()),
+        started_at: Some(created.created_at.clone()),
+        last_connected_at: None,
+        loss_reason: Some("test_runtime_lost".to_owned()),
+    });
+    entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
+    let lost_job = entry.job.clone().expect("created session records its job");
+    drop(sessions);
+    registry
+        .lifecycle()
+        .expect("test registry supervises workers")
+        .retire(&lost_job)
+        .await
+        .expect("retire the lost generation");
+
+    drift_claude_state_hook(&claude_dir);
+    let resumed = registry.resume(&created.id).await.expect("resume");
+    assert!(warns_of_outdated_hooks(&resumed), "{:?}", resumed.warnings);
 }

@@ -246,7 +246,7 @@ the protocol 3 adapter: the daemon accepts the `runtime_id` spelling in its
 requests (a request that already carries the v4 spelling is `bad_request`) and
 answers, and streams events, in the `runtime_id` spelling, withholding warning
 kinds and events v3 never defined (a v3 connection never receives a
-`native_recovery` or `integration_outdated` session warning; v4 connections do). A client whose range does not overlap the window
+`native_recovery` session warning; v4 connections do). A client whose range does not overlap the window
 receives `daemon/version_mismatch` before any method runs; a client of this build
 negotiates v3 and translates as described above. The window covers
 the public daemon protocol only: the CLI's `--json` envelope reports `protocol`
@@ -1148,9 +1148,9 @@ Important fields:
   and `native_recovery` for a session whose stored native recovery record could
   not be completed after an upgrade: it cannot resume or fork, `message` says to
   start a new session and resume the native conversation, and `detail` carries
-  the stored native reference. `integration_outdated` marks a launch whose
-  agent's installed Claude or Codex hook assets differ from the ones the daemon
-  embeds (an older version marker or changed content): `message` names the
+  the stored native reference. `hook` also marks a launch (new, resume or fork)
+  whose agent's installed Claude or Codex hook assets differ from the ones the
+  daemon embeds (an older version marker or changed content): `message` names the
   `pohunek integration install --agent <agent>` command (with `--profile` for a
   host profile's home) and `detail` carries the status warnings; the session
   still starts, and an agent whose hooks are not installed carries no such

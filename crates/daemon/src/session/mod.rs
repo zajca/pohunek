@@ -2192,9 +2192,14 @@ impl SessionRegistry {
             Ok(mut target) => {
                 #[cfg(test)]
                 self.hold_bound_create(&id).await;
-                target
-                    .warnings
-                    .extend(self.outdated_integration_warning(&resolved).await);
+                let profile = resolved.profile.as_ref().map(|_| resolved.name.clone());
+                target.warnings.extend(
+                    self.outdated_integration_warning(
+                        RuntimeRef::from(resolved.base.clone()),
+                        profile,
+                    )
+                    .await,
+                );
                 self.create_spec(
                     &id,
                     &params,
@@ -2219,7 +2224,18 @@ impl SessionRegistry {
         Ok((info, pending_initial_input))
     }
 
-    /// The warning a launch of `resolved` carries when its agent's managed hook
+    /// [`Self::outdated_integration_warning`] for the agent a resume binding
+    /// relaunches, as the warnings of the relaunched session.
+    async fn outdated_binding_warnings(&self, binding: &ResumeBinding) -> Vec<SessionWarning> {
+        let profile =
+            (binding.agent != binding.agent_base.as_wire()).then(|| binding.agent.clone());
+        self.outdated_integration_warning(binding.agent_base.clone(), profile)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// The warning a launch of `agent` (under host profile `profile`) carries when its agent's managed hook
     /// assets are outdated.
     ///
     /// The inspection reads a few small files off the async runtime and is best
@@ -2227,21 +2243,20 @@ impl SessionRegistry {
     /// warning and never fails the launch.
     async fn outdated_integration_warning(
         &self,
-        resolved: &ResolvedAgent,
+        agent: RuntimeRef,
+        profile: Option<String>,
     ) -> Option<SessionWarning> {
         let homes = match self.integration_homes() {
             Ok(homes) => homes,
             Err(error) => {
                 debug!(
-                    name: "session.integration_outdated.homes_unresolved",
+                    name: "session.hook_assets_outdated.homes_unresolved",
                     error_code = %error.code,
                     "skipped the outdated hook asset check: config homes unresolved"
                 );
                 return None;
             }
         };
-        let agent = RuntimeRef::from(resolved.base.clone());
-        let profile = resolved.profile.as_ref().map(|_| resolved.name.clone());
         match tokio::task::spawn_blocking(move || {
             crate::integration::outdated_assets_warning(&homes, agent, profile)
         })
@@ -2250,7 +2265,7 @@ impl SessionRegistry {
             Ok(warning) => warning,
             Err(_join_error) => {
                 warn!(
-                    name: "session.integration_outdated.check_panicked",
+                    name: "session.hook_assets_outdated.check_panicked",
                     "the outdated hook asset check panicked; the launch carries no warning"
                 );
                 None

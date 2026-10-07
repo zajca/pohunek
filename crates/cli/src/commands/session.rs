@@ -2040,7 +2040,6 @@ fn warning_kind_label(kind: SessionWarningKind) -> &'static str {
         SessionWarningKind::SetupScript => "setup_script",
         SessionWarningKind::Hook => "hook",
         SessionWarningKind::NativeRecovery => "native_recovery",
-        SessionWarningKind::IntegrationOutdated => "integration_outdated",
     }
 }
 

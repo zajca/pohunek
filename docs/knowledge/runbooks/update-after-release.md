@@ -72,10 +72,10 @@ assets with the ones the new daemon embeds:
    with the same target; it needs `--confirm-modified` only when `modified=true`.
 
 The installer wrapper prints these commands after a successful install or
-upgrade. A launch whose agent has outdated Claude or Codex hook assets returns a
-session warning of kind `integration_outdated` (shown by `session new`,
-`session list` and `session inspect`) that names the exact install command; the
-session still starts. Files in a user-owned config home change only by an
+upgrade. A new, resumed or forked session whose agent has outdated Claude or
+Codex hook assets carries a session warning of kind `hook` (shown by
+`session new`, `session list` and `session inspect`) that names the exact install
+command; the session still starts. Files in a user-owned config home change only by an
 explicit owner command, never as a side effect of an upgrade or a launch.
 
 ## Mixed releases across hosts

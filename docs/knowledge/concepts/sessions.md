@@ -729,9 +729,9 @@ in it, using the reference in the warning's `detail`. Never resume the old
 record when the native conversation already continues under another session,
 because that would start a second agent on the same native id.
 
-A launch whose agent's installed Claude or Codex hook assets are outdated (an
-older version marker, or content that differs from the daemon's embedded script)
-carries an `integration_outdated` warning on the new session: its hooks may
+A launch (new, resume or fork) whose agent's installed Claude or Codex hook
+assets are outdated (an older version marker, or content that differs from the
+daemon's embedded script) carries a `hook` warning on the session: its hooks may
 report nothing, so `message` names the `pohunek integration install --agent
 <agent>` command (with `--profile <name>` for a host profile's home). The
 session starts normally and an agent without installed hooks carries no warning.

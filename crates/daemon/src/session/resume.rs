@@ -488,6 +488,7 @@ impl SessionRegistry {
             },
             profile_revision: revision,
         };
+        let outdated_hooks = self.outdated_binding_warnings(&binding).await;
         let guard = self.lock_lifecycle(&id).await;
         let info = self
             .register_pty_session(
@@ -516,7 +517,7 @@ impl SessionRegistry {
                     branch,
                     worktree_path,
                     metadata: binding.metadata,
-                    warnings: Vec::new(),
+                    warnings: outdated_hooks,
                     initial_input_pending: false,
                     package_authority: Some(package_authority),
                 },
@@ -814,6 +815,7 @@ impl SessionRegistry {
         // binding without a snapshot program falls back to the base kind's
         // compiled spec.
         let id = SessionId(binding.session_id.clone());
+        let outdated_hooks = self.outdated_binding_warnings(&binding).await;
 
         // A legacy binding carries no snapshot program; fall back to the base kind's
         // default so it still relaunches. `program`/`input_rules` are frozen
@@ -903,7 +905,7 @@ impl SessionRegistry {
                 branch,
                 worktree_path,
                 metadata: binding.metadata,
-                warnings: Vec::new(),
+                warnings: outdated_hooks,
                 initial_input_pending: false,
                 package_authority: None,
             },
