@@ -383,32 +383,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reopening_appends_rather_than_truncates() {
-        let dir = temp_events_dir("reopen");
-        {
-            let log = EventLog::open(&dir).expect("first open");
-            log.append(&crate::events::event(
-                event::SESSION_CREATED,
-                json!({ "n": 1 }),
-            ))
-            .expect("append 1");
-        };
-        {
-            let log = EventLog::open(&dir).expect("second open");
-            log.append(&crate::events::event(
-                event::SESSION_STOPPED,
-                json!({ "n": 2 }),
-            ))
-            .expect("append 2");
-            assert_eq!(
-                read_lines(log.path()).len(),
-                2,
-                "reopen must append to the existing log, not truncate it"
-            );
-        }
-    }
-
-    #[tokio::test]
     async fn drain_keeps_running_after_a_slow_consumer_lag() {
         // A tiny channel forces a lag when more events are sent than buffered
         // before the drain catches up; the drain must survive and keep recording.

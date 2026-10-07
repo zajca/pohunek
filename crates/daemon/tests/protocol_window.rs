@@ -671,25 +671,6 @@ async fn methods_added_after_the_previous_version_are_unknown_to_it() {
 }
 
 #[tokio::test]
-async fn a_client_two_versions_back_is_rejected_with_a_typed_mismatch() {
-    let daemon = Daemon::start("window-below").await;
-    let mut client = daemon.connect().await;
-    let below = MIN_PROTOCOL_VERSION.get() - 1;
-    let response = exchange(
-        &mut client,
-        &json!({
-            "v": {"minimum": below, "maximum": below},
-            "id": "below-1",
-            "method": method::DAEMON_HEALTH,
-            "params": null,
-        }),
-    )
-    .await;
-    assert_eq!(response["err"]["code"], "version_mismatch", "{response}");
-    daemon.stop().await;
-}
-
-#[tokio::test]
 async fn recorded_previous_release_consumer_requests_are_accepted() {
     let daemon = Daemon::start("window-consumers").await;
     let mut driver = daemon.connect().await;

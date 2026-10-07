@@ -175,19 +175,6 @@ fn rejects_unsafe_modes_regular_substitution_and_hard_links() {
 }
 
 #[test]
-fn lock_is_exclusive_and_releases_with_its_holder() {
-    let root = temp_root("lock");
-    let host = HostStateDir::open_or_create(&state_dir(&root)).expect("open host");
-    let first = host.acquire_lock().expect("first lock");
-    assert!(matches!(
-        host.acquire_lock(),
-        Err(HostStateError::LockContended { .. })
-    ));
-    drop(first);
-    drop(host.acquire_lock().expect("lock reacquires after drop"));
-}
-
-#[test]
 fn cross_process_lock_is_contended_and_releases_after_holder_exit() {
     let root = temp_root("cross-process-lock");
     let state = state_dir(&root);

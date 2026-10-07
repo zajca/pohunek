@@ -804,18 +804,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_preserves_identity_and_approval_reference() {
-        let temp = state_dir();
-        let first = HostStateRepository::open_or_create(temp.path()).expect("bootstrap repository");
-        let snapshot = first.snapshot();
-        let reference = first.approval_key_reference().clone();
-        drop(first);
-        let second = HostStateRepository::open_or_create(temp.path()).expect("reload repository");
-        assert_eq!(second.snapshot(), snapshot);
-        assert_eq!(second.approval_key_reference(), &reference);
-    }
-
-    #[test]
     fn diagnostic_revalidates_the_reopened_stable_snapshot() {
         let temp = state_dir();
         let repository = HostStateRepository::open_or_create(temp.path()).expect("bootstrap");

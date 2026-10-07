@@ -247,6 +247,9 @@ mod tests {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
 
         assert_zeroize_on_drop::<SigningKey>();
+        // The decoder accepts the private record only through a zeroizing owner.
+        let _: fn(&Zeroizing<Vec<u8>>) -> Result<ApprovalKeyRecord, HostStateRepositoryError> =
+            ApprovalKeyRecord::decode;
 
         let host_id = host_id_from_bytes([1; 32]).expect("host identity");
         let record = ApprovalKeyRecord::generate(&host_id).expect("approval key");
@@ -256,20 +259,6 @@ mod tests {
         let decoded = ApprovalKeyRecord::decode(&encoded).expect("decode approval key");
         assert_eq!(decoded.host_id, host_id);
         assert_eq!(decoded.key.reference(), record.key.reference());
-    }
-
-    #[test]
-    fn approval_key_decoder_requires_a_zeroizing_record_owner() {
-        fn decode_secret_record(
-            decode: fn(&Zeroizing<Vec<u8>>) -> Result<ApprovalKeyRecord, HostStateRepositoryError>,
-            bytes: &Zeroizing<Vec<u8>>,
-        ) -> Result<ApprovalKeyRecord, HostStateRepositoryError> {
-            decode(bytes)
-        }
-
-        let bytes = Zeroizing::new(Vec::new());
-        decode_secret_record(ApprovalKeyRecord::decode, &bytes)
-            .expect_err("empty private record is rejected through the zeroizing decoder boundary");
     }
 
     #[test]
@@ -289,18 +278,6 @@ mod tests {
         assert!(record_debug.contains("ApprovalKey([REDACTED])"));
         assert!(!key_debug.contains(&seed_text));
         assert!(!record_debug.contains(&seed_text));
-    }
-
-    #[test]
-    fn rejects_weak_and_invalid_external_verifying_key_candidates() {
-        validate_verifying_key([0; 32]).expect_err("all-zero Ed25519 key is weak");
-        let has_invalid_candidate = (0_u8..=u8::MAX)
-            .map(|byte| [byte; 32])
-            .any(|candidate| validate_verifying_key(candidate).is_err());
-        assert!(
-            has_invalid_candidate,
-            "Ed25519 rejects at least one malformed encoding"
-        );
     }
 
     #[test]

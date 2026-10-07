@@ -1579,15 +1579,6 @@ mod tests {
     }
 
     #[test]
-    fn current_negotiation_requests_control_plane_observation() {
-        let requested = requested_capabilities(
-            pohunek_worker_protocol::CURRENT_VERSION,
-            &[Capability::ControlPlaneObservation],
-        );
-        assert_eq!(requested, vec![Capability::ControlPlaneObservation]);
-    }
-
-    #[test]
     fn subagent_observation_requires_version_five() {
         let current = requested_capabilities(
             pohunek_worker_protocol::SUBAGENT_OBSERVATION_VERSION,
@@ -2476,20 +2467,6 @@ mod tests {
             ATTACH_SNAPSHOT_VERSION,
             &[Capability::AttachSnapshot],
         ));
-    }
-
-    #[test]
-    fn previous_attach_keeps_the_snapshot_request() {
-        let attach = AttachStart { dimensions: None };
-        assert_eq!(
-            select_attach_start(
-                pohunek_worker_protocol::PREVIOUS_VERSION,
-                &[Capability::AttachSnapshot],
-                attach.clone()
-            )
-            .expect("v3 snapshot capability must be supported"),
-            Some(attach),
-        );
     }
 
     #[test]

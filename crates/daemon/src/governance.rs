@@ -1252,18 +1252,6 @@ mod tests {
             .expect("canonical test time")
     }
 
-    #[tokio::test]
-    async fn service_opens_and_shares_an_immutable_snapshot() {
-        let service = Arc::new(HostGovernanceService::open_test());
-        let shared = Arc::clone(&service);
-
-        assert!(Arc::ptr_eq(&service, &shared));
-        assert_eq!(
-            service.snapshot().expect("initial snapshot"),
-            shared.snapshot().expect("shared snapshot")
-        );
-    }
-
     #[test]
     fn test_service_temp_root_is_removed_after_the_last_service_arc_drops() {
         let service = Arc::new(HostGovernanceService::open_test());

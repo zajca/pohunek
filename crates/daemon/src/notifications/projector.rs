@@ -210,18 +210,6 @@ struct ProjectorState {
 }
 
 impl ProjectorState {
-    #[cfg(test)]
-    fn handle_event(
-        &mut self,
-        notifications: &NotificationService,
-        attention: &AttentionCoordinator,
-        event: &Event,
-    ) {
-        for pending in self.pending_event(notifications, attention, event) {
-            create_pending_notification(notifications, attention, pending);
-        }
-    }
-
     async fn handle_event_blocking(
         &mut self,
         notifications: &NotificationService,
@@ -486,26 +474,6 @@ struct PendingNotification {
     session_id: SessionId,
     kind: NotificationKind,
     params: NotificationCreateParams,
-}
-
-#[cfg(test)]
-fn create_pending_notification(
-    notifications: &NotificationService,
-    attention: &AttentionCoordinator,
-    pending: PendingNotification,
-) {
-    if is_debounced_create(pending.kind, pending.params.dedupe_key.as_deref()) {
-        defer_pending_notification(notifications, attention, pending);
-        return;
-    }
-    if let Err(err) = notifications.create(pending.params) {
-        warn!(
-            error = %err,
-            session_id = %pending.session_id.0,
-            kind = pending.kind.as_str(),
-            "failed to create derived notification"
-        );
-    }
 }
 
 async fn create_pending_notification_blocking(
@@ -822,11 +790,13 @@ mod tests {
         let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Blocked),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
         settle().await;
         assert!(
             list(&service).is_empty(),
@@ -858,22 +828,26 @@ mod tests {
         let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Blocked),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
         settle().await;
         assert!(
             list(&service).is_empty(),
             "the derived agent_blocked notification is still pending"
         );
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Working),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Working),
+            )
+            .await;
         settle().await;
         advance_past_debounce().await;
         settle().await;
@@ -900,11 +874,13 @@ mod tests {
         assert_eq!(created[0].kind, NotificationKind::ApprovalRequired);
         assert_eq!(created[0].status, NotificationStatus::Unread);
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Working),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Working),
+            )
+            .await;
         settle().await;
 
         let resolved = list(&service);
@@ -921,11 +897,13 @@ mod tests {
         service
             .create(provider_approval_params("s-1"))
             .expect("create provider approval notification");
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Idle),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Idle),
+            )
+            .await;
         settle().await;
 
         let active = list(&service);
@@ -948,11 +926,13 @@ mod tests {
         assert_eq!(created[0].kind, NotificationKind::TurnCompleted);
         assert_eq!(created[0].status, NotificationStatus::Unread);
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Working),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Working),
+            )
+            .await;
         settle().await;
 
         let resolved = list(&service);
@@ -966,21 +946,27 @@ mod tests {
         let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Blocked),
-        );
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Blocked),
-        );
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Blocked),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
         settle().await;
         advance_past_debounce().await;
         settle().await;
@@ -997,11 +983,13 @@ mod tests {
             .expect("provider create");
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Blocked),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
         settle().await;
         advance_past_debounce().await;
         settle().await;
@@ -1013,20 +1001,22 @@ mod tests {
         assert_eq!(notifications[0].source.provider, "codex");
     }
 
-    #[test]
-    fn failed_session_update_creates_error_with_exit_code() {
+    #[tokio::test]
+    async fn failed_session_update_creates_error_with_exit_code() {
         let service = service("failed");
         let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &session_event(
-                event::SESSION_UPDATED,
-                &session_info("s-1", SessionState::Failed, Some(42)),
-            ),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(
+                    event::SESSION_UPDATED,
+                    &session_info("s-1", SessionState::Failed, Some(42)),
+                ),
+            )
+            .await;
 
         let notifications = list(&service);
         assert_eq!(notifications.len(), 1);
@@ -1045,21 +1035,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn done_session_update_creates_session_finished_when_policy_enabled() {
+    #[tokio::test]
+    async fn done_session_update_creates_session_finished_when_policy_enabled() {
         let service = service("done-enabled");
         enable_session_finished(&service);
         let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &session_event(
-                event::SESSION_UPDATED,
-                &session_info("s-1", SessionState::Done, Some(0)),
-            ),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(
+                    event::SESSION_UPDATED,
+                    &session_info("s-1", SessionState::Done, Some(0)),
+                ),
+            )
+            .await;
 
         let notifications = list(&service);
         assert_eq!(notifications.len(), 1);
@@ -1071,46 +1063,52 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stopped_session_events_do_not_create_error_notifications() {
+    #[tokio::test]
+    async fn stopped_session_events_do_not_create_error_notifications() {
         let service = service("stopped");
         let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &session_event(
-                event::SESSION_STOPPED,
-                &session_info("s-1", SessionState::Stopped, None),
-            ),
-        );
-        projector.handle_event(
-            &service,
-            &attention,
-            &session_event(
-                event::SESSION_UPDATED,
-                &session_info("s-2", SessionState::Stopped, None),
-            ),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(
+                    event::SESSION_STOPPED,
+                    &session_info("s-1", SessionState::Stopped, None),
+                ),
+            )
+            .await;
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(
+                    event::SESSION_UPDATED,
+                    &session_info("s-2", SessionState::Stopped, None),
+                ),
+            )
+            .await;
 
         assert!(list(&service).is_empty());
     }
 
-    #[test]
-    fn disabled_policy_kinds_do_not_create_records() {
+    #[tokio::test]
+    async fn disabled_policy_kinds_do_not_create_records() {
         let service = service("done-disabled");
         let attention = AttentionCoordinator::disconnected();
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &session_event(
-                event::SESSION_UPDATED,
-                &session_info("s-1", SessionState::Done, Some(0)),
-            ),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &session_event(
+                    event::SESSION_UPDATED,
+                    &session_info("s-1", SessionState::Done, Some(0)),
+                ),
+            )
+            .await;
 
         assert!(list(&service).is_empty());
     }
@@ -1121,11 +1119,13 @@ mod tests {
         let (attention, _task) = AttentionCoordinator::spawn(service.clone());
         let mut projector = ProjectorState::default();
 
-        projector.handle_event(
-            &service,
-            &attention,
-            &agent_state_event("s-1", AgentActivity::Blocked),
-        );
+        projector
+            .handle_event_blocking(
+                &service,
+                &attention,
+                &agent_state_event("s-1", AgentActivity::Blocked),
+            )
+            .await;
         settle().await;
         advance_past_debounce().await;
         settle().await;

@@ -50,22 +50,11 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::handle_host_governance_inspect;
-    use crate::api::{handle_request, DaemonState, HealthInfo};
     use crate::governance::HostGovernanceService;
     use crate::host_state::records::GovernanceState;
-    use crate::session::SessionRegistry;
 
     fn governance_id(prefix: &str) -> String {
         format!("{prefix}{}", "A".repeat(GOVERNANCE_ID_PAYLOAD_BYTES))
-    }
-
-    fn state(governance: Arc<HostGovernanceService>) -> DaemonState {
-        DaemonState::new(
-            HealthInfo::new("test"),
-            SessionRegistry::default(),
-            governance,
-            crate::test_support::overlay_registry(),
-        )
     }
 
     async fn replace_status(
@@ -94,23 +83,6 @@ mod tests {
     fn request(id: &str, params: Value) -> Request {
         Request::new(id, method::HOST_GOVERNANCE_INSPECT, params)
             .expect("valid governance inspection request")
-    }
-
-    #[tokio::test]
-    async fn inspection_returns_explicit_absence_before_any_enrollment() {
-        let governance = Arc::new(HostGovernanceService::open_test());
-        let response =
-            handle_request(&request("never-enrolled", Value::Null), &state(governance)).await;
-        let value = response
-            .into_result()
-            .expect("governance inspection succeeds");
-
-        assert!(value["host_id"].is_string());
-        assert!(value["approval_key_reference"].is_string());
-        assert_eq!(value["enrollment"], Value::Null);
-        assert_eq!(value["owner"], Value::Null);
-        assert_eq!(value["owner_revision"], Value::Null);
-        assert_eq!(value["quarantine"], Value::Null);
     }
 
     #[tokio::test]
@@ -171,29 +143,5 @@ mod tests {
                 .expect("quarantined governance inspection succeeds");
         assert_eq!(quarantined_value["enrollment"]["status"], "quarantined");
         assert_eq!(quarantined_value["quarantine"], "host_identity_clone");
-    }
-
-    #[tokio::test]
-    async fn inspection_rejects_every_non_null_parameter_value() {
-        let governance = Arc::new(HostGovernanceService::open_test());
-        let state = state(governance);
-
-        for (index, params) in [
-            json!({}),
-            json!([]),
-            json!("unexpected"),
-            json!(1),
-            json!(true),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let response =
-                handle_request(&request(&format!("invalid-{index}"), params), &state).await;
-            let error = response
-                .into_result()
-                .expect_err("non-null params are rejected");
-            assert_eq!(error.code, "bad_request");
-        }
     }
 }

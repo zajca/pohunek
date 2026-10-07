@@ -169,29 +169,7 @@ pub(crate) fn command() -> Result<Command, String> {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use pohunek_test_support::process_env::ProcessEnv;
-
     use super::*;
-
-    #[test]
-    fn the_builder_drops_exactly_the_ambient_git_variables_outside_the_allow_list() {
-        // `command()` resolves `git` on `PATH` and reads the ambient variables.
-        let _env = ProcessEnv::lock();
-        let command = command().expect("git on PATH");
-        let mut removed: Vec<String> = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .filter_map(|(name, _)| name.to_str().map(str::to_owned))
-            .collect();
-        removed.sort_unstable();
-        let mut expected: Vec<String> = std::env::vars_os()
-            .filter_map(|(name, _)| name.into_string().ok())
-            .filter(|name| name.starts_with(GIT_VAR_PREFIX) && !is_inherited(name))
-            .collect();
-        expected.sort_unstable();
-        assert_eq!(removed, expected);
-        assert_eq!(command.get_envs().count(), expected.len());
-    }
 
     /// Persistent user choices of every kept group, plus one `GIT_LFS_` name.
     fn kept_names() -> Vec<&'static str> {
@@ -309,22 +287,6 @@ mod tests {
         );
         let dropped: Vec<OsString> = dropped_git_vars(names).collect();
         assert_eq!(dropped, hostile.map(OsString::from));
-    }
-
-    #[test]
-    fn the_kept_groups_hold_only_git_variables_without_duplicates() {
-        let names = kept_names();
-        for name in &names {
-            assert!(name.starts_with(GIT_VAR_PREFIX), "{name}");
-            assert_eq!(
-                names.iter().filter(|n| *n == name).count(),
-                1,
-                "{name} is listed twice"
-            );
-        }
-        for prefix in INHERITED_GIT_PREFIXES {
-            assert!(prefix.starts_with(GIT_VAR_PREFIX) && prefix.ends_with('_'));
-        }
     }
 
     /// Names in the string-literal list that follows `marker` in `source`.

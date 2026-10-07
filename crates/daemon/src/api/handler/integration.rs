@@ -175,30 +175,8 @@ pub(super) async fn handle_integration_status(request: &Request, state: &DaemonS
     .await
 }
 
-/// Run integration installation off the Tokio request task.
-///
-/// Test helper for the join path; the handler runs the install through
-/// `SessionRegistry::integration_install`.
-///
-/// A blocking-task panic becomes a typed daemon error. The helper is exposed to
-/// handler tests that assert the join path.
-#[cfg(test)]
-pub(super) async fn run_integration_install_blocking<F>(request: &Request, op: F) -> Response
-where
-    F: FnOnce() -> Result<protocol::IntegrationInstallResult, ProtocolError> + Send + 'static,
-{
-    super::util::run_blocking(
-        request,
-        op,
-        "integration_install_task_panicked",
-        "integration installation task panicked",
-        Some("retry the request; if it repeats, inspect daemon logs"),
-    )
-    .await
-}
-
 /// Run filesystem inspection off the Tokio request task and map a task panic to
-/// a typed daemon error. Exposed to handler tests that assert the join path.
+/// a typed daemon error.
 pub(super) async fn run_integration_status_blocking<F>(request: &Request, op: F) -> Response
 where
     F: FnOnce() -> Result<IntegrationStatusResult, ProtocolError> + Send + 'static,

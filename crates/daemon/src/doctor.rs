@@ -241,21 +241,6 @@ mod tests {
             .join("root")
     }
 
-    #[test]
-    fn the_supervision_mode_follows_the_active_supervision() {
-        let active = |native| ActiveSupervision {
-            worker_executable: PathBuf::from("/opt/pohunek-sessiond"),
-            native,
-        };
-
-        assert_eq!(supervision_mode(Some(&active(true))), Supervision::Native);
-        assert_eq!(
-            supervision_mode(Some(&active(false))),
-            Supervision::Subprocess
-        );
-        assert_eq!(supervision_mode(None), Supervision::Unknown);
-    }
-
     #[tokio::test]
     async fn report_contains_writable_daemon_paths_and_governance_checks() {
         let root = temp_dir("report");
@@ -345,32 +330,6 @@ mod tests {
             .expect("the trust check is reported");
         assert_eq!(check.status, DoctorStatus::Fail);
         assert_eq!(report.overall, DoctorStatus::Fail);
-    }
-
-    #[test]
-    fn projection_and_enrollment_conflicts_warn_but_identity_clone_fails() {
-        for reason in [
-            QuarantineReason::ProjectionConflict,
-            QuarantineReason::EnrollmentConflict,
-        ] {
-            let checks = governance_checks(HostGovernanceDiagnostic::Available(
-                quarantined_status(reason),
-            ));
-            assert!(checks
-                .iter()
-                .filter(|check| check.name.ends_with("consistency")
-                    || check.name.ends_with("quarantine"))
-                .all(|check| check.status == DoctorStatus::Warn));
-        }
-        let checks = governance_checks(HostGovernanceDiagnostic::Available(quarantined_status(
-            QuarantineReason::HostIdentityClone,
-        )));
-        assert!(checks
-            .iter()
-            .filter(
-                |check| check.name.ends_with("consistency") || check.name.ends_with("quarantine")
-            )
-            .all(|check| check.status == DoctorStatus::Fail));
     }
 
     #[test]

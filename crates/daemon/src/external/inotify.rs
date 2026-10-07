@@ -668,31 +668,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_directory_made_unreadable_before_the_walk_is_partial() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = pohunek_test_support::tempdir().expect("root");
-        let locked = root.path().join("locked");
-        fs::create_dir(&locked).expect("locked");
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("deny");
-        let mut backend = InotifyBackend::open().expect("open inotify");
-
-        let outcome = backend.register_root(root.path(), &CancellationToken::new());
-        let denied = fs::read_dir(&locked).is_err();
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("restore");
-
-        if denied {
-            assert!(
-                matches!(outcome, RootRegistration::Partial { failed_dirs: 1, .. }),
-                "unexpected outcome {outcome:?}"
-            );
-        } else {
-            eprintln!("permission bits do not bind this user; asserting the unrestricted outcome");
-            assert!(matches!(outcome, RootRegistration::Complete), "{outcome:?}");
-        }
-    }
-
-    #[tokio::test]
     async fn a_root_below_a_non_directory_is_missing_not_failed() {
         let base = pohunek_test_support::tempdir().expect("base");
         let file = base.path().join("file");

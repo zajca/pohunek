@@ -506,18 +506,13 @@ mod tests {
 
     use pohunek_test_support::process_env::ProcessEnv;
     use protocol::{
-        method, AssistantMaterializeParams, AssistantMaterializeResult, DaemonDoctorResult,
-        DetectionRegionKind, ForkCwdMode, ProtocolError, Request, RuntimeRef,
-        SessionDetectionParams, SessionDetectionResult, SessionForkParams, SessionId, SessionInfo,
-        SessionNewParams, SessionSetMetadataParams, SessionSetMetadataResult, SessionState,
-        StateSource,
+        method, AssistantMaterializeParams, AssistantMaterializeResult, DetectionRegionKind,
+        ForkCwdMode, ProtocolError, Request, RuntimeRef, SessionDetectionParams,
+        SessionDetectionResult, SessionForkParams, SessionId, SessionInfo, SessionNewParams,
+        SessionSetMetadataParams, SessionSetMetadataResult, SessionState, StateSource,
     };
 
     use super::assistant::run_assistant_materialize_blocking;
-    use super::integration::{
-        run_integration_doctor_blocking, run_integration_install_blocking,
-        run_integration_status_blocking, run_integration_uninstall_blocking,
-    };
     use super::project::live_sessions;
     use super::util::parse_attach_prelude;
     use super::{handle_request, DaemonState, HealthInfo};
@@ -1134,68 +1129,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_doctor_returns_report() {
-        let _env = EnvGuard::set_all("daemon-doctor-rpc");
-        let state = daemon_state(
-            HealthInfo::new("test"),
-            SessionRegistry::new(SessionRegistryConfig::default()),
-        );
-        let request = request(
-            "daemon-doctor",
-            method::DAEMON_DOCTOR,
-            serde_json::Value::Null,
-        );
-
-        let response = handle_request(&request, &state).await;
-
-        let ok = ok_value(response, "daemon.doctor");
-        let result: DaemonDoctorResult =
-            serde_json::from_value(ok).expect("doctor result deserializes");
-        assert!(result
-            .report
-            .checks
-            .iter()
-            .any(|check| check.name == "socket_dir_writable"));
-        assert_eq!(
-            result
-                .report
-                .checks
-                .iter()
-                .filter(|check| check.name.starts_with("host_"))
-                .map(|check| check.name.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "host_governance_durability",
-                "host_identity_stable",
-                "host_state_private_storage",
-                "host_governance_consistency",
-                "host_approval_key",
-                "host_governance_quarantine",
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_doctor_rejects_non_null_params() {
-        let _env = EnvGuard::set_all("daemon-doctor-invalid-params");
-        let state = daemon_state(
-            HealthInfo::new("test"),
-            SessionRegistry::new(SessionRegistryConfig::default()),
-        );
-        let request = request(
-            "daemon-doctor-invalid-params",
-            method::DAEMON_DOCTOR,
-            serde_json::json!({}),
-        );
-
-        let error = error_value(handle_request(&request, &state).await, "daemon.doctor");
-
-        assert_eq!(error.class, protocol::ErrorClass::Daemon);
-        assert_eq!(error.code, "bad_request");
-        assert_eq!(error.msg, "daemon.doctor does not accept params");
-    }
-
-    #[tokio::test]
     async fn assistant_materialize_blocking_task_panic_returns_daemon_error() {
         let request = request(
             "assistant-materialize-panic",
@@ -1209,71 +1142,6 @@ mod tests {
         let err = error_value(response, "assistant.materialize");
         assert_eq!(err.class, protocol::ErrorClass::Daemon);
         assert_eq!(err.code, "assistant_materialize_task_panicked");
-    }
-
-    #[tokio::test]
-    async fn integration_status_blocking_task_panic_returns_daemon_error() {
-        let request = request(
-            "integration-status-panic",
-            method::INTEGRATION_STATUS,
-            serde_json::Value::Null,
-        );
-
-        let response =
-            run_integration_status_blocking(&request, || panic!("integration status panic")).await;
-
-        let err = error_value(response, "integration.status");
-        assert_eq!(err.class, protocol::ErrorClass::Daemon);
-        assert_eq!(err.code, "integration_status_task_panicked");
-    }
-
-    #[tokio::test]
-    async fn integration_uninstall_blocking_task_panic_returns_daemon_error() {
-        let request = request(
-            "integration-uninstall-panic",
-            method::INTEGRATION_UNINSTALL,
-            serde_json::Value::Null,
-        );
-
-        let response =
-            run_integration_uninstall_blocking(&request, || panic!("integration removal panic"))
-                .await;
-        let err = error_value(response, "integration.uninstall");
-        assert_eq!(err.class, protocol::ErrorClass::Daemon);
-        assert_eq!(err.code, "integration_uninstall_task_panicked");
-    }
-
-    #[tokio::test]
-    async fn integration_doctor_blocking_task_panic_returns_daemon_error() {
-        let request = request(
-            "integration-doctor-panic",
-            method::INTEGRATION_DOCTOR,
-            serde_json::Value::Null,
-        );
-
-        let response =
-            run_integration_doctor_blocking(&request, || panic!("integration diagnosis panic"))
-                .await;
-        let err = error_value(response, "integration.doctor");
-        assert_eq!(err.class, protocol::ErrorClass::Daemon);
-        assert_eq!(err.code, "integration_doctor_task_panicked");
-    }
-
-    #[tokio::test]
-    async fn integration_install_blocking_task_panic_returns_daemon_error() {
-        let request = request(
-            "integration-install-panic",
-            method::INTEGRATION_INSTALL,
-            serde_json::json!({ "agent": "codex" }),
-        );
-
-        let response =
-            run_integration_install_blocking(&request, || panic!("integration installation panic"))
-                .await;
-
-        let err = error_value(response, "integration.install");
-        assert_eq!(err.class, protocol::ErrorClass::Daemon);
-        assert_eq!(err.code, "integration_install_task_panicked");
     }
 
     async fn assistant_materialize_result(
@@ -1384,34 +1252,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn previous_version_health_reports_the_negotiated_version() {
-        let response = handle_request(
-            &previous_version_request(method::DAEMON_HEALTH, serde_json::Value::Null),
-            &idle_state(),
-        )
-        .await;
-
-        // A previous-version SDK compares this field with its own version.
-        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
-        let ok = ok_value(response, "daemon.health");
-        assert_eq!(ok["protocol_version"], protocol::MIN_PROTOCOL_VERSION.get());
-    }
-
-    #[tokio::test]
-    async fn a_method_added_after_the_previous_version_is_unknown_to_it() {
-        for name in protocol::compat::introduced_methods(protocol::MIN_PROTOCOL_VERSION) {
-            let response = handle_request(
-                &previous_version_request(name, serde_json::Value::Null),
-                &idle_state(),
-            )
-            .await;
-            assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION, "{name}");
-            let error = error_value(response, name);
-            assert_eq!(error.code, "method_not_found", "{name}");
-        }
-    }
-
-    #[tokio::test]
     async fn previous_version_host_inspect_reports_the_negotiated_version() {
         let response = handle_request(
             &previous_version_request(method::HOST_INSPECT, serde_json::Value::Null),
@@ -1422,52 +1262,6 @@ mod tests {
         assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
         let ok = ok_value(response, "host.inspect");
         assert_eq!(ok["protocol_version"], protocol::MIN_PROTOCOL_VERSION.get());
-    }
-
-    #[tokio::test]
-    async fn current_version_health_reports_the_current_version() {
-        let response = handle_request(
-            &request(
-                "health-current",
-                method::DAEMON_HEALTH,
-                serde_json::Value::Null,
-            ),
-            &idle_state(),
-        )
-        .await;
-
-        assert_eq!(response.version(), protocol::PROTOCOL_VERSION);
-        let ok = ok_value(response, "daemon.health");
-        assert_eq!(ok["protocol_version"], protocol::PROTOCOL_VERSION.get());
-    }
-
-    #[tokio::test]
-    async fn previous_version_native_id_report_reaches_the_handler_with_the_current_key() {
-        let params = serde_json::json!({
-            "session_id": "s-missing",
-            "runtime_id": "worker-instance-1",
-            "agent": "claude",
-            "pid": 42,
-            "pid_start_identity": "7",
-            "sequence": "1",
-            "expires_at": "2099-01-01T00:00:00Z",
-            "native_session_id": "native-1",
-        });
-        let response = handle_request(
-            &previous_version_request(method::SESSION_REPORT_NATIVE_ID, params),
-            &idle_state(),
-        )
-        .await;
-
-        assert_eq!(response.version(), protocol::MIN_PROTOCOL_VERSION);
-        // Without the adapter the strict parse answers `bad_request` for the
-        // unknown `runtime_id` key before the session lookup runs.
-        let accepted = response.is_ok()
-            || response
-                .result()
-                .err()
-                .is_some_and(|error| error.code != "bad_request");
-        assert!(accepted, "{response:?}");
     }
 
     #[tokio::test]

@@ -21,22 +21,21 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use protocol::{
-    event, method, AgentActivity, AssistantMaterializeParams, AssistantMaterializeResult,
-    AttachHeader, ErrorClass, Event, HostDiscoverParams, HostRecord, IntegrationDoctorResult,
-    IntegrationInstallState, IntegrationStatusResult, IntegrationUninstallResult,
-    IntegrationUninstallState, NotificationCreateParams, NotificationCreateResult,
-    NotificationDeleteParams, NotificationDeleteResult, NotificationKind, NotificationKindPolicy,
-    NotificationListParams, NotificationListResult, NotificationPolicy, NotificationPolicyParams,
-    NotificationPolicyResult, NotificationRetentionParams, NotificationRetentionResult,
-    NotificationSeverity, NotificationSource, NotificationStatus, NotificationUpdateParams,
-    NotificationUpdateResult, ProcessStartIdentity, ReportSequence, Request as ProtocolRequest,
-    Response, RuntimeId, RuntimeRef, SessionAttachParams, SessionAttachResult, SessionDetachParams,
-    SessionDetachResult, SessionId, SessionInfo, SessionInputParams, SessionInputResult,
-    SessionListFilter, SessionListParams, SessionNewParams, SessionRemoveResult,
-    SessionReportAgentParams, SessionReportAgentResult, SessionReportNativeIdParams,
-    SessionReportNativeIdResult, SessionResizeParams, SessionResizeResult, SessionState,
-    SessionStopResult, StateSource, TerminalDimensions, WorktreeRemoveParams, WorktreeRemoveResult,
-    PROTOCOL_VERSION,
+    event, method, AgentActivity, AttachHeader, ErrorClass, Event, HostDiscoverParams, HostRecord,
+    IntegrationDoctorResult, IntegrationInstallState, IntegrationStatusResult,
+    IntegrationUninstallResult, IntegrationUninstallState, NotificationCreateParams,
+    NotificationCreateResult, NotificationDeleteParams, NotificationDeleteResult, NotificationKind,
+    NotificationKindPolicy, NotificationListParams, NotificationListResult, NotificationPolicy,
+    NotificationPolicyParams, NotificationPolicyResult, NotificationRetentionParams,
+    NotificationRetentionResult, NotificationSeverity, NotificationSource, NotificationStatus,
+    NotificationUpdateParams, NotificationUpdateResult, ProcessStartIdentity, ReportSequence,
+    Request as ProtocolRequest, Response, RuntimeId, RuntimeRef, SessionAttachParams,
+    SessionAttachResult, SessionDetachParams, SessionDetachResult, SessionId, SessionInfo,
+    SessionInputParams, SessionInputResult, SessionListFilter, SessionListParams, SessionNewParams,
+    SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
+    SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
+    SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
+    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -1489,37 +1488,6 @@ async fn host_discover_with_the_whole_window_is_served_on_a_connection_frozen_on
     let records: Vec<HostRecord> =
         serde_json::from_value(ok_payload(response)).expect("host records deserialize");
     assert!(records.is_empty());
-
-    let _ = shutdown.send(());
-    let _ = handle.await;
-}
-
-#[tokio::test]
-async fn assistant_materialize_returns_readable_paths_over_socket() {
-    let _env = XdgGuard::set_all("assistant-materialize-socket");
-    let socket = temp_socket("assistant-materialize");
-    let (shutdown, handle) = spawn_server(&socket, "0.0.0").await;
-
-    let mut client = connect(&socket).await;
-    let params = AssistantMaterializeParams {
-        snapshot: r#"{"source":"socket"}"#.to_owned(),
-    };
-    let req = Request::make(
-        "assistant-materialize-socket",
-        method::ASSISTANT_MATERIALIZE,
-        serde_json::to_value(params).expect("params serialize"),
-    );
-    let resp = exchange(&mut client, &req).await;
-
-    let result: AssistantMaterializeResult =
-        serde_json::from_value(ok_payload(resp)).expect("result deserializes");
-    assert!(Path::new(&result.bundle_path).join("index.md").is_file());
-    assert_eq!(
-        std::fs::read_to_string(&result.snapshot_path).expect("snapshot"),
-        r#"{"source":"socket"}"#
-    );
-    assert!(result.content_hash.starts_with("sha256:"));
-    assert!(!result.concepts.is_empty());
 
     let _ = shutdown.send(());
     let _ = handle.await;

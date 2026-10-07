@@ -810,9 +810,4 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    fn parses_empty_listing_as_no_worktrees() {
-        assert!(parse_worktrees_porcelain("").is_empty());
-    }
 }

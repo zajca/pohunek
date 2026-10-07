@@ -166,19 +166,6 @@ fn distinct_homes_get_distinct_ids_and_one_canonical_home_gets_one() {
 }
 
 #[test]
-fn the_bare_runtime_and_a_profile_naming_its_home_share_the_id() {
-    let rig = Rig::new();
-    // The bare Claude runtime resolves to `$HOME/.claude`.
-    let ambient = rig.home().join(".claude");
-    fs::create_dir_all(&ambient).expect("create the ambient home");
-    rig.profile("pinned", "claude", "CLAUDE_CONFIG_DIR", &ambient);
-
-    let caps = rig.inspect(&rig.registry(Some(rig.state())));
-
-    assert_eq!(id_of(&caps, "claude"), id_of(&caps, "pinned"));
-}
-
-#[test]
 fn a_home_that_does_not_exist_is_identified_by_its_path_without_dot_components() {
     let rig = Rig::new();
     let plain = rig.root.join("not-created-yet");

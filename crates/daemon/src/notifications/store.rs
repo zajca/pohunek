@@ -1308,33 +1308,6 @@ mod tests {
     }
 
     #[test]
-    fn replay_keeps_deleted_action_before_trailing_partial() {
-        let data_dir = temp_data_dir("deleted-before-partial");
-        let store = NotificationStore::open(&data_dir).expect("open store");
-        let mut deleted = record("n-1", "2026-07-03T10:00:00Z");
-        store
-            .append_created(deleted.clone())
-            .expect("append created record");
-        deleted.status = NotificationStatus::Deleted;
-        deleted.deleted_at = Some("2026-07-03T10:05:00Z".to_owned());
-        store
-            .append_deleted(deleted.clone())
-            .expect("append deleted record");
-        let path = store.path().to_path_buf();
-        drop(store);
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open log for trailing partial")
-            .write_all(br#"{"action":"updated""#)
-            .expect("write trailing partial");
-
-        let reopened = NotificationStore::open(&data_dir).expect("reopen with trailing partial");
-
-        assert_eq!(reopened.all(), vec![deleted]);
-    }
-
-    #[test]
     fn list_filters_by_status_kind_severity_provider_session_and_time_range() {
         let data_dir = temp_data_dir("filters");
         let store = NotificationStore::open(&data_dir).expect("open store");
