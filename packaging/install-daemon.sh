@@ -633,9 +633,10 @@ fi
 # the ones this release embeds.
 if [ "$status" -eq 0 ]; then
     echo "next: check the agent hook assets against this release with" >&2
-    echo "\`pohunek integration doctor\`, and reinstall each agent it reports as" >&2
-    echo "outdated with \`pohunek integration install --agent <agent>\` (add" >&2
-    echo "\`--profile <name>\` for a host profile's home; Hermes: \`pohunek integration" >&2
-    echo "install --agent hermes\` with its target flags)" >&2
+    echo "\`pohunek integration doctor\`, and reinstall each Claude or Codex agent it" >&2
+    echo "reports as outdated with \`pohunek integration install --agent <agent>\`" >&2
+    echo "(add \`--profile <name>\` for a host profile's home)" >&2
+    echo "for an outdated Hermes plugin run \`pohunek integration update --agent hermes\`" >&2
+    echo "with the \`--hermes-profile\` or \`--hermes-home\` it was installed with" >&2
 fi
 exit "$status"

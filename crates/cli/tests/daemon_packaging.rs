@@ -32,8 +32,24 @@ fn assert_hook_asset_next_steps(output: &Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("pohunek integration doctor"), "{stderr}");
     assert!(
-        stderr.contains("pohunek integration install --agent <agent>"),
+        stderr.contains("pohunek integration install --agent <agent>`"),
         "{stderr}"
+    );
+    // Hermes install needs --access-mode and --allow-host, so an existing
+    // plugin is brought current with `update`, which keeps the installed policy.
+    assert!(
+        stderr.contains(
+            "for an outdated Hermes plugin run `pohunek integration update --agent hermes`"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`--hermes-profile` or `--hermes-home`"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("integration install --agent hermes"),
+        "the Hermes recommendation must not name the install action: {stderr}"
     );
 }
 
