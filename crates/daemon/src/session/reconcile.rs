@@ -9673,6 +9673,65 @@ handler = "codex-hook-v1"
             .expect("nesting admits the release");
     }
 
+    #[test]
+    fn an_active_identity_reference_kind_outside_the_hook_schema_is_rejected() {
+        use pohunek_worker_protocol::{HookAction, HookSchema, ReferenceKind};
+
+        // Every shipped schema admits both kinds, so only a schema narrower
+        // than the registry's reaches the reference-kind filter.
+        static BOTH_KINDS: HookSchema = HookSchema {
+            id: "reference-kinds-test",
+            handlers: &[],
+            identity_providers: &["codex", "claude"],
+            subagent_providers: &[],
+            actions: &[HookAction::IdentityReport],
+            reference_kinds: &[ReferenceKind::Id, ReferenceKind::Path],
+            ancestry: AncestryMatcher::ManagedPtyDescendant,
+            nested_active: true,
+            subagent_fields: &[],
+            subagent_sequence: None,
+        };
+        static ID_ONLY: HookSchema = HookSchema {
+            reference_kinds: &[ReferenceKind::Id],
+            ..BOTH_KINDS
+        };
+        static PATH_ONLY: HookSchema = HookSchema {
+            reference_kinds: &[ReferenceKind::Path],
+            ..BOTH_KINDS
+        };
+
+        for (kind, reference, excluding) in [
+            ("id", "nested-native", &PATH_ONLY),
+            ("path", "/home/operator/.claude/nested.jsonl", &ID_ONLY),
+        ] {
+            let mut snapshot = identity_snapshot("launch-native");
+            // Without a launch claim the active identity is the only input
+            // that can change the record.
+            snapshot.launch_identity = None;
+            let claim = snapshot.active_identity.as_mut().expect("active identity");
+            claim.reference_kind = Some(kind.to_owned());
+            claim.native_reference = Some(reference.to_owned());
+
+            let mut record = identity_record();
+            let original = record.clone();
+            assert_eq!(
+                apply_worker_identities_with(&mut record, &snapshot, Ok(Some(excluding)))
+                    .map(|_projection| ()),
+                Err("active_identity_reference_kind_invalid"),
+                "{kind:?} is outside {:?}",
+                excluding.reference_kinds
+            );
+            assert_eq!(
+                record, original,
+                "a rejected {kind:?} claim changes nothing"
+            );
+
+            apply_worker_identities_with(&mut record, &snapshot, Ok(Some(&BOTH_KINDS)))
+                .unwrap_or_else(|reason| panic!("{kind:?} is admitted by both kinds: {reason}"));
+            assert_eq!(record.info.active_agent.as_deref(), Some("claude"));
+        }
+    }
+
     /// A minimal legacy-manifest session snapshot, as `pohunek migration
     /// preflight` would have captured it: no runtime yet (the daemon fills
     /// that in on import) and just enough fields for `import_legacy_manifest`
