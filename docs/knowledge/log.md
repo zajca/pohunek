@@ -1,5 +1,15 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-07, stop and remove need no runtime definition)
+
+- `session.stop` and `session.remove` no longer require the session's agent
+  runtime to resolve, so the owner can end the worker of and delete a session
+  whose runtime is not installed or whose recorded kind is a historical label.
+  Resume, fork, input and every other mutation stay refused with
+  `runtime_not_installed` or `agent_kind_unsupported`; external sessions stay
+  read-only. The public API reference and the agent-profiles concept page state
+  the rule.
+
 ## Unreleased (2026-10-07, package test daemons use the test-host process view)
 
 - The shared package test harness builds its daemon with

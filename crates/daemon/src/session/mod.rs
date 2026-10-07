@@ -2950,6 +2950,18 @@ impl SessionRegistry {
         self.ensure_mutable_kinds(&info, &pin)
     }
 
+    /// Records `agent_base` as the session's runtime so a test can make a live
+    /// session's runtime unresolvable.
+    #[cfg(test)]
+    pub(crate) async fn set_agent_base_for_test(&self, id: &SessionId, agent_base: RuntimeRef) {
+        let mut sessions = self.inner.sessions.lock().await;
+        sessions
+            .get_mut(id)
+            .expect("the session is registered")
+            .info
+            .agent_base = agent_base;
+    }
+
     #[cfg(test)]
     pub(super) async fn record_cwd_hint(&self, id: &SessionId, path: String) {
         self.record_cwd_hint_scoped(id, path, None).await;
@@ -3241,11 +3253,15 @@ impl SessionRegistry {
 
     /// Stop a running session.
     ///
+    /// A session whose agent runtime is not installed (or whose recorded kind
+    /// is not a runtime id) can still be stopped: ending the worker needs only
+    /// the recorded worker identity, never the runtime definition.
+    ///
     /// A session whose runtime is unavailable is refused before any durable
     /// write, except a `conflict` whose recorded worker is journal-proven: its
     /// supervised job is stopped by that recorded identity.
     pub async fn stop(&self, id: &SessionId) -> Result<SessionStopResult, ProtocolError> {
-        self.ensure_not_external(id).await?;
+        self.ensure_not_external_session(id).await?;
         let _guard = self.lock_lifecycle(id).await;
         if let Some(stopped) = self.stop_unavailable_runtime(id).await? {
             return Ok(stopped);
@@ -3264,7 +3280,7 @@ impl SessionRegistry {
         desired_state: DesiredState,
         transaction_kind: TransactionKind,
     ) -> Result<SessionStopResult, ProtocolError> {
-        self.ensure_not_external(id).await?;
+        self.ensure_not_external_session(id).await?;
         let sequence = self.inner.next_write_id.fetch_add(1, Ordering::Relaxed);
         let operation = match transaction_kind {
             TransactionKind::Stop => "stop",
@@ -3517,7 +3533,7 @@ impl SessionRegistry {
         id: &SessionId,
         cleanup: UnconfirmedCleanup,
     ) -> Result<SessionRemoveResult, ProtocolError> {
-        self.ensure_not_external(id).await?;
+        self.ensure_not_external_session(id).await?;
         let _guard = self.lock_lifecycle(id).await;
         let should_stop = {
             let sessions = self.inner.sessions.lock().await;
@@ -4478,10 +4494,24 @@ impl SessionRegistry {
         }
     }
 
-    async fn ensure_not_external(&self, id: &SessionId) -> Result<(), ProtocolError> {
+    /// Rejects a mutation of an external (observed, not owned) session.
+    ///
+    /// Stop and remove use this guard alone: they release what a session
+    /// already owns and never launch, resume, fork or write input, so they do
+    /// not need its agent runtime to resolve.
+    ///
+    /// # Errors
+    ///
+    /// Returns `session_external_read_only` for an external session.
+    async fn ensure_not_external_session(&self, id: &SessionId) -> Result<(), ProtocolError> {
         if self.inner.external.contains_id(id).await {
             return Err(session_external_read_only(id));
         }
+        Ok(())
+    }
+
+    async fn ensure_not_external(&self, id: &SessionId) -> Result<(), ProtocolError> {
+        self.ensure_not_external_session(id).await?;
         let sessions = self.inner.sessions.lock().await;
         if let Some(entry) = sessions.get(id) {
             self.ensure_mutable_kinds(&entry.info, &entry.snapshot.launch_binding)?;

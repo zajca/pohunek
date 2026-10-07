@@ -10289,6 +10289,123 @@ handler = "codex-hook-v1"
         );
     }
 
+    /// Persists the inert record of runtime `acme`, which no definition backs,
+    /// and returns the registry after startup reconciliation.
+    async fn inert_registry(root: &Path) -> (SessionRegistry, Store, SessionId) {
+        let data_dir = root.join("data");
+        create_private_dir(&data_dir);
+        let store = Store::new(data_dir.join("metadata.jsonl"));
+        let mut record = identity_record();
+        let kind = RuntimeRef::from_wire("acme");
+        record.info.agent = "acme".to_owned();
+        record.info.agent_base = kind.clone();
+        let recovery = record.recovery.as_mut().expect("recovery binding");
+        recovery.agent = "acme".to_owned();
+        recovery.agent_base = kind;
+        store.record_session(&record).expect("persist inert record");
+        let registry = empty_registry(root, &root.join("runtime/workers"));
+        Box::pin(registry.reconcile_workers())
+            .await
+            .expect("reconcile");
+        (registry, store, SessionId(record.session_id))
+    }
+
+    #[tokio::test]
+    async fn an_inert_session_is_removed_without_its_runtime_and_releases_its_record() {
+        let root = temp_root();
+        let (registry, store, id) = inert_registry(&root).await;
+        registry.inspect(&id).await.expect("the session is listed");
+
+        let removed = registry
+            .remove(&id)
+            .await
+            .expect("an uninstalled runtime does not block removal");
+
+        assert!(removed.removed);
+        registry
+            .inspect(&id)
+            .await
+            .expect_err("the removed session is no longer listed");
+        assert!(store.load_sessions().expect("load sessions").is_empty());
+        assert!(store.load_resume().expect("load resume").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_inert_session_stays_unlaunchable_and_unwritable() {
+        let root = temp_root();
+        let (registry, store, id) = inert_registry(&root).await;
+        let before = std::fs::read(root.join("data/metadata.jsonl")).expect("read store");
+
+        let resume = registry.resume(&id).await.expect_err("resume is refused");
+        assert_eq!(resume.code, "runtime_not_installed");
+        let fork = registry
+            .fork(protocol::SessionForkParams {
+                session_id: id.clone(),
+                name: None,
+                cwd_mode: protocol::ForkCwdMode::default(),
+                cols: 80,
+                rows: 24,
+                accept_profile_change: false,
+            })
+            .await
+            .expect_err("fork is refused");
+        assert_eq!(fork.code, "runtime_not_installed");
+        let input = registry
+            .input(protocol::SessionInputParams {
+                session_id: id.clone(),
+                text: "x".to_owned(),
+                wait: None,
+            })
+            .await
+            .expect_err("input is refused");
+        assert_eq!(input.code, "runtime_not_installed");
+
+        assert_eq!(
+            std::fs::read(root.join("data/metadata.jsonl")).expect("read store"),
+            before,
+            "refused operations write nothing"
+        );
+        assert_eq!(store.load_sessions().expect("load sessions").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_live_worker_and_an_uninstalled_runtime_is_stopped_then_removed() {
+        let root = temp_root();
+        let data_dir = root.join("data");
+        create_private_dir(&data_dir);
+        let registry = launching_registry(&root, &root.join("runtime/workers"));
+        let created = registry
+            .create(shell_params(&root))
+            .await
+            .expect("create a live session");
+        registry
+            .set_agent_base_for_test(&created.id, RuntimeRef::from_wire("acme"))
+            .await;
+        registry
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: "x".to_owned(),
+                wait: None,
+            })
+            .await
+            .expect_err("input to an uninstalled runtime is refused");
+
+        let stopped = registry
+            .stop(&created.id)
+            .await
+            .expect("the worker is stopped without its runtime definition");
+        assert!(stopped.stopped);
+        let removed = registry
+            .remove(&created.id)
+            .await
+            .expect("the stopped session is removed");
+        assert!(removed.removed);
+        registry
+            .inspect(&created.id)
+            .await
+            .expect_err("the removed session is gone");
+    }
+
     /// A plain-shell `session.new` launched in `cwd`.
     fn shell_params(cwd: &Path) -> SessionNewParams {
         SessionNewParams {

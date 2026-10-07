@@ -316,7 +316,15 @@ async fn handle_negotiated(
         .expect("deserialized request ids satisfy response validation");
     }
 
-    if let Some(target) = mutation_target(request) {
+    // Stop and remove release what a session owns and need no resolvable
+    // runtime; the registry refuses an external session itself.
+    let releases_only = matches!(
+        request.method(),
+        method::SESSION_STOP
+            | method::SESSION_REMOVE
+            | method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
+    );
+    if let Some(target) = mutation_target(request).filter(|_| !releases_only) {
         if let Err(error) = state.sessions.ensure_known_agent(target).await {
             return Response::err(selected_version, request.id(), error)
                 .expect("deserialized request ids satisfy response validation");
@@ -704,6 +712,89 @@ mod tests {
             let error = error_value(handle_request(&request, &state).await, method);
             assert_ne!(error.code, "plugin_self_target_denied", "method {method}");
         }
+    }
+
+    /// Creates a live shell session whose recorded runtime has no definition.
+    async fn inert_live_session(sessions: &SessionRegistry) -> SessionId {
+        let cwd = pohunek_test_support::tempdir().expect("create the session working directory");
+        let created = sessions
+            .create(SessionNewParams {
+                agent: "shell".to_owned(),
+                name: None,
+                cwd: Some(cwd.path().to_path_buf()),
+                cols: 80,
+                rows: 24,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create session");
+        sessions
+            .set_agent_base_for_test(&created.id, RuntimeRef::from_wire("acme"))
+            .await;
+        created.id
+    }
+
+    #[tokio::test]
+    async fn stop_and_remove_dispatch_release_a_session_whose_runtime_is_not_installed() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
+            ..SessionRegistryConfig::default()
+        });
+        let id = inert_live_session(&sessions).await;
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
+
+        let input = request(
+            "inert-input",
+            method::SESSION_INPUT,
+            serde_json::json!({"session_id": id, "text": "x"}),
+        );
+        let refused = error_value(handle_request(&input, &state).await, "session.input");
+        assert_eq!(refused.code, "runtime_not_installed");
+
+        let stop = request("inert-stop", method::SESSION_STOP, serde_json::json!(id));
+        let stopped = ok_value(handle_request(&stop, &state).await, "session.stop");
+        assert_eq!(stopped["stopped"], true);
+
+        let remove = request(
+            "inert-remove",
+            method::SESSION_REMOVE,
+            serde_json::json!(id),
+        );
+        let removed = ok_value(handle_request(&remove, &state).await, "session.remove");
+        assert_eq!(removed["removed"], true);
+        sessions
+            .inspect(&id)
+            .await
+            .expect_err("the session is gone");
+    }
+
+    #[tokio::test]
+    async fn remove_dispatch_of_a_live_session_with_an_uninstalled_runtime_stops_its_worker() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
+            ..SessionRegistryConfig::default()
+        });
+        let id = inert_live_session(&sessions).await;
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
+
+        let remove = request(
+            "inert-remove",
+            method::SESSION_REMOVE,
+            serde_json::json!(id),
+        );
+        let removed = ok_value(handle_request(&remove, &state).await, "session.remove");
+
+        assert_eq!(removed["removed"], true);
+        assert_eq!(removed["stopped"], true);
+        sessions
+            .inspect(&id)
+            .await
+            .expect_err("the session is gone");
     }
 
     #[tokio::test]
