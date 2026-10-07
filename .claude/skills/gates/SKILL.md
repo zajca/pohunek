@@ -57,9 +57,13 @@ change can affect daemon/worker behavior.
 
 1. Run each command in order. Stop reporting a step as green only after it
    exits 0.
-2. If a step fails, capture the failing output, fix the cause (or delegate the
-   fix), and re-run the whole set — do not skip a step because it "passed last
-   time".
+2. If a step fails, capture the failing output and fix the cause (or delegate
+   the fix). Re-run the failed step and every step whose inputs the fix
+   changed; a step whose inputs are unchanged keeps its result, and a fix to
+   workspace-wide inputs (`Cargo.toml`, `Cargo.lock`, `.config/nextest.toml`,
+   the CI workflow) re-runs the whole set. The reported set must hold for the
+   final revision: every step's evidence was produced on inputs identical to
+   it (AGENTS.md "Testing policy").
 3. Report a compact status per gate (pass / fail + first failing lines, or
    explicitly skipped with why). Say plainly what actually ran. If all pass,
    say so plainly; if any fail or were skipped, say which and why, with output.

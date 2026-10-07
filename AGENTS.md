@@ -355,8 +355,9 @@ with `cargo xtask ts generate`.
 
 ## Fast loops
 
-Start from a fast loop, not from the full gate set; run the full gates once
-before declaring work done. A warm local timing is not CI evidence: per-shard
+Start from a fast loop, not from the full gate set; run the applicable full
+gate set once, on the final revision, before declaring work done (see "Testing
+policy"). A warm local timing is not CI evidence: per-shard
 JUnit artifacts and `scripts/ci-timings` (which also derives job wall clock,
 JUnit execution time, and sccache/rust-cache hit rates from `gh` run data) are
 the measurement path behind
@@ -656,6 +657,66 @@ Suppress a verified `cargo shear` false positive with
 Note `knowledge` gates its protocol bridge behind a `protocol`
 feature — `--all-features` only covers the everything-on case.
 
+## Testing policy
+
+A test earns its place by protecting externally meaningful behavior that a
+regression could break. There is no line or branch coverage target, no minimum
+test count, and no rule that every function, utility, or change gets its own
+unit test. This policy is the project rule for pohunek in every agent client: it
+takes precedence over personal global instructions that ask for tests for all
+new code (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`), and it is how this
+repository reads the vendored Rust guidelines' call for test coverage over
+observable behavior — behavioral scenarios, not a percentage. The durability,
+security, compatibility, timing, flaky, and hermetic obligations elsewhere in
+this file are unchanged.
+
+- **Test a component through its supported boundary.** Exercise a coherent
+  component (a registry, store, worker, parser, request handler, CLI command)
+  through the interface its callers use, in-process with hermetic dependencies
+  where that works. Extend an existing scenario before adding a per-helper
+  test. A slow full-system test is not the default substitute for a unit test.
+- **Expected results are independent of the code under test.** They come from
+  a specification, an independent fixture, a published recording, or a
+  demonstrated regression — never regenerated from the output of the change
+  under test to make it pass.
+- **Do not write low-value tests.** No tests that restate trivial getters,
+  setters, defaults, labels, or forwarding wrappers, that repeat another test's
+  assertion, or that are self-roundtrips adding no distinct contract or failure
+  signal.
+- **Always keep a scenario for** recovery and concurrency, data migration and
+  persisted-schema guards, protocol compatibility (the N/N-1 window),
+  authorization, hostile input, secret redaction, filesystem and process
+  ownership, and native platform lifecycle. A small focused test can be exactly
+  the right granularity for these; size alone is never a reason to keep or to
+  delete a test.
+- **When a change needs a test:**
+  - a bug fix, and any lifecycle, durability, concurrency, or security fix, gets
+    a behavioral regression scenario that fails without the fix and passes with
+    it — in the component's existing scenario when one fits;
+  - new externally observable behavior (a command, flag, protocol method or
+    event, store transition, error contract) gets a scenario at its component
+    boundary;
+  - a trivial helper change needs no new unit test, and a refactor whose
+    behavior existing scenarios already cover needs no duplicate test — those
+    scenarios are its evidence.
+- **Removing tests.** Delete a low-value test without replacement when no
+  meaningful scenario is lost. Never shrink the suite by ignoring, filtering,
+  renaming, or moving tests, weakening assertions, dropping every negative case,
+  or adding retries, and never fold independently diagnosable behaviors into one
+  giant scenario. Coverage and mutation tooling are not part of this
+  repository's process. Test lists in historical plans and RFCs (`docs/design/`,
+  `docs/phases/`, `docs/superpowers/`) record what was planned then; they are
+  not mandates to add or recreate tests.
+
+Validation: while iterating, run the checks the change affects (`cargo t -p
+<crate>`, `cargo ta`, one test file, the relevant Bun, script, or docs check).
+Before declaring work done or publishing it, run the complete gate set from
+"Build, test, lint" that applies to the change once, on the final revision. A
+later fix re-runs the checks whose inputs it changed; a check whose inputs are
+unchanged keeps its evidence and does not restart, and any change to a check's
+inputs invalidates its earlier result. CI is the final landing evidence: a gate
+that cannot run locally is reported as CI-only, never as green.
+
 ## Coding conventions (project-specific)
 
 - **Rust guidelines are mandatory.** This repo follows the Microsoft Pragmatic
@@ -680,9 +741,11 @@ feature — `--all-features` only covers the everything-on case.
   error; types holding secrets get hand-written redacting `Debug`. Never read
   `.env*`, key/cert files, or print token values. Keep this posture.
 - **Shared logic goes in a library crate, not a binary.**
-- **Tests for all new logic.** Unit tests inline (`#[cfg(test)]`) for private
-  behavior; `tests/` for integration. The protocol/state machines have rich
-  test suites — extend them rather than adding untested branches.
+- **Tests follow the Testing policy above.** Component scenarios may live inline
+  (`#[cfg(test)]`) when they need private access, or in `tests/` when the public
+  boundary is enough; do not expose private APIs only to move a test. The
+  protocol and state-machine suites are the place to extend for behavior they
+  own.
 - **Keep the assistant knowledge bundle current.** `docs/knowledge/` is the
   hand-authored source for the Universal Pohunek Assistant (materialized via
   `assistant.materialize`). Whenever a change alters something the bundle
@@ -697,7 +760,8 @@ feature — `--all-features` only covers the everything-on case.
   hand-maintain generated shell scripts. Every command, subcommand, flag, or
   argument change must also review `crates/cli/src/completion.rs`, update any
   affected dynamic value completers (especially `--host` and session `target`
-  arguments), and extend completion/parser tests. Preserve the completion
+  arguments), and keep the completion scenarios current where the change adds
+  or alters completable behavior (see "Testing policy"). Preserve the completion
   safety contract: static generation performs no daemon or NetBird I/O, while
   dynamic lookups are opt-in, deadline-bounded, do not autostart the daemon, and
   fail silently. In the same change, update the CLI tables/examples in
@@ -758,7 +822,8 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
 - **Ship a stack of small sequential PRs, not one large PR.** Split the work
   into ordered slices, one coherent concern each, stacked branch on branch and
   landed bottom-up. Each PR is complete for its slice — builds, passes the
-  full gate set alone, has tests, updates `docs/knowledge/` for surfaces it
+  applicable full gate set alone, carries the behavioral scenarios its change
+  needs under "Testing policy", updates `docs/knowledge/` for surfaces it
   touches — with no stubs a later PR fills in; the stack as a whole delivers
   the full DoD, so slicing is not a PoC shortcut. The slice plan is recorded on
   the issue first. Size cue and mechanics: `pullRequests` in
@@ -767,15 +832,16 @@ PoC or imply that current direct-host execution is a hostile-workload sandbox.
   a `Co-Authored-By` trailer or any "generated with" footer.
 - Keep changes scoped. If you touch the wire protocol (`crates/protocol`), expect
   ripples in `client`, `daemon`, and `cli`, and into `docs/public-api.md` and the
-  `docs/knowledge/` bundle — update and test all. A non-additive wire change
+  `docs/knowledge/` bundle — update all of them and run their checks. A non-additive wire change
   (rename, moved field) bumps `PROTOCOL_VERSION`, adds the edge adapter for the
   version it leaves behind in `crates/protocol/src/compat/` with golden fixtures
   and consumer recordings produced by that release's own code, and deletes the
   oldest adapter in the same change. A semantic change (new required parameter,
   removed method or event, changed error code or meaning) cannot be adapted: it
   also raises `MIN_PROTOCOL_VERSION` and is announced as a break. A method added after the previous release is listed in the adapter's `INTRODUCED_METHODS` so older connections get `method_not_found`.
-- Run the full gate set above before declaring done. Report failures honestly
-  with output; never claim green without running it.
+- Run the applicable full gate set once on the final revision before declaring
+  done; iterate on affected checks in between (see "Testing policy"). Report
+  failures honestly with output; never claim green without running it.
 - When a task spans 3+ steps, plan first and verify after each major step.
 
 ## Accepted harness trade-offs (operator decisions)

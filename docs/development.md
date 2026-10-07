@@ -135,8 +135,10 @@ cargo xtask ts check      # CI gate
 - **Protocol ripples**: touching `crates/protocol` means updating `client`,
   `daemon`, `cli`, the generated TS types, `docs/public-api.md`,
   and the `docs/knowledge/` bundle in the same change.
-- **Tests for all new logic**; the protocol and state machines have rich
-  suites — extend them.
+- **Behavioral tests, not per-function tests** (AGENTS.md "Testing policy"):
+  a regression scenario for each bug or lifecycle fix, a component scenario for
+  new observable behavior, no coverage target. The protocol and state machines
+  have rich suites — extend them.
 
 ## Release
 
