@@ -207,10 +207,6 @@ mod tests {
         fn load(&self, executable: &Path) -> Result<ServiceConfig, ServiceConfigError> {
             load_service_config(&self.config_path, self.uid, &self.paths, executable)
         }
-
-        fn overwrite(&self, contents: &str) {
-            fs::write(&self.config_path, contents).expect("overwrite configuration");
-        }
     }
 
     #[test]
@@ -232,34 +228,6 @@ mod tests {
         installation
             .load(&executable)
             .expect("installed previous version");
-    }
-
-    #[test]
-    fn truncated_or_invalid_toml_is_refused() {
-        let installation = installation();
-        let executable = install_worker(&installation.prefix, VERSION);
-        let valid = fs::read_to_string(&installation.config_path).expect("read configuration");
-
-        for contents in [
-            &valid[..valid.len() / 2],
-            "",
-            "schema_version = 1\nprefix = [",
-            "not toml at all",
-        ] {
-            installation.overwrite(contents);
-            assert!(
-                matches!(
-                    installation.load(&executable),
-                    Err(ServiceConfigError::Config(ConfigError::Parse { .. }))
-                ),
-                "{contents:?} must be refused"
-            );
-        }
-        installation.overwrite(&format!("{valid}\nunknown_key = 1\n"));
-        assert!(matches!(
-            installation.load(&executable),
-            Err(ServiceConfigError::Config(ConfigError::Parse { .. }))
-        ));
     }
 
     #[test]

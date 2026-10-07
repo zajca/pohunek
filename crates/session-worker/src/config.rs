@@ -303,197 +303,145 @@ fn validate_duration(field: &'static str, value: Duration) -> Result<(), ConfigE
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, WorkerConfig};
+    use super::{
+        ConfigError, WorkerConfig, MAX_NOTIFICATION_FORWARD_TIMEOUT, MAX_NOTIFICATION_PARAMS_BYTES,
+        MAX_OBSERVATION_WAIT, MAX_PENDING_LAUNCH_CLAIMS, MAX_SUBSCRIBER_BYTES,
+    };
     use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
     use std::time::Duration;
 
-    #[test]
-    fn defaults_are_valid() {
-        WorkerConfig::new().validate().expect("valid defaults");
+    /// Returns the production policy with one field changed.
+    fn with(change: impl FnOnce(&mut WorkerConfig)) -> WorkerConfig {
+        let mut config = WorkerConfig::new();
+        change(&mut config);
+        config
     }
 
+    /// Zero or over-long durations are rejected by field name, and an inclusive
+    /// maximum is still accepted.
     #[test]
-    fn default_stop_grace_is_the_service_config_definition() {
-        assert_eq!(
-            WorkerConfig::new().stop_grace,
-            pohunek_service_config::DEFAULT_STOP_GRACE
-        );
+    fn unsafe_durations_are_rejected_by_field() {
+        let above_wait = MAX_OBSERVATION_WAIT + Duration::from_millis(1);
+        let above_forward = MAX_NOTIFICATION_FORWARD_TIMEOUT + Duration::from_millis(1);
+        let zero = |field| Err(ConfigError::Duration { field });
+        let cases = [
+            (
+                "zero stop grace",
+                with(|c| c.stop_grace = Duration::ZERO),
+                zero("stop_grace"),
+            ),
+            (
+                "zero post-exit drain timeout",
+                with(|c| c.post_exit_drain_timeout = Duration::ZERO),
+                zero("post_exit_drain_timeout"),
+            ),
+            (
+                "zero terminal commit wait timeout",
+                with(|c| c.terminal_commit_wait_timeout = Duration::ZERO),
+                zero("terminal_commit_wait_timeout"),
+            ),
+            (
+                "zero launch claim retry interval",
+                with(|c| c.launch_claim_retry_interval = Duration::ZERO),
+                zero("launch_claim_retry_interval"),
+            ),
+            (
+                "zero notification forward timeout",
+                with(|c| c.notification_forward_timeout = Duration::ZERO),
+                zero("notification_forward_timeout"),
+            ),
+            (
+                "observation wait at its maximum",
+                with(|c| c.max_observation_wait = MAX_OBSERVATION_WAIT),
+                Ok(()),
+            ),
+            (
+                "observation wait above its maximum",
+                with(|c| c.max_observation_wait = above_wait),
+                Err(ConfigError::DurationMaximum {
+                    field: "max_observation_wait",
+                    actual: above_wait,
+                    maximum: MAX_OBSERVATION_WAIT,
+                }),
+            ),
+            (
+                "notification forward timeout above its maximum",
+                with(|c| c.notification_forward_timeout = above_forward),
+                Err(ConfigError::DurationMaximum {
+                    field: "notification_forward_timeout",
+                    actual: above_forward,
+                    maximum: MAX_NOTIFICATION_FORWARD_TIMEOUT,
+                }),
+            ),
+        ];
+
+        for (label, config, expected) in cases {
+            assert_eq!(config.validate(), expected, "{label}");
+        }
     }
 
+    /// Zero or oversized byte budgets and counts are rejected by field name.
     #[test]
-    fn zero_duration_is_rejected() {
-        let config = WorkerConfig {
-            stop_grace: Duration::ZERO,
-            ..WorkerConfig::new()
-        };
-
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::Duration {
-                field: "stop_grace"
-            })
-        );
-    }
-
-    #[test]
-    fn zero_post_exit_drain_timeout_is_rejected() {
-        let config = WorkerConfig {
-            post_exit_drain_timeout: Duration::ZERO,
-            ..WorkerConfig::new()
-        };
-
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::Duration {
-                field: "post_exit_drain_timeout"
-            })
-        );
-    }
-
-    #[test]
-    fn zero_terminal_commit_wait_timeout_is_rejected() {
-        let config = WorkerConfig {
-            terminal_commit_wait_timeout: Duration::ZERO,
-            ..WorkerConfig::new()
-        };
-
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::Duration {
-                field: "terminal_commit_wait_timeout"
-            })
-        );
-    }
-
-    #[test]
-    fn zero_memory_budget_is_rejected() {
-        let config = WorkerConfig {
-            subscriber_bytes: 0,
-            ..WorkerConfig::new()
-        };
-
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::Bytes {
-                field: "subscriber_bytes",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn data_payload_cannot_exceed_wire_limit() {
-        let config = WorkerConfig {
-            data_payload_bytes: MAX_DATA_PAYLOAD_BYTES + 1,
-            ..WorkerConfig::new()
-        };
-
-        assert_eq!(
-            config.validate(),
-            Err(ConfigError::Bytes {
-                field: "data_payload_bytes",
-                actual: MAX_DATA_PAYLOAD_BYTES + 1,
-                maximum: MAX_DATA_PAYLOAD_BYTES,
-            })
-        );
-    }
-
-    #[test]
-    fn observation_wait_is_short_and_bounded() {
-        let exact = WorkerConfig {
-            max_observation_wait: Duration::from_secs(10),
-            ..WorkerConfig::new()
-        };
-        exact.validate().expect("exact wait maximum");
-
-        let above = WorkerConfig {
-            max_observation_wait: Duration::from_secs(10) + Duration::from_millis(1),
-            ..WorkerConfig::new()
-        };
-        assert!(matches!(
-            above.validate(),
-            Err(ConfigError::DurationMaximum {
-                field: "max_observation_wait",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn notification_forwarding_bounds_are_enforced() {
-        let zero = WorkerConfig {
-            notification_forward_timeout: Duration::ZERO,
-            ..WorkerConfig::new()
-        };
-        assert!(matches!(
-            zero.validate(),
-            Err(ConfigError::Duration {
-                field: "notification_forward_timeout"
-            })
-        ));
-        let too_long = WorkerConfig {
-            notification_forward_timeout: super::MAX_NOTIFICATION_FORWARD_TIMEOUT
-                + Duration::from_millis(1),
-            ..WorkerConfig::new()
-        };
-        assert!(matches!(
-            too_long.validate(),
-            Err(ConfigError::DurationMaximum {
-                field: "notification_forward_timeout",
-                ..
-            })
-        ));
-        let too_big = WorkerConfig {
-            max_notification_params_bytes: super::MAX_NOTIFICATION_PARAMS_BYTES + 1,
-            ..WorkerConfig::new()
-        };
-        assert!(matches!(
-            too_big.validate(),
-            Err(ConfigError::Bytes {
-                field: "max_notification_params_bytes",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn snapshot_bounds_are_nonzero() {
-        let config = WorkerConfig {
-            max_snapshot_rows: 0,
-            ..WorkerConfig::new()
-        };
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::Count {
-                field: "max_snapshot_rows",
-                ..
-            })
-        ));
-    }
-    #[test]
-    fn launch_claim_work_is_nonzero_and_capacity_bounded() {
-        let zero_interval = WorkerConfig {
-            launch_claim_retry_interval: Duration::ZERO,
-            ..WorkerConfig::new()
-        };
-        assert!(matches!(
-            zero_interval.validate(),
-            Err(ConfigError::Duration {
-                field: "launch_claim_retry_interval"
-            })
-        ));
-        for capacity in [0, super::MAX_PENDING_LAUNCH_CLAIMS + 1] {
-            let invalid = WorkerConfig {
-                pending_launch_claims: capacity,
-                ..WorkerConfig::new()
-            };
-            assert!(matches!(
-                invalid.validate(),
+    fn unsafe_byte_and_count_bounds_are_rejected_by_field() {
+        let cases = [
+            (
+                "zero subscriber memory budget",
+                with(|c| c.subscriber_bytes = 0),
+                Err(ConfigError::Bytes {
+                    field: "subscriber_bytes",
+                    actual: 0,
+                    maximum: MAX_SUBSCRIBER_BYTES,
+                }),
+            ),
+            (
+                "data payload above the wire limit",
+                with(|c| c.data_payload_bytes = MAX_DATA_PAYLOAD_BYTES + 1),
+                Err(ConfigError::Bytes {
+                    field: "data_payload_bytes",
+                    actual: MAX_DATA_PAYLOAD_BYTES + 1,
+                    maximum: MAX_DATA_PAYLOAD_BYTES,
+                }),
+            ),
+            (
+                "notification parameters above their maximum",
+                with(|c| c.max_notification_params_bytes = MAX_NOTIFICATION_PARAMS_BYTES + 1),
+                Err(ConfigError::Bytes {
+                    field: "max_notification_params_bytes",
+                    actual: MAX_NOTIFICATION_PARAMS_BYTES + 1,
+                    maximum: MAX_NOTIFICATION_PARAMS_BYTES,
+                }),
+            ),
+            (
+                "zero snapshot rows",
+                with(|c| c.max_snapshot_rows = 0),
+                Err(ConfigError::Count {
+                    field: "max_snapshot_rows",
+                    actual: 0,
+                    maximum: usize::from(u16::MAX),
+                }),
+            ),
+            (
+                "zero pending launch claims",
+                with(|c| c.pending_launch_claims = 0),
                 Err(ConfigError::Count {
                     field: "pending_launch_claims",
-                    ..
-                })
-            ));
+                    actual: 0,
+                    maximum: MAX_PENDING_LAUNCH_CLAIMS,
+                }),
+            ),
+            (
+                "pending launch claims above their maximum",
+                with(|c| c.pending_launch_claims = MAX_PENDING_LAUNCH_CLAIMS + 1),
+                Err(ConfigError::Count {
+                    field: "pending_launch_claims",
+                    actual: MAX_PENDING_LAUNCH_CLAIMS + 1,
+                    maximum: MAX_PENDING_LAUNCH_CLAIMS,
+                }),
+            ),
+        ];
+
+        for (label, config, expected) in cases {
+            assert_eq!(config.validate(), expected, "{label}");
         }
     }
 }

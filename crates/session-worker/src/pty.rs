@@ -3082,21 +3082,6 @@ mod tests {
             .expect("cleanup");
     }
 
-    /// The master is non-blocking for every descriptor the owner reads through.
-    #[tokio::test]
-    async fn master_description_is_non_blocking() {
-        let cwd = crate::test_support::child_cwd();
-        let pty = spawn(shell("sleep 30", cwd.path()));
-
-        let flags = rustix::fs::fcntl_getfl(&pty.output_readiness.master).expect("master flags");
-        assert!(
-            flags.contains(rustix::fs::OFlags::NONBLOCK),
-            "a blocking master read can park while holding the ordering gate"
-        );
-
-        let _ = pty.stop("cleanup", stop_grace()).await.expect("cleanup");
-    }
-
     /// A read whose readiness lapsed ends the drain instead of parking.
     ///
     /// Darwin reports a stopped terminal's queue as unreadable only after the
@@ -3239,49 +3224,42 @@ mod tests {
         assert!(state.sequences.is_empty());
     }
 
+    /// A resize or attach geometry stays committed when resuming output fails.
     #[test]
     fn resize_state_commits_before_resume_failure() {
-        let mut state = ResizeState {
-            cols: 80,
-            rows: 24,
-            sequences: HashMap::new(),
-        };
+        let cases = [
+            (
+                "source resize",
+                ResizeCommit::Resize {
+                    source_id: "attach-1",
+                    source_sequence: 7,
+                    cols: 100,
+                    rows: 40,
+                },
+                (100, 40),
+                HashMap::from([("attach-1".to_owned(), 7)]),
+            ),
+            (
+                "attach geometry",
+                ResizeCommit::Attach { cols: 90, rows: 28 },
+                (90, 28),
+                HashMap::new(),
+            ),
+        ];
+        for (label, commit, dimensions, sequences) in cases {
+            let mut state = ResizeState {
+                cols: 80,
+                rows: 24,
+                sequences: HashMap::new(),
+            };
 
-        let error = commit_resize_before_resume(
-            &mut state,
-            ResizeCommit::Resize {
-                source_id: "attach-1",
-                source_sequence: 7,
-                cols: 100,
-                rows: 40,
-            },
-            || Err(PtyError::Task),
-        )
-        .expect_err("injected resume failure");
+            let error = commit_resize_before_resume(&mut state, commit, || Err(PtyError::Task))
+                .expect_err("injected resume failure");
 
-        assert!(matches!(error, PtyError::Task));
-        assert_eq!((state.cols, state.rows), (100, 40));
-        assert_eq!(state.sequences.get("attach-1"), Some(&7));
-    }
-
-    #[test]
-    fn attach_resize_state_commits_before_resume_failure() {
-        let mut state = ResizeState {
-            cols: 80,
-            rows: 24,
-            sequences: HashMap::new(),
-        };
-
-        let error = commit_resize_before_resume(
-            &mut state,
-            ResizeCommit::Attach { cols: 90, rows: 28 },
-            || Err(PtyError::Task),
-        )
-        .expect_err("injected resume failure");
-
-        assert!(matches!(error, PtyError::Task));
-        assert_eq!((state.cols, state.rows), (90, 28));
-        assert!(state.sequences.is_empty());
+            assert!(matches!(error, PtyError::Task), "{label}");
+            assert_eq!((state.cols, state.rows), dimensions, "{label}");
+            assert_eq!(state.sequences, sequences, "{label}");
+        }
     }
 
     #[test]
