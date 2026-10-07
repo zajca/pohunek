@@ -348,7 +348,7 @@ esac"#,
         ],
     );
     let doctor_text = String::from_utf8_lossy(&outdated_doctor.stdout).into_owned()
-        + &String::from_utf8_lossy(&outdated_doctor.stderr);
+        + String::from_utf8_lossy(&outdated_doctor.stderr).as_ref();
     assert!(
         doctor_text.contains("asset_current"),
         "the doctor names the failing check: {doctor_text}"
