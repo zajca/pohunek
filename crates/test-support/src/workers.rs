@@ -28,6 +28,11 @@
 //! time of that PID is verified again (through a pidfd on Linux), so a PID that
 //! was recycled for an unrelated process is never signalled.
 //!
+//! The `ps` path cannot be exercised for paths with spaces by a live process on
+//! every platform, so those cases are covered by pure tests over captured
+//! `ps` lines (`parse_ps_line` into `command_is_worker_below`) that run on
+//! every platform; the live space, session and workload tests run on Linux only.
+//!
 //! [`TestEnv`](crate::env::TestEnv) owns a guard for its root. A test that
 //! builds its own root, for example with [`crate::tempdir_with_prefix`], wraps
 //! it with [`WorkerGuard::watch`] and declares the guard after the root so the
@@ -307,8 +312,11 @@ fn matched_worker(entry: &ProcessEntry, root: &Path) -> Option<WorkerProcess> {
 /// `/tmp/pw-s-ab` from owning a worker of `/tmp/pw-s-abc`.
 #[cfg(any(not(target_os = "linux"), test))]
 fn command_is_worker_below(command: &str, root: &Path) -> bool {
-    let names_worker = command.starts_with(WORKER_EXECUTABLE)
-        || command.contains(&format!("/{WORKER_EXECUTABLE}"));
+    let names_worker = [
+        command.starts_with(&format!("{WORKER_EXECUTABLE} ")),
+        command.contains(&format!("/{WORKER_EXECUTABLE} ")),
+    ]
+    .contains(&true);
     let marker = format!("{SOCKET_PATH_ARGUMENT} {}", root.display());
     names_worker
         && command
@@ -568,8 +576,8 @@ fn wait_for_none(root: &Path, limit: Duration) -> bool {
 ///
 /// Kills each worker's workload, sends the worker `SIGTERM`, then `SIGKILL` to
 /// whatever is still listed after
-/// [`TERMINATE_GRACE`], and returns once the process table shows none or after
-/// [`KILL_SETTLE`]. Every signal goes through [`signal_worker`], so only a
+/// `TERMINATE_GRACE`, and returns once the process table shows none or after
+/// `KILL_SETTLE`. Every signal goes through `signal_worker`, so only a
 /// process that still matches what was listed is signalled.
 ///
 /// # Errors
@@ -749,6 +757,24 @@ mod tests {
         }
     }
 
+    /// An entry shaped like the process table of the platform: separate arguments
+    /// where `/proc` provides them, the complete command as one string where it
+    /// comes from `ps` (see [`parse_ps_line`]).
+    fn table_entry(executable: &str, arguments: &[&str]) -> ProcessEntry {
+        if cfg!(target_os = "linux") {
+            entry(executable, arguments)
+        } else {
+            let command = std::iter::once(executable)
+                .chain(arguments.iter().copied())
+                .collect::<Vec<_>>()
+                .join(" ");
+            ProcessEntry {
+                argv: vec![OsString::from(command)],
+                ..entry(executable, &[])
+            }
+        }
+    }
+
     /// Starts a stand-in worker that is a direct child of this process, with
     /// its control socket below `root`.
     fn spawn_child_worker(root: &Path) -> Child {
@@ -834,7 +860,7 @@ mod tests {
         ))
         .expect("worker");
         assert_eq!(worker.socket_path, Path::new("/tmp/pw s/r/daemon.sock"));
-        let entries = [entry(
+        let entries = [table_entry(
             "/home/a b/target/pohunek-sessiond",
             &["--daemon-socket-path", "/tmp/pw s/r/daemon.sock"],
         )];
@@ -878,11 +904,11 @@ mod tests {
 
     #[test]
     fn a_root_owns_only_the_workers_below_it() {
-        let inside = entry(
+        let inside = table_entry(
             "/w/pohunek-sessiond",
             &["--daemon-socket-path", "/tmp/pw-s-abc/d.sock"],
         );
-        let sibling = entry(
+        let sibling = table_entry(
             "/w/pohunek-sessiond",
             &["--daemon-socket-path", "/tmp/pw-s-abcd/d.sock"],
         );
@@ -1121,6 +1147,34 @@ mod tests {
             Path::new("/private/tmp/pw")
         ));
         assert_eq!(parse_ps_line("1 2 Wed Oct  7 22:06:00 2026"), None);
+    }
+
+    #[test]
+    fn the_text_matcher_needs_the_executable_name_and_a_path_boundary() {
+        let command = |socket: &str| {
+            format!(
+                "/w/target/debug/pohunek-sessiond --session-id s-1 --daemon-socket-path {socket}"
+            )
+        };
+        let root = Path::new("/tmp/pw-s-abc");
+        assert!(command_is_worker_below(
+            &command("/tmp/pw-s-abc/d.sock"),
+            root
+        ));
+        assert!(!command_is_worker_below(
+            &command("/tmp/pw-s-abcd/d.sock"),
+            root
+        ));
+        assert!(!command_is_worker_below(&command("/tmp/pw-s-abc"), root));
+        assert!(!command_is_worker_below(
+            "/bin/sh script.sh --daemon-socket-path /tmp/pw-s-abc/d.sock",
+            root
+        ));
+        // A stand-in started as `/bin/sh <script>` names no worker executable.
+        assert!(!command_is_worker_below(
+            "/bin/sh /tmp/pohunek-sessiond-fake --daemon-socket-path /tmp/pw-s-abc/d.sock",
+            root
+        ));
     }
 
     #[test]
