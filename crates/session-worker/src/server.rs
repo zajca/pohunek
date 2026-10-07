@@ -4813,15 +4813,16 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        authorize_control_request, await_observation_page, capabilities, control_input_id,
-        event_visible_to_connection, identity_sequence_is_fresh, mark_running_subagents_lost,
-        observation_timed_out, redeem_data_grant, serve_stream_data, signal_number, start_subagent,
-        stop_subagent, valid_identity_expiry, validate_attach_write_id, validate_data_start,
-        validate_observation_request, validate_terminal_snapshot_dimensions,
-        validate_terminal_snapshot_response, write_data_error, write_observation_page,
-        write_output_chunks, write_runtime_output_event, write_terminal_chunks, Connection,
-        ControlInputId, DataGrant, ObservationGrant, ObservationWaitOutcome, PrefixStream,
-        TokenState, WireTerminalSnapshot, ATTACH_INPUT_PREFIX,
+        admit_hook, authorize_control_request, await_observation_page, capabilities,
+        control_input_id, event_visible_to_connection, identity_sequence_is_fresh,
+        mark_running_subagents_lost, observation_timed_out, redeem_data_grant, serve_stream_data,
+        signal_number, start_subagent, stop_subagent, valid_identity_expiry,
+        validate_attach_write_id, validate_data_start, validate_observation_request,
+        validate_terminal_snapshot_dimensions, validate_terminal_snapshot_response,
+        write_data_error, write_observation_page, write_output_chunks, write_runtime_output_event,
+        write_terminal_chunks, Connection, ControlInputId, DataGrant, ObservationGrant,
+        ObservationWaitOutcome, PrefixStream, TokenState, WireTerminalSnapshot,
+        ATTACH_INPUT_PREFIX,
     };
     use pohunek_worker_protocol::{
         self as protocol, AttachStart, Capability, ControlCode, ControlError, ControlMessage,
@@ -4833,6 +4834,7 @@ mod tests {
     use tokio::sync::watch;
     use tokio_util::sync::CancellationToken;
 
+    use crate::identity::RejectReason;
     use crate::journal::SubagentPhase;
     use crate::{ChildIdentity, JournalRecord, ReleasedIdentity};
 
@@ -5576,6 +5578,95 @@ mod tests {
             .await
             .unwrap();
         drop(server);
+    }
+
+    #[test]
+    fn identity_provider_allowlist_is_exact() {
+        let schema = protocol::hook_schema("identity-subagent-v1");
+        for provider in ["shell", "codex", "claude", "hermes"] {
+            assert!(
+                admit_hook(schema, HookAction::IdentityReport, provider, Some("codex")).is_ok(),
+                "{provider} must be accepted"
+            );
+        }
+
+        for provider in ["", "Hermes", "HERMES", "hermes ", "unknown"] {
+            assert_eq!(
+                admit_hook(schema, HookAction::IdentityReport, provider, Some("codex")).err(),
+                Some(RejectReason::ProviderNotAllowed),
+                "{provider:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_admission_follows_the_schema_per_action() {
+        let identity = protocol::hook_schema("identity-v1");
+        let subagent = protocol::hook_schema("identity-subagent-v1");
+        for action in [HookAction::SubagentStart, HookAction::SubagentStop] {
+            assert_eq!(
+                admit_hook(identity, action, "codex", Some("hermes")).err(),
+                Some(RejectReason::ActionNotAllowed),
+                "a schema without subagents refuses {action}"
+            );
+            for provider in ["codex", "claude"] {
+                admit_hook(subagent, action, provider, Some("shell"))
+                    .expect("a subagent provider is admitted");
+            }
+            for provider in ["shell", "hermes", ""] {
+                assert_eq!(
+                    admit_hook(subagent, action, provider, Some("shell")).err(),
+                    Some(RejectReason::ProviderNotAllowed),
+                    "{provider:?} is not a subagent provider"
+                );
+            }
+        }
+        for action in [
+            HookAction::IdentityReport,
+            HookAction::IdentityRelease,
+            HookAction::SubagentStart,
+            HookAction::SubagentStop,
+            HookAction::Notification,
+        ] {
+            assert_eq!(
+                admit_hook(None, action, "codex", Some("codex")).err(),
+                Some(RejectReason::ActionNotAllowed),
+                "a runtime without a schema admits no {action}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_switching_disabled_pins_identity_reports_to_the_launch_runtime() {
+        static PINNED: protocol::HookSchema = protocol::HookSchema {
+            id: "pinned-test",
+            handlers: &[],
+            identity_providers: &["hermes", "codex"],
+            subagent_providers: &[],
+            actions: &[HookAction::IdentityReport],
+            reference_kinds: &[],
+            ancestry: protocol::AncestryMatcher::ManagedPtyDescendant,
+            nested_active: false,
+            subagent_fields: &[],
+            subagent_sequence: None,
+        };
+        admit_hook(
+            Some(&PINNED),
+            HookAction::IdentityReport,
+            "hermes",
+            Some("hermes"),
+        )
+        .expect("the launch runtime itself is admitted");
+        assert_eq!(
+            admit_hook(
+                Some(&PINNED),
+                HookAction::IdentityReport,
+                "codex",
+                Some("hermes")
+            )
+            .err(),
+            Some(RejectReason::ProviderNotAllowed)
+        );
     }
 
     #[test]

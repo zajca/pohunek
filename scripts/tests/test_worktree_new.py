@@ -38,7 +38,7 @@ HANDSHAKE_TIMEOUT_SECONDS = 10
 BASE_COMMIT = "1" * 40
 OTHER_COMMIT = "2" * 40
 # Name prefix of a worktree that is still at its temporary path.
-TEMP_PREFIX = worktree_new.TEMP_WORKTREE_PREFIX
+TEMP_PREFIX = ".worktree-new-"
 # Name prefix of this run's temporary branch for the slug `issue-1`.
 TEMP_BRANCH = "zajca/worktree-new-tmp-issue-1-"
 # Committer time of the last `Cargo.lock` commit on the fake base, and the
@@ -1077,6 +1077,9 @@ class PlainGitRaceTests(HarnessCase):
 
 
 class TemporaryPathTests(HarnessCase):
+    def test_prefix_matches_the_script(self):
+        self.assertEqual(TEMP_PREFIX, worktree_new.TEMP_WORKTREE_PREFIX)
+
     def test_success_leaves_only_the_final_worktree(self):
         seen = []
         self.h.executor.on_copy = lambda source, dest: seen.append(dest)
