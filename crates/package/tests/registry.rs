@@ -405,8 +405,8 @@ fn uninstall_refuses_a_modified_root_and_unrecords_a_missing_one() {
     assert!(registry.state().unwrap().packages().is_empty());
 }
 
-/// Installs `sample` selected, tampers with it through `tamper` and returns
-/// the registry state before the removal.
+/// Installs `sample` selected, tampers with its root directory through
+/// `tamper` and returns the registry state before the removal.
 fn tampered(
     fixture: &PluginFixture,
     sample: &Sample,
@@ -419,86 +419,65 @@ fn tampered(
             ..request(sample)
         })
         .unwrap();
-    tamper(&fixture.root(&sample.digest).join("files"));
+    tamper(&fixture.root(&sample.digest));
     registry.state().unwrap()
 }
 
-fn assert_removed_as_modified(fixture: &PluginFixture, sample: &Sample, before_generation: u64) {
-    let registry = fixture.open();
-    let generation = registry
-        .remove_modified(&sample.digest, &no_references())
-        .unwrap();
-    assert_eq!(generation, before_generation + 1, "one commit");
-    let state = registry.state().unwrap();
-    assert_eq!(state.generation(), generation);
-    assert!(state.package(&sample.digest).is_none());
-    assert_eq!(state.selected(&sample.identity.id), None);
-    assert!(!fixture.root(&sample.digest).exists());
-    assert!(names(&fixture.packages())
-        .iter()
-        .all(|name| !name.starts_with('.')));
-}
+/// Edits an installed root directory in place.
+type Tamper = fn(&std::path::Path);
 
 #[test]
-fn remove_modified_removes_a_root_with_changed_content() {
-    let fixture = PluginFixture::new();
-    let sample = sample();
-    let before = tampered(&fixture, &sample, |files| {
-        std::fs::write(files.join("LICENSE"), b"GPL\n").unwrap();
-    });
-    assert_removed_as_modified(&fixture, &sample, before.generation());
-}
+fn remove_modified_removes_a_root_with_any_kind_of_modification() {
+    let modifications: [(&str, Tamper); 5] = [
+        ("changed content", |root| {
+            std::fs::write(root.join("files/LICENSE"), b"GPL\n").unwrap();
+        }),
+        ("added file and directory", |root| {
+            std::fs::write(root.join("files/detect/extra.toml"), b"x").unwrap();
+            std::fs::create_dir(root.join("files/surplus")).unwrap();
+            std::fs::write(root.join("files/surplus/inner"), b"x").unwrap();
+        }),
+        ("changed mode", |root| {
+            set_mode(&root.join("files/LICENSE"), 0o644);
+        }),
+        ("missing file", |root| {
+            std::fs::remove_file(root.join("files/LICENSE")).unwrap();
+        }),
+        ("changed manifest", |root| {
+            let manifest = root.join("manifest.json");
+            let text = std::fs::read_to_string(&manifest).unwrap();
+            std::fs::write(&manifest, format!("{text} ")).unwrap();
+        }),
+    ];
+    for (label, tamper) in modifications {
+        let fixture = PluginFixture::new();
+        let sample = sample();
+        let before = tampered(&fixture, &sample, tamper);
+        let registry = fixture.open();
+        assert!(
+            matches!(
+                registry.verify(&sample.digest).unwrap_err(),
+                RegistryError::RootInvalid(_)
+            ),
+            "{label}"
+        );
 
-#[test]
-fn remove_modified_removes_a_root_with_an_added_file() {
-    let fixture = PluginFixture::new();
-    let sample = sample();
-    let before = tampered(&fixture, &sample, |files| {
-        std::fs::write(files.join("detect/extra.toml"), b"x").unwrap();
-        std::fs::create_dir(files.join("surplus")).unwrap();
-        std::fs::write(files.join("surplus/inner"), b"x").unwrap();
-    });
-    assert_removed_as_modified(&fixture, &sample, before.generation());
-}
-
-#[test]
-fn remove_modified_removes_a_root_with_a_changed_mode() {
-    let fixture = PluginFixture::new();
-    let sample = sample();
-    let before = tampered(&fixture, &sample, |files| {
-        set_mode(&files.join("LICENSE"), 0o644);
-    });
-    assert_removed_as_modified(&fixture, &sample, before.generation());
-}
-
-#[test]
-fn remove_modified_removes_a_root_with_a_missing_file() {
-    let fixture = PluginFixture::new();
-    let sample = sample();
-    let before = tampered(&fixture, &sample, |files| {
-        std::fs::remove_file(files.join("LICENSE")).unwrap();
-    });
-    assert_removed_as_modified(&fixture, &sample, before.generation());
-}
-
-#[test]
-fn remove_modified_removes_a_root_with_a_changed_manifest() {
-    let fixture = PluginFixture::new();
-    let sample = sample();
-    let registry = fixture.open();
-    registry.install(&request(&sample)).unwrap();
-    let manifest = fixture.root(&sample.digest).join("manifest.json");
-    let text = std::fs::read_to_string(&manifest).unwrap();
-    std::fs::write(&manifest, format!("{text} ")).unwrap();
-    assert!(matches!(
-        registry.verify(&sample.digest).unwrap_err(),
-        RegistryError::RootInvalid(_)
-    ));
-
-    registry
-        .remove_modified(&sample.digest, &no_references())
-        .unwrap();
-    assert!(!fixture.root(&sample.digest).exists());
+        let generation = registry
+            .remove_modified(&sample.digest, &no_references())
+            .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        assert_eq!(generation, before.generation() + 1, "{label}: one commit");
+        let state = registry.state().unwrap();
+        assert_eq!(state.generation(), generation, "{label}");
+        assert!(state.package(&sample.digest).is_none(), "{label}");
+        assert_eq!(state.selected(&sample.identity.id), None, "{label}");
+        assert!(!fixture.root(&sample.digest).exists(), "{label}");
+        assert!(
+            names(&fixture.packages())
+                .iter()
+                .all(|name| !name.starts_with('.')),
+            "{label}: no residue"
+        );
+    }
 }
 
 #[test]
@@ -532,8 +511,8 @@ fn remove_modified_refuses_a_root_that_verifies_or_is_missing() {
 fn remove_modified_refuses_a_retained_root_and_leaves_it_untouched() {
     let fixture = PluginFixture::new();
     let sample = sample();
-    let before = tampered(&fixture, &sample, |files| {
-        std::fs::write(files.join("LICENSE"), b"GPL\n").unwrap();
+    let before = tampered(&fixture, &sample, |root| {
+        std::fs::write(root.join("files/LICENSE"), b"GPL\n").unwrap();
     });
     let registry = fixture.open();
     let retained: RetainedDigests = [sample.digest.clone()].into_iter().collect();

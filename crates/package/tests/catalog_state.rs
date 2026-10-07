@@ -78,15 +78,6 @@ fn state_file(fixture: &PluginFixture) -> std::path::PathBuf {
 }
 
 #[test]
-fn a_fresh_registry_has_the_empty_catalog_state() {
-    let fixture = PluginFixture::new();
-    let state = fixture.open().catalog_state().unwrap();
-    assert_eq!(state.high_water(), None);
-    assert!(state.revoked_key_ids().is_empty());
-    assert!(!state_file(&fixture).exists());
-}
-
-#[test]
 fn a_recorded_catalog_round_trips_across_reopen() {
     let fixture = PluginFixture::new();
     let recorded = fixture

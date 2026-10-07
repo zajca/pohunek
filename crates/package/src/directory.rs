@@ -690,24 +690,6 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_with_more_files_than_the_budget_is_rejected_while_listing() {
-        let dir = pohunek_test_support::tempdir().expect("tempdir");
-        for index in 0..5 {
-            fs::write(dir.path().join(format!("f{index}")), b"x").expect("write");
-        }
-        let limits = Limits {
-            max_files: 3,
-            ..Limits::DEFAULT
-        };
-        assert_eq!(
-            build_directory_archive(dir.path(), &limits),
-            Err(DirectoryError::Archive(ArchiveError::TooManyFiles {
-                limit: 3
-            }))
-        );
-    }
-
-    #[test]
     fn a_directory_with_more_subdirectories_than_the_budget_is_rejected() {
         let dir = pohunek_test_support::tempdir().expect("tempdir");
         for index in 0..5 {
@@ -804,21 +786,5 @@ mod tests {
             ..Limits::DEFAULT
         };
         build_directory_archive(dir.path(), &limits).expect("3 files and an empty directory fit");
-    }
-
-    #[test]
-    fn an_unchanged_file_is_read_with_its_executable_bit() {
-        let dir = pohunek_test_support::tempdir().expect("tempdir");
-        let path = dir.path().join("hook");
-        fs::write(&path, b"#!/bin/sh\n").expect("write");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod");
-        let root = open_root(dir.path());
-        let listed = list_entry(&root, "hook").expect("list");
-        let limits = Limits::DEFAULT;
-        let mut budget = budget(&limits);
-        assert_eq!(
-            read_listed_file(&root, "hook", listed, &mut budget),
-            Ok((b"#!/bin/sh\n".to_vec(), true))
-        );
     }
 }

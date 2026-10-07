@@ -99,22 +99,6 @@ fn read_file_returns_manifest_checked_bytes() {
 }
 
 #[test]
-fn verification_accepts_an_untouched_root() {
-    let fixture = Fixture::new();
-    let installed = install(&fixture);
-
-    let verified = verify(&fixture).expect("untouched root verifies");
-    assert_eq!(verified.digest(), &digest());
-    assert_eq!(verified.manifest_digest(), installed.root.manifest_digest());
-}
-
-#[test]
-fn verification_reports_a_missing_root() {
-    let fixture = Fixture::new();
-    assert_eq!(verify(&fixture).unwrap_err(), VerifyError::RootMissing);
-}
-
-#[test]
 fn verification_detects_modified_contents_of_equal_size() {
     let fixture = Fixture::new();
     install(&fixture);

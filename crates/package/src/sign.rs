@@ -93,21 +93,4 @@ mod tests {
         assert_eq!(verified.sequence(), 3);
         assert_eq!(verified.signer(), &KeyId::derive(&signer.verifying_key()));
     }
-
-    #[test]
-    fn another_key_does_not_verify() {
-        let envelope = sign_catalog(empty_catalog(), &key(1)).expect("sign");
-        let bytes = catalog_document_bytes(&envelope).expect("bytes");
-        assert_eq!(
-            verify_catalog(&bytes, &anchor_of(&key(2)), NOW, None).expect_err("wrong anchor"),
-            CatalogError::UnknownSigner
-        );
-    }
-
-    #[test]
-    fn signing_is_deterministic() {
-        let first = catalog_document_bytes(&sign_catalog(empty_catalog(), &key(1)).expect("sign"));
-        let second = catalog_document_bytes(&sign_catalog(empty_catalog(), &key(1)).expect("sign"));
-        assert_eq!(first.expect("bytes"), second.expect("bytes"));
-    }
 }

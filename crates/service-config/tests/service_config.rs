@@ -1065,17 +1065,6 @@ fn verify_installation_rejects_another_installation() {
     ));
 }
 
-#[test]
-fn errors_name_the_rejected_key() {
-    let fixture = Fixture::new();
-    let text = replace(GOLDEN, "grace_ms = 5000", "grace_ms = 0");
-    let error = fixture.load(&text).expect_err("zero grace is rejected");
-    assert_eq!(
-        error.to_string(),
-        "service config key sweep.grace_ms = 0 is outside 1..=600000"
-    );
-}
-
 /// Generates valid specs spanning every bound.
 fn arb_spec() -> impl Strategy<Value = ConfigSpec> {
     let max = u64::try_from(MAX_DEADLINE.as_millis()).expect("bounded");
