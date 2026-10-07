@@ -520,6 +520,8 @@ fn trailing_data_and_non_integer_numbers_are_rejected() {
         verify(format!("{text}x").as_bytes(), &anchor).unwrap_err(),
         CatalogError::Syntax
     );
+    // An empty document is not a JSON value.
+    assert_eq!(verify(b"", &anchor).unwrap_err(), CatalogError::Syntax);
     let float = text.replacen("\"sequence\":7", "\"sequence\":7.0", 1);
     assert_eq!(
         verify(float.as_bytes(), &anchor).unwrap_err(),

@@ -519,6 +519,16 @@ mod tests {
     }
 
     #[test]
+    fn the_supervision_mode_needs_an_installed_service_config() {
+        let (_guard, base) = unique_temp_dir();
+        std::fs::create_dir_all(&base).expect("create config dir");
+
+        assert_eq!(supervision_mode(&base), Supervision::Unknown);
+        std::fs::write(base.join("service.toml"), "x").expect("write service.toml");
+        assert_eq!(supervision_mode(&base), Supervision::Native);
+    }
+
+    #[test]
     fn a_failed_job_is_reported_even_with_a_pending_transaction_or_state_error() {
         let pending = || crate::service::report::PendingReport {
             operation: "upgrade",

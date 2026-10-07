@@ -4298,6 +4298,21 @@ mod tests {
         }
     }
 
+    /// Every managed hook runs its interpreter in isolated mode.
+    #[test]
+    fn hook_assets_run_python_in_isolated_mode() {
+        for agent in ["claude", "codex"] {
+            for asset in [state_asset(agent), notification_asset(agent)] {
+                let script = fs::read_to_string(&asset).expect("read hook asset");
+                assert!(
+                    script.contains("python3 -I -"),
+                    "{} must start python3 with -I",
+                    asset.display()
+                );
+            }
+        }
+    }
+
     /// The hook runs in the agent's working directory, which must neither slow
     /// the interpreter's imports nor shadow the standard library.
     #[test]

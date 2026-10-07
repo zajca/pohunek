@@ -241,6 +241,21 @@ mod tests {
             .join("root")
     }
 
+    #[test]
+    fn the_supervision_mode_follows_the_active_supervision() {
+        let active = |native| ActiveSupervision {
+            worker_executable: PathBuf::from("/opt/pohunek-sessiond"),
+            native,
+        };
+
+        assert_eq!(supervision_mode(Some(&active(true))), Supervision::Native);
+        assert_eq!(
+            supervision_mode(Some(&active(false))),
+            Supervision::Subprocess
+        );
+        assert_eq!(supervision_mode(None), Supervision::Unknown);
+    }
+
     #[tokio::test]
     async fn report_contains_writable_daemon_paths_and_governance_checks() {
         let root = temp_dir("report");

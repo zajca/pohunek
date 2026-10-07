@@ -305,7 +305,7 @@ fn validate_duration(field: &'static str, value: Duration) -> Result<(), ConfigE
 mod tests {
     use super::{
         ConfigError, WorkerConfig, MAX_NOTIFICATION_FORWARD_TIMEOUT, MAX_NOTIFICATION_PARAMS_BYTES,
-        MAX_OBSERVATION_WAIT, MAX_PENDING_LAUNCH_CLAIMS, MAX_SUBSCRIBER_BYTES,
+        MAX_PENDING_LAUNCH_CLAIMS, MAX_SUBSCRIBER_BYTES,
     };
     use pohunek_worker_protocol::MAX_DATA_PAYLOAD_BYTES;
     use std::time::Duration;
@@ -321,7 +321,10 @@ mod tests {
     /// maximum is still accepted.
     #[test]
     fn unsafe_durations_are_rejected_by_field() {
-        let above_wait = MAX_OBSERVATION_WAIT + Duration::from_millis(1);
+        // The 10 s observation-wait cap, written independently of the
+        // production constant.
+        let wait_cap = Duration::from_secs(10);
+        let above_wait = wait_cap + Duration::from_millis(1);
         let above_forward = MAX_NOTIFICATION_FORWARD_TIMEOUT + Duration::from_millis(1);
         let zero = |field| Err(ConfigError::Duration { field });
         let cases = [
@@ -352,7 +355,7 @@ mod tests {
             ),
             (
                 "observation wait at its maximum",
-                with(|c| c.max_observation_wait = MAX_OBSERVATION_WAIT),
+                with(|c| c.max_observation_wait = wait_cap),
                 Ok(()),
             ),
             (
@@ -361,7 +364,7 @@ mod tests {
                 Err(ConfigError::DurationMaximum {
                     field: "max_observation_wait",
                     actual: above_wait,
-                    maximum: MAX_OBSERVATION_WAIT,
+                    maximum: wait_cap,
                 }),
             ),
             (
