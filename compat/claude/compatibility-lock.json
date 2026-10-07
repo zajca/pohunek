@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "package": "pohunek.runtime.claude",
+  "runtime": "claude",
+  "upstream": {
+    "name": "Claude Code",
+    "npm": "@anthropic-ai/claude-code",
+    "release": "2.1.289",
+    "binary": "claude",
+    "sha256": {
+      "linux-x64": "a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348"
+    }
+  },
+  "supported": {
+    "min": "2.1.289",
+    "below": "2.2.0"
+  },
+  "verified_with": "Release 2.1.289 (its linux-x64 native binary, byte-identical to the one the npm package installs) in PTY runs against a loopback Messages-API stub with a throwaway HOME and CLAUDE_CONFIG_DIR, a dummy API key, no real credential and no network egress except the first-run preflight: first-run theme, API-key approval and login screens, folder-trust, idle, working (held and streaming reply), idle-after-turn, tool-approval and question screens at widths 20 to 200, terminal-title states, the `claude --version` banner, the SessionStart hook (native reference, resume, fork) and the SubagentStart and SubagentStop hooks registered by pohunek's integration install"
+}

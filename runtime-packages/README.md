@@ -32,4 +32,7 @@ runtime-packages/<runtime>/
 Packages: [`pi`](pi) (Pi coding agent 1.0.x; install steps in
 `docs/install.md`) and [`codex`](codex) (Codex 0.160.x; serves the reserved
 `codex` id only through a signed catalog, and no release catalog or signing key
-exists yet; see `docs/knowledge/guides/codex-package.md`).
+exists yet; see `docs/knowledge/guides/codex-package.md`) and
+[`claude`](claude) (Claude Code 2.1.x from 2.1.289; serves the reserved `claude`
+id only through a signed catalog under the same condition; see
+`docs/knowledge/guides/claude-package.md`).

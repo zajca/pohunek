@@ -9,6 +9,24 @@
   the Codex package guide replaces its known-gap statement with the verified
   behavior.
 
+## Unreleased (2026-10-07, Claude Code runtime package source)
+
+- Added the Claude Code runtime package guide and the package source
+  (`runtime-packages/claude`, `compat/claude/compatibility-lock.json`,
+  `compat/claude/screens/`): the descriptor and detection manifest equal the
+  built-in Claude files, plus a `semver-line-v1` probe for `<release> (Claude
+  Code)` from 2.1.289. The package can be served as the official `claude` runtime
+  only through a signed catalog, no release catalog or signing key exists yet,
+  and the built-in Claude runtime stays in the daemon. The guide records the
+  first-run state files of a Claude home, what was verified against a real
+  Claude Code 2.1.289 (hooks from the launched process, resume and fork argv,
+  subagent hooks) and the gaps found: the working title uses a glyph no rule
+  names, narrow question forms and the trust dialog are not classified, and a
+  forked session keeps its source's native reference so its own conversation id
+  is rejected.
+- The source map lists the package source, the lock, the screens, the tests, the
+  Messages stub, the shared process guard and the `claude-package` CI job.
+
 ## Unreleased (2026-10-06, Codex hook reporter ancestry)
 
 - The real-Codex hook test requires the reporting process to descend from the
