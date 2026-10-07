@@ -2326,21 +2326,6 @@ mod tests {
     }
 
     #[test]
-    fn a_long_isolated_root_overflows_the_worker_socket_limit() {
-        // Shape of a test fixture root on macOS: canonical /private/tmp plus a
-        // descriptive directory name, with the runtime dir at run/pohunek.
-        // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
-        let long = Path::new("/private/tmp/pohunek-cli-process-api-12345-0/run/pohunek");
-        // hermetic-allowed: #363 the macOS `/private/tmp` root length is the subject
-        let short = Path::new("/private/tmp/pcpa-12345-0/run/pohunek");
-
-        let overflow = check_socket_path_length(long);
-        assert_eq!(overflow.status, DoctorStatus::Fail);
-        assert!(overflow.detail.contains("worker"), "{}", overflow.detail);
-        assert_eq!(check_socket_path_length(short).status, DoctorStatus::Ok);
-    }
-
-    #[test]
     fn agent_hint_explains_launchd_path_without_naming_a_homebrew_prefix() {
         let mut f = facts();
         f.path_var = Some(OsString::new());

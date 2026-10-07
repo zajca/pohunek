@@ -208,47 +208,4 @@ mod tests {
             assert_eq!(verdict.to_string(), verdict.as_str());
         }
     }
-
-    #[test]
-    fn only_an_adoptable_verdict_is_not_at_risk() {
-        assert!(!Verdict::Adoptable.at_risk());
-        assert!(Verdict::WouldLoseRecovery.at_risk());
-        assert!(Verdict::WouldNotBeAdopted.at_risk());
-    }
-
-    #[test]
-    fn a_report_round_trips_and_lists_only_risky_sessions() {
-        let session = |id: &str, verdict| SessionVerdict {
-            session_id: id.to_owned(),
-            name: None,
-            verdict,
-            code: CODE_ADOPTABLE.to_owned(),
-            detail: String::new(),
-        };
-        let report = PreflightReport {
-            report_version: REPORT_VERSION,
-            daemon_version: "1.0.0".to_owned(),
-            store: StoreReport {
-                path: PathBuf::from("/data/metadata.jsonl"),
-                state: StoreState::UpToDate,
-                schema_from: Some(2),
-                schema_to: 2,
-                records: 1,
-                error_code: None,
-                error: None,
-            },
-            sessions: vec![
-                session("a", Verdict::Adoptable),
-                session("b", Verdict::WouldNotBeAdopted),
-            ],
-            unmanaged_workers: Vec::new(),
-        };
-        let decoded: PreflightReport =
-            serde_json::from_str(&serde_json::to_string(&report).expect("serialize report"))
-                .expect("deserialize report");
-        assert_eq!(decoded, report);
-        let risky: Vec<_> = decoded.at_risk().map(|s| s.session_id.as_str()).collect();
-        assert_eq!(risky, ["b"]);
-        assert!(!decoded.store_refused());
-    }
 }

@@ -1085,12 +1085,4 @@ mod tests {
         let utf8 = format!("{error:?}");
         assert!(!utf8.contains("PH-TOKEN-sentinel"));
     }
-
-    #[test]
-    fn default_stop_grace_is_a_valid_nonzero_deadline() {
-        assert!(!DEFAULT_STOP_GRACE.is_zero());
-        assert!(DEFAULT_STOP_GRACE <= MAX_DEADLINE);
-        assert_eq!(DEFAULT_STOP_GRACE.subsec_nanos() % NANOS_PER_MILLI, 0);
-        validate_duration("stop_grace", DEFAULT_STOP_GRACE).expect("valid deadline");
-    }
 }

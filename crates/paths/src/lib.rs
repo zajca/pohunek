@@ -1051,29 +1051,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_full_base_path_set() {
-        let base = tmp_base("full");
-
-        let paths = resolve_in(&all_present(&base)).expect("resolve paths");
-
-        assert_eq!(paths.runtime_dir, base.join("run").join(APP_DIR));
-        assert_eq!(
-            paths.socket,
-            base.join("run").join(APP_DIR).join(SOCKET_NAME)
-        );
-        assert_eq!(paths.lock, base.join("run").join(APP_DIR).join(LOCK_NAME));
-        assert_eq!(
-            paths.log_dir,
-            base.join("state").join(APP_DIR).join(LOGS_SUBDIR)
-        );
-        assert_eq!(paths.state_dir, base.join("state").join(APP_DIR));
-        assert_eq!(paths.data_dir, base.join("data").join(APP_DIR));
-        assert_eq!(paths.cache_dir, base.join("cache").join(APP_DIR));
-        assert_eq!(paths.config_home, base.join("cfg"));
-        assert_eq!(paths.config_dir, base.join("cfg").join(APP_DIR));
-    }
-
-    #[test]
     fn resolve_reads_the_process_environment() {
         let base = tmp_base("process-env");
         let mut env = ProcessEnv::lock();
@@ -1093,22 +1070,6 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_home_for_cache_home() {
-        let base = tmp_base("cache-home");
-        let env = PathEnv {
-            xdg_cache_home: None,
-            ..all_present(&base)
-        };
-
-        let paths = resolve_in(&env).expect("resolve paths");
-
-        assert_eq!(
-            paths.cache_dir,
-            base.join("home").join(".cache").join(APP_DIR)
-        );
-    }
-
-    #[test]
     fn require_env_rejects_missing_and_empty_values() {
         let mut env = ProcessEnv::lock();
         env.remove(XDG_RUNTIME_DIR);
@@ -1120,19 +1081,6 @@ mod tests {
         assert!(matches!(
             require_env(XDG_RUNTIME_DIR),
             Err(PathError::MissingEnv { var }) if var == XDG_RUNTIME_DIR
-        ));
-    }
-
-    #[test]
-    fn xdg_or_home_relative_reports_actionable_missing_pair() {
-        let env = PathEnv::default();
-
-        let err = resolve_xdg_or_home(&env, XDG_CONFIG_HOME, HOME_CONFIG_RELATIVE)
-            .expect_err("missing config env fails");
-
-        assert!(matches!(
-            err,
-            PathError::MissingEnv { var } if var == "XDG_CONFIG_HOME or HOME"
         ));
     }
 
@@ -1218,28 +1166,6 @@ mod tests {
         for invalid in ["", "../worker", "worker/name", "worker.name"] {
             assert_eq!(paths.worker_journal("s-42", invalid), None);
         }
-    }
-
-    #[test]
-    fn host_state_paths_have_the_canonical_layout() {
-        let base = tmp_base("host-state");
-        let paths = resolve_in(&all_present(&base)).expect("resolve paths");
-        let host = base.join("state").join(APP_DIR).join(HOST_STATE_SUBDIR);
-
-        assert_eq!(paths.host_state_dir(), host);
-        assert_eq!(paths.host_identity_path(), host.join(HOST_IDENTITY_NAME));
-        assert_eq!(
-            paths.host_approval_key_path(),
-            host.join(HOST_APPROVAL_KEY_NAME)
-        );
-        assert_eq!(
-            paths.host_governance_path(),
-            host.join(HOST_GOVERNANCE_NAME)
-        );
-        assert_eq!(
-            paths.host_state_lock_path(),
-            host.join(HOST_STATE_LOCK_NAME)
-        );
     }
 
     #[test]

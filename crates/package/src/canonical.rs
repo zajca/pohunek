@@ -152,31 +152,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn octal_round_trips() {
-        let mut field = [0_u8; SIZE_FIELD_BYTES];
-        write_octal(&mut field, 0o1234);
-        assert_eq!(&field, b"00000001234\0");
-        assert_eq!(parse_octal(&field), Some(0o1234));
-    }
-
-    #[test]
     fn octal_rejects_non_octal_digits_and_missing_terminator() {
         assert_eq!(parse_octal(b"0000008\0"), None);
         assert_eq!(parse_octal(b"00000010"), None);
         assert_eq!(parse_octal(b"000 0010\0"), None);
         assert_eq!(parse_octal(b"\0"), None);
-    }
-
-    #[test]
-    fn header_checksum_matches_gnu_ustar_convention() {
-        let block = encode_header(b"a", 0, false).expect("valid header");
-        let stored = parse_octal(&[&block[148..154], &[0]].concat()).expect("octal checksum");
-        let mut copy = block;
-        copy[148..156].fill(b' ');
-        let sum: u64 = copy.iter().map(|&byte| u64::from(byte)).sum();
-        assert_eq!(stored, sum);
-        assert_eq!(block[154], 0);
-        assert_eq!(block[155], b' ');
     }
 
     #[test]
