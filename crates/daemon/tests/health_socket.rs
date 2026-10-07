@@ -60,6 +60,7 @@ use pohunek_paths::{
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{self, wait_until, HANG_GUARD};
+use pohunek_test_support::workers::WorkerGuard;
 use pohunek_test_support::{bin_exe, worker_binary};
 
 // Sessions use the production stop grace, `SessionRegistryConfig::default()`:
@@ -1273,6 +1274,10 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     let root_dir =
         pohunek_test_support::tempdir_with_prefix("pw-s-").expect("create short isolated XDG root");
     let root = root_dir.path().to_path_buf();
+    // Declared after `root_dir` and before the daemon child: the daemon is
+    // killed first, then any worker still below the root is reaped, then the
+    // root is removed.
+    let _workers = WorkerGuard::watch(&root);
     let runtime_home = root.join("r");
     let data_home = root.join("d");
     let state_home = root.join("s");
@@ -1389,6 +1394,24 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
         .expect("session.stop returns before control timeout"),
     ))
     .expect("deserialize worker-backed session stop result");
+
+    // A stopped session keeps its worker until the session is removed; the
+    // daemon is killed below and would leave that worker running.
+    let remove_request = Request::make(
+        "startup-private-state-session-remove",
+        method::SESSION_REMOVE,
+        serde_json::to_value(&created.id).expect("serialize worker-backed session id"),
+    );
+    let removed: SessionRemoveResult = serde_json::from_value(ok_payload(
+        tokio::time::timeout(
+            DAEMON_CONTROL_REQUEST_TIMEOUT,
+            exchange(&mut client, &remove_request),
+        )
+        .await
+        .expect("session.remove returns before control timeout"),
+    ))
+    .expect("deserialize worker-backed session remove result");
+    assert!(removed.removed, "the stopped session is removed");
 
     let status = stop_real_daemon(client, &mut child).await;
     assert!(!status.success(), "test termination stops the real daemon");

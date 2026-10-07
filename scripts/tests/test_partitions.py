@@ -1,11 +1,15 @@
 """Regression checks for the cost-shard coverage guard (stdlib only)."""
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from unittest import mock
@@ -164,11 +168,11 @@ class ArchiveModeTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 seen.append(command)
-                return subprocess.CompletedProcess(command, 0)
+                return 0
 
             with mock.patch.object(partitions, "ROOT", Path(root)), \
                     mock.patch.object(partitions, "require_archive_file"), \
-                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(partitions, "run_checked", side_effect=fake_run), \
                     mock.patch.object(sys, "argv", [
                         "test-partitions", "--archive-file", str(archive), "run", "relay-db",
                     ]):
@@ -189,6 +193,335 @@ class ArchiveModeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaisesRegex(ValueError, "not found"):
                 partitions.require_archive_file(Path(root) / "absent.tar.zst")
+
+
+def wait_for(condition, seconds=30):
+    """Poll `condition` until it holds; fail the test after `seconds`."""
+    deadline = time.monotonic() + seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("condition not reached before the deadline")
+        time.sleep(0.01)
+
+
+class EntrypointTests(unittest.TestCase):
+    """The script run as a program, as CI runs it."""
+
+    def run_script(self, *arguments):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *arguments],
+            capture_output=True, text=True, check=False,
+        )
+
+    def test_filter_prints_the_shard_expression(self):
+        for shard in partitions.SHARDS:
+            with self.subTest(shard=shard):
+                result = self.run_script("filter", shard)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), partitions.filters()[shard])
+                self.assertNotEqual(result.stdout.strip(), "")
+
+    def test_an_invalid_shard_or_action_fails(self):
+        for arguments in (("filter", "bogus"), ("bogus", "unit"), ("run",), ()):
+            with self.subTest(arguments=arguments):
+                self.assertNotEqual(self.run_script(*arguments).returncode, 0)
+
+
+class LeakedWorkerTests(unittest.TestCase):
+    def worker(self, socket, pid=100, executable="/w/target/debug/pohunek-sessiond", start="1"):
+        argv = [executable, "--session-id", "s-1", "--daemon-socket-path", socket]
+        return partitions.Process(pid, start, argv)
+
+    def test_only_workers_below_the_run_base_are_leaks(self):
+        processes = [
+            self.worker("/tmp/ab12/ph-x/run/pohunek/daemon.sock", pid=100),
+            self.worker("/tmp/ab123/ph-x/run/pohunek/daemon.sock", pid=101),
+            self.worker("/run/user/1000/pohunek/daemon.sock", pid=102),
+            partitions.Process(7, "1", ["/usr/bin/sleep", "1"]),
+        ]
+        found = partitions.leaked_workers(processes, Path("/tmp/ab12"))
+        self.assertEqual([process.pid for process, _ in found], [100])
+
+    def test_spaces_in_the_executable_and_the_socket_path_are_kept(self):
+        process = self.worker("/tmp/ab 12/ph-x/daemon.sock", executable="/home/a b/target/pohunek-sessiond")
+        found = partitions.leaked_workers([process], Path("/tmp/ab 12"))
+        self.assertEqual([socket for _, socket in found], ["/tmp/ab 12/ph-x/daemon.sock"])
+        self.assertEqual(partitions.leaked_workers([process], Path("/tmp/ab")), [])
+
+    def test_a_worker_without_a_socket_argument_is_not_a_leak(self):
+        process = partitions.Process(5, "1", ["/w/pohunek-sessiond", "--session-id", "s-1"])
+        self.assertEqual(partitions.leaked_workers([process], Path("/tmp/ab12")), [])
+
+    def test_the_replaced_executable_is_recognized_by_its_link(self):
+        process = partitions.Process(
+            5, "1", ["renamed", "--daemon-socket-path", "/tmp/ab12/d.sock"],
+            executable="/w/pohunek-sessiond (deleted)",
+        )
+        self.assertEqual(len(partitions.leaked_workers([process], Path("/tmp/ab12"))), 1)
+
+    def test_stat_fields_are_counted_after_the_last_parenthesis(self):
+        stat = "42 (we ird) name) S 7 42 42 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 987654 1 2"
+        self.assertEqual(partitions.start_time_of(stat), "987654")
+
+    def test_the_base_fits_the_deepest_nested_socket_layout(self):
+        self.assertEqual(partitions.RUN_BASE_MAX_LENGTH, 9)
+        base = partitions.make_run_base()
+        try:
+            self.assertLessEqual(len(str(base)), partitions.RUN_BASE_MAX_LENGTH)
+            self.assertEqual(base.stat().st_mode & 0o777, 0o700)
+        finally:
+            base.rmdir()
+
+    def test_the_workload_is_the_descendants_and_the_sessions_they_lead(self):
+        def proc(pid, parent, session):
+            return partitions.Process(pid, f"s{pid}", [], None, parent, session)
+
+        worker = proc(100, 1, 50)
+        processes = [
+            worker,
+            proc(101, 100, 50),
+            proc(102, 100, 102),   # PTY child leading its own session
+            proc(103, 102, 102),
+            proc(104, 1, 102),     # straggler reparented to init, same session
+            proc(105, 101, 50),    # descendant of a descendant
+            proc(106, 1, 50),      # shares only the worker's session
+            proc(107, 1, 107),     # unrelated
+        ]
+        self.assertEqual(
+            sorted(p.pid for p in partitions.workload_of(processes, worker)),
+            [101, 102, 103, 104, 105],
+        )
+
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
+    def test_a_signal_resistant_workload_is_killed_with_its_leaked_worker(self):
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
+            base = Path(root)
+            pid_file = base / "workload.pid"
+            executable = base / "pohunek-sessiond"
+            executable.symlink_to("/bin/sh")
+            script = (
+                f"setsid -w sh -c 'trap \"\" HUP TERM; echo $$ > {pid_file}; sleep 613; true' & wait"
+            )
+            worker = subprocess.Popen(
+                [str(executable), "-c", script, "--daemon-socket-path", str(base / "d.sock")],
+                start_new_session=True,
+            )
+            # The scope exits before the temporary directory is removed, so the
+            # recorded PID file still exists when the workload is killed, also
+            # when an assertion fails early.
+            scope.callback(worker.wait)
+            scope.callback(self.kill_group, worker)
+            scope.callback(self.kill_recorded_workload, pid_file)
+            wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
+            workload = int(pid_file.read_text())
+            self.assertTrue(Path(f"/proc/{workload}").exists())
+            self.assertFalse(partitions.check_no_leaked_workers(base))
+            worker.wait()
+            stat = Path(f"/proc/{workload}/stat")
+            wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+
+    def test_a_retained_session_is_followed_after_its_leader_was_reparented(self):
+        def proc(pid, parent, session):
+            return partitions.Process(pid, f"s{pid}", [], None, parent, session)
+
+        worker = proc(100, 1, 50)
+        processes = [worker, proc(102, 1, 102), proc(103, 102, 102)]
+        self.assertEqual(partitions.workload_of(processes, worker), [])
+        found = partitions.workload_of(processes, worker, {(102, "s102")})
+        self.assertEqual(sorted(p.pid for p in found), [102, 103])
+        recycled = partitions.workload_of(processes, worker, {(102, "other")})
+        self.assertEqual(recycled, [])
+
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
+    def test_a_workload_whose_intermediate_parent_exited_is_still_killed(self):
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
+            base = Path(root)
+            pid_file = base / "workload.pid"
+            inner = base / "inner.sh"
+            inner.write_text(f"trap '' HUP TERM; echo $$ > {pid_file}; sleep 613; true")
+            executable = base / "pohunek-sessiond"
+            executable.symlink_to("/bin/sh")
+            script = f"sleep 613 & sh -c 'setsid sh {inner}; true' & wait"
+            worker = subprocess.Popen(
+                [str(executable), "-c", script, "--daemon-socket-path", str(base / "d.sock")],
+                start_new_session=True,
+            )
+            # The scope exits before the temporary directory is removed, so the
+            # recorded PID file still exists when the workload is killed, also
+            # when an assertion fails early.
+            scope.callback(worker.wait)
+            scope.callback(self.kill_group, worker)
+            scope.callback(self.kill_recorded_workload, pid_file)
+            wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
+            leader = int(pid_file.read_text())
+
+            retained = set()
+            partitions.retain_sessions(partitions.read_processes(), base, retained)
+            self.assertEqual({session for session, _ in retained}, {leader})
+
+            def parent_of(pid):
+                stat = Path(f"/proc/{pid}/stat").read_text()
+                return partitions.stat_fields(stat)[0]
+
+            intermediate = parent_of(leader)
+            self.assertNotEqual(intermediate, worker.pid)
+            os.kill(intermediate, signal.SIGKILL)
+            wait_for(lambda: parent_of(leader) != intermediate)
+
+            processes = partitions.read_processes()
+            found = partitions.leaked_workers(processes, base)
+            self.assertNotIn(leader, [p.pid for p in partitions.workload_of(processes, found[0][0])])
+
+            self.assertFalse(partitions.check_no_leaked_workers(base, retained))
+            stat = Path(f"/proc/{leader}/stat")
+            wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
+    def test_the_workload_dies_even_when_the_test_fails_early(self):
+        pid_file_seen = []
+
+        class Failing(unittest.TestCase):
+            def runTest(inner):
+                with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
+                    pid_file = Path(root) / "workload.pid"
+                    worker = subprocess.Popen(
+                        ["/bin/sh", "-c",
+                         f"setsid -w sh -c 'echo $$ > {pid_file}; sleep 613; true' & wait"],
+                        start_new_session=True,
+                    )
+                    scope.callback(worker.wait)
+                    scope.callback(self.kill_group, worker)
+                    scope.callback(self.kill_recorded_workload, pid_file)
+                    wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
+                    pid_file_seen.append(int(pid_file.read_text()))
+                    inner.fail("early assertion failure")
+
+        result = unittest.TestResult()
+        Failing().run(result)
+        self.assertEqual(len(result.failures), 1)
+        stat = Path(f"/proc/{pid_file_seen[0]}/stat")
+        wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+
+    @staticmethod
+    def kill_group(child):
+        """SIGKILL the stand-in and the `sleep` it started, which share its group."""
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def kill_recorded_workload(pid_file):
+        """SIGKILL the session the stand-in recorded: its leader and the `sleep` it started."""
+        try:
+            os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+
+    def spawn_stand_in(self, base, scope, name="pohunek-sessiond"):
+        """A real process whose argv names a worker below `base`, and its Process."""
+        executable = base / name
+        executable.symlink_to("/bin/sh")
+        child = subprocess.Popen(
+            [str(executable), "-c", "sleep 30; true", "--daemon-socket-path", str(base / "d.sock")],
+            start_new_session=True,
+        )
+        scope.callback(child.wait)
+        scope.callback(self.kill_group, child)
+        found = None
+        while found is None:
+            found = next(
+                (p for p in partitions.read_processes() if p.pid == child.pid
+                 and partitions.SOCKET_PATH_ARGUMENT in p.argv),
+                None,
+            )
+        return found
+
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc")
+    def test_a_recycled_pid_is_not_killed_and_a_matching_process_is(self):
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
+            process = self.spawn_stand_in(Path(root), scope)
+            recycled = partitions.Process(process.pid, process.start + "1", process.argv)
+            self.assertFalse(partitions.kill_if_unchanged(recycled))
+            self.assertIn(process.pid, [p.pid for p in partitions.read_processes()])
+            self.assertTrue(partitions.kill_if_unchanged(process))
+
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc")
+    def test_paths_with_spaces_survive_the_real_process_table(self):
+        with tempfile.TemporaryDirectory(prefix="a b ") as root, contextlib.ExitStack() as scope:
+            process = self.spawn_stand_in(Path(root), scope)
+            found = partitions.leaked_workers(partitions.read_processes(), Path(root))
+            self.assertEqual([p.pid for p, _ in found], [process.pid])
+            partitions.kill_if_unchanged(process)
+
+    def run_with(self, runner, leaks):
+        """`run_checked` with a mocked runner process and a fixed set of leaks."""
+        events = []
+        base = Path("/tmp/zz99")
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(partitions, "make_run_base", return_value=base), \
+                mock.patch.object(partitions.subprocess, "Popen", return_value=runner), \
+                mock.patch.object(partitions, "read_processes", return_value=leaks), \
+                mock.patch.object(partitions, "kill_if_unchanged",
+                                  side_effect=lambda p: events.append(("kill", p.pid))), \
+                mock.patch.object(partitions, "remove_tree",
+                                  side_effect=lambda *a, **k: events.append(("rmtree",))):
+            try:
+                return partitions.run_checked(["nextest"]), events
+            except BaseException as error:
+                return error, events
+
+    def stand_in_runner(self, wait, running=False):
+        runner = mock.Mock()
+        runner.wait.side_effect = wait
+        runner.poll.return_value = None if running else 0
+        return runner
+
+    def test_a_leak_fails_a_run_that_passed_and_is_terminated(self):
+        leaks = [self.worker("/tmp/zz99/ph-x/d.sock", pid=100)]
+        status, events = self.run_with(self.stand_in_runner([0]), leaks)
+        self.assertEqual(status, 1)
+        self.assertEqual(events, [("kill", 100), ("rmtree",)])
+
+    def test_remove_tree_removes_directories_without_permissions(self):
+        with tempfile.TemporaryDirectory() as root:
+            tree = Path(root) / "base"
+            locked = tree / "a" / "b"
+            locked.mkdir(parents=True)
+            (locked / "f").write_text("x")
+            locked.chmod(0)
+            partitions.remove_tree(tree)
+            self.assertFalse(tree.exists())
+
+    def test_a_clean_run_keeps_its_status(self):
+        status, events = self.run_with(self.stand_in_runner([3]), [])
+        self.assertEqual(status, 3)
+        self.assertEqual(events, [("rmtree",)])
+
+    def test_a_cancelled_run_stops_the_runner_cleans_workers_and_reraises(self):
+        leaks = [self.worker("/tmp/zz99/ph-x/d.sock", pid=100)]
+        runner = self.stand_in_runner([KeyboardInterrupt(), 0], running=True)
+        error, events = self.run_with(runner, leaks)
+        self.assertIsInstance(error, KeyboardInterrupt)
+        runner.terminate.assert_called_once()
+        self.assertEqual(events, [("kill", 100), ("rmtree",)], "workers are cleaned before the base is removed")
+
+    def test_the_run_sees_a_base_of_its_own_as_tmpdir(self):
+        seen = []
+
+        def fake_popen(command, **kwargs):
+            seen.append(kwargs["env"]["TMPDIR"])
+            runner = mock.Mock()
+            runner.wait.return_value = 0
+            runner.poll.return_value = 0
+            return runner
+
+        with mock.patch.object(partitions, "read_processes", return_value=[]), \
+                mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(partitions.subprocess, "Popen", side_effect=fake_popen):
+            self.assertEqual(partitions.run_checked(["nextest"]), 0)
+        self.assertEqual(len(seen[0]), partitions.RUN_BASE_MAX_LENGTH)
+        self.assertFalse(Path(seen[0]).exists(), "the base is removed after the run")
 
 
 if __name__ == "__main__":
@@ -233,11 +566,11 @@ class JunitReportTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 seen.append(stale.exists())
-                return subprocess.CompletedProcess(command, 0)
+                return 0
 
             with mock.patch.object(partitions, "ROOT", Path(root)), \
                     mock.patch.dict("os.environ", {"CARGO_TARGET_DIR": str(Path(root) / "elsewhere")}), \
-                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(partitions, "run_checked", side_effect=fake_run), \
                     mock.patch.object(sys, "argv", ["test-partitions", "run", "heavy"]):
                 with self.assertRaises(SystemExit) as exit_:
                     partitions.main()

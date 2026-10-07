@@ -10,8 +10,12 @@ is how CI shares one build across the shard jobs.
 import argparse
 import collections
 import json
+import os
 from pathlib import Path
+import secrets
 import shutil
+import signal
+import string
 import subprocess
 import sys
 import tomllib
@@ -26,6 +30,34 @@ CLI = "package(=pohunek-cli)"
 # form their own shard: CI runs them in a job whose Postgres service is gated
 # by a paths filter on the relay crates.
 SHARDS = ("unit", "daemon", "relay", "cli", "relay-db", "heavy")
+# Executable name of the session worker a real daemon starts.
+WORKER_EXECUTABLE = "pohunek-sessiond"
+# Argument that carries the worker's control socket path.
+SOCKET_PATH_ARGUMENT = "--daemon-socket-path"
+# Parent of the per-run fixture base.
+RUN_BASE_PARENT = Path("/tmp")
+# Capacity of a Unix socket path in bytes, including the terminating NUL, on
+# the strictest supported platform (Darwin).
+SOCKET_PATH_CAPACITY = 104
+# Longest socket path below a test root, relative to it
+# (`pohunek-test-support` env.rs NESTED_SOCKET_SUFFIX).
+NESTED_SOCKET_SUFFIX = len("/run/pohunek/workers/" + "0" * 36 + "/control.sock")
+# One test root directory name, `ph-` plus six characters, with its separator.
+TEST_ROOT_NAME = len("/ph-XXXXXX")
+# The deepest nesting any test uses: a test root whose private `TMPDIR`
+# (`<root>/tmp`) is the base of a second test root. The git environment tests
+# in the daemon and xtask crates do this.
+TMPDIR_NESTING = TEST_ROOT_NAME + len("/tmp")
+# Longest base path for which that nested layout still binds its sockets.
+RUN_BASE_MAX_LENGTH = SOCKET_PATH_CAPACITY - 1 - NESTED_SOCKET_SUFFIX - TEST_ROOT_NAME - TMPDIR_NESTING
+# Random characters of the base name: what is left of the budget after the parent.
+RUN_BASE_NAME_LENGTH = RUN_BASE_MAX_LENGTH - len(str(RUN_BASE_PARENT)) - len("/")
+RUN_BASE_ALPHABET = string.ascii_lowercase + string.digits
+# How long a cancelled runner gets to stop after SIGTERM before it is killed.
+RUNNER_STOP_GRACE_SECONDS = 30
+# How often the running tests are scanned for worker workloads, so their
+# sessions are known even if the process linking them to the worker exits.
+RETAIN_POLL_SECONDS = 2
 
 
 def filters():
@@ -153,6 +185,197 @@ def inventory(expression=None, archive=None):
     return selected_tests(json.loads(result.stdout))
 
 
+class Process:
+    """One entry of the process table: identity, command line and executable."""
+
+    def __init__(self, pid, start, argv, executable=None, parent=0, session=0):
+        self.pid = pid
+        self.start = start
+        self.argv = argv
+        self.executable = executable
+        self.parent = parent
+        self.session = session
+
+
+def stat_fields(stat):
+    """`(parent pid, session id, start time)` from `/proc/<pid>/stat`, or None.
+
+    The command name is parenthesised and may contain spaces and parentheses,
+    so fields are counted from the last closing parenthesis.
+    """
+    fields = stat[stat.rfind(")") + 1:].split()
+    if len(fields) <= 19:
+        return None
+    return int(fields[1]), int(fields[3]), fields[19]
+
+
+def start_time_of(stat):
+    """The start time (field 22) in the contents of `/proc/<pid>/stat`."""
+    parsed = stat_fields(stat)
+    return parsed[2] if parsed else None
+
+
+def read_processes(proc="/proc"):
+    """Every readable process of `proc` with its NUL-separated argument vector.
+
+    Reading `/proc` runs no program, so the result never depends on `PATH`, and
+    arguments with spaces stay whole.
+    """
+    processes = []
+    for entry in Path(proc).iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text(errors="replace")
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue  # the process ended between the listing and the read
+        parsed = stat_fields(stat)
+        if parsed is None:
+            continue
+        parent, session, start = parsed
+        try:
+            executable = os.readlink(entry / "exe")
+        except OSError:
+            executable = None
+        argv = [os.fsdecode(part) for part in cmdline.split(b"\0")[:-1]]
+        processes.append(Process(int(entry.name), start, argv, executable, parent, session))
+    return processes
+
+
+def is_worker(process):
+    """Whether `process` runs the session worker, by `argv[0]` or its exe link."""
+    names = [Path(process.executable).name.removesuffix(" (deleted)")] if process.executable else []
+    if process.argv:
+        names.append(Path(process.argv[0]).name)
+    return WORKER_EXECUTABLE in names
+
+
+def leaked_workers(processes, base):
+    """Workers among `processes` whose control socket is below `base`.
+
+    The subprocess launcher starts workers with a cleared environment, so the
+    only marker a test run leaves on one is the `--daemon-socket-path` value,
+    which lies inside a fixture root. A run's `TMPDIR` is a base of its own, so
+    workers of the host, of other runs and of other checkouts never match. The
+    argument is taken whole from the argument vector, so spaces do not matter.
+    Returns `(process, socket path)` pairs.
+    """
+    found = []
+    for process in processes:
+        if not is_worker(process) or SOCKET_PATH_ARGUMENT not in process.argv:
+            continue
+        index = process.argv.index(SOCKET_PATH_ARGUMENT) + 1
+        if index < len(process.argv) and Path(process.argv[index]).is_relative_to(base):
+            found.append((process, process.argv[index]))
+    return found
+
+
+def led_sessions(processes, worker):
+    """`(session id, leader start)` pairs of the sessions `worker`'s descendants lead."""
+    by_pid = {p.pid: p for p in processes}
+    sessions = set()
+    for member in workload_of(processes, worker):
+        leader = by_pid.get(member.session)
+        if member.session not in (0, worker.session) and leader is not None:
+            sessions.add((leader.pid, leader.start))
+    return sessions
+
+
+def retain_sessions(processes, base, retained):
+    """Add the sessions led by the workloads of workers below `base` to `retained`."""
+    for worker, _socket in leaked_workers(processes, base):
+        retained |= led_sessions(processes, worker)
+
+
+def workload_of(processes, worker, retained=()):
+    """Descendants of `worker` and the members of the sessions they lead.
+
+    `retained` holds `(session id, leader start)` pairs seen as this worker's
+    workload in earlier scans; those sessions are followed even after the
+    intermediate parent exited and the leader was reparented to init. A pair
+    whose leader PID now has another start time is a recycled PID and is ignored.
+
+    A descendant that called `setsid` (the PTY child of a worker) leads a
+    session of its own, which outlives the worker. The worker's own session is
+    never followed: it is shared with the daemon and the test run. Neither the
+    worker nor this process is part of the result.
+    """
+    members = {}
+    frontier = [worker.pid]
+    while frontier:
+        parent = frontier.pop()
+        for process in processes:
+            if process.parent == parent and process.pid not in (worker.pid, os.getpid()) \
+                    and process.pid not in members:
+                members[process.pid] = process
+                frontier.append(process.pid)
+    sessions = {p.session for p in members.values() if p.session not in (0, worker.session)}
+    by_pid = {p.pid: p for p in processes}
+    for session, start in retained:
+        leader = by_pid.get(session)
+        if session not in (0, worker.session) and (leader is None or leader.start == start):
+            sessions.add(session)
+    for process in processes:
+        if process.session in sessions and process.pid not in (worker.pid, os.getpid()):
+            members.setdefault(process.pid, process)
+    return list(members.values())
+
+
+def kill_if_unchanged(process):
+    """SIGKILL `process` only while its PID still has the recorded start time.
+
+    A pidfd pins the process first and the start time is read afterwards, so a
+    PID recycled for an unrelated process is never signalled.
+    """
+    try:
+        pidfd = os.pidfd_open(process.pid)
+    except ProcessLookupError:
+        return False
+    try:
+        stat = Path(f"/proc/{process.pid}/stat").read_text(errors="replace")
+        if start_time_of(stat) != process.start:
+            return False
+        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+    finally:
+        os.close(pidfd)
+
+
+def check_no_leaked_workers(base, retained=()):
+    """Terminate and report workers a run left below `base`; True when none did.
+
+    `retained` carries the sessions seen as workload during the run.
+    """
+    processes = read_processes()
+    leaked = leaked_workers(processes, base)
+    for process, socket in leaked:
+        print(f"leaked pohunek-sessiond worker: pid {process.pid}, socket {socket}", file=sys.stderr)
+        # The workload goes first: a worker killed first leaves its PTY session
+        # running with the fixture root deleted beneath it.
+        for member in workload_of(processes, process, retained):
+            kill_if_unchanged(member)
+        kill_if_unchanged(process)
+    return not leaked
+
+
+def make_run_base():
+    """Create the private, unique, short fixture base of one run.
+
+    `mkdir` is exclusive, so concurrent runs never share a base.
+    """
+    while True:
+        name = "".join(secrets.choice(RUN_BASE_ALPHABET) for _ in range(RUN_BASE_NAME_LENGTH))
+        base = RUN_BASE_PARENT / name
+        try:
+            base.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return base.resolve()
+
+
 def require_archive_file(archive):
     """Fail with a clear message unless `archive` is an existing file.
 
@@ -211,7 +434,86 @@ def main():
         report.unlink(missing_ok=True)
     command = nextest_command("run", profile, archive)
     command.extend(["-E", expressions[args.shard]])
-    sys.exit(subprocess.run(command, cwd=ROOT, check=False).returncode)
+    sys.exit(run_checked(command))
+
+
+def remove_tree(path):
+    """Remove `path`, including directories a test left without owner permissions.
+
+    Every directory is made owner-accessible before it is entered; symlinks are
+    never followed or changed.
+    """
+    path = Path(path)
+    path.chmod(0o700)
+    for directory, subdirectories, _files in os.walk(path):
+        for name in subdirectories:
+            entry = os.path.join(directory, name)
+            if not os.path.islink(entry):
+                os.chmod(entry, 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def stop_runner(runner):
+    """Stop a still running `runner` (SIGTERM, then SIGKILL) and wait for it."""
+    if runner.poll() is not None:
+        return
+    runner.terminate()
+    try:
+        runner.wait(timeout=RUNNER_STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        runner.kill()
+        runner.wait()
+
+
+def raise_cancelled(signum, frame):
+    """Turn SIGTERM into the interruption a terminal Ctrl-C raises."""
+    raise KeyboardInterrupt
+
+
+def run_checked(command):
+    """Run `command` with a per-run fixture base and fail if it leaks a worker.
+
+    Test fixtures are created below `TMPDIR`, so a unique base makes every
+    worker the run starts identifiable by its socket path. The check only runs
+    where fixtures follow `TMPDIR` (Linux); macOS fixtures use a fixed
+    `/private/tmp`, and there the in-process `WorkerGuard` is the check.
+
+    When the run is cancelled the runner is stopped and waited for, workers
+    below the base are terminated, and only then is the base removed; the
+    cancellation itself is re-raised.
+    """
+    if sys.platform != "linux":
+        return subprocess.run(command, cwd=ROOT, check=False).returncode
+    base = make_run_base()
+    checked = False
+    retained = set()
+    previous_handler = signal.signal(signal.SIGTERM, raise_cancelled)
+    try:
+        runner = subprocess.Popen(
+            command, cwd=ROOT, env={**os.environ, "TMPDIR": str(base)},
+        )
+        try:
+            while True:
+                try:
+                    status = runner.wait(timeout=RETAIN_POLL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    retain_sessions(read_processes(), base, retained)
+        finally:
+            stop_runner(runner)
+        checked = True
+        if not check_no_leaked_workers(base, retained):
+            print(
+                "error: the test run left pohunek-sessiond workers running (terminated above)",
+                file=sys.stderr,
+            )
+            return status or 1
+        return status
+    finally:
+        if not checked:
+            check_no_leaked_workers(base, retained)
+        remove_tree(base)
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,7 @@ use std::path::{Component, Path, PathBuf};
 
 use tempfile::TempDir;
 
+use crate::workers::WorkerGuard;
 use crate::{make_private, PRIVATE_DIR_MODE};
 
 /// Capacity of a Unix socket path on the strictest supported platform, in bytes.
@@ -237,14 +238,19 @@ pub fn check_socket_path(path: &Path) -> Result<(), SocketPathError> {
 /// A private root, working directory, HOME and XDG directories, and a
 /// scrubbed child environment, owned by one test.
 ///
-/// Dropping the value removes the root and everything beneath it, on success
-/// and while a panic unwinds. A test process that is killed or aborts cannot
-/// run the drop and leaves its root behind.
+/// Dropping the value first terminates any `pohunek-sessiond` worker whose
+/// control socket is below the root and fails the test that left it (see
+/// [`WorkerGuard`]), then removes the root and everything beneath it, on
+/// success and while a panic unwinds. A test process that is killed or aborts
+/// cannot run the drop and leaves its root and workers behind.
 ///
 /// The `Debug` output lists the directories and the names of the child
 /// environment variables, never their values: the parent environment can hold
 /// credentials such as `GH_TOKEN` that an allowlisted variable might carry.
 pub struct TestEnv {
+    // Declared before `root` so the guard reaps workers while the root still
+    // exists; fields drop in declaration order.
+    workers: WorkerGuard,
     root: TempDir,
     cwd: PathBuf,
     home: PathBuf,
@@ -260,6 +266,7 @@ pub struct TestEnv {
 impl fmt::Debug for TestEnv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TestEnv")
+            .field("workers", &self.workers)
             .field("root", &self.root.path())
             .field("cwd", &self.cwd)
             .field("home", &self.home)
@@ -357,6 +364,7 @@ impl TestEnv {
         .map(|(name, dir)| (OsString::from(name), dir.clone().into_os_string()));
         let environment = scrubbed(parent, pinned);
         Ok(Self {
+            workers: WorkerGuard::watch(root.path()),
             root,
             cwd,
             home,
