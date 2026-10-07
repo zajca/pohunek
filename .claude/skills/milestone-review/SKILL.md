@@ -40,7 +40,9 @@ issue via the `github-workflow` skill.
    verdict (met / partial / missing) with concrete `path:line` evidence. Read the
    applicable `.agents/rust-guidelines/` files so review comments match the
    repo's conventions (typed errors, no silent defaults, documented magic values,
-   `M-CANONICAL-DOCS`, tests for new logic). For a deeper pass this maps well to
+   `M-CANONICAL-DOCS`, behavioral scenarios per the AGENTS.md "Testing
+   policy" — a missing regression scenario for a bug or lifecycle fix is a
+   gap; a missing per-function unit test is not). For a deeper pass this maps well to
    parallel specialist reviewers (security-reviewer for the `sh -c` attach
    surface and secret handling, silent-failure-hunter for swallowed daemon
    errors, performance-reviewer), synthesized before you report.
@@ -56,8 +58,9 @@ issue via the `github-workflow` skill.
    the review go to their own follow-up issues (dedup via the
    `github-workflow` skill); an unmet original DoD item is never moved to a
    follow-up to claim the milestone done.
-5. **Re-run the gates after fixes.** Invoke the `gates` skill on the branch
-   once fixes land. Iterate until green.
+5. **Re-run the gates after fixes.** Run the checks the fixes affect while
+   iterating, then the `gates` skill on the branch's final revision. Iterate
+   until green.
    For a stack, review each slice against its own diff (`git diff
    <lower-slice-branch>...<slice-branch>`) and the DoD items the slice plan
    assigns it, and flag a slice that mixes concerns, exceeds the

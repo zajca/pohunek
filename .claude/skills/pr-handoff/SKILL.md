@@ -57,7 +57,8 @@ bottom-up. For each slice, from the bottom:
   `Closes #N`, so the issue cannot close before the whole stack lands.
 - A review fix to a lower slice is committed on that slice's branch; restack
   the branches above it with `git rebase --update-refs` from the top branch,
-  re-run the gates on every rebased slice, and push them all
+  re-run the applicable gates on every rebased slice (its inputs changed with
+  its base), and push them all
   (`--force-with-lease`).
 
 A milestone that is one small concern is a stack of one: a single PR on

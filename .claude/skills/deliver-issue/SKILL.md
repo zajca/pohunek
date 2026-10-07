@@ -74,7 +74,7 @@ slice:
 1. Write a **shared context file** (in the session scratchpad) holding: the
    worktree path and HEAD, "no commits, no pushes, no branches", the mandatory
    repo rules (Rust guidelines, comment rules below, no hardcoded tuning
-   values, tests for every change, knowledge-bundle updates), the local test
+   values, the AGENTS.md "Testing policy", knowledge-bundle updates), the local test
    environment rules (below), and the report format. Brief every worker with
    "read the context file first" plus its own 4-step briefing (known facts,
    `path:line` starts, testable success criteria, owned files).
@@ -82,9 +82,12 @@ slice:
    worker must:
    - **verify the task/finding against the code first** and report a false
      premise with `path:line` evidence instead of changing code;
-   - add a regression test and show it fails without the change and passes
-     with it;
-   - run its crate's tests, clippy `-D warnings` (host, and
+   - for a bug, lifecycle, durability, concurrency, or security fix, add a
+     behavioral regression scenario — in the component's existing scenario
+     when one fits — and show it fails without the change and passes with
+     it; add no new test for a trivial helper change or a refactor existing
+     scenarios already cover (AGENTS.md "Testing policy");
+   - run the checks its change affects: its crate's tests, clippy `-D warnings` (host, and
      `--target aarch64-apple-darwin` for platform/daemon code), `cargo fmt`,
      and `cargo xtask docs check` when docs changed;
    - report root cause, changes with `path:line`, test evidence, and open
@@ -100,9 +103,10 @@ slice:
 
 ## Phase 4 — gates, commit, publish
 
-1. Run the full gate set per the `gates` skill on the whole worktree, not
-   per crate. A gate that cannot run locally (see environment rules) is
-   named as CI-only in the evidence, never silently skipped.
+1. Run the full applicable gate set per the `gates` skill once on the final
+   revision of each slice, on the whole worktree, not per crate. A gate that
+   cannot run locally (see environment rules) is named as CI-only in the
+   evidence, never silently skipped.
 2. Commit per `pr-handoff`: explicit staging, `--no-gpg-sign`, concise
    imperative English message with the *why*, no trailers or footers.
 3. Push and open the PR stack per `pr-handoff` (evidence-built
@@ -170,7 +174,11 @@ head; checking only CI loses review rounds.
    - A finding whose proper fix is a separate design decision outside the
      issue's DoD becomes a follow-up issue with the evidence; one inside
      the DoD is fixed here, never deferred.
-5. **Close the round.** Gates (Phase 4.1), commit, push to the owning slice
+5. **Close the round.** Re-run the checks whose inputs the round's fixes
+   changed (`cargo ta --print` names the affected crates; workspace-wide
+   inputs such as `Cargo.toml`, `Cargo.lock`, `.config/nextest.toml`, or the
+   CI workflow mean the full applicable gate set); checks with unchanged
+   inputs keep their evidence. Commit, push to the owning slice
    branch (restack upper slices with `git rebase --update-refs` and
    `--force-with-lease` per `pr-handoff`), then post one issue comment per
    round: review id, each finding → fixed (`path:line`, test) / rejected
@@ -218,6 +226,9 @@ address its findings in a new fix PR off the updated `main` (same loop).
   watchers, reconciliation) must not act on work a live task still owns.
 - **Fail closed**: uncertain evidence never deletes, kills, or retires
   anything; it keeps a visible, retryable state.
+- **Tests** follow AGENTS.md "Testing policy": behavioral scenarios through a
+  component's supported boundary with independent expected results; no
+  per-function unit tests, coverage targets, or duplicates of covered behavior.
 - Tests are deterministic (hooks, barriers, paused time — no sleeps) and
   hermetic (no dependence on the host's process table, paths, or timing).
 

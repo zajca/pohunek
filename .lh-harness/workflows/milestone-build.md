@@ -111,8 +111,11 @@ contains, and never spend an episode investigating it beyond that.
 - `#![forbid(unsafe_code)]` in library crates stays. `strict_types` and
   existing code style are not negotiable. Follow existing patterns; do not
   add backward-compatibility shims.
-- Tests for all new logic: inline `#[cfg(test)]` for private behavior,
-  `tests/` for integration. Extend existing protocol/state-machine suites.
+- Tests follow the AGENTS.md "Testing policy": new observable behavior gets
+  a scenario at its component boundary, a bug or lifecycle fix gets a
+  behavioral regression scenario, and a trivial helper change or an
+  already-covered refactor gets no new test. No coverage targets. Extend
+  existing protocol/state-machine suites before adding new ones.
 - Config fails fast with a typed error; no silent defaults for required
   values.
 - All repository text (code, comments, docs) in English.

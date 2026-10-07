@@ -1379,7 +1379,14 @@ health for humans and operator agents.
 
 ## Testing Strategy
 
-Core tests:
+Tests protect externally meaningful behavior through each component's supported
+boundary, with expected results taken from a specification, an independent
+fixture, a published recording, or a demonstrated regression. There is no
+coverage target and no per-function unit-test requirement; the working rules are
+in AGENTS.md ("Testing policy"). The obligations below must each stay represented
+by independent scenarios.
+
+Component scenarios:
 
 - Control protocol serialization for request/response/error/event envelopes and
   version negotiation.
@@ -1396,10 +1403,12 @@ Core tests:
 - Explicit recovery via native session IDs creates a new runtime generation.
 - Worktree binding, ownership checks, and conflict handling.
 - Session transaction, worker-journal, reconciliation, and metadata-store
-  round-trip coverage across create, stop, remove, recovery, and restart.
-- CLI table and `--json` output.
+  durability across create, stop, remove, recovery, and restart, including
+  persisted-schema guards and migration of stored records.
+- CLI command behavior: arguments to request, table and `--json` output, error
+  output, and exit status.
 
-Integration tests:
+Integration and system scenarios:
 
 - Local daemon + CLI full session lifecycle.
 - Remote daemon over NetBird (or a loopback TCP stand-in) reusing the same

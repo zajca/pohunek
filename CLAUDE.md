@@ -7,7 +7,12 @@ repeat AGENTS.md.
 
 Your personal global instructions in `~/.claude/CLAUDE.md` also apply and take
 precedence where they are stricter (Czech communication, English files,
-security > quality > simplicity > time, no mocks, no hardcoded values).
+security > quality > simplicity > time, no mocks, no hardcoded values). The one
+exception is testing: AGENTS.md "Testing policy" replaces the global "write
+tests for all new code" rule for this repository. Write the behavioral scenarios
+that policy asks for — a regression scenario for a bug or lifecycle fix, a
+component scenario for new observable behavior — and no per-function unit tests,
+coverage targets, or duplicate tests for already-covered refactors.
 
 ## Mandatory: read the Rust guidelines before any Rust edit
 
@@ -36,9 +41,12 @@ The constraints are spelled out in AGENTS.md ("Hard constraints").
 
 ## Verifying work
 
-CI is the source of truth. Before reporting a Rust change as done, run the gate
-set from AGENTS.md ("Build, test, lint") — clippy is `-D warnings`, so a warning
-is a failure. For docs/knowledge changes, also run `cargo xtask docs check`.
+CI is the source of truth. While iterating, run the checks your change affects;
+before reporting a Rust change as done, run the applicable gate set from
+AGENTS.md ("Build, test, lint") once on the final revision — clippy is
+`-D warnings`, so a warning is a failure. A later fix re-runs only the checks
+whose inputs it changed (AGENTS.md "Testing policy"). For docs/knowledge
+changes, also run `cargo xtask docs check`.
 
 ## Milestone workflow skills
 
@@ -58,7 +66,7 @@ semantics, safe persistence — config in `.github/agent-workflow.json`).
   issue in a fresh worktree, then run the gates.
 - **`milestone-review`** — review a branch/worktree against the issue's DoD
   with `path:line` evidence, record findings on the issue, delegate fixes,
-  re-run the gates.
+  re-run the checks the fixes affect and the final gates.
 - **`merge-advance`** — commit unsigned, merge to `main`, prune the
   branch/worktree, update the milestone issue and project status.
 - **`release`** — cut a version with `scripts/release` and verify the Release
