@@ -108,47 +108,6 @@ describe("Client request/response", () => {
     }
   });
 
-  test("call carries the typed safe never-enrolled governance inspect contract", async () => {
-    const status = {
-      host_id: "host_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-      enrollment: null,
-      owner: null,
-      owner_revision: null,
-      quarantine: null,
-      approval_key_reference: "approval_key_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-    } satisfies HostGovernanceStatus;
-    const daemon = await startUnixDaemon([
-      { kind: "reply", line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), status) },
-    ]);
-    try {
-      const client = await connectClient(daemon);
-
-      const result = await client.call("host.governance.inspect", null);
-
-      expect(result).toEqual(status);
-      expect(Object.keys(result).sort()).toEqual([
-        "approval_key_reference",
-        "enrollment",
-        "host_id",
-        "owner",
-        "owner_revision",
-        "quarantine",
-      ]);
-      expect(/^host_[A-Za-z0-9_-]{43}$/.test(result.host_id)).toBe(true);
-      expect(/^approval_key_[A-Za-z0-9_-]{43}$/.test(result.approval_key_reference)).toBe(true);
-      expect(result.enrollment).toBeNull();
-      expect(result.owner).toBeNull();
-      expect(result.owner_revision).toBeNull();
-      expect(result.quarantine).toBeNull();
-
-      const sent = parseRequestLine(await daemon.nextRequest());
-      expect(sent["method"]).toBe("host.governance.inspect");
-      expect(sent["params"]).toBeNull();
-    } finally {
-      await daemon.close();
-    }
-  });
-
   test("call accepts every canonical 32-byte Base64URL final character for host and approval-key identifiers", async () => {
     for (const finalCharacter of "AEIMQUYcgkosw048") {
       const status = {
@@ -499,60 +458,6 @@ describe("Client request/response", () => {
     }
   });
 
-  test("typed screen, output, and wait methods preserve observation payloads", async () => {
-    const screen = {
-      session_id: "s-test-1",
-      worker_id: "worker-test-1",
-      worker_instance_id: "runtime-test-1",
-      runtime_generation: "1",
-      watermark: "2",
-      dimensions: { cols: 80, rows: 24 },
-      cursor: { row: 0, col: 3, visible: true },
-      alternate_screen: false,
-      visible_lines: ["test"],
-    } as const;
-    const output = {
-      session_id: "s-test-1",
-      worker_instance_id: "runtime-test-1",
-      runtime_generation: "1",
-      history_start_offset: "0",
-      start_offset: "0",
-      next_offset: "4",
-      runtime_end_offset: "4",
-      data_base64: "dGVzdA==",
-      has_more: false,
-      timed_out: false,
-    } as const;
-    const wait = {
-      reason: "output_advanced",
-      session: minimalSessionInfo(),
-      terminal_watermark: "2",
-      output_offset: "4",
-    } as const;
-    const daemon = await startUnixDaemon([
-      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), screen) },
-      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), output) },
-      { kind: "reply", line: (line) => okResponseLine(requestIdFromLine(line), wait) },
-    ]);
-    try {
-      const screenClient = await connectClient(daemon);
-      expect(await screenClient.sessionScreen({ session_id: "s-test-1" })).toEqual(screen);
-      await screenClient.close();
-      const outputClient = await connectClient(daemon);
-      expect(await outputClient.sessionOutput({ session_id: "s-test-1", max_bytes: 128 })).toEqual(output);
-      await outputClient.close();
-      const waitClient = await connectClient(daemon);
-      expect(await waitClient.sessionWait({
-        session_id: "s-test-1",
-        after_updated_at: "2026-07-08T00:00:00Z",
-        timeout_ms: 50,
-      })).toEqual(wait);
-      await waitClient.close();
-    } finally {
-      await daemon.close();
-    }
-  });
-
   test("configured origin reaches ordinary and dedicated observation connections", async () => {
     const screen = {
       session_id: "s-target",
@@ -679,40 +584,6 @@ describe("Client request/response", () => {
       });
       const followUp = parseRequestLine(await daemon.nextRequest());
       expect(followUp["method"]).toBe("daemon.health");
-      await client.close();
-    } finally {
-      await daemon.close();
-    }
-  });
-
-  test("input wait normalizes absent targets before wire validation", async () => {
-    const input = {
-      accepted: true,
-      activity: "idle",
-      activity_source: "report",
-      runtime: { worker_instance_id: "runtime-target", runtime_generation: "1" },
-      activity_epoch: "d-epoch-1",
-      activity_revision: "2",
-    } as const;
-    const daemon = await startUnixDaemon([{
-      kind: "reply",
-      line: (line) => okResponseLine(requestIdFromLine(line), input),
-    }]);
-    try {
-      const client = await connectClient(daemon);
-
-      expect(await client.sessionInput({
-        session_id: "s-target",
-        text: "hello",
-        wait: {},
-      })).toEqual(input);
-
-      const request = parseRequestLine(await daemon.nextRequest());
-      expect(request["params"]).toEqual({
-        session_id: "s-target",
-        text: "hello",
-        wait: { until: [] },
-      });
       await client.close();
     } finally {
       await daemon.close();

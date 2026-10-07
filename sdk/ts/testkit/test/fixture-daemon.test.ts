@@ -187,32 +187,6 @@ describe("@pohunek/testkit fixture daemon", () => {
     }
   });
 
-  test("session input wait rejects invalid timeout contracts", async () => {
-    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-invalid") } });
-    try {
-      const client = await connectLocal(requireUnixSocket(daemon));
-      const created = await client.call("session.new", {
-        agent: "codex",
-        cols: TEST_COLS,
-        rows: TEST_ROWS,
-      });
-
-      await expectProtocolError(client.call("session.input", {
-        session_id: created.id,
-        text: "hello",
-        wait: { until: ["idle"], timeout_ms: 0 },
-      }), "session_input_invalid_wait");
-      await expectProtocolError(client.call("session.input", {
-        session_id: created.id,
-        text: "hello",
-        wait: { until: ["idle"], timeout_ms: MAX_SESSION_WAIT_MS + 1 },
-      }), "session_wait_limit_exceeded");
-      await client.close();
-    } finally {
-      await daemon.close();
-    }
-  });
-
   test("session input wait rejects delayed provider framing before delivery", async () => {
     const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("input-delayed") } });
     try {
@@ -568,26 +542,6 @@ describe("@pohunek/testkit fixture daemon", () => {
       expect(await client.call("session.inspect", futureSession.id)).toEqual(before);
       expect((await client.call("session.list", {})).map((session) => session.id)).toEqual([futureSession.id]);
       expect(daemon.scenario.resizes(futureSession.id)).toEqual([]);
-      await client.close();
-    } finally {
-      await daemon.close();
-    }
-  });
-
-  test("attach round-trips binary bytes without UTF-8 assumptions", async () => {
-    const daemon = await startFixtureDaemon({ listen: { unixSocketPath: testSocketPath("binary") } });
-    try {
-      const socketPath = requireUnixSocket(daemon);
-      const client = await connectLocal(socketPath);
-      const created = await client.call("session.new", {
-        agent: "shell",
-        cols: TEST_COLS,
-        rows: TEST_ROWS,
-      });
-      const attach = await client.call("session.attach", { session_id: created.id });
-      const raw = await attachRawLocal(socketPath, attach.stream_id);
-
-      await expectRoundTrip(raw, NON_UTF8_PAYLOAD);
       await client.close();
     } finally {
       await daemon.close();

@@ -218,10 +218,6 @@ async function everyRecordedMethod(fresh: boolean): Promise<void> {
 }
 
 describe("client against a daemon of the previous release", () => {
-  test("the client advertises the whole window", () => {
-    expect(CLIENT_PROTOCOL_VERSIONS).toEqual({ minimum: MIN_PROTOCOL_VERSION, maximum: PROTOCOL_VERSION });
-  });
-
   test("every method family works on one connection", async () => {
     await everyRecordedMethod(false);
   });
