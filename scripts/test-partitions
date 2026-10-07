@@ -55,6 +55,9 @@ RUN_BASE_NAME_LENGTH = RUN_BASE_MAX_LENGTH - len(str(RUN_BASE_PARENT)) - len("/"
 RUN_BASE_ALPHABET = string.ascii_lowercase + string.digits
 # How long a cancelled runner gets to stop after SIGTERM before it is killed.
 RUNNER_STOP_GRACE_SECONDS = 30
+# How often the running tests are scanned for worker workloads, so their
+# sessions are known even if the process linking them to the worker exits.
+RETAIN_POLL_SECONDS = 2
 
 
 def filters():
@@ -268,8 +271,30 @@ def leaked_workers(processes, base):
     return found
 
 
-def workload_of(processes, worker):
+def led_sessions(processes, worker):
+    """`(session id, leader start)` pairs of the sessions `worker`'s descendants lead."""
+    by_pid = {p.pid: p for p in processes}
+    sessions = set()
+    for member in workload_of(processes, worker):
+        leader = by_pid.get(member.session)
+        if member.session not in (0, worker.session) and leader is not None:
+            sessions.add((leader.pid, leader.start))
+    return sessions
+
+
+def retain_sessions(processes, base, retained):
+    """Add the sessions led by the workloads of workers below `base` to `retained`."""
+    for worker, _socket in leaked_workers(processes, base):
+        retained |= led_sessions(processes, worker)
+
+
+def workload_of(processes, worker, retained=()):
     """Descendants of `worker` and the members of the sessions they lead.
+
+    `retained` holds `(session id, leader start)` pairs seen as this worker's
+    workload in earlier scans; those sessions are followed even after the
+    intermediate parent exited and the leader was reparented to init. A pair
+    whose leader PID now has another start time is a recycled PID and is ignored.
 
     A descendant that called `setsid` (the PTY child of a worker) leads a
     session of its own, which outlives the worker. The worker's own session is
@@ -286,6 +311,11 @@ def workload_of(processes, worker):
                 members[process.pid] = process
                 frontier.append(process.pid)
     sessions = {p.session for p in members.values() if p.session not in (0, worker.session)}
+    by_pid = {p.pid: p for p in processes}
+    for session, start in retained:
+        leader = by_pid.get(session)
+        if session not in (0, worker.session) and (leader is None or leader.start == start):
+            sessions.add(session)
     for process in processes:
         if process.session in sessions and process.pid not in (worker.pid, os.getpid()):
             members.setdefault(process.pid, process)
@@ -314,15 +344,18 @@ def kill_if_unchanged(process):
         os.close(pidfd)
 
 
-def check_no_leaked_workers(base):
-    """Terminate and report workers a run left below `base`; True when none did."""
+def check_no_leaked_workers(base, retained=()):
+    """Terminate and report workers a run left below `base`; True when none did.
+
+    `retained` carries the sessions seen as workload during the run.
+    """
     processes = read_processes()
     leaked = leaked_workers(processes, base)
     for process, socket in leaked:
         print(f"leaked pohunek-sessiond worker: pid {process.pid}, socket {socket}", file=sys.stderr)
         # The workload goes first: a worker killed first leaves its PTY session
         # running with the fixture root deleted beneath it.
-        for member in workload_of(processes, process):
+        for member in workload_of(processes, process, retained):
             kill_if_unchanged(member)
         kill_if_unchanged(process)
     return not leaked
@@ -453,17 +486,23 @@ def run_checked(command):
         return subprocess.run(command, cwd=ROOT, check=False).returncode
     base = make_run_base()
     checked = False
+    retained = set()
     previous_handler = signal.signal(signal.SIGTERM, raise_cancelled)
     try:
         runner = subprocess.Popen(
             command, cwd=ROOT, env={**os.environ, "TMPDIR": str(base)},
         )
         try:
-            status = runner.wait()
+            while True:
+                try:
+                    status = runner.wait(timeout=RETAIN_POLL_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    retain_sessions(read_processes(), base, retained)
         finally:
             stop_runner(runner)
         checked = True
-        if not check_no_leaked_workers(base):
+        if not check_no_leaked_workers(base, retained):
             print(
                 "error: the test run left pohunek-sessiond workers running (terminated above)",
                 file=sys.stderr,
@@ -472,7 +511,7 @@ def run_checked(command):
         return status
     finally:
         if not checked:
-            check_no_leaked_workers(base)
+            check_no_leaked_workers(base, retained)
         remove_tree(base)
         signal.signal(signal.SIGTERM, previous_handler)
 

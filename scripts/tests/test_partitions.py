@@ -2,7 +2,9 @@
 
 import importlib.machinery
 import importlib.util
+import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import tempfile
@@ -301,9 +303,11 @@ class LeakedWorkerTests(unittest.TestCase):
             )
             worker = subprocess.Popen(
                 [str(executable), "-c", script, "--daemon-socket-path", str(base / "d.sock")],
+                start_new_session=True,
             )
             self.addCleanup(worker.wait)
-            self.addCleanup(worker.kill)
+            self.addCleanup(self.kill_group, worker)
+            self.addCleanup(self.kill_recorded_workload, pid_file)
             wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
             workload = int(pid_file.read_text())
             self.assertTrue(Path(f"/proc/{workload}").exists())
@@ -312,15 +316,85 @@ class LeakedWorkerTests(unittest.TestCase):
             stat = Path(f"/proc/{workload}/stat")
             wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
 
+    def test_a_retained_session_is_followed_after_its_leader_was_reparented(self):
+        def proc(pid, parent, session):
+            return partitions.Process(pid, f"s{pid}", [], None, parent, session)
+
+        worker = proc(100, 1, 50)
+        processes = [worker, proc(102, 1, 102), proc(103, 102, 102)]
+        self.assertEqual(partitions.workload_of(processes, worker), [])
+        found = partitions.workload_of(processes, worker, {(102, "s102")})
+        self.assertEqual(sorted(p.pid for p in found), [102, 103])
+        recycled = partitions.workload_of(processes, worker, {(102, "other")})
+        self.assertEqual(recycled, [])
+
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
+    def test_a_workload_whose_intermediate_parent_exited_is_still_killed(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = Path(root)
+            pid_file = base / "workload.pid"
+            inner = base / "inner.sh"
+            inner.write_text(f"trap '' HUP TERM; echo $$ > {pid_file}; sleep 613; true")
+            executable = base / "pohunek-sessiond"
+            executable.symlink_to("/bin/sh")
+            script = f"sleep 613 & sh -c 'setsid sh {inner}; true' & wait"
+            worker = subprocess.Popen(
+                [str(executable), "-c", script, "--daemon-socket-path", str(base / "d.sock")],
+                start_new_session=True,
+            )
+            self.addCleanup(worker.wait)
+            self.addCleanup(self.kill_group, worker)
+            self.addCleanup(self.kill_recorded_workload, pid_file)
+            wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
+            leader = int(pid_file.read_text())
+
+            retained = set()
+            partitions.retain_sessions(partitions.read_processes(), base, retained)
+            self.assertEqual({session for session, _ in retained}, {leader})
+
+            def parent_of(pid):
+                stat = Path(f"/proc/{pid}/stat").read_text()
+                return partitions.stat_fields(stat)[0]
+
+            intermediate = parent_of(leader)
+            self.assertNotEqual(intermediate, worker.pid)
+            os.kill(intermediate, signal.SIGKILL)
+            wait_for(lambda: parent_of(leader) != intermediate)
+
+            processes = partitions.read_processes()
+            found = partitions.leaked_workers(processes, base)
+            self.assertNotIn(leader, [p.pid for p in partitions.workload_of(processes, found[0][0])])
+
+            self.assertFalse(partitions.check_no_leaked_workers(base, retained))
+            stat = Path(f"/proc/{leader}/stat")
+            wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+
+    @staticmethod
+    def kill_group(child):
+        """SIGKILL the stand-in and the `sleep` it started, which share its group."""
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    @staticmethod
+    def kill_recorded_workload(pid_file):
+        """SIGKILL the workload whose PID the stand-in recorded, if it is still there."""
+        try:
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+
     def spawn_stand_in(self, base, name="pohunek-sessiond"):
         """A real process whose argv names a worker below `base`, and its Process."""
         executable = base / name
         executable.symlink_to("/bin/sh")
         child = subprocess.Popen(
             [str(executable), "-c", "sleep 30; true", "--daemon-socket-path", str(base / "d.sock")],
+            start_new_session=True,
         )
         self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
+        self.addCleanup(self.kill_group, child)
         found = None
         while found is None:
             found = next(

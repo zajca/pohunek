@@ -49,6 +49,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::wait::POLL_INTERVAL;
@@ -104,6 +105,9 @@ pub struct WorkerProcess {
     /// The PTY workload of a session runs in a session of its own and outlives
     /// a worker that is terminated, so it is stopped before the worker is.
     pub workload: Vec<ProcessId>,
+    /// Leaders of the sessions the workload leads: those listed now plus those
+    /// the caller retained from earlier scans.
+    pub sessions: Vec<ProcessId>,
 }
 
 /// One process of the process table, before it is matched against a root.
@@ -135,6 +139,7 @@ enum Stop {
 /// binary was replaced on disk still does. The socket path is the argument that
 /// follows [`SOCKET_PATH_ARGUMENT`], taken whole so a path with spaces stays one
 /// path.
+#[cfg(any(target_os = "linux", test))]
 fn as_worker(entry: &ProcessEntry) -> Option<WorkerProcess> {
     let named = |path: &Path| {
         path.file_name()
@@ -160,6 +165,7 @@ fn as_worker(entry: &ProcessEntry) -> Option<WorkerProcess> {
         start: entry.start.clone(),
         socket_path,
         workload: Vec::new(),
+        sessions: Vec::new(),
     })
 }
 
@@ -171,7 +177,18 @@ fn as_worker(entry: &ProcessEntry) -> Option<WorkerProcess> {
 /// processes exit. The session of the worker itself is never followed: it is
 /// shared with the daemon and the test. The worker and this process are never
 /// part of the result.
-fn workload_of(entries: &[ProcessEntry], worker: &ProcessEntry) -> Vec<ProcessId> {
+///
+/// `retained` lists the leaders of sessions seen as this worker's workload in
+/// earlier scans. Their sessions are followed even when no listed descendant
+/// leads them any more, which is the case once the intermediate parent exited
+/// and init adopted the session leader. A retained leader whose PID now has a
+/// different start time is a recycled PID and is ignored. Returns the processes
+/// and the leaders of the sessions followed.
+fn workload_of(
+    entries: &[ProcessEntry],
+    worker: &ProcessEntry,
+    retained: &[ProcessId],
+) -> (Vec<ProcessId>, Vec<ProcessId>) {
     let own_pid = std::process::id();
     let mut members: Vec<&ProcessEntry> = Vec::new();
     let mut frontier = vec![worker.pid];
@@ -186,11 +203,34 @@ fn workload_of(entries: &[ProcessEntry], worker: &ProcessEntry) -> Vec<ProcessId
             }
         }
     }
-    let sessions: Vec<u32> = members
+    let still_theirs = |leader: &&ProcessId| {
+        entries
+            .iter()
+            .find(|entry| entry.pid == leader.pid)
+            .is_none_or(|entry| entry.start == leader.start)
+    };
+    let mut sessions: Vec<u32> = members
         .iter()
         .map(|entry| entry.session)
+        .chain(
+            retained
+                .iter()
+                .filter(still_theirs)
+                .map(|leader| leader.pid),
+        )
         .filter(|session| *session != 0 && *session != worker.session)
         .collect();
+    sessions.sort_unstable();
+    sessions.dedup();
+    let leaders = sessions
+        .iter()
+        .filter_map(|session| entries.iter().find(|entry| entry.pid == *session))
+        .map(|leader| ProcessId {
+            pid: leader.pid,
+            start: leader.start.clone(),
+        })
+        .chain(retained.iter().filter(still_theirs).cloned())
+        .collect::<Vec<_>>();
     let session_members = entries.iter().filter(|entry| {
         sessions.contains(&entry.session)
             && entry.pid != worker.pid
@@ -198,30 +238,82 @@ fn workload_of(entries: &[ProcessEntry], worker: &ProcessEntry) -> Vec<ProcessId
             && !members.iter().any(|known| known.pid == entry.pid)
     });
     let session_members: Vec<&ProcessEntry> = session_members.collect();
-    members
+    let workload = members
         .into_iter()
         .chain(session_members)
         .map(|entry| ProcessId {
             pid: entry.pid,
             start: entry.start.clone(),
         })
-        .collect()
+        .collect();
+    let mut leaders = leaders;
+    leaders.sort_by_key(|leader| leader.pid);
+    leaders.dedup();
+    (workload, leaders)
 }
 
 /// Returns the workers among `entries` whose socket path is below `root`.
 ///
 /// The comparison is per path component, so `/tmp/pw-s-ab` does not own a
 /// worker of `/tmp/pw-s-abc`.
-fn workers_among(entries: &[ProcessEntry], root: &Path) -> Vec<WorkerProcess> {
+fn workers_among(
+    entries: &[ProcessEntry],
+    root: &Path,
+    retained: &[ProcessId],
+) -> Vec<WorkerProcess> {
     entries
         .iter()
-        .filter_map(|entry| as_worker(entry).map(|worker| (entry, worker)))
-        .filter(|(_, worker)| worker.socket_path.starts_with(root))
-        .map(|(entry, worker)| WorkerProcess {
-            workload: workload_of(entries, entry),
-            ..worker
+        .filter_map(|entry| matched_worker(entry, root).map(|worker| (entry, worker)))
+        .map(|(entry, worker)| {
+            let (workload, sessions) = workload_of(entries, entry, retained);
+            WorkerProcess {
+                workload,
+                sessions,
+                ..worker
+            }
         })
         .collect()
+}
+
+/// Returns the worker `entry` describes when its socket is below `root`.
+#[cfg(target_os = "linux")]
+fn matched_worker(entry: &ProcessEntry, root: &Path) -> Option<WorkerProcess> {
+    as_worker(entry).filter(|worker| worker.socket_path.starts_with(root))
+}
+
+/// Returns the worker `entry` describes when its socket is below `root`.
+///
+/// `ps` has lost the argument boundaries, so the whole command line is matched
+/// as text (see [`command_is_worker_below`]); the socket path reported is the root.
+#[cfg(not(target_os = "linux"))]
+fn matched_worker(entry: &ProcessEntry, root: &Path) -> Option<WorkerProcess> {
+    let command = entry.argv.first()?.to_str()?;
+    command_is_worker_below(command, root).then(|| WorkerProcess {
+        pid: entry.pid,
+        parent_pid: entry.parent_pid,
+        start: entry.start.clone(),
+        socket_path: root.to_path_buf(),
+        workload: Vec::new(),
+        sessions: Vec::new(),
+    })
+}
+
+/// Whether `command`, the whole command column of `ps`, is a worker whose
+/// control socket is below `root`.
+///
+/// Plain substring matching, so spaces in the executable or in `root` do not
+/// matter: the command names the worker executable and contains
+/// `--daemon-socket-path <root>` followed by a path separator, which keeps
+/// `/tmp/pw-s-ab` from owning a worker of `/tmp/pw-s-abc`.
+#[cfg(any(not(target_os = "linux"), test))]
+fn command_is_worker_below(command: &str, root: &Path) -> bool {
+    let names_worker = command.starts_with(WORKER_EXECUTABLE)
+        || command.contains(&format!("/{WORKER_EXECUTABLE}"));
+    let marker = format!("{SOCKET_PATH_ARGUMENT} {}", root.display());
+    names_worker
+        && command
+            .match_indices(&marker)
+            .any(|(at, _)| command[at + marker.len()..].starts_with('/'))
 }
 
 /// Fields of `/proc/<pid>/stat` the process table uses.
@@ -367,8 +459,13 @@ fn start_of(pid: u32) -> Option<String> {
 ///
 /// Returns the I/O error when the process table cannot be read.
 pub fn try_workers_under(root: &Path) -> io::Result<Vec<WorkerProcess>> {
+    workers_retaining(root, &[])
+}
+
+/// [`try_workers_under`] that also follows the sessions in `retained`.
+fn workers_retaining(root: &Path, retained: &[ProcessId]) -> io::Result<Vec<WorkerProcess>> {
     let own_pid = std::process::id();
-    Ok(workers_among(&process_table()?, root)
+    Ok(workers_among(&process_table()?, root, retained)
         .into_iter()
         .filter(|worker| worker.parent_pid != own_pid)
         .collect())
@@ -468,16 +565,34 @@ fn wait_for_none(root: &Path, limit: Duration) -> bool {
 ///
 /// Returns the I/O error when the process table cannot be read.
 pub fn try_reap_workers_under(root: &Path) -> io::Result<Vec<WorkerProcess>> {
-    let found = try_workers_under(root)?;
+    reap_retaining(root, &mut Vec::new())
+}
+
+/// Adds the session leaders of the workloads of `workers` to `retained`.
+fn retain_sessions(retained: &mut Vec<ProcessId>, workers: &[WorkerProcess]) {
+    retained.extend(
+        workers
+            .iter()
+            .flat_map(|worker| worker.sessions.iter().cloned()),
+    );
+    retained.sort_by_key(|leader| leader.pid);
+    retained.dedup();
+}
+
+/// [`try_reap_workers_under`] that follows the sessions in `retained` and adds
+/// the ones it finds to it.
+fn reap_retaining(root: &Path, retained: &mut Vec<ProcessId>) -> io::Result<Vec<WorkerProcess>> {
+    let found = workers_retaining(root, retained)?;
     if found.is_empty() {
         return Ok(found);
     }
+    retain_sessions(retained, &found);
     for worker in &found {
         stop_workload(worker);
         signal_worker(worker, Stop::Terminate);
     }
     if !wait_for_none(root, TERMINATE_GRACE) {
-        for worker in try_workers_under(root)? {
+        for worker in workers_retaining(root, retained)? {
             stop_workload(&worker);
             signal_worker(&worker, Stop::Kill);
         }
@@ -508,6 +623,8 @@ pub fn reap_workers_under(root: &Path) -> Vec<WorkerProcess> {
 #[derive(Debug)]
 pub struct WorkerGuard {
     root: PathBuf,
+    /// Sessions seen as the workload of a worker in an earlier scan.
+    retained_sessions: Mutex<Vec<ProcessId>>,
 }
 
 impl WorkerGuard {
@@ -517,23 +634,41 @@ impl WorkerGuard {
     /// the match is on the path as it appears in the worker's arguments.
     #[must_use]
     pub fn watch(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            retained_sessions: Mutex::new(Vec::new()),
+        }
     }
 
     /// Returns the workers below the root that are running now.
+    ///
+    /// The sessions their workloads lead are remembered, so the guard still
+    /// stops them if the intermediate parent exits before the guard drops.
     ///
     /// # Panics
     ///
     /// Panics when the process table cannot be read.
     #[must_use]
     pub fn survivors(&self) -> Vec<WorkerProcess> {
-        workers_under(&self.root)
+        let mut retained = self
+            .retained_sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let workers = workers_retaining(&self.root, &retained).unwrap_or_else(|error| {
+            panic!("cannot read the process table to look for leaked workers: {error}")
+        });
+        retain_sessions(&mut retained, &workers);
+        workers
     }
 }
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        let leaked = match try_reap_workers_under(&self.root) {
+        let retained = self
+            .retained_sessions
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        let leaked = match reap_retaining(&self.root, retained) {
             Ok(leaked) => leaked,
             Err(error) => {
                 assert!(
@@ -571,8 +706,9 @@ mod tests {
     use std::process::{Child, Command, Stdio};
 
     use super::{
-        as_worker, parse_stat, reap_workers_under, signal_worker, workers_among, workers_under,
-        workload_of, ProcessEntry, Stat, Stop, WorkerGuard, WorkerProcess,
+        as_worker, command_is_worker_below, parse_stat, reap_workers_under, signal_worker,
+        workers_among, workers_under, workload_of, ProcessEntry, ProcessId, Stat, Stop,
+        WorkerGuard, WorkerProcess,
     };
     use crate::process_env::ProcessEnv;
     use crate::tempdir;
@@ -669,6 +805,7 @@ mod tests {
                 start: "100".to_owned(),
                 socket_path: "/tmp/pw-s-abc/d.sock".into(),
                 workload: Vec::new(),
+                sessions: Vec::new(),
             }
         );
     }
@@ -690,8 +827,11 @@ mod tests {
             "/home/a b/target/pohunek-sessiond",
             &["--daemon-socket-path", "/tmp/pw s/r/daemon.sock"],
         )];
-        assert_eq!(workers_among(&entries, Path::new("/tmp/pw s")).len(), 1);
-        assert!(workers_among(&entries, Path::new("/tmp/pw")).is_empty());
+        assert_eq!(
+            workers_among(&entries, Path::new("/tmp/pw s"), &[]).len(),
+            1
+        );
+        assert!(workers_among(&entries, Path::new("/tmp/pw"), &[]).is_empty());
     }
 
     #[test]
@@ -736,8 +876,11 @@ mod tests {
             &["--daemon-socket-path", "/tmp/pw-s-abcd/d.sock"],
         );
         let entries = [inside, sibling];
-        assert_eq!(workers_among(&entries, Path::new("/tmp/pw-s-abc")).len(), 1);
-        assert!(workers_among(&entries, Path::new("/tmp/pw-s-ab")).is_empty());
+        assert_eq!(
+            workers_among(&entries, Path::new("/tmp/pw-s-abc"), &[]).len(),
+            1
+        );
+        assert!(workers_among(&entries, Path::new("/tmp/pw-s-ab"), &[]).is_empty());
     }
 
     #[test]
@@ -866,7 +1009,8 @@ mod tests {
             process_in_table(107, 1, 107),
             process_in_table(std::process::id(), 100, 102),
         ];
-        let mut pids: Vec<u32> = workload_of(&entries, &worker)
+        let mut pids: Vec<u32> = workload_of(&entries, &worker, &[])
+            .0
             .iter()
             .map(|process| process.pid)
             .collect();
@@ -922,6 +1066,129 @@ mod tests {
         assert_eq!(reap_workers_under(root.path()).len(), 1);
         poll_until("the workload ends", || {
             (!process_exists(workload) && !process_exists(worker.pid)).then_some(())
+        });
+    }
+
+    #[test]
+    fn a_ps_command_is_matched_as_text_so_spaces_do_not_matter() {
+        let command = "/Users/a b/target/debug/pohunek-sessiond --session-id s-1 \
+                       --daemon-socket-path /private/tmp/pw s/r/pohunek/daemon.sock";
+        assert!(command_is_worker_below(
+            command,
+            Path::new("/private/tmp/pw s")
+        ));
+        assert!(!command_is_worker_below(
+            command,
+            Path::new("/private/tmp/pw")
+        ));
+        assert!(!command_is_worker_below(
+            command,
+            Path::new("/private/tmp/other")
+        ));
+        assert!(!command_is_worker_below(
+            "grep pohunek-sessiond --daemon-socket-path /private/tmp/pw s/x",
+            Path::new("/private/tmp/pw s")
+        ));
+    }
+
+    #[test]
+    fn a_retained_session_is_followed_after_its_leader_was_reparented() {
+        let worker = process_in_table(100, 1, 50);
+        // The intermediate parent exited: the leader's parent is init.
+        let entries = [
+            worker.clone(),
+            process_in_table(102, 1, 102),
+            process_in_table(103, 102, 102),
+        ];
+        assert!(workload_of(&entries, &worker, &[]).0.is_empty());
+        let leader = ProcessId {
+            pid: 102,
+            start: "s102".to_owned(),
+        };
+        let (workload, sessions) = workload_of(&entries, &worker, std::slice::from_ref(&leader));
+        let mut pids: Vec<u32> = workload.iter().map(|process| process.pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, [102, 103]);
+        assert_eq!(sessions, [leader]);
+
+        // The same PID with another start time is a recycled one: not followed.
+        let recycled = ProcessId {
+            pid: 102,
+            start: "other".to_owned(),
+        };
+        assert!(workload_of(&entries, &worker, &[recycled]).0.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_workload_whose_intermediate_parent_exited_is_still_stopped() {
+        let root = tempdir().expect("root");
+        let pid_file = root.path().join("workload.pid");
+        // worker -> intermediate shell -> session leader (`setsid` runs `inner.sh`
+        // in place; the trailing `true` keeps the intermediate shell alive).
+        let inner = root.path().join("inner.sh");
+        std::fs::write(
+            &inner,
+            format!(
+                "trap '' HUP TERM; echo $$ > {}; sleep 613; true",
+                pid_file.display()
+            ),
+        )
+        .expect("write the workload script");
+        let worker = spawn_orphan_at(
+            root.path(),
+            &root.path().join("pohunek-sessiond"),
+            &root.path().join("r/pohunek/daemon.sock"),
+            // The idle child keeps the worker alive once the intermediate shell ends.
+            &format!(
+                "sleep 613 & sh -c 'setsid sh {}; true' & wait",
+                inner.display()
+            ),
+        );
+        let leader: u32 = poll_until("the workload records its PID", || {
+            std::fs::read_to_string(&pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+        });
+        let guard = WorkerGuard::watch(root.path());
+        poll_until("the guard sees the workload", || {
+            guard
+                .survivors()
+                .iter()
+                .any(|listed| listed.workload.iter().any(|process| process.pid == leader))
+                .then_some(())
+        });
+
+        // End the process between the worker and the session leader.
+        let parent_of = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| parse_stat(&stat))
+                .map(|stat| stat.parent_pid)
+        };
+        let intermediate = parent_of(leader).expect("the leader has a parent");
+        assert_ne!(intermediate, worker.pid);
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(i32::try_from(intermediate).expect("pid")).expect("pid"),
+            rustix::process::Signal::KILL,
+        )
+        .expect("end the intermediate parent");
+        poll_until("the leader is reparented", || {
+            (parent_of(leader) != Some(intermediate)).then_some(())
+        });
+        let listed = workers_under(root.path());
+        assert!(
+            !listed[0]
+                .workload
+                .iter()
+                .any(|process| process.pid == leader),
+            "without the retained session the leader is no longer linked to the worker"
+        );
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| drop(guard)));
+        assert!(outcome.is_err(), "the leaked worker fails the test");
+        poll_until("the workload ends", || {
+            (!process_exists(leader) && !process_exists(worker.pid)).then_some(())
         });
     }
 
