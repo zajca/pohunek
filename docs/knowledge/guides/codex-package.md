@@ -103,14 +103,21 @@ classifies every one of them through the package manifest.
 - **Hooks run in a descendant process.** Codex 0.160.0 runs its hooks from a
   `codex app-server --listen unix:// --managed-daemon` process below the
   launched `codex`: a direct child of the native binary, which is itself a child
-  of the Node launcher an npm install starts. The daemon accepts native-reference reports only from the
-  launch process, so the conversation id arrives as the nested active agent's
-  (`active_agent_session_id`) and `native_session_id` stays empty: `session
-  resume` is refused with `not_resumable`. A real-Codex test pins this
-  (`a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_so_resume_has_no_reference`).
-  The app-server also outlives the TUI when it is detached; the fixture's
-  process guard stops every process of the fixture, including after a failed
-  assertion.
+  of the Node launcher an npm install starts. The session worker accepts a launch
+  claim from the launch process itself and from a process named for the provider
+  that the launch process started directly (see "Which process may report the
+  conversation id" in [sessions](../concepts/sessions.md)), so the app-server's
+  conversation id becomes `native_session_id` and `session resume` runs `codex
+  resume <id>`. A real-Codex test pins this
+  (`a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_and_resume_has_its_reference`):
+  it waits for `native_session_id`, checks the reporter descends from the launch
+  process, stops the session, resumes it and checks the reference is unchanged.
+  Codex reports a subagent through its own `SubagentStart` hook, which the
+  reporter sends as a subagent claim and never as a reference, so a subagent id
+  is not promoted; the first reference stays, and a later different id from the
+  app-server does not replace it. The app-server also outlives the TUI when it is
+  detached; the fixture's process guard stops every process of the fixture,
+  including after a failed assertion.
 - **Process forms.** The helper process has kernel name `codex` too, so the
   matchers accept it. An npm install (`@openai/codex@0.160.0`) launches the tree
   `node …/@openai/codex/bin/codex.js` (the launched process), the native

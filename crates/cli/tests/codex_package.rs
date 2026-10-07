@@ -1660,19 +1660,16 @@ fn describe_chain(chain: &[u64]) -> String {
         .join("\n")
 }
 
-/// Pins a gap of Codex 0.160.0 against the shared integration: Codex runs its
-/// hooks from a `codex app-server` process below the one pohunek launched (a
-/// child of it, or of the native binary an npm launcher starts), so the daemon
-/// records the conversation id as the nested active agent's and
-/// never as the session's native reference, and `session resume` has nothing to
-/// resume with.
+/// Codex 0.160.0 runs its hooks from a `codex app-server` process below the one
+/// pohunek launched (a child of it, or of the native binary an npm launcher
+/// starts). The daemon records the conversation id that process reports as the
+/// session's native reference, so `session resume` has something to resume with.
 ///
-/// When the daemon accepts the app-server process as the launch agent, this test
-/// fails on its first assertion and is replaced by a resume test that drives
-/// `codex resume <id>` through the package.
+/// Needs a `codex` on `PATH` and `POHUNEK_CODEX_E2E=1`; the model is a
+/// loopback stub.
 #[tokio::test]
 #[ignore = "needs a real `codex` on PATH; run with POHUNEK_CODEX_E2E=1 and --ignored"]
-async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_so_resume_has_no_reference(
+async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_and_resume_has_its_reference(
 ) {
     require_real_codex();
     let fixture = Fixture::start().await;
@@ -1697,10 +1694,10 @@ async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_so
         )
         .await;
 
-    let reported = wait_until("the hook-reported conversation id", || async {
+    let reported = wait_until("the hook-reported native reference", || async {
         let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
         assert_eq!(code, 0, "{inspected}");
-        inspected["ok"]["active_agent_session_id"]
+        inspected["ok"]["native_session_id"]
             .is_string()
             .then(|| inspected["ok"].clone())
     })
@@ -1720,15 +1717,30 @@ async fn a_real_codex_reports_hooks_from_a_descendant_of_the_launched_process_so
         reached,
         "the reporting process descends from the launched process; its ancestry:\n{tree}"
     );
+    let reference = reported["native_session_id"]
+        .as_str()
+        .expect("the native reference")
+        .to_owned();
+    assert_eq!(
+        reported["active_agent_session_id"], reference,
+        "the nested reporter's id is the session's reference: {reported}"
+    );
     assert!(
-        reported["native_session_id"].is_null(),
-        "no native reference is recorded for a nested reporter: {reported}"
+        fixture.rollout_file(&reference).is_some(),
+        "Codex wrote a rollout file for the reported conversation {reference}"
     );
 
     fixture.stop(&id).await;
-    let (code, refused) = fixture.harness.json(&["session", "resume", &id]).await;
-    assert_eq!(code, 1, "{refused}");
-    assert_eq!(refused["err"]["code"], "not_resumable", "{refused}");
+    let (code, resumed) = fixture.harness.json(&["session", "resume", &id]).await;
+    assert_eq!(code, 0, "{resumed}");
+    fixture.wait_activity(&id, "idle").await;
+    let (code, inspected) = fixture.harness.json(&["session", "inspect", &id]).await;
+    assert_eq!(code, 0, "{inspected}");
+    assert_eq!(
+        inspected["ok"]["native_session_id"], reference,
+        "the resumed session keeps the conversation it resumed: {inspected}"
+    );
+    fixture.stop(&id).await;
     fixture.finish().await;
 }
 

@@ -680,6 +680,21 @@ when it belongs to the record's own worker instance and the verified launch
 process; a report that arrives while the worker is still verifying the launch
 process is promoted with the claim. The public API reference
 has the field-level contract.
+
+### Which process may report the conversation id
+
+A hook reports the conversation id through the worker, and the worker accepts it
+as the launch claim only from the launch process: the process named for the
+provider that started first below the PTY root, never an interpreter such as
+`node`. A process named for the provider that the launch process started
+directly is accepted as well, because Codex runs its hooks from a `codex
+app-server` child of the launched `codex`. A deeper process, a sibling, a
+process of another name, and a process whose PID or start time no longer matches
+are refused, so an agent a tool command starts never speaks for the session. The
+first accepted claim is the session's reference and is never replaced by a
+different one. Only the `SessionStart` identity report carries a conversation
+id; a subagent's `SubagentStart` and `SubagentStop` reports are a separate
+claim type that never touches the reference.
 The official Pi package is the worked example: see the [Pi runtime package](../guides/pi-package.md).
 
 `session.fork` creates a new pohunek session id and PTY from the source session's
