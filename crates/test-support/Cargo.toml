@@ -9,8 +9,8 @@ publish = false
 
 [dependencies]
 tempfile.workspace = true
-# `workers` signals the leaked worker processes it finds below a fixture root.
-nix = { workspace = true, features = ["signal"] }
+# `workers` signals leaked worker processes through pidfds (`process`).
+rustix = { workspace = true, features = ["process"] }
 # The async waits use `tokio::time` and `TestEnv::tokio_command` returns a
 # `tokio::process::Command`; the workspace spec already enables every
 # feature the other crates use, so this adds no build weight to a workspace build.
