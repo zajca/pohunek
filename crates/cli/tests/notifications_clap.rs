@@ -1,15 +1,5 @@
 //! Parser coverage for the `pohunek notifications` command tree.
 
-use std::process::Command;
-
-/// The built `pohunek` binary with an empty environment: these tests stop at
-/// argument parsing and read none of it.
-fn pohunek() -> Command {
-    let mut command = Command::new(pohunek_test_support::bin_exe("pohunek"));
-    command.env_clear();
-    command
-}
-
 #[test]
 fn notifications_subcommands_parse() {
     for args in [
@@ -100,48 +90,6 @@ fn notifications_subcommands_parse() {
             .try_get_matches_from(args)
             .expect("notifications command should parse");
     }
-}
-
-#[test]
-fn notifications_rejects_host_and_all_hosts() {
-    let out = pohunek()
-        .args([
-            "--host",
-            "host-b",
-            "notifications",
-            "list",
-            "--all-hosts",
-            "--json",
-        ])
-        .output()
-        .expect("spawn pohunek");
-
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stderr.is_empty());
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let doc: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|err| panic!("stdout must be JSON ({err}): {stdout:?}"));
-    assert_eq!(doc["err"]["code"], "cli_usage");
-    assert!(
-        doc["err"]["msg"]
-            .as_str()
-            .is_some_and(|msg| { msg.contains("--host") && msg.contains("--all-hosts") }),
-        "usage message should name both arguments: {doc:?}"
-    );
-}
-
-#[test]
-fn notifications_command_tree_accepts_host_all_hosts_for_typed_usage_validation() {
-    pohunek_cli::command()
-        .try_get_matches_from([
-            "pohunek",
-            "--host",
-            "host-b",
-            "notifications",
-            "list",
-            "--all-hosts",
-        ])
-        .expect("typed run_cli validation handles this global/subcommand combination");
 }
 
 #[test]

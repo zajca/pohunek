@@ -82,47 +82,30 @@ fn invalid_enum_value_under_json_is_structured() {
 }
 
 #[test]
-fn invalid_session_list_filter_under_json_is_structured() {
-    let out = pohunek()
-        .args(["session", "list", "--filter", "state=paused", "--json"])
-        .output()
-        .expect("spawn pohunek");
+fn invalid_session_list_filters_under_json_are_structured() {
+    for (filter, expected) in [
+        ("state=paused", "invalid state filter value"),
+        ("cwd=/workspace", "unknown filter key"),
+    ] {
+        let out = pohunek()
+            .args(["session", "list", "--filter", filter, "--json"])
+            .output()
+            .expect("spawn pohunek");
 
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stderr.is_empty());
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let doc: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {stdout:?}"));
-    assert_eq!(doc["err"]["code"], "cli_usage");
-    assert_eq!(doc["err"]["class"], "configuration");
-    assert!(
-        doc["err"]["msg"]
-            .as_str()
-            .is_some_and(|msg| msg.contains("invalid state filter value")),
-        "usage message should name the filter value problem: {doc:?}"
-    );
-}
-
-#[test]
-fn unknown_session_list_filter_key_under_json_is_structured() {
-    let out = pohunek()
-        .args(["session", "list", "--filter", "cwd=/workspace", "--json"])
-        .output()
-        .expect("spawn pohunek");
-
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stderr.is_empty());
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    let doc: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout must be JSON ({e}): {stdout:?}"));
-    assert_eq!(doc["err"]["code"], "cli_usage");
-    assert_eq!(doc["err"]["class"], "configuration");
-    assert!(
-        doc["err"]["msg"]
-            .as_str()
-            .is_some_and(|msg| msg.contains("unknown filter key")),
-        "usage message should name the unknown filter key: {doc:?}"
-    );
+        assert_eq!(out.status.code(), Some(2), "{filter}");
+        assert!(out.stderr.is_empty(), "{filter}");
+        let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+        let doc: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{filter}: stdout must be JSON ({e}): {stdout:?}"));
+        assert_eq!(doc["err"]["code"], "cli_usage", "{filter}");
+        assert_eq!(doc["err"]["class"], "configuration", "{filter}");
+        assert!(
+            doc["err"]["msg"]
+                .as_str()
+                .is_some_and(|msg| msg.contains(expected)),
+            "{filter}: usage message should name the filter problem: {doc:?}"
+        );
+    }
 }
 
 #[test]

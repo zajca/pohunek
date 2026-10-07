@@ -105,24 +105,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_bare_session_id_as_implicit_local() {
-        let t: Target = "s-42".parse().expect("parse");
-        assert_eq!(t.host, None);
-        assert_eq!(t.session_id, "s-42");
-    }
-
-    #[test]
-    fn parses_explicit_local_host() {
-        let t: Target = "local/s-42".parse().expect("parse");
-        assert_eq!(t.host.as_deref(), Some("local"));
-        assert_eq!(t.session_id, "s-42");
-    }
-
-    #[test]
-    fn parses_remote_host() {
-        let t: Target = "host-b/s-42".parse().expect("parse");
-        assert_eq!(t.host.as_deref(), Some("host-b"));
-        assert_eq!(t.session_id, "s-42");
+    fn parses_implicit_local_explicit_local_and_remote_targets() {
+        for (input, host) in [
+            ("s-42", None),
+            ("local/s-42", Some("local")),
+            ("host-b/s-42", Some("host-b")),
+        ] {
+            let target: Target = input.parse().expect(input);
+            assert_eq!(target.host.as_deref(), host, "{input}");
+            assert_eq!(target.session_id, "s-42", "{input}");
+        }
     }
 
     #[test]
@@ -140,40 +132,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty() {
-        assert_eq!("".parse::<Target>(), Err(TargetParseError::Empty));
-        assert_eq!("   ".parse::<Target>(), Err(TargetParseError::Empty));
-    }
-
-    #[test]
-    fn rejects_missing_session_id() {
-        assert_eq!(
-            "host/".parse::<Target>(),
-            Err(TargetParseError::MissingSessionId("host/".to_owned()))
-        );
-    }
-
-    #[test]
-    fn rejects_missing_host() {
-        assert_eq!(
-            "/s-42".parse::<Target>(),
-            Err(TargetParseError::MissingHost("/s-42".to_owned()))
-        );
-    }
-
-    #[test]
-    fn rejects_too_many_separators() {
-        assert_eq!(
-            "a/b/c".parse::<Target>(),
-            Err(TargetParseError::TooManySeparators("a/b/c".to_owned()))
-        );
-    }
-
-    #[test]
-    fn display_roundtrips() {
-        for s in ["s-42", "local/s-42", "host-b/s-42"] {
-            let t: Target = s.parse().expect("parse");
-            assert_eq!(t.to_string(), s);
+    fn rejects_malformed_targets() {
+        for (input, expected) in [
+            ("", TargetParseError::Empty),
+            ("   ", TargetParseError::Empty),
+            (
+                "host/",
+                TargetParseError::MissingSessionId("host/".to_owned()),
+            ),
+            ("/s-42", TargetParseError::MissingHost("/s-42".to_owned())),
+            (
+                "a/b/c",
+                TargetParseError::TooManySeparators("a/b/c".to_owned()),
+            ),
+        ] {
+            assert_eq!(input.parse::<Target>(), Err(expected), "{input:?}");
         }
     }
 }

@@ -408,16 +408,28 @@ mod tests {
     }
 
     #[test]
-    fn local_launch_needs_no_target() {
-        validate_target(&opts(LOCAL_HOST)).expect("local with no target is allowed");
-        validate_target(&opts("")).expect("empty host is local");
-    }
-
-    #[test]
-    fn local_degraded_is_allowed() {
-        let mut o = opts(LOCAL_HOST);
-        o.degraded = true;
-        validate_target(&o).expect("local degraded is allowed");
+    fn local_launches_and_targeted_remote_launches_are_allowed() {
+        let local_degraded = AssistantOptions {
+            degraded: true,
+            ..opts(LOCAL_HOST)
+        };
+        let remote_project = AssistantOptions {
+            project: Some("ui".to_owned()),
+            ..opts("build-box")
+        };
+        let remote_repo = AssistantOptions {
+            repo: Some(PathBuf::from("/srv/repo")),
+            ..opts("build-box")
+        };
+        for (row, options) in [
+            ("local without a target", opts(LOCAL_HOST)),
+            ("empty host is local", opts("")),
+            ("local degraded", local_degraded),
+            ("remote with --project", remote_project),
+            ("remote with --repo", remote_repo),
+        ] {
+            validate_target(&options).unwrap_or_else(|error| panic!("{row}: {error:?}"));
+        }
     }
 
     #[test]
@@ -427,20 +439,6 @@ mod tests {
             matches!(err, CliError::RemoteTargetRequired),
             "expected RemoteTargetRequired, got {err:?}"
         );
-    }
-
-    #[test]
-    fn remote_with_project_is_allowed() {
-        let mut o = opts("build-box");
-        o.project = Some("ui".to_owned());
-        validate_target(&o).expect("remote with --project is allowed");
-    }
-
-    #[test]
-    fn remote_with_repo_is_allowed() {
-        let mut o = opts("build-box");
-        o.repo = Some(PathBuf::from("/srv/repo"));
-        validate_target(&o).expect("remote with --repo is allowed");
     }
 
     #[test]

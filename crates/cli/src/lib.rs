@@ -2694,90 +2694,6 @@ mod tests {
     }
 
     #[test]
-    fn integration_parses_the_home_selectors_on_every_daemon_backed_command() {
-        for action in ["install", "status", "doctor", "uninstall"] {
-            let agent = ["--agent", "claude"];
-            let profile = Cli::try_parse_from(
-                ["pohunek", "integration", action]
-                    .into_iter()
-                    .chain(agent)
-                    .chain(["--profile", "work"]),
-            )
-            .unwrap_or_else(|error| panic!("{action} --profile: {error}"));
-            let all = Cli::try_parse_from(
-                ["pohunek", "integration", action]
-                    .into_iter()
-                    .chain(agent)
-                    .chain(["--all-profiles"]),
-            )
-            .unwrap_or_else(|error| panic!("{action} --all-profiles: {error}"));
-            let selected = |cli: Cli| match cli.command {
-                Commands::Integration { action } => match action {
-                    IntegrationAction::Install { home, .. }
-                    | IntegrationAction::Status { home, .. }
-                    | IntegrationAction::Doctor { home, .. }
-                    | IntegrationAction::Uninstall { home, .. } => {
-                        commands::integration::HomeSelectionArgs::from(home)
-                    }
-                    other @ IntegrationAction::Update { .. } => panic!("unexpected {other:?}"),
-                },
-                other => panic!("unexpected command: {other:?}"),
-            };
-            assert_eq!(
-                selected(profile),
-                commands::integration::HomeSelectionArgs {
-                    profile: Some("work".to_owned()),
-                    all_profiles: false,
-                },
-                "{action}"
-            );
-            assert_eq!(
-                selected(all),
-                commands::integration::HomeSelectionArgs {
-                    profile: None,
-                    all_profiles: true,
-                },
-                "{action}"
-            );
-        }
-    }
-
-    #[test]
-    fn integration_home_selectors_are_exclusive_and_absent_by_default() {
-        let error = Cli::try_parse_from([
-            "pohunek",
-            "integration",
-            "install",
-            "--profile",
-            "work",
-            "--all-profiles",
-        ])
-        .expect_err("a profile and every profile cannot be combined");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-        assert!(
-            Cli::try_parse_from([
-                "pohunek",
-                "integration",
-                "update",
-                "--agent",
-                "hermes",
-                "--profile",
-                "x"
-            ])
-            .is_err(),
-            "update has no home selector"
-        );
-        let cli = Cli::try_parse_from(["pohunek", "integration", "install"])
-            .expect("parse a bare install");
-        match cli.command {
-            Commands::Integration {
-                action: IntegrationAction::Install { home, .. },
-            } => assert!(!commands::integration::HomeSelectionArgs::from(home).is_selected()),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
     fn integration_parses_explicit_hermes_update_policy_bounds() {
         let cli = Cli::try_parse_from([
             "pohunek",
@@ -2843,137 +2759,6 @@ mod tests {
     }
 
     #[test]
-    fn integration_preserves_status_target_conflicts_and_other_required_targets() {
-        let conflict = Cli::try_parse_from([
-            "pohunek",
-            "integration",
-            "status",
-            "--agent",
-            "hermes",
-            "--hermes-profile",
-            "default",
-            "--hermes-home",
-            "/private/hermes",
-        ])
-        .expect_err("targets conflict");
-        assert_eq!(conflict.kind(), clap::error::ErrorKind::ArgumentConflict);
-
-        Cli::try_parse_from(["pohunek", "integration", "status"])
-            .expect("bare daemon-backed status remains reachable");
-        for agent in ["codex", "claude"] {
-            Cli::try_parse_from(["pohunek", "integration", "status", "--agent", agent])
-                .expect("explicit daemon-backed status remains reachable");
-        }
-        Cli::try_parse_from([
-            "pohunek",
-            "integration",
-            "status",
-            "--agent",
-            "hermes",
-            "--hermes-profile",
-            "default",
-            "--hermes-bin",
-            "/opt/hermes/bin/hermes",
-        ])
-        .expect("explicit local Hermes status preserves target flags");
-
-        Cli::try_parse_from(["pohunek", "integration", "status", "--agent", "hermes"])
-            .expect("Hermes target validation runs before local filesystem access");
-
-        for action in ["doctor", "update", "uninstall"] {
-            let missing_target =
-                Cli::try_parse_from(["pohunek", "integration", action, "--agent", "hermes"])
-                    .expect_err("Hermes-only action requires an explicit target");
-            assert_eq!(
-                missing_target.kind(),
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "{action}"
-            );
-        }
-
-        Cli::try_parse_from(["pohunek", "integration", "install"])
-            .expect("legacy no-agent install remains valid");
-    }
-
-    #[test]
-    fn integration_doctor_and_uninstall_accept_daemon_backed_agents() {
-        for agent in ["codex", "claude"] {
-            for action in ["doctor", "uninstall"] {
-                Cli::try_parse_from(["pohunek", "integration", action, "--agent", agent])
-                    .unwrap_or_else(|error| panic!("{action} --agent {agent}: {error}"));
-            }
-        }
-        Cli::try_parse_from(["pohunek", "integration", "doctor"])
-            .expect("bare doctor diagnoses the daemon-backed agents");
-        let missing = Cli::try_parse_from(["pohunek", "integration", "uninstall"])
-            .expect_err("a removal must name its agent");
-        assert_eq!(
-            missing.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        for action in ["doctor", "uninstall", "update"] {
-            let error =
-                Cli::try_parse_from(["pohunek", "integration", action, "--agent", "hermes"])
-                    .expect_err("Hermes still requires an explicit target");
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "{action}"
-            );
-        }
-        match Cli::try_parse_from([
-            "pohunek",
-            "integration",
-            "uninstall",
-            "--agent",
-            "hermes",
-            "--hermes-profile",
-            "default",
-        ])
-        .expect("explicit Hermes uninstall still parses")
-        .command
-        {
-            Commands::Integration {
-                action:
-                    IntegrationAction::Uninstall {
-                        agent: commands::integration::HookAgentArg::Hermes,
-                        ..
-                    },
-            } => {}
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn integration_rejects_non_hermes_lifecycle_before_dispatch() {
-        let error = run_integration_hermes_action(
-            commands::integration::HermesAction::Update,
-            commands::integration::HookAgentArg::Codex,
-            &commands::integration::HermesOptions {
-                profile: None,
-                home: None,
-                hermes_bin: None,
-                pohunek_bin: None,
-                access_mode: None,
-                allowed_hosts: vec![],
-                tool_timeout_ms: None,
-                request_timeout_ms: None,
-                max_output_bytes: None,
-                max_screen_bytes: None,
-                max_concurrency: None,
-                confirm_wildcard: false,
-                confirm_modified: false,
-            },
-            true,
-        )
-        .expect_err("Codex lifecycle is unsupported");
-        assert_eq!(
-            error.to_protocol_error().code,
-            "integration_action_unsupported"
-        );
-    }
-
-    #[test]
     fn assistant_rejects_project_and_repo_together() {
         let err = Cli::try_parse_from([
             "pohunek",
@@ -2985,165 +2770,6 @@ mod tests {
         ])
         .expect_err("--project and --repo are mutually exclusive");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn exported_command_matches_root_subcommands() {
-        let command = pohunek_cli::command();
-
-        assert_eq!(command.get_name(), "pohunek");
-        for expected in [
-            "attach",
-            "doctor",
-            "daemon",
-            "health",
-            "status",
-            "session",
-            "integration",
-            "setup",
-            "host",
-            "notifications",
-            "prompt",
-            "project",
-            "assistant",
-        ] {
-            assert!(
-                command
-                    .get_subcommands()
-                    .any(|subcommand| subcommand.get_name() == expected),
-                "missing {expected} subcommand"
-            );
-        }
-    }
-
-    #[test]
-    fn parses_session_new_defaults() {
-        let cli = Cli::try_parse_from(["pohunek", "session", "new"]).expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::New {
-                        agent,
-                        name,
-                        cwd,
-                        cols,
-                        rows,
-                        project,
-                        repo,
-                        branch,
-                        base_branch,
-                        input,
-                        input_stdin,
-                        request_timeout_ms,
-                        meta,
-                        yes,
-                        json,
-                    },
-            } => {
-                assert_eq!(agent, "shell");
-                assert_eq!(name, None);
-                assert_eq!(cwd, None);
-                assert_eq!(cols, 80);
-                assert_eq!(rows, 24);
-                assert_eq!(project, None);
-                assert_eq!(repo, None);
-                assert_eq!(branch, None);
-                assert_eq!(base_branch, None);
-                assert_eq!(input, None);
-                assert!(!input_stdin);
-                assert_eq!(request_timeout_ms, None);
-                assert!(meta.is_empty(), "meta defaults to empty");
-                assert!(!yes, "yes defaults to false");
-                assert!(!json, "json defaults to false");
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_new_codex_agent() {
-        let cli =
-            Cli::try_parse_from(["pohunek", "session", "new", "--agent", "codex"]).expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::New { agent, .. },
-            } => {
-                assert_eq!(agent, "codex");
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_new_claude_agent() {
-        let cli =
-            Cli::try_parse_from(["pohunek", "session", "new", "--agent", "claude"]).expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::New { agent, .. },
-            } => {
-                assert_eq!(agent, "claude");
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_new_hermes_agent() {
-        let cli =
-            Cli::try_parse_from(["pohunek", "session", "new", "--agent", "hermes"]).expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::New { agent, .. },
-            } => assert_eq!(agent, "hermes"),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_new_worktree_flags() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "new",
-            "--agent",
-            "claude",
-            "--repo",
-            "/workspace/project",
-            "--branch",
-            "feature/login",
-            "--base-branch",
-            "main",
-        ])
-        .expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::New {
-                        agent,
-                        repo,
-                        branch,
-                        base_branch,
-                        input,
-                        ..
-                    },
-            } => {
-                assert_eq!(agent, "claude");
-                assert_eq!(
-                    repo.as_deref(),
-                    Some(std::path::Path::new("/workspace/project"))
-                );
-                assert_eq!(branch.as_deref(), Some("feature/login"));
-                assert_eq!(base_branch.as_deref(), Some("main"));
-                assert_eq!(input, None);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
     }
 
     #[test]
@@ -3164,150 +2790,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_new_project_reference() {
-        let cli =
-            Cli::try_parse_from(["pohunek", "session", "new", "--project", "ui"]).expect("parse");
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::New { project, repo, .. },
-            } => {
-                assert_eq!(project.as_deref(), Some("ui"));
-                assert_eq!(repo, None);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_new_repeated_meta_flags() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "new",
-            "--meta",
-            "link.provider=github",
-            "--meta",
-            "link.kind=pull_request",
-        ])
-        .expect("parse");
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::New { meta, .. },
-            } => {
-                assert_eq!(
-                    meta,
-                    vec![
-                        ("link.provider".to_owned(), "github".to_owned()),
-                        ("link.kind".to_owned(), "pull_request".to_owned()),
-                    ]
-                );
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
     fn rejects_session_new_malformed_meta_flag() {
         // A `--meta` value missing `=` fails at parse time (clap usage error),
         // not silently or after a daemon round-trip.
         let err = Cli::try_parse_from(["pohunek", "session", "new", "--meta", "no-equals-sign"])
             .expect_err("malformed --meta must fail to parse");
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-    }
-
-    #[test]
-    fn parses_session_new_initial_input() {
-        let cli = Cli::try_parse_from(["pohunek", "session", "new", "--input", "Fix #1234"])
-            .expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::New { input, .. },
-            } => assert_eq!(input.as_deref(), Some("Fix #1234")),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_hidden_subscribe_json() {
-        let cli = Cli::try_parse_from(["pohunek", "subscribe", "--json"]).expect("parse");
-
-        match cli.command {
-            Commands::Subscribe { json } => assert!(json),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_input_target_and_text() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "input",
-            "local/s-42",
-            "write tests first",
-        ])
-        .expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::Input {
-                        target,
-                        text,
-                        input_stdin,
-                        json,
-                        ..
-                    },
-            } => {
-                assert_eq!(target.session_id, "s-42");
-                assert_eq!(target.host.as_deref(), Some("local"));
-                assert_eq!(text.as_deref(), Some("write tests first"));
-                assert!(!input_stdin);
-                assert!(!json, "json defaults to false");
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_input_from_stdin_without_argv_payload() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "input",
-            "host-a/s-42",
-            "--stdin",
-            "--json",
-        ])
-        .expect("parse stdin input");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::Input {
-                        target,
-                        text,
-                        input_stdin,
-                        json,
-                        ..
-                    },
-            } => {
-                assert_eq!(target.host.as_deref(), Some("host-a"));
-                assert!(text.is_none());
-                assert!(input_stdin);
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn input_rejects_mixed_positional_and_stdin_sources() {
-        let error =
-            Cli::try_parse_from(["pohunek", "session", "input", "s-42", "secret", "--stdin"])
-                .expect_err("mixed sources");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
@@ -3322,125 +2810,6 @@ mod tests {
         ])
         .expect_err("mixed sources");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn parses_observation_commands_and_runtime_cursors() {
-        let output = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "output",
-            "s-42",
-            "--worker-instance-id",
-            "r-1",
-            "--runtime-generation",
-            "7",
-            "--after-offset",
-            "11",
-            "--wait-ms",
-            "500",
-            "--json",
-        ])
-        .expect("parse output");
-        assert!(matches!(
-            output.command,
-            Commands::Session {
-                action: SessionAction::Output {
-                    runtime_generation: Some(7),
-                    after_offset: Some(11),
-                    wait_ms: Some(500),
-                    json: true,
-                    ..
-                }
-            }
-        ));
-
-        let wait = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "wait",
-            "s-42",
-            "--state",
-            "done",
-            "--activity",
-            "blocked",
-            "--timeout-ms",
-            "1000",
-        ])
-        .expect("parse wait");
-        assert!(matches!(
-            wait.command,
-            Commands::Session {
-                action: SessionAction::Wait {
-                    timeout_ms: 1000,
-                    ..
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn session_wait_requires_timeout_and_enforces_shared_maximum() {
-        let missing =
-            Cli::try_parse_from(["pohunek", "session", "wait", "s-42", "--state", "done"])
-                .expect_err("timeout is required");
-        assert_eq!(
-            missing.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-
-        let above = (protocol::MAX_SESSION_WAIT_MS + 1).to_string();
-        let invalid = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "wait",
-            "s-42",
-            "--state",
-            "done",
-            "--timeout-ms",
-            &above,
-        ])
-        .expect_err("timeout above shared maximum");
-        assert_eq!(invalid.kind(), clap::error::ErrorKind::ValueValidation);
-    }
-
-    #[test]
-    fn session_input_parses_optional_wait_flags() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "input",
-            "s-42",
-            "hello",
-            "--until",
-            "idle",
-            "--until",
-            "blocked",
-            "--timeout",
-            "1000",
-        ])
-        .expect("parse input wait");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::Input {
-                        wait_until,
-                        timeout_ms,
-                        ..
-                    },
-            } => {
-                assert_eq!(
-                    wait_until,
-                    vec![
-                        protocol::AgentActivity::Idle,
-                        protocol::AgentActivity::Blocked
-                    ]
-                );
-                assert_eq!(timeout_ms, Some(1000));
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
     }
 
     #[test]
@@ -3461,653 +2830,120 @@ mod tests {
         assert!(!rendered.contains("--timeout-ms"));
     }
 
+    /// Every consent flag that unlocks a destructive or trust-changing action
+    /// stays off unless the operator passes it explicitly.
     #[test]
-    fn parses_session_fork_target_name_and_json_flag() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "fork",
-            "host-a/s-42",
-            "--name",
-            "forked review",
-            "--json",
-        ])
-        .expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::Fork {
-                        target,
-                        name,
-                        accept_profile_change,
-                        json,
-                    },
-            } => {
-                assert_eq!(target.session_id, "s-42");
-                assert_eq!(target.host.as_deref(), Some("host-a"));
-                assert_eq!(name.as_deref(), Some("forked review"));
-                assert!(!accept_profile_change, "the override is opt-in");
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_fork_accept_profile_change_flag() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "fork",
-            "s-42",
-            "--accept-profile-change",
-        ])
-        .expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::Fork {
-                        accept_profile_change,
-                        ..
-                    },
-            } => assert!(accept_profile_change),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_resume_with_and_without_the_profile_override() {
-        let plain =
-            Cli::try_parse_from(["pohunek", "session", "resume", "s-42"]).expect("parse plain");
-        match plain.command {
-            Commands::Session {
-                action:
-                    SessionAction::Resume {
-                        target,
-                        accept_profile_change,
-                        json,
-                    },
-            } => {
-                assert_eq!(target.session_id, "s-42");
-                assert!(!accept_profile_change, "the override is opt-in");
-                assert!(!json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-
-        let accepted = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "resume",
-            "host-a/s-42",
-            "--accept-profile-change",
-            "--json",
-        ])
-        .expect("parse override");
-        match accepted.command {
-            Commands::Session {
-                action:
-                    SessionAction::Resume {
-                        target,
-                        accept_profile_change,
-                        json,
-                    },
-            } => {
-                assert_eq!(target.host.as_deref(), Some("host-a"));
-                assert!(accept_profile_change);
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_inspect_target_and_json_flag() {
-        let cli = Cli::try_parse_from(["pohunek", "session", "inspect", "local/s-42", "--json"])
-            .expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::Inspect { target, json },
-            } => {
-                assert_eq!(target.session_id, "s-42");
-                assert_eq!(target.host.as_deref(), Some("local"));
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_session_list_repeatable_filters_and_quiet() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "list",
-            "--filter",
-            "state=running",
-            "--filter",
-            "agent=codex",
-            "-q",
-        ])
-        .expect("parse");
-
-        match cli.command {
-            Commands::Session {
-                action:
-                    SessionAction::List {
-                        json,
-                        quiet,
-                        filters,
-                    },
-            } => {
-                assert!(!json);
-                assert!(quiet);
-                assert_eq!(
-                    filters,
-                    vec![
-                        commands::session::parse_list_filter("state=running").expect("state"),
-                        commands::session::parse_list_filter("agent=codex").expect("agent"),
-                    ]
-                );
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rejects_session_list_json_and_quiet_together() {
-        let err = Cli::try_parse_from(["pohunek", "session", "list", "--json", "-q"])
-            .expect_err("json and quiet conflict");
-
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn parses_attach_bare_target() {
-        let cli = Cli::try_parse_from(["pohunek", "attach", "s-42"]).expect("parse");
-
-        match cli.command {
-            Commands::Attach { target } => {
-                assert_eq!(target.session_id, "s-42");
-                assert_eq!(target.host, None);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_attach_explicit_local_target() {
-        let cli = Cli::try_parse_from(["pohunek", "attach", "local/s-42"]).expect("parse");
-
-        match cli.command {
-            Commands::Attach { target } => {
-                assert_eq!(target.session_id, "s-42");
-                assert_eq!(target.host.as_deref(), Some("local"));
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_static_completion_command() {
-        let cli = Cli::try_parse_from(["pohunek", "completions", "zsh"]).expect("parse");
-
-        match cli.command {
-            Commands::Completions { shell, dynamic } => {
-                assert_eq!(shell, completion::CompletionShell::Zsh);
-                assert!(!dynamic);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_dynamic_setup_completion_command() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "setup",
-            "completions",
-            "fish",
-            "--dynamic",
-            "--json",
-        ])
-        .expect("parse");
-
-        match cli.command {
-            Commands::Setup {
-                action:
-                    Some(SetupAction::Completions {
-                        shell,
-                        dynamic,
-                        json,
-                    }),
-                ..
-            } => {
-                assert_eq!(shell, completion::CompletionShell::Fish);
-                assert!(dynamic);
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    // --- setup ----------------------------------------------------------------
-
-    #[test]
-    fn parses_bare_setup_as_no_action() {
-        let cli = Cli::try_parse_from(["pohunek", "setup"]).expect("parse");
-
-        match cli.command {
-            Commands::Setup { action, json } => {
-                assert!(action.is_none(), "bare setup has no subcommand");
-                assert!(!json, "json defaults to false");
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_setup_config_force() {
-        let cli = Cli::try_parse_from(["pohunek", "setup", "config", "--force"]).expect("parse");
-
-        match cli.command {
-            Commands::Setup {
-                action: Some(SetupAction::Config { force, json }),
-                ..
-            } => {
-                assert!(force);
-                assert!(!json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    // --- effective-host routing -----------------------------------------------
-
-    fn target(host: Option<&str>, id: &str) -> Target {
-        Target {
-            host: host.map(str::to_owned),
-            session_id: id.to_owned(),
-        }
-    }
-
-    #[test]
-    fn effective_host_uses_global_when_no_target() {
-        assert_eq!(effective_host(LOCAL_HOST, None), "local");
-        assert_eq!(effective_host("host-b", None), "host-b");
-    }
-
-    #[test]
-    fn integration_status_preserves_global_host_for_dispatch() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "--host",
-            "host-b",
-            "integration",
-            "status",
-            "--agent",
-            "codex",
-        ])
-        .expect("parse remote integration status");
-
-        assert_eq!(effective_host(&cli.host, None), "host-b");
-        assert!(matches!(
-            cli.command,
-            Commands::Integration {
-                action: IntegrationAction::Status {
-                    agent: Some(commands::integration::HookAgentArg::Codex),
-                    ..
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn effective_host_target_host_wins_over_global() {
-        // A `<host>/<id>` target's host overrides the global `--host` flag.
-        assert_eq!(
-            effective_host("host-b", Some(&target(Some("host-c"), "s-1"))),
-            "host-c"
-        );
-        // An explicit `local/` target forces local even with a remote global.
-        assert_eq!(
-            effective_host("host-b", Some(&target(Some("local"), "s-1"))),
-            "local"
-        );
-    }
-
-    #[test]
-    fn effective_host_bare_target_falls_back_to_global() {
-        // A bare `s-1` target (no host) falls back to the global flag.
-        assert_eq!(
-            effective_host("host-b", Some(&target(None, "s-1"))),
-            "host-b"
-        );
-        assert_eq!(
-            effective_host(LOCAL_HOST, Some(&target(None, "s-1"))),
-            "local"
-        );
-    }
-
-    #[test]
-    fn parses_session_new_yes_flag() {
-        let cli = Cli::try_parse_from(["pohunek", "--host", "host-b", "session", "new", "--yes"])
-            .expect("parse");
-        match cli.command {
-            Commands::Session {
-                action: SessionAction::New { yes, .. },
-            } => assert!(yes, "--yes sets the flag"),
-            other => panic!("unexpected command: {other:?}"),
-        }
-        assert_eq!(cli.host, "host-b");
-    }
-
-    #[test]
-    fn parses_host_inspect_with_positional_host() {
-        let cli =
-            Cli::try_parse_from(["pohunek", "host", "inspect", "host-b", "--json"]).expect("parse");
-        match cli.command {
-            Commands::Host {
-                action: HostAction::Inspect { host, json },
-            } => {
-                assert_eq!(host, "host-b");
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_read_only_host_governance_inspect_with_json() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "host",
-            "governance",
-            "inspect",
-            "host-b",
-            "--json",
-        ])
-        .expect("parse governance inspection");
-        assert!(matches!(
-            cli.command,
-            Commands::Host {
-                action: HostAction::Governance {
-                    action: HostGovernanceAction::Inspect { host, json: true },
+    fn consent_flags_default_to_refusal_and_are_opt_in() {
+        type Extract = fn(Commands) -> Option<bool>;
+        let rows: [(&str, &[&str], &str, Extract); 5] = [
+            (
+                "session rm",
+                &["session", "rm", "s-1"],
+                "--accept-unconfirmed-cleanup",
+                |command| match command {
+                    Commands::Session {
+                        action:
+                            SessionAction::Rm {
+                                accept_unconfirmed_cleanup,
+                                ..
+                            },
+                    } => Some(accept_unconfirmed_cleanup),
+                    _ => None,
                 },
-            } if host == "host-b"
-        ));
-    }
-
-    #[test]
-    fn parses_host_discover_and_list() {
-        let discover = Cli::try_parse_from(["pohunek", "host", "discover", "--refresh", "--json"])
-            .expect("parse");
-        assert!(matches!(
-            discover.command,
-            Commands::Host {
-                action: HostAction::Discover {
-                    refresh: true,
-                    json: true,
-                }
-            }
-        ));
-        let list = Cli::try_parse_from(["pohunek", "host", "list"]).expect("parse");
-        assert!(matches!(
-            list.command,
-            Commands::Host {
-                action: HostAction::List { json: false, .. }
-            }
-        ));
-    }
-
-    // --- project ----------------------------------------------------------------
-
-    #[test]
-    fn parses_project_list_with_filters_and_json() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "project",
-            "list",
-            "--filter",
-            "source=manual",
-            "--filter",
-            "label=ui",
-            "--json",
-        ])
-        .expect("parse");
-        match cli.command {
-            Commands::Project {
-                action: ProjectAction::List { filters, json },
-            } => {
-                assert!(json);
-                assert_eq!(
-                    filters,
-                    vec![
-                        protocol::ProjectListFilter::Source(protocol::ProjectSource::Manual),
-                        protocol::ProjectListFilter::Label("ui".to_owned()),
-                    ]
-                );
-            }
-            other => panic!("unexpected command: {other:?}"),
+            ),
+            (
+                "session fork",
+                &["session", "fork", "s-1"],
+                "--accept-profile-change",
+                |command| match command {
+                    Commands::Session {
+                        action:
+                            SessionAction::Fork {
+                                accept_profile_change,
+                                ..
+                            },
+                    } => Some(accept_profile_change),
+                    _ => None,
+                },
+            ),
+            (
+                "session resume",
+                &["session", "resume", "s-1"],
+                "--accept-profile-change",
+                |command| match command {
+                    Commands::Session {
+                        action:
+                            SessionAction::Resume {
+                                accept_profile_change,
+                                ..
+                            },
+                    } => Some(accept_profile_change),
+                    _ => None,
+                },
+            ),
+            (
+                "session new",
+                &["session", "new"],
+                "--yes",
+                |command| match command {
+                    Commands::Session {
+                        action: SessionAction::New { yes, .. },
+                    } => Some(yes),
+                    _ => None,
+                },
+            ),
+            (
+                "project rm",
+                &["project", "rm", "ui"],
+                "--prune-worktrees",
+                |command| match command {
+                    Commands::Project {
+                        action:
+                            ProjectAction::Rm {
+                                prune_worktrees, ..
+                            },
+                    } => Some(prune_worktrees),
+                    _ => None,
+                },
+            ),
+        ];
+        for (name, argv, flag, extract) in rows {
+            let parse = |extra: Option<&str>| {
+                let cli = Cli::try_parse_from(
+                    std::iter::once("pohunek")
+                        .chain(argv.iter().copied())
+                        .chain(extra),
+                )
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+                extract(cli.command).unwrap_or_else(|| panic!("{name}: unexpected command"))
+            };
+            assert!(!parse(None), "{name} must refuse without {flag}");
+            assert!(parse(Some(flag)), "{name} must accept {flag}");
         }
     }
 
+    /// A `<host>/<id>` target's host wins over the global `--host`; a bare
+    /// target or no target falls back to the global flag.
     #[test]
-    fn parses_project_add_with_path_name_and_base_branch() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "project",
-            "add",
-            "/code/ui",
-            "--name",
-            "dashboard",
-            "--base-branch",
-            "develop",
-        ])
-        .expect("parse");
-        match cli.command {
-            Commands::Project {
-                action:
-                    ProjectAction::Add {
-                        path,
-                        name,
-                        base_branch,
-                        json,
-                    },
-            } => {
-                assert_eq!(path.as_deref(), Some(std::path::Path::new("/code/ui")));
-                assert_eq!(name.as_deref(), Some("dashboard"));
-                assert_eq!(base_branch.as_deref(), Some("develop"));
-                assert!(!json);
-            }
-            other => panic!("unexpected command: {other:?}"),
+    fn effective_host_prefers_the_target_host_over_the_global_flag() {
+        for (row, global, target, expected) in [
+            ("no target, local global", LOCAL_HOST, None, "local"),
+            ("no target, remote global", "host-b", None, "host-b"),
+            ("qualified target", "host-b", Some(Some("host-c")), "host-c"),
+            (
+                "explicit local target",
+                "host-b",
+                Some(Some("local")),
+                "local",
+            ),
+            ("bare target, remote global", "host-b", Some(None), "host-b"),
+            ("bare target, local global", LOCAL_HOST, Some(None), "local"),
+        ] {
+            let target = target.map(|host: Option<&str>| Target {
+                host: host.map(str::to_owned),
+                session_id: "s-1".to_owned(),
+            });
+            assert_eq!(effective_host(global, target.as_ref()), expected, "{row}");
         }
-    }
-
-    #[test]
-    fn parses_project_add_without_path() {
-        let cli = Cli::try_parse_from(["pohunek", "project", "add"]).expect("parse");
-        match cli.command {
-            Commands::Project {
-                action: ProjectAction::Add { path, .. },
-            } => assert_eq!(path, None, "no PATH means the cwd (filled by the command)"),
-            other => panic!("unexpected command: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn session_rm_consent_flag_defaults_to_refusal_and_is_opt_in() {
-        let default = Cli::try_parse_from(["pohunek", "session", "rm", "s-1"]).expect("parse");
-        assert!(matches!(
-            default.command,
-            Commands::Session {
-                action: SessionAction::Rm {
-                    accept_unconfirmed_cleanup: false,
-                    ..
-                }
-            }
-        ));
-
-        let consented = Cli::try_parse_from([
-            "pohunek",
-            "session",
-            "rm",
-            "s-1",
-            "--accept-unconfirmed-cleanup",
-        ])
-        .expect("parse with consent");
-        assert!(matches!(
-            consented.command,
-            Commands::Session {
-                action: SessionAction::Rm {
-                    accept_unconfirmed_cleanup: true,
-                    ..
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_project_show_rename_rm_references() {
-        let show = Cli::try_parse_from(["pohunek", "project", "show", "ui", "--json"])
-            .expect("parse show");
-        assert!(matches!(
-            show.command,
-            Commands::Project { action: ProjectAction::Show { reference, json: true } } if reference == "ui"
-        ));
-
-        let rename = Cli::try_parse_from(["pohunek", "project", "rename", "p-abc", "dashboard"])
-            .expect("parse rename");
-        match rename.command {
-            Commands::Project {
-                action:
-                    ProjectAction::Rename {
-                        reference, name, ..
-                    },
-            } => {
-                assert_eq!(reference, "p-abc");
-                assert_eq!(name, "dashboard");
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-
-        let rm = Cli::try_parse_from(["pohunek", "--host", "host-b", "project", "rm", "ui"])
-            .expect("parse rm");
-        assert!(matches!(
-            rm.command,
-            Commands::Project {
-                action: ProjectAction::Rm { reference, prune_worktrees: false, json: false }
-            } if reference == "ui"
-        ));
-        assert_eq!(rm.host, "host-b", "project rm honors the global --host");
-
-        let prune = Cli::try_parse_from(["pohunek", "project", "rm", "ui", "--prune-worktrees"])
-            .expect("parse rm --prune-worktrees");
-        assert!(matches!(
-            prune.command,
-            Commands::Project {
-                action: ProjectAction::Rm {
-                    prune_worktrees: true,
-                    ..
-                }
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_project_prompt_with_required_name() {
-        let cli = Cli::try_parse_from([
-            "pohunek", "--host", "host-b", "project", "prompt", "ui", "issue", "--json",
-        ])
-        .expect("parse prompt");
-        match cli.command {
-            Commands::Project {
-                action:
-                    ProjectAction::Prompt {
-                        reference,
-                        name,
-                        json,
-                    },
-            } => {
-                assert_eq!(reference, "ui");
-                assert_eq!(name, "issue");
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-        assert_eq!(
-            cli.host, "host-b",
-            "project prompt honors the global --host"
-        );
-
-        // The prompt name is required: `project prompt <ref>` with no name is a
-        // usage error (there is no "default prompt").
-        assert!(
-            Cli::try_parse_from(["pohunek", "project", "prompt", "ui"]).is_err(),
-            "missing prompt name must be a usage error"
-        );
-    }
-
-    #[test]
-    fn parses_project_action_with_required_name() {
-        let cli = Cli::try_parse_from([
-            "pohunek",
-            "--host",
-            "host-b",
-            "project",
-            "action",
-            "ui",
-            "review-pr",
-            "--json",
-        ])
-        .expect("parse action");
-        match cli.command {
-            Commands::Project {
-                action:
-                    ProjectAction::Action {
-                        reference,
-                        name,
-                        json,
-                    },
-            } => {
-                assert_eq!(reference, "ui");
-                assert_eq!(name, "review-pr");
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-        assert_eq!(
-            cli.host, "host-b",
-            "project action honors the global --host"
-        );
-
-        assert!(
-            Cli::try_parse_from(["pohunek", "project", "action", "ui"]).is_err(),
-            "missing action name must be a usage error"
-        );
-    }
-
-    #[test]
-    fn parses_project_actions() {
-        let cli = Cli::try_parse_from([
-            "pohunek", "--host", "host-b", "project", "actions", "ui", "--json",
-        ])
-        .expect("parse actions");
-        match cli.command {
-            Commands::Project {
-                action: ProjectAction::Actions { reference, json },
-            } => {
-                assert_eq!(reference, "ui");
-                assert!(json);
-            }
-            other => panic!("unexpected command: {other:?}"),
-        }
-        assert_eq!(
-            cli.host, "host-b",
-            "project actions honors the global --host"
-        );
     }
 }

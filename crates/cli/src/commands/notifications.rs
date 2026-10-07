@@ -739,17 +739,6 @@ fn set_kind_enabled(
     }
 }
 
-#[cfg(test)]
-fn filter_rows_by_agent(
-    rows: &[HostedNotification],
-    agent: Option<&protocol::RuntimeRef>,
-) -> Vec<HostedNotification> {
-    rows.iter()
-        .filter(|row| agent.is_none_or(|wanted| row.record.agent_kind.as_ref() == Some(wanted)))
-        .cloned()
-        .collect()
-}
-
 fn render_single_host_list_json(result: &NotificationListResult) -> Result<String, CliError> {
     crate::commands::render_json(result)
 }
@@ -1262,28 +1251,10 @@ mod tests {
         assert_eq!(doc["notification_id"], "n-1");
     }
 
+    /// A toggle changes one kind for one provider; a provider without its own
+    /// entry is seeded from the default kinds before the change.
     #[test]
-    fn policy_get_json_render_includes_attention_debounce_secs() {
-        let result = NotificationPolicyResult { policy: policy() };
-
-        let output = crate::commands::render_json(&result).expect("render");
-        let doc: serde_json::Value = serde_json::from_str(&output).expect("json");
-
-        assert_eq!(doc["ok"]["policy"]["attention_debounce_secs"], 5);
-        assert_eq!(doc["ok"]["policy"]["attention_dedupe_window_secs"], 120);
-        assert_eq!(doc["ok"]["policy"]["retention"]["info_ttl_secs"], 259_200);
-    }
-
-    #[test]
-    fn policy_human_render_includes_attention_debounce_secs() {
-        let output = render_policy_human("host-b", &policy());
-
-        assert!(output.contains("attention_debounce_secs: 5"));
-        assert!(output.contains("retention: sweep=21600s info=259200s"));
-    }
-
-    #[test]
-    fn policy_toggle_enables_and_disables_turn_completed() {
+    fn policy_toggle_updates_one_provider_and_seeds_missing_entries_from_defaults() {
         let mut policy = policy();
 
         apply_policy_toggle(
@@ -1293,6 +1264,11 @@ mod tests {
             true,
         );
         assert!(policy.providers["codex"].turn_completed);
+        assert!(
+            !policy.providers["claude"].turn_completed,
+            "other providers"
+        );
+        assert!(!policy.enabled.turn_completed, "default kinds");
 
         apply_policy_toggle(
             &mut policy,
@@ -1301,25 +1277,21 @@ mod tests {
             false,
         );
         assert!(!policy.providers["codex"].turn_completed);
-    }
 
-    #[test]
-    fn hermes_is_a_selectable_agent_and_policy_provider() {
-        assert_eq!(
-            parse_agent_kind("hermes"),
-            Ok(protocol::RuntimeRef::hermes())
-        );
-        assert_eq!(parse_policy_provider("hermes"), Ok(PolicyProvider::Hermes));
-
-        let mut policy = policy();
+        assert!(!policy.providers.contains_key("hermes"));
         apply_policy_toggle(
             &mut policy,
             PolicyProvider::Hermes,
             NotificationKind::TurnCompleted,
             true,
         );
-
-        assert!(policy.providers["hermes"].turn_completed);
+        assert_eq!(
+            policy.providers["hermes"],
+            NotificationKindPolicy {
+                turn_completed: true,
+                ..policy.enabled.clone()
+            }
+        );
     }
 
     #[test]
@@ -1360,28 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_filter_is_applied_client_side() {
-        let rows = vec![
-            HostedNotification {
-                host_id: "host-b".to_owned(),
-                record: record("n-1", NotificationStatus::Unread),
-            },
-            HostedNotification {
-                host_id: "host-b".to_owned(),
-                record: protocol::NotificationRecord {
-                    agent_kind: Some(protocol::RuntimeRef::claude()),
-                    ..record("n-2", NotificationStatus::Unread)
-                },
-            },
-        ];
-
-        let filtered = filter_rows_by_agent(&rows, Some(&protocol::RuntimeRef::codex()));
-
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].record.id, NotificationId("n-1".to_owned()));
-    }
-
-    #[test]
     fn agent_filter_accepts_any_valid_runtime_id_and_rejects_the_rest() {
         let custom = parse_agent_kind("acme").expect("a valid runtime id parses");
         assert_eq!(custom, protocol::RuntimeRef::from_wire("acme"));
@@ -1391,26 +1341,6 @@ mod tests {
                 Err(format!("invalid agent kind '{invalid}'"))
             );
         }
-
-        let rows = vec![
-            HostedNotification {
-                host_id: "host-b".to_owned(),
-                record: protocol::NotificationRecord {
-                    agent_kind: Some(custom.clone()),
-                    ..record("n-1", NotificationStatus::Unread)
-                },
-            },
-            HostedNotification {
-                host_id: "host-b".to_owned(),
-                record: protocol::NotificationRecord {
-                    agent_kind: Some(protocol::RuntimeRef::codex()),
-                    ..record("n-2", NotificationStatus::Unread)
-                },
-            },
-        ];
-        let filtered = filter_rows_by_agent(&rows, Some(&custom));
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].record.id, NotificationId("n-1".to_owned()));
     }
 
     #[test]

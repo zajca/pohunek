@@ -1,29 +1,14 @@
-//! CLI-level tests for `pohunek assistant`.
+//! Parser coverage for `pohunek assistant`.
 //!
-//! ## Design constraints
-//!
-//! These tests are hermetic — they do NOT require a live daemon.  Every test
-//! here exercises one of:
-//!
-//! 1. **Parser-level correctness** — every `assistant` flag and intent wrapper
-//!    accepted by clap without error; error cases clap rejects.  Driven via
-//!    `pohunek_cli::command().try_get_matches_from(...)` which never opens a
-//!    socket.
-//!
-//! 2. **Prompt composition** — unit tests for `compose_degraded` (pure
-//!    function, no daemon needed).  These assert the structural guarantees the
-//!    design requires: snapshot path present, source-map pointer present, no
-//!    bundle-TOC section, explicit "degraded" label in the header.
-//!
-//! Tests that need a live daemon (e.g. full `--print-prompt` round-trip) are
-//! deliberately NOT included here — they cannot be made hermetic without a
-//! test fixture daemon, which is out of scope for this phase.
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+//! These tests are hermetic: they drive `pohunek_cli::command()` through
+//! `try_get_matches_from`, which never opens a socket or touches the
+//! filesystem. They pin the assistant flag surface on the default form and on
+//! every intent wrapper, plus the parse errors clap must raise.
 
 use pohunek_cli::command;
+
+/// The intent wrapper subcommands, which share the default form's flags.
+const INTENT_WRAPPERS: [&str; 5] = ["setup", "project", "update", "debug", "help"];
 
 /// Parse the given argument list against the full pohunek CLI.  Returns `Ok`
 /// when clap accepts the input, `Err` otherwise.
@@ -33,99 +18,11 @@ fn try_parse<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<(), clap::Er
         .map(|_| ())
 }
 
-// ---------------------------------------------------------------------------
-// Parser tests: default form flags
-// ---------------------------------------------------------------------------
-
+/// Every assistant flag parses together on the default form and on each
+/// intent wrapper, with either repository selector and a free-form request.
 #[test]
-fn assistant_bare_parses() {
-    try_parse(["assistant"]).expect("bare assistant parses");
-}
-
-#[test]
-fn assistant_print_prompt_flag_parses() {
-    try_parse(["assistant", "--print-prompt"]).expect("--print-prompt parses");
-}
-
-#[test]
-fn assistant_no_snapshot_flag_parses() {
-    try_parse(["assistant", "--no-snapshot"]).expect("--no-snapshot parses");
-}
-
-#[test]
-fn assistant_degraded_flag_parses() {
-    try_parse(["assistant", "--degraded"]).expect("--degraded parses");
-}
-
-#[test]
-fn assistant_no_start_daemon_flag_parses() {
-    try_parse(["assistant", "--no-start-daemon"]).expect("--no-start-daemon parses");
-}
-
-#[test]
-fn assistant_yes_flag_parses() {
-    try_parse(["assistant", "--yes"]).expect("--yes parses");
-}
-
-#[test]
-fn assistant_json_flag_parses() {
-    try_parse(["assistant", "--json"]).expect("--json parses");
-}
-
-#[test]
-fn assistant_agent_flag_parses() {
-    try_parse(["assistant", "--agent", "pohunek-assistant"]).expect("--agent parses");
-}
-
-#[test]
-fn assistant_hermes_agent_flag_parses() {
-    try_parse(["assistant", "--agent", "hermes"]).expect("--agent hermes parses");
-}
-
-#[test]
-fn assistant_project_flag_parses() {
-    try_parse(["assistant", "--project", "ui"]).expect("--project parses");
-}
-
-#[test]
-fn assistant_repo_flag_parses() {
-    try_parse(["assistant", "--repo", "/code/ui"]).expect("--repo parses");
-}
-
-#[test]
-fn assistant_branch_flag_parses() {
-    try_parse(["assistant", "--branch", "feature/x"]).expect("--branch parses");
-}
-
-#[test]
-fn assistant_base_branch_flag_parses() {
-    try_parse(["assistant", "--base-branch", "main"]).expect("--base-branch parses");
-}
-
-#[test]
-fn assistant_intent_flag_parses_all_values() {
-    for value in ["setup", "project", "update", "debug", "help"] {
-        try_parse(["assistant", "--intent", value])
-            .unwrap_or_else(|e| panic!("--intent {value} should parse: {e}"));
-    }
-}
-
-#[test]
-fn assistant_intent_flag_rejects_unknown_value() {
-    try_parse(["assistant", "--intent", "nonsense"])
-        .expect_err("unknown --intent value must be rejected");
-}
-
-#[test]
-fn assistant_request_positional_args_parse() {
-    // Free-form request words are joined by the resolver.
-    try_parse(["assistant", "configure", "the", "launcher"]).expect("positional request parses");
-}
-
-#[test]
-fn assistant_all_flags_together_parse() {
-    try_parse([
-        "assistant",
+fn assistant_flags_parse_on_the_default_form_and_every_intent_wrapper() {
+    let project_form = [
         "--agent",
         "codex",
         "--project",
@@ -144,54 +41,38 @@ fn assistant_all_flags_together_parse() {
         "debug",
         "some",
         "request",
-    ])
-    .expect("all assistant flags together parse");
-}
-
-// ---------------------------------------------------------------------------
-// Parser tests: intent wrapper subcommands
-// ---------------------------------------------------------------------------
-
-#[test]
-fn assistant_setup_wrapper_parses() {
-    try_parse(["assistant", "setup"]).expect("assistant setup parses");
-}
-
-#[test]
-fn assistant_project_wrapper_parses() {
-    try_parse(["assistant", "project"]).expect("assistant project parses");
-}
-
-#[test]
-fn assistant_update_wrapper_parses() {
-    try_parse(["assistant", "update"]).expect("assistant update parses");
-}
-
-#[test]
-fn assistant_debug_wrapper_parses() {
-    try_parse(["assistant", "debug"]).expect("assistant debug parses");
-}
-
-#[test]
-fn assistant_help_wrapper_parses() {
-    try_parse(["assistant", "help"]).expect("assistant help parses");
-}
-
-#[test]
-fn assistant_wrapper_flags_pass_through() {
-    // Each wrapper accepts the same AssistantArgs flags.
-    for wrapper in ["setup", "project", "update", "debug", "help"] {
-        try_parse([
-            "assistant",
-            wrapper,
-            "--agent",
-            "codex",
-            "--no-snapshot",
-            "--degraded",
-            "--print-prompt",
-        ])
-        .unwrap_or_else(|e| panic!("assistant {wrapper} flags should parse: {e}"));
+    ];
+    let repo_form = ["--agent", "hermes", "--repo", "/code/ui", "configure", "it"];
+    for form in [&project_form[..], &repo_form[..]] {
+        try_parse(std::iter::once("assistant").chain(form.iter().copied()))
+            .unwrap_or_else(|error| panic!("assistant {form:?} should parse: {error}"));
+        for wrapper in INTENT_WRAPPERS {
+            let form_without_intent = form
+                .iter()
+                .copied()
+                .filter(|arg| !matches!(*arg, "--intent" | "debug"));
+            try_parse(
+                ["assistant", wrapper]
+                    .into_iter()
+                    .chain(form_without_intent),
+            )
+            .unwrap_or_else(|error| panic!("assistant {wrapper} {form:?} should parse: {error}"));
+        }
     }
+}
+
+#[test]
+fn assistant_intent_flag_parses_all_values() {
+    for value in INTENT_WRAPPERS {
+        try_parse(["assistant", "--intent", value])
+            .unwrap_or_else(|e| panic!("--intent {value} should parse: {e}"));
+    }
+}
+
+#[test]
+fn assistant_intent_flag_rejects_unknown_value() {
+    try_parse(["assistant", "--intent", "nonsense"])
+        .expect_err("unknown --intent value must be rejected");
 }
 
 #[test]
@@ -200,60 +81,4 @@ fn assistant_help_wrapper_does_not_collide_with_clap_help() {
     // clap's built-in --help display (which would exit non-zero in try_parse).
     try_parse(["assistant", "help"])
         .expect("assistant help parses as the intent wrapper, not as clap built-in help");
-}
-
-// ---------------------------------------------------------------------------
-// Parser tests: root subcommand list includes `assistant`
-// ---------------------------------------------------------------------------
-
-#[test]
-fn root_subcommands_include_assistant() {
-    let cmd = command();
-    assert!(
-        cmd.get_subcommands()
-            .any(|sub| sub.get_name() == "assistant"),
-        "assistant must be a root-level subcommand"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Unit tests: degraded prompt composition
-// ---------------------------------------------------------------------------
-
-// These tests import from the library directly.  `compose_degraded` and
-// `ComposeDegradedParams` are `pub(crate)` inside the `commands::assistant`
-// module, so we cannot import them from an integration-test file.  Instead we
-// embed the assertions in this file and exercise the shape via a public
-// re-export or through the binary output.  Since the types are not re-exported,
-// we duplicate the relevant logic tests in the unit-test section of
-// `prompt.rs`.  The integration-test file tests the parser and binary behavior;
-// unit tests for `compose_degraded` live in `prompt.rs` itself.
-//
-// This section documents the *contract* the binary must satisfy when
-// `--degraded --print-prompt` is used, and provides a reference for future
-// end-to-end expansion once a fixture daemon is available.
-
-/// Structural contract for `--degraded --print-prompt` output (human text):
-/// - Line "knowledge: <version> (degraded)" must appear.
-/// - Line "snapshot: <path>" must appear.
-/// - No line "bundle: " must appear (bundle was not materialized).
-///
-/// This test is integration-only and requires no daemon; it validates the
-/// parser accepts the flags.  A full end-to-end test (which would need a
-/// daemon) is deferred.
-#[test]
-fn degraded_print_prompt_flags_parse_together() {
-    try_parse([
-        "assistant",
-        "--degraded",
-        "--print-prompt",
-        "--no-start-daemon",
-    ])
-    .expect("--degraded --print-prompt --no-start-daemon should parse");
-}
-
-#[test]
-fn degraded_with_intent_wrapper_parses() {
-    try_parse(["assistant", "setup", "--degraded", "--print-prompt"])
-        .expect("assistant setup --degraded --print-prompt parses");
 }

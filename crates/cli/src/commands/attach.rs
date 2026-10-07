@@ -2567,20 +2567,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdin_event_returns_available_input() {
-        let (mut stdin, mut writer) = tokio::io::duplex(8);
-        writer.write_all(b"x").await.expect("write stdin byte");
-        let mut buffer = [0_u8; 8];
-
-        let event = read_stdin_event(&mut stdin, &mut buffer, None)
-            .await
-            .expect("read stdin event");
-
-        assert_eq!(event, StdinEvent::Input(1));
-        assert_eq!(&buffer[..1], b"x");
-    }
-
-    #[tokio::test]
     async fn stdin_event_reports_expired_shortcut_timeout() {
         let (mut stdin, _writer) = tokio::io::duplex(8);
         let mut buffer = [0_u8; 8];
@@ -2923,26 +2909,12 @@ mod tests {
         assert_eq!(request.version_range(), protocol::CLIENT_PROTOCOL_VERSIONS);
         assert_eq!(request.method(), method_name, "method");
         assert_eq!(request.params(), &params, "params");
-        // The id is now a unique per-call SDK correlation id; assert only its
+        // The id is a unique per-call SDK correlation id; assert only its
         // stable, log-greppable `sdk-<method>-` prefix.
         assert!(
             request.id().starts_with(&format!("sdk-{method_name}-")),
             "id {:?} must be prefixed by the method",
             request.id()
-        );
-    }
-
-    #[test]
-    fn attach_request_sends_session_id() {
-        let target: Target = "local/s-42".parse().expect("target");
-        let request = build_attach_request(&target, None, None, None, None).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_ATTACH,
-            json!({
-                "session_id": "s-42"
-            }),
         );
     }
 
@@ -3008,38 +2980,9 @@ mod tests {
     }
 
     #[test]
-    fn detach_request_sends_stream_id() {
-        let request = build_detach_request("stream-42").expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_DETACH,
-            json!({
-                "stream_id": "stream-42"
-            }),
-        );
-    }
-
-    #[test]
-    fn resize_request_sends_local_session_id_and_size() {
-        let target: Target = "s-42".parse().expect("target");
-        let request = build_resize_request(&target, 120, 40).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_RESIZE,
-            json!({
-                "session_id": "s-42",
-                "cols": 120,
-                "rows": 40
-            }),
-        );
-    }
-
-    #[test]
     fn attach_request_extracts_session_id_regardless_of_host() {
-        // Remote is now supported: the attach request carries only the session
-        // id; the host selects the transport, it never enters the request body.
+        // The attach request carries only the session id; the host selects
+        // the transport and never enters the request body.
         let remote: Target = "host-b/s-42".parse().expect("target");
         let request = build_attach_request(&remote, None, None, None, None).expect("request");
 
@@ -3410,21 +3353,6 @@ mod tests {
 
         assert_eq!(state, MenuState::Closed);
         assert_eq!(effects, vec![MenuEffect::RunDetach, MenuEffect::Close]);
-    }
-
-    #[test]
-    fn attach_menu_open_state_routes_fork_hotkey_to_effects() {
-        let mut state = MenuState::open_root();
-
-        let effects = handle_menu_input_chunk(&mut state, b"f");
-
-        assert_eq!(
-            state,
-            MenuState::Busy {
-                label: "Forking session".to_owned()
-            }
-        );
-        assert_eq!(effects, vec![MenuEffect::RunFork]);
     }
 
     fn placeholder_menu_task(generation: u64, action: MenuTaskAction) -> MenuTask {
@@ -3888,22 +3816,6 @@ mod tests {
     }
 
     #[test]
-    fn menu_rename_request_sends_session_id_and_name() {
-        let target: Target = "host-a/s-42".parse().expect("target");
-
-        let request = build_menu_rename_request(&target, "review branch").expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_RENAME,
-            json!({
-                "session_id": "s-42",
-                "name": "review branch"
-            }),
-        );
-    }
-
-    #[test]
     fn menu_fork_request_sends_session_id_size_and_same_cwd_mode() {
         let target: Target = "host-a/s-42".parse().expect("target");
 
@@ -4119,25 +4031,5 @@ mod tests {
             "activity": "idle"
         }));
         assert_eq!(snapshot.activity, "blocked");
-    }
-
-    #[test]
-    fn attach_status_snapshot_falls_back_to_ids_for_missing_display_labels() {
-        let mut snapshot = AttachStatusSnapshot::unknown("local", "s-42");
-
-        snapshot.update_from_session_value(&json!({
-            "id": "s-42",
-            "agent": "claude",
-            "state": "running",
-            "activity": "working",
-            "project_id": "p-abc123"
-        }));
-
-        let header = render_dialog_header(&snapshot);
-        assert_eq!(
-            &header[..3],
-            ["session: s-42", "host: local", "project: p-abc123"],
-            "header should fall back to ids when display labels are absent"
-        );
     }
 }

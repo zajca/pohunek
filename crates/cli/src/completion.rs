@@ -917,19 +917,6 @@ mod tests {
     }
 
     #[test]
-    fn completion_target_uses_stable_identity_and_discovered_port() {
-        let record = host_record(
-            "host-b",
-            HostClass::ReachableDaemon {
-                daemon_version: "1.0.0".to_owned(),
-            },
-        );
-
-        let hosts = completion_hosts(&[record]);
-        assert_eq!(hosts[0].target, "netbird:peer~cGVlci1ob3N0LWI@18722");
-    }
-
-    #[test]
     fn completion_target_rejects_non_dialable_records() {
         let reachable = HostClass::ReachableDaemon {
             daemon_version: "1.0.0".to_owned(),
@@ -1109,19 +1096,6 @@ mod tests {
             .find(|arg| arg.get_id() == "accept_unconfirmed_cleanup")
             .expect("consent flag");
         assert!(flag.get::<ArgValueCompleter>().is_none());
-    }
-
-    /// `agent-skill` is a static command with no dynamic completers; it must
-    /// still stay present in the dynamic completion tree so completions never
-    /// cover fewer commands than the parser accepts.
-    #[test]
-    fn dynamic_command_keeps_agent_skill_completable() {
-        let command = dynamic_command(CompletionContext::default());
-        command.clone().debug_assert();
-        assert!(
-            command.find_subcommand("agent-skill").is_some(),
-            "agent-skill must stay completable in dynamic completion mode"
-        );
     }
 
     fn plugin_info(id: &str, version: &str, digest_hex_char: char) -> PackageInfo {

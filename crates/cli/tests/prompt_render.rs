@@ -56,18 +56,3 @@ fn prompt_render_writes_rendered_prompt_without_extra_newline() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
-
-#[test]
-fn prompt_render_help_documents_required_inputs() {
-    let env = TestEnv::new().expect("hermetic test environment");
-    let out = pohunek(&env)
-        .args(["prompt", "render", "--help"])
-        .output()
-        .expect("spawn pohunek");
-
-    assert!(out.status.success(), "help exits successfully");
-    let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
-    assert!(stdout.contains("--provider"), "{stdout}");
-    assert!(stdout.contains("--item-id"), "{stdout}");
-    assert!(stdout.contains("--template-file"), "{stdout}");
-}

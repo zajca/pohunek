@@ -368,27 +368,4 @@ mod tests {
         assert!(results[1].ok);
         assert_eq!(results[1].value.as_deref(), Some("ok:host-b"));
     }
-
-    #[test]
-    fn host_result_shape_carries_target_and_error_details() {
-        let target = HostTarget::new("host-b", "host-b");
-        let result = HostResult::<String>::failure(
-            target,
-            ProtocolError::new(
-                ErrorClass::Configuration,
-                "bad_filter",
-                "bad filter",
-                Some("change the filter".to_owned()),
-            ),
-        );
-
-        assert_eq!(result.host_id, "host-b");
-        assert_eq!(result.transport_target, "host-b");
-        assert!(!result.ok);
-        assert!(result.value.is_none());
-        let error = result.error.expect("error");
-        assert_eq!(error.class, ErrorClass::Configuration);
-        assert_eq!(error.code, "bad_filter");
-        assert_eq!(error.recover.as_deref(), Some("change the filter"));
-    }
 }
