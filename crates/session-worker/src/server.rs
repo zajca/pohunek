@@ -3638,11 +3638,16 @@ fn verify_launch_claim_with(
     }
     // This probe also rechecks root/candidate generations after executable and
     // ancestry inspection. The stored PID alone never authorizes a retry.
-    let designated = designated_launch_process_with(inspector, root, &claim.identity.provider)?;
-    Ok(designated.is_some_and(|process| {
-        process.pid == candidate.pid
-            && process.start_identity.to_string() == candidate.start_identity.to_string()
-    }))
+    let provider = &claim.identity.provider;
+    let Some(designated) = designated_launch_process_with(inspector, root, provider)? else {
+        return Ok(false);
+    };
+    if designated.pid == candidate.pid
+        && designated.start_identity.to_string() == candidate.start_identity.to_string()
+    {
+        return Ok(true);
+    }
+    is_provider_child_of_launch(inspector, candidate, &designated, provider)
 }
 
 async fn retry_launch_claims(
@@ -4566,6 +4571,101 @@ fn is_descendant_with(
     Ok(false)
 }
 
+/// Whether the executable file name of `pid` contains the provider name.
+///
+/// A process without a readable executable (another user's, or one that exited)
+/// is not named for any provider.
+fn executable_is_named_for(
+    inspector: &dyn ProcessInspector,
+    pid: u32,
+    provider: &str,
+) -> Result<bool, WorkerError> {
+    let Some(executable) = inspector
+        .executable(pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    let executable_name = executable
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    Ok(executable_name.contains(&provider.to_ascii_lowercase()))
+}
+
+/// The hook-helper role of a provider: the first argument of the process its
+/// launch process starts to run the provider's hooks.
+///
+/// Codex 0.160.0 runs its hooks from `codex app-server ...`, a direct child of
+/// the launched `codex`, so that child speaks for the conversation. A provider
+/// without an entry has no such helper, and only its launch process may report.
+/// An independent same-provider child (a second `codex` or `claude` the launch
+/// process started) carries no helper argument, so it never qualifies.
+const HOOK_HELPER_ARGV1: &[(&str, &str)] = &[("codex", "app-server")];
+
+/// Whether the command line of `candidate` is the hook-helper invocation of
+/// `provider`.
+///
+/// Fails closed: a process whose facts cannot be read, or that exited, is not
+/// the helper.
+fn is_hook_helper_invocation(
+    inspector: &dyn ProcessInspector,
+    pid: u32,
+    provider: &str,
+) -> Result<bool, WorkerError> {
+    let Some(role) = HOOK_HELPER_ARGV1
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, argument)| *argument)
+    else {
+        return Ok(false);
+    };
+    let fact = inspector
+        .process(pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    Ok(fact.is_some_and(|fact| fact.cmdline.get(1).map(String::as_str) == Some(role)))
+}
+
+/// Whether `candidate` is the provider's hook helper that `designated`, the
+/// launch process, started directly.
+///
+/// Only a direct child in the helper role qualifies: a deeper process, such as
+/// an agent a tool command started, or an independent same-provider child never
+/// does. Both generations are rechecked after the parent link is read, so a
+/// reused PID fails closed.
+fn is_provider_child_of_launch(
+    inspector: &dyn ProcessInspector,
+    candidate: OsProcessIdentity,
+    designated: &WireProcessIdentity,
+    provider: &str,
+) -> Result<bool, WorkerError> {
+    let designated = OsProcessIdentity {
+        pid: designated.pid,
+        start_identity: StartIdentity::new(designated.start_identity),
+    };
+    if !executable_is_named_for(inspector, candidate.pid, provider)?
+        || !is_hook_helper_invocation(inspector, candidate.pid, provider)?
+    {
+        return Ok(false);
+    }
+    let parent = inspector
+        .parent_pid(candidate.pid)
+        .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+    if parent != Some(designated.pid) {
+        return Ok(false);
+    }
+    for expected in [designated, candidate] {
+        let current = inspector
+            .identity(expected.pid)
+            .map_err(|error| WorkerError::Protocol(error.to_string()))?;
+        if current != Some(expected) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Selects the launch process for `provider` among `root` and its descendants.
 ///
 /// A process qualifies only when its executable file name contains the provider
@@ -4583,21 +4683,9 @@ fn designated_launch_process_with(
         .descendant_identities(root)
         .map_err(|error| WorkerError::Protocol(error.to_string()))?;
     processes.push(root);
-    let provider = provider.to_ascii_lowercase();
     let mut candidates = Vec::new();
     for process in processes {
-        let Some(executable) = inspector
-            .executable(process.pid)
-            .map_err(|error| WorkerError::Protocol(error.to_string()))?
-        else {
-            continue;
-        };
-        let executable_name = executable
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if !executable_name.contains(&provider) {
+        if !executable_is_named_for(inspector, process.pid, provider)? {
             continue;
         }
         if inspector
@@ -5122,6 +5210,44 @@ mod tests {
             protocol::hook_schema("identity-subagent-v1");
         assert!(send_hook(&server, &pty, subagent_start_claim(2, Some("Explore"))).await);
         assert_eq!(server.shared.state.lock().await.journal.subagents.len(), 1);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_subagent_claim_never_becomes_the_launch_reference() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        server.shared.state.lock().await.hook_schema =
+            protocol::hook_schema("identity-subagent-v1");
+        assert!(send_hook(&server, &pty, subagent_start_claim(1, Some("Explore"))).await);
+        let state = server.shared.state.lock().await;
+        assert!(state.journal.launch_identity.is_none());
+        assert!(state.journal.native_reference_claim.is_none());
+        assert!(state.journal.pending_launch_claims.is_empty());
+        drop(state);
+        pty.stop("test-cleanup", server.shared.config.stop_grace)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_repeated_identical_launch_report_is_accepted_without_a_new_claim() {
+        let (server, pty, _directory) = launch_claim_fixture().await;
+        assert!(send_hook(&server, &pty, launch_report(&pty, 1, "same")).await);
+        let accepted = server
+            .shared
+            .state
+            .lock()
+            .await
+            .journal
+            .launch_identity
+            .clone();
+        assert!(send_hook(&server, &pty, launch_report(&pty, 2, "same")).await);
+        let state = server.shared.state.lock().await;
+        assert_eq!(state.journal.launch_identity, accepted);
+        assert!(state.journal.pending_launch_claims.is_empty());
+        drop(state);
         pty.stop("test-cleanup", server.shared.config.stop_grace)
             .await
             .unwrap();

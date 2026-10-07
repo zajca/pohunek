@@ -18,7 +18,9 @@ use pohunek_platform::process::{
 use crate::journal::{LaunchIdentity, PendingLaunchClaim};
 use crate::ChildIdentity;
 
-use super::{designated_launch_process_with, verify_launch_claim_with};
+use super::{
+    designated_launch_process_with, is_provider_child_of_launch, verify_launch_claim_with,
+};
 
 const ROOT_PID: Pid = 500;
 const ROOT_START: u64 = 1_000;
@@ -375,4 +377,223 @@ fn a_retry_claim_for_a_reused_root_pid_never_verifies() {
     let mut stale = claim("codex", AGENT_PID, AGENT_START);
     stale.root.start_identity = (ROOT_START + 5).to_string();
     assert!(!verify_launch_claim_with(&table, &stale).unwrap());
+}
+
+const LAUNCHER_PID: Pid = 501;
+const LAUNCHER_START: u64 = 1_001;
+const NATIVE_PID: Pid = 502;
+const NATIVE_START: u64 = 1_002;
+const APP_SERVER_PID: Pid = 503;
+const APP_SERVER_START: u64 = 1_003;
+const NATIVE_CODEX: &str = "/opt/homebrew/lib/node_modules/@openai/codex/vendor/codex/codex";
+
+/// The npm layout: a Node launcher, the native binary below it, and the
+/// `app-server` below that, which is the process Codex runs its hooks from.
+fn npm_layout() -> Table {
+    Table::default()
+        .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+        .with(
+            LAUNCHER_PID,
+            ROOT_PID,
+            LAUNCHER_START,
+            "/opt/homebrew/bin/node",
+            &[
+                "node",
+                "/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js",
+            ],
+        )
+        .with(
+            NATIVE_PID,
+            LAUNCHER_PID,
+            NATIVE_START,
+            NATIVE_CODEX,
+            &["codex"],
+        )
+        .with(
+            APP_SERVER_PID,
+            NATIVE_PID,
+            APP_SERVER_START,
+            "/home/dev/.codex/packages/app-server-daemon/bin/codex",
+            &["codex", "app-server", "--managed-daemon"],
+        )
+}
+
+fn app_server_claim() -> PendingLaunchClaim {
+    claim("codex", APP_SERVER_PID, APP_SERVER_START)
+}
+
+/// The hook reporter is a provider-named direct child of the launch process.
+#[test]
+fn a_provider_named_direct_child_of_the_launch_process_verifies() {
+    let table = npm_layout();
+    assert_eq!(selected(&table, "codex"), Some((NATIVE_PID, NATIVE_START)));
+    assert!(verify_launch_claim_with(&table, &app_server_claim()).unwrap());
+    assert!(verify_launch_claim_with(&table, &claim("codex", NATIVE_PID, NATIVE_START)).unwrap());
+}
+
+/// A native install has no launcher: the app-server is a child of the root's
+/// direct provider child.
+#[test]
+fn a_child_of_a_native_launch_process_verifies() {
+    let table = Table::default()
+        .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+        .with(NATIVE_PID, ROOT_PID, NATIVE_START, NATIVE_CODEX, &["codex"])
+        .with(
+            APP_SERVER_PID,
+            NATIVE_PID,
+            APP_SERVER_START,
+            NATIVE_CODEX,
+            &["codex", "app-server"],
+        );
+    assert!(verify_launch_claim_with(&table, &app_server_claim()).unwrap());
+}
+
+/// A provider-named process two levels below the launch process, such as an
+/// agent a tool command started, never speaks for the session.
+#[test]
+fn a_grandchild_of_the_launch_process_never_verifies() {
+    let table = npm_layout()
+        .with(
+            600,
+            APP_SERVER_PID,
+            1_100,
+            "/usr/bin/bash",
+            &["bash", "-c", "codex exec"],
+        )
+        .with(601, 600, 1_101, NATIVE_CODEX, &["codex", "exec"]);
+    assert!(!verify_launch_claim_with(&table, &claim("codex", 601, 1_101)).unwrap());
+}
+
+/// A provider-named process below the launcher but beside the launch process
+/// is not the launch process's child.
+#[test]
+fn a_sibling_of_the_launch_process_never_verifies() {
+    let table = npm_layout().with(
+        600,
+        LAUNCHER_PID,
+        1_100,
+        NATIVE_CODEX,
+        &["codex", "app-server"],
+    );
+    assert_eq!(selected(&table, "codex"), Some((NATIVE_PID, NATIVE_START)));
+    assert!(!verify_launch_claim_with(&table, &claim("codex", 600, 1_100)).unwrap());
+}
+
+/// A child whose image is not named for the provider never verifies.
+#[test]
+fn a_child_not_named_for_the_provider_never_verifies() {
+    let table = npm_layout().with(
+        600,
+        NATIVE_PID,
+        1_100,
+        "/usr/bin/python3",
+        &["python3", "hook.py"],
+    );
+    assert!(!verify_launch_claim_with(&table, &claim("codex", 600, 1_100)).unwrap());
+}
+
+/// A child of another provider's launch process never verifies for this one.
+#[test]
+fn a_child_claim_for_another_provider_never_verifies() {
+    let table = npm_layout();
+    assert!(
+        !verify_launch_claim_with(&table, &claim("claude", APP_SERVER_PID, APP_SERVER_START))
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_child_claim_with_a_stale_start_identity_never_verifies() {
+    let table = npm_layout();
+    assert!(!verify_launch_claim_with(
+        &table,
+        &claim("codex", APP_SERVER_PID, APP_SERVER_START + 1)
+    )
+    .unwrap());
+}
+
+/// A claim of a PID that no longer runs never verifies.
+#[test]
+fn a_child_that_has_exited_never_verifies() {
+    let table = Table::default()
+        .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+        .with(NATIVE_PID, ROOT_PID, NATIVE_START, NATIVE_CODEX, &["codex"]);
+    assert!(!verify_launch_claim_with(&table, &app_server_claim()).unwrap());
+}
+
+/// Either generation changing while the parent link is checked fails closed.
+#[test]
+fn pid_reuse_of_the_child_or_the_launch_process_never_verifies() {
+    let designated = pohunek_worker_protocol::ProcessIdentity {
+        pid: NATIVE_PID,
+        start_identity: NATIVE_START,
+    };
+    let candidate = ProcessIdentity {
+        pid: APP_SERVER_PID,
+        start_identity: StartIdentity::new(APP_SERVER_START),
+    };
+    let steady = npm_layout();
+    assert!(is_provider_child_of_launch(&steady, candidate, &designated, "codex").unwrap());
+    for reused in [NATIVE_PID, APP_SERVER_PID] {
+        let mut table = npm_layout();
+        table
+            .reused_after
+            .insert(reused, (0, StartIdentity::new(9_999)));
+        assert!(
+            !is_provider_child_of_launch(&table, candidate, &designated, "codex").unwrap(),
+            "{reused}"
+        );
+    }
+}
+
+/// A same-provider child that is not the hook helper (a second agent the launch
+/// process started) never verifies, for either provider.
+#[test]
+fn an_independent_same_provider_child_never_verifies() {
+    for (provider, executable) in [
+        ("codex", NATIVE_CODEX),
+        ("claude", "/opt/homebrew/bin/claude"),
+    ] {
+        let table = Table::default()
+            .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+            .with(NATIVE_PID, ROOT_PID, NATIVE_START, executable, &[provider])
+            .with(
+                APP_SERVER_PID,
+                NATIVE_PID,
+                APP_SERVER_START,
+                executable,
+                &[provider, "exec", "app-server-not-first"],
+            );
+        assert!(
+            !verify_launch_claim_with(&table, &claim(provider, APP_SERVER_PID, APP_SERVER_START))
+                .unwrap(),
+            "{provider}"
+        );
+    }
+}
+
+/// `app-server` as the second argument is Codex's helper role only; another
+/// provider has no helper role, so the same command line grants nothing.
+#[test]
+fn the_helper_role_of_one_provider_grants_nothing_to_another() {
+    let table = Table::default()
+        .with(ROOT_PID, 1, ROOT_START, "/bin/zsh", &["-zsh"])
+        .with(
+            NATIVE_PID,
+            ROOT_PID,
+            NATIVE_START,
+            "/bin/claude",
+            &["claude"],
+        )
+        .with(
+            APP_SERVER_PID,
+            NATIVE_PID,
+            APP_SERVER_START,
+            "/bin/claude",
+            &["claude", "app-server"],
+        );
+    assert!(
+        !verify_launch_claim_with(&table, &claim("claude", APP_SERVER_PID, APP_SERVER_START))
+            .unwrap()
+    );
 }

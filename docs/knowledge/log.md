@@ -1,5 +1,14 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-07, Codex conversation id becomes the native reference)
+
+- The session worker verifies a launch claim from a provider-named direct child
+  of the launch process in the provider's hook-helper role (`codex app-server`), so the conversation id Codex reports from its
+  `app-server` child becomes the session's native reference and `session resume`
+  works. The sessions concept page states which process may report the id, and
+  the Codex package guide replaces its known-gap statement with the verified
+  behavior.
+
 ## Unreleased (2026-10-06, Codex hook reporter ancestry)
 
 - The real-Codex hook test requires the reporting process to descend from the

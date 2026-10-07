@@ -269,6 +269,40 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_child_claim_leaves_the_pending_parent_claim_and_reference_untouched() {
+        let (mut journal, claim, now) = fixture();
+        submit(&mut journal, claim.clone(), 3, unavailable).unwrap();
+        let mut child = claim.clone();
+        child.identity.process = crate::journal::ChildIdentity {
+            pid: 99,
+            process_group: 10,
+            start_identity: "990".into(),
+        };
+        child.identity.native_reference = "child-reference".into();
+        child.sequence = 4;
+        assert_eq!(
+            submit(&mut journal, child, 3, |_| Ok(false)).unwrap(),
+            LaunchClaimStatus::Rejected
+        );
+        assert!(journal.launch_identity.is_none());
+        assert!(journal.native_reference_claim.is_none());
+        assert_eq!(journal.pending_launch_claims[0], claim);
+
+        assert!(retry(&mut journal, now, |pending| Ok(pending
+            .identity
+            .process
+            .pid
+            == 10)));
+        assert_eq!(
+            journal
+                .launch_identity
+                .expect("launch identity")
+                .native_reference,
+            "first-reference"
+        );
+    }
+
+    #[test]
     fn expiration_runtime_and_root_changes_reject_without_inspection() {
         for mutation in 0..4 {
             let (mut journal, claim, now) = fixture();
