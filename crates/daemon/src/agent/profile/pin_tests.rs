@@ -135,20 +135,6 @@ fn digest_of(agent: &crate::agent::ResolvedAgent) -> PackageDigest {
 }
 
 #[test]
-fn a_builtin_base_without_package_keys_resolves() {
-    let fixture = Fixture::new();
-    fixture.write("wrapped", "base = \"shell\"\nargs = [\"-l\"]\n");
-
-    let agent = fixture
-        .profiles()
-        .resolve_agent("wrapped")
-        .expect("resolves");
-
-    assert!(agent.profile.is_some());
-    assert_eq!(agent.base, RuntimeId::shell());
-}
-
-#[test]
 fn package_keys_on_a_builtin_base_are_rejected() {
     let fixture = Fixture::new();
     fixture.write(

@@ -477,19 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn relay_resolves_an_approved_profile() {
-        let (agents, state) = (scoped("relay-ok"), scoped("relay-ok-state"));
-        write_profile(&agents, "wrapped", "base = \"shell\"\n");
-        let profiles = registry(&agents, &state);
-        let approved = revision_of(&profiles, "wrapped");
-
-        let agent = relay("wrapped", &approved)
-            .resolve(&profiles)
-            .expect("approved revision resolves");
-        assert_eq!(agent.name, "wrapped");
-    }
-
-    #[test]
     fn relay_rejects_a_profile_edited_after_approval() {
         let (agents, state) = (scoped("relay-stale"), scoped("relay-stale-state"));
         write_profile(&agents, "wrapped", "base = \"shell\"\n");

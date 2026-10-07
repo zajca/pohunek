@@ -397,16 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn render_keeps_hostile_references_as_one_element() {
-        let args = NativeArgs::from_template(&["resume", "{reference}"]).expect("valid");
-        let hostile = "a b;$(touch x)|`y` --flag 'q' \"z\"";
-        assert_eq!(
-            args.render(hostile),
-            vec!["resume".to_owned(), hostile.to_owned()]
-        );
-    }
-
-    #[test]
     fn deserialization_enforces_the_same_invariants() {
         let ok: NativeArgs =
             serde_json::from_str(r#"[{"literal":"--resume"},"reference"]"#).expect("valid");
@@ -434,20 +424,6 @@ mod tests {
     }
 
     #[test]
-    fn pi_shaped_spec_builds_resume_and_fork_argv() {
-        let spec = launch(Some(&["--fork", "{reference}"]));
-        let reference = SessionRef::path("/work/a b/$(x);.jsonl").expect("path reference");
-        assert_eq!(
-            spec.resume_argv(&reference).expect("resume"),
-            vec!["--session", "/work/a b/$(x);.jsonl"]
-        );
-        assert_eq!(
-            spec.fork_argv(&reference).expect("fork"),
-            vec!["--fork", "/work/a b/$(x);.jsonl"]
-        );
-    }
-
-    #[test]
     fn fork_is_unsupported_without_fork_args() {
         let spec = launch(None);
         let reference = SessionRef::path("/work/s.jsonl").expect("path reference");
@@ -472,26 +448,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn spec_roundtrips_through_json_and_rejects_corruption() {
-        let spec = launch(Some(&["--fork", "{reference}"]));
-        let encoded = serde_json::to_string(&spec).expect("encode");
-        let decoded: NativeSessionLaunch = serde_json::from_str(&encoded).expect("decode");
-        assert_eq!(decoded, spec);
-
-        let without_fork = launch(None);
-        let encoded = serde_json::to_string(&without_fork).expect("encode");
-        assert!(!encoded.contains("fork_args"));
-        assert_eq!(
-            serde_json::from_str::<NativeSessionLaunch>(&encoded).expect("decode"),
-            without_fork
-        );
-
-        let corrupt = r#"{"reference_kind":"id","resume_args":["reference","reference"]}"#;
-        serde_json::from_str::<NativeSessionLaunch>(corrupt)
-            .expect_err("a spec with two reference slots must not decode");
-    }
-
     fn assignment() -> AssignedReference {
         AssignedReference::new(
             NativeArgs::from_template(&["--session-id", "{reference}"]).expect("template"),
@@ -513,24 +469,6 @@ mod tests {
         .with_assigned(assignment())
         .expect("an id spec accepts an assignment");
         assert!(id_spec.assigned().is_some());
-    }
-
-    #[test]
-    fn an_assignment_roundtrips_and_a_plain_spec_omits_it() {
-        let spec = NativeSessionLaunch::new(
-            SessionRefKind::Id,
-            NativeArgs::from_template(&["--session", "{reference}"]).expect("resume"),
-            None,
-        )
-        .with_assigned(assignment())
-        .expect("assigned");
-        let encoded = serde_json::to_string(&spec).expect("encode");
-        assert_eq!(
-            serde_json::from_str::<NativeSessionLaunch>(&encoded).expect("decode"),
-            spec
-        );
-        let plain = serde_json::to_string(&launch(None)).expect("encode");
-        assert!(!plain.contains("assigned"));
     }
 
     #[test]

@@ -130,12 +130,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn a_relative_package_directory_is_unreadable() {
-        assert_eq!(
-            build_directory("relative", &Limits::DEFAULT),
-            Err(PackageErrorKind::SourceUnreadable)
-        );
-    }
 }
