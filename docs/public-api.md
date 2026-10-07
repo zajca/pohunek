@@ -1168,8 +1168,15 @@ runtime registry: a value outside the runtime-id grammar is rejected with
 resolves is rejected with `runtime/runtime_not_installed`. Unknown values never
 silently become a supported launch, resume, or fork runtime. A session or
 recovery record whose runtime is not installed is kept inert: it stays listed
-with its stored recovery binding, refuses resume, fork and mutation with
-`runtime_not_installed`, and resumes again once the runtime is installed. The
+with its stored recovery binding, refuses resume, fork, input and every other
+mutation with `runtime_not_installed` (or `agent_kind_unsupported` for a
+historical label), and resumes again once the runtime is installed.
+`session.stop` and `session.remove` (also
+`session.remove_accepting_unconfirmed`) are the exceptions: they only release
+what the session owns and need no runtime definition, so the owner can end the
+session's worker and delete the session while its runtime is missing. Removal
+keeps its supervision rules (a worker not proven gone refuses), and an external
+session stays refused with `session_external_read_only`. The
 binding records the runtime identity (`LaunchBinding`) the session was
 launched with; a binding written without one may only resume through a
 built-in runtime. A session launched from an installed runtime package pins the

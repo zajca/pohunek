@@ -1230,7 +1230,11 @@ async fn mutations_fail_closed_for_a_session_whose_agent_kind_is_not_launchable(
             .agent_base = RuntimeRef::from_wire(kind);
 
         let error = registry
-            .stop(&created.id)
+            .input(protocol::SessionInputParams {
+                session_id: created.id.clone(),
+                text: "x".to_owned(),
+                wait: None,
+            })
             .await
             .expect_err("unlaunchable agent mutation must fail closed");
         assert_eq!(error.code, code, "{kind}");
@@ -9871,6 +9875,38 @@ async fn external_rescan_preserves_verified_entry_on_identity_inspection_failure
         1,
         "an inconclusive refresh must not replace the existing exit watch"
     );
+}
+
+#[tokio::test]
+async fn stop_and_remove_reject_external_observe_only_sessions() {
+    let inspector = Arc::new(MockInspector::default());
+    let registry_inspector: Arc<dyn ProcessInspector> = Arc::<MockInspector>::clone(&inspector);
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            ..SessionRegistryConfig::default()
+        },
+        registry_inspector,
+    );
+    inspector.set_descendants(1, vec![codex_fact(FOREIGN_AGENT_PID, 1)]);
+    inspector.set_cwd(FOREIGN_AGENT_PID, temp_dir("external-session-release"));
+
+    registry
+        .rescan_external_agents(&TranscriptIndex::default())
+        .await;
+    let external = registry.list().await.into_iter().next().expect("external");
+
+    let stop = registry
+        .stop(&external.id)
+        .await
+        .expect_err("an external session cannot be stopped");
+    assert_eq!(stop.code, "session_external_read_only");
+    let remove = registry
+        .remove(&external.id)
+        .await
+        .expect_err("an external session cannot be removed");
+    assert_eq!(remove.code, "session_external_read_only");
 }
 
 #[tokio::test]

@@ -224,7 +224,11 @@ launch binding (runtime id plus where its definition came from). A profile whose
 `runtime_not_installed`; a `base` that is not a runtime id fails with
 `invalid_profile`. A recovery binding whose runtime is not installed stays in the
 store, refuses resume and fork with `runtime_not_installed`, and works again once
-the runtime is installed.
+the runtime is installed. `session stop` and `session remove` still work on such
+a session (or one whose recorded kind is a historical label): they release the
+worker and the session's worktrees and never launch, resume, fork or write
+input, so they need no runtime definition. Removal keeps its fail-closed
+supervision rules.
 
 A runtime can also come from an installed runtime package (see
 `concept/runtime-package-archive`, "Daemon host"). A session launched from a
