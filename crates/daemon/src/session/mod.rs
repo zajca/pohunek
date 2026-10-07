@@ -1302,6 +1302,31 @@ impl SessionRegistry {
         config: SessionRegistryConfig,
         supervisor: Arc<dyn WorkerLauncher>,
     ) -> Result<Self, ProtocolError> {
+        Self::new_production_with_inspector(
+            config,
+            supervisor,
+            Arc::new(crate::procwatch::HostInspector::new()),
+        )
+    }
+
+    /// [`Self::new_production`] with an injected process inspector.
+    ///
+    /// Integration tests that serve installed runtime packages need the
+    /// production registry (it opens the plugin root) and a host view that
+    /// keeps removal sweeps hermetic: a same-user process of the test host
+    /// whose ownership markers cannot be read never makes a removal refuse.
+    /// Production passes [`crate::procwatch::HostInspector`] through
+    /// [`Self::new_production`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `worker_backend_required` when the per-session worker roots or
+    /// the supervision configuration are absent.
+    pub fn new_production_with_inspector(
+        config: SessionRegistryConfig,
+        supervisor: Arc<dyn WorkerLauncher>,
+        inspector: Arc<dyn ProcessInspector>,
+    ) -> Result<Self, ProtocolError> {
         validate_observation_config(&config)?;
         if config.worker_runtime_root.is_none()
             || config.worker_state_root.is_none()
@@ -1317,12 +1342,7 @@ impl SessionRegistry {
             .as_deref()
             .map(open_runtime_host)
             .transpose()?;
-        Ok(Self::build(
-            config,
-            Some(supervisor),
-            Arc::new(crate::procwatch::HostInspector::new()),
-            runtimes,
-        ))
+        Ok(Self::build(config, Some(supervisor), inspector, runtimes))
     }
 
     /// Create a registry with an injected process inspector.

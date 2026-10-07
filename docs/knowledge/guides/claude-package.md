@@ -112,7 +112,7 @@ captured screen through the package manifest.
   the reporter script, so the script's `$PPID` is that shell and the worker
   rejected the SessionStart report: no native reference, no resume. The managed
   Claude scripts now propose the parent of a wrapper shell as the reporting
-  process (the `agent-pid` block, `crates/daemon/src/integration/hook_pid_tests.rs`),
+  process (the `agent-pid` block, which reads the untruncated command line with `ps -ww` and compares the script path quoted as the installer quotes it, so long paths and paths with an apostrophe match; tests in `crates/daemon/src/integration/hook_pid_tests.rs`),
   and the real-Claude tests were also run with dash as `/bin/sh`. The Codex
   scripts keep `$PPID`.
 - The hook runs from the launched process: the SessionStart report names the
@@ -212,6 +212,16 @@ established by the network namespace, not by Claude's own switches.
   throwaway `claude` scripts: the older release, the next minor, a pre-release,
   a different banner wording and unreadable output are refused with
   `agent_runtime_unsupported`, and the supported banner launches.
+- The test daemon observes the host through the test-host process view
+  (`crates/daemon/src/procwatch/readable_host.rs`, via
+  `SessionRegistry::new_production_with_inspector`), so a same-user process of
+  the test host that started after a worker and hides its environment (another
+  parallel test's fresh worker, a non-dumpable helper) does not make a session
+  removal refuse with `runtime_supervision_ambiguous`. The hosted runner hit
+  that refusal once in `a_real_claude_resumes_and_forks_with_the_descriptor_arguments`;
+  `a_session_removal_ignores_an_unreadable_process_of_the_test_host` reproduces
+  it with a non-dumpable helper. The production daemon keeps the fail-closed
+  host view.
 - The fixture owns a process guard (`crates/cli/tests/support/process_guard.rs`):
   on success and on unwind it kills every process whose executable, working
   directory or environment value lies below the fixture's root before the

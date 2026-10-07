@@ -37,6 +37,12 @@ use pohunek_test_support::worker_binary;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
+// The test-host process view: an unrelated process of a loaded test host whose
+// ownership markers cannot be read (another test's fresh exec, a non-dumpable
+// helper) never makes a session removal refuse.
+#[path = "../../../daemon/src/procwatch/readable_host.rs"]
+mod readable_host;
+
 /// Mode of every private fixture directory.
 pub(crate) const PRIVATE_MODE: u32 = 0o700;
 
@@ -162,9 +168,12 @@ impl Harness {
             shell_command: ShellCommand::new("/bin/sh", std::iter::empty::<&str>()),
             ..SessionRegistryConfig::default()
         };
-        let registry =
-            SessionRegistry::new_production(config, Arc::new(SubprocessWorkerLauncher::new()))
-                .expect("the production registry opens the plugin root");
+        let registry = SessionRegistry::new_production_with_inspector(
+            config,
+            Arc::new(SubprocessWorkerLauncher::new()),
+            Arc::new(readable_host::ReadableHost::new()),
+        )
+        .expect("the production registry opens the plugin root");
         let governance = Arc::new(
             HostGovernanceService::open(env.root().join("governance"))
                 .await

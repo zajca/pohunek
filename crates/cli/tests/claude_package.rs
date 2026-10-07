@@ -2288,6 +2288,53 @@ async fn the_package_version_probe_refuses_an_unsupported_claude_and_starts_the_
     fixture.finish().await;
 }
 
+/// Starts a same-user process below `root` that hides its environment from
+/// procfs (`PR_SET_DUMPABLE` off), the way a non-dumpable helper or another
+/// test's process caught between images does, and returns it.
+fn spawn_non_dumpable(root: &Path) -> std::process::Child {
+    /// `prctl` option that clears the dumpable flag.
+    const PR_SET_DUMPABLE: u32 = 4;
+    /// Seconds the helper sleeps; the process guard ends it earlier.
+    const HELPER_LIFETIME_SECS: u32 = 600;
+    let code = format!(
+        "import ctypes, time; ctypes.CDLL(None).prctl({PR_SET_DUMPABLE}, 0, 0, 0, 0); time.sleep({HELPER_LIFETIME_SECS})"
+    );
+    std::process::Command::new("python3")
+        .args(["-c", &code])
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("start the non-dumpable helper")
+}
+
+/// A session removal is judged on the runtime's own processes: a same-user
+/// process of the test host that started after the worker and whose
+/// environment cannot be read (the CI case: another test's fresh worker) does
+/// not make the removal refuse, because the harness observes the host through
+/// the test-host view. The daemon keeps its fail-closed production behaviour.
+#[tokio::test]
+async fn a_session_removal_ignores_an_unreadable_process_of_the_test_host() {
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let root = fixture.harness.env.root().to_path_buf();
+    let program = write_fake_claude(&root, "fake-removal", &banner_of(&locked_release()));
+    fixture.write_profile("fake-removal", Some(&program));
+    let (code, launched) = fixture.launch("fake-removal", "removal").await;
+    assert_eq!(code, 0, "{launched}");
+    let id = launched["ok"]["id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let mut helper = spawn_non_dumpable(&root);
+    fixture.stop(&id).await;
+
+    let (code, removed) = fixture.harness.json(&["session", "rm", &id]).await;
+    let _ = helper.kill();
+    let _ = helper.wait();
+    assert_eq!(code, 0, "{removed}");
+    fixture.finish().await;
+}
+
 /// Whether `pid` is a live process; a terminated one that its parent has not
 /// reaped yet is not.
 #[cfg(target_os = "linux")]

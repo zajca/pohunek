@@ -1,5 +1,12 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-07, package test daemons use the test-host process view)
+
+- The shared package test harness builds its daemon with
+  `SessionRegistry::new_production_with_inspector` and the test-host process
+  view, so an unreadable same-user process of a loaded test host no longer makes
+  a session removal refuse. Production daemons keep the real host view.
+
 ## Unreleased (2026-10-07, Claude hook reporter behind a wrapper shell)
 
 - The managed Claude hook scripts skip a wrapper shell when they pick the process

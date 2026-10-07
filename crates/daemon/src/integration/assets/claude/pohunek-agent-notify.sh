@@ -27,11 +27,14 @@ command -v python3 >/dev/null 2>&1 || exit 0
 # Claude runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
 # shell that does not exec its last command (dash) stays between the agent and
 # this script, so the agent is the parent of that wrapper shell, not `$PPID`.
-# Only a parent whose command line is exactly that hook invocation is skipped.
+# Only a parent whose full command line contains exactly that hook invocation,
+# with the script path quoted the way the installer quotes it, is skipped.
 agent_pid="$PPID"
-parent_args="$(ps -o args= -p "$agent_pid" 2>/dev/null || true)"
+parent_args="$(ps -ww -o args= -p "$agent_pid" 2>/dev/null || true)"
+quoted_self="$(printf '%s' "$0" | sed "s/'/'\"'\"'/g")"
+hook_invocation=" -c sh '$quoted_self' "
 case "$parent_args" in
-  *" -c sh '$0' "*)
+  *"$hook_invocation"*)
     outer_pid="$(ps -o ppid= -p "$agent_pid" 2>/dev/null || true)"
     outer_pid="${outer_pid#"${outer_pid%%[![:space:]]*}"}"
     outer_pid="${outer_pid%%[[:space:]]*}"
