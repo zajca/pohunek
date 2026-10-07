@@ -746,6 +746,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use pohunek_test_support::process_env::ProcessEnv;
+    use pohunek_test_support::time::{AutoAdvanceInhibitor, TIMER_TICK};
     use protocol::HostClass;
 
     use super::*;
@@ -1332,5 +1334,275 @@ mod tests {
             package(&["pohunek", "plugin", "profile", "migrate", "work", "--digest"]),
             None
         );
+    }
+
+    /// A dynamic daemon lookup behind the session-target and package completers.
+    #[derive(Clone, Copy, Debug)]
+    enum Lookup {
+        /// `query_sessions` on the local host.
+        Sessions,
+        /// `query_packages`.
+        Packages,
+    }
+
+    impl Lookup {
+        const ALL: [Self; 2] = [Self::Sessions, Self::Packages];
+
+        /// Control method the lookup sends.
+        const fn method(self) -> &'static str {
+            match self {
+                Self::Sessions => protocol::method::SESSION_LIST,
+                Self::Packages => protocol::method::PACKAGE_LIST,
+            }
+        }
+
+        /// A daemon answer listing nothing.
+        fn empty_result(self) -> serde_json::Value {
+            match self {
+                Self::Sessions => serde_json::json!([]),
+                Self::Packages => serde_json::json!({ "generation": 0, "packages": [] }),
+            }
+        }
+
+        /// Runs the lookup: the number of entries found, or `None` on failure.
+        async fn run(self) -> Option<usize> {
+            match self {
+                Self::Sessions => query_sessions(LOCAL_HOST).await.map(|found| found.len()),
+                Self::Packages => query_packages().await.map(|found| found.len()),
+            }
+        }
+    }
+
+    /// Points the path variables the lookups resolve at the private
+    /// directories of `env` and clears the session-origin pair, so neither
+    /// `Paths::resolve` nor the client reads the host's values.
+    fn private_process_env(env: &pohunek_test_support::env::TestEnv) -> ProcessEnv {
+        let mut process = ProcessEnv::lock();
+        process
+            .set(pohunek_paths::HOME, env.home())
+            .set(pohunek_paths::XDG_CONFIG_HOME, env.config_home())
+            .set(pohunek_paths::XDG_DATA_HOME, env.data_home())
+            .set(pohunek_paths::XDG_STATE_HOME, env.state_home())
+            .set(pohunek_paths::XDG_CACHE_HOME, env.cache_home())
+            .set(pohunek_paths::XDG_RUNTIME_DIR, env.runtime_dir())
+            .remove(protocol::ENV_SESSION_ID)
+            .remove(protocol::ENV_DAEMON_ID);
+        process
+    }
+
+    /// Binds a fixture daemon at the socket path the lookups resolve.
+    fn bind_resolved_socket() -> tokio::net::UnixListener {
+        let socket = Paths::resolve()
+            .expect("paths resolve in the private environment")
+            .socket;
+        fs::create_dir_all(socket.parent().expect("socket parent"))
+            .expect("create the runtime directory");
+        tokio::net::UnixListener::bind(&socket).expect("bind fixture daemon")
+    }
+
+    /// Accepts the lookup's connection and reads its first request without
+    /// answering; fails the test when the lookup ends before connecting.
+    async fn accept_request(
+        listener: &tokio::net::UnixListener,
+        lookup: &mut tokio::task::JoinHandle<Option<usize>>,
+    ) -> (
+        tokio::io::BufReader<tokio::net::UnixStream>,
+        protocol::Request,
+    ) {
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted.expect("accept the lookup connection"),
+            ended = &mut *lookup => panic!("the lookup ended before connecting: {ended:?}"),
+        };
+        let mut stream = tokio::io::BufReader::new(stream);
+        let request = read_request(&mut stream).await;
+        (stream, request)
+    }
+
+    /// Reads one request line from the lookup's connection.
+    async fn read_request(
+        stream: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+    ) -> protocol::Request {
+        use tokio::io::AsyncBufReadExt as _;
+
+        let mut line = String::new();
+        stream
+            .read_line(&mut line)
+            .await
+            .expect("read the lookup request");
+        serde_json::from_str(&line).expect("decode the lookup request")
+    }
+
+    /// Writes a successful daemon response to `request` carrying `result`.
+    async fn answer(
+        stream: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+        request: &protocol::Request,
+        result: serde_json::Value,
+    ) {
+        use tokio::io::AsyncWriteExt as _;
+
+        let response = protocol::Response::ok(
+            request.version_range().maximum(),
+            request.id().to_owned(),
+            result,
+        )
+        .expect("valid response");
+        let mut encoded = serde_json::to_vec(&response).expect("encode response");
+        encoded.push(b'\n');
+        stream
+            .get_mut()
+            .write_all(&encoded)
+            .await
+            .expect("write response");
+    }
+
+    /// Positive control for the failure scenarios below: in the same private
+    /// environment, a daemon that answers at the resolved socket yields a
+    /// result, so their `None` comes from the daemon, not from setup.
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_lookups_reach_a_daemon_at_the_resolved_socket() {
+        for lookup in Lookup::ALL {
+            let env = pohunek_test_support::env::TestEnv::new()
+                .expect("create the hermetic test environment");
+            let _process = private_process_env(&env);
+            let listener = bind_resolved_socket();
+            // The clock stands still until the fixture has answered, so no
+            // lookup timeout can expire first.
+            let inhibitor = AutoAdvanceInhibitor::new();
+
+            let mut task = tokio::spawn(lookup.run());
+            let (mut stream, request) = pohunek_test_support::wait::guard(
+                "the lookup request",
+                accept_request(&listener, &mut task),
+            )
+            .await;
+            // The client sends a `daemon.health` version probe before a method
+            // that not every protocol version in its window supports.
+            let request = if request.method() == protocol::method::DAEMON_HEALTH {
+                let health = serde_json::json!({
+                    "status": "ok",
+                    "daemon_version": "fixture",
+                    "protocol_version": protocol::PROTOCOL_VERSION.get()
+                });
+                answer(&mut stream, &request, health).await;
+                read_request(&mut stream).await
+            } else {
+                request
+            };
+            assert_eq!(request.method(), lookup.method(), "{lookup:?}");
+            answer(&mut stream, &request, lookup.empty_result()).await;
+            let found = pohunek_test_support::wait::guard("the lookup result", task)
+                .await
+                .expect("lookup task");
+            inhibitor.release().await;
+
+            assert_eq!(found, Some(0), "{lookup:?}");
+        }
+    }
+
+    /// A daemon that accepts the connection but never answers holds a lookup
+    /// for exactly the completion deadline, after which it gives up silently.
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_lookups_give_up_on_an_unanswering_daemon_at_the_completion_deadline() {
+        for lookup in Lookup::ALL {
+            let env = pohunek_test_support::env::TestEnv::new()
+                .expect("create the hermetic test environment");
+            let _process = private_process_env(&env);
+            let listener = bind_resolved_socket();
+            let inhibitor = AutoAdvanceInhibitor::new();
+            let start = tokio::time::Instant::now();
+
+            let mut task = tokio::spawn(lookup.run());
+            // The accepted stream stays open and unanswered until the lookup
+            // has returned, so only its own timeout can end it.
+            let (_unanswered, request) = pohunek_test_support::wait::guard(
+                "the lookup request",
+                accept_request(&listener, &mut task),
+            )
+            .await;
+            assert!(
+                [protocol::method::DAEMON_HEALTH, lookup.method()].contains(&request.method()),
+                "{lookup:?} sent {}",
+                request.method()
+            );
+            inhibitor.release().await;
+            let found = pohunek_test_support::wait::guard("the lookup to give up", task)
+                .await
+                .expect("lookup task");
+            let waited = tokio::time::Instant::now() - start;
+
+            assert_eq!(found, None, "{lookup:?}");
+            assert!(
+                waited >= COMPLETION_DEADLINE && waited <= COMPLETION_DEADLINE + TIMER_TICK,
+                "{lookup:?} gave up after {waited:?}, not at the completion deadline"
+            );
+        }
+    }
+
+    /// Installs a service whose daemon executable exits at once, so a lookup
+    /// that tried to autostart the daemon would find one to start and would
+    /// then wait for its socket.
+    fn install_service(env: &pohunek_test_support::env::TestEnv) {
+        let base = pohunek_paths::BasePaths::resolve()
+            .expect("base paths resolve in the private environment");
+        let context = crate::service::Context::new(
+            base.clone(),
+            nix::unistd::Uid::effective().as_raw(),
+            Some(env.home().to_path_buf()),
+            Some(env.runtime_dir().to_path_buf()),
+            env.root().join("supervisor"),
+            env.root().join("bin").join("pohunek"),
+        );
+        let config = crate::service::definition::identity_config(
+            &context,
+            &env.root().join("prefix"),
+            "1.0.0",
+        )
+        .expect("service configuration");
+        let daemon = config.daemon_executable();
+        fs::create_dir_all(daemon.parent().expect("daemon executable parent"))
+            .expect("create the version directory");
+        pohunek_test_support::fs::write_executable(&daemon, "#!/bin/sh\nexit 0\n")
+            .expect("write the daemon executable");
+        config
+            .write(&pohunek_service_config::file_path(&base))
+            .expect("write the service configuration");
+    }
+
+    /// Without a daemon socket a lookup fails at once, waits on no timer, and
+    /// leaves the runtime directory as it found it, even though an installed
+    /// service could be started: completion never autostarts the daemon.
+    #[tokio::test(start_paused = true)]
+    async fn dynamic_lookups_against_an_absent_daemon_fail_at_once_and_start_nothing() {
+        for lookup in Lookup::ALL {
+            let env = pohunek_test_support::env::TestEnv::new()
+                .expect("create the hermetic test environment");
+            let _process = private_process_env(&env);
+            install_service(&env);
+            let paths = Paths::resolve().expect("paths resolve in the private environment");
+            // The application runtime directory, where a daemon binds its
+            // socket and keeps its lock; installing the service created it.
+            let runtime_entries = || {
+                let mut names = fs::read_dir(&paths.runtime_dir)
+                    .expect("list the runtime directory")
+                    .map(|entry| entry.expect("runtime directory entry").file_name())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            };
+            let before = runtime_entries();
+            let start = tokio::time::Instant::now();
+
+            let found = lookup.run().await;
+            let waited = tokio::time::Instant::now() - start;
+
+            assert_eq!(found, None, "{lookup:?}");
+            assert_eq!(
+                waited,
+                Duration::ZERO,
+                "{lookup:?} waited instead of failing at connect, as a daemon start does"
+            );
+            assert!(!paths.socket.exists(), "{lookup:?} left a daemon socket");
+            assert_eq!(runtime_entries(), before, "{lookup:?}");
+        }
     }
 }

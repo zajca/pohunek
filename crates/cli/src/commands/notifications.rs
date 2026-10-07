@@ -1343,6 +1343,129 @@ mod tests {
         }
     }
 
+    /// CLI paths rooted at the private directory of `env`, with the daemon
+    /// socket at a path that fits the `sun_path` limit.
+    fn fixture_paths(env: &pohunek_test_support::env::TestEnv) -> Paths {
+        let socket = env
+            .socket_path("daemon.sock")
+            .expect("socket path fits the sun_path limit");
+        let root = socket.parent().expect("socket parent").to_path_buf();
+        Paths {
+            runtime_dir: root.clone(),
+            socket,
+            data_dir: root.join("data"),
+            log_dir: root.join("logs"),
+            cache_dir: root.join("cache"),
+            config_home: root.join("config-home"),
+            config_dir: root.join("config"),
+            origin_source: pohunek_client::OriginSource::Omitted,
+        }
+    }
+
+    /// Accepts one control connection on `listener`, answers its first request
+    /// with `result` like a daemon, and returns that request.
+    async fn answer_one_request(
+        listener: tokio::net::UnixListener,
+        result: serde_json::Value,
+    ) -> Request {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let (stream, _) = listener.accept().await.expect("accept control client");
+        let mut stream = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).await.expect("read request");
+        let request: Request = serde_json::from_str(&line).expect("decode request");
+        let response = protocol::Response::ok(
+            request.version_range().maximum(),
+            request.id().to_owned(),
+            result,
+        )
+        .expect("valid response");
+        let mut encoded = serde_json::to_vec(&response).expect("encode response");
+        encoded.push(b'\n');
+        stream
+            .get_mut()
+            .write_all(&encoded)
+            .await
+            .expect("write response");
+        request
+    }
+
+    /// The daemon list API has no agent filter, so `notifications list --agent`
+    /// filters the rows on the client: a daemon that returns every agent's rows
+    /// yields only the requested agent's rows, and no filter keeps them all.
+    #[tokio::test]
+    async fn list_keeps_only_rows_of_the_requested_agent() {
+        let codex = record("n-codex", NotificationStatus::Unread);
+        let mut claude = record("n-claude", NotificationStatus::Unread);
+        claude.agent_kind = Some(protocol::RuntimeRef::claude());
+        let mut unattributed = record("n-none", NotificationStatus::Unread);
+        unattributed.agent_kind = None;
+        let daemon_rows = serde_json::to_value(NotificationListResult {
+            notifications: vec![codex, claude, unattributed],
+            next_cursor: None,
+        })
+        .expect("encode the daemon rows");
+
+        for (agent, expected) in [
+            (None, vec!["n-claude", "n-codex", "n-none"]),
+            (Some(protocol::RuntimeRef::codex()), vec!["n-codex"]),
+            (Some(protocol::RuntimeRef::claude()), vec!["n-claude"]),
+        ] {
+            let env = pohunek_test_support::env::TestEnv::new()
+                .expect("create the hermetic test environment");
+            let paths = fixture_paths(&env);
+            // Binding before the command runs is the readiness signal.
+            let listener =
+                tokio::net::UnixListener::bind(&paths.socket).expect("bind fixture daemon");
+            let filters = ListFilters {
+                unread: false,
+                status: None,
+                kind: None,
+                severity: None,
+                provider: None,
+                agent: agent.clone(),
+                session: None,
+                limit: None,
+                cursor: None,
+            };
+
+            // The fixture runs as its own task so a client that fails before
+            // sending the request ends the scenario with its error instead of
+            // leaving the fixture waiting in `accept`.
+            let fixture = tokio::spawn(answer_one_request(listener, daemon_rows.clone()));
+            let outcome = pohunek_test_support::wait::guard(
+                "notifications list against the fixture daemon",
+                list_on_target(
+                    &paths,
+                    single_target(crate::LOCAL_HOST),
+                    build_list_params(filters.clone()),
+                    filters.agent,
+                ),
+            )
+            .await;
+            let result = match outcome {
+                Ok(result) => result,
+                Err(error) => {
+                    fixture.abort();
+                    panic!("list failed against the fixture daemon: {error:?}");
+                }
+            };
+            let request =
+                pohunek_test_support::wait::guard("the fixture to record the request", fixture)
+                    .await
+                    .expect("fixture daemon task");
+
+            assert_eq!(request.method(), method::NOTIFICATION_LIST);
+            let ids: Vec<&str> = result
+                .notifications
+                .iter()
+                .map(|record| record.id.0.as_str())
+                .collect();
+            assert_eq!(ids, expected, "agent filter {agent:?}");
+        }
+    }
+
     #[test]
     fn single_host_json_render_keeps_daemon_shape() {
         let result = NotificationListResult {
