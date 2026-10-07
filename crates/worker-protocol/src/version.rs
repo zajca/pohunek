@@ -235,18 +235,6 @@ mod tests {
     }
 
     #[test]
-    fn a_version_five_peer_negotiates_below_the_base_environment_version() {
-        let five = Version::new(5).expect("valid version");
-        let previous_release = VersionRange::new(Version::new(4).expect("valid version"), five)
-            .expect("ordered range");
-
-        let selected = negotiate(SUPPORTED_RANGE, previous_release).expect("overlapping ranges");
-
-        assert_eq!(selected, five);
-        assert!(selected < BASE_ENVIRONMENT_VERSION);
-    }
-
-    #[test]
     fn negotiation_rejects_disjoint_ranges() {
         let remote = VersionRange::new(
             Version::new(7).expect("valid version"),

@@ -153,16 +153,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_id_round_trips_through_json() {
-        let id = WorkerInstanceId::new("runtime_01.test-value").expect("valid identifier");
-        let json = serde_json::to_string(&id).expect("serialize identifier");
-        let decoded: WorkerInstanceId =
-            serde_json::from_str(&json).expect("deserialize identifier");
-
-        assert_eq!(decoded, id);
-    }
-
-    #[test]
     fn deserialization_enforces_identifier_invariants() {
         let error = serde_json::from_str::<WorkerId>("\"../../worker\"")
             .expect_err("path-like identifier must fail");

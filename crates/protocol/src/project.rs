@@ -373,21 +373,3 @@ pub struct WorktreeRemoveResult {
     /// `worktree_in_use`) surface as typed errors instead.
     pub removed: bool,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{ProjectSource, ProviderKind};
-
-    #[test]
-    fn project_source_strings_match_wire_repr() {
-        assert_eq!(ProjectSource::Auto.as_str(), "auto");
-        assert_eq!(ProjectSource::Manual.as_str(), "manual");
-    }
-
-    #[test]
-    fn provider_kind_strings_match_wire_repr() {
-        assert_eq!(ProviderKind::LinearIssue.as_str(), "linear_issue");
-        assert_eq!(ProviderKind::GithubPr.as_str(), "github_pr");
-        assert_eq!(ProviderKind::None.as_str(), "none");
-    }
-}

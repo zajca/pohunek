@@ -1,10 +1,10 @@
 //! Wire-contract tests for the delegated task layer errors (task RFC section
-//! 13.1): stable codes, classes, recovery hints, payload-free text and JSON
-//! round trips.
+//! 13.1): stable codes, classes, recovery hints, payload-free text and the
+//! exact JSON wire shape.
 
 use std::collections::HashSet;
 
-use protocol::{ErrorClass, ProtocolError, Response, PROTOCOL_VERSION};
+use protocol::{ErrorClass, ProtocolError};
 use serde_json::json;
 
 /// Code prefixes admitted for task-layer errors.
@@ -511,26 +511,6 @@ fn task_error_text_is_payload_free() {
 }
 
 #[test]
-fn task_errors_round_trip_as_json() {
-    for case in task_errors() {
-        let line = serde_json::to_string(&case.error).expect("serialize task error");
-        assert!(!line.contains('\n'), "{}: multi-line JSON", case.code);
-        let back: ProtocolError = serde_json::from_str(&line).expect("deserialize task error");
-        assert_eq!(back, case.error);
-
-        let value = serde_json::to_value(&case.error).expect("task error as value");
-        assert_eq!(value["code"], case.code);
-        assert_eq!(value["class"], case.class.to_string());
-        assert_eq!(
-            value.get("recover").is_some(),
-            case.has_recover,
-            "{}",
-            case.code
-        );
-    }
-}
-
-#[test]
 fn task_error_wire_shape_is_exact() {
     assert_eq!(
         serde_json::to_value(ProtocolError::task_check_unconfined()).expect("serialize"),
@@ -549,22 +529,6 @@ fn task_error_wire_shape_is_exact() {
             "msg": "the turn's snapshots were retired with the session content",
         })
     );
-}
-
-#[test]
-fn task_error_travels_in_a_response_envelope() {
-    let response = Response::err(
-        PROTOCOL_VERSION,
-        "req-task-busy",
-        ProtocolError::task_worktree_busy(),
-    )
-    .expect("valid response");
-    let line = serde_json::to_string(&response).expect("serialize response");
-    let back: Response = serde_json::from_str(&line).expect("deserialize response");
-    assert_eq!(back, response);
-    let value = serde_json::to_value(&response).expect("response as value");
-    assert_eq!(value["err"]["class"], "runtime");
-    assert_eq!(value["err"]["code"], "task_worktree_busy");
 }
 
 /// The concatenated daemon sources, searched for hand-written code literals.

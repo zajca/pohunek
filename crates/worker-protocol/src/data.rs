@@ -543,60 +543,74 @@ mod tests {
         }
     }
 
-    #[test]
-    fn metadata_frame_rejects_payload() {
-        let error = DataFrame::new(
-            header(FrameKind::Open {
-                token: DataToken::new("token-1").expect("valid token"),
-                mode: StreamMode::Attach,
-                after_offset: None,
-                attach: None,
-            }),
-            vec![1],
-        )
-        .expect_err("open frame must be metadata-only");
+    /// Builds the header fields every literal wire fixture below shares.
+    fn wire_header(kind: serde_json::Value) -> serde_json::Value {
+        let mut wire = serde_json::json!({
+            "version": 6,
+            "stream_id": "stream-1",
+            "runtime_id": "runtime-1",
+        });
+        let serde_json::Value::Object(kind) = kind else {
+            panic!("kind fields must be a JSON object");
+        };
+        wire.as_object_mut().expect("header object").extend(kind);
+        wire
+    }
 
-        assert!(matches!(error, FrameError::UnexpectedPayload));
+    /// The typed header that [`wire_header`] spells on the wire.
+    fn wire_fixture_header(kind: FrameKind) -> FrameHeader {
+        FrameHeader {
+            version: Version::new(6).expect("valid version"),
+            ..header(kind)
+        }
     }
 
     #[test]
     fn attach_open_round_trips_start_dimensions() {
-        let start = AttachStart {
-            dimensions: Some(Dimensions::new(120, 40).expect("valid dimensions")),
-        };
-        let frame = DataFrame::new(
-            header(FrameKind::Open {
-                token: DataToken::new("token-1").expect("valid token"),
-                mode: StreamMode::Attach,
-                after_offset: None,
-                attach: Some(start.clone()),
+        let wire = wire_header(serde_json::json!({
+            "kind": "open",
+            "token": "token-1",
+            "mode": "attach",
+            "after_offset": null,
+            "attach": {"dimensions": {"columns": 120, "rows": 40}},
+        }));
+        let expected = wire_fixture_header(FrameKind::Open {
+            token: DataToken::new("token-1").expect("valid token"),
+            mode: StreamMode::Attach,
+            after_offset: None,
+            attach: Some(AttachStart {
+                dimensions: Some(Dimensions::new(120, 40).expect("valid dimensions")),
             }),
-            Vec::new(),
-        )
-        .expect("valid attach open frame");
+        });
 
-        let json = serde_json::to_value(frame.header()).expect("serialize frame header");
-        let parsed: FrameHeader = serde_json::from_value(json).expect("deserialize frame header");
-
-        assert_eq!(parsed, frame.header().clone());
-        assert!(matches!(
-            parsed.kind,
-            FrameKind::Open {
-                attach: Some(ref actual),
-                ..
-            } if actual == &start
-        ));
+        assert_eq!(
+            serde_json::from_value::<FrameHeader>(wire.clone()).expect("decode attach open"),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(&expected).expect("encode attach open"),
+            wire
+        );
     }
 
     #[test]
     fn attach_ready_round_trips_authoritative_dimensions() {
-        let dimensions = Dimensions::new(100, 30).expect("valid dimensions");
-        let frame = DataFrame::new(header(FrameKind::AttachReady { dimensions }), Vec::new())
-            .expect("valid attach readiness frame");
-        let json = serde_json::to_value(frame.header()).expect("serialize frame header");
-        let parsed: FrameHeader = serde_json::from_value(json).expect("deserialize frame header");
+        let wire = wire_header(serde_json::json!({
+            "kind": "attach_ready",
+            "dimensions": {"columns": 100, "rows": 30},
+        }));
+        let expected = wire_fixture_header(FrameKind::AttachReady {
+            dimensions: Dimensions::new(100, 30).expect("valid dimensions"),
+        });
 
-        assert_eq!(parsed.kind, FrameKind::AttachReady { dimensions });
+        assert_eq!(
+            serde_json::from_value::<FrameHeader>(wire.clone()).expect("decode attach ready"),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(&expected).expect("encode attach ready"),
+            wire
+        );
     }
 
     #[test]

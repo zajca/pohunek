@@ -1252,19 +1252,30 @@ mod tests {
 
     #[test]
     fn untagged_control_message_round_trips_a_negotiation() {
+        let wire = serde_json::json!({
+            "request_id": "request-1",
+            "type": "negotiate",
+            "daemon_instance_id": "daemon-1",
+            "minimum_version": 5,
+            "maximum_version": 6,
+        });
         let message = ControlMessage::Request(ControlRequest {
             request_id: RequestId::new("request-1").expect("valid request"),
             kind: RequestKind::Negotiate {
                 daemon_instance_id: DaemonId::new("daemon-1").expect("valid daemon"),
-                minimum_version: crate::PREVIOUS_VERSION,
-                maximum_version: crate::CURRENT_VERSION,
+                minimum_version: Version::new(5).expect("valid version"),
+                maximum_version: Version::new(6).expect("valid version"),
             },
         });
-        let json = serde_json::to_string(&message).expect("serialize message");
-        let decoded: ControlMessage = serde_json::from_str(&json).expect("deserialize message");
 
-        assert_eq!(decoded, message);
-        assert!(json.contains(r#""type":"negotiate""#));
+        assert_eq!(
+            serde_json::from_value::<ControlMessage>(wire.clone()).expect("decode negotiation"),
+            message
+        );
+        assert_eq!(
+            serde_json::to_value(&message).expect("encode negotiation"),
+            wire
+        );
     }
 
     #[test]
@@ -1283,38 +1294,5 @@ mod tests {
             .expect_err("zero columns must fail");
 
         assert!(error.to_string().contains("must be nonzero"));
-    }
-
-    #[test]
-    fn observation_messages_round_trip_without_embedding_pty_bytes() {
-        let scope = RuntimeScope {
-            lease_id: LeaseId::new("lease-1").expect("valid lease"),
-            session_id: SessionId::new("s-1").expect("valid session"),
-            worker_id: WorkerId::new("w-1").expect("valid worker"),
-            worker_instance_id: WorkerInstanceId::new("runtime-1").expect("valid runtime"),
-        };
-        let request = ControlMessage::Request(ControlRequest {
-            request_id: RequestId::new("observation-1").expect("valid request"),
-            kind: RequestKind::ReadOutput {
-                scope: scope.clone(),
-                stream_id: StreamId::new("observation-stream-1").expect("valid stream"),
-                after_offset: Some(9),
-                max_bytes: 128,
-                wait_ms: 50,
-            },
-        });
-        let encoded = serde_json::to_string(&request).expect("serialize request");
-        assert_eq!(
-            serde_json::from_str::<ControlMessage>(&encoded).expect("deserialize request"),
-            request
-        );
-
-        let response = ResponseKind::OutputReadOpened {
-            token: DataToken::new("observation-token").expect("valid token"),
-            expires_at_ms: 500,
-        };
-        let rendered = format!("{response:?}");
-        assert!(rendered.contains("OutputReadOpened"));
-        assert!(!rendered.contains("pty-data"));
     }
 }

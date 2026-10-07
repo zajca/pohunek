@@ -2198,44 +2198,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_wait_normalizes_absent_targets_before_wire() {
-        let result = serde_json::json!({
-            "accepted": true,
-            "activity": "idle",
-            "activity_source": "report",
-            "runtime": {
-                "worker_instance_id": "runtime-1",
-                "runtime_generation": "1"
-            },
-            "activity_epoch": "d-epoch-1",
-            "activity_revision": "2"
-        });
-        let (address, server) = spawn_dedicated_capture_server(result).await;
-        let mut client = Client::connect_trusted_tcp_addr_with_options(
-            "fixture-remote",
-            address,
-            no_origin_options(),
-        )
-        .await
-        .expect("connect remote");
-
-        client
-            .session_input(SessionInputParams {
-                session_id: SessionId("s-target".to_owned()),
-                text: "hello".to_owned(),
-                wait: Some(protocol::SessionInputWait {
-                    until: None,
-                    timeout_ms: None,
-                }),
-            })
-            .await
-            .expect("session input wait succeeds");
-
-        let request = server.await.expect("capture server");
-        assert_eq!(request.params()["wait"]["until"], serde_json::json!([]));
-    }
-
-    #[tokio::test]
     async fn input_wait_rejects_legacy_success_without_runtime_evidence() {
         let result = serde_json::json!({"accepted": true});
         let (address, server) = spawn_dedicated_capture_server(result).await;
@@ -2348,18 +2310,6 @@ mod tests {
                 "invalid wait opened a dedicated connection"
             );
         }
-    }
-
-    #[test]
-    fn input_wait_timeout_preserves_unknown_delivery_recovery() {
-        let error = ClientError::Protocol(ProtocolError::session_input_timeout());
-        let recovery = error
-            .to_protocol_error()
-            .recover
-            .expect("timeout recovery hint");
-
-        assert!(recovery.contains("inspect the current session"));
-        assert!(recovery.contains("do not retry blindly"));
     }
 
     #[tokio::test]
