@@ -24,7 +24,25 @@ esac
 [ -n "${POHUNEK_WORKER_SOCKET_PATH:-}" ] || [ -n "${POHUNEK_SOCKET_PATH:-}" ] || exit 0
 [ -n "${POHUNEK_SESSION_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0
+# BEGIN agent-pid
+# Claude runs a hook command as `/bin/sh -c "sh '<this script>' <action>"`. A
+# shell that does not exec its last command (dash) stays between the agent and
+# this script, so the agent is the parent of that wrapper shell, not `$PPID`.
+# Only a parent whose command line is exactly that hook invocation is skipped.
 agent_pid="$PPID"
+parent_args="$(ps -o args= -p "$agent_pid" 2>/dev/null || true)"
+case "$parent_args" in
+  *" -c sh '$0' "*)
+    outer_pid="$(ps -o ppid= -p "$agent_pid" 2>/dev/null || true)"
+    outer_pid="${outer_pid#"${outer_pid%%[![:space:]]*}"}"
+    outer_pid="${outer_pid%%[[:space:]]*}"
+    case "$outer_pid" in
+      ''|*[!0-9]*|0|1) ;;
+      *) agent_pid="$outer_pid" ;;
+    esac
+    ;;
+esac
+# END agent-pid
 
 # `|| exit 0` on the heredoc command itself (NOT a trailing `exit 0`, which
 # `set -e` would never reach): an abnormal python exit (OOM, hook timeout kill,

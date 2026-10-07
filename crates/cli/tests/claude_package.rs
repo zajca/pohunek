@@ -1833,11 +1833,19 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
 
     // Input: written text, then a separate submit after the descriptor's
-    // delay. The stub holds the reply so the status line is on screen.
+    // delay. The stub sends no text until its start gate opens, so the status
+    // line stays on screen and the working screen is stable.
     let prompt = format!("{} {PROMPT}", messages_stub::HOLD_MARKER);
     fixture.input(&id, &prompt).await;
     fixture.wait_evidence(&id, "working", "screen").await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Working).await;
+    let (_title, rows) = fixture.screen(&id).await;
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains(messages_stub::FIRST_CHUNK)),
+        "no reply text is drawn while the start gate is closed: {rows:#?}"
+    );
     assert!(
         fixture.stub.requests_containing(&prompt) >= 1,
         "the stub received the prompt intact in the turn's request"
@@ -1850,6 +1858,57 @@ async fn a_real_claude_session_launches_and_is_detected_through_package_facts() 
     fixture.wait_title_prefix(&id, IDLE_TITLE_PREFIX).await;
     fixture.wait_activity(&id, "idle").await;
     assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
+
+    fixture.stop(&id).await;
+    fixture.finish().await;
+}
+
+/// A reply held mid-stream: Claude draws the first paragraph and removes the
+/// status line while the title still shows the running-turn glyph, so the
+/// daemon and the package manifest read the screen as idle (the pinned
+/// streaming gap). The turn finishes once the stream gate opens.
+#[tokio::test]
+#[ignore = "needs a real `claude` on PATH; run with POHUNEK_CLAUDE_E2E=1 and --ignored"]
+async fn a_real_claude_reply_held_mid_stream_reads_idle_from_the_screen() {
+    require_real_claude();
+    let package = installed_definition();
+    let fixture = Fixture::start(Seed::Trusted).await;
+    let launched = fixture.new_session("stream").await;
+    let id = launched["id"].as_str().expect("session id").to_owned();
+    fixture.wait_activity(&id, "idle").await;
+
+    let prompt = format!(
+        "{} {} {PROMPT}",
+        messages_stub::HOLD_MARKER,
+        messages_stub::STREAM_HOLD_MARKER
+    );
+    fixture.input(&id, &prompt).await;
+    fixture.wait_evidence(&id, "working", "screen").await;
+    fixture.stub.open_gate();
+    let rows = fixture
+        .wait_screen_line(&id, messages_stub::FIRST_CHUNK)
+        .await;
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains(messages_stub::SECOND_CHUNK)),
+        "the second chunk waits for the stream gate: {rows:#?}"
+    );
+    let (title, _rows) = fixture.screen(&id).await;
+    assert!(
+        title.is_some_and(
+            |title| title.starts_with(['\u{25d0}', '\u{25d1}', '\u{25d2}', '\u{25d3}'])
+        ),
+        "the title still shows a running turn"
+    );
+    fixture.wait_evidence(&id, "idle", "screen").await;
+    assert_package_agrees(&fixture, &package, &id, AgentActivity::Idle).await;
+
+    fixture.stub.open_stream_gate();
+    fixture
+        .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
+        .await;
+    fixture.wait_title_prefix(&id, IDLE_TITLE_PREFIX).await;
 
     fixture.stop(&id).await;
     fixture.finish().await;
@@ -2045,15 +2104,30 @@ async fn a_real_claude_subagent_is_reported_through_the_hook_schema() {
     eprintln!("subagent record: {subagent}");
     assert_eq!(subagent["provider"], "claude", "{subagent}");
 
-    let finished = wait_until("the subagent to end", || async {
+    // The SubagentStop hook completes that same subagent while the parent
+    // runtime is still live; a subagent the worker marks lost, failed or
+    // cancelled because the parent exited is not evidence of the hook.
+    let subagent_id = subagent["id"].as_str().expect("subagent id").to_owned();
+    let launch_pid = fixture.inspect(&id).await["pid"].clone();
+    let finished = wait_until("the subagent to complete", || async {
         let inspected = fixture.inspect(&id).await;
+        assert_eq!(
+            inspected["runtime"]["state"], "live",
+            "the parent runtime stays live: {inspected}"
+        );
+        assert_eq!(inspected["pid"], launch_pid, "{inspected}");
         inspected["subagents"]
             .as_array()
-            .and_then(|subagents| subagents.first().cloned())
-            .filter(|subagent| subagent["lifecycle"] != "running")
+            .and_then(|subagents| {
+                subagents
+                    .iter()
+                    .find(|subagent| subagent["id"] == subagent_id.as_str())
+                    .cloned()
+            })
+            .filter(|subagent| subagent["lifecycle"] == "completed")
     })
     .await;
-    assert_ne!(finished["lifecycle"], "running", "{finished}");
+    assert_eq!(finished["provider"], "claude", "{finished}");
     assert!(
         fixture
             .stub
@@ -2353,10 +2427,18 @@ async fn capture_the_real_claude_screens() {
     fixture.capture_widths(&directory, &id, "idle", true).await;
 
     fixture
-        .input(&id, &format!("{} {PROMPT}", messages_stub::HOLD_MARKER))
+        .input(
+            &id,
+            &format!(
+                "{} {} {PROMPT}",
+                messages_stub::HOLD_MARKER,
+                messages_stub::STREAM_HOLD_MARKER
+            ),
+        )
         .await;
     fixture.wait_evidence(&id, "working", "screen").await;
     fixture.capture(&directory, &id, "working_early").await;
+    fixture.stub.open_gate();
     fixture
         .wait_screen_line(&id, messages_stub::FIRST_CHUNK)
         .await;
@@ -2365,7 +2447,7 @@ async fn capture_the_real_claude_screens() {
         .capture_widths(&directory, &id, "working_stream", false)
         .await;
 
-    fixture.stub.open_gate();
+    fixture.stub.open_stream_gate();
     fixture
         .wait_screen_line(&id, messages_stub::SECOND_CHUNK)
         .await;

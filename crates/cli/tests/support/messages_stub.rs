@@ -4,9 +4,11 @@
 //! The stub serves `POST /v1/messages` on an ephemeral IPv4 loopback port, as a
 //! server-sent event stream when the request asks for one and as a JSON message
 //! otherwise (Claude Code also issues short non-streaming helper calls). A
-//! request whose body carries [`HOLD_MARKER`] gets its first text chunk at once
-//! and the rest only after the test opens the gate, so a test can hold the agent
-//! in its working state and release it deterministically. A request carrying
+//! request whose body carries [`HOLD_MARKER`] gets no text until the test opens
+//! the start gate, so the agent stays in a stable working state (status line,
+//! no output) until the test releases it. A request carrying
+//! [`STREAM_HOLD_MARKER`] gets its first text chunk at once and the rest only
+//! after the test opens the stream gate, which holds the agent mid-stream. A request carrying
 //! [`APPROVAL_MARKER`], [`QUESTION_MARKER`] or [`SUBAGENT_MARKER`] is answered
 //! with a tool call (a shell command that needs approval, a multiple-choice
 //! question, a subagent task) until the conversation holds a tool result. Every
@@ -36,18 +38,23 @@ pub(crate) const MODEL_ID: &str = "claude-sonnet-4-5";
 /// every request and only checks that no other key arrives.
 pub(crate) const API_KEY: &str = "pohunek-stub-key-00000000000000000000";
 
-/// Text streamed before the gate, visible while the response is held.
+/// Text streamed before the stream gate, visible while the response is held
+/// mid-stream.
 pub(crate) const FIRST_CHUNK: &str = "working";
 
 /// Paragraph break after the first chunk: Claude Code draws streamed text only
 /// once its paragraph is complete.
 pub(crate) const CHUNK_BREAK: &str = "\n\n";
 
-/// Text streamed after the gate opens.
+/// Text streamed after the stream gate opens.
 pub(crate) const SECOND_CHUNK: &str = "done";
 
-/// Prompt text that makes the stub hold the reply until the gate opens.
+/// Prompt text that makes the stub send no text until the start gate opens.
 pub(crate) const HOLD_MARKER: &str = "[hold]";
+
+/// Prompt text that makes the stub hold the reply after its first chunk until
+/// the stream gate opens.
+pub(crate) const STREAM_HOLD_MARKER: &str = "[stream-hold]";
 
 /// Prompt text that makes the stub answer with a command that needs approval.
 pub(crate) const APPROVAL_MARKER: &str = "[approval]";
@@ -86,6 +93,27 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Substring of a request body that marks a tool result in the conversation.
 const TOOL_RESULT_MARKER: &str = "\"tool_result\"";
 
+/// A closed-until-opened barrier a response thread waits on.
+#[derive(Debug, Default)]
+struct Gate {
+    open: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Gate {
+    fn set(&self, open: bool) {
+        *self.open.lock().expect("gate lock") = open;
+        self.changed.notify_all();
+    }
+
+    fn wait_open(&self) {
+        let mut open = self.open.lock().expect("gate lock");
+        while !*open {
+            open = self.changed.wait(open).expect("gate wait");
+        }
+    }
+}
+
 /// Shared state between the acceptor, the response threads and the test.
 #[derive(Debug, Default)]
 struct State {
@@ -93,8 +121,8 @@ struct State {
     finished: AtomicUsize,
     unexpected_credential: AtomicBool,
     stopping: AtomicBool,
-    gate_open: Mutex<bool>,
-    gate_changed: Condvar,
+    start_gate: Gate,
+    stream_gate: Gate,
     paths: Mutex<Vec<String>>,
     bodies: Mutex<Vec<String>>,
 }
@@ -175,15 +203,16 @@ impl MessagesStub {
             .count()
     }
 
-    /// Lets every held response, and every later one, complete.
+    /// Opens the start gate: every response held before its first text, and
+    /// every later one, starts.
     pub(crate) fn open_gate(&self) {
-        *self.state.gate_open.lock().expect("gate lock") = true;
-        self.state.gate_changed.notify_all();
+        self.state.start_gate.set(true);
     }
 
-    /// Holds the second chunk of every marked response that starts from now on.
-    pub(crate) fn close_gate(&self) {
-        *self.state.gate_open.lock().expect("gate lock") = false;
+    /// Opens the stream gate: every response held mid-stream, and every later
+    /// one, completes.
+    pub(crate) fn open_stream_gate(&self) {
+        self.state.stream_gate.set(true);
     }
 }
 
@@ -191,6 +220,7 @@ impl Drop for MessagesStub {
     fn drop(&mut self) {
         self.state.stopping.store(true, Ordering::SeqCst);
         self.open_gate();
+        self.open_stream_gate();
         // A throwaway connection wakes the blocked `accept`.
         let _ = TcpStream::connect(self.address);
         if let Some(acceptor) = self.acceptor.take() {
@@ -262,7 +292,10 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
             &mut writer,
             state,
             &reply,
-            request.body.contains(HOLD_MARKER),
+            &Holds {
+                before_text: request.body.contains(HOLD_MARKER),
+                mid_stream: request.body.contains(STREAM_HOLD_MARKER),
+            },
         )?;
     } else {
         write_json(&mut writer, &message_json(&reply.blocks()))?;
@@ -388,13 +421,20 @@ fn write_json(writer: &mut TcpStream, document: &serde_json::Value) -> io::Resul
     )
 }
 
-/// Streams `reply` as Messages events; a held text reply waits for the gate
-/// after its first chunk.
+/// Where a streamed text reply waits for a gate.
+struct Holds {
+    /// Before the first chunk, on the start gate.
+    before_text: bool,
+    /// After the first chunk, on the stream gate.
+    mid_stream: bool,
+}
+
+/// Streams `reply` as Messages events; a held text reply waits on its gates.
 fn stream_reply(
     writer: &mut TcpStream,
     state: &State,
     reply: &Reply,
-    held: bool,
+    holds: &Holds,
 ) -> io::Result<()> {
     writer.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
@@ -417,12 +457,12 @@ fn stream_reply(
                     "content_block": { "type": "text", "text": "" },
                 }),
             )?;
+            if holds.before_text {
+                state.start_gate.wait_open();
+            }
             send_text_delta(writer, &format!("{FIRST_CHUNK}{CHUNK_BREAK}"))?;
-            if held {
-                let mut open = state.gate_open.lock().expect("gate lock");
-                while !*open {
-                    open = state.gate_changed.wait(open).expect("gate wait");
-                }
+            if holds.mid_stream {
+                state.stream_gate.wait_open();
             }
             send_text_delta(writer, SECOND_CHUNK)?;
         }

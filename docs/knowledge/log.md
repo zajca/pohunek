@@ -1,5 +1,13 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-07, Claude hook reporter behind a wrapper shell)
+
+- The managed Claude hook scripts skip a wrapper shell when they pick the process
+  that reports: Claude runs hooks as `/bin/sh -c`, and where that is dash the
+  shell stays between Claude and the script, so the worker rejected the
+  SessionStart report and no native reference was recorded. The Claude package
+  guide records the finding.
+
 ## Unreleased (2026-10-07, Codex conversation id becomes the native reference)
 
 - The session worker verifies a launch claim from a provider-named direct child

@@ -107,6 +107,14 @@ captured screen through the package manifest.
 - The idle, working and blocked states are read from the screen. Claude keeps
   its idle title (`✳ Claude Code`) while an approval or question dialog is open,
   and the screen rules (`blocked`, priority 840 and above) win over it.
+- Claude runs a hook command as `/bin/sh -c <command>`. Where `/bin/sh` is dash
+  (Debian, Ubuntu, so the hosted CI runner) the shell stays between Claude and
+  the reporter script, so the script's `$PPID` is that shell and the worker
+  rejected the SessionStart report: no native reference, no resume. The managed
+  Claude scripts now propose the parent of a wrapper shell as the reporting
+  process (the `agent-pid` block, `crates/daemon/src/integration/hook_pid_tests.rs`),
+  and the real-Claude tests were also run with dash as `/bin/sh`. The Codex
+  scripts keep `$PPID`.
 - The hook runs from the launched process: the SessionStart report names the
   launch process as the reporter, so the conversation id becomes the session's
   native reference and names Claude's transcript file
@@ -211,8 +219,11 @@ established by the network namespace, not by Claude's own switches.
 - `#[ignore]`d tests drive a real `claude` through the installed package with a
   throwaway Claude home and the loopback Messages stub: the banner against the
   probe template, launch and detection (input framing, the held turn, the
-  process matchers on the real process), the SessionStart reference and its
-  transcript, resume and fork argv, the subagent hooks, and the approval dialog.
+  process matchers on the real process; the stub sends no text until its start
+  gate opens, so the working screen is stable), a reply held mid-stream (the
+  pinned idle-by-screen gap), the SessionStart reference and its transcript,
+  resume and fork argv, the subagent hooks (the same subagent must reach
+  `completed` while the parent runtime is live), and the approval dialog.
   Hooks come from `pohunek integration install --agent claude --profile …`,
   which resolves the profile's `CLAUDE_CONFIG_DIR` so the real home is never
   touched. Run them with `POHUNEK_CLAUDE_E2E=1 cargo test -p pohunek-cli --test
