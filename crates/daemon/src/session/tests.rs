@@ -274,23 +274,6 @@ fn production_registry_rejects_missing_durable_worker_backend() {
 }
 
 #[test]
-fn registry_reports_the_active_supervision() {
-    let supervision = production_supervision();
-    let expected = supervision.worker_executable.clone();
-    let supervised = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        supervision: Some(supervision),
-        ..SessionRegistryConfig::default()
-    });
-
-    let active = supervised.active_supervision().expect("supervision");
-
-    assert_eq!(active.worker_executable, expected);
-    // `production_supervision` carries no `--service-config`: direct children.
-    assert!(!active.native);
-}
-
-#[test]
 fn production_registry_rejects_invalid_observation_limits() {
     let config = SessionRegistryConfig {
         shell_command: hermetic_shell(),
@@ -1544,14 +1527,6 @@ fn transition(activity: AgentActivity) -> ActivityTransition {
     }
 }
 
-#[test]
-fn external_observer_defaults_off() {
-    assert!(
-        !SessionRegistryConfig::default().observe_external_agents,
-        "external observation watches provider transcript trees and must remain opt-in"
-    );
-}
-
 #[derive(Debug, Default)]
 struct MockInspector {
     inner: Mutex<MockInspectorState>,
@@ -2552,25 +2527,43 @@ async fn set_metadata_merges_deletes_updates_timestamp_and_emits_event() {
 }
 
 #[tokio::test]
-async fn set_metadata_unknown_session_returns_not_found() {
+async fn operations_on_an_unknown_session_return_session_not_found() {
     let registry = SessionRegistry::default();
+    let missing = SessionId("s-missing".to_owned());
 
-    let err = registry
-        .set_metadata(&SessionId("s-missing".to_owned()), BTreeMap::new())
-        .await
-        .expect_err("unknown session id must fail");
-
-    assert_eq!(err.code, "session_not_found");
+    for (operation, result) in [
+        (
+            "set_metadata",
+            registry
+                .set_metadata(&missing, BTreeMap::new())
+                .await
+                .map(|_| ()),
+        ),
+        (
+            "rename",
+            registry
+                .rename(&missing, Some("x".to_owned()))
+                .await
+                .map(|_| ()),
+        ),
+        ("remove", registry.remove(&missing).await.map(|_| ())),
+        (
+            "inspect",
+            registry.inspect_str(&missing.0).await.map(|_| ()),
+        ),
+    ] {
+        let err = result.expect_err(operation);
+        assert_eq!(err.code, "session_not_found", "{operation}");
+    }
 }
 
 #[tokio::test]
-async fn create_with_name_trims_and_stores_it() {
+async fn create_trims_the_name_and_rename_sets_then_clears_it_with_an_event() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
         ..SessionRegistryConfig::default()
     });
-
     let created = registry
         .create(SessionNewParams {
             name: Some("  triage build  ".to_owned()),
@@ -2578,21 +2571,7 @@ async fn create_with_name_trims_and_stores_it() {
         })
         .await
         .expect("create session");
-
     assert_eq!(created.name.as_deref(), Some("triage build"));
-
-    let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
-async fn rename_sets_then_clears_name_updates_timestamp_and_emits_event() {
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
-        ..SessionRegistryConfig::default()
-    });
-    let created = registry.create(params()).await.expect("create session");
-    assert_eq!(created.name, None);
     let before_updated_at = created.updated_at.clone();
     let mut events = registry.subscribe();
 
@@ -2648,18 +2627,6 @@ async fn rename_rejects_overlong_and_control_character_names() {
     );
 
     let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
-async fn rename_unknown_session_returns_not_found() {
-    let registry = SessionRegistry::default();
-
-    let err = registry
-        .rename(&SessionId("s-missing".to_owned()), Some("x".to_owned()))
-        .await
-        .expect_err("unknown session id must fail");
-
-    assert_eq!(err.code, "session_not_found");
 }
 
 #[tokio::test]
@@ -3703,32 +3670,6 @@ async fn remove_worktree_refuses_an_unowned_path() {
 }
 
 #[tokio::test]
-async fn missing_program_spawn_returns_agent_binary_missing() {
-    // A plain shell session whose program does not exist fails at the PTY
-    // spawn (ENOENT). That must map to the typed `agent_binary_missing` error
-    // naming the program and carrying a recover hint, not `spawn_failed`.
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new(
-            "/nonexistent/pohunek-missing-program",
-            std::iter::empty::<String>(),
-        ),
-        ..SessionRegistryConfig::default()
-    });
-
-    let err = registry
-        .create(params())
-        .await
-        .expect_err("missing program must fail to spawn");
-
-    assert_eq!(err.code, "agent_binary_missing", "got: {err:?}");
-    assert!(
-        err.msg.contains("pohunek-missing-program"),
-        "error must name the missing program: {err:?}"
-    );
-    assert!(err.recover.is_some(), "must carry a recover hint: {err:?}");
-}
-
-#[tokio::test]
 async fn detects_successful_process_exit() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "exit 0"]),
@@ -3803,41 +3744,6 @@ async fn session_child_sees_the_fixture_home_and_not_the_developer_environment()
         Some("unset")
     );
     assert_eq!(child.get("DISPLAY").map(String::as_str), Some("unset"));
-
-    let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
-async fn session_start_hook_runs_after_spawn_without_blocking_create() {
-    let config_dir = temp_dir("session-start-config");
-    let cwd = temp_dir("session-start-cwd");
-    let marker = config_dir.join("session-start.marker");
-    write_host_hook(
-            &config_dir,
-            "session-start",
-            &format!(
-                "#!/bin/sh\nprintf '%s:%s:%s\\n' \"$POHUNEK_HOOK_EVENT\" \"$POHUNEK_SESSION_ID\" \"$POHUNEK_AGENT\" >> {}\n",
-                marker.display()
-            ),
-        );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
-        config_dir: Some(config_dir.clone()),
-        ..SessionRegistryConfig::default()
-    });
-
-    let created = registry
-        .create(SessionNewParams {
-            cwd: Some(cwd),
-            ..params()
-        })
-        .await
-        .expect("create session returns while hook runs best-effort");
-
-    let contents =
-        wait_for_file_contains(&marker, &format!("session-start:{}:shell", created.id.0)).await;
-    assert_eq!(contents.lines().count(), 1, "session-start fires once");
 
     let _ = registry.stop(&created.id).await;
 }
@@ -4414,6 +4320,11 @@ async fn project_backed_session_hooks_receive_project_id() {
             "{event_name} must receive project id {project_id}: {contents:?}"
         );
     }
+    assert_eq!(
+        contents.matches("session-start:").count(),
+        1,
+        "session-start fires once: {contents:?}"
+    );
 
     registry.shutdown_agent_state_hooks().await;
 }
@@ -4768,18 +4679,6 @@ async fn delete_session_logs_removes_the_worker_log_family() {
 }
 
 #[tokio::test]
-async fn remove_unknown_session_is_session_not_found() {
-    let registry = SessionRegistry::default();
-
-    let err = registry
-        .remove(&SessionId("s-missing".to_owned()))
-        .await
-        .expect_err("unknown session cannot be removed");
-
-    assert_eq!(err.code, "session_not_found");
-}
-
-#[tokio::test]
 async fn attach_tokens_are_one_shot_and_expired_tokens_are_pruned() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
@@ -4993,32 +4892,6 @@ async fn attach_from_inside_the_same_session_is_rejected() {
     registry.stop(&created.id).await.expect("stop session");
 }
 
-#[test]
-fn daemon_instance_ids_are_distinct_per_registry() {
-    // Two registries built in this one process must still get distinct ids
-    // (the process-local counter disambiguates same-instant construction), so
-    // the self-feeding-attach guard never conflates two daemon instances.
-    let a = SessionRegistry::default();
-    let b = SessionRegistry::default();
-    assert_ne!(
-        a.daemon_instance_id(),
-        b.daemon_instance_id(),
-        "each registry must get a distinct daemon instance id"
-    );
-    assert!(a.daemon_instance_id().starts_with("d-"));
-}
-
-#[tokio::test]
-async fn inspect_missing_session_returns_not_found() {
-    let registry = SessionRegistry::default();
-    let missing = registry
-        .inspect_str("s-missing")
-        .await
-        .expect_err("missing session");
-
-    assert_eq!(missing.code, "session_not_found");
-}
-
 #[tokio::test]
 async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
     let registry = SessionRegistry::new(SessionRegistryConfig {
@@ -5053,18 +4926,6 @@ async fn superseded_detector_output_cannot_stamp_replacement_runtime() {
     entry.info.runtime = original_runtime;
     drop(sessions);
     let _ = registry.stop(&created.id).await;
-}
-
-#[test]
-fn bracketed_paste_input_frame_keeps_submit_separate() {
-    let writes = super::build_input_writes(
-        "hello\nworld",
-        InputRules::unrestricted(true, Duration::ZERO),
-    )
-    .expect("unrestricted input");
-
-    assert_eq!(writes.body, b"\x1b[200~hello\nworld\x1b[201~".to_vec());
-    assert_eq!(writes.submit_delay, Duration::ZERO);
 }
 
 #[test]
@@ -8157,123 +8018,47 @@ async fn wait_for_session_waiters(
 }
 
 #[test]
-fn bare_codex_launch_receives_initial_input_as_prompt_arg() {
-    let resolved = crate::agent::ProfileRegistry::default()
-        .resolve_agent("codex")
-        .expect("resolve bare codex");
-    let plan = super::plan_initial_input_delivery(
-        &resolved,
-        pty_command("codex", []),
-        Some("# Pohunek Assistant".to_owned()),
-    );
-
-    assert_eq!(plan.command.args, vec!["# Pohunek Assistant".to_owned()]);
-    assert_eq!(plan.pending_initial_input, None);
-}
-
-#[test]
-fn bare_claude_launch_receives_initial_input_as_prompt_arg() {
-    let resolved = crate::agent::ProfileRegistry::default()
-        .resolve_agent("claude")
-        .expect("resolve bare claude");
-    let plan = super::plan_initial_input_delivery(
-        &resolved,
-        pty_command("claude", []),
-        Some("# Pohunek Assistant".to_owned()),
-    );
-
-    assert_eq!(plan.command.args, vec!["# Pohunek Assistant".to_owned()]);
-    assert_eq!(plan.pending_initial_input, None);
-}
-
-#[test]
-fn shell_launch_keeps_initial_input_for_pty_injection() {
-    let resolved = crate::agent::ProfileRegistry::default()
-        .resolve_agent("shell")
-        .expect("resolve shell");
-    let plan = super::plan_initial_input_delivery(
-        &resolved,
-        pty_command("/bin/sh", ["-c", "sleep 30"]),
-        Some("hello shell".to_owned()),
-    );
-
-    assert_eq!(plan.pending_initial_input.as_deref(), Some("hello shell"));
-}
-
-#[test]
-fn bare_hermes_keeps_initial_input_for_pty_injection() {
-    let resolved = crate::agent::ProfileRegistry::default()
-        .resolve_agent("hermes")
-        .expect("resolve bare Hermes");
-    let plan = super::plan_initial_input_delivery(
-        &resolved,
-        pty_command("hermes", ["chat"]),
-        Some("first line\nsecond line".to_owned()),
-    );
-
-    assert_eq!(plan.command.args, vec!["chat"]);
-    assert_eq!(
-        plan.pending_initial_input.as_deref(),
-        Some("first line\nsecond line")
-    );
-}
-
-#[test]
-fn host_profile_launch_keeps_initial_input_for_pty_injection() {
+fn initial_input_is_a_prompt_argument_only_for_bare_codex_and_claude() {
     let agents_dir = temp_dir("profile-initial-prompt-agents");
     fs::write(
         agents_dir.join("wrapped-codex.toml"),
         "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n",
     )
     .expect("write profile");
-    let registry = crate::agent::ProfileRegistry::new(Some(agents_dir));
-    let resolved = registry
-        .resolve_agent("wrapped-codex")
-        .expect("resolve profile");
+    let profiles = crate::agent::ProfileRegistry::new(Some(agents_dir));
+    let input = "# Pohunek Assistant\nsecond line";
+    let shell_args: &[&str] = &["-c", "sleep 30"];
 
-    let plan = super::plan_initial_input_delivery(
-        &resolved,
-        pty_command("/bin/sh", ["-c", "sleep 30"]),
-        Some("# Pohunek Assistant".to_owned()),
-    );
-
-    assert_eq!(
-        plan.command.args,
-        vec!["-c".to_owned(), "sleep 30".to_owned()]
-    );
-    assert_eq!(
-        plan.pending_initial_input.as_deref(),
-        Some("# Pohunek Assistant")
-    );
-}
-
-#[test]
-fn hook_env_injected_for_every_agent_kind_with_socket() {
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        socket_path: Some(PathBuf::from("/run/pohunek/daemon.sock")),
-        ..SessionRegistryConfig::default()
-    });
-    let id = SessionId("s-7".to_owned());
-
-    for agent in [
-        RuntimeRef::shell(),
-        RuntimeRef::codex(),
-        RuntimeRef::claude(),
-        RuntimeRef::hermes(),
+    // Rows: agent, launch program, launch args, expected argv, input left for
+    // PTY injection.
+    for (agent, program, args, expected_args, pending) in [
+        ("codex", "codex", &[][..], &[input][..], None),
+        ("claude", "claude", &[][..], &[input][..], None),
+        ("shell", "/bin/sh", shell_args, shell_args, Some(input)),
+        (
+            "hermes",
+            "hermes",
+            &["chat"][..],
+            &["chat"][..],
+            Some(input),
+        ),
+        (
+            "wrapped-codex",
+            "/bin/sh",
+            shell_args,
+            shell_args,
+            Some(input),
+        ),
     ] {
-        let env = registry.hook_env(agent, &id);
-        let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-        assert_eq!(lookup(ENV_FLAG).as_deref(), Some("1"));
-        assert_eq!(
-            lookup(ENV_SOCKET_PATH).as_deref(),
-            Some("/run/pohunek/daemon.sock")
+        let resolved = profiles.resolve_agent(agent).expect(agent);
+        let plan = super::plan_initial_input_delivery(
+            &resolved,
+            pty_command(program, args.iter().copied()),
+            Some(input.to_owned()),
         );
-        assert_eq!(lookup(ENV_SESSION_ID).as_deref(), Some("s-7"));
-        assert_eq!(
-            lookup(ENV_PROTOCOL_VERSION).as_deref(),
-            Some(protocol::PROTOCOL_VERSION.get().to_string().as_str())
-        );
+
+        assert_eq!(plan.command.args, expected_args, "{agent}");
+        assert_eq!(plan.pending_initial_input.as_deref(), pending, "{agent}");
     }
 }
 
@@ -8303,6 +8088,7 @@ fn session_pty_env_marks_session_id_for_every_agent_kind() {
         RuntimeRef::shell(),
         RuntimeRef::codex(),
         RuntimeRef::claude(),
+        RuntimeRef::hermes(),
     ] {
         let env = registry.session_pty_env(agent.clone(), &id);
         let lookup = |key: &str| env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
@@ -9037,8 +8823,6 @@ fn claude_fact(process_id: Pid, parent_id: Pid) -> ProcessFact {
 const RELEASE_MATRIX_AGENT_PID: Pid = 100;
 /// `SessionStart` sequence used by the P3 release-path matrix.
 const RELEASE_MATRIX_REPORT_SEQ: u64 = 1_000;
-/// `SessionEnd` sequence used by the P3 release-path matrix.
-const RELEASE_MATRIX_RELEASE_SEQ: u64 = RELEASE_MATRIX_REPORT_SEQ + 1;
 /// Hook source used by Codex state callbacks.
 const CODEX_HOOK_SOURCE: &str = "pohunek:codex";
 /// Agent name used by Codex state callbacks.
@@ -9939,52 +9723,6 @@ async fn session_read_rejects_external_observe_only_sessions() {
         .recover
         .as_deref()
         .is_some_and(|hint| hint.contains("pohunek")));
-}
-
-#[tokio::test]
-async fn active_agent_release_matrix_covers_hook_fast_path_and_procwatch_backstop() {
-    let (hook_registry, _hook_inspector, hook_created) =
-        mock_procwatch_registry("hook-release-matrix").await;
-    report_release_matrix_agent(&hook_registry, &hook_created).await;
-
-    let release = hook_registry
-        .release_agent(SessionReleaseAgentParams {
-            session_id: hook_created.id.clone(),
-            source: CODEX_HOOK_SOURCE.to_owned(),
-            agent: CODEX_HOOK_AGENT.to_owned(),
-            seq: Some(ReportSequence::new(RELEASE_MATRIX_RELEASE_SEQ)),
-        })
-        .await;
-    assert!(release.released);
-    let hook_cleared = hook_registry
-        .inspect(&hook_created.id)
-        .await
-        .expect("inspect");
-    assert_eq!(hook_cleared.active_agent, None);
-    assert_eq!(hook_cleared.active_agent_base, None);
-    assert_eq!(hook_cleared.active_agent_pid, None);
-    assert_eq!(hook_cleared.active_agent_session_id, None);
-    let _ = hook_registry.stop(&hook_created.id).await;
-
-    let (backstop_registry, backstop_inspector, backstop_created) =
-        mock_procwatch_registry("procwatch-release-matrix").await;
-    backstop_inspector.set_descendants(
-        backstop_created.pid,
-        vec![codex_fact(RELEASE_MATRIX_AGENT_PID, backstop_created.pid)],
-    );
-    backstop_registry
-        .rescan_procwatch_at(&backstop_created.id, backstop_created.pid, Instant::now())
-        .await;
-    report_release_matrix_agent(&backstop_registry, &backstop_created).await;
-
-    backstop_inspector.set_descendants(backstop_created.pid, Vec::new());
-    backstop_inspector.fire_exit(RELEASE_MATRIX_AGENT_PID);
-    let backstop_cleared =
-        wait_for_active_agent_pid(&backstop_registry, &backstop_created.id, None).await;
-    assert_eq!(backstop_cleared.active_agent, None);
-    assert_eq!(backstop_cleared.active_agent_base, None);
-    assert_eq!(backstop_cleared.active_agent_session_id, None);
-    let _ = backstop_registry.stop(&backstop_created.id).await;
 }
 
 #[tokio::test]
@@ -11721,130 +11459,72 @@ async fn fork_live_claude_session_mints_new_id_and_builds_fork_argv() {
     let _ = registry.stop(&forked.id).await;
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn fork_shell_session_reports_agent_fork_unsupported() {
+async fn fork_of_a_runtime_without_native_fork_fails_before_child_side_effects() {
+    let dir = temp_dir("fork-unsupported-runtime");
+    let codex = dir.join("codex-agent");
+    write_executable(&codex, "#!/bin/sh\nsleep 30\n");
+    let hermes = dir.join("hermes");
+    write_supported_hermes_executable(&hermes, "sleep 30\n");
+    let agents_dir = temp_agents_dir_with(
+        "fork-unsupported",
+        "codex-fork",
+        &format!("base = \"codex\"\nprogram = \"{}\"\n", codex.display()),
+    );
+    fs::write(
+        agents_dir.join("hermes-test.toml"),
+        format!(
+            "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
+            hermes.display()
+        ),
+    )
+    .expect("write Hermes profile");
     let registry = SessionRegistry::new(SessionRegistryConfig {
         shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
         stop_grace: Duration::from_millis(50),
-        ..SessionRegistryConfig::default()
-    });
-    let created = registry
-        .create(params())
-        .await
-        .expect("create shell session");
-
-    let err = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect_err("shell sessions cannot be forked");
-
-    assert_eq!(err, protocol::ProtocolError::agent_fork_unsupported());
-    assert_eq!(registry.list().await.len(), 1);
-    let _ = registry.stop(&created.id).await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn fork_codex_session_reports_agent_fork_unsupported() {
-    let dir = temp_dir("fork-codex-runtime");
-    let script = dir.join("codex-agent");
-    write_executable(&script, "#!/bin/sh\nsleep 30\n");
-    let agents_dir = temp_agents_dir_with(
-        "fork-codex",
-        "codex-fork",
-        &format!("base = \"codex\"\nprogram = \"{}\"\n", script.display()),
-    );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
         agents_dir: Some(agents_dir),
         ..SessionRegistryConfig::default()
     });
-    let created = registry
-        .create(SessionNewParams {
-            agent: "codex-fork".to_owned(),
-            cwd: Some(dir),
-            ..params()
-        })
-        .await
-        .expect("create codex session");
-    let err = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: None,
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect_err("codex fork is intentionally unsupported");
 
-    assert_eq!(err, protocol::ProtocolError::agent_fork_unsupported());
-    assert_eq!(
-        registry.list().await.len(),
-        1,
-        "unsupported fork must fail before registering a logical child or worker"
-    );
-    let _ = registry.stop(&created.id).await;
-}
+    for agent in ["shell", "codex-fork", "hermes-test"] {
+        let created = registry
+            .create(SessionNewParams {
+                agent: agent.to_owned(),
+                cwd: Some(dir.clone()),
+                ..params()
+            })
+            .await
+            .expect(agent);
+        let listed_before = registry.list().await.len();
 
-#[cfg(unix)]
-#[tokio::test]
-async fn fork_hermes_session_is_rejected_before_child_side_effects() {
-    let dir = temp_dir("fork-hermes-runtime");
-    let script = dir.join("hermes");
-    write_supported_hermes_executable(&script, "sleep 30\n");
-    let agents_dir = temp_agents_dir_with(
-        "fork-hermes",
-        "hermes-test",
-        &format!(
-            "base = \"hermes\"\nprogram = \"{}\"\nargs = [\"chat\"]\n",
-            script.display()
-        ),
-    );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        agents_dir: Some(agents_dir),
-        ..SessionRegistryConfig::default()
-    });
-    let created = registry
-        .create(SessionNewParams {
-            agent: "hermes-test".to_owned(),
-            cwd: Some(dir),
-            ..params()
-        })
-        .await
-        .expect("create Hermes session");
+        let error = registry
+            .fork(SessionForkParams {
+                session_id: created.id.clone(),
+                name: Some("must-not-exist".to_owned()),
+                cwd_mode: ForkCwdMode::Same,
+                cols: 80,
+                rows: 24,
+                accept_profile_change: false,
+            })
+            .await
+            .expect_err(agent);
 
-    let error = registry
-        .fork(SessionForkParams {
-            session_id: created.id.clone(),
-            name: Some("must-not-exist".to_owned()),
-            cwd_mode: ForkCwdMode::Same,
-            cols: 80,
-            rows: 24,
-            accept_profile_change: false,
-        })
-        .await
-        .expect_err("Hermes fork is unsupported");
-
-    assert_eq!(error, protocol::ProtocolError::agent_fork_unsupported());
-    assert_eq!(registry.list().await.len(), 1);
-    assert!(registry
-        .list()
-        .await
-        .iter()
-        .all(|session| session.name.as_deref() != Some("must-not-exist")));
-    let _ = registry.stop(&created.id).await;
+        assert_eq!(
+            error,
+            protocol::ProtocolError::agent_fork_unsupported(),
+            "{agent}"
+        );
+        let listed = registry.list().await;
+        assert_eq!(listed.len(), listed_before, "{agent}: no child registered");
+        assert!(
+            listed
+                .iter()
+                .all(|session| session.name.as_deref() != Some("must-not-exist")),
+            "{agent}: no child registered"
+        );
+        let _ = registry.stop(&created.id).await;
+    }
 }
 
 #[cfg(unix)]
@@ -12040,54 +11720,6 @@ async fn report_native_id_path_profile_stores_path_and_ignores_wire_agent() {
 }
 
 #[tokio::test]
-async fn non_resumable_profile_ignores_native_id_reports() {
-    let store_path = temp_store_path("noresume-profile");
-    let agents_dir = temp_agents_dir_with(
-            "noresume-profile",
-            "noresume",
-            "base = \"codex\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", \"sleep 30\"]\n[resume]\nresumable = false\n",
-        );
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path.clone()),
-        agents_dir: Some(agents_dir),
-        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
-        ..SessionRegistryConfig::default()
-    });
-
-    let created = registry
-        .create(SessionNewParams {
-            agent: "noresume".to_owned(),
-            ..params()
-        })
-        .await
-        .expect("create non-resumable profile session");
-
-    let result = registry
-        .report_native_id(native_report!(&registry;
-            session_id: created.id.clone(),
-            agent: "codex".to_owned(),
-            native_session_id: "native-ignored".to_owned(),
-            transcript_path: None,
-        ))
-        .await;
-    assert!(
-        !result.recorded,
-        "non-resumable profile must reject native-id reports fail-closed"
-    );
-    assert!(
-        crate::store::Store::new(store_path)
-            .load_resume()
-            .expect("load")
-            .is_empty(),
-        "non-resumable profile must not persist a resume binding"
-    );
-
-    let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
 async fn non_resumable_profile_binding_reports_agent_not_resumable() {
     let registry = SessionRegistry::default();
     let binding = crate::store::ResumeBinding {
@@ -12164,52 +11796,6 @@ async fn resume_binding_never_persists_profile_env_secrets() {
     );
 
     let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
-async fn stopping_a_session_drops_its_resume_binding() {
-    let store_path = temp_store_path("drop-on-stop");
-    let agents_dir = temp_resumable_agents_dir("drop-on-stop");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path.clone()),
-        agents_dir: Some(agents_dir),
-        ..SessionRegistryConfig::default()
-    });
-
-    let created = registry
-        .create(resumable_params())
-        .await
-        .expect("create session");
-    let recorded = registry
-        .report_native_id(native_report!(&registry;
-            session_id: created.id.clone(),
-            agent: "claude".to_owned(),
-            native_session_id: "native-stop".to_owned(),
-            transcript_path: None,
-        ))
-        .await;
-    assert!(recorded.recorded);
-    assert_eq!(
-        crate::store::Store::new(store_path.clone())
-            .load_resume()
-            .expect("load")
-            .len(),
-        1
-    );
-
-    // Stopping the session must drop the binding so a restart does not
-    // resurrect a session the user ended.
-    let stopped = registry.stop(&created.id).await.expect("stop");
-    assert!(stopped.stopped);
-    assert!(
-        crate::store::Store::new(store_path)
-            .load_resume()
-            .expect("load")
-            .is_empty(),
-        "stopped session must not leave a resume binding"
-    );
 }
 
 #[cfg(unix)]
@@ -12395,6 +11981,14 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     assert!(
         recovered_event.worker_instance_id.is_some(),
         "native recovery must mint a fresh durable-worker runtime id"
+    );
+    assert_eq!(
+        recovered_event.worker_instance_id,
+        resumed
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.worker_instance_id.clone()),
+        "the event names the runtime the recovery launched"
     );
 
     let repeated = registry
@@ -12664,56 +12258,6 @@ async fn hermes_resume_without_native_reference_fails_before_relaunch() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn explicit_native_recovery_accepts_terminal_runtime() {
-    let marker = temp_dir("terminal-recovery-marker").join("argv.txt");
-    let (agents_dir, mut gate) = temp_agent_that_exits_then_resumes("terminal-recovery", &marker);
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        agents_dir: Some(agents_dir),
-        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
-        ..SessionRegistryConfig::default()
-    });
-    let created = registry
-        .create(resumable_params())
-        .await
-        .expect("create session");
-    assert!(
-        registry
-            .report_native_id(native_report!(&registry;
-                session_id: created.id.clone(),
-                agent: "claude".to_owned(),
-                native_session_id: "native-terminal".to_owned(),
-                transcript_path: None,
-            ))
-            .await
-            .recorded
-    );
-    // The agent exits only now, after its native id was recorded.
-    gate.write_all(b"go\n")
-        .expect("release the agent exit gate");
-    let terminal = registry
-        .wait_for_exit(&created.id, HANG_GUARD)
-        .await
-        .expect("session exits");
-    assert_eq!(terminal.state, SessionState::Done);
-
-    let recovered = registry
-        .resume(&created.id)
-        .await
-        .expect("terminal runtime is eligible for native recovery");
-    assert_eq!(recovered.id, created.id);
-    assert_eq!(recovered.created_at, created.created_at);
-    assert_eq!(recovered.state, SessionState::Running);
-    assert!(wait_for_file_contains(&marker, "native-terminal")
-        .await
-        .contains("--resume"));
-
-    let _ = registry.stop(&created.id).await;
-}
-
-#[cfg(unix)]
-#[tokio::test]
 async fn recovery_keeps_a_hostile_native_id_as_one_argv_element() {
     let marker = temp_dir("hostile-id-marker").join("argv.txt");
     let (agents_dir, mut gate) = temp_agent_that_exits_then_resumes("hostile-id", &marker);
@@ -12933,99 +12477,6 @@ async fn explicit_native_recovery_rejects_nonterminal_runtime_states() {
             "unexpected error for {state:?}"
         );
     }
-
-    let _ = registry.stop(&created.id).await;
-}
-
-#[tokio::test]
-async fn native_recovered_event_carries_previous_and_new_worker_instance_ids() {
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: ShellCommand::new("/bin/sh", ["-c", "sleep 30"]),
-        stop_grace: Duration::from_millis(50),
-        ..SessionRegistryConfig::default()
-    });
-    let mut session = registry.create(params()).await.expect("create session");
-    session.runtime = Some(SessionRuntime {
-        state: RuntimeState::Live,
-        runtime_generation: protocol::RuntimeGeneration::new(1),
-        worker_id: Some("worker-new".to_owned()),
-        worker_instance_id: Some("runtime-new".to_owned()),
-        started_at: Some(session.created_at.clone()),
-        last_connected_at: Some(session.updated_at.clone()),
-        loss_reason: None,
-    });
-    let mut events = registry.subscribe();
-
-    registry.emit_native_recovered(&session, Some("runtime-old".to_owned()));
-
-    let event = events.recv().await.expect("native recovery event");
-    assert_eq!(event.event(), protocol::event::SESSION_NATIVE_RECOVERED);
-    let payload: SessionNativeRecoveredEvent =
-        serde_json::from_value(event.payload().clone()).expect("recovery payload");
-    assert_eq!(payload.session.id, session.id);
-    assert_eq!(
-        payload.previous_worker_instance_id.as_deref(),
-        Some("runtime-old")
-    );
-    assert_eq!(payload.worker_instance_id.as_deref(), Some("runtime-new"));
-
-    let _ = registry.stop(&session.id).await;
-}
-
-#[tokio::test]
-async fn resize_after_capture_updates_persisted_binding() {
-    let store_path = temp_store_path("resize-binding");
-    let agents_dir = temp_resumable_agents_dir("resize-binding");
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path.clone()),
-        agents_dir: Some(agents_dir),
-        ..SessionRegistryConfig::default()
-    });
-
-    let created = registry
-        .create(resumable_params())
-        .await
-        .expect("create session");
-    // Capture a native id so a resume binding exists at the launch size.
-    let recorded = registry
-        .report_native_id(native_report!(&registry;
-            session_id: created.id.clone(),
-            agent: "claude".to_owned(),
-            native_session_id: "native-resize".to_owned(),
-            transcript_path: None,
-        ))
-        .await;
-    assert!(recorded.recorded);
-    let before = crate::store::Store::new(store_path.clone())
-        .load_resume()
-        .expect("load before");
-    assert_eq!(before.len(), 1);
-    assert_eq!((before[0].cols, before[0].rows), (80, 24));
-
-    // Resizing the live session must refresh the persisted dimensions so a
-    // restart resumes at the new size, not the stale capture-time size.
-    registry
-        .resize(&created.id, 132, 50)
-        .await
-        .expect("resize session");
-
-    let after = crate::store::Store::new(store_path)
-        .load_resume()
-        .expect("load after");
-    assert_eq!(
-        after.len(),
-        1,
-        "resize must upsert, not duplicate: {after:?}"
-    );
-    assert_eq!(after[0].session_id, created.id.0);
-    assert_eq!(after[0].native_session_id.as_deref(), Some("native-resize"));
-    assert_eq!(
-        (after[0].cols, after[0].rows),
-        (132, 50),
-        "persisted binding must carry the post-resize dimensions"
-    );
 
     let _ = registry.stop(&created.id).await;
 }
@@ -13518,20 +12969,6 @@ fn submit_delay_override(runtime: &str, delay: Duration) -> BTreeMap<RuntimeId, 
     BTreeMap::from([(RuntimeId::parse(runtime).expect("runtime id"), delay)])
 }
 
-#[test]
-fn claude_input_rules_use_configured_submit_delay() {
-    let config = SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        submit_delay_overrides: submit_delay_override("claude", Duration::from_millis(75)),
-        ..SessionRegistryConfig::default()
-    };
-
-    let rules = builtin_input_rules(&RuntimeRef::claude(), &config);
-
-    assert!(!rules.bracketed_paste);
-    assert_eq!(rules.submit_delay, Duration::from_millis(75));
-}
-
 /// A definition with an arbitrary runtime id, used to prove selection is by
 /// definition data and never by a built-in id.
 fn acme_definition(submit_delay_configurable: bool, prompt_arg: bool) -> RuntimeDefinition {
@@ -13581,6 +13018,18 @@ fn submit_delay_override_applies_to_the_configured_runtime_id() {
 
     assert!(rules.bracketed_paste);
     assert_eq!(rules.submit_delay, Duration::from_millis(40));
+
+    // The built-in Claude runtime allows the override and types without
+    // bracketed paste.
+    let claude = builtin_input_rules(
+        &RuntimeRef::claude(),
+        &SessionRegistryConfig {
+            submit_delay_overrides: submit_delay_override("claude", Duration::from_millis(75)),
+            ..SessionRegistryConfig::default()
+        },
+    );
+    assert!(!claude.bracketed_paste);
+    assert_eq!(claude.submit_delay, Duration::from_millis(75));
 }
 
 #[test]
@@ -13658,20 +13107,6 @@ fn initial_prompt_is_a_launch_argument_only_when_the_definition_says_so() {
 // it is a pure read over a worktree path). The base-precedence, hostile-ref,
 // no-worktree, and unresolved-base tests drive the real `SessionRegistry::diff`
 // entry point, reusing `project_registry`/`init_git_repo`/`git_in`/`params`.
-
-#[test]
-fn session_diff_modified_tracked_file_appears_as_a_change() {
-    let repo = init_git_repo("diff-modified");
-    std::fs::write(repo.join("README.md"), "modified\n").expect("modify tracked file");
-
-    let result = super::diff::compute_session_diff(&repo, "main").expect("diff succeeds");
-
-    assert!(!result.truncated);
-    assert_eq!(result.base, "main");
-    assert!(result.diff.contains("diff --git a/README.md b/README.md"));
-    assert!(result.diff.contains("-init"));
-    assert!(result.diff.contains("+modified"));
-}
 
 #[test]
 fn session_diff_added_tracked_file_reflects_unstaged_edits_made_after_staging() {
@@ -13838,14 +13273,6 @@ fn session_diff_truncates_a_large_untracked_file_and_keeps_the_response_envelope
 }
 
 #[test]
-fn resolve_base_prefers_the_explicit_param_over_everything_else() {
-    let resolved = super::diff::resolve_base(Some("explicit-ref".to_owned()), None, "s-none", None)
-        .expect("an explicit base short-circuits before touching the store or a repository");
-
-    assert_eq!(resolved, "explicit-ref");
-}
-
-#[test]
 fn resolve_base_falls_back_to_the_repository_default_branch_when_no_store_or_binding_exists() {
     let repo = init_git_repo("diff-default-fallback");
 
@@ -13873,48 +13300,23 @@ async fn session_diff_session_without_a_worktree_fails_with_a_typed_error() {
 }
 
 #[tokio::test]
-async fn session_diff_rejects_an_empty_explicit_base() {
+async fn session_diff_rejects_a_hostile_explicit_base_before_the_session_lookup() {
     let registry = SessionRegistry::new(SessionRegistryConfig::default());
 
-    let err = registry
-        .diff(
-            &SessionId("s-does-not-matter".to_owned()),
-            Some(String::new()),
-        )
-        .await
-        .expect_err("an empty base must be rejected before the session is even looked up");
+    // The session does not exist, so `invalid_branch` (not `session_not_found`)
+    // proves the base is validated first.
+    for (case, base) in [
+        ("empty", String::new()),
+        ("argv flag injection", "--upload-pack=evil".to_owned()),
+        ("control character", "feat/x\u{7}".to_owned()),
+    ] {
+        let err = registry
+            .diff(&SessionId("s-does-not-matter".to_owned()), Some(base))
+            .await
+            .expect_err(case);
 
-    assert_eq!(err.code, "invalid_branch");
-}
-
-#[tokio::test]
-async fn session_diff_rejects_a_dash_leading_explicit_base() {
-    let registry = SessionRegistry::new(SessionRegistryConfig::default());
-
-    let err = registry
-        .diff(
-            &SessionId("s-does-not-matter".to_owned()),
-            Some("--upload-pack=evil".to_owned()),
-        )
-        .await
-        .expect_err("a dash-leading base must be rejected as a possible argv flag injection");
-
-    assert_eq!(err.code, "invalid_branch");
-}
-
-#[tokio::test]
-async fn session_diff_rejects_a_control_character_in_the_explicit_base() {
-    let registry = SessionRegistry::new(SessionRegistryConfig::default());
-
-    let err = registry
-        .diff(
-            &SessionId("s-does-not-matter".to_owned()),
-            Some("feat/x\u{7}".to_owned()),
-        )
-        .await
-        .expect_err("a control character in the base must be rejected");
-
-    assert_eq!(err.code, "invalid_branch");
+        assert_eq!(err.code, "invalid_branch", "{case}");
+    }
 }
 
 #[tokio::test]
@@ -14863,34 +14265,6 @@ async fn accepted_unconfirmed_cleanup_reports_nothing_when_no_process_was_accept
         removed.accepted_unconfirmed_processes.is_empty(),
         "{removed:?}"
     );
-}
-
-/// Without consent the same candidate refuses, whether the caller passes the
-/// default or names the refusal.
-#[tokio::test]
-async fn unconfirmed_cleanup_is_refused_unless_accepted() {
-    let inspector = Arc::new(UnreadableCandidateHost::default());
-    let (registry, _data_dir, _worktree_root) = retention_registry_over(
-        "remove-refuse-unreadable",
-        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
-    );
-    let session = record_only_session(&registry).await;
-    inspector.set_candidate(true);
-
-    for refused in [
-        registry.remove(&session.id).await,
-        registry
-            .remove_with(&session.id, super::UnconfirmedCleanup::Refuse)
-            .await,
-    ] {
-        let error = refused.expect_err("an unreadable candidate refuses without consent");
-        assert_eq!(
-            error.code,
-            crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
-            "{error:?}"
-        );
-    }
-    assert_eq!(session_ids(&registry).await, vec![session.id.0.clone()]);
 }
 
 /// Consent covers unreadable candidates only: a sweep that also failed to

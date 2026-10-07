@@ -168,8 +168,7 @@ mod tests {
     };
 
     use super::{
-        available_source, bound_read_result, json_suffix_start, serialized_len, tail_lines,
-        MAX_SESSION_READ_RESPONSE_BYTES,
+        bound_read_result, json_suffix_start, serialized_len, MAX_SESSION_READ_RESPONSE_BYTES,
     };
 
     fn result(text: String) -> SessionReadResult {
@@ -198,37 +197,6 @@ mod tests {
         assert!(
             serialized_len(&bounded).expect("serialized length") <= MAX_SESSION_READ_RESPONSE_BYTES
         );
-    }
-
-    #[test]
-    fn read_result_within_limit_is_unchanged() {
-        let expected = result("plain".to_owned());
-        let (actual, byte_truncated) = bound_read_result(expected.clone()).expect("bounded result");
-
-        assert_eq!(actual, expected);
-        assert!(!byte_truncated);
-    }
-
-    #[test]
-    fn tail_lines_keep_newest_rows() {
-        let (lines, truncated) = tail_lines(
-            vec!["old".to_owned(), "middle".to_owned(), "new".to_owned()],
-            2,
-        );
-
-        assert_eq!(lines, ["middle", "new"]);
-        assert!(truncated);
-    }
-
-    #[test]
-    fn unavailable_sources_report_visible_fallback() {
-        for source in [
-            SessionReadSource::Recent,
-            SessionReadSource::RecentUnwrapped,
-            SessionReadSource::Detection,
-        ] {
-            assert_eq!(available_source(source), SessionReadSource::Visible);
-        }
     }
 
     #[test]

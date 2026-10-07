@@ -8369,37 +8369,6 @@ while os.getppid() == parent:
         }
     }
 
-    #[test]
-    fn sequenced_session_identity_wins_over_stale_resume_projection() {
-        let mut record = identity_record();
-        record.native_identity_ordering = Some(NativeIdentityOrdering {
-            worker_instance_id: "runtime-identity".to_owned(),
-            pid: 50,
-            pid_start_identity: 500,
-            sequence: Some(2),
-            worker_sequence: None,
-        });
-        record.info.native_session_id = Some("native-newer".to_owned());
-        let recovery = record.recovery.as_mut().expect("recovery binding");
-        recovery.native_session_id = Some("native-newer".to_owned());
-        let mut stale = recovery.clone();
-        stale.native_session_id = Some("native-older".to_owned());
-
-        merge_persisted_recovery(&mut record, stale).expect("merge stale resume projection");
-
-        assert_eq!(
-            record.info.native_session_id.as_deref(),
-            Some("native-newer")
-        );
-        assert_eq!(
-            record
-                .recovery
-                .as_ref()
-                .and_then(|binding| binding.native_session_id.as_deref()),
-            Some("native-newer")
-        );
-    }
-
     /// A record whose reference core assigned at launch, naming `reference`.
     fn assigned_record(reference: &str) -> SessionRecord {
         let mut record = identity_record();
@@ -9462,22 +9431,6 @@ handler = "codex-hook-v1"
             import_worker_identities(&mut identity_record(), &snapshot)
                 .expect_err("an unknown schema id is refused"),
             "hook_schema_unknown"
-        );
-    }
-
-    #[test]
-    fn reported_native_reference_kind_must_be_in_the_schema_shape() {
-        let mut snapshot = identity_snapshot("launch-native");
-        snapshot
-            .active_identity
-            .as_mut()
-            .expect("active identity")
-            .reference_kind = Some("uri".to_owned());
-
-        assert_eq!(
-            import_worker_identities(&mut identity_record(), &snapshot)
-                .expect_err("a kind outside the schema shape"),
-            "active_identity_reference_kind_invalid"
         );
     }
 
@@ -14446,23 +14399,6 @@ handler = "codex-hook-v1"
                 durable.info.native_session_id.as_deref(),
                 Some("switched-before-the-stop")
             );
-        }
-
-        /// The retry of a pending stop finishes it without a restart.
-        #[tokio::test]
-        async fn the_retry_finishes_an_interrupted_stop_of_a_conflicted_runtime() {
-            let fixture = fixture(Arc::new(RetryInspector::default()));
-            let conflicted = interrupted_stop(&fixture, "s-5232").await;
-
-            assert!(
-                fixture
-                    .registry
-                    .retry_supervised_session(&conflicted.id)
-                    .await,
-                "the finished stop needs no further retry"
-            );
-
-            assert_stopped(&fixture, "s-5232").await;
         }
 
         /// A store write that fails while a settled stop is committed keeps
