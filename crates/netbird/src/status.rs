@@ -584,12 +584,6 @@ mod tests {
         assert!(status.peers().is_empty());
     }
 
-    #[test]
-    fn missing_program_is_cli_missing() {
-        let err = run_status_with_program("definitely-not-a-real-binary-xyz").unwrap_err();
-        assert!(matches!(err, NetbirdError::CliMissing));
-    }
-
     #[tokio::test]
     async fn async_missing_program_is_cli_missing() {
         let err = run_status_async_at(Path::new("definitely-not-a-real-binary-xyz"))

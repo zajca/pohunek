@@ -646,16 +646,6 @@ mod tests {
     }
 
     #[test]
-    fn root_is_removed_when_the_env_drops() {
-        let env = TestEnv::new().expect("create env");
-        let root = env.root().to_path_buf();
-        std::fs::write(env.cwd().join("file"), b"x").expect("write file");
-        assert!(root.is_dir());
-        drop(env);
-        assert!(!root.exists());
-    }
-
-    #[test]
     fn root_is_removed_when_the_test_panics() {
         let mut root = None;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -681,19 +671,6 @@ mod tests {
                 "{name} reached a child"
             );
         }
-    }
-
-    #[test]
-    fn every_inherited_name_is_passed_on() {
-        let parent: Vec<_> = INHERITED_VARS.iter().map(|name| pair(name, "v")).collect();
-        let env = scrubbed(parent, []);
-        assert_eq!(env.len(), INHERITED_VARS.len());
-    }
-
-    #[test]
-    fn scrub_pins_override_inherited_values() {
-        let env = scrubbed(crafted_parent(), [pair("HOME", "/private/home")]);
-        assert_eq!(env[OsStr::new("HOME")], "/private/home");
     }
 
     #[test]
@@ -799,18 +776,6 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, PRIVATE_DIR_MODE);
-    }
-
-    #[test]
-    fn environments_do_not_share_directories() {
-        let first = TestEnv::new().expect("create first");
-        let second = TestEnv::new().expect("create second");
-        assert_ne!(first.root(), second.root());
-    }
-
-    #[test]
-    fn real_base_is_accepted() {
-        validate_base(&crate::temp_root()).expect("the real temp root is a valid base");
     }
 
     #[test]

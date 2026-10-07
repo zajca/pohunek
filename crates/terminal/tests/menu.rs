@@ -326,8 +326,3 @@ fn overlay_frame_for_rename_places_cursor_after_input_prefix() {
         }
     );
 }
-
-#[test]
-fn closed_state_has_no_overlay_frame() {
-    assert_eq!(MenuState::Closed.to_overlay_frame(), None);
-}

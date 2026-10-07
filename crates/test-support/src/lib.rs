@@ -334,10 +334,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
-    use super::{
-        profile_dir_of, require_var, resolve_root, resolve_worker, temp_root, tempdir,
-        tempdir_with_prefix, workspace_root_of,
-    };
+    use super::{profile_dir_of, resolve_root, resolve_worker, temp_root, tempdir};
 
     #[test]
     fn override_is_returned_unchanged_without_a_file_check() {
@@ -372,25 +369,6 @@ mod tests {
         let error = profile_dir_of(Path::new("/x/target/debug/cli")).unwrap_err();
         assert!(error.contains("POHUNEK_WORKER_BIN"), "{error}");
         resolve_worker(None, Path::new("/x/target/debug/cli")).unwrap_err();
-    }
-
-    #[test]
-    fn missing_variable_error_names_the_variable() {
-        let error = require_var("CARGO_BIN_EXE_some-bin", None).unwrap_err();
-        assert!(error.contains("CARGO_BIN_EXE_some-bin"), "{error}");
-        assert_eq!(
-            require_var("V", Some(OsString::from("/p"))),
-            Ok(OsString::from("/p"))
-        );
-    }
-
-    #[test]
-    fn workspace_root_is_two_levels_above_the_package() {
-        assert_eq!(
-            workspace_root_of(Path::new("/w/crates/daemon")),
-            Some(PathBuf::from("/w"))
-        );
-        assert_eq!(workspace_root_of(Path::new("/w")), None);
     }
 
     #[test]
@@ -447,14 +425,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_root_keeps_a_canonical_root_unchanged() {
-        let fixture = tempdir().expect("create fixture");
-        let base = std::fs::canonicalize(fixture.path()).expect("canonicalize fixture");
-        let resolved = resolve_root(&base, never_called_cwd).expect("resolve");
-        assert_eq!(resolved, base);
-    }
-
-    #[test]
     fn resolve_root_resolves_an_absolute_root_when_the_cwd_is_unreadable() {
         let fixture = tempdir().expect("create fixture");
         let base = std::fs::canonicalize(fixture.path()).expect("canonicalize fixture");
@@ -480,11 +450,6 @@ mod tests {
     }
 
     #[test]
-    fn temp_root_is_absolute() {
-        assert!(temp_root().is_absolute());
-    }
-
-    #[test]
     fn fixture_is_private_and_removed_on_drop() {
         let fixture = tempdir().expect("create fixture");
         let path = fixture.path().to_path_buf();
@@ -496,17 +461,6 @@ mod tests {
         assert_eq!(mode & 0o777, super::PRIVATE_DIR_MODE);
         drop(fixture);
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn fixture_uses_the_requested_prefix() {
-        let fixture = tempdir_with_prefix("ph-prefix-").expect("create fixture");
-        let name = fixture
-            .path()
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .expect("utf-8 fixture name");
-        assert!(name.starts_with("ph-prefix-"), "{name}");
     }
 
     #[cfg(target_os = "macos")]

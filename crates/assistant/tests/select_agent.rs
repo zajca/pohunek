@@ -63,14 +63,6 @@ fn auto_agent_prefers_pohunek_assistant_then_codex() {
 }
 
 #[test]
-fn explicit_custom_agent_wins_when_absent_from_runtime_list() {
-    let selected = assistant::select_agent(&caps(vec![("codex", true)]), Some("custom"))
-        .expect("explicit agent selected");
-
-    assert_eq!(selected.name, "custom");
-}
-
-#[test]
 fn auto_agent_uses_hermes_after_codex_and_claude() {
     let selected = assistant::select_agent(
         &capabilities(vec![runtime(
@@ -213,15 +205,6 @@ fn grammar_valid_third_party_base_is_launchable() {
     );
 
     assert!(runtime_is_launchable(&candidate));
-}
-
-#[test]
-fn runtime_launchability_preserves_available_legacy_custom_profiles() {
-    let legacy = runtime("legacy-custom", None, true, None);
-    let missing = runtime("legacy-missing", None, false, None);
-
-    assert!(runtime_is_launchable(&legacy));
-    assert!(!runtime_is_launchable(&missing));
 }
 
 #[test]

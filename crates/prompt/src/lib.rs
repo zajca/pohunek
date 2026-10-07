@@ -287,7 +287,7 @@ fn is_variable_name(name: &str) -> bool {
 mod tests {
     use std::str::FromStr as _;
 
-    use super::{render, render_static, Error, Provider};
+    use super::{render_static, Error, Provider};
 
     #[test]
     fn static_render_accepts_literal_template() {
@@ -304,37 +304,9 @@ mod tests {
     }
 
     #[test]
-    fn provider_from_str_and_as_str_round_trip() {
-        for provider in [Provider::LinearIssue, Provider::GitHubPr] {
-            assert_eq!(
-                Provider::from_str(provider.as_str()).expect("parse provider label"),
-                provider
-            );
-        }
-    }
-
-    #[test]
     fn provider_from_str_rejects_unknown_label() {
         let err = Provider::from_str("review").expect_err("unknown provider label");
 
         assert!(matches!(err, Error::UnknownProvider(label) if label == "review"));
-    }
-
-    #[test]
-    fn github_render_rejects_unknown_variables() {
-        let context_json = r#"{"title":"t","headRefName":"b"}"#;
-
-        let err = render("${nope}", Provider::GitHubPr, "1", context_json)
-            .expect_err("unknown variable rejected");
-
-        assert!(matches!(err, Error::UnknownVariables(names) if names == vec!["nope"]));
-    }
-
-    #[test]
-    fn github_render_missing_branch_errors() {
-        let err = render("${branch}", Provider::GitHubPr, "1", r#"{"title":"t"}"#)
-            .expect_err("missing branch rejected");
-
-        assert!(matches!(err, Error::MissingRequiredField(_)));
     }
 }

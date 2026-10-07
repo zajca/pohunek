@@ -60,15 +60,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_just_outside_netbird_range() {
-        assert_eq!(
-            validate_netbird_bind_addr(ip("100.63.255.255")),
-            Err(BindAddrError::NotNetbird(ip("100.63.255.255")))
-        );
-        assert_eq!(
-            validate_netbird_bind_addr(ip("100.128.0.0")),
-            Err(BindAddrError::NotNetbird(ip("100.128.0.0")))
-        );
+    fn rejects_ipv4_outside_netbird_range() {
+        for (name, addr) in [
+            ("below the range", "100.63.255.255"),
+            ("above the range", "100.128.0.0"),
+            ("RFC 1918 10/8", "10.0.0.1"),
+            ("RFC 1918 192.168/16", "192.168.1.1"),
+            ("RFC 1918 172.16/12", "172.16.0.1"),
+            ("public", "8.8.8.8"),
+        ] {
+            assert_eq!(
+                validate_netbird_bind_addr(ip(addr)),
+                Err(BindAddrError::NotNetbird(ip(addr))),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -90,30 +96,6 @@ mod tests {
         assert_eq!(
             validate_netbird_bind_addr(ip("::1")),
             Err(BindAddrError::Forbidden(ip("::1")))
-        );
-    }
-
-    #[test]
-    fn rejects_rfc1918_private_addresses() {
-        assert_eq!(
-            validate_netbird_bind_addr(ip("10.0.0.1")),
-            Err(BindAddrError::NotNetbird(ip("10.0.0.1")))
-        );
-        assert_eq!(
-            validate_netbird_bind_addr(ip("192.168.1.1")),
-            Err(BindAddrError::NotNetbird(ip("192.168.1.1")))
-        );
-        assert_eq!(
-            validate_netbird_bind_addr(ip("172.16.0.1")),
-            Err(BindAddrError::NotNetbird(ip("172.16.0.1")))
-        );
-    }
-
-    #[test]
-    fn rejects_public_ipv4() {
-        assert_eq!(
-            validate_netbird_bind_addr(ip("8.8.8.8")),
-            Err(BindAddrError::NotNetbird(ip("8.8.8.8")))
         );
     }
 

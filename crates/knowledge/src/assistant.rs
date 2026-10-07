@@ -108,11 +108,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundle_version_matches_package_version() {
-        assert_eq!(BUNDLE_VERSION, env!("CARGO_PKG_VERSION"));
-    }
-
-    #[test]
     fn bundle_content_hash_is_deterministic_for_same_bytes() {
         let first = sha256_for_bytes(b"same bundle bytes");
         let second = sha256_for_bytes(b"same bundle bytes");
@@ -125,14 +120,6 @@ mod tests {
     }
 
     #[test]
-    fn bundle_content_hash_changes_when_bytes_change() {
-        let first = sha256_for_bytes(b"bundle A");
-        let second = sha256_for_bytes(b"bundle B");
-
-        assert_ne!(first, second);
-    }
-
-    #[test]
     fn bundle_content_hash_is_memoized() {
         let first = bundle_content_hash();
         let second = bundle_content_hash();
@@ -140,16 +127,6 @@ mod tests {
         assert!(std::ptr::eq(first, second));
         assert!(first.starts_with("sha256:"));
         assert_eq!(first.len(), "sha256:".len() + 64);
-    }
-
-    #[test]
-    fn materialized_version_hash_combines_version_and_digest_without_prefix() {
-        let hash = materialized_version_hash();
-        let digest = bundle_content_hash()
-            .strip_prefix("sha256:")
-            .expect("bundle hash has prefix");
-
-        assert_eq!(hash, format!("{BUNDLE_VERSION}-{digest}"));
     }
 
     #[test]

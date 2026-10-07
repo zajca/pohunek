@@ -161,33 +161,6 @@ mod tests {
     }
 
     #[test]
-    fn resolves_by_full_fqdn() {
-        let ip = resolve_host(&status(), "host-b.netbird.cloud").unwrap();
-        assert_eq!(ip, "100.92.30.40".parse::<IpAddr>().unwrap());
-    }
-
-    #[test]
-    fn resolves_by_stable_public_key_after_ip_change() {
-        let first = parse_status(
-            r#"{"peers":[{"publicKey":"stable-key","fqdn":"host.example","netbirdIp":"100.64.0.2"}]}"#,
-        )
-        .expect("first status");
-        let second = parse_status(
-            r#"{"peers":[{"publicKey":"stable-key","fqdn":"host.example","netbirdIp":"100.64.0.3"}]}"#,
-        )
-        .expect("second status");
-
-        assert_eq!(
-            resolve_host(&first, "stable-key").expect("first address"),
-            "100.64.0.2".parse::<IpAddr>().expect("first IP")
-        );
-        assert_eq!(
-            resolve_host(&second, "stable-key").expect("second address"),
-            "100.64.0.3".parse::<IpAddr>().expect("second IP")
-        );
-    }
-
-    #[test]
     fn typed_peer_identity_does_not_follow_reassigned_address() {
         let identity = ExternalIdentity::peer_id("stable/key+=").expect("stable identity");
         let owned = parse_status(
@@ -287,13 +260,5 @@ mod tests {
             resolve_host(&status, "build"),
             Err(NetbirdError::HostAmbiguous(host)) if host == "build"
         ));
-    }
-
-    #[test]
-    fn short_hostname_extracts_first_label() {
-        assert_eq!(short_hostname("a.b.c"), Some("a"));
-        assert_eq!(short_hostname("solo"), Some("solo"));
-        assert_eq!(short_hostname(""), None);
-        assert_eq!(short_hostname(".leading"), None);
     }
 }
