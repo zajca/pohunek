@@ -1454,6 +1454,7 @@ mod tests {
             installed,
             enabled,
             modified,
+            outdated: false,
             stale_stage,
             stale_backup,
         };
