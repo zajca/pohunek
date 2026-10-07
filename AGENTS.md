@@ -179,7 +179,7 @@ Cargo workspace, edition 2021, MSRV 1.96. Binaries: `pohunek` (CLI),
 | `crates/paths`    | Shared XDG path and local socket contract for daemon, CLI, and other clients. |
 | `crates/hostcheck`| Host environment probes shared by `doctor` and the daemon's `doctor` RPC. |
 | `crates/logging` | Process-safe size rotation and retention for daemon and per-session worker logs. |
-| `crates/test-support` | Test-only fixture roots that are symlink-free and short enough for Unix sockets on Linux and macOS, the hermetic per-test `TestEnv`, readiness waits bounded by one hang-guard ceiling (`wait`), the binary-wide unwind-safe process-environment override (`process_env`), the paused-clock auto-advance inhibitor (`time`), and fixture writers (`fs`) that cannot cause `ETXTBSY`. |
+| `crates/test-support` | Test-only fixture roots that are symlink-free and short enough for Unix sockets on Linux and macOS, the hermetic per-test `TestEnv`, readiness waits bounded by one hang-guard ceiling (`wait`), the binary-wide unwind-safe process-environment override (`process_env`), the `workers` guard that reaps and fails on leaked `pohunek-sessiond` workers of a fixture root, the paused-clock auto-advance inhibitor (`time`), and fixture writers (`fs`) that cannot cause `ETXTBSY`. |
 | `crates/platform` | Target-neutral process, peer-identity, and native-supervisor contracts plus concrete OS backends. |
 | `crates/service-config` | Typed, fail-fast `service.toml` (installation namespace, deadlines, agent environment allowlist) shared by `pohunek service`, `pohunekd`, and `pohunek-sessiond`; also the upgrade preflight report that the installer and the daemon exchange. |
 | `crates/xtask`    | Workspace automation (docs, TypeScript generation, pinned Hermes compatibility evidence, runtime package archives, and the `catalog` release tooling that builds, signs with a caller-supplied key file and verifies the runtime catalog and its trust anchor). |
@@ -434,6 +434,21 @@ subject, changes it through `pohunek_test_support::process_env::ProcessEnv` (one
 binary-wide lock, restored on drop and on unwind; tests that only read
 environment-derived values hold `ProcessEnv::lock()` too, and a command that must not
 see another test's `PATH` is built with `process_env::command`).
+
+No test leaves a session worker running. A real daemon starts each
+`pohunek-sessiond` in its own process group and lets it outlive the daemon, and a
+stopped session keeps its worker until `session.remove`, so a test that kills the
+daemon child must remove every session it created first. `TestEnv` carries a
+`pohunek_test_support::workers::WorkerGuard` for its root; a test that builds its
+own root (for example `tempdir_with_prefix`) wraps it with `WorkerGuard::watch`,
+declared after the root so it drops first. On drop, on success and on unwind, the
+guard terminates every worker whose `--daemon-socket-path` is below the root and
+fails the test that left it. The worker's argv is the only marker it carries (the
+launcher clears its environment), so the match is by root path and never touches
+workers of the host or of another run. `scripts/test-partitions run` adds a run-level
+check on Linux: the run gets a private `TMPDIR` base, and any worker below it after
+nextest exits is terminated and fails the run. Plain `cargo nextest run` relies on
+the guards alone.
 `crates/xtask/tests/hermetic_scan.rs` enforces all of this in test code with no
 baseline. A case where the host state is the subject carries
 `// hermetic-allowed: #<issue> <reason>` on or directly above its line; the

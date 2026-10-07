@@ -10,10 +10,13 @@ is how CI shares one build across the shard jobs.
 import argparse
 import collections
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +29,14 @@ CLI = "package(=pohunek-cli)"
 # form their own shard: CI runs them in a job whose Postgres service is gated
 # by a paths filter on the relay crates.
 SHARDS = ("unit", "daemon", "relay", "cli", "relay-db", "heavy")
+# Executable name of the session worker a real daemon starts.
+WORKER_EXECUTABLE = "pohunek-sessiond"
+# Argument that carries the worker's control socket path.
+SOCKET_PATH_ARGUMENT = "--daemon-socket-path"
+# Parent of the per-run fixture base. Kept short: fixture roots sit below the
+# base, and the sockets nested in them must fit a 104-byte `sun_path`.
+RUN_BASE_PARENT = "/tmp"
+RUN_BASE_PREFIX = "pt-"
 
 
 def filters():
@@ -153,6 +164,54 @@ def inventory(expression=None, archive=None):
     return selected_tests(json.loads(result.stdout))
 
 
+def leaked_workers(table, base):
+    """Workers in the `ps -o pid=,args=` output `table` whose socket is below `base`.
+
+    The subprocess launcher starts workers with a cleared environment, so the
+    only marker a test run leaves on one is the `--daemon-socket-path` value,
+    which lies inside a fixture root. A run's `TMPDIR` is a base of its own, so
+    workers of the host, of other runs and of other checkouts never match.
+    Returns `(pid, socket path)` pairs.
+    """
+    found = []
+    for line in table.splitlines():
+        tokens = line.split()
+        if len(tokens) < 2 or not tokens[0].isdigit():
+            continue
+        if Path(tokens[1]).name != WORKER_EXECUTABLE:
+            continue
+        arguments = tokens[2:]
+        if SOCKET_PATH_ARGUMENT not in arguments:
+            continue
+        index = arguments.index(SOCKET_PATH_ARGUMENT) + 1
+        if index < len(arguments) and Path(arguments[index]).is_relative_to(base):
+            found.append((int(tokens[0]), arguments[index]))
+    return found
+
+
+def process_table():
+    """The process table as `pid args` lines, wide enough that nothing is cut."""
+    with subprocess.Popen(
+        ["ps", "-axww", "-o", "pid=,args="], stdout=subprocess.PIPE, text=True, errors="replace",
+    ) as ps:
+        table, _ = ps.communicate()
+    if ps.returncode != 0:
+        raise RuntimeError(f"`ps` failed with status {ps.returncode}")
+    return table
+
+
+def check_no_leaked_workers(base):
+    """Terminate and report workers a run left below `base`; True when none did."""
+    leaked = leaked_workers(process_table(), base)
+    for pid, socket in leaked:
+        print(f"leaked pohunek-sessiond worker: pid {pid}, socket {socket}", file=sys.stderr)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return not leaked
+
+
 def require_archive_file(archive):
     """Fail with a clear message unless `archive` is an existing file.
 
@@ -211,7 +270,33 @@ def main():
         report.unlink(missing_ok=True)
     command = nextest_command("run", profile, archive)
     command.extend(["-E", expressions[args.shard]])
-    sys.exit(subprocess.run(command, cwd=ROOT, check=False).returncode)
+    sys.exit(run_checked(command))
+
+
+def run_checked(command):
+    """Run `command` with a per-run fixture base and fail if it leaks a worker.
+
+    Test fixtures are created below `TMPDIR`, so a unique base makes every
+    worker the run starts identifiable by its socket path. The check only runs
+    where fixtures follow `TMPDIR` (Linux); macOS fixtures use a fixed
+    `/private/tmp`, and there the in-process `WorkerGuard` is the check.
+    """
+    if sys.platform != "linux":
+        return subprocess.run(command, cwd=ROOT, check=False).returncode
+    base = Path(tempfile.mkdtemp(prefix=RUN_BASE_PREFIX, dir=RUN_BASE_PARENT)).resolve()
+    try:
+        status = subprocess.run(
+            command, cwd=ROOT, env={**os.environ, "TMPDIR": str(base)}, check=False,
+        ).returncode
+        if not check_no_leaked_workers(base):
+            print(
+                "error: the test run left pohunek-sessiond workers running (terminated above)",
+                file=sys.stderr,
+            )
+            return status or 1
+        return status
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 if __name__ == "__main__":

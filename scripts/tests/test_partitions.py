@@ -191,6 +191,65 @@ class ArchiveModeTests(unittest.TestCase):
                 partitions.require_archive_file(Path(root) / "absent.tar.zst")
 
 
+class LeakedWorkerTests(unittest.TestCase):
+    WORKER = (
+        "/w/target/debug/pohunek-sessiond --session-id s-1 --worker-generation g "
+        "--daemon-socket-path {socket}"
+    )
+
+    def table(self, *sockets):
+        lines = [f"{100 + i} {self.WORKER.format(socket=s)}" for i, s in enumerate(sockets)]
+        return "\n".join([*lines, "7 /usr/bin/sleep 1", "8 grep pohunek-sessiond"])
+
+    def test_only_workers_below_the_run_base_are_leaks(self):
+        table = self.table(
+            "/tmp/pt-abc/ph-x/run/pohunek/daemon.sock",
+            "/tmp/pt-abcd/ph-x/run/pohunek/daemon.sock",
+            "/run/user/1000/pohunek/daemon.sock",
+        )
+        found = leaked_workers_for(table, "/tmp/pt-abc")
+        self.assertEqual(found, [(100, "/tmp/pt-abc/ph-x/run/pohunek/daemon.sock")])
+
+    def test_a_worker_without_a_socket_argument_is_not_a_leak(self):
+        self.assertEqual(
+            leaked_workers_for("5 /w/pohunek-sessiond --session-id s-1", "/tmp/pt-abc"), [],
+        )
+
+    def test_a_leak_fails_a_run_that_passed_and_is_terminated(self):
+        table = self.table("/tmp/pt-run/ph-x/run/pohunek/daemon.sock")
+        killed = []
+        with mock.patch.object(partitions, "process_table", return_value=table), \
+                mock.patch.object(partitions.os, "kill", side_effect=lambda *a: killed.append(a)), \
+                mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(partitions.tempfile, "mkdtemp", return_value="/tmp/pt-run"), \
+                mock.patch.object(partitions.shutil, "rmtree"), \
+                mock.patch.object(Path, "resolve", lambda self: self), \
+                mock.patch.object(
+                    partitions.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ):
+            self.assertEqual(partitions.run_checked(["nextest"]), 1)
+        self.assertEqual(killed, [(100, partitions.signal.SIGKILL)])
+
+    def test_the_run_sees_a_base_of_its_own_as_tmpdir(self):
+        seen = []
+
+        def fake_run(command, **kwargs):
+            seen.append(kwargs["env"]["TMPDIR"])
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch.object(partitions, "process_table", return_value=""), \
+                mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(partitions.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(partitions.run_checked(["nextest"]), 0)
+        self.assertTrue(Path(seen[0]).name.startswith(partitions.RUN_BASE_PREFIX))
+        self.assertFalse(Path(seen[0]).exists(), "the base is removed after the run")
+
+
+def leaked_workers_for(table, base):
+    return [(pid, str(socket)) for pid, socket in partitions.leaked_workers(table, Path(base))]
+
+
 if __name__ == "__main__":
     unittest.main()
 

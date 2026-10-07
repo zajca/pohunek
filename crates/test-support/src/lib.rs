@@ -41,6 +41,10 @@
 //! which write fixture files through a child process so that no write
 //! descriptor in this process can make a later `exec` fail with `ETXTBSY`.
 //!
+//! The [`workers`] module holds [`workers::WorkerGuard`], which terminates the
+//! `pohunek-sessiond` workers a fixture root owns when it drops and fails the
+//! test that left them running; [`env::TestEnv`] carries one for its root.
+//!
 //! This crate is a development dependency only; production code never picks
 //! its paths from here.
 //!
@@ -59,6 +63,7 @@ pub mod fs;
 pub mod process_env;
 pub mod time;
 pub mod wait;
+pub mod workers;
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;

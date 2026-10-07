@@ -3154,6 +3154,7 @@ dependencies = [
 name = "pohunek-test-support"
 version = "0.33.1"
 dependencies = [
+ "nix 0.29.0",
  "tempfile",
  "tokio",
  "toml",
