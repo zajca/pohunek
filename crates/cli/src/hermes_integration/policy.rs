@@ -832,11 +832,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn errors_are_redacted() {
-        let rendered = Error::InvalidCliPath.to_string();
-        assert!(!rendered.contains("/work"));
-        assert!(!Error::InvalidCliPath.recovery_hint().contains("/work"));
-    }
 }

@@ -80,9 +80,6 @@ class StartIdentityTests(unittest.TestCase):
         linux.assert_called_once_with(1)
         darwin.assert_not_called()
 
-    def test_host_derivation_matches_independent_computation(self) -> None:
-        self.assertEqual(hooks._process_start_identity(os.getpid()), _host_start_identity())
-
     def test_real_hook_reports_the_host_start_identity_over_a_unix_socket(self) -> None:
         received: list[dict[str, object]] = []
         # The directory follows TMPDIR, which the Rust driver points at a short

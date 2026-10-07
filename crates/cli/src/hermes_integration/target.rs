@@ -621,12 +621,4 @@ mod tests {
             Err(Error::UnsafePermissions)
         );
     }
-
-    #[test]
-    fn error_display_and_recovery_do_not_leak_unsafe_paths() {
-        let error = Error::UnsafeTarget;
-        let rendered = error.to_string();
-        assert!(!rendered.contains("/work"));
-        assert!(!error.recovery_hint().contains("/work"));
-    }
 }

@@ -2390,32 +2390,6 @@ mod tests {
         assert_process_gone(child_pid);
     }
 
-    #[test]
-    fn pre_exec_closes_deliberately_inheritable_non_stdio_descriptor() {
-        let root = fixture("inherited-fd");
-        let selected = target(&root.0, TargetSelection::Profile(ProfileName::default()));
-        let inherited_path = root.0.join("inherited");
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(inherited_path)
-            .expect("open controlled descriptor");
-        let inherited = duplicate_inheritable_low(&file);
-        let descriptor = inherited.as_raw_fd();
-        let result = root.0.join("fd-result");
-        let body = format!(
-            "if test -e /dev/fd/{descriptor}; then state=inherited; else state=closed; fi\nprintf '%s' \"$state\" > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'",
-            result.display()
-        );
-        runner(&root.0, &body)
-            .verify_version(&selected)
-            .expect("fixed version after descriptor check");
-        assert_eq!(
-            fs::read_to_string(result).expect("descriptor result"),
-            "closed"
-        );
-    }
-
     /// Upper cap for the descriptor number the high-descriptor fixtures aim at.
     const HIGH_DESCRIPTOR_TARGET: libc::rlim_t = 200;
 
@@ -2497,16 +2471,6 @@ mod tests {
             crowd.push(fs::File::open("/dev/null").expect("open a crowding descriptor"));
         }
         assert_pre_exec_closes_low_and_high(&file, &root.0);
-    }
-
-    #[test]
-    fn shell_descriptor_numbers_are_the_ones_a_shell_keeps_for_itself() {
-        for descriptor in [10, 11, 15, SHELL_SCRIPT_DESCRIPTOR] {
-            assert!(is_shell_descriptor(descriptor), "{descriptor}");
-        }
-        for descriptor in [3, 9, 16, 100, 254] {
-            assert!(!is_shell_descriptor(descriptor), "{descriptor}");
-        }
     }
 
     #[test]

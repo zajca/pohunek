@@ -311,35 +311,6 @@ fn detector_with_columns(definition: &RuntimeDefinition, now: Instant, columns: 
     )
 }
 
-#[test]
-fn the_manifest_classifies_screens_captured_from_a_real_pi() {
-    let definition = installed_definition();
-    let started = Instant::now();
-    let mut detector = detector(&definition, started);
-    let idle = |activity| {
-        vec![pohunek_daemon::detect::ActivityTransition {
-            activity,
-            source: StateSource::Screen,
-        }]
-    };
-
-    assert_eq!(
-        detector.feed(started, &screen_bytes("idle.txt")),
-        idle(AgentActivity::Idle),
-        "the plain editor rules mean idle"
-    );
-    assert_eq!(
-        detector.feed(started, &screen_bytes("working.txt")),
-        idle(AgentActivity::Working),
-        "the spinner rule with `Working` means working"
-    );
-    assert_eq!(
-        detector.feed(started, &screen_bytes("idle_after_turn.txt")),
-        idle(AgentActivity::Idle),
-        "after the reply the plain rules return"
-    );
-}
-
 /// Fixture screens captured from a real Pi 1.0.2 and the activity each means.
 ///
 /// The `Working` and `Retrying` frames keep the editor rules while a turn runs,

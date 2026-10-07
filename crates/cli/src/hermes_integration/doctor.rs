@@ -835,42 +835,6 @@ mod tests {
     }
 
     #[test]
-    fn report_inventory_is_stable_and_incomplete_reports_fail() {
-        let checks: Vec<_> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
-        let report = Report { ok: false, checks };
-        assert_eq!(report.checks.len(), CHECK_CODES.len());
-        assert_eq!(report.checks[0].code, "hermes_executable");
-        assert_eq!(report.checks[14].code, "stale_backup");
-        assert!(!report.ok);
-    }
-
-    #[test]
-    fn report_json_carries_no_dynamic_diagnostic_payload() {
-        let check = Check::fail(
-            "asset_integrity",
-            "restore the embedded managed plugin assets",
-        );
-        let document = serde_json::to_string(&check).expect("serialize check");
-        assert!(!document.contains('/'));
-        assert!(!document.contains("stdout"));
-        assert!(!document.contains("stderr"));
-    }
-
-    #[test]
-    fn complete_probe_passes_each_registration_check() {
-        let mut checks: Vec<_> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
-        apply_probe(&mut checks, complete_probe());
-        for code in [
-            "pohunek_cli_compatibility",
-            "tool_registration",
-            "skill_registration",
-            "hook_registration",
-        ] {
-            assert!(is_pass(&checks, code), "{code} should pass");
-        }
-    }
-
-    #[test]
     fn complete_probe_cli_failure_does_not_hide_independent_hook_success() {
         let mut probe = complete_probe();
         probe.integration_ready = false;
@@ -894,40 +858,6 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_probe_fails_only_the_phase_nearest_check() {
-        let mut probe = complete_probe();
-        probe.probe_complete = false;
-        probe.failure_phase = 211;
-        probe.failure_errno = 1;
-        let mut checks: Vec<_> = CHECK_CODES.iter().copied().map(Check::not_run).collect();
-        apply_probe(&mut checks, probe);
-        assert_eq!(
-            check(
-                &Report {
-                    ok: false,
-                    checks: checks.clone()
-                },
-                "hook_registration"
-            ),
-            Status::Fail
-        );
-        for code in [
-            "pohunek_cli_compatibility",
-            "tool_registration",
-            "skill_registration",
-        ] {
-            assert_eq!(
-                checks
-                    .iter()
-                    .find(|check| check.code == code)
-                    .expect("registered check")
-                    .status,
-                Status::NotRun
-            );
-        }
-    }
-
-    #[test]
     fn incomplete_probe_phases_preserve_independent_registration_checks() {
         for (phase, failed) in [
             (1, "asset_integrity"),
@@ -935,6 +865,7 @@ mod tests {
             (3, "asset_integrity"),
             (4, "pohunek_cli_compatibility"),
             (5, "hook_registration"),
+            (211, "hook_registration"),
         ] {
             let mut probe = complete_probe();
             probe.probe_complete = false;

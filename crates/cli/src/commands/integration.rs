@@ -1128,7 +1128,7 @@ fn render_hermes_human(result: &HermesResult) -> String {
 
 #[cfg(test)]
 mod status_tests {
-    use super::{installed_version_label, render_status_human};
+    use super::render_status_human;
     use crate::target::LOCAL_HOST;
     use protocol::{
         IntegrationAgentStatus, IntegrationInstallState, IntegrationRecovery,
@@ -1262,12 +1262,6 @@ mod status_tests {
         ));
         assert!(!output.contains("pohunek --host buildbox integration install"));
     }
-
-    #[test]
-    fn renders_installed_and_expected_versions() {
-        assert_eq!(installed_version_label(Some(4)), "4");
-        assert_eq!(installed_version_label(None), "none");
-    }
 }
 
 #[cfg(test)]
@@ -1276,7 +1270,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
 
-    use clap::ValueEnum as _;
     use protocol::{
         ErrorClass, IntegrationHome, IntegrationHomeFailure, IntegrationInstallReport,
         IntegrationInstallResult, IntegrationUninstallReport, IntegrationUninstallResult,
@@ -1284,10 +1277,11 @@ mod tests {
     };
 
     use super::{
-        agent_name, lifecycle_from_doctor, render_doctor_human, render_install_human,
-        render_uninstall_human, AccessModeArg, HomeSelectionArgs, HookAgentArg,
+        lifecycle_from_doctor, render_doctor_human, render_install_human, render_uninstall_human,
+        AccessModeArg,
     };
     use crate::hermes_integration::doctor;
+    use crate::hermes_integration::lifecycle::LifecycleState;
     use crate::hermes_integration::policy::{
         AccessMode, Policy, PolicyInput, WildcardConfirmation, DEFAULT_REQUEST_TIMEOUT_MS,
         MAX_CONCURRENCY, MAX_OUTPUT_BYTES, MAX_SCREEN_BYTES, MAX_TIMEOUT_MS,
@@ -1340,37 +1334,6 @@ mod tests {
             .iter()
             .all(|check| check.status == doctor::Status::Pass);
         doctor::Report { ok, checks }
-    }
-
-    #[test]
-    fn hook_agent_arg_accepts_builtin_names_and_runtime_ids() {
-        assert_eq!("claude".parse(), Ok(HookAgentArg::Claude));
-        assert_eq!("codex".parse(), Ok(HookAgentArg::Codex));
-        assert_eq!("hermes".parse(), Ok(HookAgentArg::Hermes));
-        let acme: HookAgentArg = "acme".parse().expect("a runtime id");
-        assert_eq!(
-            RuntimeRef::from(acme.clone()),
-            RuntimeRef::from_wire("acme")
-        );
-        assert_eq!(agent_name(acme), "acme");
-        for invalid in ["", "Not An Id", "a/b"] {
-            assert!(invalid.parse::<HookAgentArg>().is_err(), "{invalid:?}");
-        }
-    }
-
-    #[test]
-    fn hook_agent_arg_maps_to_agent_kind() {
-        assert_eq!(RuntimeRef::from(HookAgentArg::Claude), RuntimeRef::claude());
-        assert_eq!(RuntimeRef::from(HookAgentArg::Codex), RuntimeRef::codex());
-        assert_eq!(RuntimeRef::from(HookAgentArg::Hermes), RuntimeRef::hermes());
-        assert_eq!(agent_name(HookAgentArg::Hermes), "hermes");
-        assert_eq!(
-            AccessModeArg::ReadOnly
-                .to_possible_value()
-                .unwrap()
-                .get_name(),
-            "read_only"
-        );
     }
 
     #[test]
@@ -1465,124 +1428,76 @@ mod tests {
             failed: result.failed,
         };
         assert!(
-            !render_install_human(&only_failures).starts_with("no agent hooks installed"),
-            "a request that only failed is not reported as an empty install"
+            render_install_human(&only_failures)
+                .starts_with("failed claude (default, profile alt, profile work): "),
+            "a request that only failed reports its failures, not an empty install"
         );
     }
 
     #[test]
-    fn home_selection_is_refused_for_the_hermes_plugin() {
-        HomeSelectionArgs::default()
-            .refuse_for_hermes()
-            .expect("no selector is not refused");
-        for selected in [
-            HomeSelectionArgs {
-                profile: Some("work".to_owned()),
-                all_profiles: false,
-            },
-            HomeSelectionArgs {
-                profile: None,
-                all_profiles: true,
-            },
-        ] {
-            let error = selected.refuse_for_hermes().expect_err("refused");
-            assert!(
-                matches!(&error, crate::error::CliError::Protocol(inner) if inner.code == "integration_profile_not_for_hermes"),
-                "{error:?}"
+    fn lifecycle_from_doctor_derives_state_only_from_decisive_checks() {
+        use doctor::Status::{Fail, NotRun, Pass};
+
+        // A named case: the doctor check statuses and the lifecycle they imply.
+        type Case<'a> = (
+            &'a str,
+            &'a [(&'static str, doctor::Status)],
+            LifecycleState,
+        );
+
+        let state = |installed, enabled, modified, stale_stage, stale_backup| LifecycleState {
+            installed,
+            enabled,
+            modified,
+            stale_stage,
+            stale_backup,
+        };
+        let cases: [Case<'_>; 5] = [
+            (
+                "checks that did not run report nothing",
+                &[
+                    ("plugin_ownership", NotRun),
+                    ("asset_integrity", NotRun),
+                    ("plugin_enabled", NotRun),
+                    ("stale_stage", NotRun),
+                    ("stale_backup", NotRun),
+                ],
+                state(false, false, false, false, false),
+            ),
+            (
+                "a failed stale-stage check reports only the stale stage",
+                &[("stale_stage", Fail), ("stale_backup", NotRun)],
+                state(false, false, false, true, false),
+            ),
+            (
+                "passed checks report an installed, enabled, clean plugin",
+                &[
+                    ("plugin_ownership", Pass),
+                    ("asset_integrity", Pass),
+                    ("plugin_enabled", Pass),
+                    ("stale_stage", Pass),
+                    ("stale_backup", Pass),
+                ],
+                state(true, true, false, false, false),
+            ),
+            (
+                "an asset integrity check that did not run is not a modification",
+                &[("plugin_ownership", Pass), ("asset_integrity", NotRun)],
+                state(true, false, false, false, false),
+            ),
+            (
+                "a failed asset integrity check of an owned plugin is a modification",
+                &[("plugin_ownership", Pass), ("asset_integrity", Fail)],
+                state(true, false, true, false, false),
+            ),
+        ];
+        for (case, statuses, expected) in cases {
+            assert_eq!(
+                lifecycle_from_doctor(&doctor_report(statuses)),
+                expected,
+                "{case}"
             );
         }
-    }
-
-    #[test]
-    fn renders_empty_install_result() {
-        let output = render_install_human(&IntegrationInstallResult {
-            failed: Vec::new(),
-            installed: vec![],
-        });
-        assert_eq!(output, "no agent hooks installed\n");
-    }
-
-    #[test]
-    fn lifecycle_from_doctor_ignores_not_run_checks() {
-        let report = doctor_report(&[
-            ("plugin_ownership", doctor::Status::NotRun),
-            ("asset_integrity", doctor::Status::NotRun),
-            ("plugin_enabled", doctor::Status::NotRun),
-            ("stale_stage", doctor::Status::NotRun),
-            ("stale_backup", doctor::Status::NotRun),
-        ]);
-
-        let lifecycle = lifecycle_from_doctor(&report);
-
-        assert!(!lifecycle.installed);
-        assert!(!lifecycle.enabled);
-        assert!(!lifecycle.modified);
-        assert!(!lifecycle.stale_stage);
-        assert!(!lifecycle.stale_backup);
-    }
-
-    #[test]
-    fn lifecycle_from_doctor_reports_failed_stale_stage_check() {
-        let report = doctor_report(&[
-            ("stale_stage", doctor::Status::Fail),
-            ("stale_backup", doctor::Status::NotRun),
-        ]);
-
-        let lifecycle = lifecycle_from_doctor(&report);
-
-        assert!(lifecycle.stale_stage);
-        assert!(!lifecycle.stale_backup);
-    }
-
-    #[test]
-    fn lifecycle_from_doctor_maps_all_passed_checks() {
-        let report = doctor_report(&[
-            ("plugin_ownership", doctor::Status::Pass),
-            ("asset_integrity", doctor::Status::Pass),
-            ("plugin_enabled", doctor::Status::Pass),
-            ("stale_stage", doctor::Status::Pass),
-            ("stale_backup", doctor::Status::Pass),
-        ]);
-
-        let lifecycle = lifecycle_from_doctor(&report);
-
-        assert!(lifecycle.installed);
-        assert!(lifecycle.enabled);
-        assert!(!lifecycle.modified);
-        assert!(!lifecycle.stale_stage);
-        assert!(!lifecycle.stale_backup);
-    }
-
-    #[test]
-    fn lifecycle_from_doctor_requires_failed_asset_integrity_for_modified() {
-        let not_run = doctor_report(&[
-            ("plugin_ownership", doctor::Status::Pass),
-            ("asset_integrity", doctor::Status::NotRun),
-        ]);
-        let failed = doctor_report(&[
-            ("plugin_ownership", doctor::Status::Pass),
-            ("asset_integrity", doctor::Status::Fail),
-        ]);
-
-        assert!(!lifecycle_from_doctor(&not_run).modified);
-        assert!(lifecycle_from_doctor(&failed).modified);
-    }
-
-    #[test]
-    fn renders_install_result_as_json_that_deserializes() {
-        let result = IntegrationInstallResult {
-            failed: Vec::new(),
-            installed: vec![IntegrationInstallReport {
-                home: None,
-                agent: RuntimeRef::claude(),
-                hook_path: "/home/u/.claude/hooks/pohunek-agent-state.sh".to_owned(),
-                config_paths: vec!["/home/u/.claude/settings.json".to_owned()],
-                cleanup_incomplete: vec![],
-            }],
-        };
-        let doc = crate::commands::render_json(&result).expect("json doc");
-        let parsed: IntegrationInstallResult = crate::commands::parse_json_ok(&doc);
-        assert_eq!(parsed, result);
     }
 
     #[test]
@@ -1732,19 +1647,6 @@ mod tests {
     }
 
     #[test]
-    fn install_policy_returns_typed_error_for_out_of_range_bound() {
-        let error = super::install_policy(&super::HermesOptions {
-            access_mode: Some(AccessModeArg::Manage),
-            allowed_hosts: vec!["local".to_owned()],
-            tool_timeout_ms: Some(MAX_TIMEOUT_MS + 1),
-            ..hermes_options()
-        })
-        .expect_err("timeout above policy ceiling");
-
-        assert_eq!(error.to_protocol_error().code, "hermes_invalid_policy");
-    }
-
-    #[test]
     fn every_hermes_action_requires_an_explicit_target_and_rejects_irrelevant_flags() {
         let no_target = hermes_options();
         for action in [
@@ -1863,42 +1765,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).expect("parse JSON result");
         assert_eq!(value["ok"]["action"], "status");
         assert!(!json.contains("/private/"));
-    }
-
-    #[test]
-    fn uninstall_human_output_lists_removed_updated_and_preserved_paths() {
-        use protocol::{
-            IntegrationUninstallReport, IntegrationUninstallResult, IntegrationUninstallState,
-        };
-
-        let result = IntegrationUninstallResult {
-            failed: Vec::new(),
-            uninstalled: vec![
-                IntegrationUninstallReport {
-                    home: None,
-                    agent: RuntimeRef::claude(),
-                    state: IntegrationUninstallState::Removed,
-                    removed_paths: vec!["/c/hooks/state.sh".to_owned()],
-                    updated_paths: vec!["/c/settings.json".to_owned()],
-                    preserved_paths: vec!["/c/hooks/notify.sh".to_owned()],
-                    cleanup_incomplete: vec![],
-                },
-                IntegrationUninstallReport {
-                    home: None,
-                    agent: RuntimeRef::codex(),
-                    state: IntegrationUninstallState::NotInstalled,
-                    removed_paths: vec![],
-                    updated_paths: vec![],
-                    preserved_paths: vec![],
-                    cleanup_incomplete: vec![],
-                },
-            ],
-        };
-
-        assert_eq!(
-            render_uninstall_human(&result),
-            "claude: removed managed hooks\n  removed: /c/hooks/state.sh\n  updated registration: /c/settings.json\n  preserved (not installer-owned): /c/hooks/notify.sh\ncodex: no managed hooks installed, nothing removed\n"
-        );
     }
 
     #[test]

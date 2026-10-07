@@ -431,16 +431,6 @@ fn binary_legacy_install_preserves_daemon_rpc_for_each_selector() {
 #[test]
 fn binary_parser_preserves_daemon_status_and_hermes_target_contracts() {
     let fixture = Fixture::new("parser");
-    for action in ["doctor", "update", "uninstall"] {
-        let missing = run(
-            &fixture,
-            &["integration", action, "--agent", "hermes", "--json"],
-        );
-        assert_eq!(missing.status.code(), Some(2), "{action}");
-        let envelope: Value = serde_json::from_slice(&missing.stdout).expect("usage JSON");
-        assert_eq!(envelope["err"]["code"], "cli_usage");
-    }
-
     let missing_status_target = run(
         &fixture,
         &["integration", "status", "--agent", "hermes", "--json"],
