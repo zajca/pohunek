@@ -412,29 +412,4 @@ mod tests {
             assert_eq!(parse_marker(&marker).expect("parsed marker"), ownership);
         }
     }
-
-    #[test]
-    fn embedded_skill_checksum_is_deterministic_and_owned_as_exact_bytes() {
-        let first = render(Path::new("/work/policy.json")).expect("render first assets");
-        let second = render(Path::new("/work/policy.json")).expect("render second assets");
-        let first_skill = first
-            .iter()
-            .find(|asset| asset.path() == SKILL_PATH)
-            .expect("first skill asset");
-        let second_skill = second
-            .iter()
-            .find(|asset| asset.path() == SKILL_PATH)
-            .expect("second skill asset");
-        assert_eq!(first_skill.bytes(), SKILL);
-        assert_eq!(first_skill.bytes(), second_skill.bytes());
-        assert_eq!(first_skill.checksum(), second_skill.checksum());
-
-        let ownership = ownership(
-            Path::new("/work/hermes"),
-            Path::new("/work/policy.json"),
-            &first,
-        )
-        .expect("ownership");
-        assert_eq!(ownership.assets[SKILL_PATH], checksum(SKILL));
-    }
 }

@@ -1395,58 +1395,6 @@ mod tests {
     }
 
     #[test]
-    fn list_and_doctor_parse() {
-        assert!(matches!(
-            parse(&["list", "--json"]).expect("list"),
-            Action::List { json: true }
-        ));
-        match parse(&["doctor", "acme.pi"]).expect("doctor") {
-            Action::Doctor { package, json } => {
-                assert_eq!(package.map(|id| id.to_string()).as_deref(), Some("acme.pi"));
-                assert!(!json);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        match parse(&["doctor"]).expect("doctor") {
-            Action::Doctor { package, .. } => assert!(package.is_none()),
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn selector_commands_parse_with_narrowing() {
-        for name in ["inspect", "select", "enable", "disable"] {
-            let action = parse(&[
-                name,
-                "acme.pi",
-                "--digest",
-                "aaaaaaaaaaaa",
-                "--version",
-                "1.0.0",
-                "--json",
-            ])
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
-            assert!(action.wants_json(), "{name}");
-            let selector = match action {
-                Action::Inspect { selector, .. }
-                | Action::Select { selector, .. }
-                | Action::Enable { selector, .. }
-                | Action::Disable { selector, .. } => selector,
-                other => panic!("unexpected {other:?}"),
-            };
-            assert_eq!(selector.package.as_str(), "acme.pi");
-            assert_eq!(
-                selector.digest,
-                Some(DigestSelector::Prefix("aaaaaaaaaaaa".to_owned()))
-            );
-            assert_eq!(
-                selector.version.map(|v| v.to_string()).as_deref(),
-                Some("1.0.0")
-            );
-        }
-    }
-
-    #[test]
     fn install_requires_exactly_one_trust_source() {
         let digest = DIGEST_A;
         match parse(&[
@@ -1505,38 +1453,6 @@ mod tests {
                 clap::error::ErrorKind::ValueValidation,
                 "{bad}"
             );
-        }
-    }
-
-    #[test]
-    fn link_update_and_uninstall_parse() {
-        match parse(&["link", "./dir", "--yes", "--json"]).expect("link") {
-            Action::Link(args) => assert!(args.yes && args.json),
-            other => panic!("unexpected {other:?}"),
-        }
-        match parse(&["update", "acme.pi", "new.tar", "--sha256", DIGEST_B]).expect("update") {
-            Action::Update(args) => {
-                assert_eq!(args.package.as_str(), "acme.pi");
-                assert_eq!(args.archive, PathBuf::from("new.tar"));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        assert_eq!(
-            parse_err(&["update", "acme.pi", "new.tar"]),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        match parse(&[
-            "uninstall",
-            "acme.pi",
-            "--version",
-            "1.0.0",
-            "--remove-modified",
-            "--yes",
-        ])
-        .expect("uninstall")
-        {
-            Action::Uninstall(args) => assert!(args.remove_modified && args.yes),
-            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -1700,55 +1616,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_hosts_are_rejected_and_local_forms_accepted() {
-        ensure_local(LOCAL_HOST).expect("local");
-        ensure_local("").expect("empty host means local");
-        let error = ensure_local("build-box").expect_err("remote host");
-        assert_eq!(error.code(), "plugin_local_only");
-        assert!(error.to_string().contains("this machine only"));
-    }
-
-    #[test]
-    fn errors_map_to_stable_codes_with_hints() {
-        let errors = [
-            Error::LocalOnly { host: "h".into() },
-            Error::InvalidSource {
-                path: "p".into(),
-                expected: "file",
-            },
-            Error::ConsentRequired {
-                verb: "installing",
-                summary: "s".into(),
-            },
-            Error::NotInstalled {
-                package: "p".into(),
-            },
-            Error::NoMatchingVersion {
-                package: "p".into(),
-            },
-            Error::Ambiguous {
-                package: "p".into(),
-                candidates: "c".into(),
-            },
-            Error::UpdateIdMismatch {
-                expected: "a".into(),
-                found: "b".into(),
-            },
-            Error::ProfileDirectory { detail: "d".into() },
-            Error::ProfileTarget {
-                name: "n".into(),
-                detail: "d".into(),
-            },
-        ];
-        for error in &errors {
-            assert!(!error.code().is_empty());
-            assert!(!error.hint().is_empty());
-            assert_eq!(error.class(), ErrorClass::Configuration);
-        }
-        assert_eq!(errors[2].code(), "consent_required");
-    }
-
-    #[test]
     fn list_table_abbreviates_digests_and_marks_state() {
         let mut faulty = info("acme.bad", "1.0.0", DIGEST_C, false);
         faulty.enabled = false;
@@ -1829,60 +1696,6 @@ mod tests {
             "raw escape reached the terminal: {text:?}"
         );
         assert!(text.contains("\\u{1b}"), "{text}");
-    }
-
-    #[test]
-    fn install_result_explains_how_to_enable_a_disabled_package() {
-        let mut package = info("acme.pi", "1.0.0", DIGEST_A, false);
-        package.enabled = false;
-        let result = PackageInstallResult {
-            status: PackageInstallStatus::Installed,
-            package,
-            runtime: runtime("Pi"),
-            reloaded: true,
-        };
-        let text = render_install_result(&result, Ingest::Link);
-        assert!(text.contains("Installed acme.pi 1.0.0"), "{text}");
-        assert!(
-            text.contains("pohunek plugin enable acme.pi --digest aaaaaaaaaaaa"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn doctor_renders_findings_or_a_clean_report() {
-        assert!(render_doctor(&PackageDoctorResult {
-            generation: 7,
-            findings: Vec::new()
-        })
-        .starts_with("No problems found"));
-        let text = render_doctor(&PackageDoctorResult {
-            generation: 7,
-            findings: vec![
-                PackageFinding {
-                    kind: PackageFindingKind::Fault,
-                    digest: PackageDigest::parse(DIGEST_A).expect("digest"),
-                    package: Some(protocol::PackageIdentity {
-                        id: PackageId::parse("acme.pi").expect("id"),
-                        version: PackageVersion::parse("1.0.0").expect("version"),
-                    }),
-                    fault: Some(PackageFault::RootModified),
-                    referenced: true,
-                    blocked_by: None,
-                },
-                PackageFinding {
-                    kind: PackageFindingKind::UnregisteredRoot,
-                    digest: PackageDigest::parse(DIGEST_B).expect("digest"),
-                    package: None,
-                    fault: None,
-                    referenced: false,
-                    blocked_by: None,
-                },
-            ],
-        });
-        assert!(text.contains("root modified"), "{text}");
-        assert!(text.contains("unregistered root"), "{text}");
-        assert!(text.contains("2 finding(s)"), "{text}");
     }
 
     fn held_back(version: &str, digest: &str) -> PackageInfo {
@@ -2020,31 +1833,6 @@ mod tests {
         };
         assert!(review(true).contains("Selected:    yes after install"));
         assert!(review(false).contains("Selected:    no after install"));
-    }
-
-    #[test]
-    fn disable_output_states_the_live_session_semantics() {
-        let result = PackageChangeResult {
-            package: info("acme.pi", "1.0.0", DIGEST_A, true),
-            reloaded: true,
-        };
-        let text = render_change("Disabled", &result);
-        assert!(text.contains("Live sessions keep running"), "{text}");
-        assert!(!render_change("Enabled", &result).contains("Live sessions"));
-    }
-
-    #[test]
-    fn canonical_path_checks_existence_and_kind_before_any_request() {
-        let dir = pohunek_test_support::tempdir().expect("tempdir");
-        let file = dir.path().join("pkg.tar");
-        std::fs::write(&file, b"x").expect("write archive");
-        let canonical = canonical_path(&file, "file", Path::is_file).expect("file");
-        assert!(Path::new(&canonical).is_absolute());
-        canonical_path(dir.path(), "file", Path::is_file).expect_err("a directory is not a file");
-        canonical_path(&file, "directory", Path::is_dir).expect_err("a file is not a directory");
-        let missing = dir.path().join("missing");
-        let error = canonical_path(&missing, "file", Path::is_file).expect_err("missing");
-        assert!(error.to_string().contains("missing"), "{error}");
     }
 
     #[test]

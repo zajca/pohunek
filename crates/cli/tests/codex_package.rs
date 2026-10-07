@@ -479,6 +479,8 @@ impl Meaning {
             "idle" | "idle_after_turn" => Self::Idle,
             "working_early" | "working_stream" => Self::Working,
             "approval" | "askuser" => Self::Blocked,
+            // Codex 0.160.0 asks "Trust this folder?"; `workspace_trust_prompt`
+            // matches only the older wording, so the dialog stays unclassified.
             "trust" | "login" => Self::Silent,
             other => panic!("unknown fixture state {other}"),
         }
@@ -726,37 +728,6 @@ fn working_is_read_from_the_title_because_the_screen_has_no_working_rule() {
                 frame.name
             );
         }
-    }
-}
-
-/// The real Codex 0.160.0 first-run folder dialog reads "Trust this folder?"
-/// with "1. Trust and continue". The `workspace_trust_prompt` rule matches the
-/// older wording, so the dialog is not classified; this test pins that gap so a
-/// rule change that closes it must update the fixture expectations.
-#[test]
-fn the_real_trust_folder_dialog_is_not_yet_a_blocked_screen() {
-    let definition = installed_definition();
-    let frames: Vec<Frame> = top_level_frames()
-        .into_iter()
-        .chain(width_frames())
-        .filter(|frame| frame.state == "trust")
-        .collect();
-    assert_eq!(frames.len(), 10);
-    for frame in &frames {
-        assert!(
-            frame
-                .rows
-                .iter()
-                .any(|row| row.contains("Trust this folder?") || row.contains("Trust this")),
-            "{} shows the dialog",
-            frame.name
-        );
-        assert_eq!(
-            screen_activity(&definition, &frame.rows, frame.columns),
-            None,
-            "{}",
-            frame.name
-        );
     }
 }
 

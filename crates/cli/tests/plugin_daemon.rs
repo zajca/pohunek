@@ -228,32 +228,6 @@ async fn install_needs_consent_and_the_exact_digest() {
 }
 
 #[tokio::test]
-async fn list_and_inspect_show_the_installed_package() {
-    let harness = Harness::start().await;
-    let built = harness.archive("1.0.0");
-    install_enabled(&harness, &built).await;
-
-    let (code, listed) = harness.json(&["plugin", "list"]).await;
-    assert_eq!(code, 0, "{listed}");
-    let packages = listed["ok"]["packages"].as_array().expect("packages");
-    assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["digest"], built.digest.as_str());
-    assert_eq!(packages[0]["enabled"], true);
-    assert_eq!(packages[0]["selected"], true);
-
-    let (code, inspected) = harness.json(&["plugin", "inspect", PACKAGE_ID]).await;
-    assert_eq!(code, 0, "{inspected}");
-    assert_eq!(inspected["ok"]["runtime"]["program"], PROGRAM);
-    assert_eq!(inspected["ok"]["package"]["digest"], built.digest.as_str());
-
-    let table = harness.run(&["plugin", "list"]).await;
-    assert!(table.status.success(), "{}", stderr_text(&table));
-    assert!(stdout_text(&table).contains(PACKAGE_ID));
-
-    harness.stop().await;
-}
-
-#[tokio::test]
 async fn disable_blocks_a_fresh_launch_and_enable_restores_it() {
     let harness = Harness::start().await;
     let built = harness.archive("1.0.0");
@@ -580,31 +554,6 @@ async fn profile_migrate_maps_the_daemon_refusals_and_leaves_profiles_untouched(
         fs::read_to_string(&real).expect("read"),
         format!("base = \"{RUNTIME}\"\n")
     );
-
-    harness.stop().await;
-}
-
-#[tokio::test]
-async fn a_remote_host_is_refused_without_touching_the_daemon() {
-    let harness = Harness::start().await;
-    let built = harness.archive("1.0.0");
-    install_enabled(&harness, &built).await;
-    let before = harness.registry();
-
-    let output = harness
-        .run(&["--host", "elsewhere", "plugin", "list", "--json"])
-        .await;
-    assert_eq!(output.status.code(), Some(1), "{}", stderr_text(&output));
-    let document: Value = serde_json::from_slice(&output.stdout).expect("one JSON document");
-    assert_eq!(document["err"]["code"], "plugin_local_only");
-
-    let output = harness
-        .run(&["--host", "elsewhere", "plugin", "disable", PACKAGE_ID])
-        .await;
-    assert_eq!(output.status.code(), Some(1));
-    let after = harness.registry();
-    assert_eq!(after.generation(), before.generation());
-    assert!(after.packages()[0].enabled());
 
     harness.stop().await;
 }

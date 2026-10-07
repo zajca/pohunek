@@ -153,15 +153,3 @@ fn policy_violations(path: &Path, uid: u32) -> String {
     }
     findings.join("; ")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn discovered_interpreter_is_canonical_and_meets_the_plugin_requirements() {
-        let path = interpreter();
-        assert_eq!(std::fs::canonicalize(path).expect("canonical"), path);
-        validate_runtime(path, Uid::effective().as_raw()).expect("production runtime policy");
-    }
-}

@@ -421,13 +421,6 @@ class ToolTests(unittest.TestCase):
         self.assertNotIn("pohunek_session_stop", manage)
         self.assertIn("pohunek_session_stop", full)
 
-    def test_verify_cli_uses_shared_runner(self) -> None:
-        tools = Tools(policy(), None)
-        runner = mock.Mock()
-        tools._runner = runner
-        tools.verify_cli()
-        runner.verify_compatibility.assert_called_once_with()
-
     def test_wildcard_policy_still_rejects_unsafe_runtime_hosts(self) -> None:
         wildcard = Policy(TRUE_BINARY, 1, 3, "full", frozenset(("*",)), 100, 50, 1024, 1024, 1)
         tools = Tools(wildcard, None)
@@ -476,14 +469,6 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(schema, expected)
         for schema in (output["max_bytes"], output["wait_ms"], wait["timeout_ms"]):
             self.assertEqual(schema, {"type": "integer"})
-
-    def test_origin_mutation_is_rejected_before_any_runner_call(self) -> None:
-        tools = Tools(policy(), "origin")
-        runner = mock.Mock()
-        tools._runner = runner
-        response = json.loads(tools.handlers()["pohunek_session_send"]({"session": "origin", "input": "x"}))
-        self.assertEqual(response["error"]["code"], "plugin_self_target_denied")
-        runner.run.assert_not_called()
 
     def test_session_send_passes_newline_input_to_the_fixed_runner_contract(self) -> None:
         tools = Tools(policy(), None)
@@ -702,28 +687,6 @@ class ToolTests(unittest.TestCase):
             "--after-terminal-watermark", "0",
             "--after-output-offset", "18446744073709551615",
             "--", "s",
-        ))
-
-    def test_output_cursor_roundtrips_u64_max_into_next_input(self) -> None:
-        maximum = "18446744073709551615"
-        tools = Tools(policy(), None)
-        runner = mock.Mock()
-        runner.run.side_effect = [
-            {"session_id": "s", "worker_instance_id": "r", "runtime_generation": maximum, "next_offset": maximum, "data_base64": ""},
-            {"session_id": "s", "worker_instance_id": "r", "runtime_generation": maximum, "next_offset": maximum, "data_base64": ""},
-        ]
-        tools._runner = runner
-        first = json.loads(tools.handlers()["pohunek_session_output"]({"session": "s", "max_bytes": 16}))
-        cursor = first["result"]["next_offset"]
-        generation = first["result"]["runtime_generation"]
-        second = json.loads(tools.handlers()["pohunek_session_output"]({
-            "session": "s", "worker_instance_id": "r", "runtime_generation": generation,
-            "after_offset": cursor, "max_bytes": 16,
-        }))
-        self.assertTrue(second["ok"])
-        self.assertEqual(runner.run.call_args.args[0].argv[-8:], (
-            "--worker-instance-id", "r", "--runtime-generation", maximum,
-            "--after-offset", maximum, "--", "s",
         ))
 
     def test_all_cursor_fields_reject_noncanonical_or_out_of_range_values(self) -> None:

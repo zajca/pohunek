@@ -98,7 +98,8 @@ classifies every one of them through the package manifest.
   contents of this directory?`, `1. Yes, continue`), so the real dialog is read
   by no rule and the session keeps the byte-activity fallback. The package keeps
   the built-in rule unchanged and a test pins the non-match
-  (`the_real_trust_folder_dialog_is_not_yet_a_blocked_screen`). A rule for the
+  (`every_captured_screen_is_classified_by_its_title` expects no screen or title
+  evidence for the captured trust dialogs). A rule for the
   new wording is a change to both manifests, decided by the owner.
 - **Hooks run in a descendant process.** Codex 0.160.0 runs its hooks from a
   `codex app-server --listen unix:// --managed-daemon` process below the

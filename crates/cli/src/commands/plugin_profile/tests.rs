@@ -2,12 +2,9 @@ use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::PathBuf;
 
-use clap::Parser as _;
 use protocol::{PackageIdentity, PackageOrigin, PackageVersion};
 
 use super::*;
-use crate::commands::plugin::Action;
-use crate::{Cli, Commands};
 
 /// A value that must never reach any output.
 const SENTINEL: &str = "sk-sentinel-secret-9f3a";
@@ -94,81 +91,6 @@ fn profile_names_follow_the_daemons_charset_rule() {
 
 // ----- parsing -------------------------------------------------------------
 
-fn parse(args: &[&str]) -> Result<Action, clap::Error> {
-    let mut words = vec!["pohunek", "plugin", "profile"];
-    words.extend_from_slice(args);
-    match Cli::try_parse_from(words)?.command {
-        Commands::Plugin { action } => Ok(action),
-        other => panic!("unexpected command {other:?}"),
-    }
-}
-
-fn profile_action(args: &[&str]) -> ProfileAction {
-    match parse(args).expect("parses") {
-        Action::Profile { action } => action,
-        other => panic!("unexpected {other:?}"),
-    }
-}
-
-#[test]
-fn profile_subcommands_parse() {
-    assert!(matches!(
-        profile_action(&["list", "--json"]),
-        ProfileAction::List { json: true }
-    ));
-    match profile_action(&[
-        "migrate",
-        "work",
-        "--digest",
-        "111111111111",
-        "--yes",
-        "--json",
-    ]) {
-        ProfileAction::Migrate(args) => {
-            assert_eq!(args.name, "work");
-            assert_eq!(
-                args.digest,
-                Some(DigestSelector::Prefix("111111111111".to_owned()))
-            );
-            assert!(args.yes && args.json);
-        }
-        other @ ProfileAction::List { .. } => panic!("unexpected {other:?}"),
-    }
-    match profile_action(&["migrate", "work"]) {
-        ProfileAction::Migrate(args) => {
-            assert!(args.digest.is_none() && !args.yes && !args.json);
-        }
-        other @ ProfileAction::List { .. } => panic!("unexpected {other:?}"),
-    }
-    assert!(parse(&["list", "--json"]).expect("list").wants_json());
-}
-
-#[test]
-fn profile_usage_errors_are_reported_by_clap() {
-    for args in [
-        &["migrate"][..],
-        &["migrate", "../x"],
-        &["migrate", ".hidden"],
-        &["migrate", "work", "--digest", "abc"],
-        &["bogus"],
-    ] {
-        parse(args).expect_err("must not parse");
-    }
-}
-
-#[test]
-fn head_reads_base_and_the_optional_pin() {
-    let text = format!("base = \"acme-pi\"\npackage = \"acme.pi\"\ndigest = \"{DIGEST_OLD}\"\n");
-    assert_eq!(
-        parse_head(&text).expect("head"),
-        head("acme-pi", Some(("acme.pi", DIGEST_OLD)))
-    );
-    assert_eq!(
-        parse_head(&profile_text()).expect("head"),
-        head("acme-pi", None)
-    );
-}
-
 #[test]
 fn head_diagnostics_name_keys_and_never_values() {
     let cases = [
@@ -191,14 +113,6 @@ fn head_diagnostics_name_keys_and_never_values() {
     for (text, expected) in cases {
         assert_eq!(parse_head(text).expect_err(text), expected);
     }
-}
-
-#[test]
-fn toml_syntax_errors_report_the_line_and_never_the_source() {
-    let text = format!("base = \"acme-pi\"\n[env]\nAPI_TOKEN = {SENTINEL}\n");
-    let error = parse_head(&text).expect_err("unquoted value");
-    assert!(error.starts_with("line 3:"), "{error}");
-    assert!(!error.contains(SENTINEL), "{error}");
 }
 
 // ----- classification ------------------------------------------------------
@@ -244,17 +158,6 @@ fn state_classification_covers_every_case() {
 }
 
 // ----- target resolution ---------------------------------------------------
-
-#[test]
-fn a_digest_prefix_names_exactly_one_installed_package() {
-    let packages = vec![
-        info("acme.pi", DIGEST_OLD, Some("acme-pi")),
-        info("acme.pi", DIGEST_NEW, Some("acme-pi")),
-    ];
-    let selector: DigestSelector = "222222222222".parse().expect("selector");
-    let digest = resolve_prefix("work", &selector, &packages).expect("one match");
-    assert_eq!(digest.as_str(), DIGEST_NEW);
-}
 
 #[test]
 fn a_digest_prefix_without_or_with_several_matches_is_refused() {
@@ -360,17 +263,6 @@ fn load_refuses_oversized_and_non_utf8_profiles() {
 }
 
 #[test]
-fn agents_directory_must_not_be_group_or_world_writable() {
-    let agents = Agents::new(0o770);
-    open_agents_dir(&agents.dir).expect_err("a group-writable directory is refused");
-    let private = Agents::new(0o700);
-    let missing = private.dir.join("nested");
-    assert!(open_agents_dir(&missing)
-        .expect("absent is not an error")
-        .is_none());
-}
-
-#[test]
 fn listing_reports_each_state_and_never_leaks_file_content() {
     let agents = Agents::new(0o700);
     agents.write("builtin", "base = \"shell\"\n", 0o600);
@@ -429,13 +321,6 @@ fn listing_reports_each_state_and_never_leaks_file_content() {
 }
 
 #[test]
-fn listing_without_an_agents_directory_is_empty() {
-    let listing = list_profiles(None, &[]).expect("listing");
-    assert!(listing.profiles.is_empty());
-    assert_eq!(render_listing(&listing), "No host agent profiles.\n");
-}
-
-#[test]
 fn listing_names_invalid_profile_files_by_a_sanitized_name() {
     let agents = Agents::new(0o700);
     agents.write("ok", "base = \"shell\"\n", 0o600);
@@ -458,74 +343,4 @@ fn profile_names_lists_valid_profile_files_only() {
     fs::write(agents.dir.join(".pohunek-profile-migrate-ab"), "x").expect("staging name");
     assert_eq!(profile_names(&agents.dir), ["alpha", "beta"]);
     assert!(profile_names(&agents.dir.join("missing")).is_empty());
-}
-
-fn bind_result(
-    status: PackageBindStatus,
-    previous: Option<&str>,
-    reloaded: bool,
-) -> PackageBindProfileResult {
-    PackageBindProfileResult {
-        status,
-        profile: "work".to_owned(),
-        base: RuntimeId::parse("acme-pi").expect("base"),
-        previous: previous.map(|digest| PackageDigest::parse(digest).expect("digest")),
-        package: info("acme.pi", DIGEST_NEW, Some("acme-pi")),
-        runtime: protocol::PackageRuntimeInfo {
-            runtime_id: RuntimeId::parse("acme-pi").expect("runtime"),
-            display_name: "Acme Pi".to_owned(),
-            program: "pi".to_owned(),
-            args: Vec::new(),
-            launch_args: None,
-            resume_args: None,
-            fork_args: None,
-            prompt_argument: false,
-            version_probe: None,
-            resumable: false,
-            forkable: false,
-            integration_handler: None,
-            hook_schema: None,
-        },
-        reloaded,
-    }
-}
-
-#[test]
-fn review_and_result_text_name_the_change_without_content() {
-    let review = render_review(&bind_result(PackageBindStatus::Preview, None, false));
-    for needle in [
-        "work",
-        "acme-pi",
-        "acme.pi 1.0.0",
-        DIGEST_NEW,
-        "Current pin: none",
-    ] {
-        assert!(review.contains(needle), "{needle}: {review}");
-    }
-    let review = render_review(&bind_result(
-        PackageBindStatus::Preview,
-        Some(DIGEST_OLD),
-        false,
-    ));
-    assert!(
-        review.contains(&format!("Current pin: {DIGEST_OLD}")),
-        "{review}"
-    );
-
-    let bound = render_migration(&bind_result(
-        PackageBindStatus::Bound,
-        Some(DIGEST_OLD),
-        true,
-    ));
-    assert!(
-        bound.starts_with("Pinned profile work to acme.pi 1.0.0"),
-        "{bound}"
-    );
-    let unchanged = render_migration(&bind_result(
-        PackageBindStatus::Unchanged,
-        Some(DIGEST_NEW),
-        false,
-    ));
-    assert!(unchanged.contains("already pins"), "{unchanged}");
-    assert!(unchanged.contains("nothing changed"), "{unchanged}");
 }

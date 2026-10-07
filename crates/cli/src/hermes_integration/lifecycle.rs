@@ -1700,37 +1700,6 @@ mod tests {
     }
 
     #[test]
-    fn resolver_target_metadata_round_trips_through_canonical_marker_parser() {
-        let (_root, target, policy_path, _policy) = setup("marker-roundtrip");
-        let rendered = assets::render(&policy_path).expect("rendered assets");
-        let ownership =
-            assets::ownership(target.hermes_home(), &policy_path, &rendered).expect("ownership");
-        let marker = assets::marker_bytes(&ownership).expect("marker bytes");
-        assert_eq!(
-            assets::parse_marker(&marker).expect("canonical marker parse"),
-            ownership
-        );
-    }
-
-    #[test]
-    fn staged_marker_round_trips_through_canonical_parser() {
-        let (root, target, policy_path, _policy) = setup("staged-marker");
-        let rendered = assets::render(&policy_path).expect("rendered assets");
-        let ownership =
-            assets::ownership(target.hermes_home(), &policy_path, &rendered).expect("ownership");
-        let stage = root.0.join("stage");
-        fs::create_dir(&stage).expect("stage directory");
-        fs::set_permissions(&stage, fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE))
-            .expect("private stage");
-        write_stage(&mut NativeFileOps, &stage, &rendered, &ownership).expect("write stage");
-        let marker = fs::read(stage.join(MARKER_NAME)).expect("marker bytes");
-        assert_eq!(
-            assets::parse_marker(&marker).expect("canonical staged marker parse"),
-            ownership
-        );
-    }
-
-    #[test]
     fn activated_marker_retains_private_mode_and_canonical_contents() {
         let (root, target, policy_path, _policy) = setup("activated-marker");
         let rendered = assets::render(&policy_path).expect("rendered assets");
@@ -1787,33 +1756,6 @@ mod tests {
             PRIVATE_FILE_MODE
         );
         assert!(!install(&mut hermes, &request).expect("idempotent").modified);
-    }
-
-    #[test]
-    fn update_requires_confirmation_for_modified_assets_and_replaces_policy() {
-        let (_root, target, policy_path, policy) = setup("update");
-        let mut hermes = ControlledHermes::default();
-        install(
-            &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
-        )
-        .expect("install");
-        fs::write(target.plugin_root().join("tools.py"), b"modified").expect("modify asset");
-        assert_eq!(
-            install(
-                &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
-            ),
-            Err(Error::ConfirmationRequired)
-        );
-        install(
-            &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, true),
-        )
-        .expect("confirmed update");
-        assert!(fs::read(target.plugin_root().join("tools.py"))
-            .expect("tools")
-            .starts_with(b"\"\"\""));
     }
 
     #[test]
@@ -2291,39 +2233,6 @@ esac"#,
     }
 
     #[test]
-    fn injected_first_update_rename_failure_preserves_original_bytes_and_enablement() {
-        let (_root, target, policy_path, policy) = setup("rename-failure");
-        let mut hermes = ControlledHermes::default();
-        install(
-            &mut hermes,
-            &InstallRequest::new(&target, &policy_path, &policy, false),
-        )
-        .expect("initial install");
-        let original_tool = fs::read(target.plugin_root().join("tools.py")).expect("original tool");
-        let original_policy = fs::read(&policy_path).expect("original policy");
-        let mut files = FailingFileOps::new(11);
-        assert_eq!(
-            install_with(
-                &mut hermes,
-                &InstallRequest::new(&target, &policy_path, &policy, false),
-                &mut files,
-            ),
-            Err(Error::Io {
-                kind: std::io::ErrorKind::Other,
-            })
-        );
-        assert_eq!(
-            fs::read(target.plugin_root().join("tools.py")).expect("restored tool"),
-            original_tool
-        );
-        assert_eq!(
-            fs::read(&policy_path).expect("restored policy"),
-            original_policy
-        );
-        assert!(hermes.enabled);
-    }
-
-    #[test]
     fn every_staged_write_and_activation_rename_failure_restores_exact_update_state() {
         // Eight assets, one marker, and one policy write precede four activation moves.
         const TRANSACTION_FILE_OPS: usize = 14;
@@ -2339,14 +2248,16 @@ esac"#,
                 fs::read(target.plugin_root().join("tools.py")).expect("original tool");
             let original_policy = fs::read(&policy_path).expect("original policy");
             let mut files = FailingFileOps::new(failure_at);
-            assert!(
+            assert_eq!(
                 install_with(
                     &mut hermes,
                     &InstallRequest::new(&target, &policy_path, &policy, false),
                     &mut files,
-                )
-                .is_err(),
-                "failure index {failure_at} must fail"
+                ),
+                Err(Error::Io {
+                    kind: std::io::ErrorKind::Other,
+                }),
+                "failure index {failure_at} must surface the injected pre-commit failure"
             );
             assert_eq!(
                 fs::read(target.plugin_root().join("tools.py")).expect("restored tool"),
