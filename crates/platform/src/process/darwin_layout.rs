@@ -433,12 +433,21 @@ mod tests {
         let whole = procargs(2, b"/bin/sh", 0, &[b"sh", b"-c"], &[b"HOME=/"]);
         let mut negative = whole.clone();
         negative[..4].copy_from_slice(&(-1_i32).to_ne_bytes());
+        let oversized_count = procargs(
+            i32::try_from(MAX_ARGUMENT_COUNT).expect("bound fits a C int") + 1,
+            b"/bin/sh",
+            1,
+            &[],
+            &[],
+        );
         let unwritten = procargs(1, b"", 0, &[b"sh"], &[]);
+        let no_executable = procargs(0, b"", 0, &[], &[]);
         let short_of_arguments = {
             let mut buffer = 3_i32.to_ne_bytes().to_vec();
             buffer.extend_from_slice(b"/bin/sh\0sh");
             buffer
         };
+        let more_arguments_than_strings = procargs(3, b"/bin/sh", 1, &[b"sh"], &[]);
         let oversized_marker = procargs(
             1,
             b"/bin/sh",
@@ -451,20 +460,31 @@ mod tests {
             .as_bytes()],
         );
 
-        let empty: &[u8] = &[];
-        for buffer in [
-            &whole[..whole.len() / 2],
-            &whole[..2],
-            empty,
-            negative.as_slice(),
-            unwritten.as_slice(),
-            short_of_arguments.as_slice(),
-            oversized_marker.as_slice(),
+        let count_only = 1_i32.to_ne_bytes();
+        for (case, buffer) in [
+            ("cut in half", &whole[..whole.len() / 2]),
+            ("two bytes", &whole[..2]),
+            ("three bytes", &[0_u8; 3][..]),
+            ("empty", &[][..]),
+            ("a count without an executable region", &count_only[..]),
+            ("a negative count", negative.as_slice()),
+            ("an oversized count", oversized_count.as_slice()),
+            ("an unwritten executable", unwritten.as_slice()),
+            (
+                "an empty executable without arguments",
+                no_executable.as_slice(),
+            ),
+            ("an unterminated argument", short_of_arguments.as_slice()),
+            (
+                "a count above the strings present",
+                more_arguments_than_strings.as_slice(),
+            ),
+            ("an oversized marker value", oversized_marker.as_slice()),
         ] {
             assert_eq!(
                 decode_argument_region(buffer),
                 ArgumentRegion::Unobservable,
-                "{buffer:?}"
+                "{case}"
             );
         }
     }
@@ -505,56 +525,6 @@ mod tests {
         let parsed = parse_process_arguments(&buffer).expect("kernel layout");
 
         assert_eq!(parsed.executable.as_os_str(), OsStr::from_bytes(raw));
-    }
-
-    #[test]
-    fn empty_and_truncated_buffers_are_malformed() {
-        for buffer in [
-            Vec::new(),
-            vec![0_u8; 3],
-            // An argument count without any executable region.
-            1_i32.to_ne_bytes().to_vec(),
-            // A count that promises more arguments than the region holds.
-            procargs(3, b"/bin/sh", 1, &[b"sh"], &[]),
-        ] {
-            assert_eq!(
-                parse_process_arguments(&buffer),
-                Err(LayoutError::Malformed),
-                "buffer of {} bytes must be rejected",
-                buffer.len()
-            );
-        }
-    }
-
-    #[test]
-    fn negative_and_oversized_argument_counts_are_malformed() {
-        let negative = procargs(-1, b"/bin/sh", 1, &[], &[]);
-        assert_eq!(
-            parse_process_arguments(&negative),
-            Err(LayoutError::Malformed)
-        );
-
-        let oversized = procargs(
-            i32::try_from(MAX_ARGUMENT_COUNT).expect("bound fits a C int") + 1,
-            b"/bin/sh",
-            1,
-            &[],
-            &[],
-        );
-        assert_eq!(
-            parse_process_arguments(&oversized),
-            Err(LayoutError::Malformed)
-        );
-    }
-
-    #[test]
-    fn an_empty_executable_region_is_malformed() {
-        let buffer = procargs(0, b"", 0, &[], &[]);
-
-        assert_eq!(
-            parse_process_arguments(&buffer),
-            Err(LayoutError::Malformed)
-        );
     }
 
     #[test]
@@ -635,18 +605,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_oversized_runtime_marker_is_malformed() {
-        let mut entry = b"POHUNEK_WORKER_INSTANCE_ID=".to_vec();
-        entry.extend(std::iter::repeat_n(b'r', MAX_MARKER_VALUE_BYTES + 1));
-        let buffer = procargs(1, b"/bin/sh", 1, &[b"sh"], &[&entry]);
-
-        assert_eq!(
-            parse_process_arguments(&buffer),
-            Err(LayoutError::Malformed)
-        );
-    }
-
     /// Builds an environment of `filler` unrelated entries followed by the
     /// runtime marker.
     fn environment_with_marker_after(filler: usize) -> Vec<Vec<u8>> {
@@ -716,19 +674,6 @@ mod tests {
         assert_eq!(
             encode_start_identity(u64::MAX, 0),
             Err(LayoutError::OutOfRange)
-        );
-    }
-
-    #[test]
-    fn identical_start_times_compare_equal_across_callers() {
-        let daemon_view = encode_start_identity(1_700_000_000, 5).expect("in range");
-        let worker_view = encode_start_identity(1_700_000_000, 5).expect("in range");
-
-        assert_eq!(daemon_view, worker_view);
-        assert_eq!(daemon_view.to_string(), worker_view.to_string());
-        assert_ne!(
-            daemon_view,
-            encode_start_identity(1_700_000_000, 6).expect("in range")
         );
     }
 

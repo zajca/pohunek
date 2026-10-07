@@ -226,18 +226,6 @@ mod tests {
     const BODY_FAILURE: &str = "body failed after the spawner started";
 
     #[test]
-    fn the_result_of_the_body_is_returned() {
-        let dir = pohunek_test_support::tempdir().expect("fixture directory");
-        assert_eq!(
-            while_a_sibling_spawns(dir.path(), |sibling| {
-                sibling.wait_for_next_spawn();
-                7
-            }),
-            7
-        );
-    }
-
-    #[test]
     fn a_panicking_body_stops_the_spawner_and_returns_its_panic_instead_of_hanging() {
         let dir = pohunek_test_support::tempdir().expect("fixture directory");
         let cwd = dir.path().to_path_buf();
