@@ -19364,3 +19364,166 @@ async fn a_resume_over_outdated_hook_assets_carries_a_hook_warning() {
     let resumed = registry.resume(&created.id).await.expect("resume");
     assert!(warns_of_outdated_hooks(&resumed), "{:?}", resumed.warnings);
 }
+
+/// A registry where the profile `claude` shadows the bare Claude runtime and
+/// carries its own config home `profile_dir`, while the registry's default
+/// Claude home is `default_dir`.
+#[cfg(unix)]
+fn shadowing_profile_registry(
+    tag: &str,
+    default_dir: &std::path::Path,
+    profile_dir: &std::path::Path,
+    script: &std::path::Path,
+    store_path: Option<PathBuf>,
+) -> SessionRegistry {
+    let agents_dir = temp_agents_dir_with(
+        tag,
+        "claude",
+        &format!(
+            "base = \"claude\"\nprogram = \"{}\"\n[env]\nCLAUDE_CONFIG_DIR = \"{}\"\n",
+            script.display(),
+            profile_dir.display()
+        ),
+    );
+    claude_home_registry(default_dir, agents_dir, store_path)
+}
+
+/// Installs the Claude hooks into the home of the profile `claude` only.
+#[cfg(unix)]
+fn install_shadowing_profile_hooks(registry: &SessionRegistry) {
+    crate::integration::install_in(
+        &registry.integration_homes().expect("config homes"),
+        Some(&protocol::RuntimeRef::claude()),
+        &crate::integration::HomeSelection::Profile("claude".to_owned()),
+        &crate::integration::RetainedSchemas::default(),
+    )
+    .expect("install the profile's Claude hooks");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fork_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
+    let default_dir = temp_dir("shadow-fork-default");
+    let profile_dir = temp_dir("shadow-fork-profile");
+    let dir = temp_dir("shadow-fork-runtime");
+    let script = dir.join("fork-agent");
+    write_executable(&script, "#!/bin/sh\nsleep 30\n");
+    let registry =
+        shadowing_profile_registry("shadow-fork", &default_dir, &profile_dir, &script, None);
+    install_shadowing_profile_hooks(&registry);
+    let created = create_in(&registry, "claude", &dir).await.expect("create");
+    let recorded = registry
+        .report_native_id(native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: "native-shadow".to_owned(),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded);
+    drift_claude_state_hook(&profile_dir);
+
+    let forked = registry
+        .fork(SessionForkParams {
+            session_id: created.id.clone(),
+            name: None,
+            cwd_mode: ForkCwdMode::Same,
+            cols: 80,
+            rows: 24,
+            accept_profile_change: false,
+        })
+        .await
+        .expect("fork");
+    let warning = forked
+        .warnings
+        .iter()
+        .find(|warning| warning.kind == protocol::SessionWarningKind::Hook)
+        .expect("the profile home's outdated hooks are flagged");
+    assert!(
+        warning
+            .message
+            .contains("pohunek integration install --agent claude --profile claude"),
+        "{}",
+        warning.message
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resume_of_a_profile_named_after_its_runtime_checks_the_profile_home() {
+    let default_dir = temp_dir("shadow-resume-default");
+    let profile_dir = temp_dir("shadow-resume-profile");
+    let runtime = temp_dir("shadow-resume-runtime");
+    let script = runtime.join("resume-agent");
+    let gate_path = runtime.join("exit.gate");
+    let mut exit_gate = hook_gate(&gate_path);
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" --resume \"*) sleep 30 ;; *) read _ < '{}'; exit 0 ;; esac\n",
+            gate_path.display(),
+        ),
+    );
+    let registry = shadowing_profile_registry(
+        "shadow-resume",
+        &default_dir,
+        &profile_dir,
+        &script,
+        Some(temp_store_path("shadow-resume")),
+    );
+    install_shadowing_profile_hooks(&registry);
+    let created = create_in(&registry, "claude", &runtime)
+        .await
+        .expect("create");
+    let recorded = registry
+        .report_native_id(native_report!(&registry;
+            session_id: created.id.clone(),
+            agent: "claude".to_owned(),
+            native_session_id: "native-shadow".to_owned(),
+            transcript_path: None,
+        ))
+        .await;
+    assert!(recorded.recorded);
+    exit_gate
+        .write_all(b"go\n")
+        .expect("release the agent exit gate");
+    registry
+        .wait_for_exit(&created.id, HANG_GUARD)
+        .await
+        .expect("session exits");
+    let mut sessions = registry.inner.sessions.lock().await;
+    let entry = sessions.get_mut(&created.id).expect("terminal entry");
+    entry.info.runtime = Some(SessionRuntime {
+        state: RuntimeState::Lost,
+        runtime_generation: protocol::RuntimeGeneration::new(1),
+        worker_id: Some("worker-before-recovery".to_owned()),
+        worker_instance_id: Some("runtime-before-recovery".to_owned()),
+        started_at: Some(created.created_at.clone()),
+        last_connected_at: None,
+        loss_reason: Some("test_runtime_lost".to_owned()),
+    });
+    entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
+    let lost_job = entry.job.clone().expect("created session records its job");
+    drop(sessions);
+    registry
+        .lifecycle()
+        .expect("test registry supervises workers")
+        .retire(&lost_job)
+        .await
+        .expect("retire the lost generation");
+    drift_claude_state_hook(&profile_dir);
+
+    let resumed = registry.resume(&created.id).await.expect("resume");
+    let warning = resumed
+        .warnings
+        .iter()
+        .find(|warning| warning.kind == protocol::SessionWarningKind::Hook)
+        .expect("the profile home's outdated hooks are flagged");
+    assert!(
+        warning
+            .message
+            .contains("pohunek integration install --agent claude --profile claude"),
+        "{}",
+        warning.message
+    );
+}

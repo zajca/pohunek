@@ -133,7 +133,7 @@ impl RecoveryProfile {
 
 /// Everything a resume or fork launches with, resolved once and consumed by
 /// verification, launch and the relaunched snapshot.
-struct RelaunchPlan {
+pub(super) struct RelaunchPlan {
     definition: Arc<RuntimeDefinition>,
     launch: NativeSessionLaunch,
     session_ref: SessionRef,
@@ -141,7 +141,7 @@ struct RelaunchPlan {
     validated_program: Option<ValidatedLaunchProgram>,
     /// Base environment the launch hands to the agent.
     base_environment: BaseEnv,
-    profile: RecoveryProfile,
+    pub(super) profile: RecoveryProfile,
 }
 
 /// The profile a session was launched from no longer resolves.
@@ -435,6 +435,7 @@ impl SessionRegistry {
         // A fork starts a new process of the runtime, so a runtime with a
         // version probe is probed again before anything is allocated.
         let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
+        let outdated_hooks = self.outdated_relaunch_warnings(&binding, &relaunch).await;
         let id = Self::allocate_session_id();
         self.ensure_worker_socket(&id)?;
         let input_rules = self.recovery_input_rules(&binding, &relaunch.definition);
@@ -488,7 +489,6 @@ impl SessionRegistry {
             },
             profile_revision: revision,
         };
-        let outdated_hooks = self.outdated_binding_warnings(&binding).await;
         let guard = self.lock_lifecycle(&id).await;
         let info = self
             .register_pty_session(
@@ -815,7 +815,7 @@ impl SessionRegistry {
         // binding without a snapshot program falls back to the base kind's
         // compiled spec.
         let id = SessionId(binding.session_id.clone());
-        let outdated_hooks = self.outdated_binding_warnings(&binding).await;
+        let outdated_hooks = self.outdated_relaunch_warnings(&binding, &relaunch).await;
 
         // A legacy binding carries no snapshot program; fall back to the base kind's
         // default so it still relaunches. `program`/`input_rules` are frozen

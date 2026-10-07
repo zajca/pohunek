@@ -165,7 +165,7 @@ pub(crate) fn inspect(
                 &mut checks,
                 "asset_current",
                 state.installed && !state.outdated,
-                "reinstall the managed plugin with `pohunek integration install --agent hermes` to replace assets from an older release",
+                "run `pohunek integration update --agent hermes` with the original `--hermes-profile` or `--hermes-home` to replace assets from an older release",
             );
             set_result(
                 &mut checks,

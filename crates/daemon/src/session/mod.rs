@@ -2224,11 +2224,22 @@ impl SessionRegistry {
         Ok((info, pending_initial_input))
     }
 
-    /// [`Self::outdated_integration_warning`] for the agent a resume binding
-    /// relaunches, as the warnings of the relaunched session.
-    async fn outdated_binding_warnings(&self, binding: &ResumeBinding) -> Vec<SessionWarning> {
-        let profile =
-            (binding.agent != binding.agent_base.as_wire()).then(|| binding.agent.clone());
+    /// [`Self::outdated_integration_warning`] for the agent `binding` relaunches
+    /// under `relaunch`, as the warnings of the relaunched session.
+    ///
+    /// A revision is frozen exactly when the relaunch resolved a host profile,
+    /// which then names the binding's agent; a profile may carry its runtime's
+    /// own name, so the name alone cannot tell.
+    async fn outdated_relaunch_warnings(
+        &self,
+        binding: &ResumeBinding,
+        relaunch: &resume::RelaunchPlan,
+    ) -> Vec<SessionWarning> {
+        let profile = relaunch
+            .profile
+            .revision
+            .is_some()
+            .then(|| binding.agent.clone());
         self.outdated_integration_warning(binding.agent_base.clone(), profile)
             .await
             .into_iter()
