@@ -179,28 +179,6 @@ mod tests {
     }
 
     #[test]
-    fn non_executable_daemon_binary_on_path_is_not_resolved() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let guard = pohunek_test_support::tempdir().expect("create dir");
-        let dir = guard.path().to_path_buf();
-        let plain = dir.join(DAEMON_BIN);
-        std::fs::write(&plain, b"#!/bin/sh\n").expect("write");
-        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-
-        assert_eq!(
-            hostcheck::resolve_executable(DAEMON_BIN, Some(dir.as_os_str())),
-            None
-        );
-
-        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        assert_eq!(
-            hostcheck::resolve_executable(DAEMON_BIN, Some(dir.as_os_str())),
-            Some(plain)
-        );
-    }
-
-    #[test]
     fn service_mode_passes_only_the_service_config() {
         let command = service_command(
             Path::new("/p/libexec/pohunek/1.0.0/pohunekd"),

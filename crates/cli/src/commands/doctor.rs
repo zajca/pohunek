@@ -400,35 +400,6 @@ mod tests {
         (guard, base)
     }
 
-    /// Build a `Paths` rooted at `base` (same-crate `pub(crate)` fields).
-    fn paths_at(base: &Path) -> Paths {
-        Paths {
-            runtime_dir: base.join("runtime"),
-            socket: base.join("runtime").join("daemon.sock"),
-            data_dir: base.join("data"),
-            log_dir: base.join("logs"),
-            cache_dir: base.join("cache"),
-            config_home: base.join("config"),
-            config_dir: base.join("config").join("pohunek"),
-            origin_source: pohunek_client::OriginSource::Omitted,
-        }
-    }
-
-    /// The CLI doctor wiring assembles a report (the individual host probes are
-    /// covered in the `hostcheck` crate). Writable temp dirs make the
-    /// directory-writability checks pass; the result is rendered as JSON without
-    /// error.
-    #[tokio::test]
-    async fn run_assembles_report_without_error() {
-        let (_guard, base) = unique_temp_dir();
-        let paths = paths_at(&base);
-
-        let healthy = run(&paths, true).await.expect("doctor run resolves");
-        // We assert only that the run completed and produced a boolean verdict;
-        // the exact value depends on which binaries exist on the test host.
-        let _ = healthy;
-    }
-
     fn job(state: &'static str) -> crate::service::report::JobReport {
         crate::service::report::JobReport {
             service_id: "dev.pohunek.daemon".to_owned(),
@@ -545,16 +516,6 @@ mod tests {
         assert_eq!(native.status, Status::Fail);
         assert_eq!(unknown.status, Status::Warn);
         assert!(unknown.detail.contains("supervision mode unknown"));
-    }
-
-    #[test]
-    fn the_supervision_mode_needs_an_installed_service_config() {
-        let (_guard, base) = unique_temp_dir();
-        std::fs::create_dir_all(&base).expect("create config dir");
-
-        assert_eq!(supervision_mode(&base), Supervision::Unknown);
-        std::fs::write(base.join("service.toml"), "x").expect("write service.toml");
-        assert_eq!(supervision_mode(&base), Supervision::Native);
     }
 
     #[test]

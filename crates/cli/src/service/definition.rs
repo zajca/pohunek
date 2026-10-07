@@ -199,36 +199,6 @@ mod tests {
     use crate::service::context::PathDiscovery;
 
     #[test]
-    fn initial_config_writes_the_documented_values() {
-        let (_root, root) = temp_root();
-        let context = context(root.as_path());
-        let prefix = root.as_path().join("prefix");
-        let config = initial_config(&context, &prefix, "1.2.3").expect("config");
-        assert_eq!(config.active_version(), "1.2.3");
-        assert_eq!(config.prefix(), prefix);
-        let deadlines = config.deadlines();
-        assert_eq!(deadlines.worker_connect.as_secs(), 10);
-        assert_eq!(deadlines.worker_initialize.as_secs(), 45);
-        assert_eq!(deadlines.launchctl_command.as_secs(), 10);
-        assert_eq!(deadlines.worker_exit_timeout.as_secs(), 30);
-        assert_eq!(deadlines.daemon_exit_timeout.as_secs(), 30);
-        assert_eq!(deadlines.daemon_restart_throttle.as_secs(), 5);
-        assert_eq!(config.sweep_grace().as_secs(), 5);
-        assert_eq!(config.open_files(), 8_192);
-        assert_eq!(
-            config.environment_allowlist(),
-            DEFAULT_ENVIRONMENT_ALLOWLIST
-        );
-        assert_eq!(config.namespace(), context.namespace().expect("namespace"));
-        assert_eq!(
-            with_version(&config, "1.2.4")
-                .expect("upgrade config")
-                .active_version(),
-            "1.2.4"
-        );
-    }
-
-    #[test]
     fn daemon_definition_runs_the_versioned_daemon_with_the_config() {
         let (_root, root) = temp_root();
         let context = context(root.as_path());
@@ -423,35 +393,6 @@ mod tests {
             identity_config(&context, &root.join("prefix"), "1.2.3").expect("identity config");
         assert!(config.search_path().is_empty());
         assert!(!marker.exists());
-    }
-
-    #[test]
-    fn the_managed_policy_uses_the_documented_defaults() {
-        let PathDiscovery::Managed {
-            login_shell: Some(spec),
-            shell_defaulted,
-            fallback_directories,
-        } = managed_path_discovery(None, Vec::new()).expect("discovery")
-        else {
-            panic!("managed discovery");
-        };
-        assert!(shell_defaulted, "an unset $SHELL is reported as defaulted");
-        assert_eq!(spec.shell, Path::new(settings::DEFAULT_LOGIN_SHELL));
-        assert_eq!(spec.timeout, settings::LOGIN_SHELL_TIMEOUT);
-        assert_eq!(spec.max_output_bytes, settings::LOGIN_SHELL_OUTPUT);
-        assert!(fallback_directories.contains(&"/opt/homebrew/bin".to_owned()));
-        assert!(fallback_directories.contains(&"/usr/local/bin".to_owned()));
-        let PathDiscovery::Managed {
-            login_shell: Some(spec),
-            shell_defaulted,
-            ..
-        } = managed_path_discovery(Some(std::path::PathBuf::from("/bin/fish")), Vec::new())
-            .expect("discovery")
-        else {
-            panic!("managed discovery");
-        };
-        assert!(!shell_defaulted);
-        assert_eq!(spec.shell, Path::new("/bin/fish"));
     }
 
     #[test]

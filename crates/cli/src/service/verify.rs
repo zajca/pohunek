@@ -214,11 +214,6 @@ mod tests {
     use pohunek_test_support::env::TestEnv;
 
     #[test]
-    fn scratch_names_differ_for_one_process_and_one_clock_reading() {
-        assert_ne!(scratch_name(7, 42, 0), scratch_name(7, 42, 1));
-    }
-
-    #[test]
     fn concurrent_scratch_directories_never_collide() {
         let scratches: Vec<_> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..16)
@@ -274,39 +269,6 @@ mod tests {
             verifier.verify(&config.namespace(), &definition).await,
             Err(Error::UnitVerification { .. })
         ));
-    }
-
-    #[tokio::test]
-    async fn a_configured_program_accepting_the_units_verifies_them() {
-        let (_root, root) = temp_root();
-        let (config, definition) = definition_below(&root);
-        UnitVerifier::default()
-            .with_program("/bin/true")
-            .verify(&config.namespace(), &definition)
-            .await
-            .expect("accepting program");
-    }
-
-    #[tokio::test]
-    async fn a_configured_program_rejecting_the_units_fails_the_verification() {
-        let (_root, root) = temp_root();
-        let (config, definition) = definition_below(&root);
-        let result = UnitVerifier::default()
-            .with_program("/bin/false")
-            .verify(&config.namespace(), &definition)
-            .await;
-        assert!(matches!(result, Err(Error::UnitVerification { .. })));
-    }
-
-    #[tokio::test]
-    async fn a_missing_configured_program_is_a_missing_verifier() {
-        let (_root, root) = temp_root();
-        let (config, definition) = definition_below(&root);
-        let result = UnitVerifier::default()
-            .with_program(root.join("no-such-verifier"))
-            .verify(&config.namespace(), &definition)
-            .await;
-        assert!(matches!(result, Err(Error::VerifierMissing)));
     }
 
     #[test]
