@@ -1,5 +1,6 @@
 """Regression checks for the cost-shard coverage guard (stdlib only)."""
 
+import contextlib
 import importlib.machinery
 import importlib.util
 import os
@@ -293,7 +294,7 @@ class LeakedWorkerTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
     def test_a_signal_resistant_workload_is_killed_with_its_leaked_worker(self):
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
             base = Path(root)
             pid_file = base / "workload.pid"
             executable = base / "pohunek-sessiond"
@@ -305,9 +306,12 @@ class LeakedWorkerTests(unittest.TestCase):
                 [str(executable), "-c", script, "--daemon-socket-path", str(base / "d.sock")],
                 start_new_session=True,
             )
-            self.addCleanup(worker.wait)
-            self.addCleanup(self.kill_group, worker)
-            self.addCleanup(self.kill_recorded_workload, pid_file)
+            # The scope exits before the temporary directory is removed, so the
+            # recorded PID file still exists when the workload is killed, also
+            # when an assertion fails early.
+            scope.callback(worker.wait)
+            scope.callback(self.kill_group, worker)
+            scope.callback(self.kill_recorded_workload, pid_file)
             wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
             workload = int(pid_file.read_text())
             self.assertTrue(Path(f"/proc/{workload}").exists())
@@ -330,7 +334,7 @@ class LeakedWorkerTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
     def test_a_workload_whose_intermediate_parent_exited_is_still_killed(self):
-        with tempfile.TemporaryDirectory() as root:
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
             base = Path(root)
             pid_file = base / "workload.pid"
             inner = base / "inner.sh"
@@ -342,9 +346,12 @@ class LeakedWorkerTests(unittest.TestCase):
                 [str(executable), "-c", script, "--daemon-socket-path", str(base / "d.sock")],
                 start_new_session=True,
             )
-            self.addCleanup(worker.wait)
-            self.addCleanup(self.kill_group, worker)
-            self.addCleanup(self.kill_recorded_workload, pid_file)
+            # The scope exits before the temporary directory is removed, so the
+            # recorded PID file still exists when the workload is killed, also
+            # when an assertion fails early.
+            scope.callback(worker.wait)
+            scope.callback(self.kill_group, worker)
+            scope.callback(self.kill_recorded_workload, pid_file)
             wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
             leader = int(pid_file.read_text())
 
@@ -369,6 +376,32 @@ class LeakedWorkerTests(unittest.TestCase):
             stat = Path(f"/proc/{leader}/stat")
             wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
 
+    @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
+    def test_the_workload_dies_even_when_the_test_fails_early(self):
+        pid_file_seen = []
+
+        class Failing(unittest.TestCase):
+            def runTest(inner):
+                with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
+                    pid_file = Path(root) / "workload.pid"
+                    worker = subprocess.Popen(
+                        ["/bin/sh", "-c",
+                         f"setsid -w sh -c 'echo $$ > {pid_file}; sleep 613; true' & wait"],
+                        start_new_session=True,
+                    )
+                    scope.callback(worker.wait)
+                    scope.callback(self.kill_group, worker)
+                    scope.callback(self.kill_recorded_workload, pid_file)
+                    wait_for(lambda: pid_file.exists() and pid_file.read_text().strip())
+                    pid_file_seen.append(int(pid_file.read_text()))
+                    inner.fail("early assertion failure")
+
+        result = unittest.TestResult()
+        Failing().run(result)
+        self.assertEqual(len(result.failures), 1)
+        stat = Path(f"/proc/{pid_file_seen[0]}/stat")
+        wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+
     @staticmethod
     def kill_group(child):
         """SIGKILL the stand-in and the `sleep` it started, which share its group."""
@@ -379,13 +412,13 @@ class LeakedWorkerTests(unittest.TestCase):
 
     @staticmethod
     def kill_recorded_workload(pid_file):
-        """SIGKILL the workload whose PID the stand-in recorded, if it is still there."""
+        """SIGKILL the session the stand-in recorded: its leader and the `sleep` it started."""
         try:
-            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            os.killpg(int(pid_file.read_text()), signal.SIGKILL)
         except (OSError, ValueError):
             pass
 
-    def spawn_stand_in(self, base, name="pohunek-sessiond"):
+    def spawn_stand_in(self, base, scope, name="pohunek-sessiond"):
         """A real process whose argv names a worker below `base`, and its Process."""
         executable = base / name
         executable.symlink_to("/bin/sh")
@@ -393,8 +426,8 @@ class LeakedWorkerTests(unittest.TestCase):
             [str(executable), "-c", "sleep 30; true", "--daemon-socket-path", str(base / "d.sock")],
             start_new_session=True,
         )
-        self.addCleanup(child.wait)
-        self.addCleanup(self.kill_group, child)
+        scope.callback(child.wait)
+        scope.callback(self.kill_group, child)
         found = None
         while found is None:
             found = next(
@@ -406,8 +439,8 @@ class LeakedWorkerTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "reads /proc")
     def test_a_recycled_pid_is_not_killed_and_a_matching_process_is(self):
-        with tempfile.TemporaryDirectory() as root:
-            process = self.spawn_stand_in(Path(root))
+        with tempfile.TemporaryDirectory() as root, contextlib.ExitStack() as scope:
+            process = self.spawn_stand_in(Path(root), scope)
             recycled = partitions.Process(process.pid, process.start + "1", process.argv)
             self.assertFalse(partitions.kill_if_unchanged(recycled))
             self.assertIn(process.pid, [p.pid for p in partitions.read_processes()])
@@ -415,8 +448,8 @@ class LeakedWorkerTests(unittest.TestCase):
 
     @unittest.skipUnless(sys.platform == "linux", "reads /proc")
     def test_paths_with_spaces_survive_the_real_process_table(self):
-        with tempfile.TemporaryDirectory(prefix="a b ") as root:
-            process = self.spawn_stand_in(Path(root))
+        with tempfile.TemporaryDirectory(prefix="a b ") as root, contextlib.ExitStack() as scope:
+            process = self.spawn_stand_in(Path(root), scope)
             found = partitions.leaked_workers(partitions.read_processes(), Path(root))
             self.assertEqual([p.pid for p, _ in found], [process.pid])
             partitions.kill_if_unchanged(process)

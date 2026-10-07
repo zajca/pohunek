@@ -46,7 +46,7 @@
 
 // Rust guideline compliant 2026-06-26
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -143,7 +143,7 @@ enum Stop {
 fn as_worker(entry: &ProcessEntry) -> Option<WorkerProcess> {
     let named = |path: &Path| {
         path.file_name()
-            .and_then(OsStr::to_str)
+            .and_then(|name| name.to_str())
             .is_some_and(|name| name.trim_end_matches(" (deleted)") == WORKER_EXECUTABLE)
     };
     let is_worker = entry
@@ -394,12 +394,43 @@ fn process_table() -> io::Result<Vec<ProcessEntry>> {
     Ok(entries)
 }
 
-/// Reads the process table from `ps`, whose output has lost argument
-/// boundaries: a path with spaces splits into several arguments there.
+/// Words before the command in a line of `ps -o pid=,ppid=,lstart=,args=`: the
+/// PID, the parent PID and the five words of `lstart` ("Mon Oct  7 22:06:00 2026").
+#[cfg(any(not(target_os = "linux"), test))]
+const PS_LEADING_WORDS: usize = 7;
+
+/// Parses one line of `ps -axww -o pid=,ppid=,lstart=,args=`.
+///
+/// `ps` has lost the argument boundaries, so the complete command column is
+/// kept as the single `argv` element and matched as text
+/// ([`command_is_worker_below`]).
+#[cfg(any(not(target_os = "linux"), test))]
+fn parse_ps_line(line: &str) -> Option<ProcessEntry> {
+    let mut rest = line.trim_start();
+    let mut words = Vec::with_capacity(PS_LEADING_WORDS);
+    for _ in 0..PS_LEADING_WORDS {
+        let (word, tail) = rest.split_once(char::is_whitespace)?;
+        words.push(word);
+        rest = tail.trim_start();
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    Some(ProcessEntry {
+        pid: words[0].parse().ok()?,
+        parent_pid: words[1].parse().ok()?,
+        // `ps` has no portable session column; without one only descendants
+        // are part of a worker's workload.
+        session: 0,
+        start: words[2..].join(" "),
+        executable: None,
+        argv: vec![OsString::from(rest.trim_end())],
+    })
+}
+
+/// Reads the process table from `ps`.
 #[cfg(not(target_os = "linux"))]
 fn process_table() -> io::Result<Vec<ProcessEntry>> {
-    /// Whitespace-separated words of `ps -o lstart=` ("Mon Oct  7 22:06:00 2026").
-    const START_WORDS: usize = 5;
     let output = std::process::Command::new(PS_PROGRAM)
         .args(["-axww", "-o", "pid=,ppid=,lstart=,args="])
         .output()?;
@@ -409,29 +440,9 @@ fn process_table() -> io::Result<Vec<ProcessEntry>> {
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let table = String::from_utf8_lossy(&output.stdout);
-    Ok(table
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| {
-            let mut words = line.split_whitespace();
-            let pid = words.next()?.parse().ok()?;
-            let parent_pid = words.next()?.parse().ok()?;
-            let start = words
-                .by_ref()
-                .take(START_WORDS)
-                .collect::<Vec<_>>()
-                .join(" ");
-            Some(ProcessEntry {
-                pid,
-                parent_pid,
-                // `ps` has no portable session column; without one only
-                // descendants are part of a worker's workload.
-                session: 0,
-                start,
-                executable: None,
-                argv: words.map(OsString::from).collect(),
-            })
-        })
+        .filter_map(parse_ps_line)
         .collect())
 }
 
@@ -706,9 +717,9 @@ mod tests {
     use std::process::{Child, Command, Stdio};
 
     use super::{
-        as_worker, command_is_worker_below, parse_stat, reap_workers_under, signal_worker,
-        workers_among, workers_under, workload_of, ProcessEntry, ProcessId, Stat, Stop,
-        WorkerGuard, WorkerProcess,
+        as_worker, command_is_worker_below, parse_ps_line, parse_stat, reap_workers_under,
+        signal_worker, workers_among, workers_under, workload_of, ProcessEntry, ProcessId, Stat,
+        Stop, WorkerGuard, WorkerProcess,
     };
     use crate::process_env::ProcessEnv;
     use crate::tempdir;
@@ -1089,6 +1100,27 @@ mod tests {
             "grep pohunek-sessiond --daemon-socket-path /private/tmp/pw s/x",
             Path::new("/private/tmp/pw s")
         ));
+    }
+
+    #[test]
+    fn a_captured_ps_line_reaches_the_matcher_with_its_complete_command() {
+        let line =
+            "  4242     1 Wed Oct  7 22:06:00 2026 /Users/a b/target/debug/pohunek-sessiond \
+                    --session-id s-1 --daemon-socket-path /private/tmp/pw s/r/pohunek/daemon.sock";
+        let entry = parse_ps_line(line).expect("ps line");
+        assert_eq!((entry.pid, entry.parent_pid), (4242, 1));
+        assert_eq!(entry.start, "Wed Oct 7 22:06:00 2026");
+        assert_eq!(entry.argv.len(), 1, "the command stays one string");
+        let command = entry.argv[0].to_str().expect("utf-8");
+        assert!(command_is_worker_below(
+            command,
+            Path::new("/private/tmp/pw s")
+        ));
+        assert!(!command_is_worker_below(
+            command,
+            Path::new("/private/tmp/pw")
+        ));
+        assert_eq!(parse_ps_line("1 2 Wed Oct  7 22:06:00 2026"), None);
     }
 
     #[test]
