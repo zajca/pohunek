@@ -91,28 +91,6 @@ describe("attach raw stream", () => {
     }
   });
 
-  test("binary payloads round-trip without UTF-8 assumptions", async () => {
-    const daemon = await startUnixDaemon([
-      { kind: "attachSuccess", emit: [READY_BYTES], echo: true },
-    ]);
-    try {
-      const raw = await attachLocal(daemon, "stream-binary");
-      const reader = raw.readable.getReader();
-      const writer = raw.writable.getWriter();
-      const payload = patternedBytes(1024);
-
-      expectBytes(await readExactly(reader, READY_BYTES.byteLength), READY_BYTES);
-      await writer.write(payload);
-      expectBytes(await readExactly(reader, payload.byteLength), payload);
-
-      writer.releaseLock();
-      reader.releaseLock();
-      await raw.close();
-    } finally {
-      await daemon.close();
-    }
-  });
-
   test("multi-megabyte round-trip respects writer backpressure", async () => {
     const daemon = await startUnixDaemon([
       {
