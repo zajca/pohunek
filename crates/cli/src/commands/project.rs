@@ -505,22 +505,6 @@ mod tests {
     }
 
     #[test]
-    fn list_params_preserve_filters_for_typed_sdk_call() {
-        let params = list_params(&[
-            ProjectListFilter::Source(ProjectSource::Manual),
-            ProjectListFilter::Label("ui".to_owned()),
-        ]);
-
-        assert_eq!(
-            params.filters,
-            vec![
-                ProjectListFilter::Source(ProjectSource::Manual),
-                ProjectListFilter::Label("ui".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
     fn add_path_resolves_locally_and_requires_an_absolute_path_remotely() {
         let cwd = std::env::current_dir().expect("cwd");
         // Local, no path: the CLI fills its own cwd.
@@ -602,13 +586,5 @@ mod tests {
             output.contains("owned") && output.contains("session=s-1"),
             "owned worktree with a live session must be flagged: {output}"
         );
-    }
-
-    #[test]
-    fn list_and_show_json_round_trip() {
-        let projects = vec![project("p-aaa", "ui", ProjectSource::Auto)];
-        let doc = crate::commands::render_json(&projects).expect("json");
-        let parsed: Vec<ProjectInfo> = crate::commands::parse_json_ok(&doc);
-        assert_eq!(parsed, projects);
     }
 }

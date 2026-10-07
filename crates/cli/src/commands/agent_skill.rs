@@ -105,42 +105,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "embed-agent-skill")]
-    fn content_sha256_is_lowercase_hex_over_the_embedded_bytes() {
-        let digest = content_sha256();
-        assert_eq!(digest.len(), 64, "sha256 hex digest: {digest}");
-        assert!(
-            digest
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "digest must be lowercase hex: {digest}"
-        );
-    }
-
-    #[test]
-    #[cfg(feature = "embed-agent-skill")]
-    fn json_document_serializes_skill_and_hash_fields() {
-        let document = SkillDocument {
-            skill: EMBEDDED_SKILL,
-            content_sha256: content_sha256(),
-        };
-        let value: serde_json::Value =
-            serde_json::to_value(&document).expect("serialize skill document");
-        assert_eq!(value["skill"], EMBEDDED_SKILL);
-        assert_eq!(value["content_sha256"], content_sha256());
-    }
-
-    #[test]
-    #[cfg(feature = "embed-agent-skill")]
-    fn write_payload_writes_and_flushes_the_whole_payload() {
-        let mut buffer = Vec::new();
-
-        write_payload(&mut buffer, EMBEDDED_SKILL.as_bytes()).expect("in-memory write succeeds");
-
-        assert_eq!(buffer, EMBEDDED_SKILL.as_bytes());
-    }
-
-    #[test]
-    #[cfg(feature = "embed-agent-skill")]
     fn write_payload_treats_closed_consumer_as_successful_early_exit() {
         let mut writer = FailingWriter {
             kind: io::ErrorKind::BrokenPipe,

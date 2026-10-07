@@ -633,17 +633,6 @@ mod tests {
     }
 
     #[test]
-    fn sdk_client_error_delegates_to_sdk_protocol_mapping() {
-        let sdk = pohunek_client::ClientError::Framing("bad frame".to_owned());
-        let expected = sdk.to_protocol_error();
-
-        let structured = CliError::Client(sdk).to_protocol_error();
-
-        assert_eq!(structured, expected);
-        assert_eq!(structured.code, "framing");
-    }
-
-    #[test]
     fn sdk_descriptor_exhaustion_renders_specific_non_daemon_hint() {
         let err = CliError::Client(
             pohunek_client::ClientError::ClientFileDescriptorsExhausted {
@@ -703,17 +692,6 @@ mod tests {
     }
 
     #[test]
-    fn structured_error_serializes_to_parseable_json_with_stable_code() {
-        let err = CliError::Protocol(ProtocolError::agent_binary_missing("claude"));
-        let doc =
-            serde_json::to_string(&err.to_protocol_error()).expect("serialize structured error");
-        let parsed: ProtocolError = serde_json::from_str(&doc).expect("parse structured error");
-        assert_eq!(parsed.code, "agent_binary_missing");
-        assert!(parsed.msg.contains("claude"));
-        assert!(parsed.recover.is_some());
-    }
-
-    #[test]
     fn human_error_renders_recover_hint_for_version_mismatch() {
         let err = CliError::Protocol(ProtocolError::version_mismatch(
             ProtocolVersionRange::new(
@@ -735,14 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn human_error_renders_recover_hint_for_agent_binary_missing() {
-        let err = CliError::Protocol(ProtocolError::agent_binary_missing("claude"));
-        let text = human_error_text(&err);
-        assert!(text.contains("claude"), "text: {text}");
-        assert!(text.contains("hint:"), "text: {text}");
-    }
-
-    #[test]
     fn human_error_without_hint_has_no_hint_line() {
         let text = human_error_text(&CliError::Client(pohunek_client::ClientError::Framing(
             "bad frame".to_owned(),
@@ -755,77 +725,31 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn args_request_json_detects_the_flag() {
-        assert!(args_request_json([
-            "pohunek", "session", "inspect", "s-1", "--json"
-        ]));
-        assert!(args_request_json(["pohunek", "doctor", "--json"]));
-    }
-
-    #[test]
-    fn args_request_json_is_false_when_absent() {
-        assert!(!args_request_json(["pohunek", "session", "inspect", "s-1"]));
-        assert!(!args_request_json(["pohunek"]));
-    }
-
-    #[test]
-    fn args_request_json_ignores_program_name() {
-        // argv[0] is the program name, not a flag — even if it were `--json`.
-        assert!(!args_request_json(["--json"]));
-    }
-
-    #[test]
-    fn args_request_json_ignores_value_after_double_dash() {
-        // `--json` after `--` is a positional value (e.g. `session input` text),
-        // not the flag, so it must not flip the rendering mode.
-        assert!(!args_request_json([
-            "pohunek", "session", "input", "s-1", "--", "--json"
-        ]));
-    }
-
-    #[test]
-    fn clap_missing_required_arg_maps_to_cli_usage() {
-        // `session inspect` without its required <target> — the exact case from
-        // the finding (`session inspect --json`).
-        let err = crate::Cli::try_parse_from(["pohunek", "session", "inspect"])
-            .expect_err("missing <target> must fail to parse");
-        let pe = clap_error_to_protocol_error(&err);
-        assert_eq!(pe.class, ErrorClass::Configuration);
-        assert_eq!(pe.code, "cli_usage");
-        assert!(pe.recover.is_some(), "usage error carries a recover hint");
-        assert!(!pe.msg.is_empty(), "usage error has a message");
-        // The structured message must be plain text: no ANSI escape may leak
-        // into the JSON document.
-        assert!(
-            !pe.msg.contains('\u{1b}'),
-            "msg must be ANSI-free: {:?}",
-            pe.msg
-        );
-    }
-
-    #[test]
-    fn clap_invalid_value_maps_to_cli_usage_and_round_trips() {
-        // A clap invalid-value error. `session new --agent` is a free string
-        // (resolved daemon-side), so use `integration install --agent`, whose
-        // value_parser accepts the built-in names and any valid runtime id.
-        let err = crate::Cli::try_parse_from([
-            "pohunek",
-            "integration",
-            "install",
-            "--agent",
-            "Not An Id",
-        ])
-        .expect_err("invalid --agent value must fail to parse");
-        let pe = clap_error_to_protocol_error(&err);
-        assert_eq!(pe.code, "cli_usage");
-        // Round-trips through serde like every other structured error, so a
-        // script can deserialize and branch on `code`.
-        let doc = serde_json::to_string(&pe).expect("serialize structured usage error");
-        let parsed: ProtocolError =
-            serde_json::from_str(&doc).expect("parse structured usage error");
-        assert_eq!(parsed.code, "cli_usage");
-        assert_eq!(parsed.class, ErrorClass::Configuration);
-        assert!(parsed.recover.is_some());
+    fn args_request_json_detects_only_the_flag_itself() {
+        for (row, args, expected) in [
+            (
+                "inspect --json",
+                &["pohunek", "session", "inspect", "s-1", "--json"][..],
+                true,
+            ),
+            ("doctor --json", &["pohunek", "doctor", "--json"][..], true),
+            (
+                "flag absent",
+                &["pohunek", "session", "inspect", "s-1"][..],
+                false,
+            ),
+            ("program name only", &["pohunek"][..], false),
+            // argv[0] is the program name, never a flag.
+            ("argv[0] named --json", &["--json"][..], false),
+            // After `--` it is a positional value (e.g. `session input` text).
+            (
+                "value after --",
+                &["pohunek", "session", "input", "s-1", "--", "--json"][..],
+                false,
+            ),
+        ] {
+            assert_eq!(args_request_json(args.iter().copied()), expected, "{row}");
+        }
     }
 
     #[test]

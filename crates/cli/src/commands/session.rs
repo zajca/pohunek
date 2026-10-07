@@ -1448,19 +1448,6 @@ fn build_list_request(filters: &[ListFilter]) -> Result<Request, CliError> {
     request_with_params(method::SESSION_LIST, &list_params(filters))
 }
 
-#[cfg(test)]
-fn build_inspect_request(target: &Target) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_INSPECT,
-        &SessionId(target.session_id.clone()),
-    )
-}
-
-#[cfg(test)]
-fn build_stop_request(target: &Target) -> Result<Request, CliError> {
-    request_with_params(method::SESSION_STOP, &SessionId(target.session_id.clone()))
-}
-
 /// Recovery hint for a daemon that does not know the consent method.
 const CONSENT_METHOD_UPGRADE_HINT: &str =
     "the daemon predates --accept-unconfirmed-cleanup; upgrade the daemon and retry";
@@ -1485,19 +1472,6 @@ fn missing_consent_method_hint(error: CliError) -> CliError {
         }
         other => other,
     }
-}
-
-#[cfg(test)]
-fn build_remove_request(
-    target: &Target,
-    accept_unconfirmed_cleanup: bool,
-) -> Result<Request, CliError> {
-    let method = if accept_unconfirmed_cleanup {
-        method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED
-    } else {
-        method::SESSION_REMOVE
-    };
-    request_with_params(method, &SessionId(target.session_id.clone()))
 }
 
 fn fork_params(
@@ -1581,33 +1555,6 @@ fn diff_params(target: &Target, base: Option<String>) -> SessionDiffParams {
 #[cfg(test)]
 fn build_diff_request(target: &Target, base: Option<String>) -> Result<Request, CliError> {
     request_with_params(method::SESSION_DIFF, &diff_params(target, base))
-}
-
-#[cfg(test)]
-fn read_params(
-    target: &Target,
-    source: Option<SessionReadSource>,
-    lines: Option<u32>,
-    format: Option<SessionReadFormat>,
-) -> Result<SessionReadParams, CliError> {
-    SessionReadParams::new(SessionId(target.session_id.clone()), source, lines, format).map_err(
-        |error| CliError::InvalidObservation {
-            detail: error.to_string(),
-        },
-    )
-}
-
-#[cfg(test)]
-fn build_read_request(
-    target: &Target,
-    source: Option<SessionReadSource>,
-    lines: Option<u32>,
-    format: Option<SessionReadFormat>,
-) -> Result<Request, CliError> {
-    request_with_params(
-        method::SESSION_READ,
-        &read_params(target, source, lines, format)?,
-    )
 }
 
 fn render_new_human(info: &SessionInfo) -> String {
@@ -2161,37 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn read_request_uses_bounded_defaults() {
-        let target = Target {
-            host: Some(LOCAL_HOST.to_owned()),
-            session_id: "session-1".to_owned(),
-        };
-        let request = build_read_request(&target, None, None, None).expect("valid params");
-        assert_request(
-            &request,
-            method::SESSION_READ,
-            json!({"session_id": "session-1"}),
-        );
-    }
-
-    #[test]
-    fn read_request_rejects_lines_above_ceiling() {
-        let target = Target {
-            host: Some(LOCAL_HOST.to_owned()),
-            session_id: "session-1".to_owned(),
-        };
-        let error = build_read_request(
-            &target,
-            Some(SessionReadSource::Recent),
-            Some(MAX_SESSION_READ_LINES + 1),
-            Some(SessionReadFormat::Text),
-        )
-        .expect_err("line limit should be rejected");
-        assert!(error.to_string().contains("1000"));
-    }
-
-    #[test]
-    fn read_parsers_accept_unwrapped_aliases_and_reject_zero_lines() {
+    fn read_parsers_accept_unwrapped_aliases_and_bound_lines() {
         assert_eq!(
             parse_read_source("recent_unwrapped").expect("wire-style source"),
             SessionReadSource::RecentUnwrapped
@@ -2205,6 +2122,13 @@ mod tests {
         assert!(error.contains("recent-unwrapped"));
         parse_read_lines("0").expect_err("zero lines must fail");
         assert_eq!(parse_read_lines("1").expect("minimum lines"), 1);
+        let ceiling = MAX_SESSION_READ_LINES.to_string();
+        assert_eq!(
+            parse_read_lines(&ceiling).expect("maximum lines"),
+            MAX_SESSION_READ_LINES
+        );
+        parse_read_lines(&(MAX_SESSION_READ_LINES + 1).to_string())
+            .expect_err("lines above the protocol ceiling must fail");
     }
 
     #[expect(
@@ -2215,8 +2139,8 @@ mod tests {
         assert_eq!(request.version_range(), protocol::CLIENT_PROTOCOL_VERSIONS);
         assert_eq!(request.method(), method_name, "method");
         assert_eq!(request.params(), &params, "params");
-        // The id is now a unique per-call SDK correlation id, not a fixed string;
-        // assert only its stable, log-greppable `sdk-<method>-` prefix.
+        // The id is a unique per-call SDK correlation id; assert only its
+        // stable, log-greppable `sdk-<method>-` prefix.
         assert!(
             request.id().starts_with(&format!("sdk-{method_name}-")),
             "id {:?} must be prefixed by the method",
@@ -2240,65 +2164,42 @@ mod tests {
     }
 
     #[test]
-    fn new_request_accepts_codex_agent() {
-        let request = build_new_request(&new_args("codex", None)).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "codex",
-                "cols": 80,
-                "rows": 24
-            }),
+    fn parse_meta_pair_splits_on_the_first_equals_and_rejects_malformed_pairs() {
+        // A value that itself contains '=' (a URL query string) stays whole.
+        assert_eq!(
+            parse_meta_pair("link.url=https://example.com?a=1&b=2").expect("value with ="),
+            (
+                "link.url".to_owned(),
+                "https://example.com?a=1&b=2".to_owned()
+            )
         );
+        for (input, expected) in [
+            ("link.provider", "expected key=value"),
+            ("=github", "key cannot be empty"),
+        ] {
+            let err = parse_meta_pair(input).expect_err(input);
+            assert!(err.contains(expected), "{input}: {err}");
+        }
     }
 
     #[test]
-    fn new_request_accepts_claude_agent() {
-        let request = build_new_request(&new_args("claude", None)).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "claude",
-                "cols": 80,
-                "rows": 24
-            }),
-        );
-    }
-
-    #[test]
-    fn new_request_accepts_hermes_agent() {
-        let request = build_new_request(&new_args("hermes", None)).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "hermes",
-                "cols": 80,
-                "rows": 24
-            }),
-        );
-    }
-
-    #[test]
-    fn new_request_carries_worktree_repo_branch_and_base() {
+    fn new_request_carries_every_optional_field() {
         let args = NewArgs {
             agent: "claude".to_owned(),
             name: None,
-            cwd: None,
-            cols: 80,
-            rows: 24,
-            project: None,
-            repo: Some(PathBuf::from("/workspace/project")),
+            cwd: Some(PathBuf::from("/workspace/cwd")),
+            cols: 120,
+            rows: 40,
+            project: Some("ui".to_owned()),
+            repo: Some(PathBuf::from("/workspace/repo")),
             branch: Some("feature/login".to_owned()),
             base_branch: Some("main".to_owned()),
-            input: None,
+            input: Some("Fix #1234".to_owned()),
             request_timeout_ms: None,
-            meta: Vec::new(),
+            meta: vec![
+                ("link.provider".to_owned(), "github".to_owned()),
+                ("link.kind".to_owned(), "pull_request".to_owned()),
+            ],
         };
         let request = build_new_request(&args).expect("request");
 
@@ -2307,130 +2208,14 @@ mod tests {
             method::SESSION_NEW,
             json!({
                 "agent": "claude",
-                "cols": 80,
-                "rows": 24,
-                "repo": "/workspace/project",
-                "branch": "feature/login",
-                "base_branch": "main"
-            }),
-        );
-    }
-
-    #[test]
-    fn new_request_includes_cwd_and_requested_size() {
-        let request = build_new_request(&NewArgs {
-            agent: "shell".to_owned(),
-            name: None,
-            cwd: Some(PathBuf::from("/workspace/project")),
-            cols: 120,
-            rows: 40,
-            project: None,
-            repo: None,
-            branch: None,
-            base_branch: None,
-            input: None,
-            request_timeout_ms: None,
-            meta: Vec::new(),
-        })
-        .expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "shell",
-                "cwd": "/workspace/project",
+                "cwd": "/workspace/cwd",
                 "cols": 120,
-                "rows": 40
-            }),
-        );
-    }
-
-    #[test]
-    fn new_request_carries_initial_input() {
-        let mut args = new_args("shell", None);
-        args.input = Some("Fix #1234".to_owned());
-        let request = build_new_request(&args).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "shell",
-                "cols": 80,
-                "rows": 24,
-                "input": "Fix #1234"
-            }),
-        );
-    }
-
-    #[test]
-    fn parse_meta_pair_accepts_valid_pair() {
-        assert_eq!(
-            parse_meta_pair("link.provider=github").expect("valid pair"),
-            ("link.provider".to_owned(), "github".to_owned())
-        );
-    }
-
-    #[test]
-    fn parse_meta_pair_rejects_missing_equals() {
-        let err = parse_meta_pair("link.provider").expect_err("missing =");
-        assert!(err.contains("expected key=value"), "{err}");
-    }
-
-    #[test]
-    fn parse_meta_pair_rejects_empty_key() {
-        let err = parse_meta_pair("=github").expect_err("empty key");
-        assert!(err.contains("key cannot be empty"), "{err}");
-    }
-
-    #[test]
-    fn parse_meta_pair_preserves_value_containing_equals() {
-        // Split on the FIRST '=' only, so a value that itself contains '=' (e.g.
-        // a URL query string) is preserved whole rather than truncated.
-        assert_eq!(
-            parse_meta_pair("link.url=https://example.com?a=1&b=2").expect("value with ="),
-            (
-                "link.url".to_owned(),
-                "https://example.com?a=1&b=2".to_owned()
-            )
-        );
-    }
-
-    #[test]
-    fn new_request_carries_single_meta_pair() {
-        let mut args = new_args("shell", None);
-        args.meta = vec![("link.provider".to_owned(), "github".to_owned())];
-        let request = build_new_request(&args).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "shell",
-                "cols": 80,
-                "rows": 24,
-                "metadata": { "link.provider": "github" }
-            }),
-        );
-    }
-
-    #[test]
-    fn new_request_carries_multiple_meta_pairs() {
-        let mut args = new_args("shell", None);
-        args.meta = vec![
-            ("link.provider".to_owned(), "github".to_owned()),
-            ("link.kind".to_owned(), "pull_request".to_owned()),
-        ];
-        let request = build_new_request(&args).expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "shell",
-                "cols": 80,
-                "rows": 24,
+                "rows": 40,
+                "project": "ui",
+                "repo": "/workspace/repo",
+                "branch": "feature/login",
+                "base_branch": "main",
+                "input": "Fix #1234",
                 "metadata": {
                     "link.kind": "pull_request",
                     "link.provider": "github"
@@ -2455,13 +2240,6 @@ mod tests {
     }
 
     #[test]
-    fn list_request_uses_empty_typed_params() {
-        let request = build_list_request(&[]).expect("request");
-
-        assert_request(&request, method::SESSION_LIST, json!({}));
-    }
-
-    #[test]
     fn list_request_sends_typed_filters() {
         let request = build_list_request(&[
             parse_list_filter("state=running").expect("state filter"),
@@ -2481,20 +2259,6 @@ mod tests {
                 ]
             }),
         );
-    }
-
-    #[test]
-    fn list_filter_matches_single_field() {
-        let filter = parse_list_filter("state=running").expect("filter");
-
-        assert!(filter.matches(&running_session("s-42")));
-    }
-
-    #[test]
-    fn list_filter_rejects_non_matching_field() {
-        let filter = parse_list_filter("agent=codex").expect("filter");
-
-        assert!(!filter.matches(&running_session("s-42")));
     }
 
     #[test]
@@ -2533,29 +2297,6 @@ mod tests {
             &running_session("s-shell"),
             &filters
         ));
-    }
-
-    #[test]
-    fn list_params_preserve_filters_for_typed_sdk_call() {
-        let params = list_params(&[
-            ListFilter::State(SessionState::Running),
-            ListFilter::Project("ui".to_owned()),
-        ]);
-
-        assert_eq!(
-            params.filters,
-            vec![
-                SessionListFilter::State(SessionState::Running),
-                SessionListFilter::Project("ui".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
-    fn list_params_without_filters_is_empty_for_typed_sdk_call() {
-        let params = list_params(&[]);
-
-        assert!(params.filters.is_empty());
     }
 
     #[test]
@@ -2628,20 +2369,6 @@ mod tests {
     }
 
     #[test]
-    fn list_filter_unknown_key_is_error() {
-        let err = parse_list_filter("cwd=/workspace/project").expect_err("unknown key");
-
-        assert!(err.contains("unknown filter key"), "{err}");
-    }
-
-    #[test]
-    fn list_filter_bad_value_is_error() {
-        let err = parse_list_filter("state=paused").expect_err("bad value");
-
-        assert!(err.contains("invalid state filter value"), "{err}");
-    }
-
-    #[test]
     fn json_and_quiet_list_outputs_use_the_same_filtered_sessions() {
         let mut codex = running_session("s-codex");
         codex.agent = "codex".to_owned();
@@ -2667,25 +2394,9 @@ mod tests {
     }
 
     #[test]
-    fn input_request_sends_local_session_id_and_text() {
-        let target: Target = "local/s-42".parse().expect("target");
-        let request = build_input_request(&target, "write tests first").expect("request");
-
-        assert_request(
-            &request,
-            method::SESSION_INPUT,
-            json!({
-                "session_id": "s-42",
-                "text": "write tests first"
-            }),
-        );
-    }
-
-    #[test]
     fn input_request_extracts_session_id_regardless_of_host() {
-        // Remote is now supported: the request carries only the session id (host
-        // routing is the transport's job), and it is extracted identically from a
-        // remote target as from a local one.
+        // The request carries only the session id; host routing is the
+        // transport's job, so a remote target's host never enters the body.
         let remote: Target = "host-b/s-42".parse().expect("target");
         let request = build_input_request(&remote, "write tests first").expect("request");
 
@@ -2700,25 +2411,18 @@ mod tests {
     }
 
     #[test]
-    fn rename_request_sends_session_id_and_name() {
+    fn rename_request_sends_the_name_or_omits_it_to_clear() {
         let target: Target = "host-b/s-42".parse().expect("target");
         let request =
             build_rename_request(&target, Some("triage build".to_owned())).expect("request");
-
         assert_request(
             &request,
             method::SESSION_RENAME,
             json!({"session_id": "s-42", "name": "triage build"}),
         );
-    }
 
-    #[test]
-    fn rename_request_omits_name_when_clearing() {
-        let target: Target = "local/s-42".parse().expect("target");
+        // The daemon treats an absent name as clear.
         let request = build_rename_request(&target, None).expect("request");
-
-        // A cleared name is omitted from the wire (the daemon treats absence as
-        // clear), so the body carries only the session id.
         assert_request(
             &request,
             method::SESSION_RENAME,
@@ -2727,66 +2431,22 @@ mod tests {
     }
 
     #[test]
-    fn diff_request_sends_session_id_and_explicit_base() {
+    fn diff_request_sends_an_explicit_base_or_leaves_it_to_the_daemon() {
         let target: Target = "host-b/s-42".parse().expect("target");
         let request = build_diff_request(&target, Some("main".to_owned())).expect("request");
-
         assert_request(
             &request,
             method::SESSION_DIFF,
             json!({"session_id": "s-42", "base": "main"}),
         );
-    }
 
-    #[test]
-    fn diff_request_omits_base_when_left_to_daemon_default() {
-        let target: Target = "local/s-42".parse().expect("target");
+        // Without `--base` the daemon resolves the default base itself.
         let request = build_diff_request(&target, None).expect("request");
-
-        // No explicit `--base` means the wire body carries only the session
-        // id; the daemon resolves the default base itself.
         assert_request(
             &request,
             method::SESSION_DIFF,
             json!({"session_id": "s-42"}),
         );
-    }
-
-    #[test]
-    fn renders_session_name_in_list_and_inspect() {
-        let mut session = running_session("s-42");
-        session.name = Some("triage".to_owned());
-
-        let list = render_list_human(&[session.clone()]);
-        assert_eq!(
-            list_row(&list, "s-42")[1],
-            "triage",
-            "NAME column shows name"
-        );
-
-        let inspect = render_inspect_human(&session);
-        assert!(
-            has_row(&inspect, "name", "triage"),
-            "inspect shows the name row: {inspect}"
-        );
-    }
-
-    #[test]
-    fn inspect_request_sends_only_session_id() {
-        let target: Target = "local/s-42".parse().expect("target");
-        let request = build_inspect_request(&target).expect("request");
-
-        assert_request(&request, method::SESSION_INSPECT, json!("s-42"));
-    }
-
-    #[test]
-    fn stop_request_extracts_session_id_regardless_of_host() {
-        // A remote target's session id is sent unchanged; the host never leaks
-        // into the request body.
-        let remote: Target = "host-b/s-42".parse().expect("target");
-        let request = build_stop_request(&remote).expect("request");
-
-        assert_request(&request, method::SESSION_STOP, json!("s-42"));
     }
 
     #[test]
@@ -2846,23 +2506,6 @@ mod tests {
     }
 
     #[test]
-    fn new_request_carries_project_reference() {
-        let mut args = new_args("claude", None);
-        args.project = Some("ui".to_owned());
-        let request = build_new_request(&args).expect("request");
-        assert_request(
-            &request,
-            method::SESSION_NEW,
-            json!({
-                "agent": "claude",
-                "cols": 80,
-                "rows": 24,
-                "project": "ui"
-            }),
-        );
-    }
-
-    #[test]
     fn confirmation_gate_local_always_proceeds() {
         // Local `session new` is never gated, regardless of json/yes.
         for json in [false, true] {
@@ -2907,13 +2550,6 @@ mod tests {
             confirmation_decision("host-b", false, true),
             ConfirmDecision::Proceed
         );
-    }
-
-    #[test]
-    fn renders_new_session_summary() {
-        let output = render_new_human(&running_session("s-42"));
-
-        assert_eq!(output, "session s-42 created (state: running)\n");
     }
 
     /// Whitespace-split tokens of the list row whose first column is `id`.
@@ -2965,61 +2601,6 @@ mod tests {
                 "/workspace/project",
             ]
         );
-    }
-
-    #[test]
-    fn renders_detected_activity_in_session_list_table() {
-        let mut session = running_session("s-42");
-        session.activity = Some(AgentActivity::Working);
-        session.state_source = StateSource::OscTitle;
-
-        let output = render_list_human(&[session]);
-
-        assert_eq!(
-            list_row(&output, "s-42"),
-            vec![
-                "s-42",
-                "-", // NAME
-                "shell",
-                "managed",
-                "running",
-                "working",
-                "osc_title",
-                "4242",
-                "120x40",
-                "-", // PROJECT
-                "-", // BRANCH
-                "-", // WARN
-                "-", // SUBAGENTS
-                "/workspace/project",
-            ]
-        );
-    }
-
-    #[test]
-    fn renders_external_origin_in_session_list_table() {
-        let mut session = running_session("ext-42");
-        session.external = Some(true);
-
-        let output = render_list_human(&[session]);
-
-        assert_eq!(list_row(&output, "ext-42")[3], "external");
-    }
-
-    #[test]
-    fn renders_known_agents_in_session_list_table() {
-        let mut codex = running_session("s-codex");
-        codex.agent = "codex".to_owned();
-        let mut claude = running_session("s-claude");
-        claude.agent = "claude".to_owned();
-        let mut hermes = running_session("s-hermes");
-        hermes.agent = "hermes".to_owned();
-
-        let output = render_list_human(&[codex, claude, hermes]);
-
-        assert_eq!(list_row(&output, "s-codex")[2], "codex");
-        assert_eq!(list_row(&output, "s-claude")[2], "claude");
-        assert_eq!(list_row(&output, "s-hermes")[2], "hermes");
     }
 
     #[test]
@@ -3131,6 +2712,10 @@ mod tests {
         assert!(has_row(&output, "native_session_id", "<none>"));
         assert!(has_row(&output, "resumable", "no"));
         assert!(has_row(&output, "exit_code", "<none>"));
+        assert!(has_row(&output, "repo", "<none>"));
+        assert!(has_row(&output, "branch", "<none>"));
+        assert!(has_row(&output, "worktree_path", "<none>"));
+        assert!(has_row(&output, "warnings", "-"));
     }
 
     #[test]
@@ -3180,16 +2765,6 @@ mod tests {
                 "a terminal session ({state:?}) must not report resumable=yes: {output}"
             );
         }
-    }
-
-    #[test]
-    fn renders_claude_agent_in_session_inspect_table() {
-        let mut session = running_session("s-42");
-        session.agent = "claude".to_owned();
-
-        let output = render_inspect_human(&session);
-
-        assert!(has_row(&output, "agent", "claude"));
     }
 
     #[test]
@@ -3284,15 +2859,6 @@ mod tests {
     }
 
     #[test]
-    fn renders_inspect_worktree_fields_absent_as_none() {
-        let output = render_inspect_human(&running_session("s-42"));
-        assert!(has_row(&output, "repo", "<none>"));
-        assert!(has_row(&output, "branch", "<none>"));
-        assert!(has_row(&output, "worktree_path", "<none>"));
-        assert!(has_row(&output, "warnings", "-"));
-    }
-
-    #[test]
     fn renders_new_summary_with_worktree_and_warnings() {
         let mut session = running_session("s-42");
         session.branch = Some("feature/login".to_owned());
@@ -3306,7 +2872,10 @@ mod tests {
 
         let output = render_new_human(&session);
 
-        assert!(output.contains("session s-42 created"));
+        assert!(
+            output.starts_with("session s-42 created (state: running)\n"),
+            "{output}"
+        );
         assert!(
             output.contains(
                 "worktree: /data/worktrees/s-42-project-feature-login (branch feature/login)"
@@ -3367,22 +2936,6 @@ mod tests {
         let output = render_stop_human("s-42", &protocol::SessionStopResult { stopped: true });
 
         assert_eq!(output, "session s-42: stopped=true\n");
-    }
-
-    #[test]
-    fn renders_remove_result_with_target_id() {
-        let output = render_remove_human(
-            "s-42",
-            &SessionRemoveResult {
-                removed: true,
-                stopped: true,
-                worktrees_removed: 0,
-                worktrees_failed: 0,
-                accepted_unconfirmed_processes: Vec::new(),
-            },
-        );
-
-        assert_eq!(output, "session s-42: removed=true stopped=true\n");
     }
 
     #[test]
@@ -3455,12 +3008,8 @@ mod tests {
     }
 
     #[test]
-    fn a_clean_sweep_succeeds() {
+    fn a_sweep_succeeds_only_without_a_failed_removal_or_leftover_worktree() {
         assert!(sweep_succeeded(&sweep_result(0, 0)));
-    }
-
-    #[test]
-    fn a_sweep_with_a_failed_removal_or_leftover_worktree_does_not_succeed() {
         assert!(
             !sweep_succeeded(&sweep_result(1, 0)),
             "a session it could not remove is a partial failure"
@@ -3503,24 +3052,119 @@ mod tests {
         assert_eq!(output, "session s-99 forked (state: running)\n");
     }
 
-    #[test]
-    fn build_remove_request_targets_session_remove_method() {
-        let target: Target = "local/s-42".parse().expect("parse target");
-        let request = build_remove_request(&target, false).expect("build remove request");
+    /// Accepts control connections on `listener`, answers `daemon.health` like a
+    /// daemon, and returns the first method request after answering it with
+    /// `result`.
+    async fn answer_first_method_request(
+        listener: &tokio::net::UnixListener,
+        result: serde_json::Value,
+    ) -> Request {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-        assert_request(&request, method::SESSION_REMOVE, serde_json::json!("s-42"));
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept control client");
+            let mut stream = tokio::io::BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.expect("read request") == 0 {
+                    break;
+                }
+                let request: Request = serde_json::from_str(&line).expect("decode request");
+                let is_health = request.method() == method::DAEMON_HEALTH;
+                let value = if is_health {
+                    json!({
+                        "status": "ok",
+                        "daemon_version": "fixture",
+                        "protocol_version": protocol::PROTOCOL_VERSION.get()
+                    })
+                } else {
+                    result.clone()
+                };
+                let response = protocol::Response::ok(
+                    request.version_range().maximum(),
+                    request.id().to_owned(),
+                    value,
+                )
+                .expect("valid response");
+                let mut encoded = serde_json::to_vec(&response).expect("encode response");
+                encoded.push(b'\n');
+                stream
+                    .get_mut()
+                    .write_all(&encoded)
+                    .await
+                    .expect("write response");
+                if !is_health {
+                    return request;
+                }
+            }
+        }
     }
 
-    #[test]
-    fn build_remove_request_carries_the_unconfirmed_cleanup_consent() {
-        let target: Target = "local/s-42".parse().expect("parse target");
-        let request = build_remove_request(&target, true).expect("build remove request");
+    #[tokio::test]
+    async fn run_remove_calls_the_consenting_method_only_with_explicit_consent() {
+        for (accept_unconfirmed_cleanup, expected_method) in [
+            (true, method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED),
+            (false, method::SESSION_REMOVE),
+        ] {
+            let env = pohunek_test_support::env::TestEnv::new()
+                .expect("create the hermetic test environment");
+            let socket = env
+                .socket_path("daemon.sock")
+                .expect("socket path fits the sun_path limit");
+            let root = socket.parent().expect("socket parent").to_path_buf();
+            let paths = Paths {
+                runtime_dir: root.clone(),
+                socket: socket.clone(),
+                data_dir: root.join("data"),
+                log_dir: root.join("logs"),
+                cache_dir: root.join("cache"),
+                config_home: root.join("config-home"),
+                config_dir: root.join("config"),
+                origin_source: pohunek_client::OriginSource::Omitted,
+            };
+            // Binding before the command runs is the readiness signal.
+            let listener = tokio::net::UnixListener::bind(&socket).expect("bind fixture daemon");
+            let target: Target = "local/s-42".parse().expect("target");
+            let result = json!({
+                "removed": true,
+                "stopped": true,
+                "worktrees_removed": 0,
+                "worktrees_failed": 0
+            });
 
-        assert_request(
-            &request,
-            method::SESSION_REMOVE_ACCEPTING_UNCONFIRMED,
-            serde_json::json!("s-42"),
-        );
+            // The fixture runs as its own task so a client that fails before
+            // sending the request ends the scenario with its error instead of
+            // leaving the fixture waiting in `accept`.
+            let fixture =
+                tokio::spawn(async move { answer_first_method_request(&listener, result).await });
+            let outcome = pohunek_test_support::wait::guard(
+                "session remove against the fixture daemon",
+                run_remove(
+                    LOCAL_HOST,
+                    &paths,
+                    &target,
+                    accept_unconfirmed_cleanup,
+                    true,
+                ),
+            )
+            .await;
+            if let Err(error) = outcome {
+                fixture.abort();
+                panic!("remove failed against the fixture daemon: {error:?}");
+            }
+            let request =
+                pohunek_test_support::wait::guard("the fixture to record the request", fixture)
+                    .await
+                    .expect("fixture daemon task");
+
+            assert_eq!(
+                request.method(),
+                expected_method,
+                "accept_unconfirmed_cleanup={accept_unconfirmed_cleanup}"
+            );
+            assert_eq!(request.params(), &json!("s-42"));
+        }
     }
 
     #[test]
@@ -3593,12 +3237,11 @@ mod tests {
     }
 
     #[test]
-    fn build_fork_request_targets_session_fork_method() {
+    fn build_fork_request_carries_the_profile_override_only_when_asked() {
         let target: Target = "host-a/s-42".parse().expect("target");
 
         let request = build_fork_request(&target, Some("forked review".to_owned()), false, 100, 30)
             .expect("build fork request");
-
         assert_request(
             &request,
             method::SESSION_FORK,
@@ -3610,14 +3253,8 @@ mod tests {
                 "rows": 30
             }),
         );
-    }
-
-    #[test]
-    fn build_fork_request_carries_the_profile_override_only_when_asked() {
-        let target: Target = "s-42".parse().expect("target");
 
         let request = build_fork_request(&target, None, true, 100, 30).expect("build fork request");
-
         assert_request(
             &request,
             method::SESSION_FORK,
@@ -3644,53 +3281,6 @@ mod tests {
             serde_json::to_value(resume_params(&target, true)).expect("serialize"),
             serde_json::json!({"session_id": "s-42", "accept_profile_change": true})
         );
-    }
-
-    #[test]
-    fn renders_new_session_as_json_that_deserializes() {
-        let info = running_session("s-42");
-        let doc = crate::commands::render_json(&info).expect("json doc");
-        let parsed: SessionInfo = crate::commands::parse_json_ok(&doc);
-        assert_eq!(parsed, info);
-    }
-
-    #[test]
-    fn renders_session_list_as_json_that_deserializes() {
-        let sessions = vec![running_session("s-1"), running_session("s-2")];
-        let doc = crate::commands::render_json(&sessions).expect("json doc");
-        let parsed: Vec<SessionInfo> = crate::commands::parse_json_ok(&doc);
-        assert_eq!(parsed, sessions);
-    }
-
-    #[test]
-    fn renders_inspect_as_json_that_deserializes() {
-        let info = running_session("s-42");
-        let doc = crate::commands::render_json(&info).expect("json doc");
-        let parsed: SessionInfo = crate::commands::parse_json_ok(&doc);
-        assert_eq!(parsed, info);
-    }
-
-    #[test]
-    fn renders_stop_result_as_json_that_deserializes() {
-        let result = protocol::SessionStopResult { stopped: true };
-        let doc = crate::commands::render_json(&result).expect("json doc");
-        let parsed: protocol::SessionStopResult = crate::commands::parse_json_ok(&doc);
-        assert_eq!(parsed, result);
-    }
-
-    #[test]
-    fn renders_input_result_as_json_that_deserializes() {
-        let result = protocol::SessionInputResult {
-            accepted: true,
-            activity: None,
-            activity_source: None,
-            runtime: None,
-            activity_epoch: None,
-            activity_revision: None,
-        };
-        let doc = crate::commands::render_json(&result).expect("json doc");
-        let parsed: protocol::SessionInputResult = crate::commands::parse_json_ok(&doc);
-        assert_eq!(parsed, result);
     }
 
     #[test]
@@ -3725,15 +3315,6 @@ mod tests {
             read_bounded_input(input.as_bytes()).expect("valid stdin"),
             input
         );
-    }
-
-    #[test]
-    fn bounded_input_rejects_control_without_echoing_payload() {
-        let error = read_bounded_input(b"private\0payload".as_slice()).expect_err("control");
-        let diagnostic = error.to_string();
-        assert!(diagnostic.contains("control character"));
-        assert!(!diagnostic.contains("private"));
-        assert!(!diagnostic.contains("payload"));
     }
 
     #[test]

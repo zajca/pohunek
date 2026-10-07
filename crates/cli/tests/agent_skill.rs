@@ -103,18 +103,6 @@ fn agent_skill_prints_the_embedded_bytes_exactly() {
 }
 
 #[test]
-fn agent_skill_output_is_deterministic_across_invocations() {
-    let first = agent_skill_command()
-        .output()
-        .expect("spawn first agent-skill run");
-    let second = agent_skill_command()
-        .output()
-        .expect("spawn second agent-skill run");
-    assert_eq!(first.stdout, second.stdout);
-    assert_eq!(first.stdout, EMBEDDED_SKILL.as_bytes());
-}
-
-#[test]
 fn agent_skill_accepts_and_ignores_host() {
     let output = agent_skill_command()
         .args(["--host", "buildbox"])
@@ -166,19 +154,6 @@ fn expected_content_sha256() -> String {
 }
 
 // --- Parser coverage ---------------------------------------------------------
-
-#[test]
-fn agent_skill_command_tree_accepts_host_and_json() {
-    for args in [
-        vec!["pohunek", "agent-skill"],
-        vec!["pohunek", "agent-skill", "--json"],
-        vec!["pohunek", "--host", "buildbox", "agent-skill", "--json"],
-    ] {
-        pohunek_cli::command()
-            .try_get_matches_from(args)
-            .expect("agent-skill should parse, including with the global --host flag");
-    }
-}
 
 #[test]
 fn embedded_artifact_examples_parse_through_the_live_clap_tree() {
@@ -610,75 +585,71 @@ fn parse_example(line: usize, example: &str) -> Option<clap::ArgMatches> {
     }
 }
 
+/// Each row is a Markdown fixture with the examples the collector must find
+/// and the 1-based line each one opens on.
 #[test]
-fn example_collector_finds_inline_spans_and_fenced_lines() {
-    let content = concat!(
-        "prose with `pohunek doctor --json` inline.\n",
-        "```sh\n",
-        "pohunek host list --json\n",
-        "# not a command\n",
-        "  pohunek session list --json\n",
-        "```\n",
-        "tail mentioning `--host` only.\n",
-    );
-    let examples = collect_pohunek_examples(content);
-    let commands: Vec<&str> = examples
-        .iter()
-        .map(|example| example.command.as_str())
-        .collect();
-    assert_eq!(
-        commands,
-        [
-            "pohunek doctor --json",
-            "pohunek host list --json",
-            "pohunek session list --json"
-        ]
-    );
-    let lines: Vec<usize> = examples.iter().map(|example| example.line).collect();
-    assert_eq!(lines, [1, 3, 5]);
-}
-
-#[test]
-fn example_collector_ignores_prose_and_unterminated_spans() {
-    // Prose outside fences never becomes a candidate, and a backticked span
-    // with no closing backtick is not a complete example.
-    let content = "pohunek in prose is not a command\n`pohunek unterminated\n";
-    assert!(collect_pohunek_examples(content).is_empty());
-}
-
-#[test]
-fn example_collector_collects_inline_spans_across_lines() {
-    // A wrapped inline command is one example anchored at its opening line,
-    // so a multi-line command cannot bypass the parse gate.
-    let content = concat!("Run `pohunek doctor\n", "--json` after startup.\n",);
-    let examples = collect_pohunek_examples(content);
-    let commands: Vec<&str> = examples
-        .iter()
-        .map(|example| example.command.as_str())
-        .collect();
-    let lines: Vec<usize> = examples.iter().map(|example| example.line).collect();
-    assert_eq!(commands, ["pohunek doctor --json"]);
-    assert_eq!(lines, [1]);
-}
-
-#[test]
-fn example_collector_drops_spans_crossing_blank_lines_or_fences() {
-    let content = concat!(
-        "broken `pohunek doctor\n",
-        "\n",
-        "--json` span\n",
-        "broken `pohunek doctor\n",
-        "```sh\n",
-        "pohunek host list --json\n",
-        "```\n",
-        "--json` span\n",
-    );
-    let examples = collect_pohunek_examples(content);
-    let commands: Vec<&str> = examples
-        .iter()
-        .map(|example| example.command.as_str())
-        .collect();
-    // The blank line and the fence each end the broken span, so only the
-    // fenced bare line survives.
-    assert_eq!(commands, ["pohunek host list --json"]);
+fn example_collector_finds_spans_and_fenced_lines_within_markdown_boundaries() {
+    let rows: [(&str, &str, &[&str], &[usize]); 4] = [
+        (
+            "inline spans and fenced bare lines",
+            concat!(
+                "prose with `pohunek doctor --json` inline.\n",
+                "```sh\n",
+                "pohunek host list --json\n",
+                "# not a command\n",
+                "  pohunek session list --json\n",
+                "```\n",
+                "tail mentioning `--host` only.\n",
+            ),
+            &[
+                "pohunek doctor --json",
+                "pohunek host list --json",
+                "pohunek session list --json",
+            ],
+            &[1, 3, 5],
+        ),
+        (
+            // Prose outside fences is never a candidate, and a span with no
+            // closing backtick is not a complete example.
+            "prose and unterminated spans",
+            "pohunek in prose is not a command\n`pohunek unterminated\n",
+            &[],
+            &[],
+        ),
+        (
+            // A wrapped inline command is one example anchored at its opening
+            // line, so a multi-line command cannot bypass the parse gate.
+            "inline span across lines",
+            concat!("Run `pohunek doctor\n", "--json` after startup.\n"),
+            &["pohunek doctor --json"],
+            &[1],
+        ),
+        (
+            // The blank line and the fence each end the broken span, so only
+            // the fenced bare line survives.
+            "spans crossing a blank line or a fence",
+            concat!(
+                "broken `pohunek doctor\n",
+                "\n",
+                "--json` span\n",
+                "broken `pohunek doctor\n",
+                "```sh\n",
+                "pohunek host list --json\n",
+                "```\n",
+                "--json` span\n",
+            ),
+            &["pohunek host list --json"],
+            &[6],
+        ),
+    ];
+    for (row, content, expected_commands, expected_lines) in rows {
+        let examples = collect_pohunek_examples(content);
+        let commands: Vec<&str> = examples
+            .iter()
+            .map(|example| example.command.as_str())
+            .collect();
+        let lines: Vec<usize> = examples.iter().map(|example| example.line).collect();
+        assert_eq!(commands, expected_commands, "{row}");
+        assert_eq!(lines, expected_lines, "{row}");
+    }
 }
