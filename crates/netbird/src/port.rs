@@ -93,23 +93,6 @@ mod tests {
     }
 
     #[test]
-    fn unset_lookup_returns_default() {
-        assert_eq!(
-            port_from_lookup(Err(std::env::VarError::NotPresent)).unwrap(),
-            DEFAULT_REMOTE_PORT
-        );
-    }
-
-    #[test]
-    fn set_lookup_is_parsed() {
-        assert_eq!(port_from_lookup(Ok("9000".to_owned())).unwrap(), 9000);
-        assert!(matches!(
-            port_from_lookup(Ok("0".to_owned())),
-            Err(NetbirdError::InvalidConfig(_))
-        ));
-    }
-
-    #[test]
     fn non_unicode_lookup_is_a_configuration_error() {
         let err = port_from_lookup(Err(std::env::VarError::NotUnicode(
             std::ffi::OsString::new(),

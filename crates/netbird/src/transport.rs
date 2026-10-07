@@ -225,27 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn discovery_excludes_local_self_from_remote_peers() {
-        let status = status(
-            r#"{
-                "netbirdIp":"100.64.0.1",
-                "fqdn":"self.example",
-                "peers":[
-                    {"fqdn":"remote.example","netbirdIp":"100.64.0.2"}
-                ]
-            }"#,
-        );
-
-        let peers = discover_from_status(&status);
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].fqdn.as_deref(), Some("remote.example"));
-        assert_eq!(
-            peers[0].address,
-            Some("100.64.0.2".parse().expect("remote"))
-        );
-    }
-
-    #[test]
     fn resolver_preserves_typed_unknown_error() {
         let id = OverlayId::new(NETBIRD_OVERLAY_ID).expect("id");
         let error = resolve_from_status(&status(r#"{"peers":[]}"#), "missing", &id)

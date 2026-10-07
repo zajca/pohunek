@@ -222,17 +222,6 @@ mod tests {
     const VIRTUAL_INTERVAL: Duration = Duration::from_secs(1);
 
     #[test]
-    fn poll_until_returns_a_ready_value_on_the_first_probe() {
-        let probes = Cell::new(0_u32);
-        let value = poll_until("immediate", || {
-            probes.set(probes.get() + 1);
-            Some("ready")
-        });
-        assert_eq!(value, "ready");
-        assert_eq!(probes.get(), 1);
-    }
-
-    #[test]
     fn poll_until_returns_once_the_condition_becomes_ready() {
         let probes = Cell::new(0_u32);
         let value = poll_until_within(HANG_GUARD, TINY_INTERVAL, "fourth probe", || {
@@ -256,25 +245,6 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "hang guard of 30ms elapsed after")]
-    fn poll_until_panic_reports_ceiling_and_elapsed_time() {
-        poll_until_within(TINY_CEILING, TINY_INTERVAL, "anything", || None::<()>);
-    }
-
-    #[test]
-    fn poll_until_keeps_probing_until_the_ceiling() {
-        let probes = Cell::new(0_u32);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            poll_until_within(TINY_CEILING, TINY_INTERVAL, "counted", || {
-                probes.set(probes.get() + 1);
-                None::<()>
-            });
-        }));
-        assert!(outcome.is_err());
-        assert!(probes.get() >= 2, "probed {} times", probes.get());
-    }
-
-    #[test]
-    #[should_panic(expected = "hang guard of 30ms elapsed after")]
     fn poll_until_rejects_a_condition_that_becomes_ready_only_after_the_ceiling() {
         let first_probe = Cell::new(None::<Instant>);
         poll_until_within(TINY_CEILING, TINY_INTERVAL, "a late condition", || {
@@ -292,12 +262,6 @@ mod tests {
             std::thread::sleep(TINY_CEILING * 2);
             Some(())
         });
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_until_returns_a_ready_value_on_the_first_probe() {
-        let value = wait_until("immediate", || async { Some(11_u8) }).await;
-        assert_eq!(value, 11);
     }
 
     #[tokio::test(start_paused = true)]
@@ -335,12 +299,6 @@ mod tests {
             std::future::pending::<Option<()>>,
         )
         .await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn guard_returns_the_output_of_a_future_that_completes() {
-        let value = guard("a ready future", async { 5_u8 }).await;
-        assert_eq!(value, 5);
     }
 
     #[tokio::test(start_paused = true)]

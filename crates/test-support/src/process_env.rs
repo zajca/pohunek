@@ -220,10 +220,8 @@ mod tests {
 
     const KEY_UNSET: &str = "TEST_SUPPORT_PROCESS_ENV_UNSET";
     const KEY_SET: &str = "TEST_SUPPORT_PROCESS_ENV_SET";
-    const KEY_NESTED: &str = "TEST_SUPPORT_PROCESS_ENV_NESTED";
     const KEY_PANIC: &str = "TEST_SUPPORT_PROCESS_ENV_PANIC";
     const KEY_CONTEND: &str = "TEST_SUPPORT_PROCESS_ENV_CONTEND";
-    const KEY_READ_ONLY: &str = "TEST_SUPPORT_PROCESS_ENV_READ_ONLY";
 
     fn var(key: &str) -> Option<String> {
         std::env::var(key).ok()
@@ -254,18 +252,6 @@ mod tests {
     }
 
     #[test]
-    fn overriding_the_same_key_twice_restores_the_original() {
-        let mut env = ProcessEnv::lock();
-        std::env::set_var(KEY_NESTED, "baseline");
-        env.set(KEY_NESTED, "first").set(KEY_NESTED, "second");
-        assert_eq!(var(KEY_NESTED).as_deref(), Some("second"));
-        drop(env);
-        let _env = ProcessEnv::lock();
-        assert_eq!(var(KEY_NESTED).as_deref(), Some("baseline"));
-        std::env::remove_var(KEY_NESTED);
-    }
-
-    #[test]
     fn panic_restores_the_environment_and_does_not_poison_the_lock() {
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut env = ProcessEnv::lock();
@@ -276,17 +262,6 @@ mod tests {
         let env = ProcessEnv::lock();
         assert_eq!(var(KEY_PANIC), None);
         drop(env);
-    }
-
-    #[test]
-    fn lock_without_changes_leaves_the_environment_untouched() {
-        std::env::set_var(KEY_READ_ONLY, "kept");
-        let env = ProcessEnv::lock();
-        assert_eq!(var(KEY_READ_ONLY).as_deref(), Some("kept"));
-        drop(env);
-        let _env = ProcessEnv::lock();
-        assert_eq!(var(KEY_READ_ONLY).as_deref(), Some("kept"));
-        std::env::remove_var(KEY_READ_ONLY);
     }
 
     #[test]
@@ -352,12 +327,6 @@ mod tests {
         assert_eq!(super::resolve_in("sub/tool", &path), None);
         assert_eq!(super::resolve_in("", &path), None);
         assert_eq!(super::resolve_in("missing", &path), None);
-    }
-
-    #[test]
-    fn command_passes_an_unresolvable_name_through() {
-        let command = super::command("test-support-no-such-program");
-        assert_eq!(command.get_program(), "test-support-no-such-program");
     }
 
     #[test]

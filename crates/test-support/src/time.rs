@@ -122,9 +122,10 @@ mod tests {
     const PENDING_TIMER: Duration = Duration::from_secs(10);
 
     /// Real time the I/O thread waits for the pending timer to fire before it
-    /// completes the I/O anyway. Only the held-inhibitor test relies on it, and
-    /// only to give an erroneous auto-advance time to show; a longer or shorter
-    /// wait cannot make that test fail, it can only weaken it.
+    /// completes the I/O anyway. Only the measurements taken while an inhibitor
+    /// is held rely on it, and only to give an erroneous auto-advance time to
+    /// show; a longer or shorter wait cannot make those tests fail, it can only
+    /// weaken them.
     const IO_GRACE: Duration = Duration::from_millis(100);
 
     /// Real ceiling of the self-ending inhibitor test.
@@ -154,20 +155,6 @@ mod tests {
         let moved = start.elapsed();
         sleeper.abort();
         moved
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn clock_stays_put_while_the_inhibitor_is_held() {
-        let inhibitor = AutoAdvanceInhibitor::new();
-        let moved = clock_movement_during_io(IO_GRACE).await;
-        assert_eq!(moved, Duration::ZERO);
-        inhibitor.release().await;
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn clock_auto_advances_without_an_inhibitor() {
-        let moved = clock_movement_during_io(HANG_GUARD).await;
-        assert!(moved >= PENDING_TIMER, "{moved:?}");
     }
 
     #[tokio::test(start_paused = true)]

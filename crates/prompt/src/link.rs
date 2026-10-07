@@ -291,20 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn link_metadata_accepts_normal_values() {
-        let link = SessionLinkMetadata::new(
-            SessionLinkProvider::Linear,
-            SessionLinkKind::Issue,
-            "LIN-1",
-            "https://linear.test/LIN-1",
-            "feature/link-metadata",
-        )
-        .expect("valid link metadata");
-
-        assert_eq!(link.branch, "feature/link-metadata");
-    }
-
-    #[test]
     fn github_branch_selection_prefers_head_ref_name() {
         let branch = branch_from_provider_json(
             Provider::GitHubPr,

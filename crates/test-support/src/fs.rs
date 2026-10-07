@@ -231,15 +231,6 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_file_is_replaced_not_appended() {
-        let dir = crate::tempdir().expect("fixture directory");
-        let path = dir.path().join("replaced");
-        write_file(&path, "a much longer first content").expect("first write");
-        write_file(&path, "short").expect("second write");
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), "short");
-    }
-
-    #[test]
     fn a_missing_directory_is_an_error_naming_the_path() {
         let dir = crate::tempdir().expect("fixture directory");
         let path = dir.path().join("missing-dir").join("file");

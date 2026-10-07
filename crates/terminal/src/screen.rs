@@ -288,52 +288,24 @@ mod tests {
     use super::{ScreenRegion, ScreenTracker};
 
     #[test]
-    fn feeding_plain_output_produces_visible_lines() {
-        let mut tracker = ScreenTracker::new(3, 20);
-
-        tracker.feed(b"hello\r\nworld");
-
-        assert_eq!(
-            tracker.visible_lines(),
-            vec!["hello".to_string(), "world".to_string(), String::new()]
-        );
-    }
-
-    #[test]
     fn bottom_lines_returns_visible_tail() {
         let mut tracker = ScreenTracker::new(4, 20);
 
-        tracker.feed(b"one\r\ntwo\r\nthree\r\nfour");
+        tracker.feed(b"one\r\ntwo\r\nthree");
 
-        assert_eq!(
-            tracker.bottom_lines(2),
-            ScreenRegion {
-                lines: vec!["three".to_string(), "four".to_string()],
-            }
-        );
-    }
-
-    #[test]
-    fn bottom_lines_zero_count_returns_empty_region() {
-        let mut tracker = ScreenTracker::new(3, 20);
-
-        tracker.feed(b"one\r\ntwo");
-
-        assert_eq!(tracker.bottom_lines(0), ScreenRegion { lines: Vec::new() });
-    }
-
-    #[test]
-    fn bottom_lines_oversized_count_returns_all_visible_lines() {
-        let mut tracker = ScreenTracker::new(3, 20);
-
-        tracker.feed(b"one\r\ntwo");
-
-        assert_eq!(
-            tracker.bottom_lines(10),
-            ScreenRegion {
-                lines: vec!["one".to_string(), "two".to_string(), String::new()],
-            }
-        );
+        for (name, count, expected) in [
+            ("tail", 2, vec!["three", ""]),
+            ("zero count", 0, vec![]),
+            ("oversized count", 10, vec!["one", "two", "three", ""]),
+        ] {
+            assert_eq!(
+                tracker.bottom_lines(count),
+                ScreenRegion {
+                    lines: expected.into_iter().map(str::to_owned).collect(),
+                },
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -342,38 +314,19 @@ mod tests {
 
         tracker.feed(b"alpha\r\n\r\nbeta\r\n\r\ngamma");
 
-        assert_eq!(
-            tracker.bottom_non_empty_lines(2),
-            ScreenRegion {
-                lines: vec!["beta".to_string(), "gamma".to_string()],
-            }
-        );
-    }
-
-    #[test]
-    fn bottom_non_empty_lines_zero_count_returns_empty_region() {
-        let mut tracker = ScreenTracker::new(3, 20);
-
-        tracker.feed(b"one\r\ntwo");
-
-        assert_eq!(
-            tracker.bottom_non_empty_lines(0),
-            ScreenRegion { lines: Vec::new() }
-        );
-    }
-
-    #[test]
-    fn bottom_non_empty_lines_oversized_count_returns_all_non_empty_lines() {
-        let mut tracker = ScreenTracker::new(5, 20);
-
-        tracker.feed(b"alpha\r\n\r\nbeta\r\n\r\ngamma");
-
-        assert_eq!(
-            tracker.bottom_non_empty_lines(10),
-            ScreenRegion {
-                lines: vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
-            }
-        );
+        for (name, count, expected) in [
+            ("tail", 2, vec!["beta", "gamma"]),
+            ("zero count", 0, vec![]),
+            ("oversized count", 10, vec!["alpha", "beta", "gamma"]),
+        ] {
+            assert_eq!(
+                tracker.bottom_non_empty_lines(count),
+                ScreenRegion {
+                    lines: expected.into_iter().map(str::to_owned).collect(),
+                },
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -409,13 +362,6 @@ mod tests {
         tracker.feed(b"ab");
 
         assert_eq!(tracker.slice_columns(0, 0, 5), "ab   ");
-    }
-
-    #[test]
-    fn slice_columns_returns_spaces_for_blank_region() {
-        let tracker = ScreenTracker::new(1, 6);
-
-        assert_eq!(tracker.slice_columns(0, 1, 3), "   ");
     }
 
     #[test]

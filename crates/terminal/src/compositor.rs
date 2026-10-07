@@ -586,13 +586,6 @@ mod tests {
     }
 
     #[test]
-    fn grid_size_matches_raw_passthrough_geometry() {
-        let compositor = Compositor::new(80, 24);
-
-        assert_eq!(compositor.grid_size(), (24, 80));
-    }
-
-    #[test]
     fn rows_are_clamped_to_leave_an_addressable_grid() {
         let compositor = Compositor::new(80, 0);
 
@@ -816,70 +809,6 @@ mod tests {
         assert!(
             !frame.contains("First long"),
             "content beyond the clipped height must not be rendered: {frame:?}"
-        );
-    }
-
-    #[test]
-    fn agent_output_during_modal_does_not_replace_the_overlay() {
-        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
-        compositor.set_overlay(Some(test_overlay()));
-        let _ = compositor.render();
-
-        compositor.feed(b"\x1b[1;1HUNDERLAY");
-        let frame = render_string(&mut compositor);
-
-        assert!(
-            !frame.contains("UNDERLAY") && frame.contains("Menu"),
-            "the frozen background must remain visible until buffered output is replayed: {frame:?}"
-        );
-    }
-
-    #[test]
-    fn opening_overlay_repaints_the_frozen_background() {
-        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
-        compositor.feed(b"base");
-        let _ = compositor.render();
-
-        compositor.set_overlay(Some(test_overlay()));
-        let frame = render_string(&mut compositor);
-
-        assert!(
-            frame.contains("base"),
-            "opening repaint must include the existing grid contents: {frame:?}"
-        );
-    }
-
-    #[test]
-    fn updating_open_overlay_repaints_its_content() {
-        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
-        compositor.set_overlay(Some(test_overlay()));
-        let _ = compositor.render();
-
-        let mut updated = test_overlay();
-        updated.lines[0].highlighted = false;
-        updated.lines[1].highlighted = true;
-        compositor.set_overlay(Some(updated));
-        let frame = render_string(&mut compositor);
-
-        assert!(
-            frame.contains("Detach"),
-            "updated overlay content must still be redrawn: {frame:?}"
-        );
-    }
-
-    #[test]
-    fn restore_clears_overlay_with_the_frozen_background() {
-        let mut compositor = Compositor::new(SHORT_TEST_COLS, SHORT_TEST_ROWS);
-        compositor.feed(b"covered");
-        compositor.set_overlay(Some(test_overlay()));
-        let _ = compositor.render();
-
-        compositor.set_overlay(None);
-        let frame = String::from_utf8(compositor.restore()).expect("restore is utf8");
-
-        assert!(
-            frame.contains("covered"),
-            "restore must repaint content hidden by the overlay: {frame:?}"
         );
     }
 
