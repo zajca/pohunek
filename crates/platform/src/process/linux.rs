@@ -723,33 +723,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stat_foreground_group_reads_tpgid_after_command() {
-        assert_eq!(
-            parse_stat_pid_field(
+    fn stat_fields_are_counted_after_the_command_name() {
+        for (case, stat, field, expected) in [
+            (
+                "tpgid after a command with spaces",
                 "123 (agent with spaces) S 1 2 3 456 789 8",
                 STAT_TPGID_FIELD,
+                Some(789),
             ),
-            Some(789)
-        );
-    }
-
-    #[test]
-    fn stat_process_group_reads_pgrp_after_command() {
+            (
+                "pgrp after a command with spaces",
+                "123 (agent with spaces) S 1 456 3 4 789 8",
+                STAT_PGRP_FIELD,
+                Some(456),
+            ),
+            (
+                "tpgid after an escaped parenthesis in the command",
+                "123 (escaped \\() name) S 1 2 3 456 789",
+                STAT_TPGID_FIELD,
+                Some(789),
+            ),
+            (
+                "a field before the state",
+                "123 (agent) S 1 2 3 4 5",
+                2,
+                None,
+            ),
+            (
+                "tpgid -1 without a controlling terminal",
+                "123 (agent) S 1 2 3 456 -1",
+                STAT_TPGID_FIELD,
+                None,
+            ),
+            (
+                "a truncated stat after an escaped parenthesis",
+                "123 (agent with \\() parenthesis) S 1 2 3",
+                STAT_TPGID_FIELD,
+                None,
+            ),
+        ] {
+            assert_eq!(parse_stat_pid_field(stat, field), expected, "{case}");
+        }
         assert_eq!(
-            parse_stat_pid_field("123 (agent with spaces) S 1 456 3 4 789 8", STAT_PGRP_FIELD,),
-            Some(456)
-        );
-    }
-
-    #[test]
-    fn stat_start_identity_uses_shared_production_parser() {
-        let stat = concat!(
-            "123 (agent) S 1 456 3 4 789 0 0 0 0 0 0 0 0 0 ",
-            "20 0 1 0 987654"
-        );
-        assert_eq!(
-            parse_stat_field::<u64>(stat, STAT_STARTTIME_FIELD),
-            Some(987_654)
+            parse_stat_field::<u64>(
+                "123 (agent) S 1 456 3 4 789 0 0 0 0 0 0 0 0 0 20 0 1 0 987654",
+                STAT_STARTTIME_FIELD,
+            ),
+            Some(987_654),
+            "starttime"
         );
     }
 
@@ -1090,46 +1111,6 @@ mod tests {
         assert!(
             read_control_group_membership_at(root.path(), process_id, euid, "/")
                 .expect("root cgroup membership")
-        );
-    }
-
-    #[test]
-    fn stat_parser_rejects_fields_before_state() {
-        assert_eq!(parse_stat_pid_field("123 (agent) S 1 2 3 4 5", 2), None);
-    }
-
-    #[test]
-    fn stat_foreground_group_uses_production_offset_arithmetic() {
-        assert_eq!(
-            parse_stat_pid_field("123 (agent) S 1 2 3 456 7 8", STAT_TPGID_FIELD),
-            Some(7)
-        );
-    }
-
-    #[test]
-    fn stat_foreground_group_parses_signed_absent_value() {
-        assert_eq!(
-            parse_stat_pid_field("123 (agent) S 1 2 3 456 -1", STAT_TPGID_FIELD),
-            None
-        );
-    }
-
-    #[test]
-    fn stat_foreground_group_handles_escaped_parenthesis_in_command() {
-        assert_eq!(
-            parse_stat_pid_field("123 (escaped \\() name) S 1 2 3 456 789", STAT_TPGID_FIELD,),
-            Some(789)
-        );
-    }
-
-    #[test]
-    fn malformed_stat_has_no_process_group() {
-        assert_eq!(
-            parse_stat_pid_field(
-                "123 (agent with \\() parenthesis) S 1 2 3",
-                STAT_TPGID_FIELD,
-            ),
-            None
         );
     }
 

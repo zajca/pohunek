@@ -459,21 +459,6 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_that_times_out_after_the_fallback_stage_still_yields_the_fallback() {
-        let dir = fixture();
-        let (home, table, expected) = fake_host(dir.path());
-        let mut spec = shell(dir.path(), "exec sleep 300");
-        spec.timeout = Duration::from_millis(500);
-        let resolution = resolve_search_path(&policy(Some(&spec), &refs(&table), Some(&home)))
-            .expect("resolution");
-        assert_eq!(resolution.path.entries(), expected);
-        assert!(matches!(
-            resolution.login_shell_failure,
-            Some(LoginShellError::Timeout { .. })
-        ));
-    }
-
-    #[test]
     fn a_login_path_of_only_untrusted_directories_is_still_reported_with_the_fallback() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = fixture();

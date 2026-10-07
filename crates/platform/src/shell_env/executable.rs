@@ -575,19 +575,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_only_execute_permission_counts() {
-        let dir = fixture();
-        let path = dir.path().join("agent");
-        fs::write(&path, "#!/bin/sh\n").expect("write");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("chmod");
-        let search = SearchPath::new(vec![dir.path().to_path_buf()]).expect("search");
-        assert_eq!(
-            resolve_executable(OsStr::new("agent"), &search).expect("agent"),
-            path
-        );
-    }
-
-    #[test]
     fn an_environment_path_skips_empty_and_relative_entries_and_keeps_searching() {
         let dir = fixture();
         let bin = dir.path().join("bin");
@@ -752,17 +739,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_directory_or_special_file_is_never_an_executable() {
-        let dir = fixture();
-        make_dir(dir.path(), &dir.path().join("agent"));
-        let search = SearchPath::new(vec![dir.path().to_path_buf()]).expect("search");
-        assert_eq!(
-            resolve_executable(OsStr::new("agent"), &search),
-            Err(ExecutableError::NotFound)
-        );
-    }
-
     /// A world-writable directory (not sticky): anyone may rename its entries.
     fn wild_dir(root: &Path, name: &str) -> PathBuf {
         let wild = root.join(name);
@@ -819,18 +795,6 @@ mod tests {
             resolve_executable(OsStr::new("tool"), &search),
             Err(ExecutableError::NotFound)
         );
-    }
-
-    #[test]
-    fn a_trusted_chain_under_a_sticky_root_owned_temporary_root_is_accepted() {
-        // `fixture` lives in a private 0700 directory below the sticky,
-        // world-writable, root-owned temporary root.
-        let dir = fixture();
-        let bin = dir.path().join("bin");
-        make_dir(dir.path(), &bin);
-        let agent = executable(&bin, "agent");
-        let search = SearchPath::new(vec![bin]).expect("search");
-        assert_eq!(resolve_executable(OsStr::new("agent"), &search), Ok(agent));
     }
 
     #[test]

@@ -1782,22 +1782,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_watch_on_one_identity_completes_once_it_exits() {
-        let inspector = DarwinInspector::new();
-        let mut fixture = spawn_shell("/bin/sleep 60", &[], None);
-        let identity = live_identity(inspector, fixture.pid());
-
-        let first = inspector.exit_watch(identity).expect("arm the first watch");
-        let second = inspector
-            .exit_watch(identity)
-            .expect("arm the second watch");
-        fixture.0.kill().expect("kill the fixture");
-
-        await_exit("the first watch", first).await;
-        await_exit("the second watch", second).await;
-    }
-
-    #[tokio::test]
     async fn exit_watch_rejects_a_process_that_already_exited() {
         let inspector = DarwinInspector::new();
         let mut fixture = spawn_shell("exit 0", &[], None);

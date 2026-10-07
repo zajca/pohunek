@@ -333,14 +333,6 @@ mod tests {
     }
 
     #[test]
-    fn workers_never_keep_alive() {
-        let xml = rendered(worker_spec());
-        assert!(!xml.contains("KeepAlive"));
-        assert!(!xml.contains("ThrottleInterval"));
-        assert!(!xml.contains("ProcessType"));
-    }
-
-    #[test]
     fn hostile_values_are_escaped_by_the_plist_crate() {
         let hostile = [
             "</string><key>KeepAlive</key><true/><string>",

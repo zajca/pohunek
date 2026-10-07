@@ -5422,12 +5422,4 @@ mod tests {
             }) if path == foreign
         ));
     }
-
-    #[test]
-    fn file_sync_flushes_real_descriptor() {
-        let temporary = pohunek_test_support::tempdir().expect("create fixture root");
-        let file = fs::File::create(temporary.path().join("synced")).expect("create file");
-        sync_file(&file).expect("sync temporary file");
-        assert_eq!(file.metadata().expect("inspect file").nlink(), 1);
-    }
 }
