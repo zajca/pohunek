@@ -234,6 +234,7 @@ esac"#,
     status_json_arguments.push("--json");
     let status_json = parse_ok(&run(&fixture, &status_json_arguments));
     assert_eq!(status_json["modified"], false);
+    assert_eq!(status_json["outdated"], false);
 
     let policy_paths = fs::read_dir(fixture.root.join("state/pohunek/policies/hermes"))
         .expect("read policy directory")
