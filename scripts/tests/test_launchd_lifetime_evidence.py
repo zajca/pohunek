@@ -7,23 +7,18 @@ observations exactly as `docs/acceptance/README.md` documents.
 """
 
 import base64
-import contextlib
 import copy
-import importlib.util
-import io
 import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ACCEPTANCE = Path(__file__).resolve().parents[1] / "acceptance"
 DRIVER = ACCEPTANCE / "macos-launchd-lifetime"
 HELPER = ACCEPTANCE / "launchd_lifetime_evidence.py"
-SPEC = importlib.util.spec_from_file_location("launchd_lifetime_evidence", HELPER)
-evidence = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(evidence)
 
 NAMESPACE = "0123456789ab"
 BOOT = "{ sec = 1727000000, usec = 0 }"
@@ -149,7 +144,8 @@ class StateDir:
         self.write(base + "after/boottime.txt", overrides.get("after_boot", after_boot))
         self.write(base + "after/ps.txt", overrides.get("ps", "  900 1 pohunekd --service-config /x\n"))
         labels = "\n".join(
-            "{} {}".format(evidence.worker_label(NAMESPACE, sid, gen), overrides.get("label_status", 113))
+            "io.github.zajca.pohunek.{}.worker.{}.{} {}".format(
+                NAMESPACE, sid, gen, overrides.get("label_status", 113))
             for sid, gen in ((SHELL, "aaaaaaaa"), (AGENT, "bbbbbbbb"))
         )
         self.write(base + "after/launchctl.txt", labels + "\n")
@@ -219,9 +215,21 @@ class EvidenceTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def assemble(self):
+        output = self.state.root / "evidence.json"
+        result = subprocess.run(
+            [sys.executable, str(HELPER), "assemble", str(self.state.root), str(output)],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(output.read_text())
+
+    def phase(self, name):
+        return next(phase for phase in self.assemble()["phases"] if phase["name"] == name)
+
     def test_complete_passing_run(self):
         self.state.complete()
-        document = evidence.assemble(self.state.root)
+        document = self.assemble()
         self.assertEqual(document["schema"], "pohunek.acceptance.launchd-lifetime")
         self.assertEqual(document["schema_version"], 1)
         self.assertEqual([phase["name"] for phase in document["phases"]],
@@ -241,7 +249,7 @@ class EvidenceTest(unittest.TestCase):
 
     def test_partial_run_is_incomplete_and_not_passed(self):
         self.state.survive("screen-lock")
-        document = evidence.assemble(self.state.root)
+        document = self.assemble()
         self.assertFalse(document["complete"])
         self.assertFalse(document["passed"])
         self.assertIsNone(document["completed_at"])
@@ -250,7 +258,7 @@ class EvidenceTest(unittest.TestCase):
     def test_survival_fails_when_the_worker_was_replaced(self):
         replaced = [worker(SHELL, "dddddddd", 999), worker(AGENT, "bbbbbbbb", 402)]
         self.state.survive("screen-lock", after_service=service(300, replaced))
-        phase = evidence.evaluate_phase(self.state.root, "screen-lock")
+        phase = self.phase("screen-lock")
         self.assertFalse(phase["passed"])
         self.assertEqual(
             failed_checks(phase),
@@ -259,7 +267,7 @@ class EvidenceTest(unittest.TestCase):
 
     def test_survival_fails_when_the_pty_does_not_run_the_probe(self):
         self.state.survive("terminal-close", probe_line="$")
-        phase = evidence.evaluate_phase(self.state.root, "terminal-close")
+        phase = self.phase("terminal-close")
         self.assertEqual(failed_checks(phase), ["s-shell:pty_accepts_input_and_prints"])
 
     def test_survival_accepts_the_probe_in_retained_output(self):
@@ -268,19 +276,19 @@ class EvidenceTest(unittest.TestCase):
         self.state.write(
             "phases/terminal-close/probe/{}.output.json".format(SHELL), envelope({"data_base64": data})
         )
-        phase = evidence.evaluate_phase(self.state.root, "terminal-close")
+        phase = self.phase("terminal-close")
         self.assertTrue(phase["passed"], failed_checks(phase))
 
     def test_survival_fails_when_the_daemon_restarted(self):
         self.state.survive("screen-lock", after_service=service(301, LIVE_WORKERS))
-        phase = evidence.evaluate_phase(self.state.root, "screen-lock")
+        phase = self.phase("screen-lock")
         self.assertEqual(failed_checks(phase), ["daemon_unchanged"])
 
     def test_loss_fails_when_a_worker_was_resurrected(self):
         resurrected = service(900, [worker(SHELL, "aaaaaaaa", 401)])
         ps = "  401 1 pohunek-sessiond --session-id s-shell --worker-generation aaaaaaaa\n"
         self.state.lost("logout-login", after_service=resurrected, ps=ps)
-        phase = evidence.evaluate_phase(self.state.root, "logout-login")
+        phase = self.phase("logout-login")
         self.assertEqual(
             failed_checks(phase),
             ["s-shell:no_worker_job_after", "s-shell:no_worker_process"],
@@ -288,7 +296,7 @@ class EvidenceTest(unittest.TestCase):
 
     def test_loss_fails_when_the_old_label_is_still_loaded(self):
         self.state.lost("reboot", label_status=0)
-        phase = evidence.evaluate_phase(self.state.root, "reboot")
+        phase = self.phase("reboot")
         self.assertEqual(
             failed_checks(phase),
             ["s-shell:old_generation_label_absent", "s-claude:old_generation_label_absent"],
@@ -298,27 +306,27 @@ class EvidenceTest(unittest.TestCase):
         sessions = lost_sessions()
         sessions[0]["runtime"]["loss_reason"] = "runtime_lost_cleanup_unconfirmed"
         self.state.lost("logout-login", after_sessions=sessions)
-        phase = evidence.evaluate_phase(self.state.root, "logout-login")
+        phase = self.phase("logout-login")
         self.assertEqual(failed_checks(phase), ["s-shell:loss_reason"])
 
     def test_logout_must_not_look_like_a_reboot(self):
         self.state.lost("logout-login", after_boot=REBOOTED)
-        phase = evidence.evaluate_phase(self.state.root, "logout-login")
+        phase = self.phase("logout-login")
         self.assertEqual(failed_checks(phase), ["host_not_rebooted"])
 
     def test_reboot_must_change_the_boot_time(self):
         self.state.lost("reboot", after_boot=BOOT)
-        phase = evidence.evaluate_phase(self.state.root, "reboot")
+        phase = self.phase("reboot")
         self.assertEqual(failed_checks(phase), ["host_rebooted"])
 
     def test_recovery_must_start_a_new_generation(self):
         self.state.lost("logout-login", new_generation="bbbbbbbb")
-        phase = evidence.evaluate_phase(self.state.root, "logout-login")
+        phase = self.phase("logout-login")
         self.assertEqual(failed_checks(phase), ["s-claude:explicit_recovery_starts_new_generation"])
 
     def test_failed_resume_fails_the_phase(self):
         self.state.lost("reboot", recovery_exit="1")
-        phase = evidence.evaluate_phase(self.state.root, "reboot")
+        phase = self.phase("reboot")
         self.assertEqual(failed_checks(phase), ["s-claude:explicit_recovery_starts_new_generation"])
 
     def test_loss_phase_needs_a_recoverable_session(self):
@@ -328,13 +336,13 @@ class EvidenceTest(unittest.TestCase):
             entry.pop("native_session_id", None)
         self.state.lost("logout-login", after_sessions=sessions)
         self.state.write("phases/logout-login/before/sessions.json", envelope(before))
-        phase = evidence.evaluate_phase(self.state.root, "logout-login")
+        phase = self.phase("logout-login")
         self.assertEqual(failed_checks(phase), ["recovery_covered"])
 
     def test_missing_observation_fails_closed(self):
         self.state.survive("screen-lock")
         (self.state.root / "phases/screen-lock/after/service.json").unlink()
-        phase = evidence.evaluate_phase(self.state.root, "screen-lock")
+        phase = self.phase("screen-lock")
         self.assertFalse(phase["passed"])
         self.assertEqual(failed_checks(phase), ["observations_readable"])
 
@@ -348,10 +356,12 @@ class QueryCommandTest(unittest.TestCase):
         self.temp.cleanup()
 
     def run_helper(self, *argv):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            status = evidence.main([str(arg) for arg in argv])
-        return status, output.getvalue().splitlines()
+        result = subprocess.run(
+            [sys.executable, str(HELPER), *(str(arg) for arg in argv)],
+            capture_output=True, text=True, check=False,
+        )
+        self.last_stderr = result.stderr
+        return result.returncode, result.stdout.splitlines()
 
     def test_labels_name_the_current_generation(self):
         path = self.root / "service.json"
@@ -398,11 +408,9 @@ class QueryCommandTest(unittest.TestCase):
     def test_malformed_input_is_an_error(self):
         path = self.root / "broken.json"
         path.write_text("{")
-        errors = io.StringIO()
-        with contextlib.redirect_stderr(errors):
-            status, _ = self.run_helper("states", path, SHELL)
+        status, _ = self.run_helper("states", path, SHELL)
         self.assertEqual(status, 2)
-        self.assertIn("is not JSON", errors.getvalue())
+        self.assertIn("is not JSON", self.last_stderr)
 
 
 if __name__ == "__main__":
