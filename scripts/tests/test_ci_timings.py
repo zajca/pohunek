@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import io
+import os
 import importlib.machinery
 import importlib.util
 import json
@@ -96,659 +97,679 @@ def _summary(**overrides):
     return ci_timings.summarize_run(dict(RUN, **overrides))
 
 
-def _selection(**overrides):
-    """Selection args carrying every field the diagnosis reads."""
-    defaults = {
-        "input": None, "conclusion": None, "event": None, "branch": None,
-        "attempts": "first",
-    }
-    return argparse.Namespace(**{**defaults, **overrides})
-
-
 class RunTimingTests(unittest.TestCase):
-    def test_format_seconds_scales_negative_values_too(self):
-        # A delta is a duration: an improvement must read like the
-        # regression it mirrors, not fall back to raw seconds.
-        self.assertEqual(ci_timings.format_seconds(-196), "-3m16s")
-        self.assertEqual(ci_timings.format_seconds(196), "3m16s")
-        self.assertEqual(ci_timings.format_seconds(-4000), "-1h06m")
-        self.assertEqual(ci_timings.format_seconds(-9), "-9s")
-        self.assertEqual(ci_timings.format_seconds(0), "0s")
+    """Command-line scenarios for `scripts/ci-timings`.
 
-    def test_job_seconds_skips_unfinished_jobs(self):
-        seconds = ci_timings.job_seconds(RUN)
-        self.assertEqual(seconds["fmt + clippy"], 199.0)
-        self.assertNotIn("cargo-udeps (unused dependencies)", seconds)
+    Every case starts the real script as a subprocess and asserts on the
+    stdout/stderr/exit code an operator observes. Run documents are `gh
+    run view --json` fixtures written into a disposable directory, so no
+    case touches `gh`, the network, writes outside a temp root, or any
+    host state. Run selection is driven with `--input` snapshots; the one
+    fetch-path contract (which selection flags go where) uses a stub `gh`
+    on `PATH` that records its arguments.
 
-    def test_job_seconds_skips_skipped_jobs_with_real_timestamps(self):
-        # A conditionally skipped job can still carry usable timestamps, so
-        # the conclusion is what disqualifies it -- counting it would add a
-        # run that never ran.
-        skipped = {
-            "name": "tests (relay DB, PostgreSQL)",
-            "startedAt": "2026-09-20T10:00:00Z",
-            "completedAt": "2026-09-20T10:04:00Z",
-            "conclusion": "skipped",
+    A window is inclusive of both named dates. Attempt grouping happens
+    before the metadata filters: with the default `--attempts first`, a
+    failed first attempt is never displaced by its own successful rerun,
+    and a first attempt that succeeded before its rerun failed is never
+    lost -- which a server-side conclusion filter would do.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    # -- fixture helpers --------------------------------------------------
+
+    def _document(self, databaseId, *, created, updated, jobs=None,
+                  started=None, attempt=1, conclusion="success",
+                  event="pull_request", branch="topic"):
+        """A `gh run view --json` document shaped like the CLI reads it."""
+        if started is None:
+            started = created
+        return {
+            "databaseId": databaseId,
+            "name": "ci.yml",
+            "displayTitle": "CI",
+            "event": event,
+            "conclusion": conclusion,
+            "createdAt": created,
+            "startedAt": started,
+            "updatedAt": updated,
+            "attempt": attempt,
+            "headBranch": branch,
+            "workflowName": "CI",
+            "jobs": list(jobs) if jobs is not None else [],
         }
-        self.assertEqual(ci_timings.job_seconds({"jobs": [skipped]}), {})
 
-    def test_job_seconds_skips_a_half_finished_job(self):
-        # A job still running when the run was read has a start but no
-        # completion; `gh` serializes that as null rather than the Go zero
-        # time, and it carries no duration to measure.
-        unfinished = {
-            "name": "tests (heavy, PTY + Hermes)",
-            "startedAt": "2026-09-20T10:00:00Z",
-            "completedAt": None,
-            "conclusion": "success",
+    @staticmethod
+    def _job(name, start, end, conclusion="success"):
+        """One job entry with the timestamp pair `gh` reports."""
+        return {
+            "name": name,
+            "startedAt": start,
+            "completedAt": end,
+            "conclusion": conclusion,
         }
-        self.assertEqual(ci_timings.job_seconds({"jobs": [unfinished]}), {})
 
-    def test_job_seconds_skips_the_go_zero_timestamp(self):
-        # `gh` serializes a missing time as Go's zero `time.Time`, not null.
-        # Paired with a real completion that parses into a ~2000-year
-        # duration, which would dominate every median it entered.
-        zero_start = {
-            "name": "TS binding drift (xs check)",
-            "startedAt": "0001-01-01T00:00:00Z",
-            "completedAt": "2026-09-20T10:04:00Z",
-            "conclusion": "success",
-        }
-        self.assertEqual(ci_timings.job_seconds({"jobs": [zero_start]}), {})
+    def write_snapshot(self, name, documents):
+        """Write a run snapshot the way an accumulated `--input` holds it."""
+        path = self.dir / name
+        path.write_text(json.dumps(list(documents), indent=1) + "\n")
+        return str(path)
 
-    def test_job_seconds_skips_zero_length_jobs(self):
-        instant = {
-            "name": "fmt + clippy",
-            "startedAt": "2026-09-20T10:00:00Z",
-            "completedAt": "2026-09-20T10:00:00Z",
-            "conclusion": "success",
-        }
-        self.assertEqual(ci_timings.job_seconds({"jobs": [instant]}), {})
+    def run_cli(self, *arguments, env=None):
+        """Start the script exactly as an operator does."""
+        return subprocess.run(
+            [str(SCRIPT), *arguments],
+            capture_output=True,
+            text=True,
+            cwd=self.dir,
+            env=env,
+        )
 
-    def test_runs_in_window_spans_the_whole_last_day(self):
-        # The window is inclusive of its end date, so a run late on that day
-        # belongs to it; the diagnosis and filter_runs must agree on this or
-        # they report different populations for the same request.
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        last_day = _summary(
-            createdAt="2026-09-16T23:59:59Z", startedAt="2026-09-16T23:59:59Z"
-        )
-        next_day = _summary(
-            createdAt="2026-09-17T00:00:00Z", startedAt="2026-09-17T00:00:00Z"
-        )
-        first_day = _summary(
-            createdAt="2026-09-14T00:00:00Z", startedAt="2026-09-14T00:00:00Z"
-        )
+    def run_json(self, *arguments):
+        """A successful `--json` invocation, parsed."""
+        result = self.run_cli(*arguments, "--json")
         self.assertEqual(
-            ci_timings.runs_in_window([last_day, next_day, first_day], window),
-            [last_day, first_day],
+            result.returncode, 0,
+            f"unexpected failure: {result.stderr}",
         )
-        # The same boundary, through the real selection path.
-        self.assertEqual(
-            [run["created_at"] for run in ci_timings.filter_runs(
-                [last_day], window=window
-            )],
-            [last_day["created_at"]],
-        )
-        self.assertEqual(
-            ci_timings.filter_runs([next_day], window=window), []
+        return json.loads(result.stdout)
+
+    def snapshot_one(self):
+        """One successful run fixture, as `RUN`'s timestamps describe it."""
+        return self.write_snapshot(
+            "snapshot.json",
+            [self._document(1, created="2026-09-20T10:00:00Z",
+                            updated="2026-09-20T10:09:30Z")],
         )
 
-    def test_summarize_run_requires_timestamps(self):
-        with self.assertRaisesRegex(ValueError, "no timestamps"):
-            ci_timings.summarize_run({"databaseId": 7})
+    # -- jobs and per-run timing -----------------------------------------
 
-    def test_summarize_run_separates_created_and_started(self):
-        # A rerun keeps createdAt at the original attempt; wall clock must
-        # measure the actual execution from startedAt, not the gap between
-        # attempts, while windows keep matching on creation time (the
-        # server-side `--created` semantics).
-        summary = _summary(
-            createdAt="2026-09-20T09:00:00Z",
-            startedAt="2026-09-20T10:00:00Z",
-            updatedAt="2026-09-20T10:09:30Z",
-        )
-        self.assertEqual(summary["wall_seconds"], 570.0)
-        self.assertEqual(summary["created_at"], ci_timings.parse_timestamp(
-            "2026-09-20T09:00:00Z"
-        ))
-        self.assertEqual(summary["started_at"], ci_timings.parse_timestamp(
-            "2026-09-20T10:00:00Z"
-        ))
-        self.assertEqual(summary["attempt"], 1)
-
-    def test_filter_runs_windows_follow_created_not_started(self):
-        queued = _summary(
-            databaseId=25,
-            createdAt="2026-09-19T23:50:00Z",
-            startedAt="2026-09-20T00:10:00Z",
-        )
-        window = ci_timings.parse_window("2026-09-20..2026-09-21")
-        self.assertEqual(ci_timings.filter_runs([queued], window=window), [])
-
-    def test_filter_runs_conclusion_applies_to_grouped_first_attempt(self):
-        # A failed first attempt must stay excluded even when its rerun
-        # succeeded: grouping precedes the conclusion filter.
-        failed = _summary(
-            databaseId=26, attempt=1, conclusion="failure",
-            startedAt="2026-09-20T10:00:00Z",
-        )
-        rerun = _summary(
-            databaseId=26, attempt=2, conclusion="success",
-            startedAt="2026-09-20T15:00:00Z",
-        )
-        selected = ci_timings.filter_runs(
-            [failed, rerun], conclusion="success"
-        )
-        self.assertEqual(selected, [])
-        everything = ci_timings.filter_runs(
-            [failed, rerun], conclusion="success", attempts="all"
-        )
-        self.assertEqual(
-            [(run["id"], run["attempt"]) for run in everything], [(26, 2)]
-        )
-
-    def test_filter_runs_keeps_run_whose_rerun_failed(self):
-        # The scenario a server-side `gh run list --status success` would
-        # lose: `gh run list` reports only attempt 2's failure, so the run
-        # would never be fetched, yet attempt 1 is a genuine success sample.
-        succeeded = _summary(
-            databaseId=27, attempt=1, conclusion="success",
-            startedAt="2026-09-20T10:00:00Z",
-        )
-        rerun = _summary(
-            databaseId=27, attempt=2, conclusion="failure",
-            startedAt="2026-09-20T15:00:00Z",
-        )
-        selected = ci_timings.filter_runs(
-            [succeeded, rerun], conclusion="success"
-        )
-        self.assertEqual(
-            [(run["id"], run["attempt"]) for run in selected], [(27, 1)]
-        )
-
-    def test_filter_runs_default_keeps_only_first_attempts(self):
-        first = _summary(databaseId=20, startedAt="2026-09-20T10:00:00Z")
-        rerun = _summary(
-            databaseId=20,
-            startedAt="2026-09-20T15:00:00Z",
-            attempt=2,
-            conclusion="success",
-        )
-        other = _summary(databaseId=21, startedAt="2026-09-20T16:00:00Z")
-        selected = ci_timings.filter_runs([rerun, other, first])
-        self.assertEqual([run["id"] for run in selected], [20, 21])
-        everything = ci_timings.filter_runs([rerun, other, first], attempts="all")
-        self.assertEqual([run["id"] for run in everything], [20, 20, 21])
-
-    def test_filter_runs_window_is_inclusive_and_sorted(self):
-        older = _summary(databaseId=2, createdAt="2026-09-14T09:00:00Z")
-        newer = _summary(databaseId=3, createdAt="2026-09-21T00:00:00Z")
-        outside = _summary(databaseId=4, createdAt="2026-09-22T00:00:00Z")
-        window = ci_timings.parse_window("2026-09-14..2026-09-21")
-        selected = ci_timings.filter_runs(
-            [outside, newer, older], window=window, event="pull_request"
-        )
-        self.assertEqual([run["id"] for run in selected], [2, 3])
-
-    def test_filter_runs_metadata_filters(self):
-        failed = _summary(databaseId=5, conclusion="failure")
-        schedule = _summary(databaseId=6, event="schedule")
-        branch = _summary(databaseId=7, headBranch="other")
-        selected = ci_timings.filter_runs(
-            [_summary(), failed, schedule, branch],
-            event="pull_request",
-            conclusion="success",
-            branch="topic",
-        )
-        self.assertEqual([run["id"] for run in selected], [1])
-
-    def test_filter_runs_first_attempt_is_by_attempt_number(self):
-        # Attempts may arrive in either order (snapshot accumulation); the
-        # choice must follow the attempt value, not input position.
-        first = _summary(databaseId=22, startedAt="2026-09-20T10:00:00Z", attempt=1)
-        rerun = _summary(databaseId=22, startedAt="2026-09-20T15:00:00Z", attempt=2)
-        forward = ci_timings.filter_runs([first, rerun])
-        backward = ci_timings.filter_runs([rerun, first])
-        self.assertEqual([run["attempt"] for run in forward], [1])
-        self.assertEqual([run["attempt"] for run in backward], [1])
-
-    def test_list_arguments_scopes_to_ci_workflow(self):
-        arguments = ci_timings.list_arguments(
-            argparse.Namespace(limit=40, event="pull_request", branch=None,
-                               conclusion=None),
-            None,
-        )
-        self.assertIn("--workflow", arguments)
-        self.assertIn("ci.yml", arguments)
-
-    def test_list_arguments_keeps_conclusion_client_side(self):
-        # `gh run list` reports the latest attempt's conclusion, so a
-        # server-side --status would drop a run whose first attempt succeeded
-        # and whose rerun failed before an attempt is even selected.
-        arguments = ci_timings.list_arguments(
-            argparse.Namespace(limit=40, event=None, branch=None,
-                               conclusion="success"),
-            None,
-        )
-        self.assertNotIn("--status", arguments)
-        self.assertNotIn("success", arguments)
-
-    def test_list_arguments_passes_window_and_branch(self):
-        arguments = ci_timings.list_arguments(
-            argparse.Namespace(limit=40, event=None, branch="main",
-                               conclusion=None),
-            ci_timings.parse_window("2026-09-14..2026-09-16"),
-        )
-        self.assertIn("--branch", arguments)
-        self.assertIn("main", arguments)
-        self.assertIn("--created", arguments)
-        self.assertIn("2026-09-14..2026-09-16", arguments)
-
-    def test_empty_window_diagnosis_names_the_filter_that_excluded_runs(self):
-        # The case that makes guessing unsafe: the window IS covered, so
-        # telling the user to widen the fetch or drop --input would send them
-        # away from the filter actually responsible.
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        covered = _summary(
-            conclusion="failure",
-            createdAt="2026-09-15T10:00:00Z",
-            startedAt="2026-09-15T10:00:00Z",
-        )
-        for source in (None, "snapshot.json"):
-            message = ci_timings.empty_window_diagnosis(
-                _selection(input=source, conclusion="success", event=None, branch=None),
-                [covered],
-                window,
-            ).message
-            self.assertIn("1 run(s) fall inside it", message)
-            self.assertIn("--conclusion success", message)
-            self.assertNotIn("--limit", message)
-            self.assertNotIn("drop --input", message)
-
-    def test_empty_window_diagnosis_names_only_blocking_filters(self):
-        # The fixture run is a successful `pull_request` on `topic`, so only
-        # --conclusion rejects it; naming the matching --event would send the
-        # user after a flag that excluded nothing.
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        covered = _summary(
-            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
-        )
-        message = ci_timings.empty_window_diagnosis(
-            _selection(input=None, conclusion="failure", event="pull_request", branch="topic"),
-            [covered],
-            window,
-        ).message
-        self.assertIn("--conclusion failure", message)
-        self.assertNotIn("--event", message)
-        self.assertNotIn("--branch", message)
-
-    def test_empty_window_diagnosis_judges_filters_against_candidates(self):
-        """A sibling attempt must not be blamed for emptying the window.
-
-        `wanted_attempts("first")` always loads attempt 1 beside the latest,
-        and reruns share their run's creation time, so both siblings sit in
-        the window. Only attempt 1 is a candidate under `--attempts first`;
-        counting attempt 2's mismatch would misreport what happened.
-        """
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        def attempt(number, conclusion):
-            return _summary(
-                databaseId=60, attempt=number, conclusion=conclusion,
-                createdAt="2026-09-15T10:00:00Z",
-                startedAt="2026-09-15T10:00:00Z",
-            )
-        loaded = [attempt(1, "failure"), attempt(2, "success")]
-        message = ci_timings.empty_window_diagnosis(
-            _selection(conclusion="success"), loaded, window
-        ).message
-        # One candidate, not two: attempt 2 never reaches the filter stage.
-        self.assertIn("1 run(s) fall inside it", message)
-        self.assertIn("--conclusion success", message)
-        # The narrower fix the user actually wants is named too.
-        self.assertIn("--attempts all", message)
-        self.assertEqual(
-            [(run["id"], run["attempt"]) for run in ci_timings.filter_runs(
-                loaded, window=window, conclusion="success", attempts="all"
-            )],
-            [(60, 2)],
-        )
-
-    def test_empty_window_diagnosis_ignores_a_non_candidate_mismatch(self):
-        # Attempt 2 ran on another branch, but it is not a candidate under
-        # --attempts first, so its --branch mismatch did not empty the
-        # window and naming --branch would send the user after the wrong flag.
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        loaded = [
-            _summary(databaseId=63, attempt=1, conclusion="failure",
-                     headBranch="main", createdAt="2026-09-15T10:00:00Z",
-                     startedAt="2026-09-15T10:00:00Z"),
-            _summary(databaseId=63, attempt=2, conclusion="failure",
-                     headBranch="other", createdAt="2026-09-15T10:00:00Z",
-                     startedAt="2026-09-15T10:00:00Z"),
+    def test_runs_reports_job_wall_clock_and_skips_jobs_with_no_duration(self):
+        # Skipped jobs (even with usable timestamps), half-finished jobs
+        # (`gh` serializes a running job's end as null, not the Go zero
+        # time), Go zero timestamps, and zero-length jobs all carry no
+        # duration to measure; each must stay out of the tables instead of
+        # dragging the medians or inflating run counts.
+        jobs = [
+            self._job("fmt + clippy",
+                      "2026-09-20T10:00:05Z", "2026-09-20T10:03:24Z"),
+            self._job("tests (relay DB, PostgreSQL)",
+                      "2026-09-20T10:00:00Z", "2026-09-20T10:04:00Z",
+                      conclusion="skipped"),
+            self._job("tests (heavy, PTY + Hermes)",
+                      "2026-09-20T10:00:00Z", None),
+            self._job("TS binding drift (xs check)",
+                      "0001-01-01T00:00:00Z", "2026-09-20T10:04:00Z"),
+            self._job("instant job",
+                      "2026-09-20T10:00:00Z", "2026-09-20T10:00:00Z"),
         ]
-        message = ci_timings.empty_window_diagnosis(
-            _selection(conclusion="success", branch="main"), loaded, window
-        ).message
-        self.assertIn("--conclusion success", message)
-        self.assertNotIn("--branch", message)
-
-    def test_empty_window_diagnosis_blames_filters_failed_by_any_candidate(self):
-        """Two candidates, each failing a different filter, must name both.
-
-        A filter blocks when it rejects *any* candidate, not only when it
-        rejects every one. With one candidate the two readings agree, so
-        this needs a heterogeneous set: judging "every" here would report no
-        blocking filter at all and fall through to blaming attempt grouping,
-        which has nothing to do with it -- there are no reruns in sight.
-        """
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-
-        def run(**overrides):
-            return _summary(
-                createdAt="2026-09-15T10:00:00Z",
-                startedAt="2026-09-15T10:00:00Z",
-                **overrides,
-            )
-
-        loaded = [
-            run(databaseId=80, conclusion="success", event="push"),
-            run(databaseId=81, conclusion="failure", event="pull_request"),
-        ]
-        args = _selection(conclusion="success", event="pull_request")
-        # Neither run passes both filters, so the window is genuinely empty.
-        self.assertEqual(
-            ci_timings.filter_runs(
-                loaded, window=window, conclusion="success",
-                event="pull_request",
-            ),
-            [],
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [self._document(1, created="2026-09-20T10:00:00Z",
+                            updated="2026-09-20T10:09:30Z", jobs=jobs)],
         )
-        message = ci_timings.empty_window_diagnosis(args, loaded, window).message
-        self.assertIn("--conclusion success", message)
-        self.assertIn("--event pull_request", message)
-        self.assertNotIn("--attempts", message)
-        self.assertIn("2 run(s) fall inside it", message)
-
-    def test_empty_window_diagnosis_omits_rescue_note_without_a_rescuer(self):
-        # Both attempts failed, so --attempts all would not help and must
-        # not be suggested.
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        def attempt(number):
-            return _summary(
-                databaseId=61, attempt=number, conclusion="failure",
-                createdAt="2026-09-15T10:00:00Z",
-                startedAt="2026-09-15T10:00:00Z",
-            )
-        message = ci_timings.empty_window_diagnosis(
-            _selection(conclusion="success"),
-            [attempt(1), attempt(2)],
-            window,
-        ).message
-        self.assertIn("--conclusion success", message)
-        self.assertNotIn("--attempts all", message)
-
-    def test_empty_window_diagnosis_rejects_an_impossible_state(self):
-        """Every candidate passing every filter contradicts an empty selection.
-
-        `candidates` is `filter_runs`' own post-window pool, so this state
-        means the two have drifted apart. That is a bug in the tool, not a
-        user error, and must not be dressed up as advice.
-        """
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        covered = _summary(
-            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
+        payload = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
         )
-        # The real pipeline selects this run, so no diagnosis is ever asked for.
-        self.assertTrue(ci_timings.filter_runs([covered], window=window))
-        with self.assertRaisesRegex(RuntimeError, "invariant violated"):
-            ci_timings.empty_window_diagnosis(_selection(), [covered], window)
-
-    def test_empty_window_diagnosis_explains_every_reachable_empty_window(self):
-        """Tie the diagnosis to the pipeline and to the branch it reports.
-
-        Testing the diagnosis in isolation is what let a branch survive on a
-        premise the real pipeline contradicts, so every case asserts that
-        `filter_runs` really is empty before asking for a diagnosis. The
-        branch each case claims is then compared against the tag the
-        function itself returns, so a case cannot look covered while
-        exercising a different branch: a wrong label fails its own case, and
-        the closing set comparison catches a branch no case reaches at all.
-        """
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-
-        def run(**overrides):
-            return _summary(
-                createdAt="2026-09-15T10:00:00Z",
-                startedAt="2026-09-15T10:00:00Z",
-                **overrides,
-            )
-
-        outside = _summary(
-            createdAt="2026-09-21T10:00:00Z", startedAt="2026-09-21T10:00:00Z"
+        self.assertEqual(payload["runs"][0]["jobs"], {"fmt + clippy": 199.0})
+        self.assertEqual(len(payload["summary"]["jobs"]), 1)
+        rendered = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
         )
-        cases = {
-            "uncovered, nothing in range": (
-                _selection(), [outside], "no run was fetched for it",
-                "uncovered-fetch",
-            ),
-            "uncovered, nothing loaded at all": (
-                _selection(), [], "no run was fetched for it",
-                "uncovered-fetch",
-            ),
-            "uncovered, snapshot": (
-                _selection(input="snapshot.json"), [outside],
-                "the snapshot given to --input holds no run in it",
-                "uncovered-snapshot",
-            ),
-            "conclusion excludes": (
-                _selection(conclusion="failure"), [run()],
-                "none passed --conclusion failure", "blocking",
-            ),
-            "branch excludes": (
-                _selection(branch="other"), [run()],
-                "none passed --branch other", "blocking",
-            ),
-            "event excludes": (
-                _selection(event="push"), [run()],
-                "none passed --event push", "blocking",
-            ),
-            # Both attempts share createdAt, so both are in the window and
-            # attempt 1 is a candidate: this reaches the blocking branch with
-            # attempt 2 as the rescuable sibling.
-            "rerun blocked with a rescuable sibling": (
-                _selection(conclusion="success"),
-                [run(databaseId=70, attempt=1, conclusion="failure"),
-                 run(databaseId=70, attempt=2, conclusion="success")],
-                "so --attempts all would match", "blocking-with-rescue",
-            ),
-            # A stitched-together snapshot can hold attempts with different
-            # creation times; then --attempts first picks a candidate that
-            # falls outside the window and hides the sibling inside it.
-            "attempt selection misses the window": (
-                _selection(),
-                [_summary(databaseId=71, attempt=1,
-                          createdAt="2026-09-21T10:00:00Z",
-                          startedAt="2026-09-21T10:00:00Z"),
-                 run(databaseId=71, attempt=2)],
-                "kept no attempt of theirs inside it; pass --attempts all "
-                "to count the attempts that do",
-                "no-candidates",
-            ),
+        self.assertEqual(rendered.returncode, 0)
+        self.assertEqual(rendered.stderr, "")
+        # One per-run row with the billable runner minutes (199 s ceils to
+        # 4 min) and a wall clock measured from startedAt to updatedAt.
+        self.assertIn(
+            "| 1 | 2026-09-20 | pull_request | topic | success | "
+            "9m30s | 4 |",
+            rendered.stdout,
+        )
+        self.assertIn("| fmt + clippy | 3m19s | 3m19s | 1 |", rendered.stdout)
+        for absent in ("relay DB", "heavy", "TS binding drift", "instant"):
+            self.assertNotIn(absent, rendered.stdout)
+
+    def test_runs_fails_loudly_without_timestamps_and_on_a_bad_snapshot(self):
+        # A run without any timestamp cannot be measured; the tool must say
+        # which run it stopped on rather than emit a fabricated sample.
+        snapshot = self.write_snapshot("snapshot.json", [{"databaseId": 7}])
+        result = self.run_cli("runs", "--input", snapshot)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("run 7 has no timestamps", result.stderr)
+        missing = self.run_cli(
+            "runs", "--input", str(self.dir / "absent.json")
+        )
+        self.assertEqual(missing.returncode, 1)
+        self.assertTrue(missing.stderr.startswith("ci-timings: "))
+
+    # -- window and selection --------------------------------------------
+
+    def test_runs_window_is_inclusive_of_its_end_date(self):
+        # The window is inclusive of its end date, so a run late on that
+        # day belongs to it while the next day's first instant does not.
+        when_to_id = {
+            "2026-09-14T00:00:00Z": 20,
+            "2026-09-16T23:59:59Z": 21,
+            "2026-09-17T00:00:00Z": 22,
         }
-        reached = set()
-        for label, (args, loaded, expected, branch) in cases.items():
-            with self.subTest(case=label):
-                selected = ci_timings.filter_runs(
-                    loaded, window=window, event=args.event,
-                    conclusion=args.conclusion, branch=args.branch,
-                    attempts=args.attempts,
-                )
-                self.assertEqual(selected, [], "case must be genuinely empty")
-                diagnosis = ci_timings.empty_window_diagnosis(
-                    args, loaded, window
-                )
-                self.assertIn(expected, diagnosis.message)
-                # The tag comes from the function's own control flow, so a
-                # mislabelled case fails here instead of passing quietly.
-                self.assertEqual(diagnosis.branch, branch)
-                reached.add(diagnosis.branch)
-        # Every branch reachable with a non-empty selection is represented;
-        # the invariant branch is unreachable here by construction and has
-        # its own test.
-        self.assertEqual(
-            reached,
-            {"uncovered-fetch", "uncovered-snapshot", "blocking",
-             "blocking-with-rescue", "no-candidates"},
-        )
-
-    def test_selection_coverage_warning_reports_uncovered_windows(self):
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        args = _selection(input=None, conclusion=None, event=None, branch=None)
-        message = ci_timings.selection_coverage_warning(args, window, [], [])
-        self.assertIn("2026-09-14..2026-09-16", message)
-        covered = _summary(
-            createdAt="2026-09-15T10:00:00Z", startedAt="2026-09-15T10:00:00Z"
-        )
-        self.assertIsNone(
-            ci_timings.selection_coverage_warning(
-                args, window, [covered], [covered]
-            )
-        )
-        self.assertIsNone(
-            ci_timings.selection_coverage_warning(args, None, [], [])
-        )
-
-    def test_parse_window_rejects_malformed_input(self):
-        with self.assertRaisesRegex(ValueError, "START..END"):
-            ci_timings.parse_window("2026-09-14")
-
-    def test_window_summary_reports_p90_beside_the_median(self):
-        # The report quotes a p90, so the tool has to be able to print one.
-        runs = [
-            _summary(databaseId=i, startedAt="2026-09-20T10:00:00Z",
-                     updatedAt=f"2026-09-20T10:0{i}:00Z")
-            for i in range(1, 6)
-        ]
-        summary = ci_timings.window_summary(runs)
-        walls = sorted(run["wall_seconds"] for run in runs)
-        # Nearest-rank: the value is an observed run, not an interpolation.
-        self.assertIn(summary["wall_p90"], walls)
-        self.assertEqual(summary["wall_p90"], walls[-1])
-        rendered = ci_timings.render_runs_markdown(runs)
-        self.assertIn("p90", rendered)
-        self.assertIn(ci_timings.format_seconds(summary["wall_p90"]), rendered)
-
-    def test_window_summary_reports_p90_per_job(self):
-        # Job durations must spread, or p50 and p90 coincide and a wrong
-        # percentile would be invisible.
-        runs = []
-        for index, minutes in enumerate((1, 2, 3, 4, 9), start=1):
-            runs.append(ci_timings.summarize_run({
-                "databaseId": index,
-                "conclusion": "success", "event": "pull_request",
-                "headBranch": "topic", "displayTitle": "CI",
-                "createdAt": "2026-09-20T10:00:00Z",
-                "startedAt": "2026-09-20T10:00:00Z",
-                "updatedAt": "2026-09-20T10:10:00Z",
-                "jobs": [{
-                    "name": "fmt + clippy",
-                    "startedAt": "2026-09-20T10:00:00Z",
-                    "completedAt": f"2026-09-20T10:{minutes:02d}:00Z",
-                    "conclusion": "success",
-                }],
-            }))
-        job = ci_timings.window_summary(runs)["jobs"]["fmt + clippy"]
-        self.assertEqual(job["p50"], 180.0)
-        self.assertEqual(job["p90"], 540.0)
-        self.assertIn("9m00s", ci_timings.render_runs_markdown(runs))
-
-    def test_render_compare_markdown_includes_a_p90_row(self):
-        baseline = {"runs": 2, "wall_seconds": 584.0, "wall_p90": 697.0,
-                    "jobs": {}}
-        current = {"runs": 2, "wall_seconds": 388.0, "wall_p90": 699.0,
-                   "jobs": {}}
-        rendered = ci_timings.render_compare_markdown(baseline, current, [])
-        self.assertIn("**workflow (p90)**", rendered)
-        self.assertIn("**11m37s**", rendered)
-        self.assertIn("**11m39s**", rendered)
-        # The median row's improvement scales like a duration.
-        self.assertIn("**-3m16s**", rendered)
-
-    def test_window_summary_medians_across_runs(self):
-        first = _summary(databaseId=10)
-        second = _summary(
-            databaseId=11,
-            jobs=[
-                {
-                    "name": "fmt + clippy",
-                    "startedAt": "2026-09-20T10:00:05Z",
-                    "completedAt": "2026-09-20T10:04:05Z",
-                    "conclusion": "success",
-                }
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(id, created=when, updated=when)
+                for when, id in when_to_id.items()
             ],
         )
-        summary = ci_timings.window_summary([first, second])
+        within = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-14..2026-09-16"
+        )
+        self.assertEqual([run["id"] for run in within["runs"]], [20, 21])
+        beyond = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-17..2026-09-17"
+        )
+        self.assertEqual([run["id"] for run in beyond["runs"]], [22])
+
+    def test_runs_window_selects_by_created_not_started(self):
+        # A rerun keeps createdAt at the original attempt, and a run can
+        # start on the day after its creation; windows keep matching on
+        # creation time (the server-side `--created` semantics), never on
+        # the gap between attempts or the execution window.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [self._document(
+                25,
+                created="2026-09-19T23:50:00Z",
+                started="2026-09-20T00:10:00Z",
+                updated="2026-09-20T00:19:30Z",
+            )],
+        )
+        after = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-20..2026-09-21"
+        )
+        self.assertEqual(after["runs"], [])
+        before = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-19"
+        )
+        self.assertEqual([run["id"] for run in before["runs"]], [25])
+
+    def test_runs_keeps_first_attempts_unless_attempts_all_is_passed(self):
+        documents = [
+            self._document(20, created="2026-09-20T10:00:00Z",
+                           updated="2026-09-20T10:09:30Z"),
+            self._document(20, attempt=2, created="2026-09-20T10:00:00Z",
+                           updated="2026-09-20T15:09:30Z"),
+            self._document(21, created="2026-09-20T16:00:00Z",
+                           updated="2026-09-20T16:09:30Z"),
+        ]
+        window = ("--window", "2026-09-19..2026-09-21")
+        for order in (documents, list(reversed(documents))):
+            # Attempts may arrive in either order (snapshot accumulation);
+            # the choice must follow the attempt value, not input position.
+            snapshot = self.write_snapshot("snapshot.json", order)
+            default = self.run_json("runs", "--input", snapshot, *window)
+            self.assertEqual(
+                [(run["id"], run["attempt"]) for run in default["runs"]],
+                [(20, 1), (21, 1)],
+            )
+            every = self.run_json(
+                "runs", "--input", snapshot, *window, "--attempts", "all"
+            )
+            self.assertEqual(
+                [(run["id"], run["attempt"]) for run in every["runs"]],
+                [(20, 1), (20, 2), (21, 1)],
+            )
+            rendered = self.run_cli(
+                "runs", "--input", snapshot, *window, "--attempts", "all"
+            )
+            self.assertIn("(attempt 2)", rendered.stdout)
+
+    def test_conclusion_filter_applies_after_attempt_grouping(self):
+        # A failed first attempt stays excluded even when its rerun
+        # succeeded (grouping precedes the filter), while the mirror case a
+        # server-side `gh --status success` would lose -- a first attempt
+        # that succeeded before its rerun failed -- stays a success sample.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(26, attempt=1, conclusion="failure",
+                               created="2026-09-20T10:00:00Z",
+                               updated="2026-09-20T10:09:30Z"),
+                self._document(26, attempt=2, conclusion="success",
+                               created="2026-09-20T10:00:00Z",
+                               updated="2026-09-20T15:09:30Z"),
+                self._document(27, attempt=1, conclusion="success",
+                               created="2026-09-20T10:00:00Z",
+                               updated="2026-09-20T10:09:30Z"),
+                self._document(27, attempt=2, conclusion="failure",
+                               created="2026-09-20T10:00:00Z",
+                               updated="2026-09-20T15:09:30Z"),
+            ],
+        )
+        window = ("--window", "2026-09-19..2026-09-21")
+        first = self.run_json(
+            "runs", "--input", snapshot, *window, "--conclusion", "success"
+        )
+        self.assertEqual(
+            [(run["id"], run["attempt"]) for run in first["runs"]],
+            [(27, 1)],
+        )
+        every = self.run_json(
+            "runs", "--input", snapshot, *window, "--attempts", "all",
+            "--conclusion", "success",
+        )
+        self.assertEqual(
+            [(run["id"], run["attempt"]) for run in every["runs"]],
+            [(26, 2), (27, 1)],
+        )
+
+    def test_runs_metadata_filters(self):
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(40, created="2026-09-20T10:00:00Z",
+                               updated="2026-09-20T10:09:30Z"),
+                self._document(41, conclusion="failure",
+                               created="2026-09-20T11:00:00Z",
+                               updated="2026-09-20T11:09:30Z"),
+                self._document(42, event="schedule",
+                               created="2026-09-20T12:00:00Z",
+                               updated="2026-09-20T12:09:30Z"),
+                self._document(43, branch="other",
+                               created="2026-09-20T13:00:00Z",
+                               updated="2026-09-20T13:09:30Z"),
+            ],
+        )
+        payload = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21",
+            "--event", "pull_request", "--conclusion", "success",
+            "--branch", "topic",
+        )
+        self.assertEqual([run["id"] for run in payload["runs"]], [40])
+
+    # -- empty-window diagnosis ------------------------------------------
+
+    def test_runs_empty_window_names_only_blocking_filters(self):
+        # The case that makes guessing unsafe: the window IS covered, so
+        # telling the user to widen the fetch or drop --input would send
+        # them away from the filter actually responsible. The fixture run
+        # is a failed `pull_request` on `topic`, so only --conclusion
+        # rejects it; naming the matching --event or --branch would send
+        # the user after a flag that excluded nothing.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [self._document(1, conclusion="failure",
+                            created="2026-09-15T10:00:00Z",
+                            updated="2026-09-15T10:09:30Z")],
+        )
+        result = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-14..2026-09-16",
+            "--conclusion", "success",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--conclusion success", result.stderr)
+        self.assertIn("1 run(s) fall inside it", result.stderr)
+        for absent in ("--event", "--branch", "--limit", "drop --input"):
+            self.assertNotIn(absent, result.stderr)
+        # The empty selection still renders, with the diagnosis beside it.
+        self.assertIn("| Run | Date | Event | Branch | Conclusion", result.stdout)
+
+    def test_runs_empty_window_advises_the_snapshot_side(self):
+        # A --input snapshot the window is not covered by gets its own
+        # advice: re-request a window the snapshot holds, not one to fetch.
+        snapshot = self.snapshot_one()
+        result = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-02..2026-09-03"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no run matched the requested window", result.stderr)
+        self.assertIn("the snapshot given to --input holds no run in it",
+                      result.stderr)
+        self.assertIn("drop --input", result.stderr)
+
+    def test_runs_empty_window_names_both_filters_two_candidates_failed(self):
+        """A filter blocks when it rejects any candidate, not only all.
+
+        With one candidate the two readings agree, so this needs a
+        heterogeneous set: judging "every" here would report no blocking
+        filter at all and fall through to blaming attempt grouping, which
+        has nothing to do with it -- there are no reruns in sight.
+        """
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(80, event="push",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T10:09:30Z"),
+                self._document(81, conclusion="failure",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T10:09:30Z"),
+            ],
+        )
+        result = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-14..2026-09-16",
+            "--conclusion", "success", "--event", "pull_request",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--conclusion success", result.stderr)
+        self.assertIn("--event pull_request", result.stderr)
+        self.assertNotIn("--attempts", result.stderr)
+        self.assertIn("2 run(s) fall inside it", result.stderr)
+
+    def test_runs_empty_window_suggests_attempts_all_when_a_rerun_would_pass(self):
+        # `--attempts first` always loads attempt 1 beside the latest, and
+        # reruns share their run's creation time, so both siblings sit in
+        # the window. Only attempt 1 is a candidate here; counting attempt
+        # 2's mismatch would misreport what happened, and the narrower fix
+        # the user actually wants is named too.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(60, attempt=1, conclusion="failure",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T10:09:30Z"),
+                self._document(60, attempt=2, conclusion="success",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T15:09:30Z"),
+            ],
+        )
+        result = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-14..2026-09-16",
+            "--conclusion", "success",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--conclusion success", result.stderr)
+        self.assertIn("so --attempts all would match", result.stderr)
+        self.assertIn("1 run(s) fall inside it", result.stderr)
+
+    def test_runs_empty_window_omits_attempts_all_when_both_attempts_failed(self):
+        # Both attempts failed, so --attempts all would not help and must
+        # not be suggested.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(61, attempt=1, conclusion="failure",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T10:09:30Z"),
+                self._document(61, attempt=2, conclusion="failure",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T15:09:30Z"),
+            ],
+        )
+        result = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-14..2026-09-16",
+            "--conclusion", "success",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--conclusion success", result.stderr)
+        self.assertNotIn("--attempts all", result.stderr)
+
+    def test_runs_empty_window_ignores_a_non_candidate_attempt_mismatch(self):
+        # Attempt 2 ran on another branch, but it is not a candidate under
+        # --attempts first, so its --branch mismatch did not empty the
+        # window and naming --branch would send the user after the wrong
+        # flag.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(63, attempt=1, conclusion="failure",
+                               branch="main",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T10:09:30Z"),
+                self._document(63, attempt=2, conclusion="failure",
+                               branch="other",
+                               created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T15:09:30Z"),
+            ],
+        )
+        result = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-14..2026-09-16",
+            "--conclusion", "success", "--branch", "main",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--conclusion success", result.stderr)
+        self.assertNotIn("--branch", result.stderr)
+
+    def test_runs_fetch_arguments_scope_to_the_ci_workflow(self):
+        # The fetch must scope itself to `ci.yml` and pass the window and
+        # branch server-side, and forbid a server-side `--status`: `gh run
+        # list` reports only the latest attempt's conclusion, so filtering
+        # there would drop a run whose first attempt succeeded and whose
+        # rerun failed before attempt selection ever happens.
+        shim_dir = self.dir / "bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "gh"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'printf \'%s\\n\' "$@" >> "$GH_LOG"\n'
+            "printf '[]\\n'\n"
+        )
+        shim.chmod(0o755)
+        log = self.dir / "gh-argv.log"
+        env = dict(os.environ)
+        env["PATH"] = f"{shim_dir}:{env.get('PATH', '')}"
+        env["GH_LOG"] = str(log)
+        result = self.run_cli(
+            "runs", "--window", "2026-09-14..2026-09-16", "--branch", "main",
+            "--conclusion", "success", "--limit", "40", env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        arguments = log.read_text()
+        self.assertIn("--workflow", arguments)
+        self.assertIn("ci.yml", arguments)
+        self.assertIn("--created", arguments)
+        self.assertIn("2026-09-14..2026-09-16", arguments)
+        self.assertIn("--branch", arguments)
+        self.assertIn("main", arguments)
+        self.assertIn("--limit", arguments)
+        self.assertIn("40", arguments)
+        self.assertNotIn("--status", arguments)
+
+    # -- percentiles and aggregates --------------------------------------
+
+    def test_runs_reports_p90_beside_the_median(self):
+        # The report quotes a p90 beside the median, both as observed runs
+        # (nearest-rank), so a misreported percentile cannot hide behind an
+        # interpolated value.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(
+                    50 + index,
+                    created="2026-09-20T10:00:00Z",
+                    updated=f"2026-09-20T10:{index:02d}:00Z",
+                )
+                for index in range(1, 6)
+            ],
+        )
+        payload = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
+        )
+        walls = sorted(run["wall_seconds"] for run in payload["runs"])
+        self.assertEqual(payload["summary"]["wall_seconds"], 180.0)
+        self.assertIn(payload["summary"]["wall_p90"], walls)
+        self.assertEqual(payload["summary"]["wall_p90"], 300.0)
+        rendered = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
+        )
+        self.assertIn("p50 3m00s, p90 5m00s", rendered.stdout)
+
+    def test_runs_per_job_percentiles_spread_across_runs(self):
+        # Job durations must spread, or p50 and p90 coincide and a wrong
+        # percentile would be invisible in the rendered table.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(
+                    50 + index,
+                    created="2026-09-20T10:00:00Z",
+                    updated="2026-09-20T10:10:00Z",
+                    jobs=[self._job(
+                        "fmt + clippy",
+                        "2026-09-20T10:00:00Z",
+                        f"2026-09-20T10:{minutes:02d}:00Z",
+                    )],
+                )
+                for index, minutes in enumerate((1, 2, 3, 4, 9), start=1)
+            ],
+        )
+        payload = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
+        )
+        job = payload["summary"]["jobs"]["fmt + clippy"]
+        self.assertEqual(job["p50"], 180.0)
+        self.assertEqual(job["p90"], 540.0)
+        rendered = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
+        )
+        self.assertIn("| fmt + clippy | 3m00s | 9m00s | 5 |", rendered.stdout)
+
+    def test_runs_job_medians_span_windows_of_runs(self):
+        # Two run docs sharing a window: the workflow medians come from all
+        # selected runs, and each job's median only counts the runs where
+        # it actually ran.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                self._document(
+                    60,
+                    created="2026-09-20T10:00:00Z",
+                    updated="2026-09-20T10:09:30Z",
+                    jobs=[
+                        self._job("fmt + clippy",
+                                  "2026-09-20T10:00:05Z",
+                                  "2026-09-20T10:03:24Z"),
+                        self._job("tests (unit, fast)",
+                                  "2026-09-20T10:00:06Z",
+                                  "2026-09-20T10:03:52Z"),
+                    ],
+                ),
+                self._document(
+                    61,
+                    created="2026-09-20T11:00:00Z",
+                    updated="2026-09-20T11:09:30Z",
+                    jobs=[self._job("fmt + clippy",
+                                    "2026-09-20T11:00:05Z",
+                                    "2026-09-20T11:04:05Z")],
+                ),
+            ],
+        )
+        payload = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
+        )
+        summary = payload["summary"]
         self.assertEqual(summary["runs"], 2)
         self.assertEqual(summary["wall_seconds"], 570.0)
         self.assertEqual(summary["jobs"]["fmt + clippy"]["p50"], 219.5)
         self.assertEqual(summary["jobs"]["fmt + clippy"]["runs"], 2)
         self.assertEqual(summary["jobs"]["tests (unit, fast)"]["runs"], 1)
 
-    def test_compare_windows_reports_deltas_and_missing_jobs(self):
-        baseline = ci_timings.window_summary([_summary()])
-        current = ci_timings.window_summary(
+    # -- comparison ------------------------------------------------------
+
+    def test_compare_reports_deltas_and_jobs_missing_from_one_window(self):
+        # Jobs that exist in only one window still get a row with `n/a` on
+        # the missing side, so added or removed shards stay visible both in
+        # the JSON and in the rendered table a report quotes.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
             [
-                _summary(
-                    databaseId=12,
+                self._document(
+                    70,
+                    created="2026-09-14T10:00:00Z",
+                    updated="2026-09-14T10:09:30Z",
                     jobs=[
-                        {
-                            "name": "fmt + clippy",
-                            "startedAt": "2026-09-20T10:00:05Z",
-                            "completedAt": "2026-09-20T10:01:05Z",
-                            "conclusion": "success",
-                        }
+                        self._job("fmt + clippy",
+                                  "2026-09-14T10:00:05Z",
+                                  "2026-09-14T10:03:24Z"),
+                        self._job("tests (unit, fast)",
+                                  "2026-09-14T10:00:06Z",
+                                  "2026-09-14T10:03:52Z"),
                     ],
-                )
-            ]
+                ),
+                self._document(
+                    71,
+                    created="2026-09-20T10:00:00Z",
+                    updated="2026-09-20T10:01:30Z",
+                    jobs=[self._job("fmt + clippy",
+                                    "2026-09-20T10:00:05Z",
+                                    "2026-09-20T10:01:05Z")],
+                ),
+                self._document(
+                    72,
+                    created="2026-09-20T10:10:00Z",
+                    updated="2026-09-20T10:12:10Z",
+                    jobs=[self._job("tests (new-shard, fast)",
+                                    "2026-09-20T10:10:05Z",
+                                    "2026-09-20T10:12:05Z")],
+                ),
+            ],
         )
-        rows = ci_timings.compare_windows(baseline, current)
-        clippy = next(row for row in rows if row["job"] == "fmt + clippy")
+        arguments = ("compare", "--input", snapshot,
+                     "--baseline", "2026-09-14..2026-09-14",
+                     "--current", "2026-09-20..2026-09-20")
+        payload = self.run_json(*arguments)
+        rows = {row["job"]: row for row in payload["rows"]}
+        clippy = rows["fmt + clippy"]
         self.assertEqual(clippy["before"], 199.0)
         self.assertEqual(clippy["after"], 60.0)
         self.assertEqual(clippy["delta"], -139.0)
         self.assertAlmostEqual(clippy["percent"], -69.8, places=1)
-        unit = next(row for row in rows if row["job"] == "tests (unit, fast)")
-        self.assertIsNone(unit["after"])
-        self.assertIsNone(unit["percent"])
-
-    def test_compare_windows_includes_current_only_jobs(self):
-        baseline = ci_timings.window_summary([_summary()])
-        current = ci_timings.window_summary(
-            [
-                _summary(
-                    databaseId=13,
-                    jobs=[
-                        {
-                            "name": "tests (new-shard, fast)",
-                            "startedAt": "2026-09-20T10:00:05Z",
-                            "completedAt": "2026-09-20T10:02:05Z",
-                            "conclusion": "success",
-                        }
-                    ],
-                )
-            ]
+        self.assertIsNone(rows["tests (unit, fast)"]["after"])
+        self.assertIsNone(rows["tests (unit, fast)"]["percent"])
+        rendered = self.run_cli(*arguments)
+        self.assertIn(
+            "| tests (new-shard, fast) | n/a | 2m00s | n/a | n/a | 0/1 |",
+            rendered.stdout,
         )
-        rows = ci_timings.compare_windows(baseline, current)
-        added = next(row for row in rows if row["job"] == "tests (new-shard, fast)")
-        self.assertIsNone(added["before"])
-        self.assertEqual(added["after"], 120.0)
-        self.assertEqual(added["after_runs"], 1)
-        self.assertIsNone(added["delta"])
-        self.assertIsNone(added["percent"])
-        # Rendered output shows the new job with `n/a` on the baseline side.
-        rendered = ci_timings.render_compare_markdown(baseline, current, rows)
-        self.assertIn("| tests (new-shard, fast) | n/a | 2m00s | n/a | n/a | 0/1 |", rendered)
+
+    def test_compare_renders_deltas_and_p90_rows_as_scaled_durations(self):
+        # A delta is a duration: an improvement must read like the
+        # regression it mirrors (sign first, magnitude scaled), and the
+        # workflow p90 is quoted in its own row.
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [
+                # Improvement of 196 s at p50 and p90 together.
+                self._document(80, created="2026-09-14T10:00:00Z",
+                               updated="2026-09-14T10:09:30Z"),
+                self._document(81, created="2026-09-15T10:00:00Z",
+                               updated="2026-09-15T10:06:14Z"),
+                # An hour-scale improvement (4000 s) needs a second pair
+                # of windows.
+                self._document(82, created="2026-09-21T10:00:00Z",
+                               updated="2026-09-21T12:00:00Z"),
+                self._document(83, created="2026-09-22T10:00:00Z",
+                               updated="2026-09-22T10:53:20Z"),
+            ],
+        )
+        minutes = self.run_cli(
+            "compare", "--input", snapshot,
+            "--baseline", "2026-09-14..2026-09-14",
+            "--current", "2026-09-15..2026-09-15",
+        )
+        self.assertEqual(minutes.returncode, 0, minutes.stderr)
+        self.assertIn("**workflow (p90)**", minutes.stdout)
+        self.assertIn("**-3m16s**", minutes.stdout)
+        hours = self.run_cli(
+            "compare", "--input", snapshot,
+            "--baseline", "2026-09-21..2026-09-21",
+            "--current", "2026-09-22..2026-09-22",
+        )
+        self.assertEqual(hours.returncode, 0, hours.stderr)
+        self.assertIn("**-1h06m**", hours.stdout)
+
+    # -- window validation -----------------------------------------------
+
+    def test_runs_window_requires_start_and_end_dates(self):
+        snapshot = self.snapshot_one()
+        result = self.run_cli(
+            "runs", "--input", snapshot, "--window", "2026-09-14"
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("window must be START..END", result.stderr)
+        self.assertIn("2026-09-14", result.stderr)
 
 
 class ErrorReportingTests(unittest.TestCase):
