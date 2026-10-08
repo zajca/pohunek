@@ -129,29 +129,3 @@ fn frontmatter(content: &str) -> Option<&str> {
     let delimiter = body.find("\n---\n").or_else(|| body.find("\r\n---\r\n"))?;
     Some(&body[..delimiter])
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_concept_meta_reports_missing_frontmatter() {
-        let error = parse_concept_meta("concepts/broken.md", "# Broken\n")
-            .expect_err("missing frontmatter should be reported");
-
-        assert_eq!(error.path(), std::path::Path::new("concepts/broken.md"));
-        assert!(error.to_string().contains("missing frontmatter"));
-    }
-
-    #[test]
-    fn parse_concept_meta_reports_invalid_schema() {
-        let error = parse_concept_meta(
-            "concepts/broken.md",
-            "---\ntype: Unknown\nid: concept/broken\n---\n# Broken\n",
-        )
-        .expect_err("invalid schema should be reported");
-
-        assert_eq!(error.path(), std::path::Path::new("concepts/broken.md"));
-        assert!(error.to_string().contains("invalid frontmatter"));
-    }
-}

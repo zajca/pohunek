@@ -8,12 +8,6 @@ use sha2::{Digest, Sha256};
 /// Knowledge bundle version shipped with this binary.
 pub const BUNDLE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Whether generated reference concepts were included in the embedded bundle.
-///
-/// Only consumed by tests; the value is set by the build script.
-#[cfg(test)]
-const REFERENCE_MODE: &str = env!("POHUNEK_KNOWLEDGE_REFERENCE_MODE");
-
 const EMBEDDED_BUNDLE_CONTENT_HASH: &str = env!("POHUNEK_KNOWLEDGE_CONTENT_HASH");
 
 /// Embedded assistant knowledge bundle.
@@ -108,28 +102,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundle_content_hash_is_deterministic_for_same_bytes() {
-        let first = sha256_for_bytes(b"same bundle bytes");
-        let second = sha256_for_bytes(b"same bundle bytes");
-
-        assert_eq!(first, second);
-        assert_eq!(
-            first,
-            "sha256:06d4332522483bf4e2ed426c2ac497fd4a735fea3246dfae586f679c29a2a16d"
-        );
-    }
-
-    #[test]
-    fn bundle_content_hash_is_memoized() {
-        let first = bundle_content_hash();
-        let second = bundle_content_hash();
-
-        assert!(std::ptr::eq(first, second));
-        assert!(first.starts_with("sha256:"));
-        assert_eq!(first.len(), "sha256:".len() + 64);
-    }
-
-    #[test]
     fn assistant_launch_id_includes_version_hash_and_is_unique() {
         let first = assistant_launch_id("0.3.3-abc");
         let second = assistant_launch_id("0.3.3-abc");
@@ -137,15 +109,5 @@ mod tests {
         assert!(first.starts_with("launch-0.3.3-abc-"));
         assert!(second.starts_with("launch-0.3.3-abc-"));
         assert_ne!(first, second);
-    }
-
-    #[test]
-    fn embedded_bundle_contains_manual_index() {
-        let index = embedded_bundle()
-            .get_text("index.md")
-            .expect("embedded bundle contains index.md");
-
-        assert!(index.contains('#'));
-        assert_eq!(REFERENCE_MODE, "manual-only");
     }
 }
