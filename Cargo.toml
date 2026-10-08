@@ -222,6 +222,23 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# The slowest tests spend their time inside these crates: lazy-DFA
+# determinization (regex-automata) and ed25519/SHA-256 signing and verification.
+# At opt-level 0 those loops dominate test CPU time. Each override sets only
+# opt-level, so `"*"` still disables their debuginfo. A bare name matches every
+# version in the lockfile. See AGENTS.md "Fast loops" for when to add a crate.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Keep release builds debuggable enough for a daemon while small.
 [profile.release]
 opt-level = 2
