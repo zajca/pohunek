@@ -394,6 +394,9 @@ impl<'de> Deserialize<'de> for StopPolicy {
 pub struct Initialize {
     /// Durable logical session.
     pub session_id: SessionId,
+    /// Daemon instance that launched this child. Older peers omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_instance_id: Option<DaemonId>,
     /// Idempotent create transaction.
     pub transaction_id: TransactionId,
     /// Worker expected by the daemon's logical transaction.
@@ -444,6 +447,7 @@ impl Debug for Initialize {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Initialize")
             .field("session_id", &self.session_id)
+            .field("daemon_instance_id", &self.daemon_instance_id)
             .field("transaction_id", &self.transaction_id)
             .field("expected_worker_id", &self.expected_worker_id)
             .field("launch", &self.launch)
@@ -1100,6 +1104,7 @@ mod tests {
     fn initialize(secret: &str) -> Initialize {
         Initialize {
             session_id: SessionId::new("s-1").expect("valid session"),
+            daemon_instance_id: Some(DaemonId::new("daemon-1").expect("valid daemon")),
             transaction_id: TransactionId::new("tx-1").expect("valid transaction"),
             expected_worker_id: WorkerId::new("w-1").expect("valid worker"),
             launch: LaunchIdentity {
@@ -1181,6 +1186,23 @@ mod tests {
         assert_eq!(wire["hook_schema"], "identity-v1");
         let parsed: Initialize = serde_json::from_value(wire).expect("round trip");
         assert_eq!(parsed.hook_schema.as_deref(), Some("identity-v1"));
+    }
+
+    #[test]
+    fn initialize_daemon_identity_accepts_older_peer_and_rejects_invalid_identity() {
+        let mut wire = serde_json::to_value(initialize("value")).expect("serialize");
+        wire.as_object_mut()
+            .expect("initialize object")
+            .remove("daemon_instance_id");
+        let older: Initialize = serde_json::from_value(wire).expect("older daemon initialize");
+        assert_eq!(older.daemon_instance_id, None);
+
+        let mut wire = serde_json::to_value(initialize("value")).expect("serialize");
+        wire["daemon_instance_id"] = serde_json::json!("invalid/daemon");
+        assert!(
+            serde_json::from_value::<Initialize>(wire).is_err(),
+            "the launch daemon identity must be validated"
+        );
     }
 
     #[test]

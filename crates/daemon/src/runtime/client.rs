@@ -1343,6 +1343,7 @@ mod tests {
     fn observation_initialize(root: &Path, output_bytes: usize) -> Initialize {
         Initialize {
             session_id: SessionId::new("s-9001").expect("session id"),
+            daemon_instance_id: Some(DaemonId::new("daemon-e2e").expect("daemon id")),
             transaction_id: TransactionId::new("transaction-e2e").expect("transaction id"),
             expected_worker_id: WorkerId::new("worker-e2e").expect("worker id"),
             launch: pohunek_worker_protocol::LaunchIdentity {

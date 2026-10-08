@@ -4132,6 +4132,9 @@ fn command_from_initialize(
             initialize.public_protocol_version.to_string(),
         ),
     ]);
+    if let Some(daemon_id) = &initialize.daemon_instance_id {
+        reserved.insert("POHUNEK_DAEMON_ID".to_owned(), daemon_id.to_string());
+    }
     if let Some(reference_kind) = &initialize.launch.reference_kind {
         reserved.insert(
             "POHUNEK_NATIVE_REFERENCE_KIND".to_owned(),
@@ -7388,6 +7391,9 @@ mod tests {
     ) -> protocol::Initialize {
         protocol::Initialize {
             session_id: protocol::SessionId::new("s-114").expect("session id"),
+            daemon_instance_id: Some(
+                protocol::DaemonId::new("daemon-environment").expect("daemon id"),
+            ),
             transaction_id: protocol::TransactionId::new("create-environment")
                 .expect("transaction id"),
             expected_worker_id: protocol::WorkerId::new("worker-environment").expect("worker id"),
@@ -7445,6 +7451,7 @@ mod tests {
                 ("WATCHDOG_USEC", "1"),
                 ("XPC_SERVICE_NAME", "profile"),
                 ("POHUNEK_SESSION_ID", "s-spoofed"),
+                ("POHUNEK_DAEMON_ID", "daemon-spoofed"),
                 ("POHUNEK_RUNTIME_ID", "runtime-spoofed"),
             ],
         );
@@ -7468,6 +7475,7 @@ mod tests {
                 ("LANG", "C.UTF-8"),
                 ("PATH", "/usr/bin:/bin"),
                 ("POHUNEK_ENV", "1"),
+                ("POHUNEK_DAEMON_ID", "daemon-environment"),
                 ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
                 ("POHUNEK_PROTOCOL_VERSION", "7"),
                 ("POHUNEK_WORKER_INSTANCE_ID", "runtime-environment"),

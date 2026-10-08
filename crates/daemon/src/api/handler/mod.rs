@@ -301,19 +301,23 @@ async fn handle_negotiated(
     state: &DaemonState,
     selected_version: protocol::ProtocolVersion,
 ) -> Response {
-    if mutation_target(request).is_some_and(|target| {
-        state.sessions.is_origin_session(
-            request.origin_session_id(),
-            request.origin_daemon_id(),
-            target,
-        )
-    }) {
-        return Response::err(
-            selected_version,
-            request.id(),
-            ProtocolError::plugin_self_target_denied(),
-        )
-        .expect("deserialized request ids satisfy response validation");
+    if let Some(target) = mutation_target(request) {
+        if state
+            .sessions
+            .is_origin_session(
+                request.origin_session_id(),
+                request.origin_daemon_id(),
+                target,
+            )
+            .await
+        {
+            return Response::err(
+                selected_version,
+                request.id(),
+                ProtocolError::plugin_self_target_denied(),
+            )
+            .expect("deserialized request ids satisfy response validation");
+        }
     }
 
     // Stop and remove release what a session owns and need no resolvable
@@ -707,6 +711,22 @@ mod tests {
             let error = error_value(handle_request(&request, &state).await, method);
             assert_ne!(error.code, "plugin_self_target_denied", "method {method}");
         }
+    }
+
+    #[tokio::test]
+    async fn origin_guard_allows_foreign_daemon_to_stop_a_live_session() {
+        let sessions = SessionRegistry::new(SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", SLEEP_SESSION_SCRIPT]),
+            ..SessionRegistryConfig::default()
+        });
+        let id = inert_live_session(&sessions).await;
+        let state = daemon_state(HealthInfo::new("test"), sessions.clone());
+        let stop = request("foreign-stop", method::SESSION_STOP, serde_json::json!(id))
+            .with_origin(Some(id.clone()), Some("d-foreign".to_owned()))
+            .expect("valid foreign origin");
+        let stopped = ok_value(handle_request(&stop, &state).await, method::SESSION_STOP);
+        assert_eq!(stopped["stopped"], true);
+        sessions.remove(&id).await.expect("remove stopped session");
     }
 
     /// Creates a live shell session whose recorded runtime has no definition.

@@ -6853,6 +6853,10 @@ while os.getppid() == parent:
         let worker_instance_id = first_controller
             .initialize(Initialize {
                 session_id: wire_session_id,
+                daemon_instance_id: Some(
+                    pohunek_worker_protocol::DaemonId::new("daemon-restart-test")
+                        .expect("daemon id"),
+                ),
                 transaction_id: TransactionId::new("create-restart-test").expect("transaction id"),
                 expected_worker_id: wire_worker_id.clone(),
                 launch: LaunchIdentity {
@@ -7245,6 +7249,10 @@ while os.getppid() == parent:
         let worker_instance_id = first_controller
             .initialize(Initialize {
                 session_id: WorkerSessionId::new(session_id).expect("session id"),
+                daemon_instance_id: Some(
+                    pohunek_worker_protocol::DaemonId::new("daemon-hermes-test")
+                        .expect("daemon id"),
+                ),
                 transaction_id: TransactionId::new("create-hermes-restart")
                     .expect("transaction id"),
                 expected_worker_id: wire_worker_id,
@@ -8110,6 +8118,10 @@ while os.getppid() == parent:
         let worker_instance_id = controller
             .initialize(Initialize {
                 session_id: WorkerSessionId::new(session_id).expect("session id"),
+                daemon_instance_id: Some(
+                    pohunek_worker_protocol::DaemonId::new("daemon-reconcile-test")
+                        .expect("daemon id"),
+                ),
                 transaction_id: TransactionId::new(format!("create-{session_id}"))
                     .expect("transaction id"),
                 expected_worker_id: controller.worker_id().await,

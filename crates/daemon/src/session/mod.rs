@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use pohunek_platform::process::WorkerInstanceMarker;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use protocol::{
@@ -484,10 +485,9 @@ struct SessionRegistryInner {
     /// Bounded input operations use this token instead of the event-log drain
     /// token so shutdown cancellation does not depend on later flush ordering.
     daemon_shutdown: CancellationToken,
-    /// Opaque id unique to this daemon process instance, injected into every
-    /// session PTY as `POHUNEK_DAEMON_ID` and compared against the attach origin
-    /// so the self-feeding-attach guard fires only for this instance's own PTYs
-    /// (see [`SessionRegistry::attach`]). Regenerated each start; never persisted.
+    /// Opaque id unique to this daemon process instance. A worker receives it
+    /// at launch and injects it into its PTY as `POHUNEK_DAEMON_ID`.
+    /// Regenerated each start; never persisted.
     daemon_instance_id: String,
     config: SessionRegistryConfig,
     /// Worker job supervisor; `None` when the registry cannot launch workers.
@@ -1004,16 +1004,66 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
-    /// Reports whether inherited origin markers target this daemon's same session.
-    #[must_use]
-    pub(crate) fn is_origin_session(
+    /// Reports whether inherited origin markers target the named session.
+    ///
+    /// A live worker retains its launch daemon ID across daemon restarts. Its
+    /// root process markers identify that launch ID and runtime generation.
+    /// Missing or inconsistent process evidence denies a same-session mutation.
+    pub(crate) async fn is_origin_session(
         &self,
         origin_session_id: Option<&SessionId>,
         origin_daemon_id: Option<&str>,
         target: &str,
     ) -> bool {
-        origin_session_id.is_some_and(|origin| origin.0 == target)
-            && origin_daemon_id == Some(self.inner.daemon_instance_id.as_str())
+        if origin_session_id.is_none_or(|origin| origin.0 != target) {
+            return false;
+        }
+        let Some(origin_daemon_id) = origin_daemon_id else {
+            return false;
+        };
+        if origin_daemon_id == self.inner.daemon_instance_id {
+            return true;
+        }
+
+        let (pid, worker_instance_id) = {
+            let sessions = self.inner.sessions.lock().await;
+            let Some(entry) = sessions.get(&SessionId(target.to_owned())) else {
+                return false;
+            };
+            let worker_instance_id = entry
+                .info
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.worker_instance_id.clone());
+            (entry.info.pid, worker_instance_id)
+        };
+        let Some(worker_instance_id) = worker_instance_id else {
+            return true;
+        };
+        let Ok(markers) = self.inner.inspector.ownership_markers(pid) else {
+            return true;
+        };
+        let matching_runtime = markers.session_id.as_deref() == Some(target)
+            && matches!(markers.worker_instance(), WorkerInstanceMarker::Instance(id) if id == worker_instance_id);
+        if !matching_runtime {
+            return true;
+        }
+        let sessions = self.inner.sessions.lock().await;
+        let same_runtime = sessions
+            .get(&SessionId(target.to_owned()))
+            .is_some_and(|entry| {
+                entry.info.pid == pid
+                    && entry
+                        .info
+                        .runtime
+                        .as_ref()
+                        .and_then(|runtime| runtime.worker_instance_id.as_deref())
+                        == Some(worker_instance_id.as_str())
+            });
+        if !same_runtime {
+            return true;
+        }
+        markers.daemon_id.as_deref() == Some(origin_daemon_id) || markers.daemon_id.is_none()
     }
 
     /// Returns the latest fail-closed durable-worker discovery inventory.

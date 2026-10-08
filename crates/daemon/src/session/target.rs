@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use pohunek_worker_protocol::{
-    read_frame, Dimensions, FrameKind, Initialize, InitializeLimits,
+    read_frame, DaemonId, Dimensions, FrameKind, Initialize, InitializeLimits,
     LaunchIdentity as WorkerLaunchIdentity, SecretEnv, SessionId as WorkerSessionId, StopPolicy,
     StreamId, StreamMode, TransactionId, Version,
 };
@@ -1104,6 +1104,9 @@ impl SessionRegistry {
                 session_id: worker_session_id,
                 transaction_id,
                 expected_worker_id: worker_id.clone(),
+                daemon_instance_id: Some(DaemonId::new(self.daemon_instance_id()).map_err(
+                    |error| runtime_error("worker_initialize_invalid", error.to_string()),
+                )?),
                 launch: WorkerLaunchIdentity {
                     agent: agent.to_owned(),
                     agent_base: super::agent_kind_label(&agent_base).to_owned(),

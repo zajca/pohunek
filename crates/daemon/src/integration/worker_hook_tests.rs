@@ -116,6 +116,9 @@ fn initialize(
 ) -> Initialize {
     Initialize {
         session_id: SessionId::new(SESSION_ID).expect("session id"),
+        daemon_instance_id: Some(
+            pohunek_worker_protocol::DaemonId::new("daemon-hook-test").expect("daemon id"),
+        ),
         transaction_id: TransactionId::new("transaction-notify").expect("transaction id"),
         expected_worker_id: WorkerId::new(WORKER_ID).expect("worker id"),
         launch: LaunchIdentity {

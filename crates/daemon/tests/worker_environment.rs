@@ -23,9 +23,9 @@ use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
-    is_denylisted, BaseEnv, Dimensions, Initialize, InitializeLimits, LaunchIdentity, RuntimePhase,
-    SecretEnv, SessionId, StopPolicy, TransactionId, Version, BASE_ENVIRONMENT_VERSION,
-    PREVIOUS_VERSION,
+    is_denylisted, BaseEnv, DaemonId, Dimensions, Initialize, InitializeLimits, LaunchIdentity,
+    RuntimePhase, SecretEnv, SessionId, StopPolicy, TransactionId, Version,
+    BASE_ENVIRONMENT_VERSION, PREVIOUS_VERSION,
 };
 
 /// Bounds waiting for the worker socket and the child's exit.
@@ -175,6 +175,7 @@ impl Fixture {
     fn initialize(&self, worker_id: pohunek_worker_protocol::WorkerId) -> Initialize {
         Initialize {
             session_id: SessionId::new(&self.session_id).expect("session id"),
+            daemon_instance_id: Some(DaemonId::new(DAEMON_ID).expect("daemon id")),
             transaction_id: TransactionId::new("create-environment").expect("transaction id"),
             expected_worker_id: worker_id,
             launch: LaunchIdentity {
@@ -285,6 +286,7 @@ async fn version_six_child_gets_only_base_term_profile_and_identity() {
         ("TERM", "xterm-256color"),
         ("PROFILE_TOKEN", "profile-value"),
         ("POHUNEK_ENV", "1"),
+        ("POHUNEK_DAEMON_ID", DAEMON_ID),
         ("POHUNEK_NATIVE_REFERENCE_KIND", "id"),
         ("POHUNEK_PROTOCOL_VERSION", "7"),
         ("POHUNEK_WORKER_INSTANCE_ID", worker_instance_id.as_str()),
