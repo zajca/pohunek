@@ -268,7 +268,9 @@ For a daemon archive upgrade, run its installer
 `pohunek service upgrade --from <archive-dir>`) rather than replacing only `pohunekd`. Before it changes anything, the upgrade
 runs the [upgrade preflight](#upgrade-preflight) with the new binaries and
 refuses when a live session would not survive the switch. It then copies the new
-binaries into their own `<prefix>/libexec/pohunek/<version>/` directory,
+binaries and the release's catalog trust anchor into their own
+`<prefix>/libexec/pohunek/<version>/` directory (the daemon reads the anchor
+only at startup, so the restart below is what makes a new anchor effective),
 switches `active_version` in `service.toml`, rewrites the daemon job to the new
 version, and restarts only the daemon. Worker jobs are separate native jobs
 (systemd transient units or launchd jobs, one per worker generation) that keep

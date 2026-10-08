@@ -28,6 +28,7 @@ uuid.workspace = true
 zeroize.workspace = true
 pohunek-hostcheck = { workspace = true }
 pohunek-protocol = { workspace = true }
+pohunek-package = { workspace = true }
 pohunek-paths = { workspace = true }
 pohunek-platform = { workspace = true }
 pohunek-service-config = { workspace = true }
@@ -69,7 +70,6 @@ pohunek-logging = { workspace = true }
 pohunek-test-support = { workspace = true }
 # `plugin_daemon.rs` serves the real package lifecycle from an in-process daemon.
 pohunek-daemon = { path = "../daemon" }
-pohunek-package = { workspace = true }
 # `plugin_catalog_install.rs` signs catalogs with a key generated in the test.
 ed25519-dalek = { workspace = true }
 # `codex_package.rs` compares the package files with the built-in Codex files as data.

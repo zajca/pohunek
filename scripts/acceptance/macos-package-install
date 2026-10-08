@@ -333,6 +333,12 @@ for version_dir in "$prefix/libexec/pohunek/$version_a"; do
   for binary in pohunek pohunekd pohunek-sessiond; do
     [ -x "$version_dir/$binary" ] || die "$version_dir/$binary is not installed"
   done
+  # The daemon trusts only an anchor that is a regular, non-executable file
+  # beside its executable.
+  [ -f "$version_dir/runtime-catalog-anchor.json" ] && [ ! -L "$version_dir/runtime-catalog-anchor.json" ] ||
+    die "$version_dir/runtime-catalog-anchor.json is not an installed regular file"
+  [ ! -x "$version_dir/runtime-catalog-anchor.json" ] ||
+    die "$version_dir/runtime-catalog-anchor.json is executable"
 done
 printf 'installed version %s as namespace %s; daemon pid %s\n' "$version_a" "$namespace" "$daemon_pid_a"
 

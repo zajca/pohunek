@@ -256,6 +256,15 @@ root, beside the `pohunekd` executable, with mode `0644`; `packaging/stage-archi
 refuses to stage a daemon archive without it. CLI and relay archives carry no
 anchor.
 
+`pohunek service install` and `upgrade` copy the staged anchor into the version
+directory next to the daemon (`<prefix>/libexec/pohunek/<version>/`, mode `0644`)
+so the `catalog_trust_anchor` doctor check is `ok` for an installed release
+layout. An anchor that is not a valid trust anchor is refused with
+`service_staged_anchor_invalid` and nothing is published; a build without one
+installs and the daemon stays in the absent state. A version directory is
+immutable, so republishing it with a different or missing anchor is
+`service_version_conflict`.
+
 ## Limits
 
 Named constants in `crates/package/src/catalog.rs`: catalog 1 MiB, 256 entries,
