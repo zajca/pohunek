@@ -236,6 +236,8 @@ fn clean_sessions_of_an_old_store_are_adoptable_and_nothing_is_written() {
         (&Verdict::Adoptable, CODE_ADOPTABLE)
     );
     assert_eq!(report.at_risk().count(), 0);
+    let report_json = serde_json::to_value(&report).expect("serialize preflight report");
+    assert_eq!(report_json["sessions"][0]["verdict"], "adoptable");
     assert_eq!(
         host.snapshot(),
         before,
@@ -262,6 +264,11 @@ fn a_session_record_that_cannot_be_loaded_is_named_and_not_adopted() {
         (&Verdict::WouldNotBeAdopted, CODE_RECORD_UNREADABLE)
     );
     assert_eq!(verdict_of(&report, "s-2").0, &Verdict::Adoptable);
+    let report_json = serde_json::to_value(&report).expect("serialize preflight report");
+    assert_eq!(
+        report_json["sessions"][0]["verdict"],
+        "would_not_be_adopted"
+    );
 }
 
 #[test]
@@ -278,6 +285,8 @@ fn a_recovery_that_cannot_be_mapped_loses_native_recovery() {
         verdict_of(&report, "s-1"),
         (&Verdict::WouldLoseRecovery, CODE_RECOVERY_UNMAPPABLE)
     );
+    let report_json = serde_json::to_value(&report).expect("serialize preflight report");
+    assert_eq!(report_json["sessions"][0]["verdict"], "would_lose_recovery");
 }
 
 /// A resume line of the fixture rebound to `s-1` with its `agent` removed, so

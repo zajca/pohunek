@@ -191,21 +191,3 @@ impl PreflightReport {
         self.store.state == StoreState::Refused
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verdicts_use_stable_snake_case_spellings() {
-        for verdict in [
-            Verdict::Adoptable,
-            Verdict::WouldLoseRecovery,
-            Verdict::WouldNotBeAdopted,
-        ] {
-            let encoded = serde_json::to_string(&verdict).expect("serialize verdict");
-            assert_eq!(encoded, format!("\"{}\"", verdict.as_str()));
-            assert_eq!(verdict.to_string(), verdict.as_str());
-        }
-    }
-}

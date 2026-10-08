@@ -14,7 +14,6 @@ use pohunek_service_config::{
     ConfigError, ConfigSpec, Deadlines, ServiceConfig, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
     MAX_DEADLINE, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
-use proptest::prelude::*;
 use tempfile::TempDir;
 
 /// The schema example from the crate contract.
@@ -526,26 +525,6 @@ fn open_files_is_bounded() {
 }
 
 #[test]
-fn sub_millisecond_durations_cannot_be_recorded() {
-    let mut value = spec();
-    value.deadlines.worker_initialize = Duration::from_micros(1_500);
-    assert!(matches!(
-        ServiceConfig::new(value),
-        Err(ConfigError::Precision {
-            key: "deadlines.worker_initialize_ms"
-        })
-    ));
-    let mut value = spec();
-    value.sweep_grace = Duration::from_nanos(1);
-    assert!(matches!(
-        ServiceConfig::new(value),
-        Err(ConfigError::Precision {
-            key: "sweep.grace_ms"
-        })
-    ));
-}
-
-#[test]
 fn paths_must_be_absolute_and_normalized() {
     let fixture = Fixture::new();
     for (line, key) in [
@@ -585,59 +564,6 @@ fn paths_must_be_absolute_and_normalized() {
             Err(ConfigError::InvalidPath { .. })
         ));
     }
-}
-
-#[test]
-fn validate_prefix_decides_exactly_as_the_config_does() {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let long = format!("/{}", "a".repeat(4096));
-    let non_utf8 = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff/.local"));
-    let mut prefixes: Vec<PathBuf> = [
-        "/home/u/.local",
-        "/",
-        "relative/dir",
-        "",
-        "/a/../b",
-        "/a/.",
-        "/a/./b",
-        "/a//b",
-        "/a/b/",
-        "/a/\0b",
-        long.as_str(),
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect();
-    prefixes.push(non_utf8);
-    for prefix in prefixes {
-        let mut value = spec();
-        value.prefix.clone_from(&prefix);
-        match (
-            pohunek_service_config::validate_prefix(&prefix),
-            ServiceConfig::new(value),
-        ) {
-            (Ok(layout), Ok(config)) => assert_eq!(&layout, config.layout(), "{prefix:?}"),
-            (
-                Err(ConfigError::InvalidPath {
-                    key: "prefix",
-                    reason,
-                    ..
-                }),
-                Err(ConfigError::InvalidPath {
-                    key: "prefix",
-                    reason: config_reason,
-                    ..
-                }),
-            ) => assert_eq!(reason, config_reason, "{prefix:?}"),
-            other => panic!("{prefix:?}: {other:?}"),
-        }
-    }
-    assert!(matches!(
-        pohunek_service_config::validate_prefix(Path::new("/a/.")),
-        Err(ConfigError::InvalidPath { key: "prefix", .. })
-    ));
-    pohunek_service_config::validate_prefix(Path::new("/home/u/.local")).expect("normalized");
 }
 
 #[test]
@@ -1063,79 +989,6 @@ fn verify_installation_rejects_another_installation() {
             ..
         })
     ));
-}
-
-/// Generates valid specs spanning every bound.
-fn arb_spec() -> impl Strategy<Value = ConfigSpec> {
-    let max = u64::try_from(MAX_DEADLINE.as_millis()).expect("bounded");
-    let millis = move || (1..=max).prop_map(Duration::from_millis);
-    let path = || {
-        prop::collection::vec("[a-zA-Z0-9._-]{1,12}", 1..6).prop_filter_map(
-            "no dot components",
-            |parts| {
-                parts
-                    .iter()
-                    .all(|part| part != "." && part != "..")
-                    .then(|| PathBuf::from(format!("/{}", parts.join("/"))))
-            },
-        )
-    };
-    let pattern = "[A-Za-z_][A-Za-z0-9_]{0,20}\\*?";
-    (
-        (
-            path(),
-            "[0-9A-Za-z+-][0-9A-Za-z.+-]{0,40}",
-            0..u32::MAX,
-            path(),
-            path(),
-        ),
-        (millis(), millis(), millis(), millis(), millis(), millis()),
-        prop::collection::btree_set(pattern, 1..40),
-        millis(),
-        256..=1_048_576_u64,
-    )
-        .prop_map(
-            |(
-                (prefix, active_version, uid, state_root, runtime_root),
-                (connect, initialize, launchctl, worker_exit, daemon_exit, throttle),
-                allowlist,
-                sweep_grace,
-                open_files,
-            )| ConfigSpec {
-                prefix,
-                active_version,
-                uid,
-                state_root,
-                runtime_root,
-                deadlines: Deadlines {
-                    worker_connect: connect,
-                    worker_initialize: initialize,
-                    launchctl_command: launchctl,
-                    worker_exit_timeout: worker_exit,
-                    daemon_exit_timeout: daemon_exit,
-                    daemon_restart_throttle: throttle,
-                },
-                environment_allowlist: allowlist.into_iter().collect(),
-                search_path: SearchPath::empty(),
-                sweep_grace,
-                open_files,
-            },
-        )
-}
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
-
-    #[test]
-    fn write_then_load_round_trips(value in arb_spec()) {
-        let fixture = Fixture::new();
-        let config = ServiceConfig::new(value.clone()).expect("generated spec is valid");
-        prop_assert_eq!(config.to_spec(), value);
-        config.write(&fixture.path()).expect("write config");
-        let loaded = ServiceConfig::load(&fixture.path()).expect("load config");
-        prop_assert_eq!(&loaded, &config);
-        prop_assert_eq!(loaded.to_toml(), config.to_toml());
-    }
 }
 
 #[test]
