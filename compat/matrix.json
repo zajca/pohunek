@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "suite_version": 1,
+  "rows": [
+    {
+      "runtime": "claude",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "runtime": "claude",
+      "target": "x86_64-unknown-linux-musl"
+    },
+    {
+      "runtime": "codex",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "runtime": "codex",
+      "target": "x86_64-unknown-linux-musl"
+    },
+    {
+      "runtime": "pi",
+      "target": "x86_64-unknown-linux-gnu"
+    },
+    {
+      "runtime": "pi",
+      "target": "x86_64-unknown-linux-musl"
+    }
+  ]
+}

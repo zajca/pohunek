@@ -565,6 +565,7 @@ Signed runtime catalog:
 - `crates/package/src/canonical_json.rs` — strict JSON parsing and the canonical signed byte form.
 - `crates/package/tests/catalog.rs`
 - `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
+- `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/xtask/src/runtime_package.rs` — `cargo xtask package build|verify`.
 - `crates/package/src/anchor.rs` — the catalog trust anchor file format and its strict parser.
 - `crates/package/src/sign.rs` — catalog signing for release tooling.
@@ -575,6 +576,8 @@ Signed runtime catalog:
 - `packaging/runtime-catalog-anchor.json` — the production trust anchor shipped beside `pohunekd`.
 - `packaging/catalog-trust/roots.txt` — the production roots and windows (with the `primary.pub` and `ci.pub` public keys) the anchor is generated from.
 - `crates/cli/tests/plugin_catalog_install.rs` — clean-environment official install through a real daemon with a test key.
+- `crates/xtask/src/attestation.rs` — `cargo xtask compat attest|verify|matrix-check`, the binary-set digest and the compatibility attestation.
+- `compat/matrix.json` — the required runtime x target rows and the suite version of the release compatibility matrix.
 
 Hermes compatibility evidence:
 

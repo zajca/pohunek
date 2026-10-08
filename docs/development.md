@@ -161,4 +161,12 @@ creates an isolated temporary profile/state, requires that executable rather
 than downloading it, and fails if install, status, doctor, or uninstall cannot
 prove the embedded plugin and generated skill.
 
+Runtime package compatibility is attested per package and target:
+`cargo xtask compat attest` turns a consumer-suite report into an attestation
+recomputed from the artifact bytes, `cargo xtask compat verify` re-checks one,
+and `cargo xtask compat matrix-check` keeps `compat/matrix.json` equal to the
+`runtime-packages/` directories times the declared targets (bump its
+`suite_version` when the consumer suite's semantics change). See the knowledge
+page `concepts/release-attestation.md`.
+
 After a published stable release, `.github/workflows/notify-tap.yml` (a `workflow_run` of `Release`, the only workflow with a secret, `TAP_DISPATCH_PAT`) sends the Homebrew tap `zajca/homebrew-pohunek` a `pohunek-work-release` repository dispatch for the `pohunek` formula and the tag, and the tap bumps it; pre-releases are skipped. `scripts/tests/test_notify_tap_workflow.py` pins it.

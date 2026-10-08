@@ -237,6 +237,11 @@ const RULES: &[Rule] = &[
         "daemon packaging tested by pohunek-cli; xtask embeds stage-archive's release files",
     ),
     rule(
+        Pattern::File("compat/matrix.json"),
+        Effect::Packages(&["xtask"]),
+        "release compatibility matrix read by xtask's attestation scenarios",
+    ),
+    rule(
         Pattern::File(".github/workflows/release.yml"),
         Effect::Packages(&["pohunek-cli"]),
         "release workflow asserted by pohunek-cli's daemon_packaging test",

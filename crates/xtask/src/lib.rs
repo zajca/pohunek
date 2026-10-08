@@ -2,6 +2,7 @@
 
 mod affected;
 mod agent_skill;
+mod attestation;
 mod catalog;
 mod catalog_key;
 mod checks;
@@ -80,6 +81,8 @@ pub enum XtaskError {
     Json(serde_json::Error),
     Yaml(serde_yaml::Error),
     Package(::package::ArchiveError),
+    /// A compatibility attestation input was refused.
+    Attestation(attestation::AttestationError),
     /// A catalog could not be built, signed or verified.
     Catalog(::package::CatalogError),
     /// A trust anchor could not be built or read.
@@ -138,6 +141,7 @@ impl fmt::Display for XtaskError {
             Self::Json(error) => write!(f, "failed to serialize json: {error}"),
             Self::Yaml(error) => write!(f, "failed to serialize yaml: {error}"),
             Self::Package(error) => write!(f, "package archive: {error}"),
+            Self::Attestation(error) => write!(f, "attestation: {error}"),
             Self::Catalog(error) => write!(f, "catalog: {error}"),
             Self::Anchor(error) => write!(f, "trust anchor: {error}"),
             Self::KeyFile { path, fault } => {
@@ -169,6 +173,7 @@ impl Error for XtaskError {
             Self::Json(error) => Some(error),
             Self::Yaml(error) => Some(error),
             Self::Package(error) => Some(error),
+            Self::Attestation(error) => Some(error),
             Self::Catalog(error) => Some(error),
             Self::Anchor(error) => Some(error),
             Self::Usage(_)
@@ -374,6 +379,7 @@ where
         TopCommand::Affected(options) => affected::run(&root, &options),
         TopCommand::Package { action } => run_package(action),
         TopCommand::Catalog { action } => run_catalog(action),
+        TopCommand::Compat { action } => attestation::run(action, &root),
         TopCommand::AgentSkill { action } => match action {
             AgentSkillAction::Generate => {
                 agent_skill::generate(&root)?;
@@ -475,6 +481,14 @@ enum TopCommand {
     Catalog {
         #[command(subcommand)]
         action: CatalogAction,
+    },
+    /// Attest, verify and matrix-check runtime package compatibility.
+    ///
+    /// Every digest is recomputed from file bytes; a report or attestation
+    /// only supplies values that must equal the recomputed ones.
+    Compat {
+        #[command(subcommand)]
+        action: attestation::CompatAction,
     },
     /// Build and check canonical runtime package archives.
     Package {
