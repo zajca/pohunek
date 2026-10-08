@@ -10,6 +10,20 @@
   digest and `compat/matrix.json` (runtime x target rows, suite version)
   define the compatibility attestation each release row emits; the new concept
   page `release-attestation` describes the tuple and the trust model.
+- The release consumer suite (`crates/cli/tests/release_consumer.rs`) runs one
+  runtime out of process through the exact release binaries and writes the
+  consumer report that `compat attest` consumes.
+
+## Unreleased (2026-10-08, digest-bound release evidence, #150)
+
+- Runtime catalog schema 2: a signed `release` block (version, commit, binary
+  sets per target) and, per entry, `runtime_api` and per-platform attestation
+  digests; the signing domain separator is v2, schema 1 documents are refused.
+  The daemon does not enforce the new fields yet.
+- `cargo xtask compat attest|verify|matrix-check`, the canonical binary-set
+  digest and `compat/matrix.json` (runtime x target rows, suite version)
+  define the compatibility attestation each release row emits; the new concept
+  page `release-attestation` describes the tuple and the trust model.
 
 ## Unreleased (2026-10-08, digest-bound release evidence, #150)
 

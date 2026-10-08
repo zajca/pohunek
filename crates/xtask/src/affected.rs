@@ -238,8 +238,8 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::File("compat/matrix.json"),
-        Effect::Packages(&["xtask"]),
-        "release compatibility matrix read by xtask's attestation scenarios",
+        Effect::Packages(&["xtask", "pohunek-cli"]),
+        "release compatibility matrix read by xtask's attestation scenarios and embedded in pohunek-cli's consumer suite",
     ),
     rule(
         Pattern::File(".github/workflows/release.yml"),

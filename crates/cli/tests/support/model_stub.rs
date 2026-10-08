@@ -48,7 +48,14 @@ struct State {
     stopping: AtomicBool,
     gate_open: Mutex<bool>,
     gate_changed: Condvar,
+    bodies: Mutex<Vec<String>>,
 }
+
+/// Most recent request bodies the stub keeps for [`ModelStub::bodies_containing`].
+///
+/// Bounded so a long session does not grow memory; tests inspect requests that
+/// are at most a few turns old.
+const KEPT_BODIES: usize = 64;
 
 /// A running stub endpoint.
 #[derive(Debug)]
@@ -95,6 +102,18 @@ impl ModelStub {
         self.state.finished.load(Ordering::SeqCst)
     }
 
+    /// The kept request bodies that carry `needle`, oldest first.
+    pub(crate) fn bodies_containing(&self, needle: &str) -> Vec<String> {
+        self.state
+            .bodies
+            .lock()
+            .expect("bodies lock")
+            .iter()
+            .filter(|body| body.contains(needle))
+            .cloned()
+            .collect()
+    }
+
     /// Lets every held response, and every later one, complete.
     pub(crate) fn open_gate(&self) {
         *self.state.gate_open.lock().expect("gate lock") = true;
@@ -138,7 +157,8 @@ fn accept_loop(listener: &TcpListener, state: &Arc<State>) {
 fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    drain_request(&mut reader)?;
+    let body = read_request(&mut reader)?;
+    keep_body(state, &body);
     state.started.fetch_add(1, Ordering::SeqCst);
     writer.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
@@ -157,8 +177,16 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
     Ok(())
 }
 
-/// Reads one HTTP request (headers and body) and discards it.
-fn drain_request(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
+fn keep_body(state: &State, body: &[u8]) {
+    let mut bodies = state.bodies.lock().expect("bodies lock");
+    if bodies.len() == KEPT_BODIES {
+        bodies.remove(0);
+    }
+    bodies.push(String::from_utf8_lossy(body).into_owned());
+}
+
+/// Reads one HTTP request (headers and body) and returns the body.
+fn read_request(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
     let mut content_length = 0_usize;
     let mut chunked = false;
     let mut header_bytes = 0_usize;
@@ -184,17 +212,18 @@ fn drain_request(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
         }
     }
     if chunked {
-        drain_chunked_body(reader)
+        read_chunked_body(reader)
     } else if content_length > MAX_BODY_BYTES {
         Err(io::ErrorKind::InvalidData.into())
     } else {
         let mut body = vec![0_u8; content_length];
-        reader.read_exact(&mut body)
+        reader.read_exact(&mut body)?;
+        Ok(body)
     }
 }
 
-fn drain_chunked_body(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
-    let mut total = 0_usize;
+fn read_chunked_body(reader: &mut BufReader<TcpStream>) -> io::Result<Vec<u8>> {
+    let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
         if reader.read_line(&mut size_line)? == 0 {
@@ -202,15 +231,15 @@ fn drain_chunked_body(reader: &mut BufReader<TcpStream>) -> io::Result<()> {
         }
         let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or(""), 16)
             .map_err(|_error| io::Error::from(io::ErrorKind::InvalidData))?;
-        total += size;
-        if total > MAX_BODY_BYTES {
+        if body.len() + size > MAX_BODY_BYTES {
             return Err(io::ErrorKind::InvalidData.into());
         }
         let mut chunk = vec![0_u8; size + 2];
         reader.read_exact(&mut chunk)?;
         if size == 0 {
-            return Ok(());
+            return Ok(body);
         }
+        body.extend_from_slice(&chunk[..size]);
     }
 }
 
