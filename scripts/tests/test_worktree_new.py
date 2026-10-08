@@ -33,6 +33,7 @@ CROSS_DEVICE = "cp: failed to clone: Invalid cross-device link"
 # bounds a hang when the code under test deadlocks, a passing run never
 # waits for it.
 HANDSHAKE_TIMEOUT_SECONDS = 10
+CLI_TIMEOUT_SECONDS = 30
 # Commit ids of the fake repository: the base every new branch starts at,
 # and a commit only other processes' refs point to.
 BASE_COMMIT = "1" * 40
@@ -385,60 +386,100 @@ class HarnessCase(unittest.TestCase):
         self.assertFalse((self.h.worktrees / "issue-1").exists())
 
 
-class SlugValidationTests(unittest.TestCase):
-    def test_accepts_repository_style_slugs(self):
-        for slug in ("issue-168", "pr112-review", "a_b.c", "X9"):
-            with self.subTest(slug=slug):
-                worktree_new.validate_slug(slug)
+class WorktreeCliTests(unittest.TestCase):
+    """Exercise argument validation through the real script and a private Git repo."""
 
-    def test_rejects_escaping_or_malformed_slugs(self):
-        bad = ["", "../x", "a/b", "/abs", "-rf", ".hidden", "a..b", "a b",
-               "x.lock", "trailing.", "tab\t", "ü", "a" * 101]
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="worktree-new-cli-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.repo = self.root / "pohunek"
+        self.repo.mkdir()
+        self.env = dict(os.environ)
+        self.env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_AUTHOR_NAME": "fixture",
+            "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+            "GIT_COMMITTER_NAME": "fixture",
+            "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "commit.gpgsign",
+            "GIT_CONFIG_VALUE_0": "false",
+        })
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "README.md").write_text("fixture\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "fixture")
+        self.base = self.git("rev-parse", "HEAD").stdout.strip()
+        self.worktrees = self.root / "pohunek-worktrees"
+
+    def git(self, *args):
+        result = subprocess.run(
+            ["git", *args], cwd=self.repo, env=self.env,
+            capture_output=True, text=True, check=False,
+            timeout=CLI_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def run_script(self, *args):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args], cwd=self.repo, env=self.env,
+            capture_output=True, text=True, check=False,
+            timeout=CLI_TIMEOUT_SECONDS,
+        )
+
+    def test_valid_slugs_create_branches_and_registered_worktrees(self):
+        for slug in ("issue-168", "pr112-review", "a_b.c", "X9", "a" * 100):
+            with self.subTest(slug=slug):
+                result = self.run_script("--no-seed", slug, "HEAD")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                destination = self.worktrees / slug
+                self.assertTrue(destination.is_dir())
+                self.assertEqual(
+                    subprocess.run(
+                        ["git", "-C", str(destination), "rev-parse", "HEAD"],
+                        env=self.env, capture_output=True, text=True, check=True,
+                    ).stdout.strip(),
+                    self.base,
+                )
+                self.assertIn(f"branch zajca/{slug} from HEAD", result.stdout)
+                self.assertIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
+
+    def test_invalid_slugs_create_no_branch_or_worktree(self):
+        bad = ("", "../x", "a/b", "/abs", "-rf", ".hidden", "a..b",
+               "a b", "x.lock", "trailing.", "tab\t", "ü", "a" * 101)
         for slug in bad:
             with self.subTest(slug=slug):
-                with self.assertRaises(worktree_new.WorktreeError):
-                    worktree_new.validate_slug(slug)
-
-    def test_max_length_slug_is_accepted(self):
-        worktree_new.validate_slug("a" * worktree_new.MAX_SLUG_LENGTH)
-
-
-class ArgumentTests(HarnessCase):
-    def parse_exit(self, *argv):
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as caught:
-                worktree_new.main(list(argv), cwd=self.h.repo,
-                                  executor=self.h.executor)
-        return caught.exception.code
+                result = self.run_script("--no-seed", "--", slug, "HEAD")
+                self.assertNotEqual(result.returncode, 0)
+                if not slug:
+                    expected = "must not be empty"
+                elif len(slug) > 100:
+                    expected = "longer than 100 characters"
+                else:
+                    expected = "invalid slug"
+                self.assertIn(expected, result.stderr)
+                self.assertFalse(self.worktrees.exists())
+                self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
 
     def test_malformed_command_lines_are_usage_errors(self):
-        cases = {
-            "missing slug": (),
-            "extra positional": ("a", "origin/main", "extra"),
-            "unknown flag": ("--reflink-auto", "a"),
-            "--branch without a value": ("a", "--branch"),
-        }
-        for label, argv in cases.items():
-            with self.subTest(label):
-                self.assertEqual(self.parse_exit(*argv), 2, label)
+        for args in ((), ("a", "HEAD", "extra"), ("--reflink-auto", "a"),
+                     ("a", "--branch")):
+            with self.subTest(args=args):
+                result = self.run_script(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.worktrees.exists())
 
-    def test_invalid_slug_fails_before_any_command(self):
-        code, _, err = self.h.run("../escape")
-        self.assertEqual(code, 1)
-        self.assertIn("invalid slug", err)
-        self.assertEqual(self.h.executor.commands, [])
-
-    def test_invalid_branch_override_is_rejected(self):
-        code, _, err = self.h.run("--branch", "zajca/bad..name", "issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("invalid branch name", err)
-        self.assert_no_worktree_created()
-
-    def test_branch_override_starting_with_dash_is_rejected(self):
-        code, _, err = self.h.run("--branch=-D", "issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("invalid branch name", err)
-        self.assert_no_worktree_created()
+    def test_invalid_branch_overrides_create_no_worktree(self):
+        for branch in ("zajca/bad..name", "-D"):
+            with self.subTest(branch=branch):
+                result = self.run_script("--no-seed", f"--branch={branch}", "issue-1", "HEAD")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid branch name", result.stderr)
+                self.assertFalse(self.worktrees.exists())
+                self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
 
 
 class SeededCreateTests(HarnessCase):
