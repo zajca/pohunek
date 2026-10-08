@@ -822,29 +822,50 @@ class RunTimingTests(unittest.TestCase):
         self.assertIn("missing older runs", result.stderr)
 
 
-class ErrorReportingTests(unittest.TestCase):
-    def test_describe_error_falls_back_without_stderr(self):
-        error = subprocess.CalledProcessError(1, ["gh", "run", "list"])
-        self.assertEqual(ci_timings.describe_error(error), str(error))
-        blank = subprocess.CalledProcessError(
-            1, ["gh", "run", "list"], stderr="   \n"
+class GhFailureCommandTests(unittest.TestCase):
+    """The real command must print useful `gh` errors without leaking tokens."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "sys.stderr.write(os.environ.get('GH_ERROR', ''))\n"
+            "raise SystemExit(1)\n"
         )
-        self.assertEqual(ci_timings.describe_error(blank), str(blank))
-        self.assertEqual(
-            ci_timings.describe_error(ValueError("plain")), "plain"
+        gh.chmod(0o755)
+        self.environment = {
+            **os.environ,
+            "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+        }
+
+    def run_failed_fetch(self, message):
+        environment = {**self.environment, "GH_ERROR": message}
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "runs", "--window", "2026-09-14..2026-09-16",
+             "--cache", str(self.root / "runs.json")],
+            cwd=self.root, env=environment, capture_output=True,
+            text=True, check=False,
         )
 
-    def test_describe_error_redacts_credentials(self):
-        """A secret printed to a terminal or CI log can only be rotated.
+    def test_failed_fetch_preserves_a_diagnostic_and_handles_blank_stderr(self):
+        detailed = self.run_failed_fetch("gh: API rate limit exceeded\n")
+        self.assertEqual(detailed.returncode, 1)
+        self.assertIn("API rate limit exceeded", detailed.stderr)
+        for blank in ("", "   \n"):
+            result = self.run_failed_fetch(blank)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("returned non-zero exit status 1", result.stderr)
 
-        Each pattern is checked separately so a regression in one cannot
-        hide behind another still matching.
-        """
+    def test_failed_fetch_redacts_each_credential_shape(self):
         secrets = (
             "ghp_" + "A" * 36,
             "github_pat_" + "B" * 30,
-            # The scheme word sits between the key and the value here, and
-            # a pattern that stops at the first token redacts only "Bearer".
             "Authorization: Bearer " + "C" * 40,
             "https://api.github.com/x?access_token=" + "D" * 40,
             "Bearer " + "E" * 40,
@@ -853,40 +874,17 @@ class ErrorReportingTests(unittest.TestCase):
         runs = ["A" * 36, "B" * 30, "C" * 40, "D" * 40, "E" * 40, "F" * 40]
         for secret in secrets:
             with self.subTest(secret=secret[:12]):
-                error = subprocess.CalledProcessError(
-                    1, ["gh"], stderr=f"failed with {secret}"
-                )
-                message = ci_timings.describe_error(error)
-                self.assertIn("[redacted]", message)
+                result = self.run_failed_fetch(f"rate limit exceeded: {secret}\n")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("rate limit exceeded", result.stderr)
+                self.assertIn("[redacted]", result.stderr)
                 for run in runs:
-                    self.assertNotIn(run, message)
+                    self.assertNotIn(run, result.stderr)
 
-    def test_describe_error_keeps_credential_free_diagnostics(self):
-        # Redaction must not eat the reason: these words appear in ordinary
-        # gh messages that carry no secret.
-        error = subprocess.CalledProcessError(
-            1, ["gh"], stderr="gh: token expired, run gh auth login\n"
-        )
-        self.assertIn("token expired", ci_timings.describe_error(error))
-
-    def test_main_reports_the_underlying_gh_failure(self):
-        def failing(arguments):
-            raise subprocess.CalledProcessError(
-                1, ["gh", *arguments], stderr="gh: API rate limit exceeded\n"
-            )
-
-        original = ci_timings.gh_json
-        ci_timings.gh_json = failing
-        stderr = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(stderr):
-                code = ci_timings.main(
-                    ["runs", "--window", "2026-09-14..2026-09-16"]
-                )
-        finally:
-            ci_timings.gh_json = original
-        self.assertEqual(code, 1)
-        self.assertIn("API rate limit exceeded", stderr.getvalue())
+    def test_credential_free_auth_diagnostic_stays_actionable(self):
+        result = self.run_failed_fetch("gh: token expired, run gh auth login\n")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("token expired", result.stderr)
 
 
 class JunitCommandTests(unittest.TestCase):
@@ -1023,123 +1021,30 @@ class JunitCommandTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["job"]["name"], "tests (unit, fast)")
         self.assertEqual(json.loads(result.stdout)["job"]["step_seconds"], 258.0)
 
-class CacheTests(unittest.TestCase):
-    def test_junit_step_seconds_matches_exact_step_names(self):
-        # Only the test-execution step counts; a step whose name merely
-        # contains "nextest" (e.g. "Install cargo-nextest") must not match.
-        document = {
-            "jobs": [
+
+    def test_junit_job_step_ignores_nextest_installation(self):
+        jobs = [{
+            "name": "tests (unit, fast)",
+            "steps": [
                 {
-                    "name": "tests (unit, fast)",
-                    "steps": [
-                        {
-                            "name": "Install cargo-nextest",
-                            "startedAt": "2026-09-20T10:00:00Z",
-                            "completedAt": "2026-09-20T10:00:10Z",
-                        },
-                        {
-                            "name": "Run fast shard",
-                            "startedAt": "2026-09-20T10:01:00Z",
-                            "completedAt": "2026-09-20T10:05:18Z",
-                        },
-                    ],
+                    "name": "Install cargo-nextest",
+                    "startedAt": "2026-09-20T10:00:00Z",
+                    "completedAt": "2026-09-20T10:00:10Z",
                 },
-                {"name": "docs check", "steps": []},
-            ]
-        }
-        durations = ci_timings.junit_step_seconds(document)
-        self.assertIsNone(durations["docs check"])
-        self.assertEqual(durations["tests (unit, fast)"], 4.0 * 60 + 18)
+                {
+                    "name": "Run fast shard",
+                    "startedAt": "2026-09-20T10:01:00Z",
+                    "completedAt": "2026-09-20T10:05:18Z",
+                },
+            ],
+        }]
+        result = self.run_command(
+            "--run", "7", "--label", "tests (unit, fast)", "--json", jobs=jobs
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["job"]["step_seconds"], 258.0)
 
-    def test_parse_cache_log_extracts_sccache_json(self):
-        records = {record["job"]: record for record in ci_timings.parse_cache_log(CACHE_LOG)}
-        release = records["doctests + release build"]
-        self.assertEqual(release["sccache"]["executed"], 1015)
-        self.assertEqual(release["sccache"]["hits"], 660)
-        self.assertEqual(release["sccache"]["misses"], 286)
-        self.assertEqual(release["sccache"]["write_errors"], 272)
-        self.assertIn("ghac", release["sccache"]["location"])
-        self.assertEqual(release["rust_cache"], "hit")
 
-    def test_render_cache_markdown_hit_ratio(self):
-        rendered = ci_timings.render_cache_markdown(
-            ci_timings.parse_cache_log(CACHE_LOG)
-        )
-        self.assertIn(
-            "| doctests + release build | 1015 | 660 | 286 | 0 | 70 % | hit |",
-            rendered,
-        )
-        self.assertIn(
-            "| tests (unit, fast) | n/a | n/a | n/a | n/a | n/a | miss |",
-            rendered,
-        )
-
-    def test_parse_cache_log_counts_cache_errors(self):
-        # Backend lookup errors dilute the hit ratio: the same blob with
-        # half its lookups failing must not read as highly cached.
-        errored = CACHE_LOG.replace(
-            '"cache_misses":{"counts":{"Rust":286}}',
-            '"cache_misses":{"counts":{"Rust":286}},'
-            '"cache_errors":{"counts":{"Timeout":946}}',
-        )
-        records = {
-            record["job"]: record for record in ci_timings.parse_cache_log(errored)
-        }
-        release = records["doctests + release build"]
-        self.assertEqual(release["sccache"]["errors"], 946)
-        self.assertAlmostEqual(release["sccache"]["hit_ratio"], 660 / 1892)
-        rendered = ci_timings.render_cache_markdown(
-            ci_timings.parse_cache_log(errored)
-        )
-        self.assertIn(
-            "| doctests + release build | 1015 | 660 | 286 | 946 | 35 % | hit |",
-            rendered,
-        )
-
-    def test_parse_cache_log_separates_restore_errors_from_misses(self):
-        # "Failed to restore" is a backend/extraction failure, not evidence
-        # that the entry was absent: reporting it as a miss would make the
-        # cache look ineffective when it is the restore that broke.
-        log = "\n".join(
-            [
-                "tests (heavy)\tCache cargo build"
-                "\t2026-09-21T05:17:40Z Failed to restore: archive extraction failed",
-                "tests (cli, fast)\tCache cargo build"
-                "\t2026-09-21T05:17:40Z Cache not found for keys: Linux-x64-gnu",
-            ]
-        )
-        records = {record["job"]: record for record in ci_timings.parse_cache_log(log)}
-        self.assertEqual(records["tests (heavy)"]["rust_cache"], "error")
-        self.assertEqual(records["tests (cli, fast)"]["rust_cache"], "miss")
-
-    def test_parse_cache_log_accepts_unnamed_rust_cache_step(self):
-        # A workflow step left unnamed is logged under its action reference;
-        # its hit evidence must not be discarded.
-        log = (
-            "tests (unit, fast)\tRun Swatinem/rust-cache@v2"
-            "\t2026-09-21T05:17:40Z Cache restored successfully"
-        )
-        records = ci_timings.parse_cache_log(log)
-        self.assertEqual(
-            [(record["job"], record["rust_cache"]) for record in records],
-            [("tests (unit, fast)", "hit")],
-        )
-
-    def test_parse_cache_log_ignores_unrelated_cache_steps(self):
-        # "Cache restored successfully" from an `actions/cache` step (Bun)
-        # must not fabricate a rust-cache record; nor may an sccache-looking
-        # line outside the post-step.
-        records = {record["job"]: record for record in ci_timings.parse_cache_log(CACHE_LOG)}
-        self.assertNotIn("SDK workspace", records)
-        unrelated = "\n".join(
-            [
-                "tests (cli, fast)\tRun fast shard"
-                f"\t2026-09-21T05:20:00Z some output {{\"stats\": 1}}",
-                "tests (cli, fast)\tCache Bun packages"
-                "\t2026-09-21T05:17:40Z Cache restored successfully",
-            ]
-        )
-        self.assertEqual(ci_timings.parse_cache_log(unrelated), [])
 
 
 class FetchTests(unittest.TestCase):
@@ -1395,6 +1300,86 @@ class LogCacheCommandTests(unittest.TestCase):
 
     def gh_calls(self):
         return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def run_input(self, log, *arguments):
+        self.log.write_text(log)
+        return subprocess.run(
+            [sys.executable, str(self.script), "cache", "--input", str(self.log), *arguments],
+            cwd=self.root, env=self.environment, capture_output=True,
+            text=True, check=False,
+        )
+
+    def test_input_log_reports_sccache_and_rust_cache_in_json_and_markdown(self):
+        result = self.run_input(CACHE_LOG, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = {record["job"]: record for record in json.loads(result.stdout)}
+        release = records["doctests + release build"]
+        self.assertEqual(release["sccache"]["executed"], 1015)
+        self.assertEqual(release["sccache"]["hits"], 660)
+        self.assertEqual(release["sccache"]["misses"], 286)
+        self.assertEqual(release["sccache"]["write_errors"], 272)
+        self.assertIn("ghac", release["sccache"]["location"])
+        self.assertEqual(release["rust_cache"], "hit")
+        self.assertNotIn("SDK workspace", records)
+        markdown = self.run_input(CACHE_LOG)
+        self.assertEqual(markdown.returncode, 0, markdown.stderr)
+        self.assertIn(
+            "| doctests + release build | 1015 | 660 | 286 | 0 | 70 % | hit |",
+            markdown.stdout,
+        )
+        self.assertIn(
+            "| tests (unit, fast) | n/a | n/a | n/a | n/a | n/a | miss |",
+            markdown.stdout,
+        )
+
+    def test_input_log_counts_backend_errors_in_the_reported_hit_ratio(self):
+        errored = CACHE_LOG.replace(
+            '"cache_misses":{"counts":{"Rust":286}}',
+            '"cache_misses":{"counts":{"Rust":286}},'
+            '"cache_errors":{"counts":{"Timeout":946}}',
+        )
+        result = self.run_input(errored, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = {record["job"]: record for record in json.loads(result.stdout)}
+        release = records["doctests + release build"]
+        self.assertEqual(release["sccache"]["errors"], 946)
+        self.assertAlmostEqual(release["sccache"]["hit_ratio"], 660 / 1892)
+        markdown = self.run_input(errored)
+        self.assertEqual(markdown.returncode, 0, markdown.stderr)
+        self.assertIn(
+            "| doctests + release build | 1015 | 660 | 286 | 946 | 35 % | hit |",
+            markdown.stdout,
+        )
+
+    def test_input_log_distinguishes_restore_errors_from_cache_misses(self):
+        log = "\n".join([
+            "tests (heavy)\tCache cargo build\t2026-09-21T05:17:40Z Failed to restore: archive extraction failed",
+            "tests (cli, fast)\tCache cargo build\t2026-09-21T05:17:40Z Cache not found for keys: Linux-x64-gnu",
+        ])
+        result = self.run_input(log, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = {record["job"]: record for record in json.loads(result.stdout)}
+        self.assertEqual(records["tests (heavy)"]["rust_cache"], "error")
+        self.assertEqual(records["tests (cli, fast)"]["rust_cache"], "miss")
+
+    def test_input_log_accepts_unnamed_rust_cache_and_ignores_other_steps(self):
+        unnamed = (
+            "tests (unit, fast)\tRun Swatinem/rust-cache@v2"
+            "\t2026-09-21T05:17:40Z Cache restored successfully"
+        )
+        result = self.run_input(unnamed, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            [(record["job"], record["rust_cache"]) for record in json.loads(result.stdout)],
+            [("tests (unit, fast)", "hit")],
+        )
+        unrelated = "\n".join([
+            "tests (cli, fast)\tRun fast shard\t2026-09-21T05:20:00Z some output {\"stats\": 1}",
+            "tests (cli, fast)\tCache Bun packages\t2026-09-21T05:17:40Z Cache restored successfully",
+        ])
+        ignored = self.run_input(unrelated, "--json")
+        self.assertEqual(ignored.returncode, 0, ignored.stderr)
+        self.assertEqual(json.loads(ignored.stdout), [])
 
     def test_rerun_logs_use_distinct_default_paths_and_cached_logs_are_reused(self):
         first = self.run_cache(1)
