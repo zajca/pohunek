@@ -138,11 +138,13 @@ def main():
             import subprocess
 
             base = Path(os.environ["TMPDIR"])
-            executable = base / "pohunek-sessiond"
+            worker_dir = base / os.environ.get("PARTITIONS_WORKER_SUBDIR", "")
+            worker_dir.mkdir(exist_ok=True)
+            executable = worker_dir / "pohunek-sessiond"
             executable.symlink_to("/bin/sh")
             worker = subprocess.Popen(
                 [str(executable), "-c", "sleep 30 & echo $$ $!; wait",
-                 "--daemon-socket-path", str(base / "d.sock")],
+                 "--daemon-socket-path", str(worker_dir / "d.sock")],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -522,7 +524,10 @@ class WorkerRunActionTests(ScriptScenario):
         pid_file = self.root / "worker.pid"
         result = self.run_script(
             "run", "unit",
-            extra_env={"PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file)},
+            extra_env={
+                "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
+                "PARTITIONS_WORKER_SUBDIR": "worker with spaces",
+            },
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         pids = json.loads(pid_file.read_text())
@@ -533,6 +538,7 @@ class WorkerRunActionTests(ScriptScenario):
         wait_for(lambda: gone_or_zombie(pids["workload"]))
         call = self.nextest_calls()[-1]
         base = Path(call["tmpdir"])
+        self.assertIn(str(base / "worker with spaces" / "d.sock"), result.stderr)
         self.assertLessEqual(len(str(base)), 9)
         self.assertEqual(call["tmpdir_mode"], 0o700)
         self.assertFalse(base.exists(), "the private run base is removed after cleanup")
@@ -546,6 +552,31 @@ class WorkerRunActionTests(ScriptScenario):
         call = self.nextest_calls()[-1]
         self.assertEqual(call["tmpdir_mode"], 0o700)
         self.assertFalse(Path(call["tmpdir"]).exists())
+
+    def test_a_worker_outside_the_run_base_is_left_running(self):
+        foreign = self.root / "other run with spaces"
+        foreign.mkdir()
+        executable = foreign / "pohunek-sessiond"
+        executable.symlink_to("/bin/sh")
+        worker = subprocess.Popen(
+            [str(executable), "-c", "sleep 30 & echo ready; wait",
+             "--daemon-socket-path", str(foreign / "d.sock")],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            self.assertEqual(worker.stdout.readline().strip(), b"ready")
+            worker.stdout.close()
+            result = self.run_script("run", "unit")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("leaked pohunek-sessiond worker", result.stderr)
+            self.assertIsNone(worker.poll(), "another run's worker remains live")
+        finally:
+            try:
+                os.killpg(worker.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            worker.wait()
 
     def test_cancellation_stops_the_runner_and_cleans_the_worker(self):
         pid_file = self.root / "worker.pid"
@@ -585,26 +616,6 @@ class WorkerRunActionTests(ScriptScenario):
 
 
 class LeakedWorkerTests(unittest.TestCase):
-    def worker(self, socket, pid=100, executable="/w/target/debug/pohunek-sessiond", start="1"):
-        argv = [executable, "--session-id", "s-1", "--daemon-socket-path", socket]
-        return partitions.Process(pid, start, argv)
-
-    def test_only_workers_below_the_run_base_are_leaks(self):
-        processes = [
-            self.worker("/tmp/ab12/ph-x/run/pohunek/daemon.sock", pid=100),
-            self.worker("/tmp/ab123/ph-x/run/pohunek/daemon.sock", pid=101),
-            self.worker("/run/user/1000/pohunek/daemon.sock", pid=102),
-            partitions.Process(7, "1", ["/usr/bin/sleep", "1"]),
-        ]
-        found = partitions.leaked_workers(processes, Path("/tmp/ab12"))
-        self.assertEqual([process.pid for process, _ in found], [100])
-
-    def test_spaces_in_the_executable_and_the_socket_path_are_kept(self):
-        process = self.worker("/tmp/ab 12/ph-x/daemon.sock", executable="/home/a b/target/pohunek-sessiond")
-        found = partitions.leaked_workers([process], Path("/tmp/ab 12"))
-        self.assertEqual([socket for _, socket in found], ["/tmp/ab 12/ph-x/daemon.sock"])
-        self.assertEqual(partitions.leaked_workers([process], Path("/tmp/ab")), [])
-
     def test_a_worker_without_a_socket_argument_is_not_a_leak(self):
         process = partitions.Process(5, "1", ["/w/pohunek-sessiond", "--session-id", "s-1"])
         self.assertEqual(partitions.leaked_workers([process], Path("/tmp/ab12")), [])
@@ -790,14 +801,6 @@ class LeakedWorkerTests(unittest.TestCase):
             self.assertFalse(partitions.kill_if_unchanged(recycled))
             self.assertIn(process.pid, [p.pid for p in partitions.read_processes()])
             self.assertTrue(partitions.kill_if_unchanged(process))
-
-    @unittest.skipUnless(sys.platform == "linux", "reads /proc")
-    def test_paths_with_spaces_survive_the_real_process_table(self):
-        with tempfile.TemporaryDirectory(prefix="a b ") as root, contextlib.ExitStack() as scope:
-            process = self.spawn_stand_in(Path(root), scope)
-            found = partitions.leaked_workers(partitions.read_processes(), Path(root))
-            self.assertEqual([p.pid for p, _ in found], [process.pid])
-            partitions.kill_if_unchanged(process)
 
     def test_remove_tree_removes_directories_without_permissions(self):
         with tempfile.TemporaryDirectory() as root:
