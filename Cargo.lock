@@ -5713,6 +5713,7 @@ dependencies = [
  "portable-pty",
  "pulldown-cmark",
  "regex",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",
