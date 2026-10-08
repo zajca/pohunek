@@ -527,17 +527,22 @@ enum CatalogAction {
         #[arg(long, value_name = "N")]
         high_water: Option<u64>,
     },
-    /// Write the trust anchor file for a public key.
+    /// Write the trust anchor file for one or more root public keys.
+    ///
+    /// Each `--root` states one root as
+    /// `<public-key-file>:<not-before>:<not-after>`: the file holding the
+    /// 64-hex public key (see `catalog public-key`), the first Unix second the
+    /// root may sign and the Unix second from which it may no longer sign.
+    /// There is no default window. Up to 8 distinct roots; the output lists
+    /// them in ascending key id order regardless of argument order.
     Anchor {
-        /// File holding the 64-hex public key (see `catalog public-key`).
-        #[arg(long, value_name = "FILE")]
-        public_key_file: PathBuf,
-        /// First Unix second the root may sign.
-        #[arg(long, value_name = "UNIX_SECONDS")]
-        not_before: u64,
-        /// Unix second from which the root may no longer sign.
-        #[arg(long, value_name = "UNIX_SECONDS")]
-        not_after: u64,
+        /// One trusted root; repeatable.
+        #[arg(
+            long = "root",
+            value_name = "PUBLIC_KEY_FILE:NOT_BEFORE:NOT_AFTER",
+            required = true
+        )]
+        roots: Vec<catalog::RootSpec>,
         /// Key id the anchor revokes; repeatable.
         #[arg(long = "revoked-key-id", value_name = "HEX")]
         revoked_key_ids: Vec<String>,
@@ -665,20 +670,12 @@ fn run_catalog(action: CatalogAction) -> Result<(), XtaskError> {
             }
         }
         CatalogAction::Anchor {
-            public_key_file,
-            not_before,
-            not_after,
+            roots,
             revoked_key_ids,
             output,
         } => {
-            catalog::anchor_to(
-                &public_key_file,
-                not_before,
-                not_after,
-                &revoked_key_ids,
-                &output,
-            )?;
-            println!("catalog anchor ok");
+            catalog::anchor_to(&roots, &revoked_key_ids, &output)?;
+            println!("catalog anchor ok: {} roots", roots.len());
         }
         CatalogAction::PublicKey { key_file } => {
             let (key_id, public_key) = catalog::public_key_of(&key_file)?;

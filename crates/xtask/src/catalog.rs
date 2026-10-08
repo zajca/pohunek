@@ -369,16 +369,69 @@ pub(crate) fn verify(
     })
 }
 
-/// The anchor file bytes for the public key at `public_key_file`.
-pub(crate) fn anchor_bytes(
-    public_key_file: &Path,
+/// One trusted root requested from `catalog anchor`: the public key file and
+/// the validity window the root may sign in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootSpec {
+    public_key_file: PathBuf,
     not_before: u64,
     not_after: u64,
-    revoked: &[String],
-) -> Result<Vec<u8>, XtaskError> {
-    let public_key = read_public_key(public_key_file)?;
-    let root = RootKey::new(public_key, not_before, not_after)
-        .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))?;
+}
+
+impl RootSpec {
+    #[cfg(test)]
+    pub(crate) fn new(public_key_file: &Path, not_before: u64, not_after: u64) -> Self {
+        Self {
+            public_key_file: public_key_file.to_path_buf(),
+            not_before,
+            not_after,
+        }
+    }
+}
+
+impl std::str::FromStr for RootSpec {
+    type Err = String;
+
+    /// Parses `<public-key-file>:<not-before>:<not-after>`.
+    ///
+    /// The two window values are split off from the right, so the file path
+    /// may itself contain colons.
+    fn from_str(value: &str) -> Result<Self, String> {
+        const FORM: &str = "expected <public-key-file>:<not-before>:<not-after>";
+        let mut parts = value.rsplitn(3, ':');
+        let (Some(not_after), Some(not_before), Some(path)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(FORM.to_owned());
+        };
+        if path.is_empty() {
+            return Err(format!("the public key file is empty: {FORM}"));
+        }
+        let seconds = |text: &str, name: &str| {
+            text.parse::<u64>()
+                .map_err(|_cause| format!("{name} is not a Unix second count: {FORM}"))
+        };
+        Ok(Self {
+            public_key_file: PathBuf::from(path),
+            not_before: seconds(not_before, "not-before")?,
+            not_after: seconds(not_after, "not-after")?,
+        })
+    }
+}
+
+/// The anchor file bytes for `roots` and the `revoked` key ids.
+///
+/// Root count, repeated keys and windows are judged by [`AnchorFile::new`] and
+/// [`RootKey::new`]; the bytes list the roots in ascending key id order.
+pub(crate) fn anchor_bytes(roots: &[RootSpec], revoked: &[String]) -> Result<Vec<u8>, XtaskError> {
+    let roots = roots
+        .iter()
+        .map(|spec| {
+            let public_key = read_public_key(&spec.public_key_file)?;
+            RootKey::new(public_key, spec.not_before, spec.not_after)
+                .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let revoked = revoked
         .iter()
         .map(|id| {
@@ -387,23 +440,19 @@ pub(crate) fn anchor_bytes(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let anchor = AnchorFile::new(vec![root], revoked)
+    let anchor = AnchorFile::new(roots, revoked)
         .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))?;
     anchor.to_bytes().map_err(XtaskError::Anchor)
 }
 
-/// Writes the anchor file for `public_key_file` to `output`.
+/// Writes the anchor file for `roots` to `output`; nothing is written when
+/// the anchor is refused.
 pub(crate) fn anchor_to(
-    public_key_file: &Path,
-    not_before: u64,
-    not_after: u64,
+    roots: &[RootSpec],
     revoked: &[String],
     output: &Path,
 ) -> Result<(), XtaskError> {
-    write_output(
-        output,
-        &anchor_bytes(public_key_file, not_before, not_after, revoked)?,
-    )
+    write_output(output, &anchor_bytes(roots, revoked)?)
 }
 
 /// The key id and public key of the signing key file at `key_file`.
@@ -426,7 +475,10 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{symlink, PermissionsExt as _};
 
-    use package::{build_archive, ArchiveEntry, CatalogEntryRejection, CatalogError};
+    use package::{
+        build_archive, ArchiveEntry, CatalogEntryRejection, CatalogError, TrustAnchorError,
+        MAX_REVOKED_KEYS, MAX_TRUST_ROOTS,
+    };
     use serde_json::json;
 
     use super::*;
@@ -527,7 +579,7 @@ mod tests {
     fn anchor_file(release: &Release, name: &str, not_before: u64, not_after: u64) -> PathBuf {
         let (_private, public) = key_files(release.dir.path());
         let out = release.dir.path().join(name);
-        anchor_to(&public, not_before, not_after, &[], &out).expect("anchor");
+        anchor_to(&[RootSpec::new(&public, not_before, not_after)], &[], &out).expect("anchor");
         out
     }
 
@@ -800,7 +852,7 @@ mod tests {
         )
         .expect("write");
         let other_anchor = release.dir.path().join("other-anchor.json");
-        anchor_to(&other, 1, FAR_FUTURE, &[], &other_anchor).expect("anchor");
+        anchor_to(&[RootSpec::new(&other, 1, FAR_FUTURE)], &[], &other_anchor).expect("anchor");
         assert!(matches!(
             verify(&catalog, &other_anchor, None, NOW),
             Err(XtaskError::Catalog(CatalogError::UnknownSigner))
@@ -833,9 +885,7 @@ mod tests {
         let (_private, public) = key_files(release.dir.path());
         let anchor = release.dir.path().join("revoking-anchor.json");
         anchor_to(
-            &public,
-            1,
-            FAR_FUTURE,
+            &[RootSpec::new(&public, 1, FAR_FUTURE)],
             &[key_id().as_str().to_owned()],
             &anchor,
         )
@@ -852,7 +902,7 @@ mod tests {
         let first = anchor_file(&release, "anchor.json", 1, FAR_FUTURE);
         let second = release.dir.path().join("second-anchor.json");
         let (_private, public) = key_files(release.dir.path());
-        anchor_to(&public, 1, FAR_FUTURE, &[], &second).expect("anchor");
+        anchor_to(&[RootSpec::new(&public, 1, FAR_FUTURE)], &[], &second).expect("anchor");
         assert_eq!(
             fs::read(&first).expect("read"),
             fs::read(&second).expect("read")
@@ -860,14 +910,269 @@ mod tests {
         let parsed = parse_anchor(&fs::read(&first).expect("read")).expect("parse");
         assert_eq!(parsed.roots()[0].id(), &key_id());
 
-        assert!(
-            anchor_to(&public, FAR_FUTURE, 1, &[], &second).is_err(),
-            "empty window"
-        );
-        assert!(anchor_to(&public, 1, 2, &["nothex".to_owned()], &second).is_err());
         let bad_public = release.dir.path().join("bad.key");
         fs::write(&bad_public, "not a key").expect("write");
-        assert!(anchor_to(&bad_public, 1, 2, &[], &second).is_err());
+        assert!(anchor_to(&[RootSpec::new(&bad_public, 1, 2)], &[], &second).is_err());
+    }
+
+    const CI_SEED: u8 = SEED + 1;
+    const CI_WINDOW: (u64, u64) = (NOW - 100, NOW + 100);
+
+    fn ci_key() -> SigningKey {
+        SigningKey::from_bytes(&[CI_SEED; 32])
+    }
+
+    /// The owner-private key file and public key file of the CI root.
+    fn ci_key_files(dir: &Path) -> (PathBuf, PathBuf) {
+        let private = dir.join("ci-signing.key");
+        fs::write(&private, hex(&[CI_SEED; 32])).expect("write key");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).expect("mode");
+        let public = dir.join("ci-public.key");
+        fs::write(&public, hex(&ci_key().verifying_key().to_bytes())).expect("write public key");
+        (private, public)
+    }
+
+    fn ci_key_id() -> KeyId {
+        KeyId::derive(&ci_key().verifying_key())
+    }
+
+    /// An anchor listing the primary root for all time and the CI root for
+    /// [`CI_WINDOW`], with `revoked` revoked.
+    fn two_root_anchor(release: &Release, name: &str, revoked: &[String]) -> PathBuf {
+        let dir = release.dir.path();
+        let (_private, primary) = key_files(dir);
+        let (_ci_private, ci) = ci_key_files(dir);
+        let out = dir.join(name);
+        anchor_to(
+            &[
+                RootSpec::new(&primary, 1, FAR_FUTURE),
+                RootSpec::new(&ci, CI_WINDOW.0, CI_WINDOW.1),
+            ],
+            revoked,
+            &out,
+        )
+        .expect("anchor");
+        out
+    }
+
+    fn signed_by_ci(release: &Release) -> PathBuf {
+        let unsigned = built(release);
+        let (private, _public) = ci_key_files(release.dir.path());
+        let out = release.dir.path().join("ci-catalog.json");
+        sign_to(&unsigned, &private, ci_key_id().as_str(), &out, NOW).expect("sign");
+        out
+    }
+
+    #[test]
+    fn a_two_root_anchor_reads_back_and_verifies_a_catalog_signed_by_either_root() {
+        let release = release();
+        let anchor = two_root_anchor(&release, "anchor.json", &[]);
+        let parsed = parse_anchor(&fs::read(&anchor).expect("read")).expect("parse");
+        let ids: Vec<&KeyId> = parsed.roots().iter().map(RootKey::id).collect();
+        let mut expected = [key_id(), ci_key_id()];
+        expected.sort();
+        assert_eq!(ids, expected.iter().collect::<Vec<_>>());
+        for root in parsed.roots() {
+            let window = if root.id() == &ci_key_id() {
+                CI_WINDOW
+            } else {
+                (1, FAR_FUTURE)
+            };
+            assert_eq!((root.not_before(), root.not_after()), window);
+        }
+
+        let primary = signed(&release);
+        let verified = verify(&primary, &anchor, None, NOW).expect("primary root");
+        assert_eq!(verified.signer, key_id());
+        let ci = signed_by_ci(&release);
+        let verified = verify(&ci, &anchor, None, NOW).expect("ci root");
+        assert_eq!(verified.signer, ci_key_id());
+    }
+
+    #[test]
+    fn a_root_signs_from_not_before_inclusive_until_not_after_exclusive() {
+        let release = release();
+        let anchor = two_root_anchor(&release, "anchor.json", &[]);
+        let ci = signed_by_ci(&release);
+        assert!(matches!(
+            verify(&ci, &anchor, None, CI_WINDOW.0 - 1),
+            Err(XtaskError::Catalog(CatalogError::SignerNotYetValid))
+        ));
+        verify(&ci, &anchor, None, CI_WINDOW.0).expect("not_before is inclusive");
+        verify(&ci, &anchor, None, CI_WINDOW.1 - 1).expect("last second inside");
+        assert!(matches!(
+            verify(&ci, &anchor, None, CI_WINDOW.1),
+            Err(XtaskError::Catalog(CatalogError::SignerExpired))
+        ));
+        let primary = signed(&release);
+        verify(&primary, &anchor, None, CI_WINDOW.1).expect("primary window is its own");
+    }
+
+    #[test]
+    fn revoking_the_ci_root_leaves_the_primary_root_trusted() {
+        let release = release();
+        let anchor = two_root_anchor(
+            &release,
+            "revoking.json",
+            &[ci_key_id().as_str().to_owned()],
+        );
+        assert!(matches!(
+            verify(&signed_by_ci(&release), &anchor, None, NOW),
+            Err(XtaskError::Catalog(CatalogError::SignerRevoked))
+        ));
+        verify(&signed(&release), &anchor, None, NOW).expect("primary root still verifies");
+    }
+
+    #[test]
+    fn the_anchor_bytes_do_not_depend_on_the_order_of_the_roots() {
+        let release = release();
+        let dir = release.dir.path();
+        let (_private, primary) = key_files(dir);
+        let (_ci_private, ci) = ci_key_files(dir);
+        let a = RootSpec::new(&primary, 1, FAR_FUTURE);
+        let b = RootSpec::new(&ci, CI_WINDOW.0, CI_WINDOW.1);
+        assert_eq!(
+            anchor_bytes(&[a.clone(), b.clone()], &[]).expect("bytes"),
+            anchor_bytes(&[b, a], &[]).expect("bytes")
+        );
+    }
+
+    #[test]
+    fn a_refused_anchor_writes_no_file() {
+        let release = release();
+        let dir = release.dir.path();
+        let (_private, primary) = key_files(dir);
+        let (_ci_private, ci) = ci_key_files(dir);
+        let copy = dir.join("primary-copy.key");
+        fs::copy(&primary, &copy).expect("copy");
+        let out = dir.join("refused-anchor.json");
+        let root = |file: &Path| RootSpec::new(file, 1, FAR_FUTURE);
+
+        let refusals: [(Vec<RootSpec>, Vec<String>, TrustAnchorError); 5] = [
+            (Vec::new(), Vec::new(), TrustAnchorError::NoRoots),
+            (
+                vec![root(&primary), root(&copy)],
+                Vec::new(),
+                TrustAnchorError::DuplicateRoot,
+            ),
+            (
+                vec![RootSpec::new(&primary, FAR_FUTURE, 1)],
+                Vec::new(),
+                TrustAnchorError::EmptyWindow,
+            ),
+            (
+                vec![RootSpec::new(&primary, 5, 5)],
+                Vec::new(),
+                TrustAnchorError::EmptyWindow,
+            ),
+            (
+                vec![root(&primary), root(&ci)],
+                vec![key_id().as_str().to_owned(); MAX_REVOKED_KEYS + 1],
+                TrustAnchorError::TooLarge,
+            ),
+        ];
+        for (roots, revoked, expected) in refusals {
+            let result = anchor_to(&roots, &revoked, &out);
+            assert!(
+                matches!(&result, Err(XtaskError::Anchor(AnchorFileError::Anchor(found))) if *found == expected),
+                "expected {expected:?}, got {result:?}"
+            );
+            assert!(!out.exists(), "{expected:?} left a file behind");
+        }
+
+        let nine: Vec<RootSpec> = (0..=MAX_TRUST_ROOTS)
+            .map(|index| {
+                let seed = u8::try_from(index).expect("small index") + 100;
+                let file = dir.join(format!("extra-{index}.key"));
+                fs::write(
+                    &file,
+                    hex(&SigningKey::from_bytes(&[seed; 32])
+                        .verifying_key()
+                        .to_bytes()),
+                )
+                .expect("write");
+                root(&file)
+            })
+            .collect();
+        assert_eq!(nine.len(), MAX_TRUST_ROOTS + 1);
+        assert!(matches!(
+            anchor_to(&nine, &[], &out),
+            Err(XtaskError::Anchor(AnchorFileError::Anchor(
+                TrustAnchorError::TooLarge
+            )))
+        ));
+        assert!(!out.exists());
+        anchor_to(&nine[..MAX_TRUST_ROOTS], &[], &out).expect("eight roots are accepted");
+
+        let missing = dir.join("missing.key");
+        let other = dir.join("never-written.json");
+        assert!(anchor_to(&[root(&primary), root(&missing)], &[], &other).is_err());
+        assert!(anchor_to(&[root(&primary)], &["nothex".to_owned()], &other).is_err());
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn the_command_line_takes_repeated_roots_and_refuses_malformed_ones() {
+        let release = release();
+        let dir = release.dir.path();
+        let (_private, primary) = key_files(dir);
+        let (_ci_private, ci) = ci_key_files(dir);
+        let out = dir.join("cli-anchor.json");
+        let out_arg = out.to_string_lossy().into_owned();
+        let run = |parts: &[String]| crate::run(parts.iter().cloned());
+        let anchor_args = |roots: &[String]| -> Vec<String> {
+            let mut args: Vec<String> = ["catalog", "anchor"].map(str::to_owned).into();
+            for root in roots {
+                args.push("--root".to_owned());
+                args.push(root.clone());
+            }
+            args.extend(["--output".to_owned(), out_arg.clone()]);
+            args
+        };
+        let primary_root = format!("{}:1:{FAR_FUTURE}", primary.to_string_lossy());
+        let ci_root = format!("{}:{}:{}", ci.to_string_lossy(), CI_WINDOW.0, CI_WINDOW.1);
+
+        run(&anchor_args(&[primary_root.clone(), ci_root.clone()])).expect("two roots");
+        let forward = fs::read(&out).expect("read");
+        fs::remove_file(&out).expect("remove");
+        run(&anchor_args(&[ci_root.clone(), primary_root.clone()])).expect("reversed");
+        assert_eq!(forward, fs::read(&out).expect("read"));
+        fs::remove_file(&out).expect("remove");
+
+        let malformed = [
+            Vec::new(),
+            vec![primary.to_string_lossy().into_owned()],
+            vec![format!("{}:1", primary.to_string_lossy())],
+            vec![format!("{}:x:2", primary.to_string_lossy())],
+            vec![format!("{}:1:-2", primary.to_string_lossy())],
+            vec![":1:2".to_owned()],
+        ];
+        for roots in malformed {
+            let result = run(&anchor_args(&roots));
+            assert!(matches!(result, Err(XtaskError::Usage(_))), "{roots:?}");
+            assert!(!out.exists(), "{roots:?}");
+        }
+        let old_form = run(&[
+            "catalog",
+            "anchor",
+            "--public-key-file",
+            "k",
+            "--not-before",
+            "1",
+            "--not-after",
+            "2",
+            "--output",
+            &out_arg,
+        ]
+        .map(str::to_owned));
+        assert!(matches!(old_form, Err(XtaskError::Usage(_))));
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn a_root_argument_splits_the_window_off_the_right_so_paths_may_hold_colons() {
+        let spec: RootSpec = "/keys/a:b/public.key:7:9".parse().expect("parse");
+        assert_eq!(spec, RootSpec::new(Path::new("/keys/a:b/public.key"), 7, 9));
     }
 
     #[test]
@@ -901,12 +1206,8 @@ mod tests {
         args(&[
             "catalog",
             "anchor",
-            "--public-key-file",
-            &public.to_string_lossy(),
-            "--not-before",
-            "1",
-            "--not-after",
-            "4102444800",
+            "--root",
+            &format!("{}:1:4102444800", public.to_string_lossy()),
             "--output",
             &path("anchor.json"),
         ])

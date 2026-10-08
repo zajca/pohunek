@@ -1,5 +1,16 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-08, catalog anchor writes several roots)
+
+- `cargo xtask catalog anchor` takes a repeatable `--root
+  <public-key-file>:<not-before>:<not-after>` instead of the single-key
+  `--public-key-file/--not-before/--not-after` flags, so one anchor lists the
+  offline primary root and the CI secondary root (owner decision on #150), each
+  with its own window, plus the revoked key ids. Root count, repeated keys and
+  empty windows are refused by the anchor validation with no file written; the
+  output is sorted by key id. The runtime catalog concept page states the form
+  and the custody roles (#650).
+
 ## Unreleased (2026-10-07, stop and remove need no runtime definition)
 
 - `session.stop` and `session.remove` no longer require the session's agent

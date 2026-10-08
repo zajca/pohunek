@@ -132,6 +132,26 @@ file, and no key is compiled in. The file holds public keys only:
 }
 ```
 
+A release lists two roots with distinct custody: an offline primary root held
+by the owner, valid for the long term, and a CI secondary root that signs
+catalogs from the release pipeline, valid for a shorter window and revocable
+through `revoked_key_ids` without touching the primary. A catalog verifies when
+either listed root signed it inside that root's window; revoking the CI key id
+refuses the catalogs it signed while the primary root keeps verifying:
+
+```json
+{
+  "schema_version": 1,
+  "roots": [
+    { "key_id": "<64 hex, CI>", "public_key": "<64 hex>", "not_before": 1790000000, "not_after": 1810000000 },
+    { "key_id": "<64 hex, primary>", "public_key": "<64 hex>", "not_before": 1, "not_after": 4102444800 }
+  ],
+  "revoked_key_ids": []
+}
+```
+
+(roots appear in ascending `key_id` order; the example values are illustrative.)
+
 Every object rejects unknown fields; the strict JSON subset of the catalog
 applies and the file is at most 16 KiB. `key_id` is a cross-check: it must equal
 the SHA-256 of `public_key`, otherwise the whole anchor is refused. Up to 8
@@ -189,9 +209,17 @@ log or an output:
 - `catalog verify --catalog <file> --anchor <file> [--high-water N]` checks a
   catalog against an anchor file exactly as the daemon does and lists its
   entries.
-- `catalog anchor --public-key-file <file> --not-before N --not-after N
+- `catalog anchor --root <public-key-file>:<not-before>:<not-after>...
   [--revoked-key-id <hex>]... --output <file>` writes the anchor file for one
-  public key.
+  or more roots. Each `--root` keeps one root's three values together: the file
+  holding its 64-hex public key, the first Unix second it may sign
+  (inclusive) and the Unix second from which it may no longer sign
+  (exclusive). The window is mandatory; there is no default. The window values
+  are split off from the right, so the path may contain colons. The root count
+  (1 to 8), repeated keys, empty windows and the revoked-id limit are judged by
+  the same anchor validation the daemon applies, and a refused anchor writes no
+  file. The roots are written in ascending key id order, so the argument order
+  does not change the bytes.
 - `catalog public-key --key-file <file>` prints the key id and public key.
 
 A catalog has no per-entry expiry: `expires_at` covers the whole document, and a
