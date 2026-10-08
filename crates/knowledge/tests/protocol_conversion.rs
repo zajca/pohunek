@@ -32,3 +32,61 @@ fn validated_bundle_metadata_reaches_protocol_shape() {
         })
     );
 }
+
+#[test]
+fn every_validated_concept_type_reaches_its_protocol_variant() {
+    let directory = pohunek_test_support::tempdir_with_prefix("knowledge-protocol-types-")
+        .expect("private bundle root");
+    let names = [
+        "Concept",
+        "Guide",
+        "Runbook",
+        "Troubleshooting",
+        "SafetyPolicy",
+        "CliCommand",
+        "ConfigReference",
+        "ProtocolMethod",
+        "ProtocolEvent",
+        "SetupAsset",
+        "PromptTemplate",
+        "SourceMap",
+        "SnapshotTemplate",
+        "ReleaseNote",
+    ];
+    for name in names {
+        std::fs::write(
+            directory.path().join(format!("{name}.md")),
+            format!(
+                "---\ntype: {name}\nid: kind/{name}\ntitle: {name}\ndescription: Type contract fixture.\nsource_kind: manual\nsince: 0.3.3\n---\n\n# {name}\n"
+            ),
+        )
+        .expect("write concept fixture");
+    }
+
+    let report = validate_bundle(directory.path()).expect("all concept types validate");
+    assert_eq!(report.concepts.len(), names.len());
+    for concept in report.concepts {
+        let expected = concept.id.trim_start_matches("kind/").to_owned();
+        let converted: protocol::ConceptMeta = ConceptMeta::from(concept).into();
+        assert_eq!(protocol_type_name(converted.r#type), expected);
+    }
+}
+
+fn protocol_type_name(value: ConceptType) -> &'static str {
+    match value {
+        ConceptType::Concept => "Concept",
+        ConceptType::Guide => "Guide",
+        ConceptType::Runbook => "Runbook",
+        ConceptType::Troubleshooting => "Troubleshooting",
+        ConceptType::SafetyPolicy => "SafetyPolicy",
+        ConceptType::CliCommand => "CliCommand",
+        ConceptType::ConfigReference => "ConfigReference",
+        ConceptType::ProtocolMethod => "ProtocolMethod",
+        ConceptType::ProtocolEvent => "ProtocolEvent",
+        ConceptType::SetupAsset => "SetupAsset",
+        ConceptType::PromptTemplate => "PromptTemplate",
+        ConceptType::SourceMap => "SourceMap",
+        ConceptType::SnapshotTemplate => "SnapshotTemplate",
+        ConceptType::ReleaseNote => "ReleaseNote",
+    }
+}
