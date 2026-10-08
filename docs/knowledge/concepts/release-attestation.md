@@ -76,6 +76,9 @@ The consumer report is `{"schema": 1, "runtime", "suite_version", "package_diges
 the same file (path or hard link) as the report, package, lock, matrix or any
 executable; such an output is refused before anything is written.
 
+The pinned upstream runtime a consumer run executes against is installed and
+verified by [upstream staging](upstream-staging.md).
+
 A refusal is a typed error naming the field (for example
 `executables.pohunekd` or `upstream_lock_digest`); it never echoes file content.
 

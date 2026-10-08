@@ -207,18 +207,18 @@ const RULES: &[Rule] = &[
     ),
     rule(
         Pattern::Dir("compat/codex"),
-        Effect::Packages(&["pohunek-daemon", "pohunek-cli"]),
-        "Codex subagent hook contract embedded by the daemon; compatibility lock and captured screens read by pohunek-cli's codex_package test",
+        Effect::Packages(&["pohunek-daemon", "pohunek-cli", "xtask"]),
+        "Codex subagent hook contract embedded by the daemon; compatibility lock and captured screens read by pohunek-cli's codex_package test; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
         Pattern::Dir("compat/claude"),
-        Effect::Packages(&["pohunek-cli"]),
-        "Claude Code compatibility lock and captured screens read by pohunek-cli's claude_package test",
+        Effect::Packages(&["pohunek-cli", "xtask"]),
+        "Claude Code compatibility lock and captured screens read by pohunek-cli's claude_package test; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
         Pattern::Dir("compat/pi"),
-        Effect::Packages(&["pohunek-cli"]),
-        "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests",
+        Effect::Packages(&["pohunek-cli", "xtask"]),
+        "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests; lock and npm project read by xtask's upstream staging scenarios",
     ),
     rule(
         Pattern::Dir("runtime-packages"),
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn embedded_paths_map_to_their_embedding_packages() {
-        let cases: [(&str, &[&str]); 14] = [
+        let cases: [(&str, &[&str]); 15] = [
             (
                 "docs/knowledge/guides/agent-skill.md",
                 &["pohunek-knowledge", "xtask"],
@@ -1003,14 +1003,18 @@ mod tests {
             ),
             (
                 "compat/codex/subagent-hooks.json",
-                &["pohunek-daemon", "pohunek-cli"],
+                &["pohunek-daemon", "pohunek-cli", "xtask"],
             ),
             (
                 "compat/codex/screens/idle.txt",
-                &["pohunek-daemon", "pohunek-cli"],
+                &["pohunek-daemon", "pohunek-cli", "xtask"],
             ),
-            ("compat/pi/screens/widths/idle_w20.txt", &["pohunek-cli"]),
-            ("compat/claude/screens/idle.txt", &["pohunek-cli"]),
+            (
+                "compat/pi/screens/widths/idle_w20.txt",
+                &["pohunek-cli", "xtask"],
+            ),
+            ("compat/pi/npm/package-lock.json", &["pohunek-cli", "xtask"]),
+            ("compat/claude/screens/idle.txt", &["pohunek-cli", "xtask"]),
             ("runtime-packages/codex/detect.toml", &["pohunek-cli"]),
             ("runtime-packages/claude/runtime.toml", &["pohunek-cli"]),
             ("runtime-packages/README.md", &["pohunek-cli"]),

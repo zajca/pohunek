@@ -6,7 +6,10 @@
     "name": "Claude Code",
     "npm": "@anthropic-ai/claude-code",
     "release": "2.1.289",
+    "integrity": "sha512-RQWjAlalf9aomgI3JaXDCdFPvmNVnRdjwMtYk5L+Lw1NWxCxbhY5T9F+w1xukqvJh/I2rR2+3hICZxhk0al1nA==",
+    "scripts": true,
     "binary": "claude",
+    "version_output": "{release} (Claude Code)",
     "sha256": {
       "linux-x64": "a186b99e4a9c88366cd49df2f7dad56c61fc306ef0140b19ee64b7c42a8d1348"
     }

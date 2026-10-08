@@ -1,0 +1,9 @@
+{
+  "name": "pohunek-upstream-codex",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned npm install set of the locked codex release; staged by `cargo xtask compat stage-upstream`.",
+  "dependencies": {
+    "@openai/codex": "0.160.0"
+  }
+}

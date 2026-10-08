@@ -275,6 +275,9 @@ pub(crate) enum CompatAction {
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
     },
+    /// Stage and verify pinned upstream runtime releases.
+    #[command(flatten)]
+    Upstream(crate::upstream_stage::UpstreamAction),
 }
 
 /// Runs one `compat` action; `default_root` is this checkout's root.
@@ -306,6 +309,7 @@ pub(crate) fn run(action: CompatAction, default_root: &Path) -> Result<(), Xtask
             let rows = matrix_check(&root)?;
             println!("compat matrix-check ok: {rows} rows");
         }
+        CompatAction::Upstream(action) => crate::upstream_stage::run(action, default_root)?,
     }
     Ok(())
 }

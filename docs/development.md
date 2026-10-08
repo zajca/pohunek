@@ -273,6 +273,8 @@ and `cargo xtask compat matrix-check` keeps `compat/matrix.json` equal to the
 `suite_version` when the consumer suite's semantics change). See the knowledge
 page `concepts/release-attestation.md`.
 
+`cargo xtask compat stage-upstream --runtime <rt> --out <dir>` installs the upstream release a runtime's lock pins (network needed) from the committed `compat/<rt>/npm/package-lock.json` with `npm ci` and writes `STAGE.sha256` and `STAGE.links`; `cargo xtask compat verify-stage --runtime <rt> --dir <dir>` re-checks the tree offline. A lock edit changes attestation digests. See the knowledge page `concepts/upstream-staging.md`.
+
 `cargo xtask release assemble` turns the producer artifacts into the release bundle: it requires exactly the inventory that `packaging/release-policy.json` and `compat/matrix.json` imply, recomputes every checksum, binary-set digest and attestation from bytes, signs the catalog, rebuilds the daemon archives with the catalog and packages and writes `release-inventory.sha256`; `cargo xtask release verify-inventory --dir <bundle>` re-checks a bundle. See the knowledge page `concepts/release-bundle.md`.
 
 After a published stable release, `.github/workflows/notify-tap.yml` (a `workflow_run` of `Release`, the only workflow with a secret, `TAP_DISPATCH_PAT`) sends the Homebrew tap `zajca/homebrew-pohunek` a `pohunek-work-release` repository dispatch for the `pohunek` formula and the tag, and the tap bumps it; pre-releases are skipped. `scripts/tests/test_notify_tap_workflow.py` pins it.
