@@ -1,5 +1,12 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-08, digest-bound release evidence, #150)
+
+- Runtime catalog schema 2: a signed `release` block (version, commit, binary
+  sets per target) and, per entry, `runtime_api` and per-platform attestation
+  digests; the signing domain separator is v2, schema 1 documents are refused.
+  The daemon does not enforce the new fields yet.
+
 ## Unreleased (2026-10-08, production catalog trust anchor is checked in)
 
 - Decision: the release trust anchor `runtime-catalog-anchor.json` has two

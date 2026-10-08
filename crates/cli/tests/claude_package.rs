@@ -52,7 +52,8 @@ mod plugin_harness;
 mod process_guard;
 
 use catalog_fixture::{
-    catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, WINDOW_END, WINDOW_START,
+    attestations_for, catalog_of, host_platform, root_of, signed, test_key, ANY_CORE, RUNTIME_API,
+    WINDOW_END, WINDOW_START,
 };
 use messages_stub::MessagesStub;
 use plugin_harness::{path_str, Harness};
@@ -1567,7 +1568,9 @@ async fn install_package(harness: &Harness, key: &ed25519_dalek::SigningKey) -> 
         runtime_id: RuntimeId::parse("claude").expect("runtime id"),
         version: PackageVersion::parse(PACKAGE_VERSION).expect("package version"),
         digest: digest.clone(),
+        runtime_api: RUNTIME_API,
         platforms: vec![host_platform()],
+        attestations: attestations_for(&[host_platform()]),
         core: ANY_CORE.to_owned(),
     };
     let catalog = harness.env.root().join("runtime-catalog.json");

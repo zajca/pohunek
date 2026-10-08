@@ -54,7 +54,7 @@ pub fn catalog_document_bytes(envelope: &CatalogEnvelope) -> Result<Vec<u8>, Cat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{verify_catalog, AnchorFile, RootKey};
+    use crate::{verify_catalog, AnchorFile, BinarySet, Release, RootKey, Sha256Digest};
 
     const WINDOW_START: u64 = 1;
     const WINDOW_END: u64 = 4_102_444_800;
@@ -78,6 +78,15 @@ mod tests {
             schema_version: CATALOG_SCHEMA_VERSION,
             sequence: 3,
             expires_at: WINDOW_END,
+            release: Release {
+                version: "1.2.3".to_owned(),
+                commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                binary_sets: vec![BinarySet {
+                    target: "x86_64-unknown-linux-gnu".to_owned(),
+                    digest: Sha256Digest::parse(&format!("sha256:{}", "a".repeat(64)))
+                        .expect("digest"),
+                }],
+            },
             revoked_key_ids: Vec::new(),
             revoked_digests: Vec::new(),
             entries: Vec::new(),

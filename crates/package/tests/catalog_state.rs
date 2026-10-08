@@ -16,8 +16,9 @@ use common::{mode_of, PluginFixture};
 use ed25519_dalek::{Signer as _, SigningKey};
 use package::registry::RegistryError;
 use package::{
-    catalog_signing_message, verify_catalog, Catalog, CatalogEnvelope, CatalogSignature, KeyId,
-    RootKey, TrustAnchor, VerifiedCatalog, CATALOG_SCHEMA_VERSION, MAX_REVOKED_KEYS,
+    catalog_signing_message, verify_catalog, BinarySet, Catalog, CatalogEnvelope, CatalogSignature,
+    KeyId, Release, RootKey, Sha256Digest, TrustAnchor, VerifiedCatalog, CATALOG_SCHEMA_VERSION,
+    MAX_REVOKED_KEYS,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -49,6 +50,14 @@ fn verified(sequence: u64, revoked: &[&str]) -> VerifiedCatalog {
         schema_version: CATALOG_SCHEMA_VERSION,
         sequence,
         expires_at: EXPIRES_AT,
+        release: Release {
+            version: "1.0.0".to_owned(),
+            commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+            binary_sets: vec![BinarySet {
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                digest: Sha256Digest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
+            }],
+        },
         revoked_key_ids: revoked.iter().map(|label| key_id(label)).collect(),
         revoked_digests: Vec::new(),
         entries: Vec::new(),

@@ -11,8 +11,8 @@ use std::fmt::Write as _;
 use ed25519_dalek::{Signer as _, SigningKey};
 use package::registry::Registry;
 use package::{
-    catalog_signing_message, Catalog, CatalogEntry, CatalogEnvelope, CatalogSignature, KeyId,
-    Limits, RootKey, CATALOG_SCHEMA_VERSION,
+    catalog_signing_message, Attestation, BinarySet, Catalog, CatalogEntry, CatalogEnvelope,
+    CatalogSignature, KeyId, Limits, Release, RootKey, Sha256Digest, CATALOG_SCHEMA_VERSION,
 };
 use protocol::{
     PackageErrorKind, PackageId, PackageInstallParams, PackageOrigin, PackageTrust, PackageVersion,
@@ -34,6 +34,22 @@ const WINDOW_END: u64 = 4_102_444_800;
 
 /// A core range every released version satisfies.
 const ANY_CORE: &str = ">=0.0.0";
+
+/// Core version of every fixture catalog's release block.
+///
+/// Far above any real core version so that an entry range such as
+/// `>=999.0.0` admits the release while the daemon still judges it
+/// incompatible with its own version.
+const RELEASE_VERSION: &str = "999.0.0";
+
+/// Source commit of every fixture catalog's release block.
+const RELEASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// Digit repeated to form fixture attestation digests.
+const FIXTURE_ATTESTATION_BYTE: char = '7';
+
+/// Digit repeated to form fixture binary set digests.
+const FIXTURE_BINARY_SET_BYTE: char = '9';
 
 pub(super) fn signing_key(label: &str) -> SigningKey {
     let seed: [u8; 32] = Sha256::digest(label.as_bytes()).into();
@@ -72,8 +88,45 @@ pub(super) fn entry(
         runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
         version: PackageVersion::parse(version).expect("version"),
         digest: package.digest.clone(),
+        runtime_api: 1,
         platforms: vec![host_platform().expect("a supported platform")],
+        attestations: vec![attestation(&host_platform().expect("a supported platform"))],
         core: ANY_CORE.to_owned(),
+    }
+}
+
+/// An attestation record for `platform`.
+fn attestation(platform: &str) -> Attestation {
+    Attestation {
+        platform: platform.to_owned(),
+        digest: digest_of(FIXTURE_ATTESTATION_BYTE),
+    }
+}
+
+fn digest_of(byte: char) -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", byte.to_string().repeat(64))).expect("fixture digest")
+}
+
+/// The release block of a fixture catalog: a binary set for the host platform
+/// and for every platform an entry lists.
+fn release_for(entries: &[CatalogEntry]) -> Release {
+    let mut targets: Vec<String> = entries
+        .iter()
+        .flat_map(|entry| entry.platforms.iter().cloned())
+        .chain(host_platform().ok())
+        .collect();
+    targets.sort();
+    targets.dedup();
+    Release {
+        version: RELEASE_VERSION.to_owned(),
+        commit: RELEASE_COMMIT.to_owned(),
+        binary_sets: targets
+            .into_iter()
+            .map(|target| BinarySet {
+                target,
+                digest: digest_of(FIXTURE_BINARY_SET_BYTE),
+            })
+            .collect(),
     }
 }
 
@@ -82,6 +135,7 @@ pub(super) fn catalog(sequence: u64, entries: Vec<CatalogEntry>) -> Catalog {
         schema_version: CATALOG_SCHEMA_VERSION,
         sequence,
         expires_at: WINDOW_END,
+        release: release_for(&entries),
         revoked_key_ids: Vec::new(),
         revoked_digests: Vec::new(),
         entries,
@@ -400,6 +454,7 @@ async fn an_entry_for_another_core_or_platform_is_incompatible() {
     wrong_core.core = ">=999.0.0".to_owned();
     let mut wrong_platform = entry(&package, PACKAGE, RUNTIME, "1.0.0");
     wrong_platform.platforms = vec!["plan9-mips".to_owned()];
+    wrong_platform.attestations = vec![attestation("plan9-mips")];
 
     for (name, entry) in [("core", wrong_core), ("platform", wrong_platform)] {
         let document = signed_by(&key, catalog(5, vec![entry]));

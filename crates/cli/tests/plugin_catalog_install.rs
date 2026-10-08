@@ -34,8 +34,8 @@ use tokio::net::UnixStream;
 mod catalog_fixture;
 
 use catalog_fixture::{
-    anchor_for, anchor_with, catalog_of, host_platform, key_id, signed, test_key, ANY_CORE,
-    WINDOW_END, WINDOW_START,
+    anchor_for, anchor_with, attestations_for, catalog_of, host_platform, key_id, signed, test_key,
+    ANY_CORE, RUNTIME_API, WINDOW_END, WINDOW_START,
 };
 
 /// Package id of the fixture archive; it serves a non-reserved runtime id.
@@ -108,7 +108,9 @@ fn entry_for(built: &Built, version: &str, platform: &str, core: &str) -> Catalo
         runtime_id: RuntimeId::parse(RUNTIME).expect("runtime id"),
         version: PackageVersion::parse(version).expect("version"),
         digest: built.digest.clone(),
+        runtime_api: RUNTIME_API,
         platforms: vec![platform.to_owned()],
+        attestations: attestations_for(&[platform.to_owned()]),
         core: core.to_owned(),
     }
 }
