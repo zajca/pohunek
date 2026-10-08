@@ -43,8 +43,12 @@ their XDG or home-relative durable locations. Runtime cleanup must never remove
 those durable records.
 
 `pohunek service install [--from DIR] [--prefix DIR]` installs the daemon as a
-native login service. It copies `pohunek`, `pohunekd`, and `pohunek-sessiond`
-into `<prefix>/libexec/pohunek/<version>/` (prefix default `$HOME/.local`),
+native login service. It copies `pohunek`, `pohunekd`, and `pohunek-sessiond`,
+plus the build's `runtime-catalog-anchor.json` when it ships one (an invalid
+anchor is refused with `service_staged_anchor_invalid`; re-installing an
+existing version with a different or missing anchor fails with
+`service_version_conflict`), into `<prefix>/libexec/pohunek/<version>/` (prefix
+default `$HOME/.local`),
 installs `<prefix>/bin/pohunek`, writes `<config>/pohunek/service.toml`, and
 registers one daemon job: the systemd user unit
 `pohunek-<ns>-daemon.service` plus the slice `pohunek-<ns>-sessions.slice` on

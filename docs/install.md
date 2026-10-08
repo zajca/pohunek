@@ -79,7 +79,10 @@ For the daemon component, run the included `packaging/install-daemon.sh`. It
 calls `pohunek service install` (or `pohunek service upgrade` when a service is
 already installed and no interrupted install is pending), which:
 
-- copies `pohunek`, `pohunekd`, and `pohunek-sessiond` into
+- copies `pohunek`, `pohunekd`, `pohunek-sessiond`, and the archive's
+  `runtime-catalog-anchor.json` (mode `0644`; a build without one installs
+  without it, and an anchor that is not valid is refused with
+  `service_staged_anchor_invalid`) into
   `<prefix>/libexec/pohunek/<version>/` and installs `<prefix>/bin/pohunek`; a
   fresh install uses `POHUNEK_INSTALL_PREFIX` (default `~/.local`), an upgrade
   keeps the prefix recorded in `service.toml` and refuses a different

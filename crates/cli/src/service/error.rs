@@ -1,6 +1,6 @@
 //! Typed failures of `pohunek service`.
 
-// Rust guideline compliant 2026-09-30
+// Rust guideline compliant 2026-10-08
 
 use std::fmt::Write as _;
 use std::io;
@@ -173,6 +173,15 @@ pub enum Error {
     StagedBinary {
         /// The expected staged binary.
         path: PathBuf,
+    },
+
+    /// The staged catalog trust anchor is present but cannot be installed.
+    #[error("staged catalog trust anchor {} is unusable: {detail}", path.display())]
+    StagedAnchor {
+        /// The staged anchor file.
+        path: PathBuf,
+        /// Why it was refused; never file content.
+        detail: String,
     },
 
     /// A staged binary's `--version` could not be established.
@@ -501,6 +510,7 @@ impl Error {
             Self::UntrustedDirectory { .. } => "service_untrusted_directory",
             Self::Filesystem { .. } | Self::Io { .. } => "service_io_failed",
             Self::StagedBinary { .. } => "service_staged_binary_missing",
+            Self::StagedAnchor { .. } => "service_staged_anchor_invalid",
             Self::VersionProbe { .. } => "service_version_probe_failed",
             Self::VersionMismatch { .. } => "service_version_mismatch",
             Self::VersionConflict { .. } => "service_version_conflict",
@@ -596,6 +606,9 @@ impl Error {
             ),
             Self::VersionMismatch { .. } | Self::StagedBinary { .. } => Some(
                 "pass --from with a directory holding pohunek, pohunekd, and pohunek-sessiond of one build",
+            ),
+            Self::StagedAnchor { .. } => Some(
+                "restore runtime-catalog-anchor.json of the build being installed, or remove it to install a development build without a catalog trust anchor",
             ),
             Self::DaemonNotReady { .. } => {
                 Some("inspect the daemon logs, then rerun the command to resume or roll back")

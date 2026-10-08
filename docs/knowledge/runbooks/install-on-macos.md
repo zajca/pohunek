@@ -74,7 +74,8 @@ world-writable directory) and run its installer:
 
 The installer installs into `~/.local` (`POHUNEK_INSTALL_PREFIX` selects another
 absolute prefix): `<prefix>/libexec/pohunek/<version>/` holds `pohunek`,
-`pohunekd`, and `pohunek-sessiond`; `<prefix>/bin/pohunek` is the CLI. It writes
+`pohunekd`, `pohunek-sessiond`, and the release's `runtime-catalog-anchor.json`
+(mode `0644`); `<prefix>/bin/pohunek` is the CLI. It writes
 `~/.config/pohunek/service.toml` (mode `0600`), registers the launchd login agent
 `~/Library/LaunchAgents/io.github.zajca.pohunek.<ns>.daemon.plist`, and waits
 until the daemon answers on its socket. Put `<prefix>/bin` on `PATH`. Concurrent

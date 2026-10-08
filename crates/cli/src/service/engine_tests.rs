@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use package::ANCHOR_FILE_NAME;
 use pohunek_client::ClientError;
+use pohunek_daemon::catalog_anchor::{load_from_directory, CatalogTrust};
 use pohunek_daemon::session::upgrade_preflight::PreflightInputs;
 use pohunek_daemon::store::{DesiredState, RuntimeRecord, SessionRecord, Store as DaemonStore};
 use pohunek_paths::BasePaths;
@@ -32,7 +34,7 @@ use crate::service::backend::{Call, Control, Health};
 use crate::service::context::tests::{context, temp_root};
 use crate::service::definition::initial_config;
 use crate::service::inherited::Token;
-use crate::service::layout::tests::stage_dir;
+use crate::service::layout::tests::{anchor_bytes, stage_dir, write_anchor};
 use crate::service::layout::CLI_NAME;
 use crate::service::preflight::Judging;
 use crate::service::usage::tests::{
@@ -2886,6 +2888,54 @@ async fn an_install_that_fails_or_rolls_back_gives_the_prefix_up() {
         .await
         .expect("install into the free prefix");
     second.assert_installed(V1);
+}
+
+/// The anchor lives and dies with its version directory: the installed
+/// version's daemon loads it, garbage collection after an upgrade removes the
+/// old directory with its anchor, and uninstall removes the rest.
+#[tokio::test]
+async fn install_upgrade_and_uninstall_carry_the_anchor_with_the_version_directory() {
+    let harness = Harness::new();
+    let (first, second) = (anchor_bytes(1), anchor_bytes(2));
+    write_anchor(&harness.staged(V1), &first);
+    write_anchor(&harness.staged(V2), &second);
+
+    harness.install(V1).await.expect("install");
+    let installed = harness.layout().version_dir(V1).expect("version dir");
+    let trust = load_from_directory(&installed);
+    assert!(matches!(trust, CatalogTrust::Loaded(_)), "{trust:?}");
+    assert_eq!(
+        std::fs::read(installed.join(ANCHOR_FILE_NAME)).expect("anchor"),
+        first
+    );
+
+    harness.upgrade(V2).await.expect("upgrade");
+    harness.assert_installed(V2);
+    let upgraded = harness.layout().version_dir(V2).expect("version dir");
+    let trust = load_from_directory(&upgraded);
+    assert!(matches!(trust, CatalogTrust::Loaded(_)), "{trust:?}");
+    assert_eq!(
+        std::fs::read(upgraded.join(ANCHOR_FILE_NAME)).expect("anchor"),
+        second
+    );
+    assert!(!installed.exists(), "garbage collection removed {V1}");
+
+    harness
+        .engine()
+        .uninstall(UninstallOptions::default())
+        .await
+        .expect("uninstall");
+    harness.assert_clean();
+}
+
+#[tokio::test]
+async fn a_corrupt_staged_anchor_fails_the_install_and_gives_the_prefix_up() {
+    let harness = Harness::new();
+    write_anchor(&harness.staged(V1), b"not an anchor");
+    let error = harness.install(V1).await.expect_err("corrupt anchor");
+    assert!(matches!(error, Error::StagedAnchor { .. }), "{error:?}");
+    assert!(!layout::owner_record(&harness.layout()).exists());
+    harness.assert_clean();
 }
 
 /// The prefix is verified before the uninstall touches anything, so an

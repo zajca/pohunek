@@ -17,6 +17,10 @@
 - Daemon release archives carry the anchor at the archive root beside `pohunekd`;
   CLI and relay archives carry none, and staging a daemon archive without the
   checked-in anchor is refused.
+- The installer copies the anchor into the version directory beside the daemon, so
+  the `catalog_trust_anchor` check is `ok` after a release install; an invalid
+  staged anchor fails the install before anything is published, and a different
+  anchor on republish is a version conflict.
 
 ## Unreleased (2026-10-08, catalog anchor writes several roots)
 

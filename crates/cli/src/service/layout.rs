@@ -1,15 +1,18 @@
 //! Version directories, the installed CLI copy, and their removal.
 //!
 //! A version directory `<prefix>/libexec/pohunek/<version>/` holds
-//! `pohunekd`, `pohunek-sessiond`, and a copy of `pohunek`. It is assembled
-//! in a private staging directory next to it, each binary's `--version` is
-//! probed there, and only then is it renamed into place without replacement.
-//! An existing version directory is never overwritten; identical contents
-//! make publishing idempotent. An existing directory is reused only when it is
-//! exactly what publishing creates: owned by this user, mode `0755`, reached
-//! without a symbolic link, and holding single-link `0755` regular files. The
-//! service manager executes those files later, so anything another account
-//! could replace between this check and that execution is refused.
+//! `pohunekd`, `pohunek-sessiond`, a copy of `pohunek`, and, when the staged
+//! build ships one, the catalog trust anchor the daemon reads beside its own
+//! executable. It is assembled in a private staging directory next to it,
+//! each binary's `--version` is probed there, and only then is it renamed into
+//! place without replacement. An existing version directory is never
+//! overwritten; identical contents make publishing idempotent. An existing
+//! directory is reused only when it is exactly what publishing creates: owned
+//! by this user, mode `0755`, reached without a symbolic link, and holding
+//! single-link regular files, `0755` for the binaries and `0644` for the
+//! anchor. The service manager executes those binaries later, so anything
+//! another account could replace between this check and that execution is
+//! refused.
 //!
 //! # Prefix ownership
 //!
@@ -22,17 +25,18 @@
 //! anything, every destructive operation verifies it first, and uninstall
 //! removes it after the prefix is emptied.
 
-// Rust guideline compliant 2026-10-01
+// Rust guideline compliant 2026-10-08
 
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions, Permissions};
-use std::io::{self, Read as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use package::{parse_anchor, ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES};
 use pohunek_paths::{
     valid_install_version, InstallLayout, DAEMON_EXECUTABLE_NAME, WORKER_EXECUTABLE_NAME,
 };
@@ -55,6 +59,12 @@ pub const BINARIES: [&str; 3] = [CLI_NAME, DAEMON_EXECUTABLE_NAME, WORKER_EXECUT
 ///
 /// Binaries are not secret; they only must not be writable by other users.
 const PUBLIC_MODE: u32 = 0o755;
+
+/// Mode of the installed catalog trust anchor.
+///
+/// The daemon refuses an anchor that group or others can write; it is public
+/// data, so it stays readable and carries no execute bit.
+const ANCHOR_MODE: u32 = 0o644;
 
 /// Mode of a staging directory while it is being filled.
 const STAGING_MODE: u32 = 0o700;
@@ -319,6 +329,8 @@ pub async fn stage(layout: &InstallLayout, from: &Path, reported: &str) -> Resul
 }
 
 async fn fill(staging: &TrustedDir, from: &Path, version: &str) -> Result<(), Error> {
+    // A corrupt anchor fails here, before any binary is copied or run.
+    copy_anchor(from, staging.path())?;
     for binary in BINARIES {
         copy_binary(&from.join(binary), &staging.path().join(binary))?;
     }
@@ -628,6 +640,75 @@ fn copy_binary(source: &Path, destination: &Path) -> Result<(), Error> {
         .map_err(io_error("synchronize", destination))
 }
 
+/// Copies the catalog trust anchor of the staged build into a new `0644` file.
+///
+/// A build without an anchor file (a development build) installs without one
+/// and the daemon then runs in its absent-anchor state. An anchor that is
+/// present but not a regular file, larger than [`MAX_ANCHOR_BYTES`], or not a
+/// valid anchor is refused: installing it would hand the daemon an unusable
+/// trust state. The bytes are copied unchanged after they parse.
+fn copy_anchor(from: &Path, staging: &Path) -> Result<(), Error> {
+    let source = from.join(ANCHOR_FILE_NAME);
+    let invalid = |detail: String| Error::StagedAnchor {
+        path: source.clone(),
+        detail,
+    };
+    let input = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&source)
+    {
+        Ok(input) => input,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // A dangling link is a present but unusable anchor, not an absent one.
+            return match std::fs::symlink_metadata(&source) {
+                Err(inspect) if inspect.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(inspect) => Err(io_error("inspect", &source)(inspect)),
+                Ok(_) => Err(invalid("it is a dangling link".to_owned())),
+            };
+        }
+        Err(error) => return Err(io_error("open", &source)(error)),
+    };
+    if !input
+        .metadata()
+        .map_err(io_error("inspect", &source))?
+        .is_file()
+    {
+        return Err(invalid("it is not a regular file".to_owned()));
+    }
+    let limit = u64::try_from(MAX_ANCHOR_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    input
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(io_error("read", &source))?;
+    if bytes.len() > MAX_ANCHOR_BYTES {
+        return Err(invalid(format!("it exceeds {MAX_ANCHOR_BYTES} bytes")));
+    }
+    parse_anchor(&bytes).map_err(|error| invalid(error.to_string()))?;
+
+    let destination = staging.join(ANCHOR_FILE_NAME);
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(ANCHOR_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&destination)
+        .map_err(io_error("create", &destination))?;
+    output
+        .write_all(&bytes)
+        .map_err(io_error("write", &destination))?;
+    // The creation mode is filtered by the umask; set it explicitly.
+    output
+        .set_permissions(Permissions::from_mode(ANCHOR_MODE))
+        .map_err(io_error("set the mode of", &destination))?;
+    output
+        .sync_all()
+        .map_err(io_error("synchronize", &destination))
+}
+
 /// Whether `error` is an `exec` of a file that is open for writing.
 pub(crate) fn is_exec_busy(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::ExecutableFileBusy
@@ -724,8 +805,10 @@ fn regular_file(path: &Path) -> Result<bool, Error> {
 /// Compares the staging directory `staged` with the version directory
 /// `version`, both below `versions`, through verified descriptors.
 ///
-/// A missing binary makes them differ; an untrusted directory or binary on
-/// either side fails instead.
+/// A missing binary makes them differ; so does an anchor present on one side
+/// only or with other bytes, because the anchor decides what the daemon of
+/// that version trusts and a version directory is immutable. An untrusted
+/// directory, binary or anchor on either side fails instead.
 fn same_binaries(versions: &TrustedDir, staged: &str, version: &str) -> Result<bool, Error> {
     let staged = open_version(versions, staged)?;
     let existing = open_version(versions, version)?;
@@ -741,7 +824,26 @@ fn same_binaries(versions: &TrustedDir, staged: &str, version: &str) -> Result<b
             return Ok(false);
         }
     }
-    Ok(true)
+    match (open_anchor(&staged)?, open_anchor(&existing)?) {
+        (None, None) => Ok(true),
+        (Some(mut left), Some(mut right)) => {
+            let (left_path, right_path) = (
+                staged.path().join(ANCHOR_FILE_NAME),
+                existing.path().join(ANCHOR_FILE_NAME),
+            );
+            same_contents((&mut left, &left_path), (&mut right, &right_path))
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Opens the catalog trust anchor of a verified version directory for
+/// reading, with the same guarantees as [`open_binary`] for mode `0644`. A
+/// missing anchor is `None`.
+fn open_anchor(directory: &TrustedDir) -> Result<Option<File>, Error> {
+    directory
+        .open_file(ANCHOR_FILE_NAME, ANCHOR_MODE)
+        .map_err(|source| version_error(directory.path().join(ANCHOR_FILE_NAME), source))
 }
 
 /// Opens a version or staging directory below `versions` without following
@@ -773,9 +875,9 @@ fn version_error(path: PathBuf, source: FsError) -> Error {
     let detail = match &source {
         FsError::UnsafeType { actual, .. } => format!("it is a {actual}"),
         FsError::UnsafeOwner { actual, .. } => format!("it is owned by uid {actual}"),
-        FsError::UnsafeMode { actual, .. } => {
-            format!("its mode is {actual:#o}, not {PUBLIC_MODE:#o}")
-        }
+        FsError::UnsafeMode {
+            actual, expected, ..
+        } => format!("its mode is {actual:#o}, not {expected:#o}"),
         FsError::UnsafeLinkCount { actual, .. } => format!("it has {actual} hard links"),
         FsError::UnsafeAcl { .. } => "an extended ACL grants other users access".to_owned(),
         FsError::Io { .. }
@@ -841,6 +943,8 @@ pub fn is_scratch(name: &OsStr) -> bool {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use pohunek_daemon::catalog_anchor::{load_from_directory, CatalogTrust};
+
     use super::*;
     use crate::service::context::tests::temp_root;
 
@@ -853,6 +957,26 @@ pub(crate) mod tests {
             format!("#!/bin/sh\n[ \"$1\" = --version ] && echo '{name} {version}'\n"),
         )
         .expect("write fake binary");
+    }
+
+    /// The bytes of a valid trust anchor with one root derived from `seed`.
+    pub(crate) fn anchor_bytes(seed: u8) -> Vec<u8> {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let root = package::RootKey::new(key.verifying_key().to_bytes(), 1, ANCHOR_TEST_WINDOW_END)
+            .expect("root");
+        package::AnchorFile::new(vec![root], Vec::new())
+            .expect("anchor")
+            .to_bytes()
+            .expect("anchor bytes")
+    }
+
+    /// Far-future end of the test root's validity window (year 2100).
+    const ANCHOR_TEST_WINDOW_END: u64 = 4_102_444_800;
+
+    /// Writes `bytes` as the staged anchor of `from`.
+    pub(crate) fn write_anchor(from: &Path, bytes: &[u8]) {
+        pohunek_test_support::fs::write_file(from.join(ANCHOR_FILE_NAME), bytes)
+            .expect("write staged anchor");
     }
 
     fn busy() -> io::Error {
@@ -1000,6 +1124,143 @@ pub(crate) mod tests {
             .map(|entry| entry.expect("entry").file_name())
             .collect();
         assert_eq!(leftovers, ["1.0.0"], "staging directories are removed");
+    }
+
+    /// Publishes `1.0.0` from a source holding `anchor`, if any, and returns
+    /// what the daemon's loader makes of the installed version directory.
+    async fn installed_trust(root: &Path, anchor: Option<&[u8]>) -> (PathBuf, CatalogTrust) {
+        let layout = InstallLayout::new(root.join("prefix")).expect("layout");
+        let from = stage_dir(root, "1.0.0");
+        if let Some(bytes) = anchor {
+            write_anchor(&from, bytes);
+        }
+        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
+        let dir = layout.version_dir("1.0.0").expect("version dir");
+        let trust = load_from_directory(&dir);
+        (dir, trust)
+    }
+
+    #[tokio::test]
+    async fn a_staged_anchor_is_installed_where_the_daemon_loads_it() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (_root, root) = temp_root();
+        let bytes = anchor_bytes(1);
+        let (dir, trust) = installed_trust(root.as_path(), Some(&bytes)).await;
+        assert!(matches!(trust, CatalogTrust::Loaded(_)), "{trust:?}");
+        let installed = dir.join(ANCHOR_FILE_NAME);
+        let metadata = std::fs::symlink_metadata(&installed).expect("installed anchor");
+        assert!(metadata.is_file());
+        assert_eq!(metadata.mode() & 0o7777, ANCHOR_MODE);
+        let own = std::fs::metadata(dir.join(CLI_NAME)).expect("installed CLI");
+        assert_eq!(metadata.uid(), own.uid(), "owned by the installing user");
+        assert_eq!(metadata.nlink(), 1);
+        assert_eq!(std::fs::read(&installed).expect("read"), bytes);
+    }
+
+    #[tokio::test]
+    async fn a_build_without_an_anchor_installs_and_the_daemon_sees_none() {
+        let (_root, root) = temp_root();
+        let (dir, trust) = installed_trust(root.as_path(), None).await;
+        assert!(matches!(trust, CatalogTrust::Absent), "{trust:?}");
+        assert!(!dir.join(ANCHOR_FILE_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn an_unusable_staged_anchor_is_refused_and_nothing_is_published() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
+        let oversized = vec![b' '; MAX_ANCHOR_BYTES + 1];
+        let cases: [(&str, &[u8]); 3] = [
+            ("not JSON", b"not an anchor"),
+            ("wrong schema", b"{\"schema_version\": 1}"),
+            ("oversized", &oversized),
+        ];
+        for (label, bytes) in cases {
+            write_anchor(&from, bytes);
+            let error = stage(&layout, &from, "1.0.0").await.expect_err(label);
+            assert!(
+                matches!(error, Error::StagedAnchor { .. }),
+                "{label}: {error:?}"
+            );
+            assert_eq!(error.code(), "service_staged_anchor_invalid");
+            assert!(error.hint().is_some());
+            assert!(
+                !error.to_string().contains("not an anchor"),
+                "the message never carries file content"
+            );
+        }
+
+        let anchor = from.join(ANCHOR_FILE_NAME);
+        std::fs::remove_file(&anchor).expect("remove anchor");
+        std::os::unix::fs::symlink(root.as_path().join("missing"), &anchor).expect("symlink");
+        let error = stage(&layout, &from, "1.0.0").await.expect_err("dangling");
+        assert!(matches!(error, Error::StagedAnchor { .. }), "{error:?}");
+
+        std::fs::remove_file(&anchor).expect("remove link");
+        std::fs::create_dir(&anchor).expect("anchor directory");
+        let error = stage(&layout, &from, "1.0.0").await.expect_err("directory");
+        assert!(matches!(error, Error::StagedAnchor { .. }), "{error:?}");
+
+        assert!(installed_versions(&layout).expect("list").is_empty());
+        let leftovers = std::fs::read_dir(layout.versions_dir()).map_or(0, Iterator::count);
+        assert_eq!(leftovers, 0, "staging directories are removed");
+    }
+
+    #[tokio::test]
+    async fn republishing_is_idempotent_only_for_the_same_anchor() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
+        write_anchor(&from, &anchor_bytes(1));
+        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        assert!(publish(&layout, &staged, "1.0.0").expect("publish"));
+
+        let same = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        verify_existing(&layout, &same, "1.0.0").expect("same anchor is reused");
+        assert!(!publish(&layout, &same, "1.0.0").expect("identical publish"));
+
+        write_anchor(&from, &anchor_bytes(2));
+        let other = stage(&layout, &from, "1.0.0").await.expect("stage other");
+        assert!(matches!(
+            verify_existing(&layout, &other, "1.0.0"),
+            Err(Error::VersionConflict { .. })
+        ));
+        assert!(matches!(
+            publish(&layout, &other, "1.0.0"),
+            Err(Error::VersionConflict { .. })
+        ));
+
+        std::fs::remove_file(from.join(ANCHOR_FILE_NAME)).expect("drop anchor");
+        let missing = stage(&layout, &from, "1.0.0").await.expect("stage bare");
+        assert!(matches!(
+            publish(&layout, &missing, "1.0.0"),
+            Err(Error::VersionConflict { .. })
+        ));
+        assert_eq!(
+            installed_versions(&layout).expect("list"),
+            ["1.0.0"],
+            "the staging directories are removed either way"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_writable_anchor_is_never_reused() {
+        let (_root, root) = temp_root();
+        let layout = InstallLayout::new(root.as_path().join("prefix")).expect("layout");
+        let from = stage_dir(root.as_path(), "1.0.0");
+        write_anchor(&from, &anchor_bytes(1));
+        let staged = stage(&layout, &from, "1.0.0").await.expect("stage");
+        publish(&layout, &staged, "1.0.0").expect("publish");
+        let again = stage(&layout, &from, "1.0.0").await.expect("stage again");
+        let anchor = layout
+            .version_dir("1.0.0")
+            .expect("version dir")
+            .join(ANCHOR_FILE_NAME);
+        std::fs::set_permissions(&anchor, Permissions::from_mode(0o664)).expect("chmod");
+        assert_untrusted(verify_existing(&layout, &again, "1.0.0"), &anchor);
     }
 
     #[tokio::test]
