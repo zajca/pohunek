@@ -80,10 +80,16 @@ multi-team control plane without replacing either owner path.
   `task.wait`, typed results with repository evidence and checks, OpenCode
   2.x as the first provider with structured turn evidence, and
   manager/auditor composition above the daemon (the relay dark factory).
+  Amended 2026-10-08 (design-only): durable client work items, a client
+  acceptance eligibility policy, and host-enforced human input control
+  (`task.input_control`).
 - [Relay dark factory RFC](design/relay-dark-factory-rfc.md) — accepted:
   relay authorization, budgets, audit, task projections and escalation for
   unattended manager/auditor delegation over the team relay; the factory is a
-  client, never relay or daemon logic.
+  client, never relay or daemon logic. Amended 2026-10-08 (design-only):
+  protected audit reserves, the versioned FactorySpec run manifest, and a
+  bounded semantic progress policy; factory tracking and recovery state stay
+  client-owned.
 - [Universal Pohunek Assistant](design/universal-assistant.md) - one ordinary
   session-backed assistant, steered by intent and a live snapshot, for setup,
   project configuration, updates, troubleshooting, and general help.

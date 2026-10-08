@@ -2,6 +2,14 @@
 
 - Status: Accepted for implementation
 - Date: 2026-09-02
+- Factory amendment: the accepted relay dark factory RFC
+  (`docs/design/relay-dark-factory-rfc.md`, epic
+  [#185](https://github.com/zajca/pohunek/issues/185)) amends named contracts
+  of this RFC and adds, dated 2026-10-08, `task.input_control` routing and
+  protected audit-reserve accounting; tracked by
+  [#233](https://github.com/zajca/pohunek/issues/233)/[#235](https://github.com/zajca/pohunek/issues/235)/[#236](https://github.com/zajca/pohunek/issues/236);
+  the authoritative amendment map is its section 3 and this document's
+  section 23.1.
 - Tracking issue: [#80](https://github.com/zajca/pohunek/issues/80)
 - Reconciliation: [#91](https://github.com/zajca/pohunek/issues/91), 2026-09-08, pending merge
 - Umbrella issue: [#56](https://github.com/zajca/pohunek/issues/56)
@@ -539,6 +547,11 @@ session origin, share coordinates, atomic share snapshot, event watermark, and
 host-initiated attach negotiation. This is a coordinated cutover across Rust
 and TypeScript protocol artifacts. There is no relay-path downgrade to v3.
 
+The factory amendment (#185/#233) adds idempotent
+`operation.cancel { request_id }` for routed waits: cancellation releases the
+routed waiter, never cancels task execution, and a late cancellation after the
+response is a no-op (task RFC 8.3).
+
 Local Unix and direct overlay connections retain their existing owner context.
 They do not require OIDC or relay credentials. Connection origin is derived from
 the listener/link that accepted the request and cannot be selected in request
@@ -604,6 +617,15 @@ Each share contains a revisioned, default-deny policy:
 - per-share attach, waiter, subscription, request, bandwidth, and buffer limits;
   and
 - activation, expiry, reversible suspension, and terminal revocation state.
+
+The factory amendment (#185/#233) adds permitted task operation classes,
+`allow_delegated_answers`, `allow_unverified_answers` and permitted check names
+(plain names and `repo:<name>` entries; host definitions win). Both answer
+flags are explicit default-deny policy capabilities, not operation classes.
+The daemon enforces them with the current share's task/terminal operation and
+resource ceilings; input-control takeover/release require both relevant
+operation ceilings. Factory RFC 7.1/7.3 defines the intersections. Audit
+reserve designation grants no broader host operation or answer authority.
 
 The relay carries `HostShareId` on every relay-path request. The daemon resolves
 typed target IDs and intersects the operation with the current local share. It
@@ -699,6 +721,12 @@ and safe owned worker/worktree/native references. Bounded outstanding tickets
 apply backpressure before admission. Only after both conditions may evidence
 compact to safe digest/status; post-expiry lookup may report reconciliation
 evidence but never executes. `operation.result.get` returns the retained result.
+
+For task delivery, the factory amendment adds repeatable
+`awaiting_resubmission -> begun` on the same ticket and matching fingerprint,
+within the host resubmission window/attempt cap. It never re-enters after
+`writing`, expiry or abandonment; first/second-crash cases are required tests
+(task RFC 8.8). This does not mint a replacement ticket.
 
 Each enrollment/recovery namespace also persists a monotonic `ticket_expiry_floor`
 separate from catalog retirement. Before deleting any expired ticket/result row,
@@ -950,16 +978,28 @@ available/unavailable state. The existence record excludes session title,
 creator, profile, project, branch, worktree, metadata, timestamps, terminal
 state, notifications, and failure details.
 
-The creator receives full relay-side session permissions by default. Any access
+A human creator receives full relay-side session permissions by default; a
+service-account creator receives them except `session.terminal.control`. Any access
 beyond existence requires an explicit session grant, a matching custom role, or
 the built-in team `Owner`/`Admin` authority. Permission classes are separate:
 
 - `session.metadata.read`;
 - `session.terminal.observe`;
 - `session.terminal.control`;
+- `session.task.control`;
 - `session.lifecycle.control`;
 - `session.share.manage`; and
 - `session.remove`.
+
+The factory amendment adds `task.metadata.read`, `task.execute`,
+`task.investigate`, `task.evidence.read`, `task.answer` and `task.review`, each
+intersected with the session rights specified in factory RFC 7.1. No task class
+bypasses session visibility. `task.input_control` inspection requires both
+`task.metadata.read` and `session.metadata.read`; takeover/release require a
+human with session terminal/task control plus the host task/terminal ceilings.
+A service account's explicit terminal grant never qualifies, and team
+Owner/Admin authority never bypasses the host ceiling. Task/control projections
+are excluded from minimal existence records.
 
 Interactive attach always requires terminal control because client bytes can
 reach the PTY. Read-only users use bounded screen/output observation. Team
@@ -1014,9 +1054,20 @@ also enforced in the service layer; row scoping is not left to UI filtering.
 The relay may persist reconstructible session catalog metadata and the last
 known connection state, marked stale after disconnect. It never persists
 terminal screen snapshots, output, input, prompts, file contents, profile
-environment, or attach buffers.
+environment, or attach buffers. Within these rules the relay dark factory RFC
+adds durable, content-free factory metadata: delegation budget counters,
+admission records with their append-only ledger and accounting classes, and
+per-run ownership, membership and generation records;
+the ledger belongs to the witness-protected storage of section 19.1.
 
 ### 15.3 Public API
+
+The factory amendment adds typed `task.*` routing and the content-free
+`factory.run.open`, `factory.run.add_member`, `factory.run.reconcile` and
+`factory.run.failover` methods (factory RFC 12.2). Run membership/generation
+checks and the unresolved-admission failover barrier are relay responsibilities;
+`run_id` is attribution, never a client-created grant. Human control is the
+explicit audited fence exception defined there.
 
 `pohunek-relayd` exposes:
 
@@ -1056,6 +1107,14 @@ The protocol provides an atomic host-scoped snapshot operation returning:
 - a watermark sequence included in that snapshot.
 
 Every later event contains the same epoch and a higher sequence.
+
+The relay dark factory RFC adds a bounded, optional, content-free `task`
+metadata field to the session projection row (task id, lifecycle state,
+open turn, last outcome, attention kind, owner task, retain hold, `run_id`,
+timestamps, bounded input-control desired/effective mode, transition status,
+revision and runtime binding — never turn-level detail or result content,
+factory RFC section 10), delivered only with both task/session metadata rights and the same
+epoch/sequence and frame bounds as the row itself.
 
 ### 16.2 Subscription-first algorithm
 
@@ -1132,6 +1191,14 @@ contents, provider bodies, and arbitrary error payloads.
 | Audit metadata | Optional local security event | PostgreSQL | The audit record | Configured append-only policy |
 | Attach buffers | Memory only | Memory only | Never | Until forwarded/disconnected |
 
+Factory paths (`task.*`, factory RFC section 9) add no new persistent
+content class: their audit metadata is the same structured metadata of
+section 17.1, extended only with bounded identifiers (task, turn, run
+identifier, budget decision, accounting class). Client-owned work items,
+acceptance policies, run manifests and diagnostic state are not relay data at
+all, and prompt text, result bodies and check logs remain excluded from relay
+persistence, logs and audit.
+
 Structured process logs go to the repository-established runtime logging
 destination and include correlation IDs, latency, sizes, and safe state
 transitions. They do not duplicate audit or terminal content. Metrics avoid
@@ -1147,6 +1214,11 @@ Manual deletion immediately creates a durable suppression record and removes
 the relay catalog projection. It never removes a host session, PTY, worker or
 worktree, and it does not shorten audit or safety retention. Audit defaults to
 90 days and is operator-controlled.
+
+A task session row with `retain_hold: true` is not retired while its retained
+worktree is needed for authorized continuation or cleanup (factory RFC 7.1).
+Release restores ordinary retirement eligibility; it never erases ticket,
+admission, audit or revocation evidence.
 
 Each host has a monotonic `retirement_sequence`, a durable host-side retirement
 checkpoint and relay-side acknowledged contiguous floor. Suppression records
@@ -1192,7 +1264,17 @@ owns that boundary. Local Unix and direct-NetBird owner operation do not depend
 on relay admission, but ordinary OS resource exhaustion remains outside this
 relay scheduler claim.
 
+The factory's protected audit-reserve accounting (relay dark factory RFC
+section 8.5) is a bounded partition inside these existing limits, never
+additional capacity beyond them: an admitted executor operation can never
+borrow reserved admission headroom, and reserved use stays subject to every
+team, principal, service-account, share, and host limit above.
+
 ### 18.1 Proposed unmeasured reference profile
+
+The task/control projection amendment requires re-measuring per-entry and
+snapshot bytes, waiter use and convergence with those fields present (#237,
+#240). Existing figures do not establish the enlarged projection's cost.
 
 All values in this section are **PROPOSED UNMEASURED** design-acceptance
 candidates. They are inputs to #72/#84/#87 implementation and measurement, not
@@ -1288,6 +1370,12 @@ raising a runtime limit.
 | Disk full/migration failure | Fail startup or mutation transaction safely without broadening access. |
 
 Reconnect uses bounded exponential backoff with jitter and storm protection.
+Factory failure and recovery semantics — counters and audit across a relay
+restart, the admission-ledger floors, restore quarantine while factory
+admission stays closed, and operation-ticket resubmission — are those of the
+relay dark factory RFC (section 8.2) and the delegated task runs RFC
+(section 8.8); the generations, quarantine and lease fencing of this section
+(and 19.1) are the substrate they run on, and never widen.
 Shutdown stops new ingress, cancels login/enrollment transactions, drains or
 fails bounded requests, closes streams, releases the active relay lease, and
 exits within a configured deadline.
@@ -1471,6 +1559,27 @@ description conflicts until the issue is reconciled.
 generic direct-overlay architecture used by NetBird. It is a prerequisite fact,
 not a reason to force the relay tunnel through the direct-overlay discovery API.
 
+### 23.1 Task and factory tracks (accepted, not implemented)
+
+The delegated task layer ([#182](https://github.com/zajca/pohunek/issues/182),
+sub-issues #219–#232) and the relay dark factory
+([#185](https://github.com/zajca/pohunek/issues/185), sub-issues
+[#233](https://github.com/zajca/pohunek/issues/233)–[#240](https://github.com/zajca/pohunek/issues/240))
+are accepted, not implemented, and compose on top of this RFC's host link,
+share policy, and authorization framework:
+
+- [#233](https://github.com/zajca/pohunek/issues/233) owns every relay RFC
+  amendment those RFCs declare, including their 2026-10-08 factory amendment
+  (`task.input_control` routing, protected audit-reserve accounting, factory
+  client contracts); its section 3 identifies the detailed contracts
+  reconciled here. Implementation and remote landing remain separately tracked.
+- [#234](https://github.com/zajca/pohunek/issues/234)–[#236](https://github.com/zajca/pohunek/issues/236)
+  own daemon share policy, relay authorization, and delegation budgets;
+  [#237](https://github.com/zajca/pohunek/issues/237)–[#240](https://github.com/zajca/pohunek/issues/240)
+  own projection fields, escalation routing, the factory client contract, and
+  validation. The task layer lands first (#219–#232); the factory tracks
+  depend on it.
+
 The intended dependency graph is:
 
 ```text
@@ -1485,6 +1594,14 @@ The intended dependency graph is:
 #71 + #72 + #85 -> #87
 #71 + #84 + #85 + #86 + #87 -> #73
 #82 + #86 + #87 -> #88
+#218 -> #233
+#82 + #233 + #221 + #225 -> #234
+#83 + #71 + #70 + #233 + #234 + #219 -> #235
+#87 + #235 + #70 -> #236
+#84 + #235 + #226 -> #237
+#108 + #235 + #237 -> #238
+#235 + #236 + #237 + #238 + #229 + #230 -> #239
+#239 + #232 -> #240
 ```
 
 ## 24. Definition of done

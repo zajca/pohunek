@@ -5,7 +5,14 @@
   comparison, a code-grounded review on 2026-09-25 and four review rounds on
   2026-09-28. Amended 2026-10-04 (#510): provider-initiated prompts,
   usage-limit attentions, delegation origin and loop guards, multi-target
-  `task.wait`, MCP adapter scope.
+  `task.wait`, MCP adapter scope. Amended 2026-10-08 (#182, together with the
+  relay dark factory RFC): six owner-approved factory amendment contracts —
+  the durable client work-item contract (section 16.5), the client acceptance
+  policy (section 16.6), the `task.input_control` human control mode (section
+  8.9), protected audit-reserve accounting and the versioned run manifest and
+  bounded progress policy of the factory RFC (its sections 8.5, 12.5, 12.6).
+  Design-only: nothing here claims a shipped surface, and none of it changes
+  existing section numbering.
 - **Date:** 2026-09-24
 - **Scope:** A task layer over ordinary sessions that lets an orchestrating agent
   delegate bounded coding work to another agent on any owned host and receive a
@@ -37,7 +44,13 @@ and one call to collect.
 
 Nothing about the runtime model changes. A task's session is a normal PTY
 session: it can be attached, observed, stopped, resumed and forked like any
-other, and a human can take over at any point.
+other, and a human can take over at any point — after the 2026-10-08
+amendment, such a takeover can also be declared explicitly through host
+enforcement with `task.input_control` (section 8.9). The 2026-10-08 amendment
+also defines what unattended orchestrators keep durable outside the daemon:
+client work items (section 16.5), an acceptance policy that gates any
+integration effect (section 16.6), and a versioned run manifest with a bounded
+progress policy in the relay dark factory RFC (its sections 12.5, 12.6).
 
 ## 2. Motivation
 
@@ -1016,6 +1029,12 @@ calls for that attention fail with `task_attention_stale`, and only
 `task.answer` records the answered choice as data.
 `task.answer` stays policy-gated (section 11.3) regardless of takeover.
 
+Humans or their UIs declare a protected takeover explicitly: the 2026-10-08
+amendment adds `task.input_control`
+(section 8.9), which parks automatic delivery while the human works instead of
+leaving the mode implicit in a `steered` mark. Taking over without the
+declaration remains allowed and carries exactly the semantics above.
+
 ### 8.7 Shared worktrees (`worktree_of`)
 
 `task.start { worktree_of: <task-id> }` starts a new task — a new session
@@ -1217,6 +1236,87 @@ abandoned, never re-enters `begun`, and a `begin` in any other state returns
 the recorded result as before. The relay dark
 factory RFC lists this amendment (its section 3) and the accepted relay RFC
 gains it together with a one-shot resubmission case in its ticket tests.
+
+### 8.9 Human control mode (`task.input_control`, 2026-10-08 amendment)
+
+Explicit takeover protects a human's terminal work from automatic deliveries.
+Observation-only attach is neutral; undeclared human input retains section
+8.6's steering semantics. The human or their UI requests takeover; an unattended
+manager observes the mode and parks, and cannot claim human authority itself.
+
+**Contract.** `task.input_control` has `get`, `takeover` and `release` actions.
+`get { task_id }` is an authorized metadata read and needs no mutation key.
+Both mutations require `task_id`, `client_request_id`,
+`expected_control_revision` and `expected_runtime_generation`. Missing
+preconditions are invalid requests; mismatches fail with
+`task_control_revision_stale` or `task_control_runtime_stale` without effects.
+The durable record contains desired/effective mode (`automatic` or `human`),
+control revision, session/runtime binding and pending transition status.
+Mutations increment the revision. Their request-key journal binds the complete
+request fingerprint; a committed retry reconciles its recorded outcome before
+new-state CAS checks, never repeats an effect against a newer runtime.
+
+**Write barrier.** The daemon persists desired protection before asking the
+worker to activate it. Automatic mutations of an existing task carry mandatory expected control
+revision/runtime preconditions too; delayed requests cannot be admitted under
+a revision the caller never observed. Every delivery, including queued task
+input, answers and task-backed raw `session.input`, retains those admitted
+values. Attach writers are bound to them when authorized. The worker checks them at the final write
+boundary under the same serialization as takeover. Pre-write deliveries are
+cancelled; an already committed write is reported as committed. A partially
+written or unresolved delivery retains section 8.8's uncertain outcome and is
+never described as unwritten or safely replayable. Effective takeover is
+acknowledged only after all preceding writes have finished or been fenced and
+no old writer can resume. If that cannot be established, protection remains
+requested, automatic input stays closed, and recovery exposes the uncertainty.
+
+While protection is requested or effective:
+
+- Automatic `task.continue`, `task.extend` and `task.answer` are refused with
+  `task_input_control_active`. Queued, not-yet-written turns settle `cancelled`
+  with that reason. Previously committed operations keep their actual outcome.
+- Automatic raw/attach writers are fenced too. Human input uses a connection
+  or terminal stream explicitly bound by the daemon to the current revision
+  and generation. That binding is issued only on a trusted owner path or from
+  the authenticated relay's human-control authorization context; an arbitrary
+  client field or a service-account terminal grant cannot create it. The
+  worker accepts the daemon's classification, not an agent-supplied label.
+- Human terminal input keeps the existing `steered` and `resolved_elsewhere`
+  semantics. An authorized human `task.answer` remains possible subject to
+  its usual attention/answer preconditions and the current control binding.
+  Read/wait/observe and authorized stop/recovery remain available.
+
+The owner path remains owner-trusted, including scripts running as the owner.
+On the relay path, takeover/release require an authenticated human with both
+`session.terminal.control` and `session.task.control` on the session, plus the
+host's permitted task and terminal operations. Team Owner/Admin authority
+never bypasses the host ceiling. A service account is refused even with an
+explicit terminal grant. The relay resolves principals and rechecks rights
+when binding a human stream; the daemon authenticates the enrolled relay and
+checks typed origin/share operations, never end-user roles. The relay run
+fence's explicit, audited human exception applies (factory RFC section 12.2).
+
+**Recovery and release.** The worker persists its fence and reconciles with
+the daemon before accepting further input; daemon restart does not reopen it.
+A replacement runtime starts protected when protection was requested/effective;
+old generation bindings cannot write or release it. A human must inspect the
+new binding and explicitly take over or release against its current revision.
+No timeout, disconnect or client crash releases protection. Release invalidates
+old input bindings and never drains cancelled queues or resends old prompts.
+A client may proceed only with a fresh operation based on the current task and
+control snapshot, using the existing work item if appropriate. Committed
+retries remain observation/reconciliation; uncertain writes use section 8.8
+recovery. Neither action changes worktree occupancy, cancels checks, or stops
+provider-autonomous work: this is an input gate, not process isolation.
+
+`task.inspect`, metadata projections and `task_input_control_changed` expose
+bounded mode, transition status, revision and runtime binding, never input
+content or credentials. Pending and effective transitions are distinguishable.
+Protocol/capability negotiation and persisted-schema changes follow the normal
+upgrade window; these are future contracts, not currently supported methods.
+Ownership: #219 types, #220 worker barrier, #221 durable recovery, #222/#223
+settlement and queues, #224 occupancy composition, #226 metadata, #229 CLI,
+#230 SDK, #232 cross-provider tests; #234/#235 relay authorization.
 
 ## 9. Provider Turn Evidence
 
@@ -1981,6 +2081,7 @@ the result says so (`baseline_on: "worktree"`).
 | `task.check_log` | Page a check log by reference and byte offset. |
 | `task.retain_worktree` | Set the retain hold on the worktree's owner task after the fact, while the worktree exists (section 8.7). Idempotent. |
 | `task.release_worktree` | Clear the retain hold set by `retain_worktree` on an owner task (section 8.7); the worktree returns to ordinary retention rules. Idempotent. |
+| `task.input_control` | Get, take over, or release the human control mode of a task session (section 8.9, 2026-10-08 amendment); CAS over the durable control revision and runtime generation, refusals while protection holds (`task_input_control_active`). Idempotent per `(task_id, caller_scope, client_request_id)` (invariant 3). |
 
 `task.start` accepts an optional `run_id`: a client-chosen ULID or UUID
 (validated to that syntax, so it can carry no free text or secret and is
@@ -2075,7 +2176,7 @@ Typed errors introduced by this RFC:
 | `task_turn_ceiling_reached` | `task.extend` | The turn's total open time reached `tasks.turn_open_ceiling_ms`. |
 | `task_answer_unsupported` | `task.answer` | A degraded attention whose manifest declares no approve/deny input, or a `usage_limit` attention (section 8.5). |
 | `task_answer_unverifiable` | `task.answer` | A keystroke answer without `allow_unverified_delivery` (section 8.5). |
-| (reason) `task_turn_reopened` / `task_stopped` / `session_ended` | result of a queued turn | A queued turn settled `cancelled` without delivery because the previous turn re-opened, the task was stopped, or the session ended (section 8.2). Returned by `task.wait`/`task.result`, not as a call error. |
+| (reason) `task_turn_reopened` / `task_stopped` / `session_ended` / `task_input_control_active` | result of a queued turn | A queued turn settled `cancelled` without delivery because the previous turn re-opened, the task was stopped, the session ended, or human control mode activated (sections 8.2, 8.9). Returned by `task.wait`/`task.result`, not as a call error. |
 | `task_payload_mismatch` | retried `task.start`, `task.continue`, `task.answer` | The resubmitted payload does not match the stored digest or ticket fingerprint (section 8.8). |
 | `task_stop_precondition_failed` | `task.stop` | `if_latest_turn` / `require_idle` did not hold. |
 | `worktree_users_changed` | `session.remove` | `expected_worktree_users` differs from the current set (section 8.7). |
@@ -2099,9 +2200,12 @@ Typed errors introduced by this RFC:
 | `task_delegation_depth_exceeded` | `task.start` | The new task's `delegation_depth` would exceed `tasks.max_delegation_depth` (section 13.1, origin). |
 | `task_origin_limit_reached` | `task.start` | The origin session already has `tasks.max_active_tasks_per_origin` active tasks (section 13.1, origin). |
 | `task_wait_target_invalid` | `task.wait` | A multi-target wait names an unknown or retired task, a task on another host, or more than `tasks.max_wait_targets` targets (section 8.3). |
+| `task_input_control_active` | `task.continue`, automatic `task.extend`/`task.answer`, automatic `session.input`/attach input | Human control protection is requested or effective (section 8.9); reads and waits remain available, and queued cancellation is a result, not a wait error. |
+| `task_control_runtime_stale` | Input-control mutations and task-backed input | The expected runtime generation no longer matches (section 8.9); inspect before an explicit new operation. |
+| `task_control_revision_stale` | Input-control mutations and task-backed input | `expected_control_revision` does not match the durable control revision (section 8.9); nothing changed. |
 
 Events on `subscribe`: `task_turn_opened`, `task_result_published` (emitted at publication, after finalization, not at settlement), `task_result_final` (when a heuristic result's re-open window closes),
-`task_turn_attention`, `task_reviewed`. Notifications gain `task_settled` and
+`task_turn_attention`, `task_reviewed`, `task_input_control_changed`. Notifications gain `task_settled` and
 `task_attention` kinds with the existing policy and retention machinery. For
 a task session, the hook-driven `turn_completed` and `approval_required`
 notifications for the same provider event are deduplicated into the task
@@ -2109,7 +2213,7 @@ kinds through the existing dedupe key, so one turn never notifies twice.
 
 Every method follows the existing protocol conventions: typed errors with class,
 code and recovery hint; decimal-string counters; generated TypeScript types; and
-ripples through `client`, `daemon`, `cli`, `gui-core` and `web`.
+ripples through `client`, `daemon`, `cli` and the generated TypeScript (`sdk/ts/`); any external UI (`zajca/pohunek-work`) consumes those.
 
 ### 13.2 CLI
 
@@ -2319,6 +2423,14 @@ section 19).
 | Human or another client writes into the task session mid-turn | Turn marked `steered`; settlement unchanged; result records it (section 8.6). |
 | OpenCode server child dies while the TUI lives | The TUI is bound to the dead server's ephemeral `--server` URL and has no reconnect contract, so the worker ends the runtime generation exactly as for a PTY-child exit: the TUI is stopped, an open turn settles `lost`, and explicit recovery starts a new generation with a fresh server and a TUI resumed on the stored OpenCode session (`--session <id>`, section 9.3 item 8). Evidence never silently degrades to detection while a TUI points at a dead server. |
 | Check hangs | Check timeout, process-group kill, `timed_out` outcome; the turn result still publishes. |
+| Human control activated while a delivery was in flight | The write barrier distinguishes committed, cancelled-before-write and uncertain/partial delivery (sections 8.8/8.9). Effective protection is acknowledged only after no old writer can resume; uncertainty leaves automatic input closed. A queued turn settles `cancelled` with reason `task_input_control_active` (section 8.9). |
+| Daemon restarts while human control is active | The desired protection is durable and is restored without a client; no queued delivery, no automatic `task.continue`/`task.answer`/`task.extend` runs until release. |
+| Runtime generation replaced while human control is active | Protection follows the durable control state of the task, not one runtime process; generation replacement does not auto-release or retarget queued input; open turn settles `lost` by the ordinary rule (section 6.3). |
+| Release with planned work outstanding | Nothing replays. Existing client obligations remain; further delivery needs a fresh current-state operation, and committed retries only read and reconcile (section 8.9). |
+| Client crashes mid-handoff | Recover the durable outbox/inbox and committed assignment; reconcile persisted task operation identities before effects. A send or ACK alone does not transfer custody (16.5). |
+| Client work-item store irrecoverably lost | Park and report missing intent/custody; host task records alone cannot reconstruct it. Explicit operator recovery is required. |
+| Acceptance policy evaluation hits incomplete or retired evidence | The verdict is `unknown`, never a silent acceptance; the work item's disposition blocks until evidence is re-established (section 16.6). |
+| Review recorded, then candidate changed before integration | The TOCTOU guard refuses the effect: `stale` verdict or changed fingerprint forces checks and review to be recomputed for the changed candidate (section 16.6, section 13.1). |
 
 ## 16. Composition: Manager/Auditor Loops and the Relay Dark Factory
 
@@ -2400,7 +2512,10 @@ is recorded on the executor's result). Clients therefore keep a durable
 **round record** before cleaning up — round id, executor and auditor task
 ids, the reviewed `result_id` and each task's latest turn at close — and a
 restarted client stops exactly the tasks listed in closed round records,
-with those turns as `if_latest_turn` preconditions. A precondition failure
+with those turns as `if_latest_turn` preconditions. The 2026-10-08
+amendment generalizes this record into the durable client **work-item**
+contract of section 16.5; the round record above is one of its checkpoint
+forms. A precondition failure
 means work continued after the round closed; the client leaves that task
 running and re-plans instead of stopping it. Without this step a sequential
 run accumulates live sessions until it exhausts any concurrency limit, and a
@@ -2414,8 +2529,11 @@ ceiling per objective) is orchestrator policy, and the skill states it as such
 
 With manager, executor and auditor all above the substrate, the loop can run
 unattended — a dark factory: the daemon is the chassis, tasks are the
-production line, and humans enter only at two explicit points, `attention`
-escalations (section 8.5) and `task.review` verdicts. The team relay (the
+production line, and humans enter only at explicit points: `attention`
+escalations (section 8.5), `task.review` verdicts, and — since the
+2026-10-08 amendment — a declared human control window of
+`task.input_control` (section 8.9), which is a park of automatic work, not
+an escalation. The team relay (the
 accepted relay RFC) is the natural team-facing home for such a factory without
 changing anything in this design:
 
@@ -2441,6 +2559,104 @@ worktree or evidence authority off the host daemon.
 There is no manager, auditor, planner or task-state store in the daemon or in
 the relay runtime. If a future milestone adds host-side orchestration, it must
 be a client of the public protocol like any other (non-goal, section 5).
+
+The 2026-10-08 amendment adds two contracts to this composition, both in
+clients and both additive to the sections above: the durable work-item
+contract (16.5) and the client acceptance policy (16.6). They are
+protocol-independent client state and policy helper shapes; the Reference
+factory loop implementation is the TypeScript SDK responsibility (#230, and
+#239 on the factory side), and neither contract works against worktree
+occupancy, immutable result binding or the task operation journals of this
+RFC: client work items **reference** task attempts, never hold task truth.
+
+### 16.5 Durable work-item contract (2026-10-08 amendment)
+
+A work item is a versioned client record of a logical obligation, distinct from
+its `task.*` execution attempts. It carries stable item/run identity, record
+revision, spec/policy digests, owning role/principal and assignment revision,
+acceptance criteria, dependency DAG, task/result references, and artifact
+references bound to host, session, worktree, result and content digest. A
+cross-host consumer verifies the artifact identity; a path alone is not proof.
+
+Each item has one authoritative client store and one accountable owner.
+Transitions use compare-and-swap against its record and assignment revisions:
+`ready -> assigned -> working -> awaiting_audit -> accepted`; `blocked` and
+`handoff_pending` retain outstanding obligations. Rework returns an item to
+`assigned` with an explicit new attempt; it never silently overwrites evidence.
+Closure records one of `accepted` with policy evidence, `superseded` with a
+successor, or `cancelled` with an authorized reason. A blocked item names its
+blocker and remains unresolved. Dependency failure blocks dependents; DAG
+cycles are rejected before dispatch. The schema rejects unknown transitions.
+
+**Durable handoff.** Assignment changes, the delivery intent and its outbox
+entry commit atomically in the authoritative store before any send. The entry
+pins a handoff id, source/target assignment revisions, request key, target and
+payload fingerprint. The receiver deduplicates that id in a durable inbox and
+acknowledges the exact item revision it accepted. Acknowledgment alone does not
+allow execution: the authoritative store commits the custody transfer by CAS,
+fences the old assignment, then the receiver observes the committed assignment
+before effects. Unresolved prior effects block reassignment; existing live
+attempts are adopted or explicitly stopped through their normal barriers,
+never duplicated merely because custody changed. Until then the sender remains accountable and the receiver
+cannot start a competing attempt. A single-store deployment performs the same
+transition transactionally without a cross-store exchange.
+
+Lost wakeups and acknowledgments are recovered by reading these durable
+records. Duplicate/late acknowledgments cannot transfer a newer assignment.
+Restart resends only the persisted operation identity after reconciliation;
+new keys are not invented to escape uncertain delivery. Client role-generation
+fences (factory RFC section 12.2 on the relay path) prevent stale managers from
+acting on an old assignment. Task idempotency prevents a repeated operation;
+it does not by itself deduplicate two independently generated attempts.
+Unavailable recipients leave the item pending/blocked, never silently dropped.
+
+Manager and auditor keep separate private stores outside the objective
+worktree. They exchange bounded references and custody acknowledgments, not
+shared mutable private records. Work-item storage, outbox/inbox and acceptance
+state belong to client helpers (#239); protocol SDK support is #230. Host
+results remain authoritative for task facts, but cannot reconstruct unsent
+intent, questions or custody. No work-item content enters daemon or relay
+persistence, and logical role separation claims no same-UID workload isolation
+(#88).
+
+### 16.6 Client acceptance policy (2026-10-08 amendment)
+
+`task.review` records an attributable verdict; a versioned, digest-pinned
+client policy decides whether a candidate is eligible for a subsequent effect.
+The policy names required checks, criterion-to-evidence coverage, evidence
+quality requirements and designated reviewer principals. When independence is
+required, the executor and manager cannot satisfy it with their own review,
+a different session or a self-declared auditor role. Their verdict can still
+be recorded; it cannot count as the independent acceptance decision.
+
+An acceptance record binds the policy digest/revision, work-item assignment,
+exact executor/auditor `result_id`s, complete verified worktree fingerprints,
+check-definition identities and reviewer principals. Missing, retired,
+incomplete, superseded or stale evidence produces `unknown`; failed criteria
+produce `not_eligible`; only all required evidence produces `eligible`.
+Provider claims, commit counts and successful task settlement are insufficient.
+
+Before each integration effect, the client rechecks candidate and policy
+identity and the current grants. Policy changes are explicit recorded
+revisions and invalidate old eligibility. Rebase, merge, tree changes or a
+changed integration target invalidate evidence for the old candidate. The
+integrator verifies the exact integrated tree against the expected base and
+target head, reruns required checks/review for that candidate, and uses the
+integration adapter's compare-and-swap/preconditions to refuse a changed target.
+After integration it verifies the resulting identity and required acceptance
+evidence before marking the objective accepted. Unknown outcomes remain pending
+and are reconciled; they are never retried as a second blind integration.
+
+Parallel executors use declared separate worktrees. One integrator per run
+serializes its effects; target-head CAS also protects against other runs and
+external writers. Integration adapters and provider credentials belong in
+`zajca/pohunek-work`; executor profiles are not given those credentials. This
+is a credential-delivery and authorization rule, not OS isolation between
+processes sharing a Unix account (#88).
+
+Generic policy evaluation and durable eligibility are client helpers (#239),
+using SDK contracts (#230) and host review/fingerprint evidence (#226/#232).
+The daemon does not decide product acceptance or grant publish authority.
 
 ## 17. Implementation Workstreams and Definition of Done
 
@@ -2520,8 +2736,9 @@ deliberately last: it ships in this epic after the CLI and skill
    daemon restart, `task gc --orphans` and the origin filters of
    `task list`; skill sections including the wake matrix (section 13.3);
    knowledge bundle update.
-6. **SDKs and clients:** Rust client and TS SDK methods; `gui-core` and web
-   task views (outcome, attention, review) without embedding a terminal.
+6. **SDKs and clients:** Rust client and TS SDK (`sdk/ts/`) methods; task
+   views in the external clients (`zajca/pohunek-work`; outcome, attention,
+   review) without embedding a terminal in core.
 7. **MCP adapter:** `pohunek mcp` with origin-marker forwarding and the
    investigate-mode tool restriction (section 13.4).
 8. **Validation:**
@@ -2724,9 +2941,54 @@ deliberately last: it ships in this epic after the CLI and skill
      recorded on the epic issue, and it is never a CI gate — CI covers only
      the model-free goldens and settlement tests above.
 
+**2026-10-08 amendment workstreams.** The amendment adds the following to the
+workstreams above, reusing the existing issues — no new task-layer issue is
+opened:
+
+1. **Protocol (#219):** `task.input_control` with its action, expected
+   revision and idempotency semantics (section 8.9), the typed errors
+   `task_input_control_active`, `task_control_revision_stale` and
+   `task_control_runtime_stale`, and the
+   queued-turn cancellation reason `task_input_control_active`; Rust and
+   generated TypeScript; wire-shape tests.
+2. **Worker (#220):** final-byte execution of the control fence (section
+   8.9): activation acknowledged only after every write already serialized
+   ahead of it has finished or been fenced, no in-flight frame sneaking in
+   around the fence, the in-flight outcome reported honestly, and the
+   control mode carried across runtime generations by the journal state.
+3. **Daemon (#221–#223, #226):** durable desired/effective/revision control
+   triplet bound to session and runtime generation, restart restoration (#221);
+   refusal of automatic `task.continue`/`task.answer`/`task.extend` and
+   explicit cancellation of queued pre-write deliveries while protection
+   holds (#222, #223); refusal of `session.input` and terminal write grants to
+   automatic clients or stale human stream bindings while protection holds, with the typed
+   errors of section 13.1 surfaced through `task.inspect` (#226). No
+   worktree-occupancy change.
+4. **CLI and skill (#229):** `task input-control` subcommand; the skill's
+   takeover guidance for humans/UIs and manager observation of
+   `task.input_control` instead of guessing from implicit steering; shell completions.
+5. **SDKs and clients (#230, factory helpers #239):** client-side durable **work-item store** and
+   **acceptance-policy evaluation** referenced by sections 16.5, 16.6 as
+   TypeScript SDK policy helpers plus the Rust client method surface;
+   protocol-independent so owner-path clients compose the same contracts
+   without the relay.
+6. **Validation (#232):** model-free scenarios listed here: take over and
+   release; a takeover refusing a queued delivery; a queued turn cancelling
+   with `task_input_control_active`; a takeover acknowledged only after the
+   journal shows the in-flight write resolved; restart and generation
+   replacement preserving the mode; release replaying nothing; a stale
+   revision via CAS; observation attach refused nothing; a service
+   account unable to route a relay-path takeover (the relay contract, also
+   under #235). Acceptance policy and work-item scenarios: custody never
+   inferred from a PTY send; crash after send but before custody moves;
+   dependency-failure parking; a DAG cycle refused pre-dispatch; policy
+   digest change invalidating eligibility; `stale`/`unknown` evidence never
+   being accepted silently.
+
 Definition of done: all gates in `AGENTS.md` pass; the benchmark shows at most
 two orchestrator tool calls per turn on the common path and records cost, wall
-time, orchestrator tool calls and worker turns per task per arm (a cheap worker
+time, orchestrator tool calls, worker turns, accepted outcomes, rework and
+human interventions per task per arm (a cheap worker
 must not hide round inflation); the delegating arm's total cost is reported
 against arm A with the same acceptance quality, and the epic issue records
 whether delegation paid off (a result where it does not is recorded, not

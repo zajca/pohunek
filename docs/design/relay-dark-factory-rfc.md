@@ -3,7 +3,14 @@
 - **Status:** Accepted 2026-09-29 (epic #185; implementation tracked by its
   sub-issues). Revised after a code-grounded review on 2026-09-25 and four
   review rounds on 2026-09-28. Amended 2026-10-04 (#510): usage-limit
-  attentions and multi-target waits in the factory loop.
+  attentions and multi-target waits in the factory loop. Amended 2026-10-08
+  (#185, together with the delegated task runs RFC): six owner-approved
+  amendment contracts — human control (`task.input_control`, sections 7.1 and
+  13), protected audit-reserve accounting (section 8.5), and four
+  client contracts: durable work custody and candidate acceptance (section
+  12.2 and task RFC sections 16.5/16.6), the versioned run manifest
+  (FactorySpec, section 12.5) and the bounded semantic progress policy
+  (section 12.6). Design-only; no shipped surface is claimed.
 - **Date:** 2026-09-24
 - **Scope:** The relay-side authorization, budget, audit, projection and
   escalation changes needed to run unattended manager/auditor delegation loops
@@ -44,8 +51,11 @@ auditor (client, investigate-mode task or checks)      |      result
 task.review verdict  ----------------------->  relay audit + catalog
 ```
 
-Humans enter at exactly two points: `attention` escalations (answering or
-approving) and `task.review` verdicts. A machine answers an `attention`
+Humans can intervene at explicit points:
+`attention` escalations (answering or approving), `task.review` verdicts, and
+— since the 2026-10-08 amendment — a declared human control window
+(`task.input_control`, which a machine can never self-declare; sections 7.1
+and 12.4). A machine answers an `attention`
 through `task.answer` only where a team administrator explicitly granted it
 that right and the host owner opted the share in (section 7.3). Typing an
 approval into the terminal needs terminal control, which a service account
@@ -119,6 +129,17 @@ supported operating mode or an accident.
     matching-fingerprint `begin`, bounded by the host's resubmission window
     and attempt cap and never after `writing`, expiry or abandonment (task
     RFC section 8.8), with ticket tests for a first and a second crash.
+- **2026-10-08 amendment.** Six owner-approved contracts preserve the
+  boundaries above while extending the named relay contracts under #233:
+  human input control (task RFC 8.9, this RFC 7.1), protected audit capacity
+  (8.5), durable work custody (task RFC 16.5), candidate acceptance (task
+  RFC 16.6), FactorySpec (12.5), and bounded progress diagnostics (12.6).
+  The first two affect share authorization, audit, catalog metadata and
+  budget/recovery contracts; the other four remain client-owned (#239).
+  Sections 12.2, 14–19 and 23 of the relay RFC carry their relevant
+  reconciliation. #234–#238 own relay/host enforcement and projections;
+  #240 owns factory validation.
+
 - **The delegated task runs RFC is the task substrate.** All settlement,
   causality, result and attention semantics come from there; this RFC never
   redefines them. Section 16 of that RFC is the composition this factory
@@ -307,7 +328,25 @@ budgets of section 8; the daemon enforces
 its own `HostShare` operation-class intersection (relay RFC section 12.2)
 with `task.*` added to the allowed operation classes a share may permit. A
 share that does not permit task operations refuses them regardless of relay
-role. The share policy also lists the check names relay-path callers may
+role.
+
+**Human control routing (2026-10-08 amendment).** For `task.input_control`
+(task RFC 8.9), `get` requires `task.metadata.read` intersected with
+`session.metadata.read`. `takeover`/`release` require a human principal with
+both `session.terminal.control` and `session.task.control` on the task's
+session. Team Owner/Admin authority may satisfy relay permissions, never the
+host's independently approved task/terminal operation ceilings. A service
+account is refused even with an explicit terminal-control grant. The relay
+rechecks human authority when binding an input stream and forwards a trusted,
+typed control context; client-supplied role flags are not authority. The host
+checks origin/share, control revision and runtime generation, not end-user
+roles. Takeover/release use ordinary mutation tickets and idempotency, and
+qualify for section 12.2's explicit audited human `fence_bypass`, allowing
+intervention in a fenced run without giving service accounts that exception.
+They consume no task start/turn budget. A stale mutation requires inspection
+and a fresh decision; a committed retry only reconciles its recorded result.
+
+The share policy also lists the check names relay-path callers may
 request (task RFC section 12); any other name is refused by the daemon with
 `task_check_not_permitted`. Entries are matched against the definition that
 actually resolves (host definitions shadow repository ones, task RFC section
@@ -667,16 +706,71 @@ relay RFC section 18) remain orthogonal and authoritative for resources.
 Budgets bound *delegation intent*; quotas bound *mechanism*. A factory within
 budget can still hit transport backpressure, and vice versa.
 
+### 8.5 Protected audit reserve (2026-10-08 amendment)
+
+Audit capacity is a protected partition of existing hard budgets, not extra
+capacity. For each of `max_active_tasks`, `task_starts_per_period` and
+`turns_per_period`, every applicable team, service-account and share scope
+explicitly divides its ceiling into execution and audit pools. The sum of
+configured pool limits stays within the hard ceiling; each pool
+independently bounds its committed and reserved consumption. Executors
+cannot borrow audit capacity; audit admissions cannot silently fall back to
+execution capacity. A scope without the required partition/headroom blocks
+reserve preflight. Host resource limits remain independent and may still
+refuse an audit. Values and per-candidate caps are required configuration,
+validated at setup; no numeric default is invented by this RFC.
+
+Reserve eligibility requires an administrator-configured auditor binding with
+principal, scope and revision, the normal `task.investigate` and session/share
+rights, and a candidate-linked investigate request. The candidate is an exact
+final executor result and digest of its complete verified worktree fingerprint
+in the authorized run/share,
+with its host/task identity; the relay verifies the bounded identity through
+an authorized host read rather than trusting a caller's role or mode label.
+This introduces no persistent result content and grants no answer, terminal,
+worktree or integration authority. A reserved task's later budgeted turns
+retain its admission class and candidate binding; unrelated work cannot be
+smuggled in by changing that binding on a retry.
+
+`factory.audit_attempts_per_candidate` limits reserve starts across principals
+and retries for the canonical executor candidate, not per caller-chosen alias.
+Reserving a new attempt consumes this cap atomically with all applicable pool
+charges. Same-key retries reuse the recorded attempt; new keys cannot reset
+it. Cap exhaustion and unavailable eligible reserve return typed
+`factory_audit_reserve_blocked` with the bounded reason/scope and recovery hint.
+An operator may explicitly plan a separate ordinary-budget investigation,
+subject to normal grants, but there is no automatic fallback or free retry.
+
+The resolved accounting class, all pool/window debits, candidate identity,
+auditor-binding revision and attempt identity are pinned in the canonical
+request fingerprint, admission record, client write-ahead record and the
+witness-protected ledger (8.2/8.3). Current authorization is rechecked on
+retry, while a retry never reclassifies or charges twice. Periodic charges
+are not refunded, even after host refusal; active slots follow the existing
+release rules. Pool-policy changes preserve outstanding consumption and may
+block new admissions rather than manufacture headroom. Window rollover,
+crash, lost response and restore quarantine preserve the same accounting and
+attempt floors as ordinary admissions.
+
+The guarantee is narrowly that executor exhaustion cannot consume audit
+headroom. It does not guarantee completion through host/resource loss, audit
+pool exhaustion or revocation, and it cannot enforce unknown monetary cost.
+Reads, stop, owner paths, human answers and human input-control actions retain
+their existing exemptions; other human relay mutations retain normal budgets.
+An admission refusal parks new factory work and never stops running turns.
+
 ## 9. Audit and Data Classification
 
 Every mutating `task.*` call on the relay path (`task.start`,
 `task.continue`, `task.extend`, `task.stop`, `task.answer`, `task.review`,
-`task.retain_worktree`, `task.release_worktree`, and cascading
+`task.retain_worktree`, `task.release_worktree`, mutating `task.input_control`,
+and cascading
 `session.remove`)
 produces the standard audit record (relay RFC section 17.1) extended with:
 task and turn identifiers, the run identifier (the task's `run_id`, task
 RFC section 13.1: a ULID or UUID, a separate field from the relay's own
-request correlation id), budget decision (admitted/refused and counter name), and — for
+request correlation id), input-control action/revision/runtime and effective
+state where applicable, budget decision (admitted/refused and counter name), and — for
 `task.review` — the verdict and `result_id`; for `task.answer` also whether
 the actor is a human or a service account, the `attention_id` and
 `settlement_revision` answered, and `answer_verification`
@@ -704,7 +798,8 @@ Data classification additions to relay RFC section 17.2:
 | Task results, check logs, final messages | Owner-private host files (task RFC section 14) | Never | Never | Existing host policy (retire with the session) |
 | Prompts (task metadata) | Keyed fingerprint only (task RFC invariant 7) | Keyed fingerprint on the admission record only | Never | Admission-record retention |
 | Prompt text as typed into the PTY | Owner-private scrollback of the session (existing session content, session ACL and retention) | Never | Never | Existing scrollback policy |
-| Budget counters | No | PostgreSQL | Decision + counter name | Configured policy |
+| Budget counters and audit partitions | No | PostgreSQL + witness ledger (8.2) | Decision, counter and accounting class | Configured safety policy |
+| Client work items, manifests, acceptance and diagnostic records | Client store only, outside objective worktree | Never | No content | Client policy |
 | Run IDs (`run_id`) | Task metadata, attribution only | Catalog projection and audit | ULID/UUID only, never free text | As task metadata / audit policy |
 
 Task content retires with its session; task metadata survives it for
@@ -725,7 +820,8 @@ which the relay needs to authorize `task.stop` for `task.investigate`
 holders and to refuse an executor `worktree_of` through an investigate task
 before forwarding), lifecycle state, open turn, last outcome, attention
 kind and `auto_resume` of a pending attention (task RFC section 8.5), `settled_by`,
-integrity, turn count, owner task, `retain_hold`, `run_id` and timestamps. Turn-level detail (per-turn results) is not projected; clients
+integrity, turn count, owner task, `retain_hold`, `run_id`, input-control
+desired/effective mode, transition status, revision, runtime binding and timestamps. Turn-level detail (per-turn results) is not projected; clients
 fetch it through `task.evidence.read` routed calls.
 
 - Folding tasks into the session row keeps the snapshot coordinator's
@@ -742,7 +838,8 @@ fetch it through `task.evidence.read` routed calls.
   minimal existence record (relay RFC section 14) never see that a session
   is a task session.
 - `task_turn_opened`, `task_result_published`, `task_result_final`,
-  `task_turn_attention` and `task_reviewed` (task RFC section 13.1) become session-row update events
+  `task_turn_attention`, `task_reviewed` and `task_input_control_changed`
+  (task RFC section 13.1) become session-row update events
   with the same epoch/sequence and frame bounds.
 - Gap/overflow/restart handling is identical: discard, resnapshot, never
   replay (relay RFC section 16.2).
@@ -859,7 +956,9 @@ One round of the Manage-Execute-Audit loop, entirely through public interfaces:
    after its re-open window closes; the daemon keeps the worktree occupied
    until then, so the audit task cannot start early (task RFC section 8.2,
    invariant 11).
-4. **Clean up**: once the verdict is recorded, the manager durably writes
+4. **Evaluate and clean up**: evaluate the pinned client acceptance policy
+   (task RFC 16.6) separately from the recorded verdict. Once the round
+   disposition is recorded, the manager durably writes
    the **round record** (round id, executor and auditor task ids, reviewed
    `result_id`, each task's latest turn at close) and then each principal
    stops the tasks **it created**: the manager stops the executor task, the
@@ -872,29 +971,30 @@ One round of the Manage-Execute-Audit loop, entirely through public interfaces:
    (section 8.3). The owner task (the first executor) is stopped after its
    round like any other; the shared worktree survives on its retain hold,
    which the manager releases with `task.release_worktree` in the run's
-   terminal step. Without this step a sequential run
+   terminal cleanup step, never while parked. Without this step a sequential run
    accumulates live sessions and eventually exhausts `max_active_tasks`,
    which a new period does not reset.
 
-No step requires relay-specific intelligence: the loop is expressible with the
+The client loop composes the public contracts; it requires no daemon or relay
+orchestration intelligence: the loop is expressible with the
 task-layer CLI (`task run --wait`, `task continue --wait`, `task review`) once
 the task RFC's CLI workstream lands.
 
 ### 12.2 Manager state placement and recovery
 
 - Run state (requirement checklist, artifacts, facts — the manager's task
-  state in the Manage-Execute-Audit loop) lives in the manager's own memory,
-  its own session, or files it writes. It never enters daemon or relay
+  state in the Manage-Execute-Audit loop) lives in the manager's durable client store
+  (task RFC 16.5), with in-memory state treated only as a cache. It never enters daemon or relay
   persistence (task RFC section 16.4).
-- **Everything evidential is reconstructible**: `task.list` filtered by the
+- **Host task evidence is reconstructible**: `task.list` filtered by the
   run's `run_id`, plus `task.inspect`, `task.result` and the
   recorded `task.review` verdicts, allow a fresh manager to rebuild the
   verified picture of any run. Task metadata and verdicts outlive swept
   sessions for `tasks.metadata_retention` on the host and for the catalog
   retention on the relay (section 9), and result content is available while
-  its session exists. A manager crash loses its plan, never its evidence,
-  within those retention windows; a run meant to be resumable across them
-  must checkpoint what it needs.
+  its session exists. A manager recovers its plan from the client store, not from these host
+  records. Evidence outside the retention windows requires an explicit
+  client checkpoint; missing evidence remains unknown.
 - The recommended pattern is therefore checkpoint-shaped: after every round,
   the manager writes its next-step decision where its successor can read it,
   so recovery is a new client process, not a restore.
@@ -939,12 +1039,15 @@ the task RFC's CLI workstream lands.
   `task.review`, `task.retain_worktree`, `task.release_worktree` and
   cascading `session.remove` as well as the budgeted calls — so a
   predecessor cannot stop, review or remove the successor's work either.
-  Two classes of callers are outside the fence and the membership check by
+  Three classes of callers are outside the fence and the membership check by
   design, each audited with a `fence_bypass` marker: a **human** escalation
   target answering through `task.answer` under section 11
-  (`human_escalation`), and a team `Owner`/`Admin` performing the
+  (`human_escalation`), a human using input-control takeover/release or its
+  explicitly bound terminal stream under section 7.1 (`human_control`),
+  and a team `Owner`/`Admin` performing the
   administrative cleanup of section 12.2 or the resolution of section 8.3
-  (`admin_cleanup`). Neither needs to know or advance `run_generation`. The generation advances only
+  (`admin_cleanup`). These exceptions never widen session/share rights and
+  do not require callers to know or advance `run_generation`. The generation advances only
   through an audited `factory.run.failover` action by a team administrator
   or by the owner account after its credential rotation; a request cannot
   raise it by itself. `run_id` stays attribution, not authorization: the
@@ -967,6 +1070,15 @@ the task RFC's CLI workstream lands.
   `task.list`: a restarted manager stops the executor tasks of closed
   rounds, and a restarted auditor client stops its own investigate tasks
   of the audits it closed, each with the recorded turn as `if_latest_turn`.
+- **Work items carry the exchange (2026-10-08 amendment).** The round
+  records, pending-cleanup list and write-ahead records of this section are
+  instances of the durable **work-item contract** of task RFC section 16.5.
+  Under the relay, manager and auditor client stores exchange only bounded
+  references (item ids, `result_id`, `worktree_fingerprint`, assignment
+  revisions) and never share mutable files; custody of a handoff is an
+  acknowledged record, and a client that died with work outstanding leaves a
+  store a successor reads — a lost wake is recovered from the store, and a
+  receipt is never inferred from a PTY send or an accepted `task.start`.
 - **Where records live.** Each client keeps its **own** records in its own
   client-side state (its state directory, its own session's files, or a
   store the operator provides) — the manager its round records, the auditor
@@ -1028,11 +1140,85 @@ meanings:
 
 ### 12.4 Stop conditions
 
-A run ends when any of: goal satisfied per the auditor's verdict; `ask`
-(unanswered `attention`); `budget_exhausted`; `lost`/`stopped` turns beyond
-the run's tolerance; or the round budget (task RFC section 16.2 — N rounds or
-a cost ceiling, orchestrator policy). The run's terminal report states which
-condition fired and the last verified state.
+A run reports `completed` only when its pinned acceptance policy approves the
+objective, all work-item obligations have explicit dispositions, and the
+pending-cleanup list is empty. A review verdict alone is insufficient.
+Recoverable conditions produce `parked`, with a reason: unanswered attention
+(`ask`), budget/audit exhaustion, human input control, unavailable required
+host/authority, or semantic non-progress. Parking prevents new automatic
+admissions and preserves live work, retained worktrees and evidence. It does
+not run terminal cleanup or imply failure/success of the protected task.
+
+A terminal failure or cancellation is explicit under the pinned run policy
+(for example the lost/stopped tolerance or round ceiling). Its report names
+unresolved items and cleanup; pending cleanup keeps the run non-completed and
+recoverable. A retained worktree is released only by an authorized terminal
+cleanup decision, never as a side effect of parking. Every status report
+includes the last verified checkpoint and remaining obligations.
+
+After human release or recovery, the factory rereads task/control state,
+reconciles outstanding operations, and creates a fresh current-state operation
+before resuming. It never drains old prompts. Provider `auto_resume: expected`
+waiting follows section 11 and the run wall-clock policy; timeout can park or
+fail under that policy but is not fabricated evidence of semantic non-progress.
+
+### 12.5 Run manifest (`FactorySpec`, 2026-10-08 amendment)
+
+FactorySpec is a strict, versioned client manifest, pinned by a content digest.
+The schema version defines canonical serialization and digest algorithm, with
+cross-client test vectors. Its stable logical roles (`manager`, `executor`,
+`auditor`, optional `integrator`) are separate from ephemeral sessions and
+mapped to explicit authorized principals. Per role it names runtime/package
+revision, profile/model requirements, evidence capabilities, permitted
+host/share targets and references to existing grants and required credentials.
+It contains no credential values. It also pins work/artifact dependencies and
+acceptance, budget/audit, escalation, continuity and progress policies.
+
+Unknown keys/versions, missing policies, unresolved references, unavailable
+capabilities or credentials and inadequate audit headroom fail preflight;
+there is no silent model/profile/capability fallback or implicit authority.
+`inspect`, `preview` and `preflight` are read-only client operations: they show
+resolved roles, targets, authority, capabilities, budget partitions and typed
+blockers without writes, starts, reservations or grants. Reports bind the spec
+digest and observed policy/catalog/budget revisions and freshness. Output is
+deterministic for the same resolved input snapshot, not a promise that a live
+fleet stays unchanged. Unverifiable required facts block effects.
+
+Before each effect, the client revalidates the required current facts and
+uses the host/relay's authoritative admission and precondition checks. A
+successful preview reserves nothing. Editing a file cannot silently change a
+running policy: adopting a new manifest is an explicit durable run revision,
+which invalidates affected plans and acceptance records. FactorySpec remains
+client-owned; the relay/daemon enforce their existing grants and contracts,
+not the manifest's contents.
+
+### 12.6 Bounded semantic progress policy (2026-10-08 amendment)
+
+The client pins a progress policy whose evidence is newly verified acceptance
+criteria, resolution of verified findings and advancement of accepted work.
+Turns, commits, checks run and output volume alone are not progress. A stable
+finding identity binds criterion and normalized defect identity, with bounded
+provenance; candidate/result fingerprints are separate evidence, so the same
+failure can recur across changed trees. Repeated finding identities, cycles
+in custody history, and a configured number of rounds with no newly verified
+criteria can open a diagnostic episode. Dependency cycles are separately
+rejected by the work-item DAG before dispatch.
+
+An episode has a durable id, reason, evidence references, attempt allowance,
+cooldown and notification state. Deduplication survives client restart. Only
+a bounded authorized investigation may run; it consumes normal or explicitly
+eligible audit capacity and cannot spawn recursive diagnosis. Diagnostic
+traffic cannot count as new progress or trigger another episode of itself.
+Exhaustion parks new admissions, preserves running work/evidence, and emits
+one escalation per episode through the client's configured human notification
+integration. A new episode requires the pinned reset/cooldown conditions.
+
+Expected provider waits, pending human attention and explicit human control
+are excluded from semantic stall counting; the separate run wall-clock policy
+still applies. Diagnostic escalation is client state, never synthetic provider
+`attention`, never an approval, and never new `task.answer` authority. The
+benchmark reports accepted outcomes, repeated findings/rework, human
+interventions and parked reasons alongside volume, cost and elapsed time.
 
 ## 13. Failure Semantics
 
@@ -1058,6 +1244,13 @@ condition fired and the last verified state.
 | Owner session of a shared worktree removed over the relay | The relay authorizes lifecycle control on every affected task session; the daemon requires the exact user set and one share, and blocks new users while removal is pending (task RFC section 8.7). |
 | Service account tries to approve through the terminal | Refused: service accounts hold no `session.terminal.control` unless explicitly granted (section 7.1). With such a grant the approval is audited as terminal control and recorded as a terminal resolution on a steered turn. |
 | Factory bug (loop storm) | Budgets cap volume; transport quotas cap resources; audit records show the pattern; revocation is one API call. |
+| Human declares control over a run task | `task.input_control` takeover: the run parks around the protected task; queued deliveries are cancelled (`task_input_control_active`), nothing replays; pending work stays client-owned and reconciles after release (task RFC section 8.9, section 12.4). A service account cannot forward takeover/release (section 7.1). |
+| Relay outage or daemon restart during human control | The host retains/reconciles durable protection independently (task RFC section 8.9); the factory neither assumes nor fabricates it. |
+| Audit blocked by an exhausted reserve | Typed `factory_audit_reserve_blocked` at admission/preflight (section 8.5); the run parks its audit step instead of auditing blind; executor work already running is untouched. |
+| Run exhausts its own audit reserve | Parked at `audit_reserve_exhausted` (section 12.4); state and evidence kept; ordinary counters unaffected. |
+| Run stalled on recurring findings or a handoff cycle | `progress_stalled` (section 12.6): admission parked, live work and evidence preserved, human escalation through the client's notification integration; diagnostics deduplicated and bounded, never self-triggering work. |
+| Run manifest edited mid-run | An explicit manifest revision is required before using the edit; affected work-item checkpoints are invalidated and the criteria affected re-evaluate (sections 12.5, task RFC 16.6). |
+| Manager crash between send and custody acknowledgment | The successor reads the work-item store: the send is not custody; reconciliation reads durable custody records before any same-identity resubmission (task RFC sections 16.5, 8.8). |
 
 ## 14. Required Invariants
 
@@ -1095,6 +1288,28 @@ condition fired and the last verified state.
 9. Task data never widens session access: every task class requires the
    corresponding session class on the task's session (section 7.1), and task
    projection fields are never delivered with an existence record.
+10. Human control is never machine-claimed: relay-path `task.input_control`
+    takeover and release are forwarded only from a human terminal-control
+    principal with the required session permissions and host ceiling (section
+    7.1), the daemon authenticates
+    the relay and never principals, and no timeout, retry grant or service
+    flag can release a human's control. Nothing here stops provider
+    autonomous work, weakens the worktree occupancy rules (task RFC
+    invariant 11) or replays a released prompt (task RFC section 8.9).
+11. Budget and reserve accounting stays inside the configured ceilings: a
+    reserve is a partition of an existing hard counter, never extra capacity;
+    executor admissions can never borrow it and a reserve never exceeds the
+    ceiling of its counter (section 8.5). A reserve protects audit capacity
+    from executor exhaustion and nothing else — not from host loss, not from
+    the reserve being spent, not from policy revocation, not from unknown
+    monetary cost.
+12. The factory never fabricates progress or attention: `task.answer` and
+    `attention` authority is only section 7.3's, a parked run states its
+    last verified checkpoint, and its diagnostics never self-trigger new
+    subtask work (section 12.6).
+13. A FactorySpec pins what a run is allowed to be, and nothing more:
+    authoring is not authorization; grants, share capabilities, budgets and
+    reserves still apply as written (section 12.5).
 
 ## 15. Workstreams and Definition of Done
 
@@ -1217,10 +1432,43 @@ Ordered by dependency; each lands with the tests named:
    - an **unattended benchmark**: the task RFC benchmark run lights-out
      through the relay path (manager + auditor service accounts), reporting
      turns per run, budget headroom consumed, escalations raised and
-     answered, and zero human interventions other than defined escalation
-     points — this measurement calibrates the proposed budget values and
+     answered, accepted outcomes, repeated findings/rework, human interventions
+     and parked reasons — this measurement calibrates the proposed budget values and
      re-measures the relay RFC section 18.1 snapshot bytes and long-wait
      waiter usage with task fields present.
+
+**2026-10-08 amendment workstreams.** Reusing the existing issues — no new
+issue is opened:
+
+1. **Relay RFC amendment text (#233):** fold the amendment into the relay
+   RFC's named contracts and issue map (section 3 above).
+2. **Share policy (#234):** the host task and terminal operation ceilings
+   cover routed `task.input_control`; no principal-aware host policy.
+   Tests: a share missing either operation permission refuses
+   takeover/release regardless of role.
+3. **Relay authorization (#235):** human-only takeover/release routing
+   (section 7.1) — grant provenance applies exactly as to `task.answer` and
+   terminal control; tests: a service account cannot forward takeover or
+   release by self-labeling, a stale-control-revision refusal is recorded
+   and never retried blindly, `get` needs only `task.metadata.read`.
+4. **Relay budgets (#236):** protective reserve accounting (section 8.5):
+   partition configuration validation, ledger accounting class, per-candidate
+   attempt cap, preflight `factory_audit_reserve_blocked`, no borrowing, no
+   refunds, restore quarantine unchanged for reserve admissions.
+5. **SDK factory loop (#239):** work-item store and exchange (section 12.2,
+   task RFC section 16.5), FactorySpec validation, inspect/preview/preflight
+   reports with blockers and no writes (section 12.5), candidate acceptance (task RFC 16.6), and the bounded progress
+   policy (section 12.6) — all protocol-independent, TypeScript SDK
+   (`sdk/ts/`) helpers and the skill sections.
+6. **Validation (#240, plus task #232):** tests for invariants 10–13: a
+   takeover parks the run and its queued deliveries are cancelled without
+   replay; a release retains obligations and replays no input; custody never
+   inferred from a
+   PTY send; a stalled run parks with preserved state and never invents an
+   attention or self-answers; a manifest digest change invalidates
+   eligibility; reserve accounting never exceeds its counter's ceiling and
+   executor admissions cannot touch it; an unauthorized reserve user is
+   refused by binding, not by a flag.
 
 Definition of done: all gates in `AGENTS.md` pass; every invariant in section
 14 has at least one test; the unattended benchmark runs a complete

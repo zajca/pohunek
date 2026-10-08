@@ -59,8 +59,8 @@ The following invariants span both domains:
 | Locally approved `HostShare` and relay-side session ACLs | Accepted, not implemented | [#82](https://github.com/zajca/pohunek/issues/82), [#83](https://github.com/zajca/pohunek/issues/83) |
 | Atomic snapshot/watermark synchronization without replay | Accepted, not implemented | [#84](https://github.com/zajca/pohunek/issues/84) |
 | Relay routing, aggregation, attach proxy, host/team API, and team clients | Accepted, not implemented; the bounded foundation HTTPS API is not a host or team surface | [#71](https://github.com/zajca/pohunek/issues/71), [#86](https://github.com/zajca/pohunek/issues/86), [#87](https://github.com/zajca/pohunek/issues/87) |
-| Delegated task layer (`task.*`, causal settlement, worker evidence journal, checks, OpenCode adapter) | Accepted, not implemented; design in `docs/design/delegated-task-runs-rfc.md` | [#182](https://github.com/zajca/pohunek/issues/182) and its sub-issues #219–#232 |
-| Relay dark factory (task ACLs, delegation budgets, escalation, factory client contract) | Accepted, not implemented; design in `docs/design/relay-dark-factory-rfc.md`; amends the relay RFC via [#233](https://github.com/zajca/pohunek/issues/233) | [#185](https://github.com/zajca/pohunek/issues/185) and its sub-issues #233–#240 |
+| Delegated task layer (`task.*`, causal settlement, worker evidence journal, checks, OpenCode adapter) | Accepted, not implemented; design in `docs/design/delegated-task-runs-rfc.md`; amended 2026-10-08 with `task.input_control` human control (8.9) and the client work-item/acceptance contracts (16.5, 16.6) | [#182](https://github.com/zajca/pohunek/issues/182) and its sub-issues #219–#232 |
+| Relay dark factory (task ACLs, delegation budgets, escalation, factory client contract) | Accepted, not implemented; design in `docs/design/relay-dark-factory-rfc.md`; amends the relay RFC via [#233](https://github.com/zajca/pohunek/issues/233); amended 2026-10-08 with protected audit reserves (8.5), the FactorySpec run manifest (12.5) and bounded progress policy (12.6) | [#185](https://github.com/zajca/pohunek/issues/185) and its sub-issues #233–#240 |
 
 ## Goals
 
