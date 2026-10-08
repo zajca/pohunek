@@ -442,14 +442,6 @@ mod tests {
 
     const STATUS_CURRENT: &str = include_str!("../tests/fixtures/status_current.json");
 
-    #[test]
-    fn self_ip_outside_netbird_range_is_rejected() {
-        // A root netbirdIp that is a public address must NOT be returned.
-        let json = r#"{ "netbirdIp": "8.8.8.8" }"#;
-        let status = parse_status(json).unwrap();
-        assert_eq!(status.self_netbird_ip(), None);
-    }
-
     #[tokio::test]
     #[cfg(target_os = "linux")]
     async fn async_status_future_is_cancellation_safe() {

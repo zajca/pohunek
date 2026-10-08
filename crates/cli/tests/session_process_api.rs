@@ -216,6 +216,41 @@ fn doctor_process_redacts_an_unavailable_local_daemon_in_human_and_json_output()
     assert_redacted_doctor_output(&human_stdout, &socket);
 }
 
+#[test]
+fn doctor_reports_only_a_safe_netbird_self_address() {
+    let home = TestHome::new();
+    let bin = home.root.join("doctor-netbird-bin");
+    fs::create_dir_all(&bin).expect("create NetBird fixture bin");
+    let program = bin.join("netbird");
+    for (address, expected_status) in [("100.64.0.10/16", "ok"), ("8.8.8.8", "warn")] {
+        pohunek_test_support::fs::write_executable(
+            &program,
+            format!("#!/bin/sh\nprintf '%s\\n' '{{\"netbirdIp\":\"{address}\"}}'\n"),
+        )
+        .expect("write NetBird status fixture");
+        let output = home
+            .command()
+            .env("PATH", &bin)
+            .args(["doctor", "--json"])
+            .output()
+            .expect("run doctor CLI");
+        let document: Value =
+            serde_json::from_slice(&output.stdout).expect("versioned doctor JSON");
+        let checks = document["ok"]["checks"].as_array().expect("doctor checks");
+        let check = checks
+            .iter()
+            .find(|check| check["name"] == "netbird_cli")
+            .expect("NetBird doctor check");
+        assert_eq!(check["status"], expected_status, "address {address}");
+        if expected_status == "warn" {
+            assert!(!check["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(address));
+        }
+    }
+}
+
 /// Renders a process outcome for assertion messages: status, stdout, stderr.
 fn describe(output: &Output) -> String {
     format!(

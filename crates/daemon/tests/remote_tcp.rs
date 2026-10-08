@@ -13,7 +13,7 @@
 
 mod support;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -811,8 +811,7 @@ async fn a_client_older_than_the_window_is_rejected_with_the_typed_version_error
 
 #[tokio::test]
 async fn bind_rejects_non_netbird_address() {
-    // A loopback address is never a NetBird address; bind must fail closed BEFORE
-    // opening any socket. Deterministic without a NetBird interface present.
+    // The daemon must reject every non-NetBird category before opening a socket.
     let root = temp_dir("remote-bind-rejection");
     let root = root.path();
     let state = DaemonState::new(
@@ -825,15 +824,30 @@ async fn bind_rejects_non_netbird_address() {
         ),
         support::overlay_registry(),
     );
-    let addr: SocketAddr = "127.0.0.1:18722".parse().expect("parse loopback addr");
-
     let transport = netbird::NetbirdTransport::new();
-    let result = RemoteServer::bind(addr, state, &transport).await;
-    match result {
-        Err(DaemonError::OverlayBind { addr: rejected, .. }) => {
-            assert_eq!(rejected.to_string(), "127.0.0.1");
+    for literal in [
+        "0.0.0.0",
+        "127.0.0.1",
+        "::",
+        "::1",
+        "100.63.255.255",
+        "100.128.0.0",
+        "10.0.0.1",
+        "172.16.0.1",
+        "192.168.1.1",
+        "8.8.8.8",
+        "2001:db8::1",
+        "::ffff:100.64.0.1",
+    ] {
+        let ip: IpAddr = literal.parse().expect("valid IP literal");
+        let result =
+            RemoteServer::bind(SocketAddr::new(ip, 18722), state.clone(), &transport).await;
+        match result {
+            Err(DaemonError::OverlayBind { addr: rejected, .. }) => {
+                assert_eq!(rejected, ip);
+            }
+            Err(other) => panic!("expected OverlayBind for {literal}, got: {other}"),
+            Ok(_) => panic!("expected bind to reject {literal}"),
         }
-        Err(other) => panic!("expected OverlayBind error, got: {other}"),
-        Ok(_) => panic!("expected bind to fail closed on a non-overlay address"),
     }
 }
