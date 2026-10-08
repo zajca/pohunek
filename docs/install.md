@@ -40,8 +40,12 @@ unsigned, named `...-unsigned-development`, and never released. The install,
 upgrade, rollback, uninstall, log, logout/reboot, and Gatekeeper procedures are
 in the [macOS install runbook](knowledge/runbooks/install-on-macos.md).
 
-Every release asset (Linux, macOS, and SDK archives and tarballs, and their
-`.sha256` checksum files) has a GitHub build-provenance attestation. Verify a download with:
+Every release asset (Linux, macOS, and SDK archives and tarballs, the runtime
+package archives, `runtime-catalog.json`, the attestation documents,
+`release-inventory.sha256`, and the `.sha256` checksum files) has a GitHub
+build-provenance attestation. `release-inventory.sha256` lists every other asset
+of the release in `sha256sum -c` format. A release becomes visible only after all
+of them were uploaded and verified. Verify a download with:
 
 ```bash
 gh attestation verify <file> --repo zajca/pohunek

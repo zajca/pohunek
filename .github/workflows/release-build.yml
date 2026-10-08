@@ -1,0 +1,362 @@
+name: Release build
+
+# Reusable producer half of the release: the Linux CLI, daemon and relay
+# archives, the official runtime package archives and the TypeScript SDK
+# tarballs, all from the exact commit of the calling run. Called by
+# release.yml (mode `release`, a tag) and by ci.yml (mode `rehearsal`, the
+# PR-time proof of the whole assembly).
+#
+# This workflow only produces workflow artifacts. It holds a read-only token,
+# no secret and no environment, and it never creates or touches a GitHub
+# Release; publication is the single `publish` job of release.yml.
+#
+# Artifacts (names are the contract with release-evidence.yml):
+#   build-<component>-<target>  the archive and its .sha256
+#   package-archives            every runtime-packages/* archive and .sha256
+#   sdk-release-assets          the SDK tarballs and their .sha256
+#
+# Mode `rehearsal` stages the daemon archives with a throwaway trust anchor
+# (scripts/release-workflow/rehearsal-trust) written over
+# packaging/runtime-catalog-anchor.json in the job's own ephemeral checkout, so
+# the archives and the rehearsal's throwaway signing key agree. The production
+# anchor is never changed, and a rehearsal bundle is never published.
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "`release` for a tag run, `rehearsal` for a CI run that never publishes"
+        type: string
+        required: true
+    outputs:
+      version:
+        description: The release version X.Y.Z of the checkout (the workspace version)
+        value: ${{ jobs.meta.outputs.version }}
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Disable incremental compilation: rust-cache strips incremental artifacts
+  # before persisting anyway (issue #124).
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  meta:
+    name: Resolve the release version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # A release run requires the tag to be exactly v<workspace version>.
+      - name: Resolve and check the version
+        id: version
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(scripts/release-workflow/version "$MODE" "$REF_NAME")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  binaries:
+    name: Build ${{ matrix.component }} for ${{ matrix.target }}
+    needs: [meta]
+    runs-on: ${{ matrix.runner }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: -D warnings -C link-arg=-fuse-ld=mold
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Dynamically linked glibc build (primary target).
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            component: cli
+            archive_prefix: pohunek-cli
+            binary: pohunek
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            component: daemon
+            archive_prefix: pohunek-daemon
+            binary: pohunekd
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            component: relay
+            archive_prefix: pohunek-relay
+            binary: pohunek-relayd
+          # Fully static musl CLI and daemon builds: self-contained binaries
+          # that run on x86_64 Linux regardless of the host glibc version.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            component: cli
+            archive_prefix: pohunek-cli
+            binary: pohunek
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            component: daemon
+            archive_prefix: pohunek-daemon
+            binary: pohunekd
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Python for Hermes release verification
+        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv for Hermes release verification
+        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+
+      - name: Install musl toolchain
+        if: ${{ endsWith(matrix.target, '-musl') }}
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      # Every leg links host binaries (build scripts, `cargo xtask docs site`)
+      # with the job-level mold RUSTFLAGS; only the musl target link itself
+      # drops mold, in the "Build release binaries" step.
+      - name: Install mold linker
+        run: sudo apt-get update && sudo apt-get install -y mold
+
+      - name: Enable sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci-
+
+      - name: Build release binaries
+        shell: bash
+        env:
+          # musl targets link statically via the musl toolchain wrapper, which
+          # does not accept GNU ld replacement flags: keep mold GNU-only.
+          RUSTFLAGS: ${{ endsWith(matrix.target, '-musl') && '-D warnings' || '-D warnings -C link-arg=-fuse-ld=mold' }}
+          TARGET: ${{ matrix.target }}
+          COMPONENT: ${{ matrix.component }}
+        run: |
+          set -euo pipefail
+          build_args=(--release --locked --target "$TARGET")
+          case "$COMPONENT" in
+            cli)
+              cargo build "${build_args[@]}" -p pohunek-cli --bin pohunek
+              ;;
+            daemon)
+              cargo build "${build_args[@]}" \
+                -p pohunek-cli \
+                -p pohunek-daemon \
+                -p pohunek-session-worker \
+                --bin pohunek \
+                --bin pohunekd \
+                --bin pohunek-sessiond
+              ;;
+            relay)
+              cargo build "${build_args[@]}" -p pohunek-relay --bin pohunek-relayd
+              ;;
+            *)
+              echo "::error::unsupported release component: $COMPONENT"
+              exit 1
+              ;;
+          esac
+
+      - name: Build docs artifacts
+        run: cargo xtask docs site
+
+      # The throwaway anchor replaces the production one in this ephemeral
+      # checkout only; stage-archive copies it into the daemon archive.
+      - name: Install the rehearsal trust anchor
+        if: ${{ inputs.mode == 'rehearsal' && matrix.component == 'daemon' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p xtask
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/rehearsal-trust \
+            "$RUNNER_TEMP/rehearsal-trust" "$GITHUB_RUN_ID" "$GITHUB_SHA"
+          cp "$RUNNER_TEMP/rehearsal-trust/anchor.json" packaging/runtime-catalog-anchor.json
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          COMPONENT: ${{ matrix.component }}
+          ARCHIVE_PREFIX: ${{ matrix.archive_prefix }}
+        run: |
+          set -euo pipefail
+          # Archives are stamped with the commit time, so rebuilding the same
+          # commit yields the same archive bytes.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          name="$(packaging/stage-archive "$COMPONENT" "$VERSION" "$TARGET" \
+            "target/$TARGET/release" target/pohunek-docs dist)"
+          if [ "$name" != "$ARCHIVE_PREFIX-$VERSION-$TARGET" ]; then
+            echo "::error::staged archive $name does not match the matrix archive prefix"
+            exit 1
+          fi
+          sh packaging/write-manifest "dist/$name" "$COMPONENT" "$VERSION" "$TARGET" none
+          sh packaging/archive dist "$name" dist
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/$name.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Provision locked Hermes runtime
+        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+        id: hermes
+        shell: bash
+        run: |
+          set -euo pipefail
+          hermes_bin="$(scripts/provision-hermes-compat "$RUNNER_TEMP/hermes-compat")"
+          printf 'bin=%s\n' "$hermes_bin" >> "$GITHUB_OUTPUT"
+
+      - name: Verify packaged CLI against pinned Hermes
+        if: ${{ inputs.mode == 'release' && matrix.component == 'cli' }}
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          HERMES_BIN: ${{ steps.hermes.outputs.bin }}
+          ARCHIVE_PREFIX: ${{ matrix.archive_prefix }}
+          BINARY: ${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          extract_dir="$(mktemp -d)"
+          trap 'rm -rf "$extract_dir"' EXIT
+          tar -xzf "$ARCHIVE" -C "$extract_dir"
+          release_root="$extract_dir/$ARCHIVE_PREFIX-$VERSION-$TARGET"
+          release_pohunek="$(realpath "$release_root/$BINARY")"
+          packaged_smoke="$release_root/packaging/smoke-hermes-plugin-release"
+          test -x "$release_pohunek"
+          test -x "$packaged_smoke"
+          cargo xtask hermes compatibility \
+            --hermes-bin "$HERMES_BIN" \
+            --pohunek-bin "$release_pohunek"
+          "$packaged_smoke" "$release_pohunek" "$HERMES_BIN"
+
+      # Only the archive and its checksum leave this job.
+      - name: Upload release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-${{ matrix.component }}-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+
+  # One job for all official packages: every runtime-packages/<runtime>/
+  # directory is verified (two builds compared) and archived. Adding a runtime
+  # directory adds its archive here without a workflow edit.
+  packages:
+    name: Build the runtime package archives
+    needs: [meta]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-packages
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Verify and build every runtime package
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/build-packages \
+            "$VERSION" "$RUNNER_TEMP/package-archives"
+
+      - name: Upload the package archives
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package-archives
+          path: ${{ runner.temp }}/package-archives
+          if-no-files-found: error
+
+  # The SDK tarballs are built with a read-only token and no persisted git
+  # credentials, because packing installs and runs npm dependencies. The
+  # policy requires them in every bundle, so a rehearsal packs them too.
+  sdk:
+    name: Pack TypeScript SDK release assets
+    needs: [meta]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.11
+
+      # The pack script compiles each package with the workspace's locked
+      # TypeScript and `@types/*`, so the lockfile is installed first.
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+
+      # The asset base URL is where the release of this version serves its files.
+      - name: Pack SDK tarballs
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          RELEASE_BASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases/download/v${{ needs.meta.outputs.version }}
+          SDK_ASSET_DIR: sdk-dist
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          bun sdk/ts/scripts/pack-release.ts \
+            --version "$VERSION" \
+            --base-url "$RELEASE_BASE_URL" \
+            --out "$SDK_ASSET_DIR"
+          ( cd "$SDK_ASSET_DIR" && sha256sum -c ./*.sha256 )
+
+      - name: Upload SDK tarballs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sdk-release-assets
+          path: sdk-dist
+          if-no-files-found: error

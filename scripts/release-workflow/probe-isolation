@@ -1,0 +1,21 @@
+#!/bin/sh
+# Report which network isolation strategy this runner allows.
+#
+# usage: probe-isolation
+#
+# Prints `userns` when unprivileged user namespaces work and `sudo` when only
+# `sudo -n unshare` does, the two strategies of packaging/smoke-archive. Fails
+# when neither works: the archive smoke never runs un-isolated. The probe runs
+# the same unshare flags as the smoke and executes nothing else.
+
+set -eu
+
+if unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1; then
+    echo userns
+elif command -v sudo >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 \
+    && sudo -n unshare --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1; then
+    echo sudo
+else
+    echo "probe-isolation: neither unprivileged user namespaces nor 'sudo -n unshare' work on this runner" >&2
+    exit 1
+fi

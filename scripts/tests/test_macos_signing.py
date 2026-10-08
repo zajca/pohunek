@@ -314,14 +314,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.text = (ROOT / ".github/workflows/release.yml").read_text()
         self.stage = self.job("stage-macos", "package-macos")
         self.package = self.job("package-macos", "verify-macos")
-        self.release = self.job("verify-macos", "attest")
-        self.attest = self.job("attest", "publish-macos")
-        self.publish = self.job("publish-macos", None)
+        self.release = self.job("verify-macos", "evidence")
+        self.evidence = (ROOT / ".github/workflows/release-evidence.yml").read_text()
         self.macos = {
             "stage": self.stage,
             "package": self.package,
             "verify": self.release,
-            "publish": self.publish,
         }
 
     def job(self, name, following):
@@ -387,20 +385,20 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("needs: [package-macos]", self.release)
         self.assertIn("needs: [stage-macos]", self.package)
 
-    def test_the_attest_job_covers_the_macos_archives(self):
-        self.assertIn("needs: [build, verify-macos, sdk-pack]", self.attest)
-        self.assertIn("pattern: macos-signed-*", self.attest)
-        self.assertIn("actions/attest@", self.attest)
+    def test_the_evidence_workflow_attests_and_assembles_the_macos_archives(self):
+        self.assertIn("needs: [build, verify-macos]", self.job("evidence", "publish"))
+        for name in ("attest", "assemble"):
+            block = self.evidence[self.evidence.index("\n  %s:\n" % name):]
+            block = block.split("\n  attest-bundle:\n" if name == "attest" else "\n  assemble-rehearsal:\n")[0]
+            self.assertIn("pattern: macos-signed-*", block, name)
+        self.assertIn("actions/attest@", self.evidence)
 
-    def test_only_the_publishing_job_can_write_and_it_runs_nothing_from_the_archive(self):
-        self.assertIn("contents: write", self.publish)
-        for name, job in (("stage", self.stage), ("package", self.package), ("verify", self.release)):
+    def test_no_macos_job_can_write_and_none_publishes(self):
+        for name, job in self.macos.items():
             self.assertNotIn("contents: write", job, name)
+            self.assertNotIn("action-gh-release", job, name)
+            self.assertNotIn("gh release", job, name)
         self.assertIn("contents: read", self.release)
-        self.assertIn("action-gh-release", self.publish)
-        for forbidden in ("tar -x", "--version", "smoke", "cargo", "bun ", "verify-signed", "checkout"):
-            self.assertNotIn(forbidden, self.publish, forbidden)
-        self.assertIn("shasum -a 256 -c", self.publish)
 
 
 if __name__ == "__main__":

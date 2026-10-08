@@ -1,0 +1,586 @@
+name: Release evidence
+
+# Reusable evidence half of the release. Given the producer artifacts of the
+# calling run (release-build.yml and, in a release, the macOS and SDK jobs of
+# release.yml), it proves that every official runtime package works with the
+# exact core binaries of the release, signs the runtime catalog over those
+# digests and checks the final archives offline:
+#
+#   plan              the (runtime x target) rows from compat/matrix.json (jq)
+#   consumer          the release consumer test executable, built once
+#   rows              one job per row: extracts the binaries from the daemon
+#                     ARCHIVE, stages the pinned upstream, runs the consumer
+#                     out of process and emits attestation-<runtime>-<target>.json
+#   attest            build provenance for every producer artifact (release only)
+#   assemble          verifies provenance with `gh attestation verify`, then
+#                     `cargo xtask release assemble` signs the catalog with the
+#                     CI root key (release only; the environment `release`)
+#   assemble-rehearsal the same assembly with a throwaway key derived from public
+#                     values and a throwaway anchor, no secret (rehearsal only)
+#   attest-bundle     build provenance for every file of the final bundle
+#                     (release only)
+#   smoke             stages the upstreams, then runs packaging/smoke-archive
+#                     on every Linux daemon archive of the bundle in a network
+#                     namespace
+#   verdict           fails unless exactly the jobs of the chosen mode succeeded
+#                     (a skipped job would otherwise let a caller proceed)
+#
+# Trust model. `rows`, `consumer`, `assemble*` and `smoke` run repository code
+# and hold a read-only token; none of them can create an attestation or write
+# to the repository. `attest` and `attest-bundle` are the only jobs with
+# `id-token: write` and `attestations: write`; they check out nothing, run no
+# repository or downloaded code, and are skipped in a rehearsal, so a CI run
+# never mints provenance that `gh attestation verify` would accept for a
+# throwaway-key bundle. Only `assemble` has the environment `release` (deployment
+# policy: tags `v*`) and reads CATALOG_SIGNING_KEY_CI, in its signing step.
+# This workflow never creates or edits a GitHub Release.
+#
+# The calling job must grant `id-token: write` and `attestations: write` even
+# for a rehearsal: a called workflow cannot hold a scope its caller lacks.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Release version X.Y.Z (the workspace version)
+        type: string
+        required: true
+      commit:
+        description: Full commit sha the artifacts were built from
+        type: string
+        required: true
+      mode:
+        description: "`release` signs with the CI root key; `rehearsal` uses a throwaway key and publishes nothing"
+        type: string
+        required: true
+      targets:
+        description: Optional space-separated targets to keep (rehearsal); empty means all
+        type: string
+        required: false
+        default: ""
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  plan:
+    name: Plan the compatibility rows
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      rows: ${{ steps.rows.outputs.rows }}
+      node: ${{ steps.rows.outputs.node }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Check the inputs and derive the row matrix
+        id: rows
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ inputs.commit }}
+          TARGETS: ${{ inputs.targets }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+          test "$(scripts/release-workflow/version "$MODE" "$REF_NAME")" = "$VERSION"
+          if [ "$MODE" = release ] && [ -n "$TARGETS" ]; then
+            echo "::error::a release is never restricted to some targets"
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          rows="$(scripts/release-workflow/row-matrix compat/matrix.json $TARGETS)"
+          node="$(scripts/release-workflow/node-version compat/matrix.json)"
+          {
+            echo "rows=$rows"
+            echo "node=$node"
+          } >> "$GITHUB_OUTPUT"
+
+  consumer:
+    name: Build the release consumer executable
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-consumer
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build the consumer executable
+        run: scripts/release-workflow/build-consumer "$RUNNER_TEMP/consumer"
+
+      - name: Upload the consumer executable
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-consumer
+          path: ${{ runner.temp }}/consumer/release_consumer
+          if-no-files-found: error
+
+  rows:
+    name: Row ${{ matrix.runtime }} on ${{ matrix.target }}
+    needs: [plan, consumer]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.rows) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-row
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Download the daemon archive of the target
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: build-daemon-${{ matrix.target }}
+          path: ${{ runner.temp }}/daemon
+
+      - name: Download the package archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-archives
+          path: ${{ runner.temp }}/packages
+
+      - name: Download the consumer executable
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-consumer
+          path: ${{ runner.temp }}/consumer
+
+      # The upstream runtimes are Node programs: the version is the highest
+      # `upstream.node_min` of their locks, not the runner image default.
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ needs.plan.outputs.node }}
+
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Run the row and write its attestation
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ inputs.commit }}
+          RUNTIME: ${{ matrix.runtime }}
+          TARGET: ${{ matrix.target }}
+          DAEMON_DIR: ${{ runner.temp }}/daemon
+          PACKAGES_DIR: ${{ runner.temp }}/packages
+          CONSUMER: ${{ runner.temp }}/consumer/release_consumer
+          OUT_DIR: ${{ runner.temp }}/row
+        run: |
+          set -euo pipefail
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/run-row
+
+      - name: Upload the attestation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: attestation-${{ matrix.runtime }}-${{ matrix.target }}
+          path: ${{ runner.temp }}/row/attestation-${{ matrix.runtime }}-${{ matrix.target }}.json
+          if-no-files-found: error
+
+  # Build provenance for every producer artifact, so that the assembler can
+  # require it. No checkout and no repository code: only artifacts are
+  # downloaded, checked against their checksum files and attested.
+  attest:
+    name: Attest the producer artifacts
+    if: ${{ inputs.mode == 'release' }}
+    needs: [rows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the Linux archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/attest-assets
+
+      - name: Download the macOS archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: macos-signed-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/attest-assets
+
+      - name: Download the package archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-archives
+          path: ${{ runner.temp }}/attest-assets
+
+      - name: Download the SDK tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-release-assets
+          path: ${{ runner.temp }}/attest-assets
+
+      - name: Download the row attestations
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: attestation-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/attest-assets
+
+      # Every archive and tarball has exactly one checksum file, and each one
+      # matches.
+      - name: Check the asset checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/attest-assets"
+          sha256sum -c ./*.sha256
+          archives="$(find . -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar.zst' \) | wc -l)"
+          checksums="$(find . -maxdepth 1 -type f -name '*.sha256' | wc -l)"
+          test "$archives" = "$checksums"
+
+      - name: Attest the producer artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/attest-assets/*.tar.gz
+            ${{ runner.temp }}/attest-assets/*.tgz
+            ${{ runner.temp }}/attest-assets/*.tar.zst
+            ${{ runner.temp }}/attest-assets/*.sha256
+            ${{ runner.temp }}/attest-assets/*.json
+
+  # Release assembly: the only job that reads the signing secret, and only in
+  # its signing step. The key is written to tmpfs and shredded by
+  # scripts/release-workflow/assemble, which runs the xtask built from this
+  # very commit. No cache is restored in this job.
+  assemble:
+    name: Assemble and sign the release bundle
+    if: ${{ inputs.mode == 'release' }}
+    needs: [rows, attest]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download the Linux archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-*
+          path: ${{ runner.temp }}/dl/build
+
+      - name: Download the macOS archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: macos-signed-*
+          path: ${{ runner.temp }}/dl/macos
+
+      - name: Download the package archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-archives
+          path: ${{ runner.temp }}/dl/packages
+
+      - name: Download the SDK tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-release-assets
+          path: ${{ runner.temp }}/dl/sdk
+
+      - name: Download the row attestations
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: attestation-*
+          path: ${{ runner.temp }}/dl/attestations
+
+      # Every input must carry provenance from this repository's evidence
+      # workflow at this commit and ref.
+      - name: Verify the provenance of every input
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ inputs.commit }}
+          REF: ${{ github.ref }}
+        run: scripts/release-workflow/verify-provenance "$RUNNER_TEMP/dl"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Collect the inputs
+        run: |
+          scripts/release-workflow/collect-inputs "$RUNNER_TEMP/inputs" \
+            "$RUNNER_TEMP/dl/build" "$RUNNER_TEMP/dl/macos" "$RUNNER_TEMP/dl/packages" \
+            "$RUNNER_TEMP/dl/sdk" "$RUNNER_TEMP/dl/attestations"
+
+      - name: Sign and assemble the bundle
+        shell: bash
+        env:
+          CATALOG_SIGNING_KEY_CI: ${{ secrets.CATALOG_SIGNING_KEY_CI }}
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ inputs.commit }}
+        run: |
+          set -euo pipefail
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/assemble \
+            release "$RUNNER_TEMP/inputs" "$RUNNER_TEMP/bundle"
+
+      - name: Upload the release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/bundle
+          if-no-files-found: error
+
+  # The rehearsal assembly: the same inputs and the same assembler, signed with
+  # a throwaway key derived from public values against the throwaway anchor the
+  # rehearsal archives carry. No secret, no environment, no provenance
+  # (nothing is attested in a rehearsal), and the bundle is never published.
+  assemble-rehearsal:
+    name: Assemble the rehearsal bundle
+    if: ${{ inputs.mode == 'rehearsal' }}
+    needs: [rows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Download the Linux archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: build-*
+          path: ${{ runner.temp }}/dl/build
+
+      - name: Download the package archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-archives
+          path: ${{ runner.temp }}/dl/packages
+
+      - name: Download the SDK tarballs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-release-assets
+          path: ${{ runner.temp }}/dl/sdk
+
+      - name: Download the row attestations
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: attestation-*
+          path: ${{ runner.temp }}/dl/attestations
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-row
+          save-if: false
+
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Collect the inputs
+        run: |
+          scripts/release-workflow/collect-inputs "$RUNNER_TEMP/inputs" \
+            "$RUNNER_TEMP/dl/build" "$RUNNER_TEMP/dl/packages" \
+            "$RUNNER_TEMP/dl/sdk" "$RUNNER_TEMP/dl/attestations"
+
+      - name: Assemble the rehearsal bundle
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          COMMIT: ${{ inputs.commit }}
+          TARGETS: ${{ inputs.targets }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/assemble \
+            rehearsal "$RUNNER_TEMP/inputs" "$RUNNER_TEMP/bundle"
+
+      - name: Upload the rehearsal bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/bundle
+          if-no-files-found: error
+
+  # Build provenance for every file of the final bundle (the rebuilt daemon
+  # archives, the signed catalog and the inventory included), so that every
+  # published asset has provenance. Like `attest`, it runs no code.
+  attest-bundle:
+    name: Attest the release bundle
+    if: ${{ inputs.mode == 'release' }}
+    needs: [assemble]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download the release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/bundle
+
+      - name: Check the bundle inventory
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/bundle"
+          sha256sum -c release-inventory.sha256
+
+      - name: Attest the release bundle
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/bundle/*
+
+  # The network-isolated archive smoke on the final bundle: every Linux daemon
+  # archive installs every official package offline and runs the consumer
+  # against the staged, hash-verified upstream. The first step proves which
+  # isolation strategy the runner allows; the smoke uses exactly that one and
+  # never runs un-isolated.
+  smoke:
+    name: Archive smoke (network-isolated)
+    needs: [plan, assemble, assemble-rehearsal, consumer]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && (needs.assemble.result == 'success' || needs.assemble-rehearsal.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-row
+          save-if: false
+
+      - name: Download the release bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-bundle
+          path: ${{ runner.temp }}/bundle
+
+      - name: Download the consumer executable
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-consumer
+          path: ${{ runner.temp }}/consumer
+
+      # The upstream runtimes are Node programs: the version is the highest
+      # `upstream.node_min` of their locks, not the runner image default.
+      - name: Install Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ needs.plan.outputs.node }}
+
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      # A throwaway step: it only proves that the runner can isolate the
+      # network, and says how.
+      - name: Probe the network isolation strategy
+        id: isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "strategy=$(scripts/release-workflow/probe-isolation)" >> "$GITHUB_OUTPUT"
+
+      - name: Run the archive smoke on every Linux daemon archive
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          ISOLATION: ${{ steps.isolation.outputs.strategy }}
+          CONSUMER: ${{ runner.temp }}/consumer/release_consumer
+        run: |
+          set -euo pipefail
+          XTASK="$PWD/target/debug/xtask" scripts/release-workflow/run-smoke "$RUNNER_TEMP/bundle"
+
+  # The caller proceeds on this workflow's result. A job skipped by an `if`
+  # counts as success to the caller, so this job requires exactly the jobs of
+  # the chosen mode to have succeeded and the other mode's jobs to be skipped.
+  verdict:
+    name: Evidence verdict
+    if: ${{ always() }}
+    needs: [plan, consumer, rows, attest, assemble, assemble-rehearsal, attest-bundle, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require the jobs of the mode
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$NEEDS" | jq -e --arg mode "$MODE" '
+            . as $needs
+            | (if $mode == "release" then
+                 {success: ["plan","consumer","rows","attest","assemble","attest-bundle","smoke"], skipped: ["assemble-rehearsal"]}
+               elif $mode == "rehearsal" then
+                 {success: ["plan","consumer","rows","assemble-rehearsal","smoke"], skipped: ["attest","assemble","attest-bundle"]}
+               else error("unknown mode") end) as $want
+            | all($want.success[]; . as $n | $needs[$n].result == "success")
+              and all($want.skipped[]; . as $n | $needs[$n].result == "skipped")
+          ' >/dev/null || { echo "::error::the evidence jobs of mode $MODE did not all succeed"; exit 1; }

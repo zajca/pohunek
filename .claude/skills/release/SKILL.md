@@ -78,12 +78,15 @@ hand-edit `Cargo.toml`/`Cargo.lock` versions or hand-craft the tag.
    gate + docs-gate, then builds `pohunek` and `pohunekd` for
    both `x86_64-unknown-linux-gnu` (dynamic glibc, primary) and
    `x86_64-unknown-linux-musl` (fully static, runs on any x86_64 Linux),
-   packages per-component tarballs with sha256 checksums in read-only `build`
-   jobs, and the `publish` jobs (the only Linux jobs with a write token, no
-   checkout) download each archive, check its checksum, and attach it to the
-   GitHub Release. After `sdk-gate` passes, `sdk-pack` builds (read-only token) and
-   `sdk-publish` attaches the TypeScript SDK tarballs `pohunek-ts-{protocol,sdk,testkit}-X.Y.Z.tgz`, each
-   with a `.sha256`. Watch it to completion:
+   packages per-component tarballs with sha256 checksums in read-only build jobs
+   (`release-build.yml`), builds the official runtime package archives, runs the
+   compatibility rows, assembles and signs the runtime catalog and rebuilds the
+   daemon archives with a `runtime/` directory (`release-evidence.yml`), runs the
+   network-isolated archive smoke, and only then the single `publish` job (the
+   only job with a write token, no checkout) verifies the complete inventory,
+   creates a draft release, uploads and checks it, and publishes it. The
+   TypeScript SDK tarballs `pohunek-ts-{protocol,sdk,testkit}-X.Y.Z.tgz`, each
+   with a `.sha256`, are part of the same inventory. Watch it to completion:
 
    ```bash
    gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"

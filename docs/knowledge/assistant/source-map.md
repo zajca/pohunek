@@ -584,6 +584,9 @@ Signed runtime catalog:
 - `crates/xtask/src/release_inventory.rs` — the release inventory and its verification.
 - `packaging/release-policy.json` — the expected archives, SDK packages and catalog validity of a release.
 - `packaging/smoke-archive` — the network-isolated archive smoke (with `scripts/tests/test_smoke_archive.py`).
+- `.github/workflows/release-build.yml` — reusable producer workflow: archives, package archives and SDK tarballs as workflow artifacts.
+- `.github/workflows/release-evidence.yml` — reusable workflow: compatibility rows, provenance, catalog signing, bundle assembly and the archive smoke.
+- `scripts/release-workflow/` — the helper scripts the release workflows call.
 - `crates/xtask/src/upstream_stage.rs` — `cargo xtask compat stage-upstream|verify-stage`: npm staging of the pinned upstream runtimes and the stage verifier.
 - `compat/pi/npm/package-lock.json` — the pinned npm dependency tree of the Pi upstream (with the codex and claude counterparts under `compat/`).
 - `crates/cli/tests/release_consumer.rs` — out-of-process consumer suite on the exact release binaries (inputs, layout, drivers, report).

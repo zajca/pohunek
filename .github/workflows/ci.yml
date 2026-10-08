@@ -6,7 +6,9 @@ name: CI
 # every pull request. The release build (job `release-build`) runs on push to
 # main, the weekly schedule, and manual dispatch, and on pull requests only when
 # the `release` paths filter matches (manifests, lockfile, .cargo, toolchain
-# pins, the release/CI workflows, scripts/release, packaging).
+# pins, the release/CI workflows, scripts/release, packaging). The release
+# rehearsal (jobs `release-rehearsal-build` and `release-rehearsal`) runs the
+# reusable release workflows with a throwaway key and publishes nothing.
 on:
   push:
     branches: [main]
@@ -417,7 +419,7 @@ jobs:
           print(bumped)
           PY
           )"
-          bindir="$(CARGO_LOCKED_FLAG= packaging/macos/build-release daemon)"
+          bindir="$(CARGO_LOCKED_FLAG="" packaging/macos/build-release daemon)"
           mkdir -p "$RUNNER_TEMP/dist-b"
           staging="$(packaging/macos/package --stage-release daemon "$version_b" "$bindir" target/pohunek-docs "$RUNNER_TEMP/dist-b")"
           archive="$(packaging/macos/package --adhoc-release daemon "$version_b" "$staging")"
@@ -591,6 +593,7 @@ jobs:
       claude_package: ${{ steps.filter.outputs.claude_package }}
       docs_ts: ${{ steps.filter.outputs.docs_ts }}
       release: ${{ steps.filter.outputs.release }}
+      release_rehearsal: ${{ steps.filter.outputs.release_rehearsal }}
       upgrade: ${{ steps.filter.outputs.upgrade }}
     steps:
       # Push events (after merge to main) resolve the filter with git commands
@@ -846,6 +849,31 @@ jobs:
               - '.github/workflows/release.yml'
               - 'scripts/release'
               - 'packaging/**'
+            # Release rehearsal (issue #150): the release workflows, the
+            # packaging and assembly tools, the compatibility matrix and locks,
+            # the official packages, the consumer suite, and the crates the
+            # assembler and the signed catalog live in. The rehearsal builds the
+            # Linux release artifacts from this commit, runs every matrix row,
+            # assembles and signs a bundle with a throwaway key and runs the
+            # network-isolated archive smoke on it.
+            release_rehearsal:
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/release.yml'
+              - '.github/workflows/release-build.yml'
+              - '.github/workflows/release-evidence.yml'
+              - 'packaging/**'
+              - 'scripts/release-workflow/**'
+              - 'scripts/tests/test_release_workflow.py'
+              - 'scripts/tests/test_release_workflow_scripts.py'
+              - 'crates/xtask/**'
+              - 'crates/package/**'
+              - 'compat/**'
+              - 'runtime-packages/**'
+              - 'crates/cli/tests/release_consumer.rs'
+              - 'crates/cli/tests/support/**'
+              - 'sdk/ts/scripts/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
             # Upgrade from the previous release's published binaries to this
             # build with a live session (issue #525): the crates that decide
             # whether a live session survives (public protocol, worker
@@ -974,9 +1002,11 @@ jobs:
 
       - name: Export binary paths
         run: |
-          echo "POHUNEK_DAEMON_BIN=$PWD/target/debug/pohunekd" >> "$GITHUB_ENV"
-          echo "POHUNEK_WORKER_BIN=$PWD/target/debug/pohunek-sessiond" >> "$GITHUB_ENV"
-          echo "POHUNEK_CLI_BIN=$PWD/target/debug/pohunek" >> "$GITHUB_ENV"
+          {
+            echo "POHUNEK_DAEMON_BIN=$PWD/target/debug/pohunekd"
+            echo "POHUNEK_WORKER_BIN=$PWD/target/debug/pohunek-sessiond"
+            echo "POHUNEK_CLI_BIN=$PWD/target/debug/pohunek"
+          } >> "$GITHUB_ENV"
 
       - name: Platform systemd backend
         run: cargo test --locked -p pohunek-platform --test systemd -- --ignored --test-threads 1
@@ -1133,6 +1163,43 @@ jobs:
 
       - name: Release build
         run: cargo build --workspace --release
+
+  # Release rehearsal (issue #150): the PR-time proof of the release assembly.
+  # It runs the same reusable workflows as a tag with mode `rehearsal`: the
+  # Linux archives, packages and SDK tarballs are built from this commit, every
+  # (runtime x target) row runs against the pinned upstream, a bundle is
+  # assembled and signed with a throwaway key derived from public values (no
+  # secret, no environment, no provenance, nothing published) and the
+  # network-isolated archive smoke runs on it. It runs on schedule, push to
+  # main, manual dispatch, or a pull request that changes a `release_rehearsal`
+  # filter input; never for a fork or Dependabot pull request, whose token
+  # cannot hold the scopes the called workflow declares. The caller grants
+  # `id-token`/`attestations` only because a called workflow cannot hold a scope
+  # its caller lacks; the attest jobs are skipped in this mode.
+  release-rehearsal-build:
+    name: release rehearsal (build)
+    needs: changes
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release_rehearsal == 'true') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    uses: ./.github/workflows/release-build.yml
+    permissions:
+      contents: read
+    with:
+      mode: rehearsal
+
+  release-rehearsal:
+    name: release rehearsal (evidence, assembly, archive smoke)
+    needs: [changes, release-rehearsal-build]
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.release_rehearsal == 'true') && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+    uses: ./.github/workflows/release-evidence.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    with:
+      version: ${{ needs.release-rehearsal-build.outputs.version }}
+      commit: ${{ github.sha }}
+      mode: rehearsal
+      targets: x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
 
   # TS-binding drift is gated by paths filter (issue #125); it only runs on
   # schedule, push to main, manual dispatch (always a full run), or when the

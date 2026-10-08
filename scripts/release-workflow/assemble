@@ -1,0 +1,109 @@
+#!/bin/sh
+# Assemble and sign the release bundle.
+#
+# usage: assemble <release|rehearsal> <inputs-dir> <output-dir>
+#                                       (run from the repository root)
+# env:   VERSION  COMMIT  XTASK  RUNNER_TEMP
+#        TARGETS  rehearsal only: space-separated targets the policy keeps
+#        RUN_ID   rehearsal only: the workflow run id
+#        CATALOG_SIGNING_KEY_CI  release only: the CI root seed (hex)
+#
+# release    signs with the CI root seed from the environment secret, against
+#            packaging/runtime-catalog-anchor.json, with the full policy. The
+#            key id passed to xtask is the anchor root holding the CI public
+#            key (packaging/catalog-trust/ci.pub), so any other seed fails. The
+#            seed is written once to a 0700 tmpfs directory with mode 0600,
+#            removed from the environment before any other program starts, and
+#            shredded on exit. It is never echoed.
+# rehearsal  signs with a throwaway key derived from public values
+#            (scripts/release-workflow/rehearsal-trust) against the throwaway
+#            anchor the rehearsal archives were staged with; no secret exists.
+#
+# After assembling, the bundle is re-checked with `release verify-inventory`.
+
+set -eu
+
+fail() {
+    printf 'assemble: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 3 ] || fail "usage: assemble <release|rehearsal> <inputs-dir> <output-dir>"
+mode=$1
+inputs=$2
+output=$3
+for name in VERSION COMMIT XTASK RUNNER_TEMP; do
+    eval "value=\${$name:-}"
+    [ -n "$value" ] || fail "$name is required"
+done
+[ -x "$XTASK" ] || fail "XTASK is not executable"
+[ -d "$inputs" ] || fail "not a directory: $inputs"
+[ "$(git rev-parse HEAD)" = "$COMMIT" ] || fail "the checkout is not commit $COMMIT"
+commit_time=$(git log -1 --format=%ct)
+here=$(dirname -- "$0")
+
+umask 077
+work=$(mktemp -d "$RUNNER_TEMP/assemble.XXXXXX")
+secret_dir=
+cleanup() {
+    status=$?
+    trap '' EXIT
+    if [ -n "$secret_dir" ] && [ -d "$secret_dir" ]; then
+        shred -u -- "$secret_dir"/* 2>/dev/null || true
+        rm -rf -- "$secret_dir"
+    fi
+    rm -rf -- "$work"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+case $mode in
+    release)
+        [ -z "${TARGETS:-}" ] || fail "a release is assembled with the full policy"
+        [ -n "${CATALOG_SIGNING_KEY_CI:-}" ] || fail "CATALOG_SIGNING_KEY_CI is not set"
+        # /dev/shm is tmpfs: the seed never reaches a disk-backed file.
+        [ -d /dev/shm ] || fail "/dev/shm is required for the signing key"
+        secret_dir=$(mktemp -d /dev/shm/pohunek-key.XXXXXX)
+        chmod 700 "$secret_dir"
+        printf '%s' "$CATALOG_SIGNING_KEY_CI" > "$secret_dir/key"
+        unset CATALOG_SIGNING_KEY_CI
+        key_file=$secret_dir/key
+        anchor=packaging/runtime-catalog-anchor.json
+        # The expected signer is the anchor root that carries the CI public key,
+        # so a seed of any other root (the offline primary) is refused by xtask.
+        ci_public_key=$(tr -d '\n' < packaging/catalog-trust/ci.pub)
+        key_id=$(jq -r --arg key "$ci_public_key" \
+            '[.roots[] | select(.public_key == $key) | .key_id] | if length == 1 then .[0] else empty end' "$anchor")
+        policy=packaging/release-policy.json
+        ;;
+    rehearsal)
+        [ -n "${RUN_ID:-}" ] || fail "RUN_ID is required"
+        [ -z "${CATALOG_SIGNING_KEY_CI:-}" ] || fail "a rehearsal must not see the release signing key"
+        "$here/rehearsal-trust" "$work/trust" "$RUN_ID" "$COMMIT"
+        key_file=$work/trust/seed
+        anchor=$work/trust/anchor.json
+        key_id=$(cat "$work/trust/key-id")
+        # shellcheck disable=SC2086
+        "$here/prepare-policy" packaging/release-policy.json "$work/policy.json" ${TARGETS:-}
+        policy=$work/policy.json
+        ;;
+    *) fail "mode must be release or rehearsal" ;;
+esac
+case $key_id in
+    '' | *[!0-9a-f]*) fail "cannot derive the signing key id" ;;
+esac
+
+"$XTASK" release assemble \
+    --version "$VERSION" \
+    --commit "$COMMIT" \
+    --commit-time "$commit_time" \
+    --policy "$policy" \
+    --matrix compat/matrix.json \
+    --inputs "$inputs" \
+    --anchor "$anchor" \
+    --key-file "$key_file" \
+    --key-id "$key_id" \
+    --output "$output"
+"$XTASK" release verify-inventory --dir "$output"

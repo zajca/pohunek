@@ -1,0 +1,47 @@
+#!/bin/sh
+# Verify the build-provenance attestation of every file below a directory.
+#
+# usage: verify-provenance <dir>
+# env:   REPO    owner/name the attestations must belong to
+#        COMMIT  commit of the run (source and signer digest)
+#        REF     git ref of the run (refs/tags/vX.Y.Z)
+#        GH_TOKEN token for the attestation API
+#
+# Each file must carry an attestation made by this repository's
+# release-evidence workflow at COMMIT, from a GitHub-hosted runner, for the
+# run's ref. The workflow file is the signer identity: the attest jobs live
+# there and nowhere else.
+
+set -eu
+
+fail() {
+    printf 'verify-provenance: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: verify-provenance <dir>"
+dir=$1
+for name in REPO COMMIT REF; do
+    eval "value=\${$name:-}"
+    [ -n "$value" ] || fail "$name is required"
+done
+[ -d "$dir" ] || fail "not a directory: $dir"
+
+odd=$(find "$dir" ! -type f ! -type d -print | head -n 1)
+[ -z "$odd" ] || fail "not a regular file or directory: $odd"
+
+count=0
+files=$(find "$dir" -type f -print | LC_ALL=C sort)
+for file in $files; do
+    gh attestation verify "$file" \
+        --repo "$REPO" \
+        --signer-workflow "$REPO/.github/workflows/release-evidence.yml" \
+        --signer-digest "$COMMIT" \
+        --source-ref "$REF" \
+        --source-digest "$COMMIT" \
+        --deny-self-hosted-runners >/dev/null \
+        || fail "no valid provenance for $(basename -- "$file")"
+    count=$((count + 1))
+done
+[ "$count" -gt 0 ] || fail "no files to verify in $dir"
+printf 'verify-provenance: %s files verified\n' "$count"

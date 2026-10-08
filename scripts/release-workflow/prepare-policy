@@ -1,0 +1,33 @@
+#!/bin/sh
+# Write the release policy the assembler is given.
+#
+# usage: prepare-policy <packaging/release-policy.json> <output> [target]...
+#
+# Without targets the policy is copied unchanged (a release). With targets the
+# archive list keeps only those targets, which is how a rehearsal leaves out
+# the platforms it does not build; every other field is kept as is.
+
+set -eu
+
+fail() {
+    printf 'prepare-policy: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -ge 2 ] || fail "usage: prepare-policy <policy> <output> [target]..."
+policy=$1
+output=$2
+shift 2
+targets=$*
+
+[ -f "$policy" ] || fail "not a file: $policy"
+[ ! -e "$output" ] || fail "output exists: $output"
+
+if [ -z "$targets" ]; then
+    cp -- "$policy" "$output"
+else
+    jq --arg targets "$targets" '
+        ($targets | split(" ") | map(select(length > 0))) as $wanted
+        | .archives |= map(select(.target as $t | $wanted | index($t)))
+    ' "$policy" > "$output" || fail "cannot filter the policy"
+fi

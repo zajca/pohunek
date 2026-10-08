@@ -1,0 +1,42 @@
+#!/bin/sh
+# Build every official runtime package archive of the checkout.
+#
+# usage: build-packages <version> <output-dir>     (run from the repository root)
+# env:   XTASK  path of the built xtask binary
+#
+# The official packages are the directories of `runtime-packages/`; no runtime
+# is named here. Each one is built twice and compared (`package verify`), then
+# written as `pohunek-runtime-<runtime>-<version>.tar.zst` with a `.sha256`
+# file in `sha256sum -c` format. The name carries the core release version, as
+# `cargo xtask release assemble` expects.
+
+set -eu
+
+fail() {
+    printf 'build-packages: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 2 ] || fail "usage: build-packages <version> <output-dir>"
+version=$1
+output=$2
+[ -n "${XTASK:-}" ] && [ -x "$XTASK" ] || fail "XTASK must name the built xtask binary"
+case $version in
+    '' | *[!0-9.]*) fail "invalid version: $version" ;;
+esac
+mkdir -p "$output"
+
+count=0
+for dir in runtime-packages/*/; do
+    [ -d "$dir" ] || continue
+    runtime=$(basename -- "$dir")
+    case $runtime in
+        '' | *[!a-z0-9_-]*) fail "invalid runtime directory name: $runtime" ;;
+    esac
+    archive="pohunek-runtime-$runtime-$version.tar.zst"
+    "$XTASK" package verify "runtime-packages/$runtime"
+    "$XTASK" package build "runtime-packages/$runtime" --output "$output/$archive"
+    (cd "$output" && sha256sum -- "$archive" > "$archive.sha256")
+    count=$((count + 1))
+done
+[ "$count" -gt 0 ] || fail "runtime-packages/ holds no package directory"
