@@ -23,7 +23,9 @@ Start here:
   catalog authorizes official packages and how local digest trust differs.
   The [release attestation](concepts/release-attestation.md) defines the
   per-package, per-target compatibility attestation, the binary-set digest and
-  `compat/matrix.json`.
+  `compat/matrix.json`. The [release bundle](concepts/release-bundle.md)
+  defines the assembled release layout, the release policy file, the catalog
+  sequence and expiry rules and the inventory the publisher verifies.
 - [Setup](guides/setup.md), [project setup](guides/project-setup.md),
   and [remote hosts](guides/remote-hosts.md)
   cover common configuration paths. The

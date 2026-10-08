@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "catalog_validity_days": 365,
+  "archives": [
+    { "component": "cli", "target": "aarch64-apple-darwin" },
+    { "component": "cli", "target": "x86_64-unknown-linux-gnu" },
+    { "component": "cli", "target": "x86_64-unknown-linux-musl" },
+    { "component": "daemon", "target": "aarch64-apple-darwin" },
+    { "component": "daemon", "target": "x86_64-unknown-linux-gnu" },
+    { "component": "daemon", "target": "x86_64-unknown-linux-musl" },
+    { "component": "relay", "target": "x86_64-unknown-linux-gnu" }
+  ],
+  "sdk_packages": ["protocol", "sdk", "testkit"]
+}

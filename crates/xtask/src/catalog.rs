@@ -27,7 +27,7 @@ use nix::fcntl::OFlag;
 use package::{
     catalog_document_bytes, check_catalog, parse_anchor, read_archive, sign_catalog,
     verify_catalog, AnchorFile, AnchorFileError, Attestation, Catalog, CatalogEntry, KeyId, Limits,
-    PackageDigest, Release, RootKey, CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES,
+    PackageDigest, Release, RootKey, VerifiedCatalog, CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES,
 };
 use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde::Deserialize;
@@ -75,14 +75,14 @@ struct PackageSpec {
     core: String,
 }
 
-fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> XtaskError {
+pub(crate) fn io_error(path: &Path) -> impl FnOnce(std::io::Error) -> XtaskError {
     let path = path.to_path_buf();
     move |source| XtaskError::Io { path, source }
 }
 
 /// Reads the regular file at `path`, at most `max_bytes`, without following a
 /// final symbolic link.
-fn read_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>, XtaskError> {
+pub(crate) fn read_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>, XtaskError> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).bits())
@@ -114,7 +114,7 @@ fn read_input(path: &Path, max_bytes: u64) -> Result<Vec<u8>, XtaskError> {
 /// Writes `bytes` to `output`, refusing a symbolic link.
 ///
 /// The open is no-follow, so a link is never written through.
-fn write_output(output: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
+pub(crate) fn write_output(output: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
     let mut file: File = OpenOptions::new()
         .write(true)
         .create(true)
@@ -135,7 +135,7 @@ fn write_output(output: &Path, bytes: &[u8]) -> Result<(), XtaskError> {
     file.write_all(bytes).map_err(io_error(output))
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut text, byte| {
         // Writing to a String cannot fail.
         let _ = write!(text, "{byte:02x}");
@@ -346,6 +346,22 @@ pub(crate) struct Verified {
     pub(crate) entries: Vec<String>,
 }
 
+/// Verifies the signed catalog `document` against the anchor file bytes
+/// `anchor_bytes` at `now`, with `high_water` as the lowest acceptable
+/// sequence.
+pub(crate) fn verify_bytes(
+    document: &[u8],
+    anchor_bytes: &[u8],
+    high_water: Option<u64>,
+    now: u64,
+) -> Result<VerifiedCatalog, XtaskError> {
+    let anchor = parse_anchor(anchor_bytes)
+        .map_err(XtaskError::Anchor)?
+        .trust_anchor()
+        .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))?;
+    verify_catalog(document, &anchor, now, high_water).map_err(XtaskError::Catalog)
+}
+
 /// Verifies the catalog at `catalog_path` against the anchor file at
 /// `anchor_path` at `now`, with `high_water` as the lowest acceptable
 /// sequence.
@@ -359,16 +375,11 @@ pub(crate) fn verify(
         anchor_path,
         u64::try_from(package::MAX_ANCHOR_BYTES).unwrap_or(u64::MAX),
     )?;
-    let anchor = parse_anchor(&anchor_bytes)
-        .map_err(XtaskError::Anchor)?
-        .trust_anchor()
-        .map_err(|error| XtaskError::Anchor(AnchorFileError::Anchor(error)))?;
     let document = read_input(
         catalog_path,
         u64::try_from(MAX_CATALOG_BYTES).unwrap_or(u64::MAX),
     )?;
-    let verified =
-        verify_catalog(&document, &anchor, now, high_water).map_err(XtaskError::Catalog)?;
+    let verified = verify_bytes(&document, &anchor_bytes, high_water, now)?;
     let entries = verified
         .entries()
         .iter()
