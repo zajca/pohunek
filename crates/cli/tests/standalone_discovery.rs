@@ -84,6 +84,27 @@ fn inspect_rejects_unknown_and_ambiguous_netbird_hosts() {
 }
 
 #[test]
+fn inspect_never_dials_an_unlisted_or_untrusted_netbird_address() {
+    let known_peer = r#"{"peers":[{"fqdn":"safe.example","netbirdIp":"100.64.0.2"}]}"#;
+    for selector in ["100.64.0.99", "8.8.8.8"] {
+        let output = inspect_output(known_peer, selector);
+        assert!(!output.status.success());
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+        assert_eq!(document["err"]["code"], "host_unknown", "{selector}");
+    }
+
+    let spoofed = r#"{"peers":[{"fqdn":"evil.example","netbirdIp":"169.254.169.254"}]}"#;
+    for selector in ["evil", "evil.example", "169.254.169.254"] {
+        let output = inspect_output(spoofed, selector);
+        assert!(!output.status.success());
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+        assert_eq!(document["err"]["code"], "host_unknown", "{selector}");
+    }
+}
+
+#[test]
 fn malformed_netbird_status_is_a_cli_error() {
     for body in ["", "{ this is not json ]", "42", "[1, 2, 3]"] {
         let output = discover_output(body);

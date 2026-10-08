@@ -201,39 +201,4 @@ mod tests {
         let ip = resolve_host(&status(), "100.92.30.40").unwrap();
         assert_eq!(ip, "100.92.30.40".parse::<IpAddr>().unwrap());
     }
-
-    #[test]
-    fn rejects_raw_netbird_ip_without_peer_state() {
-        let error = resolve_host(&status(), "100.64.0.99").unwrap_err();
-        assert!(matches!(error, NetbirdError::HostUnknown(_)));
-    }
-
-    #[test]
-    fn raw_non_netbird_ip_does_not_resolve() {
-        // A public IP literal must not bypass peer matching.
-        let err = resolve_host(&status(), "8.8.8.8").unwrap_err();
-        assert!(matches!(err, NetbirdError::HostUnknown(_)));
-    }
-
-    #[test]
-    fn peer_with_non_netbird_ip_does_not_resolve() {
-        // A peer that matches by name/fqdn/ip but advertises an address OUTSIDE
-        // the NetBird range must be treated as not-matched (fail closed), so the
-        // CLI never dials a loopback / cloud-metadata / LAN / public host the
-        // peer table happens to carry.
-        let status = parse_status(
-            r#"{"peers":[{"fqdn":"evil.netbird.cloud","netbirdIp":"169.254.169.254","status":"Connected"}]}"#,
-        )
-        .expect("inline status parses");
-
-        for name in ["evil", "evil.netbird.cloud", "169.254.169.254"] {
-            assert!(
-                matches!(
-                    resolve_host(&status, name),
-                    Err(NetbirdError::HostUnknown(_))
-                ),
-                "name {name} must not resolve to a non-NetBird IP"
-            );
-        }
-    }
 }
