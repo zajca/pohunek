@@ -188,8 +188,6 @@ function recordedExchanges(): Array<{ method: string; params: unknown; expected:
   });
 }
 
-const family = (name: string): string => name.split(".")[0] ?? name;
-
 async function everyRecordedMethod(fresh: boolean): Promise<void> {
   const daemon = await startPreviousDaemon();
   const shared = await connect(daemon);
@@ -213,16 +211,16 @@ async function everyRecordedMethod(fresh: boolean): Promise<void> {
   expect(daemon.seen.violations).toEqual([]);
 
   const introduced = new Set<string>(PREVIOUS_VERSION_INTRODUCED_METHODS);
-  const registryFamilies = new Set(METHOD_NAMES.filter((name) => !introduced.has(name)).map(family));
-  expect(new Set([...exercised].map(family))).toEqual(registryFamilies);
+  const previousMethods = new Set(METHOD_NAMES.filter((name) => !introduced.has(name)));
+  expect(exercised).toEqual(previousMethods);
 }
 
 describe("client against a daemon of the previous release", () => {
-  test("every method family works on one connection", async () => {
+  test("every previous-release method works on one connection", async () => {
     await everyRecordedMethod(false);
   });
 
-  test("every method family works on a cold connection", async () => {
+  test("every previous-release method works on a cold connection", async () => {
     await everyRecordedMethod(true);
   });
 

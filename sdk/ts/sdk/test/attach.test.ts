@@ -8,10 +8,8 @@ import {
   attachRawTcp,
   connectLocal,
   connectRawLocal,
-  connectTcp,
   type RawStream,
 } from "@pohunek/sdk";
-import { attachRawTransport, connectRawTransport } from "../src/attach";
 import {
   errResponseLine,
   okResponseLine,
@@ -199,34 +197,19 @@ function tcpAddress(daemon: MockDaemon): { host: string; port: number } {
 }
 
 async function attachLocal(daemon: MockDaemon, streamId: string): Promise<RawStream> {
-  if (daemon.endpoint.kind === "memory") {
-    return attachRawTransport(daemon.endpoint.transport, streamId);
-  }
   return attachRawLocal(unixSocketPath(daemon), streamId);
 }
 
 async function attachTcp(daemon: MockDaemon, host: string, streamId: string): Promise<RawStream> {
-  if (daemon.endpoint.kind === "memory") {
-    return attachRawTransport(daemon.endpoint.transport, streamId, host);
-  }
   return attachRawTcp(host, tcpAddress(daemon), streamId);
 }
 
 async function connectRaw(daemon: MockDaemon): Promise<RawStream> {
-  if (daemon.endpoint.kind === "memory") {
-    return connectRawTransport(daemon.endpoint.transport);
-  }
   return connectRawLocal(unixSocketPath(daemon));
 }
 
 async function connectControl(daemon: MockDaemon): Promise<Client> {
-  if (daemon.endpoint.kind === "unix") {
-    return connectLocal(daemon.endpoint.socketPath);
-  }
-  if (daemon.endpoint.kind === "memory") {
-    return Client.connectTransport(daemon.endpoint.transport);
-  }
-  return connectTcp("build-box", { host: daemon.endpoint.host, port: daemon.endpoint.port });
+  return connectLocal(unixSocketPath(daemon));
 }
 
 async function readAll(raw: RawStream, byteLength: number): Promise<Uint8Array> {

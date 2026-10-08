@@ -1,5 +1,5 @@
-import { rmSync } from "node:fs";
-import { join } from "node:path";
+import { rmSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { createServer, type AddressInfo, type Server, type Socket } from "node:net";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, type SessionInfo } from "@pohunek/protocol";
 import { ClientError, type ControlChannel, type RawDuplex, type Transport } from "@pohunek/sdk";
@@ -16,6 +16,7 @@ export type ScriptStep =
   | { kind: "close" }
   | { kind: "oversized" }
   | { kind: "delay"; ms: number; line: string | ((requestLine: string) => string) }
+  | { kind: "gate"; ready: Promise<void>; line: string | ((requestLine: string) => string) }
   | { kind: "silent" }
   | { kind: "subscription"; ack: string | ((requestLine: string) => string); events: string[] }
   | { kind: "attachSuccess"; emit?: Uint8Array[]; echo?: boolean; readDelayMs?: number }
@@ -49,10 +50,26 @@ function socketRootDir(): string {
   return socketRoot;
 }
 
-export async function startUnixDaemon(steps: ScriptStep[]): Promise<MockDaemon> {
+export interface UnixDaemonOptions {
+  /** Binds the daemon at this exact path; default is a private root path. */
+  readonly socketPath?: string;
+}
+
+function unixSocketPath(options: UnixDaemonOptions | undefined): string {
+  if (options?.socketPath !== undefined) {
+    return options.socketPath;
+  }
+  return join(socketRootDir(), `${nextSocketId++}.sock`);
+}
+
+export async function startUnixDaemon(
+  steps: ScriptStep[],
+  options?: UnixDaemonOptions,
+): Promise<MockDaemon> {
   let socketPath: string;
   try {
-    socketPath = join(socketRootDir(), `${nextSocketId++}.sock`);
+    socketPath = unixSocketPath(options);
+    mkdirSync(dirname(socketPath), { recursive: true });
   } catch (error: unknown) {
     // A sandbox without a writable temp directory cannot bind a Unix socket.
     if (isFilesystemDenied(error)) {
@@ -79,10 +96,10 @@ export async function startUnixDaemon(steps: ScriptStep[]): Promise<MockDaemon> 
     nextRequest: (): Promise<string> => runtime.nextRequest(),
     nextAttachPrelude: (): Promise<Uint8Array> => runtime.nextAttachPrelude(),
     expectNoRequest: (timeoutMs: number): Promise<void> => runtime.expectNoRequest(timeoutMs),
-    close: async (): Promise<void> => {
+    close: onceOnly(async (): Promise<void> => {
       await closeServer(server, runtime.sockets);
       rmSync(socketPath, { force: true });
-    },
+    }),
   };
 }
 
@@ -109,9 +126,21 @@ export async function startTcpDaemon(steps: ScriptStep[]): Promise<MockDaemon> {
     nextRequest: (): Promise<string> => runtime.nextRequest(),
     nextAttachPrelude: (): Promise<Uint8Array> => runtime.nextAttachPrelude(),
     expectNoRequest: (timeoutMs: number): Promise<void> => runtime.expectNoRequest(timeoutMs),
-    close: async (): Promise<void> => {
+    close: onceOnly(async (): Promise<void> => {
       await closeServer(server, runtime.sockets);
-    },
+    }),
+  };
+}
+
+/** Wraps a close so repeated teardown stays harmless. */
+function onceOnly(close: () => Promise<void>): () => Promise<void> {
+  let closed = false;
+  return async (): Promise<void> => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    await close();
   };
 }
 
@@ -477,6 +506,11 @@ function applyMemoryStep(queue: AsyncQueue<string>, requestLine: string, step: S
         queue.push(resolveLine(step.line, requestLine));
       });
       return;
+    case "gate":
+      void step.ready.then(() => {
+        queue.push(resolveLine(step.line, requestLine));
+      });
+      return;
     case "silent":
       return;
     case "subscription":
@@ -551,6 +585,12 @@ async function applyStep(socket: Socket, requestLine: string, step: ScriptStep):
       return;
     case "delay":
       await delay(step.ms);
+      if (!socket.destroyed) {
+        await writeLine(socket, resolveLine(step.line, requestLine));
+      }
+      return;
+    case "gate":
+      await step.ready;
       if (!socket.destroyed) {
         await writeLine(socket, resolveLine(step.line, requestLine));
       }

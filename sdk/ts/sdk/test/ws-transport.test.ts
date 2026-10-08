@@ -1,4 +1,9 @@
 import { Buffer } from "node:buffer";
+import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
+import type { Readable } from "node:stream";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "bun:test";
 import { MAX_CONTROL_LINE_BYTES, PROTOCOL_VERSION, CLIENT_PROTOCOL_VERSIONS, type ProtocolError, type ProtocolEvent, type SessionInfo } from "@pohunek/protocol";
 import { startTestRelay, type DaemonTarget, type TestRelayHandle } from "@pohunek/testkit/bun-relay";
@@ -22,11 +27,19 @@ import {
 } from "./mock-daemon";
 
 const RELAY_HOST = "local";
+const SDK_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const READY_BYTES = Uint8Array.of(0x70, 0x74, 0x79);
 const BACKPRESSURE_TOTAL_BYTES = 4 * 1024 * 1024;
 const BACKPRESSURE_CHUNK_BYTES = 64 * 1024;
 const SLOW_READER_DELAY_MS = 2;
 const SLOW_CLIENT_READ_DELAY_MS = 1;
+// WebSocket close codes of the WS protocol, and the relay's HTTP refusals.
+const WS_NORMAL_CLOSE = 1000;
+const WS_PROTOCOL_ERROR = 1002;
+const WS_UNSUPPORTED_DATA = 1003;
+const HTTP_NOT_FOUND = 404;
+const HTTP_UPGRADE_REQUIRED = 426;
+const RELAY_SOCKET_TIMEOUT_MS = 5_000;
 
 interface RelayFixture {
   daemon: MockDaemon;
@@ -348,6 +361,125 @@ describe("WebSocket transport through relay", () => {
     }
   });
 
+  test("a client that starts without crypto.randomUUID still talks the protocol", async () => {
+    // Browsers may miss `crypto.randomUUID`; the isolated child process below
+    // starts exactly that way before the SDK module loads, then drives a real
+    // daemon fixture over a real Unix socket, so the browser path is exercised
+    // end to end rather than one helper in isolation. The child runs async:
+    // `spawnSync` would block this event loop and the daemon fixture with it.
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (requestLine) => okResponseLine(requestIdFromLine(requestLine), {
+          status: "ok",
+          daemon_version: "0.0.0-test",
+          protocol_version: PROTOCOL_VERSION,
+        }),
+      },
+    ]);
+    try {
+      const script = [
+        'Object.defineProperty(globalThis.crypto, "randomUUID", { configurable: true, value: undefined });',
+        'const sdk = await import("@pohunek/sdk");',
+        `const client = await sdk.connectLocal(${JSON.stringify(socketPath(daemon))}, { connectTimeoutMs: 5000 });`,
+        'const health = await client.call("daemon.health", null);',
+        'process.stdout.write(`${health.protocol_version}:${sdk.nextRequestId("browser")}`);',
+        'await client.close();',
+      ].join("\n");
+      const child = spawn(process.execPath, ["--eval", script], {
+        cwd: SDK_ROOT,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const run = await completed(child);
+      if (run.code !== 0) {
+        throw new Error(`browser-like client process failed with ${run.code}: ${run.stderr}`);
+      }
+      const [versionText, requestId] = run.stdout.split(":");
+      expect(versionText).toBe(String(PROTOCOL_VERSION));
+      expect(/^sdk-browser-[0-9a-f]+-\d+$/u.test(requestId ?? "")).toBe(true);
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("only websocket upgrades reach a target, and unknown relay routes close before it", async () => {
+    // The relay refuses plain HTTP on the relay routes with the
+    // upgrade-required status without resolving a daemon, and unknown paths
+    // and hosts are 404. The scripted daemon must receive nothing in every
+    // case, so the refusals stay ahead of any daemon work.
+    const fixture = await startRelayFixture([{ kind: "silent" }]);
+    try {
+      const url = fixture.relay.url;
+      for (const path of ["/", "/daemon/local", "/daemon/local/other", "/other/local/control"]) {
+        const response = await fetch(`${url}${path}`);
+        expect(response.status).toBe(HTTP_NOT_FOUND);
+      }
+      const plain = await fetch(`${url}/daemon/${RELAY_HOST}/control`);
+      expect(plain.status).toBe(HTTP_UPGRADE_REQUIRED);
+      const unknownHost = await fetch(`${url}/daemon/missing/control`, { headers: { upgrade: "websocket" } });
+      expect(unknownHost.status).toBe(HTTP_NOT_FOUND);
+
+      await fixture.daemon.expectNoRequest(50);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("control mode closes the tunnel on binary frames and on embedded newlines", async () => {
+    const fixture = await startRelayFixture([{ kind: "silent" }]);
+    try {
+      const url = fixture.relay.url.replace("http", "ws");
+      const binary = await openSocket(`${url}/daemon/${RELAY_HOST}/control`);
+      const binaryClosed = closeCode(binary);
+      binary.send(Uint8Array.of(1, 2, 3));
+      expect(await binaryClosed).toBe(WS_PROTOCOL_ERROR);
+
+      const newline = await openSocket(`${url}/daemon/${RELAY_HOST}/control`);
+      const newlineClosed = closeCode(newline);
+      newline.send("a\nb");
+      expect(await newlineClosed).toBe(WS_PROTOCOL_ERROR);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("attach mode relays binary frames both ways and rejects text frames", async () => {
+    const fixture = await startRelayFixture([
+      { kind: "attachSuccess", emit: [READY_BYTES] },
+    ]);
+    try {
+      const url = fixture.relay.url.replace("http", "ws");
+      const ws = await openSocket(`${url}/daemon/${RELAY_HOST}/attach`);
+      // A real attach prelude: the daemon redeems it and answers with the PTY
+      // ready bytes, which the relay must relays both directions in binary.
+      ws.send(utf8Bytes('{"attach":"stream-relay-ws"}\n'));
+      const received = await nextMessage(ws);
+      expect(received instanceof ArrayBuffer).toBe(true);
+      expect(Array.from(new Uint8Array(received as ArrayBuffer))).toEqual([0x70, 0x74, 0x79]);
+
+      const closed = closeCode(ws);
+      ws.send("text");
+      expect(await closed).toBe(WS_UNSUPPORTED_DATA);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("closing the daemon target closes the relay tunnel with a normal close", async () => {
+    const fixture = await startRelayFixture([{ kind: "silent" }]);
+    try {
+      const url = fixture.relay.url.replace("http", "ws");
+      const ws = await openSocket(`${url}/daemon/${RELAY_HOST}/attach`);
+      const closed = closeCode(ws);
+      await fixture.daemon.expectNoRequest(50);
+      await fixture.daemon.close();
+      expect(await closed).toBe(WS_NORMAL_CLOSE);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test("unreachable relay rejects connectWs with the host_unreachable taxonomy", async () => {
     const relay = await startTestRelay({
       bindHost: "127.0.0.1",
@@ -389,6 +521,36 @@ async function startRelayFixture(steps: Parameters<typeof startUnixDaemon>[0]): 
     await daemon.close();
     throw error;
   }
+}
+
+function socketPath(daemon: MockDaemon): string {
+  if (daemon.endpoint.kind !== "unix") {
+    throw new Error("this test requires a real Unix socket daemon endpoint");
+  }
+  return daemon.endpoint.socketPath;
+}
+
+/** Runs `child` to completion and returns its exit status and captured output. */
+async function completed(
+  child: ChildProcess,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  const [stdout, stderr, status] = await Promise.all([
+    collect(child.stdout),
+    collect(child.stderr),
+    once(child, "exit"),
+  ]);
+  return { code: status[0] as number | null, stdout, stderr };
+}
+
+async function collect(stream: Readable | null): Promise<string> {
+  if (stream === null) {
+    return "";
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk as Buffer));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function daemonTarget(daemon: MockDaemon): DaemonTarget {
@@ -552,5 +714,50 @@ function utf8Bytes(value: string): Uint8Array {
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
+  });
+}
+
+/** Opens the relay's raw WebSocket bounded by the relay socket timeout. */
+function openSocket(url: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    const timer = setTimeout(() => reject(new Error("websocket open timed out")), RELAY_SOCKET_TIMEOUT_MS);
+    ws.addEventListener("open", () => {
+      clearTimeout(timer);
+      resolve(ws);
+    });
+    ws.addEventListener("error", () => {
+      clearTimeout(timer);
+      reject(new Error("websocket failed to open"));
+    });
+  });
+}
+
+function nextMessage(ws: WebSocket): Promise<string | ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("websocket message timed out")), RELAY_SOCKET_TIMEOUT_MS);
+    ws.addEventListener(
+      "message",
+      (event) => {
+        clearTimeout(timer);
+        resolve(event.data as string | ArrayBuffer);
+      },
+      { once: true },
+    );
+  });
+}
+
+function closeCode(ws: WebSocket): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("websocket close timed out")), RELAY_SOCKET_TIMEOUT_MS);
+    ws.addEventListener(
+      "close",
+      (event) => {
+        clearTimeout(timer);
+        resolve(event.code);
+      },
+      { once: true },
+    );
   });
 }
