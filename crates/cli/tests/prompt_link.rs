@@ -136,3 +136,77 @@ fn prompt_link_invalid_json_honors_json_error_output() {
         "error should describe invalid provider JSON: {doc:?}"
     );
 }
+
+#[test]
+fn prompt_link_rejects_unsafe_provider_branch_values() {
+    for (context, expected) in [
+        (
+            r#"{"title":"Title","branchName":" "}"#,
+            "provider link metadata is missing `link.branch`",
+        ),
+        (
+            "{\"title\":\"Title\",\"branchName\":\"feature/line\\nbreak\"}",
+            "provider link metadata `link.branch` contains an ASCII control character",
+        ),
+    ] {
+        let mut child = pohunek()
+            .args([
+                "prompt",
+                "link",
+                "--provider",
+                "linear_issue",
+                "--item-id",
+                "LIN-1",
+                "--url",
+                "https://linear.test/LIN-1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn pohunek");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(context.as_bytes())
+            .expect("write stdin");
+
+        let out = child.wait_with_output().expect("wait pohunek");
+        assert!(!out.status.success(), "unsafe branch must fail");
+        assert!(out.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(expected),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn prompt_link_uses_github_branch_fallback() {
+    let stdout = run_prompt_link(
+        "github_pr",
+        "7",
+        "https://example.test/pr/7",
+        r#"{"title":"Fix filters","branch":"feature/fallback","branchName":"feature/other"}"#,
+    );
+    assert!(
+        stdout.contains("link.branch=feature/fallback\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn prompt_link_uses_linear_branch_fallback() {
+    let stdout = run_prompt_link(
+        "linear_issue",
+        "LIN-1",
+        "https://linear.test/LIN-1",
+        r#"{"title":"Fix launcher","branch":"feature/linear-fallback"}"#,
+    );
+    assert!(
+        stdout.contains("link.branch=feature/linear-fallback\n"),
+        "{stdout}"
+    );
+}
