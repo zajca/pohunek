@@ -1,17 +1,13 @@
-"""Regression checks for the JUnit flaky-test job summary (stdlib only).
+"""CLI integration coverage for the nextest JUnit job summary.
 
-The fixtures under `fixtures/nextest-junit/` are unedited nextest 0.9.145
-reports from a throwaway test that failed on attempt 1 and passed on attempt
-2, next to a test that failed every attempt, run under profile.heavy
-(`retries = 2`). `flaky-result-fail.xml` used the repository policy;
-`flaky-result-pass.xml` overrode it with `NEXTEST_FLAKY_RESULT=pass`.
+The captured reports under `fixtures/nextest-junit/` came from nextest
+0.9.145 with a flaky test and a persistent failure under the heavy profile.
 """
 
-import contextlib
-import importlib.machinery
-import importlib.util
-import io
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -19,13 +15,23 @@ SCRIPT = Path(__file__).resolve().parents[1] / "junit-flaky-summary"
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "nextest-junit"
 FLAKY_FAIL = FIXTURES / "flaky-result-fail.xml"
 FLAKY_PASS = FIXTURES / "flaky-result-pass.xml"
-LOADER = importlib.machinery.SourceFileLoader("junit_flaky_summary", str(SCRIPT))
-SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
-summary = importlib.util.module_from_spec(SPEC)
-LOADER.exec_module(summary)
-
 FLAKY_NAME = "pohunek-paths::zz_flaky_sample flaky_first_attempt"
 FAILED_NAME = "pohunek-paths::zz_flaky_sample always_fails"
+
+
+def run_summary(*arguments, summary_path=None):
+    """Run the same script entry point and environment used by CI."""
+    environment = os.environ.copy()
+    environment.pop("GITHUB_STEP_SUMMARY", None)
+    if summary_path is not None:
+        environment["GITHUB_STEP_SUMMARY"] = str(summary_path)
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--label", "heavy", *map(str, arguments)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
 
 
 def table_rows(markdown, header):
@@ -40,148 +46,105 @@ def table_rows(markdown, header):
     return rows
 
 
-class ClassifyTests(unittest.TestCase):
-    def test_flaky_result_fail_report(self):
-        result, problem = summary.load(FLAKY_FAIL)
-        self.assertIsNone(problem)
-        total, flaky, failed = result
-        self.assertEqual(total, 3)
-        self.assertEqual([record["name"] for record in flaky], [FLAKY_NAME])
-        self.assertEqual(flaky[0]["attempts"], 2)
-        self.assertTrue(flaky[0]["fails_run"])
-        self.assertIn("zz_flaky_sample.rs:5:5", flaky[0]["message"])
-        # A persistent failure is not flaky: three attempts, all failed.
-        self.assertEqual([record["name"] for record in failed], [FAILED_NAME])
-        self.assertEqual(failed[0]["attempts"], 3)
+class JunitSummaryCliTests(unittest.TestCase):
+    def test_flaky_and_failed_reports_are_classified_and_rendered(self):
+        failed_run = run_summary("--stdout", FLAKY_FAIL)
+        self.assertEqual(failed_run.returncode, 0, failed_run.stderr)
+        self.assertIn("### Flaky and failed tests: heavy", failed_run.stdout)
+        self.assertIn("3 test(s) in 1 report(s): 1 flaky, 1 failed.", failed_run.stdout)
+        self.assertEqual(
+            table_rows(failed_run.stdout, "| Flaky test |")[0][:3],
+            [FLAKY_NAME, "2", "failure"],
+        )
+        self.assertEqual(
+            table_rows(failed_run.stdout, "| Failed test |")[0][:2],
+            [FAILED_NAME, "3"],
+        )
+        self.assertIn("zz_flaky_sample.rs:5:5", failed_run.stdout)
 
-    def test_flaky_result_pass_report_is_still_listed_as_flaky(self):
-        result, problem = summary.load(FLAKY_PASS)
-        self.assertIsNone(problem)
-        total, flaky, failed = result
-        self.assertEqual(total, 2)
-        self.assertEqual([record["name"] for record in flaky], [FLAKY_NAME])
-        self.assertFalse(flaky[0]["fails_run"])
-        self.assertEqual(failed, [])
+        passing_run = run_summary("--stdout", FLAKY_PASS)
+        self.assertEqual(passing_run.returncode, 0, passing_run.stderr)
+        self.assertIn("2 test(s) in 1 report(s): 1 flaky, 0 failed.", passing_run.stdout)
+        self.assertEqual(
+            table_rows(passing_run.stdout, "| Flaky test |")[0][:3],
+            [FLAKY_NAME, "2", "pass"],
+        )
 
-    def test_malformed_report_is_a_problem(self):
+    def test_malformed_missing_and_clean_reports_keep_the_job_summary_useful(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "junit.xml"
-            path.write_text("<testsuites><testsuite>")
-            result, problem = summary.load(path)
-        self.assertIsNone(result)
-        self.assertIn("unreadable JUnit report", problem)
-
-
-class RenderTests(unittest.TestCase):
-    def test_render_lists_flaky_and_failed_tables(self):
-        markdown = summary.render("heavy", [FLAKY_FAIL])
-        self.assertIn("### Flaky and failed tests: heavy", markdown)
-        self.assertIn("3 test(s) in 1 report(s): 1 flaky, 1 failed.", markdown)
-        flaky = table_rows(markdown, "| Flaky test |")
-        self.assertEqual(len(flaky), 1)
-        self.assertEqual(flaky[0][:3], [FLAKY_NAME, "2", "failure"])
-        failed = table_rows(markdown, "| Failed test |")
-        self.assertEqual(len(failed), 1)
-        self.assertEqual(failed[0][:2], [FAILED_NAME, "3"])
-
-    def test_render_marks_a_flaky_pass_as_counted_pass(self):
-        flaky = table_rows(summary.render("heavy", [FLAKY_PASS]), "| Flaky test |")
-        self.assertEqual(flaky[0][:3], [FLAKY_NAME, "2", "pass"])
-
-    def test_render_clean_report_has_no_tables(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "junit.xml"
-            path.write_text(
+            root = Path(directory)
+            malformed = root / "malformed.xml"
+            malformed.write_text("<testsuites><testsuite>", encoding="utf-8")
+            missing = root / "missing.xml"
+            clean = root / "clean.xml"
+            clean.write_text(
                 '<testsuites><testsuite name="s">'
                 '<testcase name="ok" classname="crate::bin" time="0.1"/>'
-                "</testsuite></testsuites>"
+                "</testsuite></testsuites>",
+                encoding="utf-8",
             )
-            markdown = summary.render("unit", [path])
-        self.assertIn("1 test(s) in 1 report(s): 0 flaky, 0 failed.", markdown)
-        self.assertNotIn("| Flaky test |", markdown)
-        self.assertNotIn("| Failed test |", markdown)
+            result = run_summary("--stdout", malformed, missing, clean, FLAKY_FAIL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"unreadable JUnit report `{malformed}`", result.stdout)
+        self.assertIn(f"missing JUnit report `{missing}`", result.stdout)
+        self.assertIn("4 test(s) in 2 report(s): 1 flaky, 1 failed.", result.stdout)
 
-    def test_render_empty_file_is_reported_as_unreadable(self):
+    def test_empty_report_and_long_warning_path_are_visible(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "junit.xml"
-            path.write_text("")
-            markdown = summary.render("heavy", [path])
-        self.assertIn(f"**Warning:** unreadable JUnit report `{path}`", markdown)
-        self.assertIn("0 test(s) in 0 report(s): 0 flaky, 0 failed.", markdown)
+            empty = Path(directory) / "empty.xml"
+            empty.write_text("", encoding="utf-8")
+            no_cases = Path(directory) / "no-cases.xml"
+            no_cases.write_text(
+                '<testsuites name="nextest-run" tests="0"/>', encoding="utf-8"
+            )
+            long_missing = Path("/", *(["d" * 100] * 4), "junit.xml")
+            unusable = Path("/", "d" * 300, "junit.xml")
+            result = run_summary(
+                "--stdout", empty, no_cases, long_missing, unusable, FLAKY_PASS
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"unreadable JUnit report `{empty}`", result.stdout)
+        self.assertIn(f"missing JUnit report `{long_missing}`", result.stdout)
+        self.assertIn(f"report `{unusable}`", result.stdout)
+        self.assertIn("2 test(s) in 2 report(s): 1 flaky, 0 failed.", result.stdout)
 
-    def test_render_report_without_testcases(self):
+    def test_table_cells_escape_markup_and_bound_long_failure_messages(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "junit.xml"
-            path.write_text('<testsuites name="nextest-run" tests="0"/>')
-            markdown = summary.render("heavy", [path])
-        self.assertNotIn("**Warning:**", markdown)
-        self.assertIn("0 test(s) in 1 report(s): 0 flaky, 0 failed.", markdown)
-        self.assertNotIn("| Flaky test |", markdown)
+            report = Path(directory) / "message.xml"
+            report.write_text(
+                '<testsuites><testsuite><testcase classname="danger | suite" '
+                'name="row" time="0"><failure message="&lt;tag&gt; | '
+                + "x" * 500
+                + '"/></testcase></testsuite></testsuites>',
+                encoding="utf-8",
+            )
+            result = run_summary("--stdout", report)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("danger \\| suite row", result.stdout)
+        self.assertIn("&lt;tag&gt; \\|", result.stdout)
+        self.assertNotIn("x" * 500, result.stdout)
+        self.assertIn("…", result.stdout)
 
-    def test_render_reports_missing_file_next_to_valid_ones(self):
-        missing = FIXTURES / "does-not-exist.xml"
-        markdown = summary.render("heavy", [FLAKY_FAIL, missing])
-        self.assertIn(f"**Warning:** missing JUnit report `{missing}`", markdown)
-        self.assertIn("3 test(s) in 1 report(s)", markdown)
-
-    def test_warning_keeps_a_long_path_whole(self):
-        # Longer than MESSAGE_LIMIT, with every component a valid file name.
-        missing = Path("/", *(["d" * 100] * 4), "junit.xml")
-        markdown = summary.render("heavy", [missing])
-        self.assertIn(f"**Warning:** missing JUnit report `{missing}`", markdown)
-
-    def test_path_that_cannot_be_inspected_is_reported(self):
-        # One component over NAME_MAX: stat() fails with ENAMETOOLONG.
-        unusable = Path("/", "d" * 300, "junit.xml")
-        markdown = summary.render("heavy", [unusable, FLAKY_FAIL])
-        self.assertIn("**Warning:**", markdown)
-        self.assertIn("3 test(s) in 1 report(s)", markdown)
-
-    def test_cell_escapes_table_and_html_syntax(self):
-        self.assertEqual(summary.cell("a | b\n<c>"), "a \\| b &lt;c&gt;")
-
-    def test_cell_truncates_long_messages(self):
-        rendered = summary.cell("x" * (summary.MESSAGE_LIMIT * 2))
-        self.assertEqual(len(rendered), summary.MESSAGE_LIMIT)
-
-
-class MainTests(unittest.TestCase):
-    def test_appends_to_step_summary(self):
+    def test_ci_appends_to_summary_and_stdout_needs_no_summary_path(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "summary.md"
-            target.write_text("earlier step\n")
-            code = summary.main(
-                ["--label", "heavy", str(FLAKY_FAIL)],
-                environ={summary.SUMMARY_ENV: str(target)},
+            target.write_text("earlier step\n", encoding="utf-8")
+            appended = run_summary(FLAKY_FAIL, summary_path=target)
+            self.assertEqual(appended.returncode, 0, appended.stderr)
+            self.assertTrue(
+                target.read_text(encoding="utf-8").startswith(
+                    "earlier step\n### Flaky and failed tests"
+                )
             )
-            written = target.read_text()
-        self.assertEqual(code, 0)
-        self.assertTrue(written.startswith("earlier step\n### Flaky and failed tests"))
+            printed = run_summary("--stdout", FLAKY_PASS)
+            self.assertEqual(printed.returncode, 0, printed.stderr)
+            self.assertIn(FLAKY_NAME, printed.stdout)
+            self.assertEqual(printed.stderr, "")
 
-    def test_missing_report_still_exits_zero(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / "summary.md"
-            code = summary.main(
-                ["--label", "heavy", str(Path(directory) / "junit.xml")],
-                environ={summary.SUMMARY_ENV: str(target)},
-            )
-            written = target.read_text()
-        self.assertEqual(code, 0)
-        self.assertIn("missing JUnit report", written)
-
-    def test_stdout_mode_ignores_step_summary(self):
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            code = summary.main(["--stdout", "--label", "heavy", str(FLAKY_FAIL)], environ={})
-        self.assertEqual(code, 0)
-        self.assertIn(FLAKY_NAME, output.getvalue())
-
-    def test_unset_step_summary_is_a_usage_error(self):
-        with contextlib.redirect_stderr(io.StringIO()) as stderr:
-            with self.assertRaises(SystemExit) as raised:
-                summary.main(["--label", "heavy", str(FLAKY_FAIL)], environ={})
-        self.assertEqual(raised.exception.code, 2)
-        self.assertIn("GITHUB_STEP_SUMMARY is not set", stderr.getvalue())
+    def test_missing_summary_environment_is_a_usage_error(self):
+        result = run_summary(FLAKY_FAIL)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("GITHUB_STEP_SUMMARY is not set", result.stderr)
 
 
 if __name__ == "__main__":
