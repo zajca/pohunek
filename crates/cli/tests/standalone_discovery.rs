@@ -171,6 +171,28 @@ fn discovery_runs_only_a_trusted_netbird_executable_from_path() {
 }
 
 #[test]
+fn discovery_normalizes_peer_cidr_and_rejects_addresses_outside_netbird() {
+    let records = discover_with_status(
+        r#"{"peers":[
+            {"fqdn":"lower.example","netbirdIp":"100.64.0.0/10"},
+            {"fqdn":"upper.example","netbirdIp":"100.127.255.255"},
+            {"fqdn":"middle.example","netbirdIp":" 100.92.10.20 "},
+            {"fqdn":"below.example","netbirdIp":"100.63.255.255"},
+            {"fqdn":"above.example","netbirdIp":"100.128.0.0"},
+            {"fqdn":"private.example","netbirdIp":"10.0.0.1"},
+            {"fqdn":"ipv6.example","netbirdIp":"::1"},
+            {"fqdn":"invalid.example","netbirdIp":"not-an-ip"}
+        ]}"#,
+    );
+    let addresses: Vec<&serde_json::Value> =
+        records.iter().map(|record| &record["address"]).collect();
+    assert_eq!(addresses[0], "100.64.0.0");
+    assert_eq!(addresses[1], "100.127.255.255");
+    assert_eq!(addresses[2], "100.92.10.20");
+    assert!(addresses[3..].iter().all(|address| address.is_null()));
+}
+
+#[test]
 fn malformed_netbird_status_is_a_cli_error() {
     for body in ["", "{ this is not json ]", "42", "[1, 2, 3]"] {
         let output = discover_output(body);
