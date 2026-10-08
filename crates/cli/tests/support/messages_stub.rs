@@ -203,6 +203,18 @@ impl MessagesStub {
             .count()
     }
 
+    /// The kept request bodies that carry `needle`, oldest first.
+    pub(crate) fn bodies_containing(&self, needle: &str) -> Vec<String> {
+        self.state
+            .bodies
+            .lock()
+            .expect("bodies lock")
+            .iter()
+            .filter(|body| body.contains(needle))
+            .cloned()
+            .collect()
+    }
+
     /// Opens the start gate: every response held before its first text, and
     /// every later one, starts.
     pub(crate) fn open_gate(&self) {

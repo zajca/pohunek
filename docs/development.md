@@ -121,6 +121,108 @@ cargo xtask ts generate   # regenerate sdk/ts/protocol/src/generated/**
 cargo xtask ts check      # CI gate
 ```
 
+## Release consumer suite
+
+`crates/cli/tests/release_consumer.rs` drives ONE runtime per invocation,
+entirely out of process, through the exact released binaries. It is what a
+release row and the archive smoke run, and it produces the consumer report that
+`cargo xtask compat attest` consumes. It never links the daemon and never looks
+at `target/` or the source tree, so it runs as a prebuilt executable
+(`cargo test -p pohunek-cli --test release_consumer --no-run`).
+
+Inputs, all mandatory and absolute, with no fallback to `CARGO_BIN_EXE_*`; a
+missing, empty, relative or non-regular value (a link counts as non-regular)
+fails naming the variable:
+
+| Variable | Meaning |
+| --- | --- |
+| `POHUNEK_CONSUMER_BIN_DIR` | directory with `pohunek`, `pohunekd`, `pohunek-sessiond` (and `runtime-catalog-anchor.json` in smoke mode) |
+| `POHUNEK_CONSUMER_RUNTIME` | runtime id to exercise (`pi`, `codex`, `claude`, ...) |
+| `POHUNEK_CONSUMER_PACKAGE` | package archive from `cargo xtask package build` |
+| `POHUNEK_CONSUMER_REPORT` | where the report is written after success |
+| `POHUNEK_CONSUMER_CATALOG` | optional; selects smoke mode |
+
+With no `POHUNEK_CONSUMER_*` variable set the test skips, which keeps a plain
+`cargo test` green. Once any is set, every missing prerequisite (an input, the
+upstream on `PATH`, a driver) is a failure, never a skip. A stale report is
+removed first, and a failed run leaves none. A report path that is, or aliases
+(same path, hard link, symlink, parent-directory symlink), the package, catalog,
+anchor or a release binary, or whose `.partial` temporary file does, is refused
+before anything is deleted or written; a relative input is resolved against the
+working directory for this check, so an input that validation will reject is
+protected too. The stale report is removed after that check and before the
+inputs are validated, so a run that fails early never leaves the report of an
+earlier run behind. Executables are staged through
+`pohunek_test_support::fs`, which keeps a write descriptor out of sibling
+threads' children (no `ETXTBSY`). Every subprocess the suite waits on (the upstream
+and staged `--version` reads, each CLI call) runs in its own process group with
+a deadline and a bounded output collection; an overrun kills the group and
+fails naming the program, so a hung upstream or a background child holding the
+pipes cannot stall a prebuilt executable.
+
+- **Row mode** (no catalog): the harness generates a throwaway Ed25519 root,
+  places its anchor beside the copied daemon and signs a schema 2 catalog
+  authorizing exactly the given archive for the daemon's own release version.
+  The release block and attestation digests of that catalog are placeholders,
+  because the real attestation does not exist until this run has produced its
+  report. A release row calls it with the binaries extracted from the just-built
+  daemon archive, the archive from `cargo xtask package build`, and the locked
+  upstream on `PATH`.
+- **Smoke mode** (`POHUNEK_CONSUMER_CATALOG` set): nothing is generated. The
+  signed catalog is used as given and the archive's own anchor is copied
+  byte for byte beside the daemon, so the official install is judged by the
+  bundle's real trust. The network-isolated archive smoke calls it this way.
+
+What a run does: copies the three binaries into
+`<tmp>/prefix/libexec/pohunek/<version>/` (the installer layout; the version is
+what `pohunekd --version` and `pohunek --version` both report) and hashes them;
+starts `pohunekd` as a subprocess (worker supervision as direct children) in a
+hermetic XDG environment with the upstream's directory in front of `PATH`;
+checks through `/proc/<pid>/exe` that the daemon and the worker execute the
+layout copies and that the executed image hashes to the installed bytes; runs
+every command as the layout's `pohunek` subprocess: `plugin install --catalog`,
+`plugin list`/`inspect` (official, enabled, selected), `host inspect local`
+(the daemon's version probe must report a supported release equal to a direct
+`<upstream> --version` read with the package's own probe grammar), one session
+against a loopback model stub through ready, input, working, idle, stop and
+resume (after the resume a second prompt is sent and the model stub must see
+the first prompt and its reply in that turn's request, which proves the
+upstream restored the conversation; where the runtime re-reports through its
+hook, a new reporter must appear), then removes the sessions, stops the daemon with SIGTERM and requires
+a clean exit and no remaining pohunek process. The bin dir and the layout are
+re-hashed before the report is written.
+
+The report (`schema`, `runtime`, `package_digest`, `upstream_version`,
+`suite_version`, `executables`) carries the version the daemon actually probed,
+the suite version of the `compat/matrix.json` this executable was built with
+and the SHA-256 of the three executed images, not strings from the lock.
+
+Prerequisite of the guard scenarios: this build's `pohunekd` and `pohunek-sessiond`
+must exist beside the test profile, as for the other daemon-backed tests
+(`cargo build -p pohunek-daemon --bin pohunekd` and `cargo build -p
+pohunek-session-worker --bin pohunek-sessiond`; CI builds every binary first,
+and the failure message names these commands). They fail rather than skip when
+a binary is missing.
+
+Guard scenarios (`guards::*`) run in the default test run without an upstream or
+a model: the input contract, a swapped binary or bin dir, an executable outside
+the layout, an archive the catalog does not name (typed `package_untrusted`), an
+upstream version outside the package's range, smoke-mode anchor handling. They
+use this build's binaries through an explicit `target_bin_dir` helper, so a run
+that executes a prebuilt test executable on a machine without that build
+selects the suite by name (`the_release_binaries_serve_the_runtime_out_of_process`).
+
+Adding a driver: a new `runtime-packages/<runtime>/` directory without an entry
+in `DRIVERS` (`crates/cli/tests/support/release_drivers.rs`) makes the suite
+fail with a message saying so. An entry names the runtime id, how its screen
+shows readiness, the marker that makes the model stub hold a reply, whether
+the conversation id arrives through a hook, a `prepare` function that writes the
+upstream's hermetic configuration (throwaway home or config directory, the
+loopback stub as its only model endpoint, every update, telemetry and
+marketplace switch off) and returns the profile `[env]`, and the text of the
+reply as it appears on screen. Reuse a stub from `crates/cli/tests/support/`
+or add one beside them.
+
 ## Conventions that matter here
 
 - **Rust guidelines are mandatory.** The Microsoft Pragmatic Rust Guidelines

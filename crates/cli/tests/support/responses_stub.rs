@@ -65,7 +65,15 @@ struct State {
     stopping: AtomicBool,
     gate_open: Mutex<bool>,
     gate_changed: Condvar,
+    bodies: Mutex<Vec<String>>,
 }
+
+/// Most recent Responses request bodies the stub keeps for
+/// [`ResponsesStub::bodies_containing`].
+///
+/// Bounded so a long session does not grow memory; tests inspect requests that
+/// are at most a few turns old.
+const KEPT_BODIES: usize = 64;
 
 /// A running stub endpoint.
 #[derive(Debug)]
@@ -115,6 +123,18 @@ impl ResponsesStub {
     /// Whether any request carried an `Authorization` header.
     pub(crate) fn saw_credential(&self) -> bool {
         self.state.authorized.load(Ordering::SeqCst)
+    }
+
+    /// The kept request bodies that carry `needle`, oldest first.
+    pub(crate) fn bodies_containing(&self, needle: &str) -> Vec<String> {
+        self.state
+            .bodies
+            .lock()
+            .expect("bodies lock")
+            .iter()
+            .filter(|body| body.contains(needle))
+            .cloned()
+            .collect()
     }
 
     /// Lets every held response, and every later one, complete.
@@ -172,6 +192,7 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
             b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         );
     }
+    keep_body(state, &request.body);
     state.started.fetch_add(1, Ordering::SeqCst);
     writer.write_all(
         b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n",
@@ -208,6 +229,14 @@ fn respond(stream: TcpStream, state: &State) -> io::Result<()> {
     writer.flush()?;
     state.finished.fetch_add(1, Ordering::SeqCst);
     Ok(())
+}
+
+fn keep_body(state: &State, body: &str) {
+    let mut bodies = state.bodies.lock().expect("bodies lock");
+    if bodies.len() == KEPT_BODIES {
+        bodies.remove(0);
+    }
+    bodies.push(body.to_owned());
 }
 
 /// Streams a text reply; a held reply waits for the gate after its first chunk.
