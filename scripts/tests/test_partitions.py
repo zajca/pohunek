@@ -272,6 +272,15 @@ class ScriptScenario(unittest.TestCase):
 
     def script_environment(self, extra_env=None):
         environment = {**os.environ}
+        for name in (
+            "PARTITIONS_SPAWN_WORKER_PID_FILE",
+            "PARTITIONS_WORKER_SUBDIR",
+            "PARTITIONS_WORKER_NO_SOCKET",
+            "PARTITIONS_FAKE_RUN_STATUS",
+            "PARTITIONS_HOLD_RUN",
+            "PARTITIONS_LOCKED_TREE",
+        ):
+            environment.pop(name, None)
         environment.update(extra_env or {})
         # Our bin first: `which cargo-nextest` and every bare `cargo` lookup
         # find the fake, while the rest of PATH still resolves python3 for the
