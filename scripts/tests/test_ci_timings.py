@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import io
-import os
 import importlib.machinery
 import importlib.util
 import json
@@ -772,6 +771,57 @@ class RunTimingTests(unittest.TestCase):
         self.assertIn("2026-09-14", result.stderr)
 
 
+    def test_runs_refuses_a_snapshot_that_is_not_a_list(self):
+        snapshot = self.dir / "invalid-snapshot.json"
+        snapshot.write_text('{"runs": []}')
+        result = self.run_cli("runs", "--input", str(snapshot))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("must hold a JSON list", result.stderr)
+
+    def test_runs_snapshot_excludes_release_runs_and_keeps_legacy_ci_runs(self):
+        release = dict(RUN, databaseId=91, workflowName="Release")
+        ci_run = dict(RUN, databaseId=92, workflowName="CI")
+        legacy = dict(RUN, databaseId=93)
+        snapshot = self.write_snapshot("ci-runs.json", [release, ci_run, legacy])
+        payload = self.run_json("runs", "--input", snapshot)
+        self.assertEqual(sorted(run["id"] for run in payload["runs"]), [92, 93])
+
+    def test_runs_warns_when_fetch_limit_may_hide_older_runs(self):
+        shim_dir = self.dir / "bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "gh"
+        shim.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "if sys.argv[1:3] == ['run', 'list']:\n"
+            "    print(os.environ['GH_LIST'])\n"
+            "elif sys.argv[1:3] == ['run', 'view']:\n"
+            "    print(os.environ['GH_VIEW'])\n"
+            "else:\n"
+            "    raise SystemExit('unexpected gh request')\n"
+        )
+        shim.chmod(0o755)
+        document = self._document(
+            1, created="2026-09-20T10:00:00Z", updated="2026-09-20T10:09:30Z"
+        )
+        environment = {
+            **os.environ,
+            "PATH": str(shim_dir) + os.pathsep + os.environ["PATH"],
+            "GH_LIST": json.dumps([{
+                "databaseId": 1, "attempt": 1, "conclusion": "success"
+            }]),
+            "GH_VIEW": json.dumps(document),
+        }
+        result = self.run_cli(
+            "runs", "--window", "2026-09-20..2026-09-20", "--limit", "1",
+            "--cache", str(self.dir / "fetched.json"), env=environment,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("requested window 2026-09-20..2026-09-20", result.stderr)
+        self.assertIn("--limit 1", result.stderr)
+        self.assertIn("missing older runs", result.stderr)
+
+
 class ErrorReportingTests(unittest.TestCase):
     def test_describe_error_falls_back_without_stderr(self):
         error = subprocess.CalledProcessError(1, ["gh", "run", "list"])
@@ -1287,130 +1337,89 @@ class FetchTests(unittest.TestCase):
         self.assertEqual([call for call in calls if call[1] == "view"], [])
 
 
-class LogCacheTests(unittest.TestCase):
-    def test_log_cache_path_carries_the_attempt(self):
-        """A rerun keeps its run id, so the id alone is not a cache key.
+class LogCacheCommandTests(unittest.TestCase):
+    """Run the real cache command with a private root and a fixture `gh`."""
 
-        Without the attempt, `cache --run` keeps reporting the superseded
-        attempt's hit/miss evidence after every rerun.
-        """
-        seen = []
-
-        def fake_run(command, **kwargs):
-            seen.append(command)
-            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-
-        original = ci_timings.subprocess.run
-        ci_timings.subprocess.run = fake_run
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                for attempt in (1, 2):
-                    path = Path(directory) / f"run-55-attempt-{attempt}.log"
-                    ci_timings.load_run_log(55, path, attempt)
-                    self.assertTrue(path.exists())
-        finally:
-            ci_timings.subprocess.run = original
-        self.assertEqual(
-            [command[command.index("--attempt") + 1] for command in seen],
-            ["1", "2"],
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        self.script = scripts / "ci-timings"
+        self.script.write_bytes(SCRIPT.read_bytes())
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "with Path(os.environ['GH_CALLS']).open('a') as calls:\n"
+            "    calls.write(json.dumps(args) + '\\n')\n"
+            "state = json.loads(Path(os.environ['GH_STATE']).read_text())\n"
+            "if args == ['run', 'view', '55', '--json', 'attempt,conclusion']:\n"
+            "    print(json.dumps({'attempt': state['attempt'], 'conclusion': state['conclusion']}))\n"
+            "elif args[:4] == ['run', 'view', '55', '--log']:\n"
+            "    if state.get('fail_log'):\n"
+            "        raise SystemExit('cached log must be reused')\n"
+            "    print(Path(state['log']).read_text())\n"
+            "else:\n"
+            "    raise SystemExit('unexpected gh call: ' + repr(args))\n"
         )
-
-    def test_log_cache_is_reused_without_calling_gh(self):
-        def fail(command, **kwargs):
-            raise AssertionError("gh must not be called for a cached log")
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "run-55-attempt-1.log"
-            path.write_text("cached log")
-            original = ci_timings.subprocess.run
-            ci_timings.subprocess.run = fail
-            try:
-                self.assertEqual(
-                    ci_timings.load_run_log(55, path, 1), "cached log"
-                )
-            finally:
-                ci_timings.subprocess.run = original
-
-    def test_cache_command_default_path_separates_attempts(self):
-        """The default log path must distinguish a rerun from its original.
-
-        `command_cache` builds this path itself, so testing `load_run_log`
-        alone leaves the naming unguarded.
-        """
-        paths = []
-
-        def fake_load(run_id, log_cache, attempt=None):
-            paths.append((Path(log_cache).name, attempt))
-            return ""
-
-        originals = (ci_timings.gh_json, ci_timings.load_run_log)
-        ci_timings.load_run_log = fake_load
-        try:
-            for attempt in (1, 2):
-                ci_timings.gh_json = lambda arguments, attempt=attempt: {
-                    "attempt": attempt, "conclusion": "success",
-                }
-                args = argparse.Namespace(
-                    input=None, run=55, log_cache=None, json=True
-                )
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(ci_timings.command_cache(args), 0)
-        finally:
-            ci_timings.gh_json, ci_timings.load_run_log = originals
-        self.assertEqual(
-            paths,
-            [("run-55-attempt-1.log", 1), ("run-55-attempt-2.log", 2)],
-        )
-
-    def test_cache_command_refuses_an_unfinished_run(self):
-        # An in-progress run's log is partial, and a partial log written to
-        # the cache would never repair itself.
-        original = ci_timings.gh_json
-        ci_timings.gh_json = lambda arguments: {
-            "attempt": 1, "conclusion": None,
+        gh.chmod(0o755)
+        self.state = self.root / "gh-state.json"
+        self.calls = self.root / "gh-calls.jsonl"
+        self.log = self.root / "fixture.log"
+        self.log.write_text(CACHE_LOG)
+        self.environment = {
+            **os.environ,
+            "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+            "GH_STATE": str(self.state),
+            "GH_CALLS": str(self.calls),
         }
-        try:
-            args = argparse.Namespace(
-                input=None, run=55, log_cache=None, json=False
-            )
-            with self.assertRaisesRegex(ValueError, "has not finished"):
-                ci_timings.command_cache(args)
-        finally:
-            ci_timings.gh_json = original
 
+    def run_cache(self, attempt, conclusion="success", fail_log=False):
+        self.state.write_text(json.dumps({
+            "attempt": attempt,
+            "conclusion": conclusion,
+            "log": str(self.log),
+            "fail_log": fail_log,
+        }))
+        return subprocess.run(
+            [sys.executable, str(self.script), "cache", "--run", "55", "--json"],
+            cwd=self.root, env=self.environment, capture_output=True,
+            text=True, check=False,
+        )
 
-class TruncationTests(unittest.TestCase):
-    def test_truncation_warning_names_the_window_and_limit(self):
-        window = ci_timings.parse_window("2026-09-14..2026-09-16")
-        message = ci_timings.truncation_warning("baseline", window, 40)
-        self.assertIn("baseline", message)
-        self.assertIn("2026-09-14..2026-09-16", message)
-        self.assertIn("--limit 40", message)
-        self.assertIn("missing older runs", message)
+    def gh_calls(self):
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
 
+    def test_rerun_logs_use_distinct_default_paths_and_cached_logs_are_reused(self):
+        first = self.run_cache(1)
+        second = self.run_cache(2)
+        cached = self.run_cache(1, fail_log=True)
+        for result in (first, second, cached):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("sccache", result.stdout)
+        cache = self.root / "target/ci-timings"
+        self.assertEqual((cache / "run-55-attempt-1.log").read_text().strip(), CACHE_LOG)
+        self.assertEqual((cache / "run-55-attempt-2.log").read_text().strip(), CACHE_LOG)
+        log_calls = [call for call in self.gh_calls() if "--log" in call]
+        self.assertEqual(log_calls, [
+            ["run", "view", "55", "--log", "--attempt", "1"],
+            ["run", "view", "55", "--log", "--attempt", "2"],
+        ])
 
-class SnapshotTests(unittest.TestCase):
-    def test_snapshot_rejects_a_non_list_document(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "snapshot.json"
-            path.write_text('{"runs": []}')
-            with self.assertRaisesRegex(ValueError, "JSON list"):
-                ci_timings.read_snapshot(path)
-
-    def test_input_snapshot_keeps_ci_and_legacy_runs_only(self):
-        # Tag Release runs complete CI-named jobs too and must never enter the
-        # medians; documents stored before `workflowName` was fetched are kept.
-        release = dict(RUN, databaseId=91, workflowName="Release")
-        ci_run = dict(RUN, databaseId=92, workflowName="CI")
-        legacy = dict(RUN, databaseId=93)
-        with tempfile.TemporaryDirectory() as directory:
-            snapshot = Path(directory) / "ci-runs.json"
-            ci_timings.write_snapshot(snapshot, [release, ci_run, legacy])
-            loaded = ci_timings.load_run_summaries(
-                argparse.Namespace(input=str(snapshot))
-            )
-        self.assertEqual(sorted(run["id"] for run in loaded.runs), [92, 93])
-        self.assertFalse(loaded.truncated)
+    def test_unfinished_run_is_refused_before_download_or_cache_write(self):
+        result = self.run_cache(1, conclusion=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has not finished", result.stderr)
+        self.assertEqual(self.gh_calls(), [
+            ["run", "view", "55", "--json", "attempt,conclusion"],
+        ])
+        self.assertFalse((self.root / "target/ci-timings").exists())
 
 
 class RunnerMinuteTests(unittest.TestCase):
