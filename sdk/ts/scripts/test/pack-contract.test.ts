@@ -62,6 +62,33 @@ for (const [name, surface] of Object.entries(surfaces)) {
 if (typeof browser.Client !== "function" || browser.Client !== Client) {
   throw new Error("sdk root and browser entries disagree on Client");
 }
+// The browser subpath exposes the browser transports only: no node-only socket
+// helpers leak into it, and the request ids need no crypto.randomUUID.
+if (typeof browser.WsTransport !== "function" || typeof browser.nextRequestId !== "function") {
+  throw new Error("browser entry does not export the browser transports");
+}
+if ("SocketTransport" in browser || "connectLocal" in browser) {
+  throw new Error("browser entry exports a node-only socket API");
+}
+const randomUUIDDescriptor = Object.getOwnPropertyDescriptor(globalThis.crypto, "randomUUID");
+Object.defineProperty(globalThis.crypto, "randomUUID", { configurable: true, value: undefined });
+try {
+  const firstId = browser.nextRequestId("browser");
+  const secondId = browser.nextRequestId("browser");
+  if (!firstId.startsWith("sdk-browser-") || !firstId.endsWith("-0") || secondId !== firstId.slice(0, -2) + "-1") {
+    throw new Error("nextRequestId produced unexpected shapes without crypto.randomUUID: " + firstId + " / " + secondId);
+  }
+  const defaults = Client.defaultOptions();
+  if (defaults.connectTimeoutMs !== 5000 || defaults.requestTimeoutMs !== 5000) {
+    throw new Error("connect options do not default to 5000ms");
+  }
+} finally {
+  if (randomUUIDDescriptor === undefined) {
+    Reflect.deleteProperty(globalThis.crypto, "randomUUID");
+  } else {
+    Object.defineProperty(globalThis.crypto, "randomUUID", randomUUIDDescriptor);
+  }
+}
 if (typeof testkit.startFixtureDaemon !== "function") {
   throw new Error("testkit does not export startFixtureDaemon");
 }
@@ -100,6 +127,26 @@ try {
   const missing = await fetch(relay.url + "/not-a-relay-route");
   if (missing.status !== 404) {
     throw new Error("unknown route returned " + missing.status);
+  }
+  const plain = await fetch(relay.url + "/daemon/local/control");
+  if (plain.status !== 426) {
+    throw new Error("control route without an upgrade returned " + plain.status);
+  }
+  // The relay is owner-only transport: a non-loopback bind must be refused
+  // before any socket is opened, with an error naming the restriction.
+  let bindError;
+  for (const bindHost of ["0.0.0.0", "::", "192.168.1.10", "localhost"]) {
+    bindError = undefined;
+    try {
+      const relay = await startTestRelay({ bindHost, port: 0, targets: new Map() });
+      await relay.close();
+      throw new Error("non-loopback bind was accepted: " + bindHost);
+    } catch (error) {
+      bindError = error;
+    }
+    if (!(bindError instanceof Error) || !bindError.message.includes("only binds to loopback")) {
+      throw new Error("non-loopback bind did not fail with the loopback refusal: " + String(bindError));
+    }
   }
   const socket = new WebSocket("ws://127.0.0.1:" + relay.port + "/daemon/local/control");
   const echoed = await new Promise((resolve, reject) => {
@@ -154,6 +201,7 @@ assert(browser.Client === Client, "sdk root and browser entries disagree on Clie
 assert(typeof browser.connectLocal === "undefined", "browser entry exports a node-only helper");
 assert(nextRequestId("probe").startsWith("sdk-probe-"), "nextRequestId has an unexpected shape");
 assert(Client.defaultOptions().requestTimeoutMs > 0, "default request timeout is not positive");
+assert(Client.defaultOptions().connectTimeoutMs === Client.defaultOptions().requestTimeoutMs, "connect and request timeouts do not default to the same value");
 assert(Number.isInteger(PROTOCOL_VERSION) && MIN_PROTOCOL_VERSION <= PROTOCOL_VERSION, "protocol versions are inconsistent");
 assert(MAX_CONTROL_LINE_BYTES > 0, "protocol line limit is not positive");
 assert(typeof relay.API_VERSION === "number", "relay constants did not load");
@@ -433,14 +481,39 @@ describe("SDK release pack contract", () => {
     }
   });
 
-  test("rejects invalid inputs instead of defaulting", async () => {
-    const valid = { version: TEST_VERSION, baseUrl, outDir: join(workDir, "rejected"), sourceDateEpoch: SOURCE_DATE_EPOCH };
-    await expectRejection(packRelease({ ...valid, version: "v1.2.3" }), "version");
-    await expectRejection(packRelease({ ...valid, baseUrl: "not a url" }), "base URL");
-    await expectRejection(packRelease({ ...valid, baseUrl: "ftp://example.com/x" }), "http or https");
-    await expectRejection(packRelease({ ...valid, baseUrl: `${baseUrl}?token=1` }), "query");
-    await expectRejection(packRelease({ ...valid, sourceDateEpoch: -1 }), "SOURCE_DATE_EPOCH");
-    await expectRejection(packRelease({ ...valid, outDir: "" }), "output directory");
+  test("the release script refuses invalid inputs on its real command line", async () => {
+    // The script runs exactly as the Release workflow runs it, with
+    // SOURCE_DATE_EPOCH and its flags on the CLI; each hostile input must fail
+    // the process with the refusing message, never a default.
+    const script = join(REPOSITORY_ROOT, "sdk", "ts", "scripts", "pack-release.ts");
+    const cases: readonly [string, readonly string[]][] = [
+      ["version", ["--version", "v1.2.3", "--base-url", baseUrl, "--out", join(workDir, "rejected")]],
+      ["base URL", ["--version", TEST_VERSION, "--base-url", "not a url", "--out", join(workDir, "rejected")]],
+      ["http or https", ["--version", TEST_VERSION, "--base-url", "ftp://example.com/x", "--out", join(workDir, "rejected")]],
+      ["query", ["--version", TEST_VERSION, "--base-url", `${baseUrl}?token=1`, "--out", join(workDir, "rejected")]],
+      ["output directory", ["--version", TEST_VERSION, "--base-url", baseUrl, "--out", ""]],
+    ];
+    for (const [fragment, flags] of cases) {
+      const rejected = await execFileAsync(BUN_EXECUTABLE, [script, ...flags], {
+        cwd: REPOSITORY_ROOT,
+        env: { ...process.env, SOURCE_DATE_EPOCH: String(SOURCE_DATE_EPOCH) },
+      }).then(() => undefined, (error: { stderr?: string }) => error as unknown);
+      expect(rejected).toBeDefined();
+      const stderr = (rejected as { stderr?: string }).stderr ?? "";
+      expect(stderr).toContain("pack-release:");
+      expect(stderr).toContain(fragment);
+    }
+    const epochCase = await execFileAsync(BUN_EXECUTABLE, [
+      script,
+      "--version", TEST_VERSION,
+      "--base-url", baseUrl,
+      "--out", join(workDir, "rejected"),
+    ], {
+      cwd: REPOSITORY_ROOT,
+      env: { ...process.env, SOURCE_DATE_EPOCH: "-1" },
+    }).then(() => undefined, (error: { stderr?: string }) => error as unknown);
+    expect(epochCase).toBeDefined();
+    expect((epochCase as { stderr?: string }).stderr ?? "").toContain("SOURCE_DATE_EPOCH");
   });
 
   test("a consumer installs @pohunek/sdk and @pohunek/testkit by URL and imports every entry point", async () => {

@@ -15,7 +15,6 @@ import {
   ClientError,
   connectLocal,
   connectTcp,
-  isRequest,
   type ConnectOptions,
   type Request,
 } from "@pohunek/sdk";
@@ -31,58 +30,6 @@ import {
 } from "./mock-daemon";
 
 describe("Client request/response", () => {
-  test("request decoder accepts ordered ranges and rejects legacy exact versions", () => {
-    expect(isRequest({
-      v: CLIENT_PROTOCOL_VERSIONS,
-      id: "range-request",
-      method: "daemon.health",
-      params: null,
-    })).toBe(true);
-    expect(isRequest({
-      v: PROTOCOL_VERSION,
-      id: "legacy-request",
-      method: "daemon.health",
-      params: null,
-    })).toBe(false);
-    expect(isRequest({
-      v: { minimum: 2, maximum: 1 },
-      id: "reversed-request",
-      method: "daemon.health",
-      params: null,
-    })).toBe(false);
-    expect(isRequest({
-      v: CLIENT_PROTOCOL_VERSIONS,
-      id: "origin-request",
-      method: "daemon.health",
-      params: null,
-      origin_session_id: "s-origin",
-      origin_daemon_id: "daemon-origin",
-    })).toBe(true);
-    expect(isRequest({
-      v: CLIENT_PROTOCOL_VERSIONS,
-      id: "partial-origin",
-      method: "daemon.health",
-      params: null,
-      origin_session_id: "s-origin",
-    })).toBe(false);
-    expect(isRequest({
-      v: CLIENT_PROTOCOL_VERSIONS,
-      id: "unsafe-origin",
-      method: "daemon.health",
-      params: null,
-      origin_session_id: "s-origin",
-      origin_daemon_id: "daemon origin",
-    })).toBe(false);
-    expect(isRequest({
-      v: CLIENT_PROTOCOL_VERSIONS,
-      id: "oversized-origin",
-      method: "daemon.health",
-      params: null,
-      origin_session_id: "s-origin",
-      origin_daemon_id: "d".repeat(129),
-    })).toBe(false);
-  });
-
   test("call decodes a typed session.list output and sends method params", async () => {
     const session = minimalSessionInfo();
     const daemon = await startUnixDaemon([
@@ -96,6 +43,8 @@ describe("Client request/response", () => {
       });
 
       expect(result).toEqual([session] satisfies SessionInfo[]);
+      expect("external" in result[0]!).toBe(false);
+      expect("name" in result[0]!).toBe(false);
       const sent = parseRequestLine(await daemon.nextRequest());
       expect(sent["v"]).toEqual(CLIENT_PROTOCOL_VERSIONS);
       expect(sent["method"]).toBe("session.list");
@@ -282,6 +231,78 @@ describe("Client request/response", () => {
       expect(structured.class).toBe(source.class);
       expect(structured.code).toBe(source.code);
       expect(structured.recover).toBe(source.recover);
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("err response preserves an omitted recovery hint", async () => {
+    const daemon = await startUnixDaemon([
+      {
+        kind: "reply",
+        line: (requestLine) => errResponseLine(requestIdFromLine(requestLine), {
+          class: "runtime",
+          code: "agent_failed",
+          msg: "agent failed during test",
+        }),
+      },
+    ]);
+    try {
+      const client = await connectClient(daemon);
+      const error = await expectClientError(client.call("daemon.health", null));
+      const structured = error.toProtocolError();
+      expect("recover" in structured).toBe(false);
+      expect(structured.recover).toBeUndefined();
+    } finally {
+      await daemon.close();
+    }
+  });
+
+  test("previous-version translation leaves owner metadata keys untouched", async () => {
+    const session = {
+      ...minimalSessionInfo(),
+      metadata: { runtime_id: "owner-value" },
+      runtime: {
+        state: "live",
+        runtime_id: "runtime-1",
+        runtime_generation: "1",
+        worker_id: "worker-1",
+      },
+    };
+    const previousReply = (requestLine: string, ok: unknown): string => JSON.stringify({
+      v: MIN_PROTOCOL_VERSION,
+      id: requestIdFromLine(requestLine),
+      ok,
+    });
+    const daemon = await startTcpDaemon([
+      {
+        kind: "gate",
+        ready: Promise.resolve(),
+        line: (requestLine) => previousReply(requestLine, {
+          status: "ok",
+          daemon_version: "0.33.0",
+          protocol_version: MIN_PROTOCOL_VERSION,
+        }),
+      },
+      { kind: "reply", line: (requestLine) => previousReply(requestLine, { session }) },
+    ]);
+    try {
+      const client = await connectClient(daemon, "previous-host");
+      expect(await client.handshake()).toBe(MIN_PROTOCOL_VERSION);
+      const result = await client.call("session.set_metadata", {
+        session_id: session.id,
+        metadata: { worker_instance_id: "owner-value" },
+      });
+      expect(result.session.metadata?.["runtime_id"]).toBe("owner-value");
+      expect(result.session.runtime?.worker_instance_id).toBe("runtime-1");
+      const probe = parseRequestLine(await daemon.nextRequest());
+      expect(probe["method"]).toBe("daemon.health");
+      const sent = parseRequestLine(await daemon.nextRequest());
+      expect(sent["params"]).toEqual({
+        session_id: session.id,
+        metadata: { worker_instance_id: "owner-value" },
+      });
+      await client.close();
     } finally {
       await daemon.close();
     }
@@ -887,11 +908,50 @@ describe("Client request/response", () => {
     }
   });
 
-  test("connect options default to 5000ms", () => {
-    expect(Client.defaultOptions()).toEqual({
-      connectTimeoutMs: 5000,
-      requestTimeoutMs: 5000,
-    });
+  test("invalid request envelopes fail before any wire write", async () => {
+    const daemon = await startUnixDaemon([{ kind: "silent" }]);
+    try {
+      const client = await connectClient(daemon);
+      const rejected: readonly string[] = [
+        "an origin session id sent alone",
+        "an origin id with characters the wire format never admits",
+        "an origin id longer than the wire format admits",
+      ];
+      const invalidRequests: readonly Request[] = [
+        {
+          v: CLIENT_PROTOCOL_VERSIONS,
+          id: "partial-origin",
+          method: "daemon.health",
+          params: null,
+          origin_session_id: "s-origin",
+        },
+        {
+          v: CLIENT_PROTOCOL_VERSIONS,
+          id: "unsafe-origin",
+          method: "daemon.health",
+          params: null,
+          origin_session_id: "s-origin",
+          origin_daemon_id: "daemon origin",
+        },
+        {
+          v: CLIENT_PROTOCOL_VERSIONS,
+          id: "oversized-origin",
+          method: "daemon.health",
+          params: null,
+          origin_session_id: "s-origin",
+          origin_daemon_id: "d".repeat(129),
+        },
+      ];
+      expect(rejected.length).toBe(invalidRequests.length);
+      for (const [index, request] of invalidRequests.entries()) {
+        const error = await expectClientError(client.request(request));
+        expect(`${index}: ${error.toProtocolError().code}`).toBe(`${index}: framing`);
+        await daemon.expectNoRequest(50);
+      }
+      await client.close();
+    } finally {
+      await daemon.close();
+    }
   });
 
   test("close shuts down the control channel and prevents later requests", async () => {

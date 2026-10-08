@@ -24,7 +24,7 @@ import {
  * the current one. The adapter translates shape only. The key names and the list
  * of methods the previous version never defined are generated from the Rust
  * adapter; the sites that carry a renamed key are checked against the golden
- * payloads recorded from the previous release (`test/compat.test.ts`).
+ * payloads recorded from the previous release (`test/previous-daemon.test.ts`).
  */
 
 /** Protocol version this adapter serves. */

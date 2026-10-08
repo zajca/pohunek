@@ -630,7 +630,6 @@ Protocol contracts and transport:
 - `crates/client/tests/previous_daemon.rs`
 - `sdk/ts/sdk/src/compat.ts`
 - `sdk/ts/sdk/test/previous-daemon.test.ts`
-- `sdk/ts/sdk/test/compat.test.ts`
 - `crates/paths/src/lib.rs`
 - `crates/protocol/src/assistant.rs`
 - `crates/protocol/src/compat/mod.rs`
