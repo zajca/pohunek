@@ -204,6 +204,19 @@ def wait_for(condition, seconds=30):
         time.sleep(0.01)
 
 
+def gone_or_zombie(pid):
+    """True once `pid` was reaped or is a zombie.
+
+    One read, not exists-then-read: the process can be reaped between two
+    calls, and reading the stat of an exiting process can also fail with ESRCH.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return ") Z " in stat
+
+
 class EntrypointTests(unittest.TestCase):
     """The script run as a program, as CI runs it."""
 
@@ -317,8 +330,7 @@ class LeakedWorkerTests(unittest.TestCase):
             self.assertTrue(Path(f"/proc/{workload}").exists())
             self.assertFalse(partitions.check_no_leaked_workers(base))
             worker.wait()
-            stat = Path(f"/proc/{workload}/stat")
-            wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+            wait_for(lambda: gone_or_zombie(workload))
 
     def test_a_retained_session_is_followed_after_its_leader_was_reparented(self):
         def proc(pid, parent, session):
@@ -373,8 +385,7 @@ class LeakedWorkerTests(unittest.TestCase):
             self.assertNotIn(leader, [p.pid for p in partitions.workload_of(processes, found[0][0])])
 
             self.assertFalse(partitions.check_no_leaked_workers(base, retained))
-            stat = Path(f"/proc/{leader}/stat")
-            wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+            wait_for(lambda: gone_or_zombie(leader))
 
     @unittest.skipUnless(sys.platform == "linux", "reads /proc and uses setsid")
     def test_the_workload_dies_even_when_the_test_fails_early(self):
@@ -399,8 +410,7 @@ class LeakedWorkerTests(unittest.TestCase):
         result = unittest.TestResult()
         Failing().run(result)
         self.assertEqual(len(result.failures), 1)
-        stat = Path(f"/proc/{pid_file_seen[0]}/stat")
-        wait_for(lambda: not stat.exists() or ") Z " in stat.read_text())
+        wait_for(lambda: gone_or_zombie(pid_file_seen[0]))
 
     @staticmethod
     def kill_group(child):
