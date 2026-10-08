@@ -1,8 +1,10 @@
 //! Signed runtime catalog: format, trust model and verification.
 //!
 //! Official runtime packages are authorized by a catalog that binds each
-//! package archive digest to a package id, runtime id, version, platforms and
-//! a core version range. The catalog is signed with Ed25519 over its canonical
+//! package archive digest to a package id, runtime id, version, runtime API,
+//! platforms, per-platform attestation digests and a core version range. A
+//! release block names the core release (version, commit and the binary set
+//! digest of every target) the catalog belongs to. The catalog is signed with Ed25519 over its canonical
 //! JSON bytes; individual packages carry no signature. A third-party archive
 //! is trusted only through [`LocalTrust`], an explicit owner-supplied digest
 //! that can never yield [`Authorization::Official`].
@@ -36,9 +38,13 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::canonical_json::{canonical_bytes, parse_strict, JsonError};
+use crate::release::{
+    check_attestations, validate_release, Attestation, Release, ReleaseRejection, VerifiedRelease,
+    MAX_ATTESTATIONS_PER_ENTRY, MAX_BINARY_SETS,
+};
 
 /// Catalog schema version this build reads and writes.
-pub const CATALOG_SCHEMA_VERSION: u64 = 1;
+pub const CATALOG_SCHEMA_VERSION: u64 = 2;
 
 /// Largest accepted catalog document: 1 MiB.
 ///
@@ -103,7 +109,10 @@ pub const MAX_TRUST_ROOTS: usize = 8;
 
 /// Domain separator prefixed to the canonical catalog bytes before signing, so
 /// a catalog signature can never be replayed as another kind of signature.
-const CATALOG_DOMAIN: &[u8] = b"pohunek-runtime-catalog-v1\n";
+///
+/// The version in the separator follows [`CATALOG_SCHEMA_VERSION`], so a
+/// signature over a document of another schema never verifies.
+const CATALOG_DOMAIN: &[u8] = b"pohunek-runtime-catalog-v2\n";
 
 /// Domain separator prefixed to the canonical key record body before signing.
 const KEY_RECORD_DOMAIN: &[u8] = b"pohunek-catalog-key-record-v1\n";
@@ -215,9 +224,14 @@ pub struct CatalogEntry {
     pub version: PackageVersion,
     /// Digest of the package archive bytes.
     pub digest: PackageDigest,
+    /// Runtime API version the package implements, at least 1.
+    pub runtime_api: u32,
     /// Platforms the package supports, as lowercase `[a-z0-9._-]` names.
     pub platforms: Vec<String>,
-    /// Semver range of core versions the package supports.
+    /// One attestation digest per platform in `platforms`.
+    pub attestations: Vec<Attestation>,
+    /// Semver range of core versions the package supports; it must admit the
+    /// release version.
     pub core: String,
 }
 
@@ -231,6 +245,8 @@ pub struct Catalog {
     pub sequence: u64,
     /// Unix seconds from which the catalog must no longer be accepted.
     pub expires_at: u64,
+    /// The core release this catalog belongs to.
+    pub release: Release,
     /// Keys that must not sign or endorse, in addition to the anchor's list.
     pub revoked_key_ids: Vec<KeyId>,
     /// Package digests that are never authorized.
@@ -291,6 +307,12 @@ pub enum CatalogLimit {
     /// Too many platforms in one entry.
     #[error("platforms")]
     Platforms,
+    /// Too many binary sets in the release block.
+    #[error("binary sets")]
+    BinarySets,
+    /// Too many attestations in one entry.
+    #[error("attestations")]
+    Attestations,
     /// Too many key chain records.
     #[error("key records")]
     KeyRecords,
@@ -317,6 +339,25 @@ pub enum CatalogEntryRejection {
     /// The core range is empty, too long, unparsable or matches every version.
     #[error("core version range is invalid")]
     CoreRange,
+    /// The core range does not admit the release version.
+    #[error("core version range excludes the release version")]
+    CoreExcludesRelease,
+    /// The runtime API version is zero.
+    #[error("runtime API version is invalid")]
+    RuntimeApi,
+    /// The attestation list is empty, too long, has a bad platform name or
+    /// repeats a platform.
+    #[error("attestation list is invalid")]
+    Attestations,
+    /// An attestation names a platform the entry does not list.
+    #[error("attestation platform is not an entry platform")]
+    AttestationPlatform,
+    /// An entry platform has no attestation.
+    #[error("entry platform has no attestation")]
+    MissingAttestation,
+    /// An entry platform has no binary set in the release block.
+    #[error("entry platform has no binary set in the release")]
+    NoBinarySet,
     /// The same package id and version appear twice.
     #[error("package version is listed twice")]
     DuplicateVersion,
@@ -409,6 +450,9 @@ pub enum CatalogError {
     /// The catalog's `expires_at` has passed.
     #[error("catalog has expired")]
     Expired,
+    /// The release block is invalid.
+    #[error("catalog release block is invalid: {0}")]
+    Release(ReleaseRejection),
     /// An entry is invalid; `index` is its position in `entries`.
     #[error("catalog entry {index} is invalid: {reason}")]
     Entry {
@@ -614,6 +658,19 @@ pub fn verify_catalog(
         return Err(CatalogError::TooLarge);
     }
     let value = parse_strict(bytes)?;
+    // A document of another schema is refused as such before its shape is
+    // judged against this schema.
+    let declared_other = [
+        value.get("schema_version"),
+        value.pointer("/catalog/schema_version"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_u64)
+    .any(|version| version != CATALOG_SCHEMA_VERSION);
+    if declared_other {
+        return Err(CatalogError::UnsupportedSchemaVersion);
+    }
     let envelope: CatalogEnvelope =
         serde_json::from_value(value.clone()).map_err(|_cause| CatalogError::Schema)?;
     if envelope.schema_version != CATALOG_SCHEMA_VERSION
@@ -648,10 +705,12 @@ pub fn verify_catalog(
     if now >= catalog.expires_at {
         return Err(CatalogError::Expired);
     }
-    let entries = validate_entries(&catalog)?;
+    let release = validate_release(&catalog.release).map_err(CatalogError::Release)?;
+    let entries = validate_entries(&catalog, &release)?;
     Ok(VerifiedCatalog {
         sequence: catalog.sequence,
         expires_at: catalog.expires_at,
+        release,
         signer,
         entries,
         revoked_digests: catalog.revoked_digests.into_iter().collect(),
@@ -660,12 +719,8 @@ pub fn verify_catalog(
 }
 
 fn check_limits(envelope: &CatalogEnvelope) -> Result<(), CatalogError> {
+    check_body_limits(&envelope.catalog)?;
     let checks = [
-        (
-            envelope.catalog.entries.len(),
-            MAX_CATALOG_ENTRIES,
-            CatalogLimit::Entries,
-        ),
         (
             envelope.key_chain.len(),
             MAX_KEY_RECORDS,
@@ -676,16 +731,6 @@ fn check_limits(envelope: &CatalogEnvelope) -> Result<(), CatalogError> {
             MAX_SIGNATURES,
             CatalogLimit::Signatures,
         ),
-        (
-            envelope.catalog.revoked_key_ids.len(),
-            MAX_REVOKED_KEYS,
-            CatalogLimit::RevokedKeys,
-        ),
-        (
-            envelope.catalog.revoked_digests.len(),
-            MAX_REVOKED_DIGESTS,
-            CatalogLimit::RevokedDigests,
-        ),
     ];
     for (len, max, limit) in checks {
         if len > max {
@@ -693,6 +738,59 @@ fn check_limits(envelope: &CatalogEnvelope) -> Result<(), CatalogError> {
         }
     }
     Ok(())
+}
+
+fn check_body_limits(catalog: &Catalog) -> Result<(), CatalogError> {
+    let checks = [
+        (
+            catalog.entries.len(),
+            MAX_CATALOG_ENTRIES,
+            CatalogLimit::Entries,
+        ),
+        (
+            catalog.revoked_key_ids.len(),
+            MAX_REVOKED_KEYS,
+            CatalogLimit::RevokedKeys,
+        ),
+        (
+            catalog.revoked_digests.len(),
+            MAX_REVOKED_DIGESTS,
+            CatalogLimit::RevokedDigests,
+        ),
+        (
+            catalog.release.binary_sets.len(),
+            MAX_BINARY_SETS,
+            CatalogLimit::BinarySets,
+        ),
+    ];
+    for (len, max, limit) in checks {
+        if len > max {
+            return Err(CatalogError::Limit(limit));
+        }
+    }
+    if catalog
+        .entries
+        .iter()
+        .any(|entry| entry.attestations.len() > MAX_ATTESTATIONS_PER_ENTRY)
+    {
+        return Err(CatalogError::Limit(CatalogLimit::Attestations));
+    }
+    Ok(())
+}
+
+/// Applies every rule [`verify_catalog`] applies to the catalog body, without
+/// a signature: limits, the release block and each entry.
+///
+/// Release tooling calls it on an unsigned body so a catalog the daemon would
+/// refuse is never signed.
+///
+/// # Errors
+///
+/// Returns the first violated rule as a [`CatalogError`].
+pub fn check_catalog(catalog: &Catalog) -> Result<(), CatalogError> {
+    check_body_limits(catalog)?;
+    let release = validate_release(&catalog.release).map_err(CatalogError::Release)?;
+    validate_entries(catalog, &release).map(|_entries| ())
 }
 
 fn parse_signature(text: &str) -> Result<Signature, CatalogError> {
@@ -822,7 +920,9 @@ pub struct VerifiedEntry {
     runtime_id: RuntimeId,
     version: PackageVersion,
     digest: PackageDigest,
+    runtime_api: u32,
     platforms: Vec<String>,
+    attestations: Vec<Attestation>,
     core: VersionReq,
 }
 
@@ -851,10 +951,22 @@ impl VerifiedEntry {
         &self.digest
     }
 
+    /// Runtime API version the package implements.
+    #[must_use]
+    pub fn runtime_api(&self) -> u32 {
+        self.runtime_api
+    }
+
     /// Supported platforms.
     #[must_use]
     pub fn platforms(&self) -> &[String] {
         &self.platforms
+    }
+
+    /// Attestation digests, one per supported platform.
+    #[must_use]
+    pub fn attestations(&self) -> &[Attestation] {
+        &self.attestations
     }
 
     /// Supported core version range.
@@ -876,7 +988,7 @@ impl VerifiedEntry {
     }
 }
 
-fn valid_platform(name: &str) -> bool {
+pub(crate) fn valid_platform(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_PLATFORM_BYTES
         && name.bytes().all(|byte| {
@@ -884,7 +996,10 @@ fn valid_platform(name: &str) -> bool {
         })
 }
 
-fn validate_entries(catalog: &Catalog) -> Result<Vec<VerifiedEntry>, CatalogError> {
+fn validate_entries(
+    catalog: &Catalog,
+    release: &VerifiedRelease,
+) -> Result<Vec<VerifiedEntry>, CatalogError> {
     let revoked: BTreeSet<&PackageDigest> = catalog.revoked_digests.iter().collect();
     let mut versions = BTreeSet::new();
     let mut digests = BTreeSet::new();
@@ -903,8 +1018,15 @@ fn validate_entries(catalog: &Catalog) -> Result<Vec<VerifiedEntry>, CatalogErro
         {
             return Err(reject(CatalogEntryRejection::Platforms));
         }
+        if entry.runtime_api == 0 {
+            return Err(reject(CatalogEntryRejection::RuntimeApi));
+        }
+        check_attestations(&entry.platforms, &entry.attestations, release).map_err(reject)?;
         let core = parse_core_range(&entry.core)
             .ok_or_else(|| reject(CatalogEntryRejection::CoreRange))?;
+        if !core.matches(release.version()) {
+            return Err(reject(CatalogEntryRejection::CoreExcludesRelease));
+        }
         if !versions.insert((&entry.package_id, &entry.version)) {
             return Err(reject(CatalogEntryRejection::DuplicateVersion));
         }
@@ -928,7 +1050,9 @@ fn validate_entries(catalog: &Catalog) -> Result<Vec<VerifiedEntry>, CatalogErro
             runtime_id: entry.runtime_id.clone(),
             version: entry.version.clone(),
             digest: entry.digest.clone(),
+            runtime_api: entry.runtime_api,
             platforms: entry.platforms.clone(),
+            attestations: entry.attestations.clone(),
             core,
         });
     }
@@ -958,6 +1082,7 @@ pub enum Authorization {
 pub struct VerifiedCatalog {
     sequence: u64,
     expires_at: u64,
+    release: VerifiedRelease,
     signer: KeyId,
     entries: Vec<VerifiedEntry>,
     revoked_digests: BTreeSet<PackageDigest>,
@@ -976,6 +1101,12 @@ impl VerifiedCatalog {
     #[must_use]
     pub fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    /// The core release the catalog belongs to.
+    #[must_use]
+    pub fn release(&self) -> &VerifiedRelease {
+        &self.release
     }
 
     /// Id of the key whose signature was accepted.

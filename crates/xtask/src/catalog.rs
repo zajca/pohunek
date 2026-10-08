@@ -1,14 +1,16 @@
 //! Runtime catalog assembly, signing and verification for release tooling.
 //!
 //! `catalog build` turns a package spec into the unsigned catalog body, with
-//! each entry's digest, package id, runtime id and version read from the
-//! package archive itself. `catalog sign` signs that body with a key file the
+//! each entry's digest, package id, runtime id, version and runtime API read
+//! from the package archive itself, and checks the body with the rules the
+//! daemon's verifier applies. `catalog sign` signs that body with a key file the
 //! caller names by path (see [`crate::catalog_key`]) and verifies the result
 //! before writing it, so a document the daemon would reject is never emitted.
 //! `catalog verify` checks a catalog against an anchor file the way the daemon
 //! does, and `catalog anchor` writes the anchor file a release ships.
 //!
-//! Every output is deterministic: entries are sorted, platforms are sorted,
+//! Every output is deterministic: entries, platforms, binary sets and
+//! attestations are sorted,
 //! documents are indented JSON with one trailing newline and Ed25519
 //! signatures are deterministic.
 
@@ -23,9 +25,9 @@ use std::path::{Path, PathBuf};
 use ed25519_dalek::SigningKey;
 use nix::fcntl::OFlag;
 use package::{
-    catalog_document_bytes, parse_anchor, read_archive, sign_catalog, verify_catalog, AnchorFile,
-    AnchorFileError, Catalog, CatalogEntry, KeyId, Limits, PackageDigest, RootKey,
-    CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES,
+    catalog_document_bytes, check_catalog, parse_anchor, read_archive, sign_catalog,
+    verify_catalog, AnchorFile, AnchorFileError, Attestation, Catalog, CatalogEntry, KeyId, Limits,
+    PackageDigest, Release, RootKey, CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES,
 };
 use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde::Deserialize;
@@ -34,7 +36,7 @@ use crate::catalog_key::{read_public_key, read_signing_key};
 use crate::XtaskError;
 
 /// Schema version of the package spec read by `catalog build`.
-const SPEC_SCHEMA_VERSION: u64 = 1;
+const SPEC_SCHEMA_VERSION: u64 = 2;
 
 /// Largest accepted spec or unsigned catalog file: the catalog size limit.
 const MAX_SPEC_BYTES: usize = MAX_CATALOG_BYTES;
@@ -56,6 +58,7 @@ struct Spec {
     schema_version: u64,
     sequence: u64,
     expires_at: u64,
+    release: Release,
     revoked_key_ids: Vec<KeyId>,
     revoked_digests: Vec<PackageDigest>,
     packages: Vec<PackageSpec>,
@@ -68,6 +71,7 @@ struct PackageSpec {
     /// Archive path, absolute or relative to the spec file's directory.
     archive: PathBuf,
     platforms: Vec<String>,
+    attestations: Vec<Attestation>,
     core: String,
 }
 
@@ -145,10 +149,15 @@ fn pretty_with_newline<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, XtaskE
     Ok(bytes)
 }
 
-/// Package id, version and runtime id a package descriptor declares.
-fn descriptor_identity(
-    descriptor: &[u8],
-) -> Result<(PackageId, PackageVersion, RuntimeId), XtaskError> {
+/// Identity and runtime API a package descriptor declares.
+struct Identity {
+    package_id: PackageId,
+    version: PackageVersion,
+    runtime_id: RuntimeId,
+    runtime_api: u32,
+}
+
+fn descriptor_identity(descriptor: &[u8]) -> Result<Identity, XtaskError> {
     let invalid = |reason: &str| {
         XtaskError::Usage(format!("package descriptor `{DESCRIPTOR_PATH}` {reason}"))
     };
@@ -166,22 +175,29 @@ fn descriptor_identity(
         .map_err(|_cause| invalid("has an invalid package `id`"))?;
     let version = PackageVersion::parse(&string(table.get("version"), "version")?)
         .map_err(|_cause| invalid("has an invalid `version`"))?;
+    let runtime_api = table
+        .get("runtime_api")
+        .and_then(toml::Value::as_integer)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value >= 1)
+        .ok_or_else(|| invalid("has no positive integer `runtime_api`"))?;
     let runtime = table
         .get("runtime")
         .and_then(toml::Value::as_table)
         .ok_or_else(|| invalid("has no `[runtime]` table"))?;
     let runtime_id = RuntimeId::parse(&string(runtime.get("id"), "runtime.id")?)
         .map_err(|_cause| invalid("has an invalid `runtime.id`"))?;
-    Ok((package_id, version, runtime_id))
+    Ok(Identity {
+        package_id,
+        version,
+        runtime_id,
+        runtime_api,
+    })
 }
 
 /// The catalog entry of the package archive at `archive`, listed for
-/// `platforms` and the core range `core`.
-fn entry_from_archive(
-    archive: &Path,
-    platforms: &[String],
-    core: &str,
-) -> Result<CatalogEntry, XtaskError> {
+/// `platforms` with their `attestations` and the core range `core`.
+fn entry_from_archive(archive: &Path, package: &PackageSpec) -> Result<CatalogEntry, XtaskError> {
     let limits = Limits::DEFAULT;
     let bytes = read_input(archive, limits.max_compressed_bytes)?;
     let verified = read_archive(&bytes, &limits).map_err(XtaskError::Package)?;
@@ -195,16 +211,20 @@ fn entry_from_archive(
                 archive.display()
             ))
         })?;
-    let (package_id, version, runtime_id) = descriptor_identity(&descriptor.contents)?;
-    let mut platforms = platforms.to_vec();
+    let identity = descriptor_identity(&descriptor.contents)?;
+    let mut platforms = package.platforms.clone();
     platforms.sort();
+    let mut attestations = package.attestations.clone();
+    attestations.sort_by(|left, right| left.platform.cmp(&right.platform));
     Ok(CatalogEntry {
-        package_id,
-        runtime_id,
-        version,
+        package_id: identity.package_id,
+        runtime_id: identity.runtime_id,
+        version: identity.version,
         digest: verified.digest().clone(),
+        runtime_api: identity.runtime_api,
         platforms,
-        core: core.to_owned(),
+        attestations,
+        core: package.core.clone(),
     })
 }
 
@@ -221,11 +241,7 @@ pub(crate) fn build(spec_path: &Path) -> Result<Catalog, XtaskError> {
     let mut entries = Vec::with_capacity(spec.packages.len());
     for package in &spec.packages {
         let archive = base.join(&package.archive);
-        entries.push(entry_from_archive(
-            &archive,
-            &package.platforms,
-            &package.core,
-        )?);
+        entries.push(entry_from_archive(&archive, package)?);
     }
     entries.sort_by(|left, right| {
         (left.package_id.as_str(), left.version.as_str())
@@ -235,14 +251,21 @@ pub(crate) fn build(spec_path: &Path) -> Result<Catalog, XtaskError> {
     revoked_key_ids.sort();
     let mut revoked_digests = spec.revoked_digests;
     revoked_digests.sort();
-    Ok(Catalog {
+    let mut release = spec.release;
+    release
+        .binary_sets
+        .sort_by(|left, right| left.target.cmp(&right.target));
+    let catalog = Catalog {
         schema_version: CATALOG_SCHEMA_VERSION,
         sequence: spec.sequence,
         expires_at: spec.expires_at,
+        release,
         revoked_key_ids,
         revoked_digests,
         entries,
-    })
+    };
+    check_catalog(&catalog).map_err(XtaskError::Catalog)?;
+    Ok(catalog)
 }
 
 /// Builds the catalog of the spec and writes the unsigned body to `output`.
@@ -351,10 +374,11 @@ pub(crate) fn verify(
         .iter()
         .map(|entry| {
             format!(
-                "{} {} {} {} [{}] {}",
+                "{} {} {} api={} {} [{}] {}",
                 entry.package_id().as_str(),
                 entry.version().as_str(),
                 entry.runtime_id().as_str(),
+                entry.runtime_api(),
                 entry.digest().as_str(),
                 entry.platforms().join(", "),
                 entry.core(),
@@ -476,8 +500,8 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt as _};
 
     use package::{
-        build_archive, ArchiveEntry, CatalogEntryRejection, CatalogError, TrustAnchorError,
-        MAX_REVOKED_KEYS, MAX_TRUST_ROOTS,
+        build_archive, ArchiveEntry, CatalogEntryRejection, CatalogError, ReleaseRejection,
+        TrustAnchorError, MAX_REVOKED_KEYS, MAX_TRUST_ROOTS,
     };
     use serde_json::json;
 
@@ -487,6 +511,43 @@ mod tests {
     const FAR_FUTURE: u64 = 4_102_444_800;
     const NOW: u64 = 1_800_000_000;
     const PLATFORM: &str = "x86_64-unknown-linux-gnu";
+    const RELEASE_VERSION: &str = "1.0.0";
+    const RELEASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// A `sha256:` digest of 64 copies of `byte`.
+    fn sha(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    /// The spec entry of `archive` for `platforms`, with attestations listed
+    /// in reverse platform order and a core range that admits the release.
+    fn package(archive: &str, platforms: &[&str]) -> serde_json::Value {
+        let attestations: Vec<_> = platforms
+            .iter()
+            .rev()
+            .map(|platform| json!({ "platform": platform, "digest": sha('7') }))
+            .collect();
+        json!({
+            "archive": archive,
+            "platforms": platforms,
+            "attestations": attestations,
+            "core": ">=0.0.0",
+        })
+    }
+
+    /// A release block with a binary set for every target the tests use,
+    /// listed out of order.
+    fn release_block() -> serde_json::Value {
+        json!({
+            "version": RELEASE_VERSION,
+            "commit": RELEASE_COMMIT,
+            "binary_sets": [
+                { "target": "b-platform", "digest": sha('b') },
+                { "target": PLATFORM, "digest": sha('9') },
+                { "target": "a-platform", "digest": sha('a') },
+            ],
+        })
+    }
 
     fn descriptor(package_id: &str, version: &str, runtime: &str) -> String {
         format!(
@@ -513,9 +574,10 @@ mod tests {
     fn write_spec(dir: &Path, packages: &serde_json::Value) -> PathBuf {
         let path = dir.join("spec.json");
         let spec = json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "sequence": 4,
             "expires_at": FAR_FUTURE,
+            "release": release_block(),
             "revoked_key_ids": [],
             "revoked_digests": [],
             "packages": packages,
@@ -555,10 +617,7 @@ mod tests {
             "codex.tar.zst",
             &descriptor("pohunek.runtime.codex", "1.0.0", "codex"),
         );
-        let spec = write_spec(
-            dir.path(),
-            &json!([{ "archive": "codex.tar.zst", "platforms": [PLATFORM], "core": ">=0.0.0" }]),
-        );
+        let spec = write_spec(dir.path(), &json!([package("codex.tar.zst", &[PLATFORM])]));
         Release { dir, spec, digest }
     }
 
@@ -661,8 +720,14 @@ mod tests {
         assert_eq!(entry.runtime_id.as_str(), "codex");
         assert_eq!(entry.version.as_str(), "1.0.0");
         assert_eq!(entry.digest, release.digest);
+        assert_eq!(entry.runtime_api, 1);
         assert_eq!(entry.platforms, [PLATFORM]);
+        assert_eq!(entry.attestations.len(), 1);
+        assert_eq!(entry.attestations[0].platform, PLATFORM);
+        assert_eq!(entry.attestations[0].digest.as_str(), sha('7'));
         assert_eq!(entry.core, ">=0.0.0");
+        assert_eq!(catalog.release.version, RELEASE_VERSION);
+        assert_eq!(catalog.release.commit, RELEASE_COMMIT);
     }
 
     #[test]
@@ -686,9 +751,9 @@ mod tests {
         let spec = write_spec(
             dir.path(),
             &json!([
-                { "archive": "b.tar.zst", "platforms": ["b-platform", "a-platform"], "core": ">=0.0.0" },
-                { "archive": "a2.tar.zst", "platforms": [PLATFORM], "core": ">=0.0.0" },
-                { "archive": "a1.tar.zst", "platforms": [PLATFORM], "core": ">=0.0.0" },
+                package("b.tar.zst", &["b-platform", "a-platform"]),
+                package("a2.tar.zst", &[PLATFORM]),
+                package("a1.tar.zst", &[PLATFORM]),
             ]),
         );
         let first = dir.path().join("first.json");
@@ -715,17 +780,25 @@ mod tests {
             ]
         );
         assert_eq!(catalog.entries[2].platforms, ["a-platform", "b-platform"]);
+        let attested: Vec<&str> = catalog.entries[2]
+            .attestations
+            .iter()
+            .map(|record| record.platform.as_str())
+            .collect();
+        assert_eq!(attested, ["a-platform", "b-platform"]);
+        let targets: Vec<&str> = catalog
+            .release
+            .binary_sets
+            .iter()
+            .map(|set| set.target.as_str())
+            .collect();
+        assert_eq!(targets, ["a-platform", "b-platform", PLATFORM]);
     }
 
     #[test]
     fn build_refuses_archives_it_cannot_read_an_identity_from() {
         let dir = pohunek_test_support::tempdir().expect("tempdir");
-        let spec_for = |name: &str| {
-            write_spec(
-                dir.path(),
-                &json!([{ "archive": name, "platforms": [PLATFORM], "core": ">=0.0.0" }]),
-            )
-        };
+        let spec_for = |name: &str| write_spec(dir.path(), &json!([package(name, &[PLATFORM])]));
 
         let entries = [ArchiveEntry {
             path: "other.toml".to_owned(),
@@ -767,11 +840,160 @@ mod tests {
     }
 
     #[test]
+    fn the_runtime_api_comes_from_the_archive_descriptor_and_never_from_the_spec() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        write_archive(
+            dir.path(),
+            "api3.tar.zst",
+            &descriptor("pohunek.runtime.codex", "1.0.0", "codex")
+                .replace("runtime_api = 1", "runtime_api = 3"),
+        );
+        let spec = write_spec(dir.path(), &json!([package("api3.tar.zst", &[PLATFORM])]));
+        assert_eq!(build(&spec).expect("build").entries[0].runtime_api, 3);
+
+        let mut member = package("api3.tar.zst", &[PLATFORM]);
+        member["runtime_api"] = json!(1);
+        let spec = write_spec(dir.path(), &json!([member]));
+        assert!(matches!(build(&spec), Err(XtaskError::Json(_))));
+
+        for (name, replacement) in [
+            ("zero", "runtime_api = 0"),
+            ("negative", "runtime_api = -1"),
+            ("beyond u32", "runtime_api = 4294967296"),
+            ("text", "runtime_api = \"1\""),
+            ("absent", ""),
+        ] {
+            let text = descriptor("pohunek.runtime.codex", "1.0.0", "codex")
+                .replace("runtime_api = 1", replacement);
+            write_archive(dir.path(), "bad.tar.zst", &text);
+            let spec = write_spec(dir.path(), &json!([package("bad.tar.zst", &[PLATFORM])]));
+            let error = build(&spec).expect_err(name);
+            assert!(error.to_string().contains("runtime_api"), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn build_refuses_a_catalog_the_verifier_would_refuse() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        write_archive(
+            dir.path(),
+            "codex.tar.zst",
+            &descriptor("pohunek.runtime.codex", "1.0.0", "codex"),
+        );
+        let reject = |edit: &dyn Fn(&mut serde_json::Value), reason: CatalogEntryRejection| {
+            let mut entry = package("codex.tar.zst", &[PLATFORM]);
+            edit(&mut entry);
+            let spec = write_spec(dir.path(), &json!([entry]));
+            match build(&spec) {
+                Err(XtaskError::Catalog(CatalogError::Entry { reason: found, .. })) => {
+                    assert_eq!(found, reason);
+                }
+                other => panic!("expected {reason:?}, got {other:?}"),
+            }
+        };
+        reject(
+            &|entry| entry["core"] = json!(">=1.0.1"),
+            CatalogEntryRejection::CoreExcludesRelease,
+        );
+        reject(
+            &|entry| entry["core"] = json!("*"),
+            CatalogEntryRejection::CoreRange,
+        );
+        reject(
+            &|entry| entry["attestations"] = json!([]),
+            CatalogEntryRejection::Attestations,
+        );
+        reject(
+            &|entry| entry["platforms"] = json!([PLATFORM, "a-platform"]),
+            CatalogEntryRejection::MissingAttestation,
+        );
+        reject(
+            &|entry| {
+                entry["attestations"]
+                    .as_array_mut()
+                    .expect("array")
+                    .push(json!({ "platform": "a-platform", "digest": sha('7') }));
+            },
+            CatalogEntryRejection::AttestationPlatform,
+        );
+        reject(
+            &|entry| {
+                entry["platforms"] = json!(["c-platform"]);
+                entry["attestations"] = json!([{ "platform": "c-platform", "digest": sha('7') }]);
+            },
+            CatalogEntryRejection::NoBinarySet,
+        );
+
+        // The spec must give the core range explicitly.
+        let mut entry = package("codex.tar.zst", &[PLATFORM]);
+        entry.as_object_mut().expect("object").remove("core");
+        let spec = write_spec(dir.path(), &json!([entry]));
+        assert!(matches!(build(&spec), Err(XtaskError::Json(_))));
+    }
+
+    #[test]
+    fn build_refuses_an_invalid_release_block() {
+        let dir = pohunek_test_support::tempdir().expect("tempdir");
+        write_archive(
+            dir.path(),
+            "codex.tar.zst",
+            &descriptor("pohunek.runtime.codex", "1.0.0", "codex"),
+        );
+        let packages = json!([package("codex.tar.zst", &[PLATFORM])]);
+        let spec = dir.path().join("spec.json");
+        let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = json!({
+                "schema_version": 2, "sequence": 1, "expires_at": FAR_FUTURE,
+                "release": release_block(),
+                "revoked_key_ids": [], "revoked_digests": [], "packages": packages,
+            });
+            edit(&mut value);
+            fs::write(&spec, serde_json::to_vec(&value).expect("json")).expect("write");
+            build(&spec)
+        };
+        assert!(matches!(
+            with(&|value| value["release"]["version"] = json!("1.0.0-rc.1")),
+            Err(XtaskError::Catalog(CatalogError::Release(
+                ReleaseRejection::Version
+            )))
+        ));
+        assert!(matches!(
+            with(&|value| value["release"]["commit"] = json!("abc")),
+            Err(XtaskError::Catalog(CatalogError::Release(
+                ReleaseRejection::Commit
+            )))
+        ));
+        assert!(matches!(
+            with(&|value| value["release"]["binary_sets"] = json!([])),
+            Err(XtaskError::Catalog(CatalogError::Release(
+                ReleaseRejection::BinarySets
+            )))
+        ));
+        assert!(matches!(
+            with(&|value| value["release"]["binary_sets"][0]["target"] = json!(PLATFORM)),
+            Err(XtaskError::Catalog(CatalogError::Release(
+                ReleaseRejection::DuplicateTarget
+            )))
+        ));
+        assert!(matches!(
+            with(&|value| value["release"]["binary_sets"][0]["digest"] = json!("sha256:zz")),
+            Err(XtaskError::Json(_))
+        ));
+        assert!(matches!(
+            with(&|value| {
+                value.as_object_mut().expect("object").remove("release");
+            }),
+            Err(XtaskError::Json(_))
+        ));
+    }
+
+    #[test]
     fn build_refuses_unknown_spec_members_and_versions_and_links() {
         let dir = pohunek_test_support::tempdir().expect("tempdir");
         let spec = dir.path().join("spec.json");
         let base = json!({
-            "schema_version": 1, "sequence": 1, "expires_at": FAR_FUTURE,
+            "schema_version": 2, "sequence": 1, "expires_at": FAR_FUTURE,
+            "release": release_block(),
             "revoked_key_ids": [], "revoked_digests": [], "packages": []
         });
         let mut extra = base.clone();
@@ -779,7 +1001,7 @@ mod tests {
         fs::write(&spec, serde_json::to_vec(&extra).expect("json")).expect("write");
         assert!(matches!(build(&spec), Err(XtaskError::Json(_))));
         let mut version = base.clone();
-        version["schema_version"] = json!(2);
+        version["schema_version"] = json!(1);
         fs::write(&spec, serde_json::to_vec(&version).expect("json")).expect("write");
         assert!(matches!(build(&spec), Err(XtaskError::Usage(_))));
 
@@ -836,18 +1058,13 @@ mod tests {
         assert!(matches!(error, XtaskError::Catalog(CatalogError::Expired)));
         assert!(!out.exists());
 
+        // An unsigned body edited by hand after `build` is judged again at sign.
         let dir = release.dir.path();
-        write_archive(
-            dir,
-            "shell.tar.zst",
-            &descriptor("acme.runtime.shell", "1.0.0", "shell"),
-        );
-        let spec = write_spec(
-            dir,
-            &json!([{ "archive": "shell.tar.zst", "platforms": [PLATFORM], "core": ">=0.0.0" }]),
-        );
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&fs::read(&unsigned).expect("read")).expect("json");
+        body["entries"][0]["runtime_id"] = json!("shell");
         let unsigned = dir.join("shell-unsigned.json");
-        build_to(&spec, &unsigned).expect("build lists whatever the archive says");
+        fs::write(&unsigned, serde_json::to_vec(&body).expect("json")).expect("write");
         let error = sign_to(&unsigned, &private, key_id().as_str(), &out, NOW)
             .expect_err("a shell entry is invalid");
         assert!(matches!(

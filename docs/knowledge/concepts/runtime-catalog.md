@@ -12,8 +12,11 @@ intents: [debug, help, project]
 Official runtime packages are authorized by a signed catalog that binds each
 package archive digest (see the
 [runtime package archive](runtime-package-archive.md)) to a package id, runtime
-id, version, platforms and a core version range. A third-party archive is
-trusted only by an explicit owner-supplied digest. Packages carry no signature
+id, version, runtime API version, platforms, one attestation digest per
+platform and a core version range. A release block names the core release
+(version, source commit and the binary set digest of every target) the catalog
+belongs to. A third-party archive is trusted only by an explicit owner-supplied
+digest. Packages carry no signature
 of their own. Implemented in `crates/package` (`catalog.rs`,
 `canonical_json.rs`); the crate verifies catalogs, while installing,
 the registry and the CLI are separate layers.
@@ -55,11 +58,18 @@ the registry and the CLI are separate layers.
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "catalog": {
-    "schema_version": 1,
+    "schema_version": 2,
     "sequence": 7,
     "expires_at": 1790000000,
+    "release": {
+      "version": "0.35.0",
+      "commit": "<40 hex>",
+      "binary_sets": [
+        { "target": "x86_64-unknown-linux-gnu", "digest": "sha256:<64 hex>" }
+      ]
+    },
     "revoked_key_ids": [],
     "revoked_digests": [],
     "entries": [
@@ -68,7 +78,11 @@ the registry and the CLI are separate layers.
         "runtime_id": "codex",
         "version": "1.0.0",
         "digest": "sha256:<64 hex>",
+        "runtime_api": 1,
         "platforms": ["x86_64-unknown-linux-gnu"],
+        "attestations": [
+          { "platform": "x86_64-unknown-linux-gnu", "digest": "sha256:<64 hex>" }
+        ],
         "core": ">=0.33.0, <0.40.0"
       }
     ]
@@ -80,15 +94,37 @@ the registry and the CLI are separate layers.
 
 Every object rejects unknown fields. Numbers are non-negative integers only.
 Hex is lowercase. `core` is a semver range that must constrain the version.
+Only schema 2 is read: a document declaring another `schema_version` is refused
+with `UnsupportedSchemaVersion` before its shape is judged, and there is no
+compatibility path for schema 1.
+
+- `release.version` is plain `X.Y.Z` (no pre-release or build part) and
+  `release.commit` is 40 lowercase hex characters. `release.binary_sets` lists
+  one `{target, digest}` per target, at least one, targets unique, each a
+  `[a-z0-9._-]` name. `digest` is `sha256:<64 hex>` of the canonical set of
+  CLI, daemon and session worker binaries for that target; the catalog treats it
+  as opaque. The release tooling writes the list in ascending target order.
+- `runtime_api` is the package's runtime API version, at least 1; the tooling
+  reads it from the archive's `runtime.toml`.
+- `attestations` holds one `{platform, digest}` per entry platform, with
+  `digest` = `sha256:<64 hex>` of the attestation file bytes; the tooling writes
+  them in ascending platform order.
+
+The daemon does not enforce the release block, `runtime_api` or the
+attestations yet: they are verified, signed and exposed (`VerifiedCatalog::release()`,
+`VerifiedEntry::runtime_api()` and `VerifiedEntry::attestations()`), and the
+authorization decision is unchanged.
 
 ## Canonical signed bytes
 
-The signature covers `pohunek-runtime-catalog-v1\n` followed by the canonical
+The signature covers `pohunek-runtime-catalog-v2\n` followed by the canonical
 JSON of the `catalog` member: object keys in ascending byte order, no
 insignificant whitespace, strings escaped by `serde_json`. A key record
 endorsement covers `pohunek-catalog-key-record-v1\n` plus the canonical JSON of
 the record without its `signature`. The separators keep a signature from being
-replayed as another kind of signature. Whitespace and key order of the file do
+replayed as another kind of signature; the catalog separator carries the schema
+version, so a signature over a schema 1 document never verifies a schema 2
+document and the reverse. Whitespace and key order of the file do
 not matter; the verifier recomputes the canonical bytes. Input with duplicate
 object keys, trailing data, floats, negative numbers or more than 1 MiB is
 rejected before any signature is considered.
@@ -105,6 +141,18 @@ rejected before any signature is considered.
 - A runtime id maps to exactly one package id and the reverse. `(package_id,
   version)` and `digest` are each unique. Platforms are a non-empty set of
   `[a-z0-9._-]` names.
+- Every entry platform has exactly one attestation, and every attestation
+  platform is an entry platform (`MissingAttestation`, `AttestationPlatform`;
+  an empty, oversized, repeated or badly named list is `Attestations`).
+- Every entry platform is a `release.binary_sets` target (`NoBinarySet`). The
+  platform string is the core target triple the daemon reports for its host,
+  such as `x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`.
+- Every entry's `core` range admits `release.version`
+  (`CoreExcludesRelease`) and `runtime_api` is at least 1 (`RuntimeApi`).
+- The release block itself is refused with `CatalogError::Release` for a bad
+  version or commit, an empty or badly named binary set list, or a repeated
+  target. A malformed digest (not `sha256:` plus 64 lowercase hex) is a
+  `Schema` error.
 - `LocalTrust::ExplicitDigest(digest)` authorizes an archive only when its
   digest equals the owner-supplied one and its runtime id is not `shell`,
   `codex`, `claude` or `hermes`. Its result type is `LocalAuthorization::Local`,
@@ -192,11 +240,16 @@ the signing key never appears in a command line, an environment variable, a
 log or an output:
 
 - `catalog build --spec <file> --output <file>` turns a spec (`schema_version`
-  1, `sequence`, `expires_at`, `revoked_key_ids`, `revoked_digests` and
-  `packages`, each `{archive, platforms, core}` with `archive` relative to the
-  spec) into the unsigned catalog body. Digest, package id, runtime id and
-  version are read from the archive and its `runtime.toml`; entries are sorted
-  by package id and version, so the output is deterministic.
+  2, `sequence`, `expires_at`, `release` `{version, commit, binary_sets}`,
+  `revoked_key_ids`, `revoked_digests` and `packages`, each `{archive,
+  platforms, attestations, core}` with `archive` relative to the spec) into the
+  unsigned catalog body. Digest, package id, runtime id, version and
+  `runtime_api` are read from the archive and its `runtime.toml`; the spec
+  cannot supply them. `core` is mandatory in the spec. The body is checked
+  with the rules the verifier applies (`package::check_catalog`) before it is
+  written, so a catalog the daemon would refuse is not produced. Entries are
+  sorted by package id and version, and platforms, binary sets and attestations
+  by name, so the output is deterministic.
 - `catalog sign --catalog <file> --key-file <file> --key-id <hex> --output
   <file>` signs the body. The key file holds the 32-byte Ed25519 seed as 64
   lowercase hex characters; it must be a regular file owned by the caller with
@@ -267,7 +320,9 @@ immutable, so republishing it with a different or missing anchor is
 
 ## Limits
 
-Named constants in `crates/package/src/catalog.rs`: catalog 1 MiB, 256 entries,
-16 platforms per entry (64 bytes each), core range 128 bytes, 16 key records,
+Named constants in `crates/package/src/catalog.rs` and `release.rs`: catalog 1
+MiB, 256 entries, 16 platforms per entry (64 bytes each), 16 attestations per
+entry (one per platform), 16 binary sets per release, core range 128 bytes,
+16 key records,
 8 signatures, 64 revoked key ids, 1024 revoked digests, 8 anchor roots.
 Errors are typed (`CatalogError`) and never carry catalog content.

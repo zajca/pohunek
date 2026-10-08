@@ -12,9 +12,11 @@ use package::{
     catalog_signing_message, key_record_signing_message, verify_catalog, Authorization, Catalog,
     CatalogEntry, CatalogEntryRejection, CatalogEnvelope, CatalogError, CatalogLimit,
     CatalogSignature, KeyId, LocalAuthorization, LocalTrust, LocalTrustError, PackageDigest,
-    RootKey, SignedKeyRecord, TrustAnchor, TrustAnchorError, CATALOG_SCHEMA_VERSION,
+    Release, ReleaseRejection, RootKey, Sha256Digest, SignedKeyRecord, TrustAnchor,
+    TrustAnchorError, CATALOG_SCHEMA_VERSION, MAX_ATTESTATIONS_PER_ENTRY, MAX_BINARY_SETS,
     MAX_CATALOG_BYTES, MAX_CATALOG_ENTRIES,
 };
+use package::{Attestation, BinarySet};
 use protocol::{PackageId, PackageVersion, RuntimeId};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -24,6 +26,12 @@ const WINDOW_START: u64 = 1_000;
 const WINDOW_END: u64 = 9_000;
 const EXPIRES_AT: u64 = 8_000;
 const SEQUENCE: u64 = 7;
+/// A boxed in-place edit of a parsed document.
+type Edit = Box<dyn Fn(&mut Value)>;
+
+const PLATFORM: &str = "x86_64-unknown-linux-gnu";
+const RELEASE_VERSION: &str = "0.35.0";
+const RELEASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 fn signing_key(label: &str) -> SigningKey {
     let seed: [u8; 32] = Sha256::digest(label.as_bytes()).into();
@@ -46,13 +54,37 @@ fn digest(byte: char) -> PackageDigest {
     PackageDigest::parse(&format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
 }
 
+fn sha(byte: char) -> Sha256Digest {
+    Sha256Digest::parse(&format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
+}
+
+fn attestation(platform: &str, byte: char) -> Attestation {
+    Attestation {
+        platform: platform.to_owned(),
+        digest: sha(byte),
+    }
+}
+
+fn release() -> Release {
+    Release {
+        version: RELEASE_VERSION.to_owned(),
+        commit: RELEASE_COMMIT.to_owned(),
+        binary_sets: vec![BinarySet {
+            target: PLATFORM.to_owned(),
+            digest: sha('9'),
+        }],
+    }
+}
+
 fn entry(package: &str, runtime: &str, version: &str, digest_char: char) -> CatalogEntry {
     CatalogEntry {
         package_id: PackageId::parse(package).expect("package id"),
         runtime_id: RuntimeId::parse(runtime).expect("runtime id"),
         version: PackageVersion::parse(version).expect("version"),
         digest: digest(digest_char),
-        platforms: vec!["x86_64-unknown-linux-gnu".to_owned()],
+        runtime_api: 1,
+        platforms: vec![PLATFORM.to_owned()],
+        attestations: vec![attestation(PLATFORM, '7')],
         core: ">=0.33.0, <0.40.0".to_owned(),
     }
 }
@@ -62,6 +94,7 @@ fn catalog(sequence: u64) -> Catalog {
         schema_version: CATALOG_SCHEMA_VERSION,
         sequence,
         expires_at: EXPIRES_AT,
+        release: release(),
         revoked_key_ids: Vec::new(),
         revoked_digests: Vec::new(),
         entries: vec![
@@ -601,7 +634,7 @@ fn unknown_fields_and_bad_schema_versions_are_rejected_without_echo() {
         CatalogError::Schema
     );
 
-    let bad_version = mutate(&bytes, |value| value["schema_version"] = Value::from(2));
+    let bad_version = mutate(&bytes, |value| value["schema_version"] = Value::from(3));
     assert_eq!(
         verify(&bad_version, &anchor).unwrap_err(),
         CatalogError::UnsupportedSchemaVersion
@@ -725,17 +758,24 @@ fn canonical_signing_message_is_pinned_and_deterministic() {
         schema_version: CATALOG_SCHEMA_VERSION,
         sequence: 3,
         expires_at: 9,
+        release: release(),
         revoked_key_ids: Vec::new(),
         revoked_digests: Vec::new(),
         entries: vec![entry("pohunek.runtime.codex", "codex", "1.0.0", 'a')],
     };
     let expected = format!(
-        "pohunek-runtime-catalog-v1\n{{\"entries\":[{{\"core\":\">=0.33.0, <0.40.0\",\
+        "pohunek-runtime-catalog-v2\n{{\"entries\":[{{\"attestations\":[{{\"digest\":\"sha256:{}\",\
+         \"platform\":\"x86_64-unknown-linux-gnu\"}}],\"core\":\">=0.33.0, <0.40.0\",\
          \"digest\":\"sha256:{}\",\"package_id\":\"pohunek.runtime.codex\",\
-         \"platforms\":[\"x86_64-unknown-linux-gnu\"],\"runtime_id\":\"codex\",\
-         \"version\":\"1.0.0\"}}],\"expires_at\":9,\"revoked_digests\":[],\
-         \"revoked_key_ids\":[],\"schema_version\":1,\"sequence\":3}}",
-        "a".repeat(64)
+         \"platforms\":[\"x86_64-unknown-linux-gnu\"],\"runtime_api\":1,\
+         \"runtime_id\":\"codex\",\"version\":\"1.0.0\"}}],\"expires_at\":9,\
+         \"release\":{{\"binary_sets\":[{{\"digest\":\"sha256:{}\",\
+         \"target\":\"x86_64-unknown-linux-gnu\"}}],\"commit\":\"{RELEASE_COMMIT}\",\
+         \"version\":\"{RELEASE_VERSION}\"}},\"revoked_digests\":[],\
+         \"revoked_key_ids\":[],\"schema_version\":2,\"sequence\":3}}",
+        "7".repeat(64),
+        "a".repeat(64),
+        "9".repeat(64),
     );
     let first = catalog_signing_message(&body).unwrap();
     assert_eq!(first, expected.as_bytes());
@@ -814,4 +854,342 @@ fn garbage_input_never_panics_or_echoes() {
         let error = verify(input, &anchor).unwrap_err();
         assert!(!error.to_string().is_empty());
     }
+}
+
+#[test]
+fn a_valid_schema_2_catalog_exposes_the_release_block_and_attestations() {
+    let root_key = signing_key("root");
+    let mut body = catalog(SEQUENCE);
+    body.release.binary_sets.push(BinarySet {
+        target: "aarch64-apple-darwin".to_owned(),
+        digest: sha('8'),
+    });
+    body.entries[1].runtime_api = 3;
+    body.entries[1].platforms = vec![PLATFORM.to_owned(), "aarch64-apple-darwin".to_owned()];
+    body.entries[1].attestations = vec![
+        attestation(PLATFORM, '5'),
+        attestation("aarch64-apple-darwin", '6'),
+    ];
+    let verified = verify(&signed_by(&root_key, body), &anchor_for(&root_key)).expect("valid");
+
+    let release = verified.release();
+    assert_eq!(release.version(), &semver::Version::new(0, 35, 0));
+    assert_eq!(release.commit(), RELEASE_COMMIT);
+    assert_eq!(release.binary_sets().len(), 2);
+    assert_eq!(
+        release
+            .binary_set_digest(PLATFORM)
+            .map(Sha256Digest::as_str),
+        Some(format!("sha256:{}", "9".repeat(64)).as_str())
+    );
+    assert_eq!(
+        release
+            .binary_set_digest("aarch64-apple-darwin")
+            .map(Sha256Digest::as_str),
+        Some(format!("sha256:{}", "8".repeat(64)).as_str())
+    );
+    assert!(release
+        .binary_set_digest("riscv64gc-unknown-linux-gnu")
+        .is_none());
+
+    let codex = &verified.entries()[0];
+    assert_eq!(codex.runtime_api(), 1);
+    assert_eq!(codex.attestations(), [attestation(PLATFORM, '7')]);
+    let claude = &verified.entries()[1];
+    assert_eq!(claude.runtime_api(), 3);
+    assert_eq!(
+        claude.attestations(),
+        [
+            attestation(PLATFORM, '5'),
+            attestation("aarch64-apple-darwin", '6')
+        ]
+    );
+}
+
+#[test]
+fn a_schema_1_document_is_refused_as_an_unsupported_schema() {
+    let root_key = signing_key("root");
+    let bytes = signed_by(&root_key, catalog(SEQUENCE));
+    let v1 = mutate(&bytes, |value| {
+        value["schema_version"] = Value::from(1);
+        let catalog = value["catalog"].as_object_mut().unwrap();
+        catalog.insert("schema_version".into(), Value::from(1));
+        catalog.remove("release");
+        for entry in catalog["entries"].as_array_mut().unwrap() {
+            let entry = entry.as_object_mut().unwrap();
+            entry.remove("runtime_api");
+            entry.remove("attestations");
+        }
+    });
+    assert_eq!(
+        verify(&v1, &anchor_for(&root_key)).unwrap_err(),
+        CatalogError::UnsupportedSchemaVersion
+    );
+}
+
+#[test]
+fn a_v1_domain_signature_does_not_verify_a_schema_2_document() {
+    let root_key = signing_key("root");
+    let body = catalog(SEQUENCE);
+    let v2_message = catalog_signing_message(&body).unwrap();
+    let v2_prefix = b"pohunek-runtime-catalog-v2\n";
+    assert!(v2_message.starts_with(v2_prefix));
+    let mut v1_message = b"pohunek-runtime-catalog-v1\n".to_vec();
+    v1_message.extend_from_slice(&v2_message[v2_prefix.len()..]);
+    let stale = CatalogSignature {
+        key_id: key_id(&root_key),
+        signature: hex(&root_key.sign(&v1_message).to_bytes()),
+    };
+    let bytes = document(body, Vec::new(), vec![stale]);
+    assert_eq!(
+        verify(&bytes, &anchor_for(&root_key)).unwrap_err(),
+        CatalogError::BadSignature
+    );
+}
+
+#[test]
+fn tampering_with_the_release_block_or_an_attestation_breaks_the_signature() {
+    let root_key = signing_key("root");
+    let anchor = anchor_for(&root_key);
+    let bytes = signed_by(&root_key, catalog(SEQUENCE));
+    let edits: [(&str, Edit); 5] = [
+        (
+            "release commit",
+            Box::new(|value| {
+                value["catalog"]["release"]["commit"] = Value::String("f".repeat(40));
+            }),
+        ),
+        (
+            "release version",
+            Box::new(|value| {
+                value["catalog"]["release"]["version"] = Value::String("0.36.0".to_owned());
+            }),
+        ),
+        (
+            "binary set digest",
+            Box::new(|value| {
+                value["catalog"]["release"]["binary_sets"][0]["digest"] =
+                    Value::String(sha('0').to_string());
+            }),
+        ),
+        (
+            "attestation digest",
+            Box::new(|value| {
+                value["catalog"]["entries"][0]["attestations"][0]["digest"] =
+                    Value::String(sha('0').to_string());
+            }),
+        ),
+        (
+            "runtime api",
+            Box::new(|value| value["catalog"]["entries"][0]["runtime_api"] = Value::from(2)),
+        ),
+    ];
+    for (what, edit) in edits {
+        assert_eq!(
+            verify(&mutate(&bytes, edit), &anchor).unwrap_err(),
+            CatalogError::BadSignature,
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn attestation_and_core_rules_are_enforced_with_typed_rejections() {
+    let root_key = signing_key("root");
+    let anchor = anchor_for(&root_key);
+    let other_platform = "aarch64-apple-darwin";
+    let entry_rejected = |edit: &dyn Fn(&mut Catalog), reason: CatalogEntryRejection| {
+        let mut body = catalog(SEQUENCE);
+        edit(&mut body);
+        assert_eq!(
+            verify(&signed_by(&root_key, body), &anchor).unwrap_err(),
+            CatalogError::Entry { index: 0, reason },
+            "{reason}"
+        );
+    };
+
+    // An attestation for a platform the entry does not list.
+    entry_rejected(
+        &|body| {
+            body.entries[0]
+                .attestations
+                .push(attestation(other_platform, '1'));
+        },
+        CatalogEntryRejection::AttestationPlatform,
+    );
+    // A platform without an attestation.
+    entry_rejected(
+        &|body| {
+            body.release.binary_sets.push(BinarySet {
+                target: other_platform.to_owned(),
+                digest: sha('8'),
+            });
+            body.entries[0].platforms.push(other_platform.to_owned());
+        },
+        CatalogEntryRejection::MissingAttestation,
+    );
+    // A platform the release has no binary set for.
+    entry_rejected(
+        &|body| {
+            body.entries[0].platforms.push(other_platform.to_owned());
+            body.entries[0]
+                .attestations
+                .push(attestation(other_platform, '1'));
+        },
+        CatalogEntryRejection::NoBinarySet,
+    );
+    // No attestations, a repeated platform and a bad platform name.
+    entry_rejected(
+        &|body| body.entries[0].attestations.clear(),
+        CatalogEntryRejection::Attestations,
+    );
+    entry_rejected(
+        &|body| {
+            body.entries[0]
+                .attestations
+                .push(attestation(PLATFORM, '1'));
+        },
+        CatalogEntryRejection::Attestations,
+    );
+    entry_rejected(
+        &|body| body.entries[0].attestations[0].platform = "Linux x64".to_owned(),
+        CatalogEntryRejection::Attestations,
+    );
+    // A core range that excludes the release version, on either side.
+    entry_rejected(
+        &|body| body.entries[0].core = ">=0.36.0".to_owned(),
+        CatalogEntryRejection::CoreExcludesRelease,
+    );
+    entry_rejected(
+        &|body| body.entries[0].core = "<0.35.0".to_owned(),
+        CatalogEntryRejection::CoreExcludesRelease,
+    );
+    entry_rejected(
+        &|body| body.entries[0].runtime_api = 0,
+        CatalogEntryRejection::RuntimeApi,
+    );
+}
+
+#[test]
+fn release_block_rules_are_enforced_with_typed_rejections() {
+    let root_key = signing_key("root");
+    let anchor = anchor_for(&root_key);
+    let release_rejected = |edit: &dyn Fn(&mut Release), reason: ReleaseRejection| {
+        let mut body = catalog(SEQUENCE);
+        edit(&mut body.release);
+        assert_eq!(
+            verify(&signed_by(&root_key, body), &anchor).unwrap_err(),
+            CatalogError::Release(reason),
+            "{reason}"
+        );
+    };
+
+    release_rejected(
+        &|release| {
+            release.binary_sets.push(BinarySet {
+                target: PLATFORM.to_owned(),
+                digest: sha('8'),
+            });
+        },
+        ReleaseRejection::DuplicateTarget,
+    );
+    release_rejected(
+        &|release| release.binary_sets.clear(),
+        ReleaseRejection::BinarySets,
+    );
+    release_rejected(
+        &|release| release.binary_sets[0].target = "X86_64".to_owned(),
+        ReleaseRejection::BinarySets,
+    );
+    for bad in [
+        "0.35",
+        "0.35.0-rc.1",
+        "0.35.0+build",
+        "v0.35.0",
+        "00.35.0",
+        "",
+    ] {
+        release_rejected(
+            &|release| release.version = bad.to_owned(),
+            ReleaseRejection::Version,
+        );
+    }
+    for bad in [
+        "0123456789ABCDEF0123456789abcdef01234567",
+        "0123456789abcdef0123456789abcdef0123456",
+        "0123456789abcdef0123456789abcdef012345678",
+        "",
+    ] {
+        release_rejected(
+            &|release| release.commit = bad.to_owned(),
+            ReleaseRejection::Commit,
+        );
+    }
+}
+
+#[test]
+fn malformed_digests_and_missing_fields_are_schema_errors() {
+    let root_key = signing_key("root");
+    let anchor = anchor_for(&root_key);
+    let bytes = signed_by(&root_key, catalog(SEQUENCE));
+    let upper = "A".repeat(64);
+    let edits: [Edit; 6] = [
+        Box::new(|value| {
+            value["catalog"]["release"]["binary_sets"][0]["digest"] =
+                Value::String("sha256:xyz".into());
+        }),
+        Box::new(move |value| {
+            value["catalog"]["entries"][0]["attestations"][0]["digest"] =
+                Value::String(format!("sha256:{upper}"));
+        }),
+        Box::new(|value| {
+            value["catalog"]["entries"][0]["attestations"][0]["digest"] =
+                Value::String("7".repeat(64));
+        }),
+        Box::new(|value| {
+            value["catalog"]["entries"][0]["attestations"][0]["extra"] = Value::Bool(true);
+        }),
+        Box::new(|value| {
+            value["catalog"]["entries"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("runtime_api");
+        }),
+        Box::new(|value| {
+            value["catalog"].as_object_mut().unwrap().remove("release");
+        }),
+    ];
+    for edit in edits {
+        assert_eq!(
+            verify(&mutate(&bytes, edit), &anchor).unwrap_err(),
+            CatalogError::Schema
+        );
+    }
+}
+
+#[test]
+fn release_collection_limits_are_enforced() {
+    let root_key = signing_key("root");
+    let anchor = anchor_for(&root_key);
+
+    let mut sets = catalog(SEQUENCE);
+    sets.release.binary_sets = (0..=MAX_BINARY_SETS)
+        .map(|index| BinarySet {
+            target: format!("target-{index}"),
+            digest: sha('8'),
+        })
+        .collect();
+    assert_eq!(
+        verify(&signed_by(&root_key, sets), &anchor).unwrap_err(),
+        CatalogError::Limit(CatalogLimit::BinarySets)
+    );
+
+    let mut attestations = catalog(SEQUENCE);
+    attestations.entries[0].attestations = (0..=MAX_ATTESTATIONS_PER_ENTRY)
+        .map(|index| attestation(&format!("target-{index}"), '1'))
+        .collect();
+    assert_eq!(
+        verify(&signed_by(&root_key, attestations), &anchor).unwrap_err(),
+        CatalogError::Limit(CatalogLimit::Attestations)
+    );
 }

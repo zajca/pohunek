@@ -46,6 +46,7 @@ mod catalog;
 mod compression;
 mod error;
 mod limits;
+mod release;
 mod sign;
 
 // Extraction, verification and the registry need descriptor-relative
@@ -75,10 +76,10 @@ pub use archive::{
     build_archive, read_archive, read_archive_with_digest, ArchiveEntry, VerifiedArchive,
 };
 pub use catalog::{
-    catalog_signing_message, key_record_signing_message, verify_catalog, Authorization, Catalog,
-    CatalogEntry, CatalogEntryRejection, CatalogEnvelope, CatalogError, CatalogLimit,
-    CatalogSignature, KeyId, LocalAuthorization, LocalTrust, LocalTrustError, RootKey,
-    SignedKeyRecord, TrustAnchor, TrustAnchorError, VerifiedCatalog, VerifiedEntry,
+    catalog_signing_message, check_catalog, key_record_signing_message, verify_catalog,
+    Authorization, Catalog, CatalogEntry, CatalogEntryRejection, CatalogEnvelope, CatalogError,
+    CatalogLimit, CatalogSignature, KeyId, LocalAuthorization, LocalTrust, LocalTrustError,
+    RootKey, SignedKeyRecord, TrustAnchor, TrustAnchorError, VerifiedCatalog, VerifiedEntry,
     CATALOG_SCHEMA_VERSION, MAX_CATALOG_BYTES, MAX_CATALOG_ENTRIES, MAX_CORE_RANGE_BYTES,
     MAX_KEY_RECORDS, MAX_PLATFORMS_PER_ENTRY, MAX_PLATFORM_BYTES, MAX_REVOKED_DIGESTS,
     MAX_REVOKED_KEYS, MAX_SIGNATURES, MAX_TRUST_ROOTS,
@@ -89,4 +90,8 @@ pub use limits::{
     MAX_FILE_BYTES, MAX_PATH_BYTES, MAX_WINDOW_BYTES,
 };
 pub use protocol::PackageDigest;
+pub use release::{
+    Attestation, BinarySet, Release, ReleaseRejection, Sha256Digest, VerifiedRelease,
+    MAX_ATTESTATIONS_PER_ENTRY, MAX_BINARY_SETS,
+};
 pub use sign::{catalog_document_bytes, sign_catalog};

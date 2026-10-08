@@ -564,6 +564,7 @@ Signed runtime catalog:
 - `crates/package/src/catalog.rs` — catalog schema, key chain, signature verification, authorization, local trust.
 - `crates/package/src/canonical_json.rs` — strict JSON parsing and the canonical signed byte form.
 - `crates/package/tests/catalog.rs`
+- `crates/package/src/release.rs` — the catalog release block, binary-set digests and per-entry attestation rules.
 - `crates/xtask/src/runtime_package.rs` — `cargo xtask package build|verify`.
 - `crates/package/src/anchor.rs` — the catalog trust anchor file format and its strict parser.
 - `crates/package/src/sign.rs` — catalog signing for release tooling.
