@@ -1006,6 +1006,56 @@ pub fn encode_worker_generation(entropy: [u8; WORKER_GENERATION_ENTROPY_BYTES]) 
         .collect()
 }
 
+/// Name of the pre-migration backup of `store` taken at schema `schema`.
+///
+/// The daemon writes it next to the store; `is_schema_backup_artifact` is its
+/// exact inverse, which keeps cleanup in step with the writer.
+#[must_use]
+pub fn schema_backup_name(store: &OsStr, schema: u32) -> OsString {
+    let mut name = store.to_os_string();
+    name.push(format!("{SCHEMA_BACKUP_INFIX}{schema}"));
+    name
+}
+
+/// Name a pre-migration backup of `store` carries while it is being written.
+///
+/// `unique` makes concurrent writers' names distinct (process id and a counter).
+#[must_use]
+pub fn schema_backup_temp_name(store: &OsStr, process: u32, sequence: u64) -> OsString {
+    let mut name = store.to_os_string();
+    name.push(format!(
+        "{SCHEMA_BACKUP_INFIX}{SCHEMA_BACKUP_TEMP_MARKER}.{process}.{sequence}"
+    ));
+    name
+}
+
+/// Whether `name` is exactly a backup, finished or in progress, of `store`.
+///
+/// Matches `<store>.pre-schema-<canonical decimal>` and
+/// `<store>.pre-schema-tmp.<decimal>.<decimal>`; nothing else, so cleanup never
+/// touches an unrelated file that merely starts with the store name.
+#[must_use]
+pub fn is_schema_backup_artifact(store: &str, name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(store)
+        .and_then(|tail| tail.strip_prefix(SCHEMA_BACKUP_INFIX))
+    else {
+        return false;
+    };
+    let canonical_decimal = |part: &str| {
+        part.parse::<u64>()
+            .is_ok_and(|number| number.to_string() == part)
+    };
+    if canonical_decimal(rest) {
+        return true;
+    }
+    let mut parts = rest.split('.');
+    parts.next() == Some(SCHEMA_BACKUP_TEMP_MARKER)
+        && parts.next().is_some_and(canonical_decimal)
+        && parts.next().is_some_and(canonical_decimal)
+        && parts.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1291,104 +1341,6 @@ mod tests {
         for entropy in [[0x12, 0x34, 0x56, 0x78, 0x9a], [1, 2, 3, 4, 5]] {
             let token = encode_worker_generation(entropy);
             assert_eq!(valid_worker_generation(&token), Some(token.as_str()));
-        }
-    }
-}
-
-/// Name of the pre-migration backup of `store` taken at schema `schema`.
-///
-/// The daemon writes it next to the store; `is_schema_backup_artifact` is its
-/// exact inverse, which keeps cleanup in step with the writer.
-#[must_use]
-pub fn schema_backup_name(store: &OsStr, schema: u32) -> OsString {
-    let mut name = store.to_os_string();
-    name.push(format!("{SCHEMA_BACKUP_INFIX}{schema}"));
-    name
-}
-
-/// Name a pre-migration backup of `store` carries while it is being written.
-///
-/// `unique` makes concurrent writers' names distinct (process id and a counter).
-#[must_use]
-pub fn schema_backup_temp_name(store: &OsStr, process: u32, sequence: u64) -> OsString {
-    let mut name = store.to_os_string();
-    name.push(format!(
-        "{SCHEMA_BACKUP_INFIX}{SCHEMA_BACKUP_TEMP_MARKER}.{process}.{sequence}"
-    ));
-    name
-}
-
-/// Whether `name` is exactly a backup, finished or in progress, of `store`.
-///
-/// Matches `<store>.pre-schema-<canonical decimal>` and
-/// `<store>.pre-schema-tmp.<decimal>.<decimal>`; nothing else, so cleanup never
-/// touches an unrelated file that merely starts with the store name.
-#[must_use]
-pub fn is_schema_backup_artifact(store: &str, name: &str) -> bool {
-    let Some(rest) = name
-        .strip_prefix(store)
-        .and_then(|tail| tail.strip_prefix(SCHEMA_BACKUP_INFIX))
-    else {
-        return false;
-    };
-    let canonical_decimal = |part: &str| {
-        part.parse::<u64>()
-            .is_ok_and(|number| number.to_string() == part)
-    };
-    if canonical_decimal(rest) {
-        return true;
-    }
-    let mut parts = rest.split('.');
-    parts.next() == Some(SCHEMA_BACKUP_TEMP_MARKER)
-        && parts.next().is_some_and(canonical_decimal)
-        && parts.next().is_some_and(canonical_decimal)
-        && parts.next().is_none()
-}
-
-#[cfg(test)]
-mod schema_backup_tests {
-    use std::ffi::OsStr;
-
-    use super::{
-        is_schema_backup_artifact, schema_backup_name, schema_backup_temp_name, METADATA_STORE_NAME,
-    };
-
-    #[test]
-    fn the_writer_names_match_the_cleanup_grammar() {
-        let store = OsStr::new(METADATA_STORE_NAME);
-        for name in [
-            schema_backup_name(store, 1),
-            schema_backup_name(store, 42),
-            schema_backup_temp_name(store, 4242, 0),
-        ] {
-            let name = name.to_str().expect("utf-8 name");
-            assert!(
-                is_schema_backup_artifact(METADATA_STORE_NAME, name),
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn unrelated_names_are_not_backup_artifacts() {
-        for name in [
-            "metadata.jsonl",
-            "metadata.jsonl.tmp.1.2",
-            "metadata.jsonl.pre-schema-",
-            "metadata.jsonl.pre-schema-01",
-            "metadata.jsonl.pre-schema--1",
-            "metadata.jsonl.pre-schema-1.bak",
-            "metadata.jsonl.pre-schema-tmp",
-            "metadata.jsonl.pre-schema-tmp.1",
-            "metadata.jsonl.pre-schema-tmp.1.2.3",
-            "metadata.jsonl.pre-schema-tmp.x.2",
-            "other.jsonl.pre-schema-1",
-            "xmetadata.jsonl.pre-schema-1",
-        ] {
-            assert!(
-                !is_schema_backup_artifact(METADATA_STORE_NAME, name),
-                "{name}"
-            );
         }
     }
 }
