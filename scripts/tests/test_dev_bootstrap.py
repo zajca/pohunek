@@ -1,443 +1,382 @@
-"""Regression checks for the local tool check (stdlib only).
+"""Integration scenarios for the `scripts/dev-bootstrap` CLI (stdlib only).
 
-No test looks at the host PATH or runs a real tool: `which`, the version
-runner are injected, and the nextest config is a
-temporary file.
+Each test runs the actual script as a child process of a disposable
+repository root (the script copy, its `Cargo.toml` and
+`.config/nextest.toml`) with executable fake tools on `PATH`. The fake
+`cargo` mirrors the real one's subcommand resolution: it prefers
+`$CARGO_HOME/bin/cargo-<sub>` unless that directory already sits later on
+`PATH`, exactly the order `dev-bootstrap` relies on. No host tool, network
+or real PATH entry is used, and no test monkeypatches production code.
 """
 
-import importlib.machinery
-import importlib.util
-import io
+import platform
 from pathlib import Path
+import sys
 import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).resolve().parents[1] / "dev-bootstrap"
-LOADER = importlib.machinery.SourceFileLoader("dev_bootstrap", str(SCRIPT))
-SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
-dev_bootstrap = importlib.util.module_from_spec(SPEC)
-LOADER.exec_module(dev_bootstrap)
+REPO_SCRIPT = Path(__file__).resolve().parents[1] / "dev-bootstrap"
 
-PATH_DIR = "/fake/path"
-CARGO_HOME = "/fake/cargo-home"
+# "Install home" passed as CARGO_HOME; fake cargo resolves subcommands from
+# its `bin/` directory first, per the real Cargo order.
+CARGO_HOME = "cargo-home"
 CARGO_BIN = f"{CARGO_HOME}/bin"
 
-# Real `--version` output shapes of every checked tool.
-CURRENT = {
-    "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\n",
-    "cargo-nextest": "cargo-nextest 0.9.145 (00af4550e 2026-09-16)\n"
-                     "release: 0.9.145\nhost: x86_64-unknown-linux-gnu\n",
-    "python3": "Python 3.13.1\n",
-    "bacon": "bacon 3.25.0\n",
-    "hyperfine": "hyperfine 1.20.0\n",
-    "mold": "mold 2.42.1 (9b376bc6a9899d4a16b41777de1f013989459fbc; "
-            "compatible with GNU ld)\n",
-}
+MSRV_MANIFEST = "[workspace.package]\nrust-version = \"1.96\"\n"
+NEXTEST_CONFIG = 'nextest-version = { required = "0.9.115" }\n'
+
+# Version outputs shaped like the real tools'.
+RUSTC_VERSION = "rustc 1.98.1 (48a229cea 2026-09-01)\n"
+NEXTEST_VERSION = (
+    "cargo-nextest 0.9.145 (00af4550e 2026-09-16)\n"
+    "release: 0.9.145\nhost: x86_64-unknown-linux-gnu\n"
+)
+PYTHON_VERSION = "Python 3.13.1\n"
+BACON_VERSION = "bacon 3.25.0\n"
+HYPERFINE_VERSION = "hyperfine 1.20.0\n"
+MOLD_VERSION = (
+    "mold 2.42.1 (9b376bc6a9899d4a16b41777de1f013989459fbc; "
+    "compatible with GNU ld)\n"
+)
+
+IS_LINUX = platform.system() == "Linux"
 
 
-class FakeHost:
-    """Injected lookups over an in-memory set of installed tools.
-
-    `on_path` and `in_cargo_bin` map tool names to their `--version` output.
-    """
-
-    def __init__(self, on_path=None, in_cargo_bin=None, cargo=True):
-        self.on_path = dict(CURRENT if on_path is None else on_path)
-        self.in_cargo_bin = dict(in_cargo_bin or {})
-        self.cargo = cargo
-        # Cargo prefers $CARGO_HOME/bin unless it already sits later on PATH.
-        self.cargo_prefers_path = False
-        self.version_calls = []
-
-    def which(self, name, path=None):
-        if name == "cargo" and path is None:
-            return f"{PATH_DIR}/cargo" if self.cargo else None
-        if path is None:
-            return f"{PATH_DIR}/{name}" if name in self.on_path else None
-        if path == CARGO_BIN and name in self.in_cargo_bin:
-            return f"{CARGO_BIN}/{name}"
-        return None
-
-    def runner(self, argv):
-        self.version_calls.append(argv)
-        directory, name = argv[0].rsplit("/", 1)
-        if name == "cargo":
-            # Cargo's own order: `$CARGO_HOME/bin` before `PATH`.
-            sub = f"cargo-{argv[1]}"
-            order = (self.on_path, self.in_cargo_bin) if self.cargo_prefers_path else (self.in_cargo_bin, self.on_path)
-            for source in order:
-                if sub in source:
-                    output = source[sub]
-                    if isinstance(output, Exception):
-                        raise output
-                    return output
-            raise subprocess.CalledProcessError(101, argv)
-        source = self.on_path if directory == PATH_DIR else self.in_cargo_bin
-        output = source[name]
-        if isinstance(output, Exception):
-            raise output
-        return output
+def sh_quote(text):
+    # Single-quote for `sh` word arguments the fake tools embed.
+    return "'" + text.replace("'", "'\\''") + "'"
 
 
+class DevBootstrapSubprocessTests(unittest.TestCase):
+    """Run the real `dev-bootstrap` script against a disposable install world."""
 
-class DevBootstrapCase(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name)
-        self.write_nextest_config(
-            '# comment\nnextest-version = { required = "0.9.115" }\n'
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        # Everything the script reads lives in the copy; the production
+        # script is never run from the real repository.
+        self.root = self.home / "repo"
+        (self.root / ".config").mkdir(parents=True)
+        (self.root / "scripts").mkdir()
+        (self.root / "scripts" / "dev-bootstrap").write_text(REPO_SCRIPT.read_text())
+        (self.root / "Cargo.toml").write_text(MSRV_MANIFEST)
+        (self.root / ".config" / "nextest.toml").write_text(NEXTEST_CONFIG)
+        self.fakes = self.home / "fakes"
+        self.fakes.mkdir()
+        self.cargo_bin = self.home / CARGO_BIN
+        (self.cargo_bin).mkdir(parents=True)
+        self.write_cargo()
+        self.write_tool("rustc", RUSTC_VERSION)
+        self.write_tool("python3", PYTHON_VERSION)
+
+    # -- fake-world helpers -------------------------------------------
+
+    def write_tool(self, name, output, directory=None, bad=False, body=None):
+        """Write an executable fake tool that prints `output` (or garbage).
+
+        `body` replaces the default print entirely, for fakes that exit
+        nonzero or fail loudly.
+        """
+        path = (directory or self.fakes) / name
+        if body is None:
+            body = "printf %s garbage" if bad else f"printf %s {sh_quote(output)}"
+        path.write_text(f"#!/bin/sh\n{body}\n")
+        path.chmod(0o755)
+        return path
+
+    def cargo_script(self):
+        # Mirrors the real resolution: `$CARGO_HOME/bin/cargo-<sub>` wins
+        # over PATH unless that directory is already on PATH (then PATH
+        # order decides, potentially shadowing the home copy).
+        return (
+            '#!/bin/sh\n'
+            'sub=$1\ncargo_home=${CARGO_HOME:-$HOME/.cargo}\n'
+            'home_bin=$cargo_home/bin\ntool=cargo-$sub\n'
+            'prefers_home=1\n'
+            'case ":$PATH:" in *":$home_bin:"*) prefers_home=0 ;; esac\n'
+            'if [ "$prefers_home" = 1 ] && [ -x "$home_bin/$tool" ]; then\n'
+            '  exec "$home_bin/$tool" "$@"\n'
+            'fi\n'
+            'exec "$tool" "$@"\n'
         )
-        self.write_manifest('[workspace.package]\nrust-version = "1.96"\n')
 
-    def write_manifest(self, text):
-        (self.root / "Cargo.toml").write_text(text)
+    def write_cargo(self):
+        # `cargo` itself must be invocable on PATH, as in a real install.
+        (self.fakes / "cargo").write_text(self.cargo_script())
+        (self.fakes / "cargo").chmod(0o755)
 
-    def write_nextest_config(self, text):
-        config = self.root / ".config" / "nextest.toml"
-        config.parent.mkdir(parents=True, exist_ok=True)
-        config.write_text(text)
-
-    def run_main(self, host, *args, system="Linux"):
-        out = io.StringIO()
-        status = dev_bootstrap.main(
-            list(args),
-            which=host.which,
-            runner=host.runner,
-                        root=self.root,
-            environ={"CARGO_HOME": CARGO_HOME},
-            out=out,
-            system=system,
-        )
-        return status, out.getvalue()
-
-class ParseVersionTests(unittest.TestCase):
-    def test_parses_real_and_edge_version_shapes(self):
-        cases = {
-            CURRENT["cargo-nextest"]: (0, 9, 145),
-            CURRENT["python3"]: (3, 13, 1),
-            CURRENT["bacon"]: (3, 25, 0),
-            CURRENT["hyperfine"]: (1, 20, 0),
-            CURRENT["mold"]: (2, 42, 1),
-            # A two-part version pads the patch level.
-            "bacon 3.4": (3, 4, 0),
-            # A prerelease suffix keeps the numeric core.
-            "cargo-nextest 0.9.150-rc.1": (0, 9, 150),
-            "\n\nhyperfine 1.9.0\n": (1, 9, 0),
+    def env(self, cargo_home=None):
+        return {
+            "PATH": str(self.fakes),
+            "CARGO_HOME": str(cargo_home if cargo_home is not None
+                              else self.home / CARGO_HOME),
+            "HOME": str(self.home),
         }
-        for text, expected in cases.items():
-            with self.subTest(text=text):
-                self.assertEqual(dev_bootstrap.parse_version(text), expected)
 
-    def test_prerelease_of_the_minimum_is_below_it(self):
-        minimum = dev_bootstrap.parse_version("0.9.115")
-        for text, below in (
-            ("cargo-nextest 0.9.115-rc.1", True),
-            ("cargo-nextest 0.9.115", False),
-            ("cargo-nextest 0.9.116-rc.1", False),
-            ("cargo-nextest 0.9.114", True),
-            # Numeric, not lexical: "99" sorts after "115" as text.
-            ("cargo-nextest 0.9.99", True),
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(
-                    dev_bootstrap.below_minimum(
-                        dev_bootstrap.parse_version(text),
-                        dev_bootstrap.is_prerelease(text),
-                        minimum,
-                    ),
-                    below,
-                )
-
-    def test_unparseable_and_empty(self):
-        # A version-like token on a later line is not the tool's version.
-        for text in ("bacon 3", "", "   \n", "mold (dev build)",
-                     "bacon unknown\ncommit 1.2.3"):
-            with self.subTest(text=text):
-                self.assertIsNone(dev_bootstrap.parse_version(text))
-
-
-class NextestConfigTests(DevBootstrapCase):
-    def test_minimum_read_from_table(self):
-        self.write_nextest_config(
-            'nextest-version = { required = "0.9.200", recommended = "1.0.0" }\n'
+    def run_script(self, *args, path_entries=None, cargo_home=None):
+        path = ":".join(map(str, path_entries)) if path_entries else str(self.fakes)
+        completed = subprocess.run(
+            [sys.executable, "scripts/dev-bootstrap", *args],
+            cwd=self.root,
+            env={**self.env(cargo_home), "PATH": path},
+            capture_output=True,
+            text=True,
+            timeout=60,
         )
-        self.assertEqual(dev_bootstrap.nextest_min_version(self.root),
-                         (0, 9, 200))
+        return completed.returncode, completed.stdout
 
-    def test_minimum_read_from_bare_string(self):
-        self.write_nextest_config('nextest-version = "0.9.120"\n')
-        self.assertEqual(dev_bootstrap.nextest_min_version(self.root),
-                         (0, 9, 120))
+    # -- the report over a working install ----------------------------
 
-    def test_config_minimum_drives_the_check(self):
-        self.write_nextest_config(
-            'nextest-version = { required = "0.9.200" }\n'
-        )
-        status, output = self.run_main(FakeHost())
-        self.assertEqual(status, 1)
-        self.assertIn("cargo-nextest 0.9.145 is older than 0.9.200", output)
-
-    def test_missing_requirement_is_a_config_error(self):
-        self.write_nextest_config("[profile.default]\ntest-threads = 4\n")
-        status, output = self.run_main(FakeHost())
-        self.assertEqual(status, 2)
-        self.assertIn("declares no nextest-version requirement", output)
-
-    def test_missing_file_is_a_config_error(self):
-        (self.root / ".config" / "nextest.toml").unlink()
-        status, output = self.run_main(FakeHost())
-        self.assertEqual(status, 2)
-        self.assertIn("cannot read", output)
-
-    def test_repository_config_parses(self):
-        root = Path(__file__).resolve().parents[2]
-        self.assertIsInstance(dev_bootstrap.nextest_min_version(root), tuple)
-
-
-class CheckTests(DevBootstrapCase):
-    def test_mold_is_checked_only_on_linux(self):
-        on_path = {name: output for name, output in CURRENT.items() if name != "mold"}
-        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Darwin")
+    def test_report_header_and_everything_current_exits_zero(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("bacon", BACON_VERSION)
+        self.write_tool("hyperfine", HYPERFINE_VERSION)
+        self.write_tool("mold", MOLD_VERSION)
+        status, output = self.run_script()
         self.assertEqual(status, 0, output)
-        self.assertNotIn("mold", output)
+        self.assertIn("dev-bootstrap: local tool check", output)
+        self.assertIn(
+            "ok       cargo-nextest 0.9.145 >= 0.9.115 (required)", output
+        )
+        self.assertIn("all checked tools that count are ready", output)
 
-        status, output = self.run_main(FakeHost(on_path=on_path), "--strict", system="Linux")
+    # -- required tools -----------------------------------------------
+
+    def test_missing_required_tool_fails_with_install_fix(self):
+        status, output = self.run_script()
         self.assertEqual(status, 1, output)
-        self.assertIn("mold", output)
-
-    def test_everything_current_passes(self):
-        status, output = self.run_main(FakeHost())
-        self.assertEqual(status, 0)
-        self.assertIn("ok       cargo-nextest 0.9.145 >= 0.9.115 (required)",
-                      output)
-        self.assertIn("ok       mold 2.42.1 >= 2.30.0 (optional)", output)
-
-    def test_missing_required_tool_fails_with_install_command(self):
-        tools = dict(CURRENT)
-        del tools["cargo-nextest"]
-        status, output = self.run_main(FakeHost(on_path=tools))
-        self.assertEqual(status, 1)
-        self.assertIn("FAIL     cargo-nextest is missing (needs >= 0.9.115)",
-                      output)
-        self.assertIn("fix: cargo install --root /fake/cargo-home --locked cargo-nextest", output)
+        self.assertIn("FAIL     cargo-nextest is missing (needs >= 0.9.115)", output)
+        self.assertIn(
+            f"fix: cargo install --root {self.home / CARGO_HOME} "
+            "--locked cargo-nextest",
+            output,
+        )
         self.assertIn("failing: cargo-nextest", output)
 
     def test_too_old_required_tool_fails(self):
-        tools = dict(CURRENT, python3="Python 3.10.12\n")
-        status, output = self.run_main(FakeHost(on_path=tools))
-        self.assertEqual(status, 1)
-        self.assertIn("python3 3.10.12 is older than 3.11.0 (required)",
-                      output)
-        self.assertIn("sudo apt-get install python3", output)
-
-    def test_missing_optional_tool_warns_without_strict(self):
-        tools = dict(CURRENT)
-        del tools["hyperfine"]
-        del tools["mold"]
-        status, output = self.run_main(FakeHost(on_path=tools))
-        self.assertEqual(status, 0)
-        self.assertIn("warn     hyperfine is missing", output)
-        self.assertIn("fix: cargo install --root /fake/cargo-home --locked hyperfine", output)
-        self.assertIn("warn     mold is missing", output)
-
-    def test_missing_optional_tool_fails_under_strict(self):
-        tools = dict(CURRENT)
-        del tools["bacon"]
-        status, output = self.run_main(FakeHost(on_path=tools), "--strict")
-        self.assertEqual(status, 1)
-        self.assertIn("FAIL     bacon is missing (needs >= 3.13.0) (optional)",
-                      output)
-
-    def test_too_old_optional_tool_fails_only_under_strict(self):
-        tools = dict(CURRENT, bacon="bacon 3.12.1\n")
-        self.assertEqual(self.run_main(FakeHost(on_path=tools))[0], 0)
-        status, output = self.run_main(FakeHost(on_path=tools), "--strict")
-        self.assertEqual(status, 1)
-        self.assertIn("bacon 3.12.1 is older than 3.13.0", output)
-
-    def test_cargo_subcommand_found_in_cargo_home_off_path(self):
-        tools = dict(CURRENT)
-        nextest = tools.pop("cargo-nextest")
-        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": nextest})
-        status, output = self.run_main(host)
-        self.assertEqual(status, 0)
-        self.assertIn([f"{PATH_DIR}/cargo", "nextest", "--version"], host.version_calls)
-
-    def test_cargo_subcommand_version_is_the_one_cargo_runs(self):
-        # Cargo prefers $CARGO_HOME/bin over PATH: an old home-bin copy fails
-        # the check even when a current one is on PATH, and vice versa.
-        old = "cargo-nextest 0.9.100\n"
-        host = FakeHost(in_cargo_bin={"cargo-nextest": old})
-        status, output = self.run_main(host)
-        self.assertEqual(status, 1, output)
-        self.assertIn("cargo-nextest 0.9.100 is older than", output)
-        # The fix installs into $CARGO_HOME, where the stale copy lives.
-        self.assertIn("cargo install --root /fake/cargo-home --locked cargo-nextest", output)
-
-        tools = dict(CURRENT)
-        tools["cargo-nextest"] = old
-        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": CURRENT["cargo-nextest"]})
-        status, output = self.run_main(host)
-        self.assertEqual(status, 0, output)
-
-    def test_current_cargo_home_nextest_shadowed_on_path_is_a_path_problem(self):
-        # Cargo keeps the PATH position of $CARGO_HOME/bin when it is on PATH:
-        # `cargo nextest` then runs the old PATH copy.
-        tools = dict(CURRENT)
-        tools["cargo-nextest"] = "cargo-nextest 0.9.100\n"
-        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": CURRENT["cargo-nextest"]})
-        host.cargo_prefers_path = True
-        status, output = self.run_main(host)
-        self.assertEqual(status, 1, output)
-        self.assertIn("cargo-nextest 0.9.145 is shadowed by an earlier copy on PATH", output)
-        self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
-
-    def test_cargo_failure_that_is_not_an_old_version_keeps_its_report(self):
-        # e.g. a Cargo alias shadowing `nextest`: not a PATH-order problem.
-        tools = dict(CURRENT)
-        tools["cargo-nextest"] = "garbage without a version\n"
-        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": CURRENT["cargo-nextest"]})
-        host.cargo_prefers_path = True
-        status, output = self.run_main(host)
-        self.assertEqual(status, 1, output)
-        self.assertIn("cargo-nextest version unknown", output)
-        self.assertNotIn("shadowed", output)
-
-    def test_two_stale_nextest_copies_get_install_and_path_fix(self):
-        tools = dict(CURRENT)
-        tools["cargo-nextest"] = "cargo-nextest 0.9.90\n"
-        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": "cargo-nextest 0.9.100\n"})
-        host.cargo_prefers_path = True
-        status, output = self.run_main(host)
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("python3", "Python 3.10.12\n")
+        status, output = self.run_script()
         self.assertEqual(status, 1, output)
         self.assertIn(
-            "cargo install --root /fake/cargo-home --locked cargo-nextest; then put it first: "
-            f'export PATH={CARGO_BIN}:"$PATH"',
+            "python3 3.10.12 is older than 3.11.0 (required)", output
+        )
+        self.assertIn("sudo apt-get install python3", output)
+        self.assertIn("failing: python3", output)
+
+    def test_prerelease_of_the_required_minimum_fails(self):
+        self.write_tool("cargo-nextest", "cargo-nextest 0.9.115-rc.1\n")
+        status, output = self.run_script()
+        self.assertEqual(status, 1, output)
+        self.assertIn(
+            "cargo-nextest 0.9.115 is older than 0.9.115", output
+        )
+
+    def test_configured_minimum_drives_the_check(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        (self.root / ".config" / "nextest.toml").write_text(
+            'nextest-version = { required = "0.9.200" }\n'
+        )
+        status, output = self.run_script()
+        self.assertEqual(status, 1, output)
+        self.assertIn(
+            "cargo-nextest 0.9.145 is older than 0.9.200 (required)", output
+        )
+
+    # -- optional tools ------------------------------------------------
+
+    def test_missing_optional_and_required_tools_fail_together(self):
+        status, output = self.run_script()
+        self.assertEqual(status, 1, output)
+        self.assertIn("failing: cargo-nextest", output)
+        self.assertIn("warn     bacon is missing", output)
+        if IS_LINUX:
+            self.assertIn("warn     mold is missing", output)
+
+    def test_mold_is_checked_only_on_linux(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("bacon", BACON_VERSION)
+        self.write_tool("hyperfine", HYPERFINE_VERSION)
+        status, output = self.run_script("--strict")
+        self.assertEqual(status, 1 if IS_LINUX else 0, output)
+        if IS_LINUX:
+            self.assertIn("FAIL     mold is missing", output)
+        else:
+            self.assertNotIn("mold", output)
+
+    def test_missing_optional_tool_fails_only_under_strict(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("hyperfine", HYPERFINE_VERSION)
+        if IS_LINUX:
+            self.write_tool("mold", MOLD_VERSION)
+        status, output = self.run_script()
+        self.assertEqual(status, 0, output)
+        self.assertIn("warn     bacon is missing", output)
+        self.assertIn(f"fix: cargo install --root {self.home / CARGO_HOME} "
+                      "--locked bacon", output)
+
+        status, output = self.run_script("--strict")
+        self.assertEqual(status, 1, output)
+        self.assertIn("FAIL     bacon is missing (needs >= 3.13.0) (optional)", output)
+
+    def test_too_old_optional_tool_fails_only_under_strict(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("bacon", "bacon 3.12.1\n")
+        self.write_tool("hyperfine", HYPERFINE_VERSION)
+        if IS_LINUX:
+            self.write_tool("mold", MOLD_VERSION)
+        status, output = self.run_script()
+        self.assertEqual(status, 0, output)
+        self.assertIn("bacon 3.12.1 is older than 3.13.0", output)
+
+        status, output = self.run_script("--strict")
+        self.assertEqual(status, 1, output)
+
+    # -- cargo subcommand precedence (fake cargo mirrors real Cargo) ----
+
+    def test_cargo_runs_the_cargo_home_copy_even_when_path_is_current(self):
+        # Cargo prefers $CARGO_HOME/bin: an old home copy fails the check
+        # even when a current one is on PATH, and the fix installs there.
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("cargo-nextest", "cargo-nextest 0.9.100\n",
+                        directory=self.cargo_bin)
+        status, output = self.run_script()
+        self.assertEqual(status, 1, output)
+        self.assertIn("cargo-nextest 0.9.100 is older than", output)
+        self.assertIn(
+            f"fix: cargo install --root {self.home / CARGO_HOME} "
+            "--locked cargo-nextest",
             output,
         )
 
-    def test_two_equally_stale_nextest_copies_get_install_and_path_fix(self):
-        tools = dict(CURRENT)
-        tools["cargo-nextest"] = "cargo-nextest 0.9.100\n"
-        host = FakeHost(on_path=tools, in_cargo_bin={"cargo-nextest": "cargo-nextest 0.9.100\n"})
-        host.cargo_prefers_path = True
-        status, output = self.run_main(host)
+    def test_subcommand_found_in_cargo_home_only_reports_ok(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION,
+                        directory=self.cargo_bin)
+        status, output = self.run_script()
+        self.assertEqual(status, 0, output)
+        self.assertIn("ok       cargo-nextest 0.9.145 >= 0.9.115 (required)", output)
+
+    def test_cargo_home_copy_shadowed_by_stale_path_copy_is_a_path_problem(self):
+        # The install root ($CARGO_HOME/bin) is already on PATH, later than
+        # a stale copy, so reordering PATH (not reinstalling) is what the
+        # report asks for.
+        self.write_tool("cargo-nextest", "cargo-nextest 0.9.100\n")
+        self.write_tool("cargo-nextest", NEXTEST_VERSION,
+                        directory=self.cargo_bin)
+        status, output = self.run_script(path_entries=[self.fakes, self.cargo_bin])
         self.assertEqual(status, 1, output)
-        self.assertIn("; then put it first: ", output)
-
-    def test_stale_copy_outside_cargo_home_gets_install_and_path_fix(self):
-        # No copy in $CARGO_HOME/bin yet: the new install could still be
-        # shadowed by the stale PATH copy, so PATH is reordered too.
-        for name in ("cargo-nextest", "bacon"):
-            with self.subTest(tool=name):
-                tools = dict(CURRENT)
-                tools[name] = f"{name} 0.0.1\n"
-                status, output = self.run_main(FakeHost(on_path=tools), "--strict")
-                self.assertEqual(status, 1, output)
-                self.assertIn(
-                    f"cargo install --root /fake/cargo-home --locked {name}; then put it first: "
-                    f'export PATH={CARGO_BIN}:"$PATH"',
-                    output,
-                )
-
-    def test_failing_cargo_subcommand_reports_its_diagnostic_first(self):
-        error = subprocess.CalledProcessError(
-            101, ["cargo", "nextest", "--version"],
-            stderr="error: user-defined alias `nextest` is shadowing an external subcommand\n",
+        self.assertIn(
+            "cargo-nextest 0.9.145 is shadowed by an earlier copy on PATH "
+            "(required)",
+            output,
         )
-        tools = dict(CURRENT)
-        tools["cargo-nextest"] = error
-        status, output = self.run_main(FakeHost(on_path=tools))
-        self.assertEqual(status, 1, output)
-        self.assertIn("alias `nextest` is shadowing an external subcommand", output)
-        self.assertIn("resolve the error above; if the binary itself is broken:", output)
+        self.assertIn(f'export PATH={self.cargo_bin}:"$PATH"', output)
+        # The PATH fix is what reorders the shadow, so no stale-copy install
+        # chain appears: the home copy is already current.
+        self.assertIn("fix: found at", output)
 
-    def test_cargo_subcommand_without_cargo_is_a_failure(self):
-        status, output = self.run_main(FakeHost(cargo=False))
+    def test_stale_path_copy_gets_install_and_path_fix(self):
+        # No copy in $CARGO_HOME/bin yet: the report chains both fixes,
+        # because the new install could still be shadowed by the stale copy.
+        self.write_tool("cargo-nextest", "cargo-nextest 0.9.90\n")
+        status, output = self.run_script()
         self.assertEqual(status, 1, output)
-        self.assertIn("`cargo` is not on PATH", output)
+        self.assertIn(
+            f"fix: cargo install --root {self.home / CARGO_HOME} --locked "
+            f"cargo-nextest; then put it first: export PATH={self.cargo_bin}:\"$PATH\"",
+            output,
+        )
 
-    def test_current_cargo_home_copy_shadowed_by_old_path_copy(self):
-        tools = dict(CURRENT)
-        tools["bacon"] = "bacon 2.0.0\n"
-        host = FakeHost(on_path=tools, in_cargo_bin={"bacon": CURRENT["bacon"]})
-        status, output = self.run_main(host, "--strict")
+    def test_binaries_found_in_cargo_home_are_reported_off_path(self):
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        self.write_tool("bacon", BACON_VERSION, directory=self.cargo_bin)
+        status, output = self.run_script("--strict")
         self.assertEqual(status, 1, output)
-        self.assertIn("bacon 3.25.0 is shadowed by", output)
-        self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
+        self.assertIn("bacon is not on PATH", output)
+        self.assertIn(f'export PATH={self.cargo_bin}:"$PATH"', output)
 
-    def test_missing_cargo_is_reported_before_a_missing_subcommand(self):
-        tools = dict(CURRENT)
-        tools.pop("cargo-nextest")
-        host = FakeHost(on_path=tools, cargo=False)
-        status, output = self.run_main(host)
+    def test_failing_tool_reports_its_diagnostic_first(self):
+        # A tool that runs but exits nonzero: its own diagnostic line is
+        # quoted, and reinstalling is offered only as the last resort.
+        self.write_tool("rustc", None, body=(
+            "printf %s 'error: no suitable target found (rustc)\n'; exit 1"
+        ))
+        status, output = self.run_script()
+        self.assertEqual(status, 1, output)
+        self.assertIn("rustc version unknown", output)
+        self.assertIn("error: no suitable target found (rustc)", output)
+        self.assertIn("resolve the error above;", output)
+        self.assertIn("if the binary itself is broken:", output)
+
+    def test_path_fix_quotes_shell_metacharacters_safely(self):
+        # CARGO_HOME with shell metacharacters: the suggested PATH fix
+        # single-quotes the directory, so pasting it is safe.
+        self.write_tool("cargo-nextest", NEXTEST_VERSION)
+        # Place a current bacon only in the metacharacter-heavy CARGO_HOME.
+        metachars = self.home / "a $(b)`c`\"d"
+        (metachars / "bin").mkdir(parents=True)
+        self.write_tool("bacon", BACON_VERSION, directory=metachars / "bin")
+        status, output = self.run_script("--strict", cargo_home=metachars)
+        self.assertEqual(status, 1, output)
+        self.assertIn("bacon is not on PATH", output)
+        expected = f'export PATH={sh_quote(str(metachars / "bin"))}:"$PATH"'
+        self.assertIn(f"put it first: {expected}", output)
+        # The suggested export really is valid shell that accepts the dir.
+        shell_home = self.home / "shell-check"
+        shell_home.mkdir()
+        script = shell_home / "fix.sh"
+        script.write_text(f"#!/bin/sh\n{expected}\nprintf %s \"$PATH\"\n")
+        script.chmod(0o755)
+        checked = subprocess.run(
+            [str(script)], capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        # The quoted directory survived as one token (no command
+        # substitution or quoting error), and $PATH stayed evaluated.
+        new_path = checked.stdout.strip()
+        self.assertEqual(new_path.split(":", 1)[0], str(metachars / "bin"))
+        self.assertIn(":", new_path)
+
+    def test_unparseable_version_output_is_a_failure(self):
+        self.write_tool("cargo-nextest", "cargo-nextest dev\n", bad=True)
+        status, output = self.run_script()
+        self.assertEqual(status, 1, output)
+        self.assertIn("cargo-nextest version unknown", output)
+        self.assertIn("unparseable version output 'garbage'", output)
+        self.assertNotIn("shadowed", output)
+
+    def test_missing_cargo_is_reported_instead_of_the_subcommand(self):
+        (self.fakes / "cargo").unlink()
+        status, output = self.run_script()
         self.assertEqual(status, 1, output)
         self.assertIn("`cargo` is not on PATH", output)
         self.assertIn("https://rustup.rs", output)
-        self.assertNotIn("cargo install --locked cargo-nextest", output)
+        self.assertNotIn("cargo install --locked", output)
 
-    def test_outdated_copy_only_in_cargo_home_keeps_its_install_fix(self):
-        tools = dict(CURRENT)
-        tools.pop("bacon")
-        host = FakeHost(on_path=tools, in_cargo_bin={"bacon": "bacon 2.0.0\n"})
-        status, output = self.run_main(host, "--strict")
-        self.assertEqual(status, 1, output)
-        self.assertIn("bacon 2.0.0 is older than", output)
-        self.assertIn("cargo install --root /fake/cargo-home --locked bacon", output)
-        self.assertNotIn("not on PATH", output)
+    # -- malformed configuration ---------------------------------------
 
-    def test_rustc_is_checked_against_the_workspace_msrv(self):
-        for output, expected in (
-            ("rustc 1.95.0 (abc 2026-05-01)\n", 1),
-            (CURRENT["rustc"], 0),
-        ):
-            with self.subTest(output=output):
-                tools = dict(CURRENT)
-                tools["rustc"] = output
-                status, report = self.run_main(FakeHost(on_path=tools))
-                self.assertEqual(status, expected, report)
-        tools = dict(CURRENT)
-        tools.pop("rustc")
-        status, report = self.run_main(FakeHost(on_path=tools))
-        self.assertEqual(status, 1, report)
-        self.assertIn("rustc is missing (needs >= 1.96.0)", report)
+    def test_missing_nextest_config_is_an_configuration_error(self):
+        (self.root / ".config" / "nextest.toml").unlink()
+        status, output = self.run_script()
+        self.assertEqual(status, 2, output)
+        self.assertIn("cannot read", output)
+        self.assertIn("nextest.toml", output)
+
+    def test_nextest_config_without_requirement_is_a_configuration_error(self):
+        (self.root / ".config" / "nextest.toml").write_text(
+            "[profile.default]\ntest-threads = 4\n"
+        )
+        status, output = self.run_script()
+        self.assertEqual(status, 2, output)
+        self.assertIn("declares no nextest-version requirement", output)
 
     def test_missing_msrv_is_a_configuration_error(self):
-        self.write_manifest("[workspace]\n")
-        status, output = self.run_main(FakeHost())
+        (self.root / "Cargo.toml").write_text("[workspace]\n")
+        status, output = self.run_script()
         self.assertEqual(status, 2, output)
         self.assertIn("rust-version", output)
-
-    def test_path_fix_quotes_shell_metacharacters(self):
-        fix = dev_bootstrap.path_fix('/home/a $(b)`c`"d/bin')
-        self.assertEqual(fix, "export PATH='/home/a $(b)`c`\"d/bin':\"$PATH\"")
-
-    def test_binary_only_in_cargo_home_is_reported_off_path(self):
-        tools = dict(CURRENT)
-        bacon = tools.pop("bacon")
-        host = FakeHost(on_path=tools, in_cargo_bin={"bacon": bacon})
-        status, output = self.run_main(host, "--strict")
-        self.assertEqual(status, 1)
-        self.assertIn("bacon is not on PATH", output)
-        self.assertIn(f'export PATH={CARGO_BIN}:"$PATH"', output)
-
-    def test_unrunnable_tool_is_a_failure_not_a_pass(self):
-        tools = dict(
-            CURRENT,
-            python3=subprocess.CalledProcessError(1, ["python3"]),
-        )
-        status, output = self.run_main(FakeHost(on_path=tools))
-        self.assertEqual(status, 1)
-        self.assertIn("python3 version unknown", output)
-
-    def test_unparseable_output_is_a_failure(self):
-        tools = dict(CURRENT, **{"cargo-nextest": "cargo-nextest dev\n"})
-        status, output = self.run_main(FakeHost(on_path=tools))
-        self.assertEqual(status, 1)
-        self.assertIn("unparseable version output 'cargo-nextest dev'",
-                      output)
 
 
 if __name__ == "__main__":
