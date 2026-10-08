@@ -70,6 +70,9 @@ pohunek-logging = { workspace = true }
 pohunek-test-support = { workspace = true }
 # `plugin_daemon.rs` serves the real package lifecycle from an in-process daemon.
 pohunek-daemon = { path = "../daemon" }
+# `session_process_api.rs` asserts the real remote-port contract through the
+# process boundary, using the netbird crate's public constants.
+netbird = { workspace = true }
 # `plugin_catalog_install.rs` signs catalogs with a key generated in the test.
 ed25519-dalek = { workspace = true }
 # `codex_package.rs` compares the package files with the built-in Codex files as data.
