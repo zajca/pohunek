@@ -12,6 +12,8 @@ use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::Shutdown;
 #[cfg(target_os = "linux")]
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -1462,6 +1464,190 @@ int connect(int fd, const struct sockaddr *address, socklen_t length) {
         utf8(&compiled.stderr)
     );
     (library, capture)
+}
+
+/// Installs a scripted `netbird` binary whose real `status` probe reports a
+/// single connected peer named `fixture-remote.netbird.test` at `netbird_ip`.
+/// The script records each invocation in `calls`, so a test can prove at the
+/// process boundary whether the CLI ever probed the provider. The child's
+/// `PATH` contains only the fixture binary directory, so a host `netbird`
+/// cannot interfere with the evidence.
+#[cfg(target_os = "linux")]
+fn install_fake_netbird(command: &mut Command, home: &TestHome, netbird_ip: &str, calls: &Path) {
+    let bin = home.root.join(NETBIRD_FIXTURE_PREFIX);
+    fs::create_dir_all(&bin).expect("create fixture netbird bin");
+    let netbird = bin.join("netbird");
+    pohunek_test_support::fs::write_file(
+        &netbird,
+        format!(
+            "#!/bin/sh\nprintf 'invoked\\n' >> \"$POHUNEK_TEST_NETBIRD_CALLS\"\nprintf '%s\\n' '{{\"peers\":{{\"details\":[{{\"fqdn\":\"fixture-remote.netbird.test\",\"netbirdIp\":\"{netbird_ip}\",\"status\":\"Connected\"}}]}}}}'\n"
+        ),
+    )
+    .expect("write fake netbird");
+    fs::set_permissions(&netbird, fs::Permissions::from_mode(0o700))
+        .expect("make fake netbird executable");
+    command.env("POHUNEK_TEST_NETBIRD_CALLS", calls);
+    command.env("PATH", &bin);
+}
+
+/// Directory below the test home where the fixture `netbird` lives.
+#[cfg(target_os = "linux")]
+const NETBIRD_FIXTURE_PREFIX: &str = "netbird-fixture-bin";
+
+/// Arguments that address a session through a remote host, in both modes.
+#[cfg(target_os = "linux")]
+fn remote_screen_args(json: bool) -> Vec<&'static str> {
+    if json {
+        vec![
+            "--host",
+            "fixture-remote",
+            "session",
+            "screen",
+            SESSION_ID,
+            "--json",
+        ]
+    } else {
+        vec!["--host", "fixture-remote", "session", "screen", SESSION_ID]
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn remote_port_override_reaches_the_connect_target() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let (connect_redirect, connect_capture) = build_connect_redirect(&home);
+    let calls = home.root.join("netbird-calls-valid.log");
+    // One real CLI process per configured value; the capture log records the
+    // raw `connect()` target after provider resolution and before redirect,
+    // so each distinct value proves the override reached the transport.
+    for (configured, expected_port) in [(" 9000 ", "9000"), ("65535", "65535"), ("1", "1")] {
+        let mut command = home.command();
+        install_fake_netbird(&mut command, &home, "100.64.0.42", &calls);
+        command
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", configured)
+            .args(remote_screen_args(true));
+        let _output = command.output().expect("run remote pohunek");
+        // The provider-targeted port cannot be a listener in the test
+        // environment, so the process may exit nonzero; what the scenario
+        // pins is only that the configured value reached the real syscalls.
+        let captured = fs::read_to_string(&connect_capture).unwrap_or_default();
+        assert!(
+            captured
+                .lines()
+                .any(|line| line == format!("100.64.0.42:{expected_port}")),
+            "configured POHUNEK_REMOTE_PORT={configured:?} must reach connect: capture\n{captured}"
+        );
+    }
+    local_fixture.finish();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn remote_port_default_is_used_when_the_override_is_unset() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let (connect_redirect, connect_capture) = build_connect_redirect(&home);
+    let calls = home.root.join("netbird-calls-default.log");
+    let mut command = home.command();
+    install_fake_netbird(&mut command, &home, "100.64.0.42", &calls);
+    command
+        .env("LD_PRELOAD", connect_redirect)
+        .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+        .args(remote_screen_args(true));
+    let _output = command.output().expect("run remote pohunek");
+    let captured = fs::read_to_string(&connect_capture).unwrap_or_default();
+    assert!(
+        captured
+            .lines()
+            .any(|line| line == format!("100.64.0.42:{}", netbird::DEFAULT_REMOTE_PORT)),
+        "without POHUNEK_REMOTE_PORT the CLI must dial the default remote port: capture\n{captured}"
+    );
+    local_fixture.finish();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn invalid_remote_port_fails_fast_before_probing_the_provider() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let calls = home.root.join("netbird-calls-invalid.log");
+    for invalid in ["", "   ", "abc", "0", "1.5", "65536", "99999"] {
+        let mut command = home.command();
+        install_fake_netbird(&mut command, &home, "100.64.0.42", &calls);
+        command
+            .env("POHUNEK_REMOTE_PORT", invalid)
+            .args(remote_screen_args(true));
+        let output = command.output().expect("run JSON pohunek with a bad port");
+        let document = assert_json_error(&output, "netbird_configuration_invalid");
+        let message = document["err"]["msg"].as_str().expect("error message");
+        assert!(
+            message.contains(netbird::REMOTE_PORT_ENV),
+            "the message must name the misconfigured variable: {message}"
+        );
+        assert!(
+            message.contains("expected a port number in 1..=65535"),
+            "the message must state the accepted range: {message}"
+        );
+    }
+    // Fail fast means the provider was never consulted and nothing dialed.
+    assert!(
+        !calls.exists(),
+        "an invalid port must fail before the netbird probe"
+    );
+    local_fixture.finish();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn invalid_remote_port_fails_loudly_in_human_mode() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    let calls = home.root.join("netbird-calls-human.log");
+    let mut command = home.command();
+    install_fake_netbird(&mut command, &home, "100.64.0.42", &calls);
+    command
+        .env("POHUNEK_REMOTE_PORT", "99999")
+        .args(remote_screen_args(false));
+    let output = command.output().expect("run human-mode pohunek");
+    assert!(
+        !output.status.success(),
+        "a misconfigured port must not exit zero"
+    );
+    let combined = format!("{}{}", utf8(&output.stdout), utf8(&output.stderr));
+    assert!(
+        combined.contains(netbird::REMOTE_PORT_ENV),
+        "the human failure must name POHUNEK_REMOTE_PORT: {combined}"
+    );
+    assert!(
+        !calls.exists(),
+        "an invalid port must fail before the netbird probe"
+    );
+    local_fixture.finish();
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn non_unicode_remote_port_value_is_a_user_visible_failure() {
+    let home = TestHome::new();
+    let local_fixture = FixtureDaemon::start(&home.socket(), Scenario::Success);
+    // An environment value that is raw bytes, not UTF-8, must surface as a
+    // configuration error rather than crash the lookup.
+    let raw_value = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+    let mut command = home.command();
+    command
+        .env(netbird::REMOTE_PORT_ENV, raw_value)
+        .args(remote_screen_args(true));
+    let output = command.output().expect("run JSON pohunek");
+    let document = assert_json_error(&output, "netbird_configuration_invalid");
+    let message = document["err"]["msg"].as_str().expect("error message");
+    assert!(
+        message.contains("value is not valid Unicode"),
+        "the message must explain the non-Unicode value: {message}"
+    );
+    local_fixture.finish();
 }
 
 #[test]
