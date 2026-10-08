@@ -6,6 +6,8 @@ import io
 import importlib.machinery
 import importlib.util
 import json
+import os
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -816,131 +818,139 @@ class ErrorReportingTests(unittest.TestCase):
         self.assertIn("API rate limit exceeded", stderr.getvalue())
 
 
-class JunitTests(unittest.TestCase):
-    def test_parse_junit_counts_and_times(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "junit.xml"
-            path.write_text(JUNIT)
-            summary = ci_timings.parse_junit([path], top=2)
+class JunitCommandTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.report = self.root / "junit.xml"
+        self.report.write_text(JUNIT)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        gh = self.bin / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "if sys.argv[1:4] != ['run', 'view', '7']:\n"
+            "    raise SystemExit('unexpected gh request: ' + repr(sys.argv))\n"
+            "print(pathlib.Path(os.environ['CI_TIMINGS_GH_FIXTURE']).read_text())\n"
+        )
+        gh.chmod(0o755)
+        self.gh_fixture = self.root / "gh-run.json"
+
+    def run_command(self, *args, jobs=None):
+        environment = {**os.environ, "PATH": str(self.bin) + os.pathsep + os.environ["PATH"]}
+        if jobs is not None:
+            self.gh_fixture.write_text(json.dumps({"jobs": jobs}))
+            environment["CI_TIMINGS_GH_FIXTURE"] = str(self.gh_fixture)
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "junit", str(self.report), *args],
+            env=environment, capture_output=True, text=True, check=False,
+        )
+
+    def test_junit_json_counts_cases_and_slowest_test(self):
+        result = self.run_command("--json", "--top", "2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
         self.assertEqual(summary["cases"], 3)
         self.assertEqual(summary["failures"], 1)
         self.assertEqual(summary["seconds"], 12.5)
         self.assertEqual(summary["p50"], 1.0)
         self.assertEqual(summary["p95"], 11.0)
-        self.assertEqual(summary["slowest"][0], ("test_gamma", 11.0))
+        self.assertEqual(summary["slowest"][0], ["test_gamma", 11.0])
         self.assertEqual(len(summary["suites"]), 2)
 
-    def test_parse_junit_counts_retried_testcases_once(self):
-        # Real nextest report with retries: one flaky test (flaky-result =
-        # "fail") and one test that failed all three attempts. Nested
-        # flakyFailure/rerunFailure elements are attempts, not test cases.
-        report = Path(__file__).resolve().parent / "fixtures/nextest-junit/flaky-result-fail.xml"
-        summary = ci_timings.parse_junit([report])
-        self.assertEqual(summary["cases"], 3)
-        self.assertEqual(summary["failures"], 2)
-        self.assertEqual(summary["errors"], 0)
+    def test_retried_cases_count_once_in_a_real_nextest_artifact(self):
+        self.report.write_bytes(
+            (Path(__file__).resolve().parent / "fixtures/nextest-junit/flaky-result-fail.xml").read_bytes()
+        )
+        result = self.run_command("--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual((summary["cases"], summary["failures"], summary["errors"]), (3, 2, 0))
         self.assertEqual(len(summary["suites"]), 1)
 
-    def test_percentile_nearest_rank_ceil_boundary(self):
-        # Nearest rank takes the ceil(q * n)-th value: p95 of 11 values is the
-        # 11th (a rounded index would pick the 10th); an empty sample has none.
-        self.assertIsNone(ci_timings.percentile([], 0.95))
-        self.assertEqual(ci_timings.percentile([5.0], 0.95), 5.0)
-        self.assertEqual(ci_timings.percentile([1.0, 2.0, 3.0, 4.0], 0.5), 2.0)
-        values = [float(value) for value in range(1, 12)]
-        self.assertEqual(ci_timings.percentile(values, 0.95), 11.0)
-        self.assertEqual(ci_timings.percentile([1.0, 2.0], 0.5), 1.0)
-
-    def test_render_junit_markdown_separates_compile_time(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "junit.xml"
-            path.write_text(JUNIT)
-            summary = ci_timings.parse_junit([path])
-        rendered = ci_timings.render_junit_markdown(
-            summary, "tests (unit, fast)", job_seconds=300.0,
-            step_seconds=258.0,
+    def test_percentiles_use_nearest_rank_for_real_junit_cases(self):
+        cases = "".join(
+            f'<testcase name="case-{n}" classname="suite" time="{n}"/>'
+            for n in range(1, 12)
         )
-        self.assertIn("tests (unit, fast): 3 test(s)", rendered)
-        self.assertIn("Test step elapsed 4m18s (86 % of the job wall clock)", rendered)
-        self.assertIn("their summed time is not a wall-clock share", rendered)
-        self.assertIn("| cli::parse | 1 | 11.0 |", rendered)
+        self.report.write_text(f'<testsuites><testsuite name="suite">{cases}</testsuite></testsuites>')
+        result = self.run_command("--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual((summary["p50"], summary["p95"]), (6.0, 11.0))
 
-    def test_render_junit_markdown_handles_empty_artifact(self):
-        # A valid JUnit artifact without test cases yields p50/p95 of None;
-        # the renderer must print `n/a` instead of raising TypeError.
-        rendered = ci_timings.render_junit_markdown(
-            {"suites": [], "cases": 0, "failures": 0, "errors": 0, "skipped": 0,
-             "seconds": 0.0, "p50": None, "p95": None, "slowest": []},
-            "tests (empty)",
-        )
-        self.assertIn("tests (empty): 0 test(s)", rendered)
-        self.assertIn("p50 n/a, p95 n/a", rendered)
+    def test_markdown_separates_test_step_from_compile_time(self):
+        jobs = [self.job("tests (unit, fast)", "Run fast shard", "10:04:18", "10:05:00")]
+        result = self.run_command("--run", "7", "--label", "tests (unit, fast)", jobs=jobs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tests (unit, fast): 3 test(s)", result.stdout)
+        self.assertIn("Test step elapsed 4m18s (86 % of the job wall clock)", result.stdout)
+        self.assertIn("their summed time is not a wall-clock share", result.stdout)
+        self.assertIn("| cli::parse | 1 | 11.0 |", result.stdout)
 
-    def test_select_junit_job_prefers_label_then_explicit(self):
+    def test_empty_junit_artifact_has_readable_percentiles(self):
+        self.report.write_text('<testsuites name="empty" tests="0"></testsuites>')
+        result = self.run_command("--label", "tests (empty)")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tests (empty): 0 test(s)", result.stdout)
+        self.assertIn("p50 n/a, p95 n/a", result.stdout)
+
+    @staticmethod
+    def job(name, step, step_end, job_end=None):
         document = {
-            "jobs": [
-                {"name": "doctests + release build", "steps": [
-                    {"name": "Documentation tests",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:02:00Z"},
-                ]},
-                {"name": "tests (unit, fast)", "steps": [
-                    {"name": "Run fast shard",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:04:18Z"},
-                ]},
-            ]
+            "name": name,
+            "steps": [{
+                "name": step,
+                "startedAt": "2026-09-20T10:00:00Z",
+                "completedAt": f"2026-09-20T{step_end}Z",
+            }],
         }
-        name, wall, step = ci_timings.select_junit_job(
-            document, label="tests (unit, fast)"
+        if job_end is not None:
+            document["startedAt"] = "2026-09-20T10:00:00Z"
+            document["completedAt"] = f"2026-09-20T{job_end}Z"
+        return document
+
+    def test_job_selection_prefers_label_and_allows_explicit_override(self):
+        jobs = [
+            self.job("doctests + release build", "Documentation tests", "10:02:00"),
+            self.job("tests (unit, fast)", "Run fast shard", "10:04:18"),
+        ]
+        matched = self.run_command("--run", "7", "--label", "tests (unit, fast)", "--json", jobs=jobs)
+        self.assertEqual(matched.returncode, 0, matched.stderr)
+        self.assertEqual(json.loads(matched.stdout)["job"], {
+            "run": 7, "name": "tests (unit, fast)",
+            "wall_seconds": None, "step_seconds": 258.0,
+        })
+        explicit = self.run_command(
+            "--run", "7", "--label", "tests (unit, fast)",
+            "--job", "doctests + release build", "--json", jobs=jobs,
         )
-        self.assertEqual((name, step), ("tests (unit, fast)", 258.0))
-        self.assertIsNone(wall)  # job wall needs job start/end; absent → None
-        name, _, _ = ci_timings.select_junit_job(
-            document, label="tests (unit, fast)", requested="doctests + release build"
-        )
-        self.assertEqual(name, "doctests + release build")
-        with self.assertRaisesRegex(ValueError, "not found"):
-            ci_timings.select_junit_job(document, requested="nope")
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertEqual(json.loads(explicit.stdout)["job"]["name"], "doctests + release build")
+        unknown = self.run_command("--run", "7", "--job", "nope", jobs=jobs)
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("not found", unknown.stderr)
 
-    def test_select_junit_job_refuses_to_guess_between_jobs(self):
-        # The default label is "JUnit", which matches no job: guessing would
-        # pair the artifact with an unrelated shard and report false numbers.
-        document = {
-            "jobs": [
-                {"name": "doctests + release build", "steps": [
-                    {"name": "Documentation tests",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:02:00Z"},
-                ]},
-                {"name": "tests (unit, fast)", "steps": [
-                    {"name": "Run fast shard",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:04:18Z"},
-                ]},
-            ]
-        }
-        with self.assertRaisesRegex(ValueError, "pass --job"):
-            ci_timings.select_junit_job(document, label="JUnit")
+    def test_ambiguous_job_selection_requires_an_explicit_job(self):
+        jobs = [
+            self.job("doctests + release build", "Documentation tests", "10:02:00"),
+            self.job("tests (unit, fast)", "Run fast shard", "10:04:18"),
+        ]
+        result = self.run_command("--run", "7", jobs=jobs)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pass --job", result.stderr)
 
-    def test_select_junit_job_auto_selects_single_candidate(self):
-        document = {
-            "jobs": [
-                {"name": "tests (unit, fast)", "steps": [
-                    {"name": "Run fast shard",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:04:18Z"},
-                ]},
-                {"name": "fmt + clippy", "steps": [
-                    {"name": "Clippy",
-                     "startedAt": "2026-09-20T10:00:00Z",
-                     "completedAt": "2026-09-20T10:03:00Z"},
-                ]},
-            ]
-        }
-        name, _, step = ci_timings.select_junit_job(document, label="JUnit")
-        self.assertEqual((name, step), ("tests (unit, fast)", 258.0))
-
+    def test_single_test_job_is_selected_without_a_matching_label(self):
+        jobs = [
+            self.job("tests (unit, fast)", "Run fast shard", "10:04:18"),
+            self.job("fmt + clippy", "Clippy", "10:03:00"),
+        ]
+        result = self.run_command("--run", "7", "--json", jobs=jobs)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["job"]["name"], "tests (unit, fast)")
+        self.assertEqual(json.loads(result.stdout)["job"]["step_seconds"], 258.0)
 
 class CacheTests(unittest.TestCase):
     def test_junit_step_seconds_matches_exact_step_names(self):
