@@ -20,8 +20,8 @@
 #      interface and that no default route exists, and re-verifies every stage
 #      with `sha256sum -c STAGE.sha256` and a link check, using POSIX tools only;
 #   4. runs the prebuilt consumer test executable once per runtime with
-#      PATH = `<stage>/<runtime>/bin` + the system node directory, a hermetic
-#      HOME/XDG tree, a temp working directory and only the
+#      PATH = `<stage>/<runtime>/bin` + the system node and tool directories,
+#      a hermetic HOME/XDG tree, a temp working directory and only the
 #      `POHUNEK_CONSUMER_*` contract variables, pointing into the extracted
 #      archive (`POHUNEK_CONSUMER_CATALOG` selects smoke mode, so the archive's
 #      own signed catalog and anchor are the trust);
@@ -140,7 +140,7 @@ inner_main() {
         (
             cd "$run/cwd"
             exec env -i \
-                PATH="$stage/$rt/bin:$node_dir" \
+                PATH="$stage/$rt/bin:$node_dir:/usr/bin:/bin" \
                 HOME="$run/home" \
                 XDG_CONFIG_HOME="$run/config" \
                 XDG_DATA_HOME="$run/data" \

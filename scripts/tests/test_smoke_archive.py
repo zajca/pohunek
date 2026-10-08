@@ -138,9 +138,11 @@ class SmokeArchiveTest(unittest.TestCase):
         self.consumer.write_text(text)
         self.consumer.chmod(0o755)
 
-    def smoke(self, *extra, archive=None, stage=None):
+    def smoke(self, *extra, archive=None, stage=None, node_dir=None):
         env = dict(os.environ)
         env["TMPDIR"] = str(self.tmpdir)
+        if node_dir is not None:
+            env["PATH"] = f"{node_dir}:{env['PATH']}"
         return subprocess.run(
             [
                 str(SCRIPT),
@@ -165,21 +167,28 @@ class SmokeArchiveTest(unittest.TestCase):
     # -- scenarios ----------------------------------------------------------
 
     def test_success_runs_every_shipped_runtime_in_a_hermetic_environment(self):
+        node_dir = self.base / "node-bin"
+        node_dir.mkdir()
+        (node_dir / "node").write_text("#!/bin/sh\nexit 0\n")
+        (node_dir / "node").chmod(0o755)
         self.write_consumer(
             STUB_PREAMBLE
             + """
+for tool in sh python3 ps sed; do
+  command -v "$tool" >/dev/null || { echo "missing tool: $tool" >&2; exit 1; }
+done
 echo "ENV-PATH=$PATH"; echo "ENV-HOME=$HOME"; echo "ENV-PWD=$(pwd)"
 echo "ENV-POHUNEK=$(set | grep -c '^POHUNEK_' || true)"
 echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
 """
             + STUB_REPORT
         )
-        result = self.smoke()
+        result = self.smoke(node_dir=node_dir)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("pi ok", result.stdout)
         self.assertIn("codex ok", result.stdout)
-        self.assertIn(f"ENV-PATH={self.stage}/pi/bin:", result.stdout)
-        self.assertIn(f"ENV-PATH={self.stage}/codex/bin:", result.stdout)
+        self.assertIn(f"ENV-PATH={self.stage}/pi/bin:{node_dir}:/usr/bin:/bin", result.stdout)
+        self.assertIn(f"ENV-PATH={self.stage}/codex/bin:{node_dir}:/usr/bin:/bin", result.stdout)
         self.assertIn("/runtime/runtime-catalog.json", result.stdout)
         self.assertIn(f"--exact the_release_binaries_serve_the_runtime_out_of_process", result.stdout)
         # Exactly the five consumer-contract variables reach the consumer.
