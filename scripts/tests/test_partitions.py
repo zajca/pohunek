@@ -1,10 +1,26 @@
-"""Regression checks for the cost-shard coverage guard (stdlib only)."""
+"""Integration scenarios for the test-partitions CLI (stdlib only).
+
+Every scenario runs `scripts/test-partitions` as a program, as CI runs it,
+with its nextest side represented by a private fake `cargo`/`cargo-nextest`
+executable and a fixture inventory: the CLI keeps talking to the nextest
+service it selects on PATH, and the fake answers each `nextest list` with the
+fixture's JSON and records its invocation. Nothing is compiled and nothing of
+the real checkout is touched, so an `--archive-file` run proves the no-build
+path without a real archive.
+
+The process-cleanup scenarios at the bottom (LeakedWorkerTests) keep real
+fixture processes: their workers and workloads are spawned, recognised in the
+real process table, and reaped; the scenarios never signal a process outside
+their own fixture root.
+"""
 
 import contextlib
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,184 +31,426 @@ import unittest
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "test-partitions"
+REPO_ROOT = SCRIPT.parent.parent
 LOADER = importlib.machinery.SourceFileLoader("partitions", str(SCRIPT))
 SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 partitions = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(partitions)
 
+# The CLI's shard arguments, as the operations they name are documented (the
+# per-package fast shards, the relay-PostgreSQL shard, and the heavy
+# complement): the inventory every check run must split exactly once.
+SHARD_NAMES = ("unit", "daemon", "relay", "cli", "relay-db", "heavy")
 
-class CoverageTests(unittest.TestCase):
+# How long one scenario lets the script + its fake run before the scenario
+# fails instead of hanging CI; a scenario finishes well under a second.
+SCRIPT_TIMEOUT_SECONDS = 120
+
+
+def shard_expressions(fast):
+    """The six shard selections, composed from the repository's own decisions.
+
+    Not a copy of the script's code, but of its documented composition: the
+    fast filter from `.config/nextest.toml` bounds the per-package shards, and
+    the fast complement is split between relay-db (the relay packages, the
+    PostgreSQL fixture consumers) and heavy. `filters()` must keep producing
+    exactly these strings.
+    """
+    daemon = ("package(=pohunek-daemon) or package(=pohunek-session-worker) "
+              "or package(=pohunek-client)")
+    relay = ("package(=pohunek-relay) or package(=pohunek-relay-client) "
+             "or package(=pohunek-relay-protocol)")
+    return {
+        "daemon": f"({fast}) and ({daemon})",
+        "relay": f"({fast}) and ({relay})",
+        "cli": f"({fast}) and (package(=pohunek-cli))",
+        "unit": f"({fast}) and (not (({daemon}) or ({relay}) or (package(=pohunek-cli))))",
+        "relay-db": f"(not ({fast})) and ({relay})",
+        "heavy": f"(not ({fast})) and not ({relay})",
+    }
+
+
+FAKE_NEXTEST = '''#!/usr/bin/env python3
+"""A private cargo/nextest stand-in for the test-partitions scenarios.
+
+It records every invocation it sees and answers a `nextest list` from the
+fixture inventory ($PARTITIONS_FIXTURE, written by the scenario). It writes
+nothing else, so an `--archive-file` run extracts nothing into any checkout
+and only the fixture decides what the script's coverage guard observes.
+
+Which fixture tests a filter selects is the fixture's business; the fake only
+recognizes which shard a selection denotes, judged from the markers the
+script's composition leaves in the expression itself, so a future edit that
+breaks the composition makes the fake report the wrong shard and the check
+fail loudly instead of passing on a shape the fixture agrees with anyway.
+"""
+
+import json
+import os
+from pathlib import Path
+import sys
+
+
+def shard_of(expression, fast):
+    """The shard the filter expression denotes, or exit non-zero.
+
+    The expression must be the fast filter with the wrap the script composes
+    it in: `(fast) and (owner)` for the owned shards, `not ((owners))` for
+    unit, and the fast complement split by the conjunction that follows it:
+    relay-db takes the relay owners, heavy rejects them.
+    """
+    if expression.startswith("(not ("):
+        rest = expression.removeprefix(f"(not ({fast})) ")
+        if rest.startswith("and (package(=pohunek-relay"):
+            return "relay-db"
+        if rest.startswith("and not (package(=pohunek-relay"):
+            return "heavy"
+        # An owned shard composes `(fast) and (owner)`, and a fast filter
+        # starting with `not (` makes that expression start `(not (` too.
+        rest = expression.removeprefix(f"({fast}) and (")
+        if rest.startswith("not ((package(=pohunek-daemon"):
+            return "unit"
+    else:
+        rest = expression.removeprefix(f"({fast}) and (")
+    for name in ("daemon", "relay", "cli"):
+        if rest.startswith(f"package(=pohunek-{name}"):
+            return name
+    raise SystemExit(
+        "fake nextest: unrecognized filter expression " + repr(expression))
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:2] not in (["nextest", "list"], ["nextest", "run"]):
+        raise SystemExit("fake nextest: unexpected invocation " + repr(sys.argv))
+    with open(os.environ["PARTITIONS_LOG"], "a") as log:
+        log.write(json.dumps({"name": Path(sys.argv[0]).name, "argv": argv}) + "\\n")
+    if argv[1] != "list":
+        return
+
+    fast = os.environ["PARTITIONS_FAST"]
+    selected = None if "-E" not in argv else shard_of(argv[argv.index("-E") + 1], fast)
+    fixture = json.loads(Path(os.environ["PARTITIONS_FIXTURE"]).read_text())
+    suites = {}
+    for entry in fixture["binaries"]:
+        cases = {}
+        for name, test in entry["tests"].items():
+            if selected is None:
+                status = "matches" if test.get("listed", True) else "mismatch"
+            elif selected in test["matches"]:
+                status = "matches"
+            else:
+                status = "mismatch"
+            cases[name] = {
+                "ignored": bool(test.get("ignored", False)),
+                "filter-match": {"status": status},
+            }
+        suites[entry["id"]] = {"testcases": cases}
+    print(json.dumps({"rust-suites": suites}))
+
+
+main()
+'''
+
+
+def nextest_inventory():
+    """A fixture inventory where each test matches exactly one shard.
+
+    Recorded per test as the shards whose filter matches it. The names mirror
+    the repository's package split: fast daemon tests belong to the daemon
+    shard, their compiled companions without the fast filter to the heavy
+    complement (which keeps ignored tests), non-fast relay tests to relay-db,
+    and the remaining fast tests to their own shards.
+    """
+    return [
+        {"id": "pohunek-daemon-111111", "tests": {
+            "store::migrate": {"matches": ["daemon"], "ignored": False},
+            "reconcile::worker_leak": {"matches": ["heavy"], "ignored": False},
+            "upgrade_preflight::refuse": {"matches": ["heavy"], "ignored": True},
+        }},
+        {"id": "pohunek-relay-222222", "tests": {
+            "acl::owner_allow": {"matches": ["relay"], "ignored": False},
+            "marshal::append": {"matches": ["relay-db"], "ignored": False},
+        }},
+        {"id": "pohunek-cli-333333", "tests": {
+            "service::upgrade": {"matches": ["cli"], "ignored": False},
+        }},
+        {"id": "pohunek-knowledge-444444", "tests": {
+            "bundle::materialize": {"matches": ["unit"], "ignored": False},
+            "source_map::drift": {"matches": ["heavy"], "ignored": False},
+        }},
+    ]
+
+
+class ScriptScenario(unittest.TestCase):
+    """Runs scripts/test-partitions as a program, with cargo/nextest faked.
+
+    The script runs from a private checkout: its own file, copied
+    byte-identical, with the repository's nextest.toml beside it, so whatever
+    the script writes (its ROOT) stays in the fixture and a later scenario can
+    also exercise the run mode safely. The private bin directory holds both
+    `cargo` and `cargo-nextest`, the script's PATH lookup finds the fake
+    either way, and the recorded invocations say which one it picked.
+    """
+
+    timeout_seconds = SCRIPT_TIMEOUT_SECONDS
+
     def setUp(self):
-        self.selections = {
-            name: {(f"binary-{name}", "test")} for name in partitions.SHARDS
+        root = tempfile.TemporaryDirectory(prefix="pohunek-partitions-")
+        # The fixture root must live for the whole test: creating it inside a
+        # `with` block removes it before the script runs, and the script's
+        # own mkdir(parents=True) would then recreate an unmanaged root.
+        self.addCleanup(root.cleanup)
+        self.root = Path(root.name).resolve()
+        self.script = self.root / "scripts" / "test-partitions"
+        self.script.parent.mkdir(parents=True)
+        # The actual CLI, byte-identical to the checkout's own file.
+        self.script.write_bytes(SCRIPT.read_bytes())
+        self.assertEqual(self.script.read_bytes(), SCRIPT.read_bytes())
+        self.config = self.root / ".config" / "nextest.toml"
+        self.config.parent.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / ".config" / "nextest.toml", self.config)
+        self.bin = self.root / "bin"
+        self.calls_log = self.root / "nextest-calls.jsonl"
+        self.inventory = self.root / "inventory.json"
+        self.bin.mkdir()
+        for name in ("cargo", "cargo-nextest"):
+            fake = self.bin / name
+            fake.write_text(FAKE_NEXTEST, encoding="utf-8")
+            fake.chmod(0o755)
+        self.set_inventory([])
+
+    def set_inventory(self, binaries):
+        self.inventory.write_text(json.dumps({"binaries": binaries}))
+
+    def run_script(self, *arguments):
+        environment = {**os.environ}
+        # Our bin first: `which cargo-nextest` and every bare `cargo` lookup
+        # find the fake, while the rest of PATH still resolves python3 for the
+        # fake's shebang.
+        environment["PATH"] = os.pathsep.join(
+            (str(self.bin), environment.get("PATH", "")))
+        environment["PARTITIONS_LOG"] = str(self.calls_log)
+        environment["PARTITIONS_FIXTURE"] = str(self.inventory)
+        # The fast filter the fake must strip from the shard expressions.
+        environment["PARTITIONS_FAST"] = self.config_fast_filter()
+        command = [sys.executable, str(self.script), *arguments]
+        process = subprocess.Popen(
+            command, cwd=self.root, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+        except subprocess.TimeoutExpired:
+            # The CLI can have a fake nextest child. Kill the whole private
+            # process group before reaping it, so a hung child cannot leak.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            _, stderr = process.communicate()
+            self.fail(
+                f"the script did not finish within {self.timeout_seconds} s: "
+                f"{stderr[-500:]}")
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+    def nextest_calls(self):
+        if not self.calls_log.exists():
+            return []
+        return [json.loads(line) for line in self.calls_log.read_text().splitlines()]
+
+    def config_fast_filter(self):
+        """The fixture checkout's nextest.toml is what the script reads."""
+        with self.config.open("rb") as config:
+            return tomllib.load(config)["profile"]["fast"]["default-filter"]
+
+
+class CheckActionTests(ScriptScenario):
+    """`check` verifies the whole partition through nextest itself."""
+
+    def test_a_covering_partition_is_reported_test_by_test(self):
+        # The numbers pin the ignored case: heavy's three include the one
+        # ignored fixture test, and the eight are only exact with it.
+        self.set_inventory(nextest_inventory())
+        result = self.run_script("check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unit: 1 tests", result.stdout)
+        self.assertIn("daemon: 1 tests", result.stdout)
+        self.assertIn("relay: 1 tests", result.stdout)
+        self.assertIn("cli: 1 tests", result.stdout)
+        self.assertIn("relay-db: 1 tests", result.stdout)
+        self.assertIn("heavy: 3 tests", result.stdout)
+        self.assertIn(
+            "Coverage OK: 8 tests selected exactly once (including ignored tests)",
+            result.stdout,
+        )
+
+    def test_the_build_mode_asks_nextest_for_the_compiled_workspace(self):
+        self.set_inventory(nextest_inventory())
+        self.assertEqual(self.run_script("check").returncode, 0)
+        calls = self.nextest_calls()
+        # Without an archive the script asks for the workspace build: the full
+        # inventory plus one list per shard.
+        self.assertEqual([call["name"] for call in calls], ["cargo"] * 7)
+        argvs = [call["argv"] for call in calls]
+        first, rest = argvs[0], argvs[1:]
+        self.assertEqual(first[:4], ["nextest", "list", "--profile", "ci"])
+        self.assertIn("--workspace", first)
+        self.assertIn("--all-features", first)
+        self.assertNotIn("-E", first)
+        for argv in rest:
+            self.assertIn("--workspace", argv)
+            self.assertIn("--all-features", argv)
+            self.assertIn("-E", argv)
+        # Every list, base inventory or shard selection, runs with nextest's
+        # ignored tests included: the coverage check counts them.
+        for argv in argvs:
+            self.assertEqual(argv[argv.index("--run-ignored") + 1], "all")
+            self.assertEqual(argv[argv.index("--message-format") + 1], "json")
+        self.assertEqual(len({argv[argv.index("-E") + 1] for argv in rest}), 6)
+
+    def test_a_test_two_shards_match_is_rejected_as_an_overlap(self):
+        # A nextest whose daemon filter also swallowed a cli test: the guard
+        # must catch selections that stop partitioning.
+        inventory = nextest_inventory()
+        inventory[2]["tests"]["service::upgrade"]["matches"] = ["cli", "daemon"]
+        self.set_inventory(inventory)
+        result = self.run_script("check")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("partition coverage failed", result.stderr)
+        self.assertIn("overlap=", result.stderr)
+        self.assertIn("service::upgrade", result.stderr)
+
+    def test_a_test_no_shard_matches_is_reported_missing(self):
+        inventory = nextest_inventory()
+        inventory[3]["tests"]["source_map::drift"]["matches"] = []
+        self.set_inventory(inventory)
+        result = self.run_script("check")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("partition coverage failed", result.stderr)
+        self.assertIn("missing=", result.stderr)
+        self.assertIn("source_map::drift", result.stderr)
+
+    def test_a_selection_outside_the_inventory_is_rejected_as_extra(self):
+        # A nextest whose shard selection reports a test its full inventory
+        # omitted: the guard must refuse the inconsistent inventory.
+        inventory = nextest_inventory()
+        inventory[3]["tests"]["source_map::drift"] = {
+            "matches": ["heavy"], "ignored": False, "listed": False,
         }
-        self.universe = set.union(*self.selections.values())
+        self.set_inventory(inventory)
+        result = self.run_script("check")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("partition coverage failed", result.stderr)
+        self.assertIn("extra=", result.stderr)
+        self.assertIn("source_map::drift", result.stderr)
 
-    def test_disjoint_complete_partition(self):
-        partitions.validate_coverage(self.universe, self.selections)
+    def test_an_empty_shard_selection_is_rejected(self):
+        # A fast-filter edit that cut the relay shard's whole selection.
+        inventory = nextest_inventory()
+        inventory[1]["tests"]["acl::owner_allow"]["matches"] = ["relay-db"]
+        self.set_inventory(inventory)
+        result = self.run_script("check")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("partition coverage failed", result.stderr)
+        self.assertIn("empty=['relay']", result.stderr)
 
-    def test_missing_test(self):
-        with self.assertRaisesRegex(ValueError, "missing="):
-            partitions.validate_coverage(self.universe | {("new", "test")}, self.selections)
-
-    def test_overlapping_test(self):
-        self.selections["cli"] |= self.selections["unit"]
-        with self.assertRaisesRegex(ValueError, "overlap="):
-            partitions.validate_coverage(self.universe, self.selections)
-
-    def test_extra_test(self):
-        self.selections["cli"].add(("extra", "test"))
-        with self.assertRaisesRegex(ValueError, "extra="):
-            partitions.validate_coverage(self.universe, self.selections)
-
-    def test_empty_shard(self):
-        self.selections["heavy"].clear()
-        with self.assertRaisesRegex(ValueError, "empty=\\['heavy'\\]"):
-            partitions.validate_coverage(self.universe, self.selections)
-
-    def test_empty_inventory(self):
-        with self.assertRaisesRegex(ValueError, "empty workspace"):
-            partitions.validate_coverage(set(), self.selections)
-
-    def test_wrong_shard_names(self):
-        self.selections["typo"] = self.selections.pop("cli")
-        with self.assertRaisesRegex(ValueError, "unexpected shard names"):
-            partitions.validate_coverage(self.universe, self.selections)
-
-    def test_inventory_keeps_ignored_but_not_filtered_tests(self):
-        document = {"rust-suites": {"bin": {"testcases": {
-            "ignored": {"ignored": True, "filter-match": {"status": "matches"}},
-            "selected": {"ignored": False, "filter-match": {"status": "matches"}},
-            "filtered": {"ignored": False, "filter-match": {"status": "mismatch"}},
-        }}}}
-        self.assertEqual(partitions.selected_tests(document), {
-            ("bin", "ignored"), ("bin", "selected"),
-        })
-
-    def test_heavy_is_fast_complement_minus_relay_db(self):
-        import tomllib
-        with (Path(__file__).resolve().parents[2] / ".config/nextest.toml").open("rb") as config:
-            fast = tomllib.load(config)["profile"]["fast"]["default-filter"]
-        expressions = partitions.filters()
-        self.assertEqual(set(expressions), set(partitions.SHARDS))
-        for name in ("unit", "daemon", "relay", "cli"):
-            self.assertIn(f"({fast}) and (", expressions[name])
-        # Relay heavy tests are the relay-db shard; heavy is the remaining
-        # fast-filter complement. Together they re-cover the full complement.
-        self.assertEqual(expressions["relay-db"], f"(not ({fast})) and ({partitions.RELAY})")
-        self.assertEqual(expressions["heavy"], f"(not ({fast})) and not ({partitions.RELAY})")
+    def test_an_empty_workspace_inventory_is_rejected(self):
+        # The default fixture: a nextest that lists no compiled test at all.
+        result = self.run_script("check")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("empty workspace test inventory", result.stderr)
+        self.assertEqual(len(self.nextest_calls()), 7)
 
 
-class ArchiveModeTests(unittest.TestCase):
-    ARCHIVE = Path("/archives/nextest-archive.tar.zst")
+class ArchiveActionTests(ScriptScenario):
+    """The archive keeps CI's shared-build rules: extract once, never build."""
 
-    def test_build_mode_compiles_the_workspace(self):
-        command = partitions.nextest_command("run", "heavy", None)
-        self.assertEqual(command[:3], ["cargo", "nextest", "run"])
-        self.assertIn("--workspace", command)
-        self.assertIn("--all-features", command)
-        self.assertNotIn("--archive-file", command)
+    def setUp(self):
+        super().setUp()
+        self.archive = self.root / "built-elsewhere.tar.zst"
+        self.archive.write_bytes(b"cargo nextest archive built at another path")
 
-    def test_archive_mode_extracts_into_the_checkout_and_never_builds(self):
-        for direct in ("/bin/cargo-nextest", None):
-            with self.subTest(direct=direct), \
-                    mock.patch.object(partitions.shutil, "which", return_value=direct):
-                command = partitions.nextest_command(
-                    "list", "ci", partitions.Archive(self.ARCHIVE)
-                )
-                self.assertEqual(
-                    command[:3], [direct, "nextest", "list"] if direct else ["cargo", "nextest", "list"]
-                )
-                self.assertEqual(command[command.index("--archive-file") + 1], str(self.ARCHIVE))
-                self.assertEqual(command[command.index("--extract-to") + 1], str(partitions.ROOT))
-                self.assertEqual(command[command.index("--workspace-remap") + 1], str(partitions.ROOT))
-                self.assertIn("--extract-overwrite", command)
-                self.assertNotIn("--workspace", command)
-                self.assertNotIn("--all-features", command)
-
-    def test_only_the_first_call_extracts_the_archive(self):
-        archive = partitions.Archive(self.ARCHIVE)
-        calls = [partitions.nextest_command("list", "ci", archive) for _ in range(3)]
-        self.assertEqual([("--extract-to" in c) for c in calls], [True, False, False])
-        self.assertEqual([("--archive-file" in c) for c in calls], [True, False, False])
-        store = partitions.ROOT / "target" / "nextest"
-        for command in calls[1:]:
+    def test_check_extracts_once_and_lists_without_building(self):
+        self.set_inventory(nextest_inventory())
+        result = self.run_script("check", "--archive-file", str(self.archive))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Coverage OK: 8 tests selected exactly once (including ignored tests)",
+            result.stdout,
+        )
+        calls = self.nextest_calls()
+        # One extraction for the whole check, then only the extracted state's
+        # metadata: no `cargo` run, no workspace or feature selection.
+        self.assertEqual([call["name"] for call in calls], ["cargo-nextest"] * 7)
+        argvs = [call["argv"] for call in calls]
+        first, rest = argvs[0], argvs[1:]
+        self.assertEqual(first[:4], ["nextest", "list", "--profile", "ci"])
+        self.assertEqual(first[first.index("--archive-file") + 1], str(self.archive))
+        self.assertIn("--extract-overwrite", first)
+        self.assertEqual(first[first.index("--extract-to") + 1], str(self.root))
+        self.assertEqual(first[first.index("--workspace-remap") + 1], str(self.root))
+        self.assertNotIn("--binaries-metadata", first)
+        self.assertEqual(["--extract-to" in argv for argv in argvs].count(True), 1)
+        store = self.root / "target" / "nextest"
+        for argv in rest:
             self.assertEqual(
-                command[command.index("--binaries-metadata") + 1],
-                str(store / "binaries-metadata.json"),
-            )
+                argv[argv.index("--binaries-metadata") + 1],
+                str(store / "binaries-metadata.json"))
             self.assertEqual(
-                command[command.index("--cargo-metadata") + 1],
-                str(store / "cargo-metadata.json"),
-            )
-            self.assertEqual(command[command.index("--workspace-remap") + 1], str(partitions.ROOT))
+                argv[argv.index("--cargo-metadata") + 1],
+                str(store / "cargo-metadata.json"))
+            self.assertEqual(argv[argv.index("--workspace-remap") + 1], str(self.root))
+            self.assertEqual(argv[argv.index("--target-dir-remap") + 1], str(store.parent))
+            self.assertNotIn("--archive-file", argv)
+            self.assertNotIn("--extract-to", argv)
+            self.assertIn("-E", argv)
+        self.assertEqual(len({argv[argv.index("-E") + 1] for argv in rest}), 6)
 
-    def test_check_extracts_once_and_still_detects_overlap_and_gaps(self):
-        shards = {name: {(f"bin-{name}", "t")} for name in partitions.SHARDS}
-        universe = set.union(*shards.values())
+    def test_the_archive_mode_still_fails_an_overlapping_partition(self):
+        inventory = nextest_inventory()
+        inventory[2]["tests"]["service::upgrade"]["matches"] = ["cli", "daemon"]
+        self.set_inventory(inventory)
+        result = self.run_script("check", "--archive-file", str(self.archive))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("partition coverage failed", result.stderr)
+        self.assertIn("overlap=", result.stderr)
+        self.assertEqual(len(self.nextest_calls()), 7)
 
-        def run_check(selections):
-            commands = []
+    def test_an_archive_built_at_any_path_is_accepted_without_calling_nextest(self):
+        result = self.run_script("filter", "unit", "--archive-file", str(self.archive))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            shard_expressions(self.config_fast_filter())["unit"])
+        self.assertEqual(self.nextest_calls(), [])
 
-            def fake_run(command, **kwargs):
-                commands.append(command)
-                return subprocess.CompletedProcess(command, 0, stdout=b"{}")
+    def test_a_missing_archive_is_refused_without_calling_nextest(self):
+        result = self.run_script(
+            "filter", "unit", "--archive-file", str(self.root / "absent.tar.zst"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("nextest archive not found", result.stderr)
+        self.assertEqual(self.nextest_calls(), [])
 
-            answers = iter([universe, *[selections[n] for n in partitions.SHARDS]])
-            with mock.patch.object(partitions, "require_archive_file"), \
-                    mock.patch.object(partitions.subprocess, "run", side_effect=fake_run), \
-                    mock.patch.object(partitions, "selected_tests", side_effect=lambda _d: next(answers)), \
-                    mock.patch.object(sys, "argv", [
-                        "test-partitions", "--archive-file", str(self.ARCHIVE), "check",
-                    ]):
-                partitions.main()
-            return commands
 
-        commands = run_check(shards)
-        self.assertEqual(len(commands), 1 + len(partitions.SHARDS))
-        self.assertEqual(sum("--extract-to" in c for c in commands), 1)
-        overlapping = {**shards, "cli": shards["cli"] | shards["unit"]}
-        with self.assertRaisesRegex(ValueError, "overlap="):
-            run_check(overlapping)
-        gapped = {**shards, "heavy": set()}
-        with self.assertRaisesRegex(ValueError, "empty=|missing="):
-            run_check(gapped)
+class EntrypointTests(ScriptScenario):
+    """The script run as a program, as CI runs it."""
 
-    def test_profile_and_filter_survive_in_archive_mode(self):
-        with tempfile.TemporaryDirectory() as root:
-            archive = Path(root) / "a.tar.zst"
-            config = Path(root) / ".config" / "nextest.toml"
-            config.parent.mkdir()
-            config.write_bytes((SCRIPT.parent.parent / ".config/nextest.toml").read_bytes())
-            seen = []
+    def test_filter_prints_the_shard_expression(self):
+        expected = shard_expressions(self.config_fast_filter())
+        printed = {}
+        for shard in SHARD_NAMES:
+            result = self.run_script("filter", shard)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            printed[shard] = result.stdout.strip()
+        self.assertEqual(printed, expected)
+        self.assertEqual(len(set(printed.values())), len(printed))
 
-            def fake_run(command, **kwargs):
-                seen.append(command)
-                return 0
-
-            with mock.patch.object(partitions, "ROOT", Path(root)), \
-                    mock.patch.object(partitions, "require_archive_file"), \
-                    mock.patch.object(partitions, "run_checked", side_effect=fake_run), \
-                    mock.patch.object(sys, "argv", [
-                        "test-partitions", "--archive-file", str(archive), "run", "relay-db",
-                    ]):
-                with self.assertRaises(SystemExit):
-                    partitions.main()
-        command = seen[-1]
-        self.assertEqual(command[command.index("--profile") + 1], "relay-db")
-        self.assertEqual(command[command.index("-E") + 1], partitions.filters()["relay-db"])
-        self.assertIn("--archive-file", command)
-
-    def test_archive_built_at_another_path_is_accepted(self):
-        with tempfile.TemporaryDirectory() as root:
-            archive = Path(root) / "a.tar.zst"
-            archive.write_bytes(b"archive built elsewhere")
-            partitions.require_archive_file(archive)
-
-    def test_missing_archive_is_refused(self):
-        with tempfile.TemporaryDirectory() as root:
-            with self.assertRaisesRegex(ValueError, "not found"):
-                partitions.require_archive_file(Path(root) / "absent.tar.zst")
+    def test_an_invalid_shard_or_action_fails(self):
+        for arguments in (("filter", "bogus"), ("bogus", "unit"), ("run",), ()):
+            with self.subTest(arguments=arguments):
+                self.assertNotEqual(self.run_script(*arguments).returncode, 0)
 
 
 def wait_for(condition, seconds=30):
@@ -215,29 +473,6 @@ def gone_or_zombie(pid):
     except (FileNotFoundError, ProcessLookupError):
         return True
     return ") Z " in stat
-
-
-class EntrypointTests(unittest.TestCase):
-    """The script run as a program, as CI runs it."""
-
-    def run_script(self, *arguments):
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), *arguments],
-            capture_output=True, text=True, check=False,
-        )
-
-    def test_filter_prints_the_shard_expression(self):
-        for shard in partitions.SHARDS:
-            with self.subTest(shard=shard):
-                result = self.run_script("filter", shard)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), partitions.filters()[shard])
-                self.assertNotEqual(result.stdout.strip(), "")
-
-    def test_an_invalid_shard_or_action_fails(self):
-        for arguments in (("filter", "bogus"), ("bogus", "unit"), ("run",), ()):
-            with self.subTest(arguments=arguments):
-                self.assertNotEqual(self.run_script(*arguments).returncode, 0)
 
 
 class LeakedWorkerTests(unittest.TestCase):
@@ -381,7 +616,7 @@ class LeakedWorkerTests(unittest.TestCase):
             wait_for(lambda: parent_of(leader) != intermediate)
 
             processes = partitions.read_processes()
-            found = partitions.leaked_workers(processes, base)
+            found = partitions.leaked_workers(partitions.read_processes(), base)
             self.assertNotIn(leader, [p.pid for p in partitions.workload_of(processes, found[0][0])])
 
             self.assertFalse(partitions.check_no_leaked_workers(base, retained))
@@ -534,10 +769,6 @@ class LeakedWorkerTests(unittest.TestCase):
         self.assertFalse(Path(seen[0]).exists(), "the base is removed after the run")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class JunitReportTests(unittest.TestCase):
     def setUp(self):
         with (SCRIPT.parent.parent / ".config/nextest.toml").open("rb") as config:
@@ -586,3 +817,7 @@ class JunitReportTests(unittest.TestCase):
                     partitions.main()
             self.assertEqual(exit_.exception.code, 0)
             self.assertEqual(seen, [False])
+
+
+if __name__ == "__main__":
+    unittest.main()
