@@ -58,7 +58,7 @@ pub enum Deprecation {
 ///
 /// This enum is mirrored by `protocol::ConceptType` for the wire contract;
 /// the two are bridged in `protocol_conversions.rs`. Keep both in sync — a
-/// parity test guards against silent drift when a variant is added.
+/// assistant materialization and bundle-to-protocol scenarios exercise the bridge.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ConceptType {

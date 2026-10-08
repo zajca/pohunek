@@ -9,6 +9,9 @@ intents:
 since: 0.3.3
 changed_in:
   - 0.3.4
+deprecated:
+  version: 0.4.0
+  successor: runbook/new-setup
 ---
 
 # Setup Runbook
