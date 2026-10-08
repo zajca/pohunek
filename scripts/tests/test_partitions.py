@@ -124,7 +124,12 @@ def main():
     if argv[:2] not in (["nextest", "list"], ["nextest", "run"]):
         raise SystemExit("fake nextest: unexpected invocation " + repr(sys.argv))
     with open(os.environ["PARTITIONS_LOG"], "a") as log:
-        log.write(json.dumps({"name": Path(sys.argv[0]).name, "argv": argv}) + "\\n")
+        stale_report = os.environ.get("PARTITIONS_STALE_REPORT")
+        log.write(json.dumps({
+            "name": Path(sys.argv[0]).name,
+            "argv": argv,
+            "stale_report_exists": Path(stale_report).exists() if stale_report else None,
+        }) + "\\n")
     if argv[1] != "list":
         return
 
@@ -223,8 +228,9 @@ class ScriptScenario(unittest.TestCase):
     def set_inventory(self, binaries):
         self.inventory.write_text(json.dumps({"binaries": binaries}))
 
-    def run_script(self, *arguments):
+    def run_script(self, *arguments, extra_env=None):
         environment = {**os.environ}
+        environment.update(extra_env or {})
         # Our bin first: `which cargo-nextest` and every bare `cargo` lookup
         # find the fake, while the rest of PATH still resolves python3 for the
         # fake's shebang.
@@ -769,54 +775,60 @@ class LeakedWorkerTests(unittest.TestCase):
         self.assertFalse(Path(seen[0]).exists(), "the base is removed after the run")
 
 
-class JunitReportTests(unittest.TestCase):
-    def setUp(self):
-        with (SCRIPT.parent.parent / ".config/nextest.toml").open("rb") as config:
-            self.config = tomllib.load(config)
 
-    def test_report_paths_follow_profile_inheritance(self):
-        cases = {
-            "ci": Path("r/target/nextest/ci/junit.xml"),
-            "fast": Path("r/target/nextest/fast/junit.xml"),
-            "heavy": Path("r/target/nextest/heavy/junit.xml"),
-            "relay-db": Path("r/target/nextest/relay-db/junit.xml"),
-            "local": None,
-        }
-        for profile, expected in cases.items():
-            with self.subTest(profile=profile):
-                self.assertEqual(partitions.junit_report(self.config, profile, "r"), expected)
+class JunitReportActionTests(ScriptScenario):
+    """The run command discards only the previous report for its nextest profile."""
 
-    def test_store_dir_setting_moves_reports(self):
-        config = {"store": {"dir": "out/nx"}, "profile": {"ci": {"junit": {"path": "j.xml"}}}}
-        self.assertEqual(partitions.junit_report(config, "ci", "r"), Path("r/out/nx/ci/j.xml"))
+    def stale_report(self, profile, store="target/nextest"):
+        report = self.root / store / profile / "junit.xml"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("<testsuites/>")
+        return report
 
-    def test_inheritance_cycle_ends(self):
-        config = {"profile": {"a": {"inherits": "b"}, "b": {"inherits": "a"}}}
-        self.assertIsNone(partitions.junit_report(config, "a", "r"))
+    def test_run_removes_the_effective_profiles_report_before_nextest(self):
+        profiles = (("unit", "ci"), ("heavy", "heavy"), ("relay-db", "relay-db"))
+        for shard, profile in profiles:
+            with self.subTest(shard=shard):
+                stale = self.stale_report(profile)
+                unrelated = self.stale_report("local")
+                result = self.run_script(
+                    "run", shard,
+                    extra_env={
+                        "CARGO_TARGET_DIR": str(self.root / "elsewhere"),
+                        "PARTITIONS_STALE_REPORT": str(stale),
+                    },
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(stale.exists())
+                self.assertTrue(unrelated.exists())
+                self.assertEqual(
+                    self.nextest_calls()[-1]["argv"][1:4],
+                    ["run", "--profile", profile],
+                )
+                self.assertFalse(self.nextest_calls()[-1]["stale_report_exists"])
 
-    def test_run_removes_a_stale_report_before_nextest_starts(self):
-        with tempfile.TemporaryDirectory() as root:
-            # CARGO_TARGET_DIR does not move nextest's store; the root does.
-            stale = Path(root) / "target" / "nextest" / "heavy" / "junit.xml"
-            stale.parent.mkdir(parents=True)
-            stale.write_text("<testsuites/>")
-            config = Path(root) / ".config" / "nextest.toml"
-            config.parent.mkdir()
-            config.write_bytes((SCRIPT.parent.parent / ".config/nextest.toml").read_bytes())
-            seen = []
+    def test_run_honors_configured_nextest_store_dir(self):
+        with self.config.open("a") as config:
+            config.write('\n[store]\ndir = "out/nx"\n')
+        stale = self.stale_report("ci", store="out/nx")
+        result = self.run_script(
+            "run", "unit", extra_env={"PARTITIONS_STALE_REPORT": str(stale)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+        self.assertFalse(self.nextest_calls()[-1]["stale_report_exists"])
 
-            def fake_run(command, **kwargs):
-                seen.append(stale.exists())
-                return 0
-
-            with mock.patch.object(partitions, "ROOT", Path(root)), \
-                    mock.patch.dict("os.environ", {"CARGO_TARGET_DIR": str(Path(root) / "elsewhere")}), \
-                    mock.patch.object(partitions, "run_checked", side_effect=fake_run), \
-                    mock.patch.object(sys, "argv", ["test-partitions", "run", "heavy"]):
-                with self.assertRaises(SystemExit) as exit_:
-                    partitions.main()
-            self.assertEqual(exit_.exception.code, 0)
-            self.assertEqual(seen, [False])
+    def test_cyclic_profile_inheritance_terminates_without_deleting_report(self):
+        config = self.config.read_text()
+        config = config.replace(
+            '[profile.heavy]\ninherits = "ci"',
+            '[profile.heavy]\ninherits = "a"',
+        )
+        config += '\n[profile.a]\ninherits = "b"\n[profile.b]\ninherits = "a"\n'
+        self.config.write_text(config)
+        stale = self.stale_report("heavy")
+        result = self.run_script("run", "heavy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(stale.exists())
 
 
 if __name__ == "__main__":
