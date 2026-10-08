@@ -92,6 +92,96 @@ const STALE_JOB_INITIALIZE: Duration = Duration::from_secs(5);
     target_os = "linux",
     ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
 )]
+async fn managed_cli_lists_sessions_and_rejects_self_attach_across_daemon_restart() {
+    let fixture = Installation::new(Settings::default()).await;
+    let cli = pohunek_test_support::bin_exe("pohunekd").with_file_name("pohunek");
+    assert!(cli.is_file(), "build the pohunek CLI at {}", cli.display());
+    let script = format!(
+        "cli='{}'; while IFS= read -r action; do case \"$action\" in \
+         list) \"$cli\" session list --json; printf 'list-exit:%s\\n' \"$?\";; \
+         attach-*) printf 'attempt:%s\\n' \"$action\"; \
+         \"$cli\" attach \"$POHUNEK_SESSION_ID\" 2>&1; \
+         printf '%s-exit:%s\\n' \"$action\" \"$?\";; esac; done",
+        cli.display()
+    );
+    let profile = format!(
+        "base = \"shell\"\nprogram = \"/bin/sh\"\nargs = [\"-c\", {}]\n",
+        toml::Value::String(script)
+    );
+    let profile_path = fixture
+        .paths
+        .config_dir
+        .join("agents")
+        .join(format!("{}.toml", supervised::AGENT));
+    std::fs::write(&profile_path, profile).expect("write managed CLI agent profile");
+    std::fs::set_permissions(&profile_path, std::fs::Permissions::from_mode(0o600))
+        .expect("keep managed CLI agent profile private");
+
+    fixture.start_daemon().await;
+    let session = fixture.new_session("managed-cli").await.id.0;
+    let before = fixture.snapshot(&session).await;
+
+    let mut attach = fixture.attach(&session).await;
+    let mut client = fixture.client().await;
+    client
+        .call::<method::SessionInput>(SessionInputParams {
+            session_id: SessionId(session.clone()),
+            text: "list".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("request session list inside managed PTY");
+    let listing = read_until(&mut attach, "successful managed session list", |bytes| {
+        contains(bytes, b"list-exit:0")
+    })
+    .await;
+    assert!(
+        contains(&listing, session.as_bytes()),
+        "CLI listed its session"
+    );
+
+    for (restart, action) in [(false, "attach-before"), (true, "attach-after")] {
+        if restart {
+            fixture.restart_daemon().await;
+            fixture.assert_same_runtime(&before).await;
+            client = fixture.client().await;
+            attach = fixture.attach(&session).await;
+        }
+        client
+            .call::<method::SessionInput>(SessionInputParams {
+                session_id: SessionId(session.clone()),
+                text: action.to_owned(),
+                wait: None,
+            })
+            .await
+            .expect("request self-attach inside managed PTY");
+        let exit_marker = format!("{action}-exit:1");
+        let output = read_until(&mut attach, "rejected managed self-attach", |bytes| {
+            contains(bytes, exit_marker.as_bytes())
+        })
+        .await;
+        let attempt_marker = format!("attempt:{action}");
+        let attempt = output
+            .windows(attempt_marker.len())
+            .position(|window| window == attempt_marker.as_bytes())
+            .expect("CLI attempt marker");
+        assert!(
+            contains(&output[attempt..], b"refusing to attach to session"),
+            "CLI must report the daemon's self-feedback rejection"
+        );
+    }
+    drop(attach);
+    client
+        .call::<method::SessionRemove>(SessionId(session))
+        .await
+        .expect("retire managed CLI session");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "requires POHUNEK_SYSTEMD_E2E=1 and a systemd user manager"
+)]
 async fn two_workers_survive_graceful_restart_and_sigkill() {
     let fixture = Installation::new(Settings::default()).await;
     let first_daemon = fixture.start_daemon().await;

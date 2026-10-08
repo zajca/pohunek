@@ -290,9 +290,10 @@ fn prune_attach_failures(
     failures.retain(|failure| now.saturating_duration_since(failure.finished_at) < ttl);
 }
 
-/// Raised when the attaching client reports (via `POHUNEK_SESSION_ID` +
-/// `POHUNEK_DAEMON_ID`) that it is running inside the very session of this very
-/// daemon instance it is attaching to. Stable code: `attach_self_feedback`.
+/// Raised when the attaching client's session and worker IDs match the target.
+///
+/// The worker ID remains stable across daemon restarts. Stable code:
+/// `attach_self_feedback`.
 fn attach_self_feedback(id: &SessionId) -> ProtocolError {
     ProtocolError::new(
         ErrorClass::Daemon,
@@ -326,12 +327,10 @@ fn attach_token_error(code: &'static str, stream_id: &str) -> ProtocolError {
 /// the two starts; the counter disambiguates registries built within one process
 /// at the same instant (e.g. tests). The clock distance is taken in *either*
 /// direction so the id never collapses to a fixed value when the clock is set
-/// before 1970 (an RTC-less boot before NTP). Used to scope the
-/// self-feeding-attach guard to this instance's own PTYs and to keep a stale
-/// `POHUNEK_DAEMON_ID` from a previous daemon from matching (see
-/// [`SessionAttachParams::origin_worker_id`]); a residual collision only
-/// false-rejects an attach (never lets a loop through) and the lag-warn throttle
-/// still bounds any such loop's log output. Not a secret.
+/// before 1970 (an RTC-less boot before NTP). Used for daemon request origin,
+/// worker control identity, and the managed child's launch-time
+/// `POHUNEK_DAEMON_ID`. The self-feeding attach guard matches session and worker
+/// IDs instead. Not a secret.
 pub(super) fn generate_daemon_instance_id() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);

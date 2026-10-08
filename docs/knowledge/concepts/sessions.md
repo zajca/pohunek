@@ -582,7 +582,11 @@ Native recovery metadata is accepted only from the immutable launch agent
 process, so a nested different or same-provider agent cannot overwrite the
 parent session's recovery reference. Managed children inherit the stable
 `POHUNEK_SESSION_ID`, `POHUNEK_WORKER_ID`,
-`POHUNEK_WORKER_SOCKET_PATH`, and worker hook protocol version. Identity hooks
+`POHUNEK_WORKER_SOCKET_PATH`, and worker hook protocol version. They also
+receive `POHUNEK_DAEMON_ID` from the daemon instance that initialized their
+worker. A daemon restart leaves this launch-time value in the live PTY;
+`pohunek attach` rejects a session attaching to itself by matching its session
+and stable worker IDs, including after the restart. Identity hooks
 prefer the worker endpoint so accepted state survives daemon outage. The worker
 binds every private report to the process that sends it: the connecting peer,
 taken from the kernel and never from the request, must be the reported process

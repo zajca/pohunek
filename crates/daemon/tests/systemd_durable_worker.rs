@@ -615,6 +615,9 @@ impl Fixture {
     ) -> Initialize {
         Initialize {
             session_id: WorkerSessionId::new(session_id).expect("session id"),
+            daemon_instance_id: Some(
+                pohunek_worker_protocol::DaemonId::new("daemon-systemd-test").expect("daemon id"),
+            ),
             transaction_id: TransactionId::new(format!("create-{session_id}"))
                 .expect("transaction id"),
             expected_worker_id: worker_id,
