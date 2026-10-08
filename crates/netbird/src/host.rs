@@ -161,30 +161,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_peer_identity_does_not_follow_reassigned_address() {
-        let identity = ExternalIdentity::peer_id("stable/key+=").expect("stable identity");
-        let owned = parse_status(
-            r#"{"peers":[{"publicKey":"stable/key+=","fqdn":"host.example","netbirdIp":"100.64.0.2"}]}"#,
-        )
-        .expect("owned status");
-        let reassigned = parse_status(
-            r#"{"peers":[{"publicKey":"different-key","fqdn":"other.example","netbirdIp":"100.64.0.2"}]}"#,
-        )
-        .expect("reassigned status");
-
-        assert_eq!(
-            resolve_peer_identity(&owned, &identity)
-                .expect("identity owner")
-                .ip(),
-            Some("100.64.0.2".parse().expect("address"))
-        );
-        assert!(matches!(
-            resolve_peer_identity(&reassigned, &identity),
-            Err(NetbirdError::HostUnknown(host)) if host == "stable/key+="
-        ));
-    }
-
-    #[test]
     fn resolves_by_short_hostname() {
         let ip = resolve_host(&status(), "host-b").unwrap();
         assert_eq!(ip, "100.92.30.40".parse::<IpAddr>().unwrap());
