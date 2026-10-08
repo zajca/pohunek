@@ -148,33 +148,3 @@ fn unique_peer<'a>(
 fn short_hostname(fqdn: &str) -> Option<&str> {
     fqdn.split('.').next().filter(|label| !label.is_empty())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::status::parse_status;
-
-    const STATUS_CURRENT: &str = include_str!("../tests/fixtures/status_current.json");
-
-    fn status() -> NetbirdStatus {
-        parse_status(STATUS_CURRENT).expect("fixture parses")
-    }
-
-    #[test]
-    fn resolves_by_short_hostname() {
-        let ip = resolve_host(&status(), "host-b").unwrap();
-        assert_eq!(ip, "100.92.30.40".parse::<IpAddr>().unwrap());
-    }
-
-    #[test]
-    fn resolves_case_insensitively() {
-        let ip = resolve_host(&status(), "HOST-B.NetBird.Cloud").unwrap();
-        assert_eq!(ip, "100.92.30.40".parse::<IpAddr>().unwrap());
-    }
-
-    #[test]
-    fn resolves_by_literal_peer_ip() {
-        let ip = resolve_host(&status(), "100.92.30.40").unwrap();
-        assert_eq!(ip, "100.92.30.40".parse::<IpAddr>().unwrap());
-    }
-}

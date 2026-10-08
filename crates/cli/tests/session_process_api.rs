@@ -1347,29 +1347,26 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
 
     let private_session = "remote-origin-session";
     let private_daemon = "remote-origin-daemon";
-    let output = home
-        .command()
-        .env("PATH", path)
-        .env("LD_PRELOAD", connect_redirect)
-        .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
-        .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
-        .env(protocol::ENV_SESSION_ID, private_session)
-        .env(protocol::ENV_DAEMON_ID, private_daemon)
-        .args([
-            "--host",
-            "fixture-remote",
-            "session",
-            "screen",
-            SESSION_ID,
-            "--json",
-        ])
-        .output()
-        .expect("run remote pohunek");
+    for selector in ["fixture-remote", "FIXTURE-REMOTE.NETBIRD.TEST", netbird_ip] {
+        let output = home
+            .command()
+            .env("PATH", &path)
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+            .env(protocol::ENV_SESSION_ID, private_session)
+            .env(protocol::ENV_DAEMON_ID, private_daemon)
+            .args([
+                "--host", selector, "session", "screen", SESSION_ID, "--json",
+            ])
+            .output()
+            .expect("run remote pohunek");
+        let ok = assert_json_success(&output);
+        assert_eq!(ok["session_id"], SESSION_ID, "selector {selector}");
+    }
     let requests = tcp_fixture.finish();
     let local_requests = local_fixture.finish();
-    let ok = assert_json_success(&output);
-    assert_eq!(ok["session_id"], SESSION_ID);
-    assert!(requests.len() >= 2, "list and screen reach TCP fixture");
+    assert!(requests.len() >= 6, "every selector reaches TCP fixture");
     for request in requests {
         assert_eq!(
             request.origin_session_id().map(|id| id.0.as_str()),
@@ -1388,8 +1385,8 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
             .lines()
             .filter(|line| *line == expected_target)
             .count()
-            >= 2,
-        "both CLI connections must target the fake NetBird address before the test-only redirect"
+            >= 6,
+        "every CLI connection must target the fake NetBird address before the test-only redirect"
     );
 }
 
