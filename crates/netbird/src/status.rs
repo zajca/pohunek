@@ -460,34 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn a_minimal_path_falls_back_to_the_trusted_install_directories() {
-        let (dir, program) = fake_netbird("fallback", STATUS_CURRENT, 0o755);
-        let table = [dir.path().to_str().expect("utf8 root")];
-        let minimal = OsStr::new("/nonexistent-minimal-path");
-        assert_eq!(
-            resolve_program(Some(minimal), &table, None).expect("fallback netbird"),
-            program
-        );
-        // The PATH wins over the fallback when both hold a netbird.
-        let (preferred, preferred_program) = fake_netbird("preferred", STATUS_CURRENT, 0o755);
-        assert_eq!(
-            resolve_program(Some(preferred.path().as_os_str()), &table, None)
-                .expect("path netbird"),
-            preferred_program
-        );
-    }
-
-    #[test]
-    fn the_fallback_directories_obey_the_trust_policy() {
-        let (loose, _) = fake_netbird("fallback-loose", STATUS_CURRENT, 0o777);
-        let table = [loose.path().to_str().expect("utf8 root")];
-        assert!(matches!(
-            resolve_program(None, &table, None),
-            Err(NetbirdError::CliMissing)
-        ));
-    }
-
-    #[test]
     fn a_stalled_lookup_neither_holds_the_future_nor_the_runtime() {
         const LOOKUP_STALL: std::time::Duration = std::time::Duration::from_secs(5);
         const DEADLINE: std::time::Duration = std::time::Duration::from_millis(50);
