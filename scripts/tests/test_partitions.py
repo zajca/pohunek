@@ -147,14 +147,24 @@ def main():
             worker_dir = base / os.environ.get("PARTITIONS_WORKER_SUBDIR", "")
             worker_dir.mkdir(exist_ok=True)
             executable = worker_dir / "pohunek-sessiond"
-            executable.symlink_to("/bin/sh")
-            worker_args = [str(executable), "-c", "sleep 30 & echo $$ $!; wait"]
+            deleted_executable = bool(os.environ.get("PARTITIONS_DELETED_WORKER_EXE"))
+            if deleted_executable:
+                import shutil
+                shutil.copyfile("/bin/sh", executable)
+                executable.chmod(0o755)
+            else:
+                executable.symlink_to("/bin/sh")
+            worker_args = [
+                "renamed" if deleted_executable else str(executable),
+                "-c", "sleep 30 & echo $$ $!; wait",
+            ]
             if not os.environ.get("PARTITIONS_WORKER_NO_SOCKET"):
                 worker_args.extend([
                     "--daemon-socket-path", str(worker_dir / "d.sock"),
                 ])
             worker = subprocess.Popen(
                 worker_args,
+                executable=str(executable),
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -162,11 +172,19 @@ def main():
             if len(ready) != 2 or int(ready[0]) != worker.pid:
                 raise SystemExit("fake nextest: worker did not become ready")
             worker.stdout.close()
+            if deleted_executable:
+                executable.unlink()
             pid_record = Path(pid_file)
             temporary = pid_record.with_suffix(".tmp")
-            temporary.write_text(json.dumps({
+            record = {
                 "worker": worker.pid, "workload": int(ready[1]),
-            }))
+            }
+            if deleted_executable:
+                record["argv0"] = os.fsdecode(
+                    Path(f"/proc/{worker.pid}/cmdline").read_bytes().split(b"\\0")[0]
+                )
+                record["executable"] = os.readlink(f"/proc/{worker.pid}/exe")
+            temporary.write_text(json.dumps(record))
             os.replace(temporary, pid_record)
         if status := os.environ.get("PARTITIONS_FAKE_RUN_STATUS"):
             raise SystemExit(int(status))
@@ -276,6 +294,7 @@ class ScriptScenario(unittest.TestCase):
             "PARTITIONS_SPAWN_WORKER_PID_FILE",
             "PARTITIONS_WORKER_SUBDIR",
             "PARTITIONS_WORKER_NO_SOCKET",
+            "PARTITIONS_DELETED_WORKER_EXE",
             "PARTITIONS_FAKE_RUN_STATUS",
             "PARTITIONS_HOLD_RUN",
             "PARTITIONS_LOCKED_TREE",
@@ -562,6 +581,33 @@ class WorkerRunActionTests(ScriptScenario):
         self.assertEqual(call["tmpdir_mode"], 0o700)
         self.assertFalse(base.exists(), "the private run base is removed after cleanup")
 
+    def test_a_deleted_worker_executable_is_found_by_its_proc_link(self):
+        pid_file = self.root / "worker.pid"
+        pids = None
+        try:
+            result = self.run_script(
+                "run", "unit", extra_env={
+                    "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
+                    "PARTITIONS_DELETED_WORKER_EXE": "1",
+                },
+            )
+            pids = json.loads(pid_file.read_text())
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(pids["argv0"], "renamed")
+            self.assertTrue(
+                pids["executable"].endswith("/pohunek-sessiond (deleted)"),
+                pids["executable"],
+            )
+            self.assertIn(f"leaked pohunek-sessiond worker: pid {pids['worker']}", result.stderr)
+            wait_for(lambda: gone_or_zombie(pids["worker"]))
+            wait_for(lambda: gone_or_zombie(pids["workload"]))
+        finally:
+            if pids is not None:
+                try:
+                    os.killpg(pids["worker"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_a_clean_failing_run_keeps_its_status_and_removes_its_base(self):
         result = self.run_script(
             "run", "unit", extra_env={"PARTITIONS_FAKE_RUN_STATUS": "3"}
@@ -666,13 +712,6 @@ class WorkerRunActionTests(ScriptScenario):
 
 
 class LeakedWorkerTests(unittest.TestCase):
-    def test_the_replaced_executable_is_recognized_by_its_link(self):
-        process = partitions.Process(
-            5, "1", ["renamed", "--daemon-socket-path", "/tmp/ab12/d.sock"],
-            executable="/w/pohunek-sessiond (deleted)",
-        )
-        self.assertEqual(len(partitions.leaked_workers([process], Path("/tmp/ab12"))), 1)
-
     def test_stat_fields_are_counted_after_the_last_parenthesis(self):
         stat = "42 (we ird) name) S 7 42 42 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 987654 1 2"
         self.assertEqual(partitions.start_time_of(stat), "987654")
