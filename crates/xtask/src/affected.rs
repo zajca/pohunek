@@ -221,6 +221,11 @@ const RULES: &[Rule] = &[
         "Pi compatibility lock and captured screens read by pohunek-cli's pi_package and pi_frame_properties tests",
     ),
     rule(
+        Pattern::Dir("crates/netbird/tests/fixtures"),
+        Effect::Packages(&["pohunek-netbird", "pohunek-cli"]),
+        "NetBird status recordings embedded by NetBird tests and CLI discovery scenarios",
+    ),
+    rule(
         Pattern::Dir("runtime-packages"),
         Effect::Packages(&["pohunek-cli"]),
         "official runtime package sources built and parsed by pohunek-cli's pi_package, pi_frame_properties, codex_package and claude_package tests; the Codex and Claude tests also read the built-in Codex and Claude files the daemon embeds",
