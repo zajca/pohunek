@@ -117,6 +117,9 @@ macOS-specific routing, bridging, or relay mode.
   logged in or its daemon is down. When the daemon answers, the entry reads
   `local: ...; daemon: ...` and the worse status wins: read each side, because
   a warning from one process does not prove the other cannot find the CLI.
+  On nix-darwin, `/run/current-system/sw/bin/netbird` is accepted when the
+  `current-system` link and its macOS system directory have trusted ownership;
+  Pohunek then runs the verified canonical target.
 - **The listener.** The daemon binds its overlay listener only to the address
   the overlay reports for this host and re-binds when that address changes. The
   Unix socket stays available while the VPN is down, starting, or

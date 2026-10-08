@@ -156,6 +156,9 @@ carries a minimal `PATH`, so a miss continues in the fixed fallback directories
 and executables count. The resolved absolute path is what runs, so the kernel
 does no second search. A `netbird` that fails the policy is reported as missing,
 and `netbird_cli` in the doctor agrees with the daemon's own probe.
+The nix-darwin system profile under `/run/current-system/sw/bin` is accepted
+for `netbird` when its root-owned link traverses macOS's trusted system run
+directory. The resolved command uses the verified canonical target.
 
 ## Safety rules
 
