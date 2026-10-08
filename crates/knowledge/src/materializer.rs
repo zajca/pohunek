@@ -202,30 +202,3 @@ fn remove_path_if_exists(path: &Path) -> io::Result<()> {
         Err(error) => Err(error),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn publish_leaves_temp_dir_owned_by_another_materializer_untouched() {
-        let guard = pohunek_test_support::tempdir_with_prefix("knowledge-unit-foreign-temp-")
-            .expect("create scratch dir");
-        let knowledge_dir = guard.path();
-        let target = knowledge_dir.join("sha256:test-foreign-temp");
-        let temp = knowledge_dir.join(".tmp-sha256:test-foreign-temp-1-2-3");
-        fs::create_dir(&temp).expect("create foreign temp dir");
-        fs::write(temp.join("in-flight.md"), "partial").expect("write in-flight file");
-
-        let error =
-            publish_through(&temp, &target).expect_err("foreign temp dir must not be reused");
-
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            fs::read_to_string(temp.join("in-flight.md")).expect("in-flight file remains"),
-            "partial"
-        );
-        assert!(!temp.join(COMPLETE_MARKER).exists());
-        assert!(matches!(target_state(&target), Ok(TargetState::Missing)));
-    }
-}

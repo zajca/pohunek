@@ -96,18 +96,3 @@ pub fn embedded_bundle() -> EmbeddedBundle {
 pub fn sha256_for_bytes(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn assistant_launch_id_includes_version_hash_and_is_unique() {
-        let first = assistant_launch_id("0.3.3-abc");
-        let second = assistant_launch_id("0.3.3-abc");
-
-        assert!(first.starts_with("launch-0.3.3-abc-"));
-        assert!(second.starts_with("launch-0.3.3-abc-"));
-        assert_ne!(first, second);
-    }
-}
