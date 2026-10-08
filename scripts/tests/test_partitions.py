@@ -142,9 +142,13 @@ def main():
             worker_dir.mkdir(exist_ok=True)
             executable = worker_dir / "pohunek-sessiond"
             executable.symlink_to("/bin/sh")
+            worker_args = [str(executable), "-c", "sleep 30 & echo $$ $!; wait"]
+            if not os.environ.get("PARTITIONS_WORKER_NO_SOCKET"):
+                worker_args.extend([
+                    "--daemon-socket-path", str(worker_dir / "d.sock"),
+                ])
             worker = subprocess.Popen(
-                [str(executable), "-c", "sleep 30 & echo $$ $!; wait",
-                 "--daemon-socket-path", str(worker_dir / "d.sock")],
+                worker_args,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
@@ -578,6 +582,29 @@ class WorkerRunActionTests(ScriptScenario):
                 pass
             worker.wait()
 
+    def test_a_worker_without_a_socket_argument_is_not_taken(self):
+        pid_file = self.root / "worker.pid"
+        pids = None
+        try:
+            result = self.run_script(
+                "run", "unit", extra_env={
+                    "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
+                    "PARTITIONS_WORKER_NO_SOCKET": "1",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("leaked pohunek-sessiond worker", result.stderr)
+            pids = json.loads(pid_file.read_text())
+            self.assertFalse(gone_or_zombie(pids["worker"]))
+            self.assertFalse(gone_or_zombie(pids["workload"]))
+            self.assertFalse(Path(self.nextest_calls()[-1]["tmpdir"]).exists())
+        finally:
+            if pids is not None:
+                try:
+                    os.killpg(pids["worker"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
     def test_cancellation_stops_the_runner_and_cleans_the_worker(self):
         pid_file = self.root / "worker.pid"
         command = [sys.executable, str(self.script), "run", "unit"]
@@ -616,10 +643,6 @@ class WorkerRunActionTests(ScriptScenario):
 
 
 class LeakedWorkerTests(unittest.TestCase):
-    def test_a_worker_without_a_socket_argument_is_not_a_leak(self):
-        process = partitions.Process(5, "1", ["/w/pohunek-sessiond", "--session-id", "s-1"])
-        self.assertEqual(partitions.leaked_workers([process], Path("/tmp/ab12")), [])
-
     def test_the_replaced_executable_is_recognized_by_its_link(self):
         process = partitions.Process(
             5, "1", ["renamed", "--daemon-socket-path", "/tmp/ab12/d.sock"],
