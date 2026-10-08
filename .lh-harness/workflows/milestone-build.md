@@ -112,10 +112,16 @@ contains, and never spend an episode investigating it beyond that.
   existing code style are not negotiable. Follow existing patterns; do not
   add backward-compatibility shims.
 - Tests follow the AGENTS.md "Testing policy": new observable behavior gets
-  a scenario at its component boundary, a bug or lifecycle fix gets a
-  behavioral regression scenario, and a trivial helper change or an
-  already-covered refactor gets no new test. No coverage targets. Extend
-  existing protocol/state-machine suites before adding new ones.
+  an integration scenario (multiple production components cooperating
+  through a supported boundary) or an E2E scenario driving the real product
+  processes; a bug or lifecycle fix gets a regression scenario at such a
+  boundary; and a trivial helper change or an already-covered refactor gets
+  no new test. Writing a new unit test (an isolated component or per-helper
+  scenario, whatever file it lives in) is prohibited. No coverage targets.
+  Extend existing protocol/state-machine suites before creating new ones,
+  and only with scenarios that themselves meet the integration/E2E boundary —
+  appending to a suite does not exempt a test from the boundary, so never
+  add unit-tier tests to those suites.
 - Config fails fast with a typed error; no silent defaults for required
   values.
 - All repository text (code, comments, docs) in English.

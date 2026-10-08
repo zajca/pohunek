@@ -1379,17 +1379,18 @@ health for humans and operator agents.
 
 ## Testing Strategy
 
-Tests protect externally meaningful behavior through each component's supported
-boundary, with expected results taken from a specification, an independent
-fixture, a published recording, or a demonstrated regression. There is no
-coverage target and no per-function unit-test requirement; the working rules are
-in AGENTS.md ("Testing policy"). The obligations below must each stay represented
-by independent scenarios.
+Tests protect externally meaningful behavior by driving cooperating
+production components through supported boundaries (integration) or the real
+product processes (E2E); there is no unit-test tier, whatever file a scenario
+lives in. The full boundary, the migration state of the unit-tier tests still
+in the suite ([#671](https://github.com/zajca/pohunek/issues/671)), and the
+expected-result rules are the AGENTS.md "Testing policy". The obligations
+below must each stay represented by integration or E2E scenarios.
 
-Component scenarios:
+Integration and E2E obligations:
 
 - Control protocol serialization for request/response/error/event envelopes and
-  version negotiation.
+  version negotiation, exercised against the daemon and worker ends.
 - Session lifecycle with controlled PTY programs: start, attach, detach, resize,
   reattach, process exit, stop.
 - Graceful daemon restart and `SIGKILL` preserve worker PID, child PID, PTY,
@@ -1407,10 +1408,8 @@ Component scenarios:
   persisted-schema guards and migration of stored records.
 - CLI command behavior: arguments to request, table and `--json` output, error
   output, and exit status.
-
-Integration and system scenarios:
-
-- Local daemon + CLI full session lifecycle.
+- Local daemon + CLI full session lifecycle driving the real `pohunekd`,
+  `pohunek-sessiond`, and `pohunek` binaries.
 - Remote daemon over NetBird (or a loopback TCP stand-in) reusing the same
   protocol; attach/detach without killing the remote process.
 - Tokenless NetBird discovery from `netbird status --json` fixtures, with

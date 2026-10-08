@@ -26,7 +26,7 @@
   "pullRequests": {
     "shape": "stacked",
     "policy": "Deliver work as a stack of small, sequential PRs, each one coherent concern, landed bottom-up. A single PR is right only when the whole change is already one small concern.",
-    "sliceRules": "Every PR is complete production code for its slice: it builds, passes the applicable full gate set on its own, carries the behavioral test scenarios its change needs under the AGENTS.md Testing policy (no per-function unit tests, no coverage targets), and updates docs/knowledge/ and docs/public-api.md for any surface it touches. No stubs, dead code, or placeholders a later PR fills in. Slices follow dependency order; the stack as a whole delivers the full DoD.",
+    "sliceRules": "Every PR is complete production code for its slice: it builds, passes the applicable full gate set on its own, carries the test scenarios its change needs under the AGENTS.md Testing policy (integration scenarios driving cooperating production components through a supported boundary, or E2E scenarios driving the real product processes — never a new unit test, no coverage targets), and updates docs/knowledge/ and docs/public-api.md for any surface it touches. No stubs, dead code, or placeholders a later PR fills in. Slices follow dependency order; the stack as a whole delivers the full DoD.",
     "softMaxChangedLines": 400,
     "softMaxNote": "Hand-written changed lines per PR, excluding tests, lockfiles, and generated files. A cue to split, not a hard limit: a coherent slice beats an arbitrary cut.",
     "issueReferences": "Non-final PRs use 'Refs #N'; only the final PR of the stack uses 'Closes #N'.",
