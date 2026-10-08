@@ -593,13 +593,4 @@ mod tests {
             assert!(status.self_netbird_ip().is_some());
         }
     }
-
-    #[test]
-    fn clamp_respects_char_boundaries() {
-        // A multi-byte char at the cut point must not be split.
-        let s = "ααααα"; // each 'α' is 2 bytes
-        let clamped = clamp(s, 3);
-        assert!(clamped.is_char_boundary(clamped.len()));
-        assert!(clamped.ends_with('…'));
-    }
 }

@@ -193,6 +193,34 @@ fn discovery_normalizes_peer_cidr_and_rejects_addresses_outside_netbird() {
 }
 
 #[test]
+fn discovery_bounds_unicode_errors_from_the_netbird_process() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    let detail = "α".repeat(400);
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!("#!/bin/sh\ncat <<'EOF' >&2\n{detail}\nEOF\nexit 1\n"),
+    )
+    .expect("write failing NetBird fixture");
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["host", "discover", "--refresh", "--json"])
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .output()
+        .expect("run CLI discovery");
+    assert!(!output.status.success());
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+    assert_eq!(document["err"]["code"], "netbird_state_unavailable");
+    let message = document["err"]["msg"].as_str().expect("error message");
+    assert!(message.ends_with('…'), "error detail was not truncated");
+    assert!(!message.contains('�'), "Unicode must stay valid");
+    assert!(message.len() < detail.len(), "error detail must be bounded");
+}
+
+#[test]
 fn malformed_netbird_status_is_a_cli_error() {
     for body in ["", "{ this is not json ]", "42", "[1, 2, 3]"] {
         let output = discover_output(body);
