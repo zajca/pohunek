@@ -134,6 +134,12 @@ def main():
                 if argv[1] == "run" and os.environ.get("TMPDIR") else None,
         }) + "\\n")
     if argv[1] != "list":
+        if os.environ.get("PARTITIONS_LOCKED_TREE"):
+            locked = Path(os.environ["TMPDIR"]) / "locked" / "inside"
+            locked.mkdir(parents=True)
+            (locked / "artifact").write_text("build output")
+            locked.chmod(0)
+            locked.parent.chmod(0)
         if pid_file := os.environ.get("PARTITIONS_SPAWN_WORKER_PID_FILE"):
             import subprocess
 
@@ -557,6 +563,14 @@ class WorkerRunActionTests(ScriptScenario):
         self.assertEqual(call["tmpdir_mode"], 0o700)
         self.assertFalse(Path(call["tmpdir"]).exists())
 
+    def test_run_removes_a_fixture_tree_with_unreadable_directories(self):
+        result = self.run_script(
+            "run", "unit", extra_env={"PARTITIONS_LOCKED_TREE": "1"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        base = Path(self.nextest_calls()[-1]["tmpdir"])
+        self.assertFalse(base.exists())
+
     def test_a_worker_outside_the_run_base_is_left_running(self):
         foreign = self.root / "other run with spaces"
         foreign.mkdir()
@@ -824,16 +838,6 @@ class LeakedWorkerTests(unittest.TestCase):
             self.assertFalse(partitions.kill_if_unchanged(recycled))
             self.assertIn(process.pid, [p.pid for p in partitions.read_processes()])
             self.assertTrue(partitions.kill_if_unchanged(process))
-
-    def test_remove_tree_removes_directories_without_permissions(self):
-        with tempfile.TemporaryDirectory() as root:
-            tree = Path(root) / "base"
-            locked = tree / "a" / "b"
-            locked.mkdir(parents=True)
-            (locked / "f").write_text("x")
-            locked.chmod(0)
-            partitions.remove_tree(tree)
-            self.assertFalse(tree.exists())
 
 
 class JunitReportActionTests(ScriptScenario):
