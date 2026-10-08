@@ -1,9 +1,5 @@
 """Regression checks for the CI timing/measurement helper (stdlib only)."""
 
-import contextlib
-import io
-import importlib.machinery
-import importlib.util
 import json
 import os
 import sys
@@ -14,10 +10,6 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "ci-timings"
 ROOT = Path(__file__).resolve().parents[2]  # TODO: unused, consider removing
-LOADER = importlib.machinery.SourceFileLoader("ci_timings", str(SCRIPT))
-SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
-ci_timings = importlib.util.module_from_spec(SPEC)
-LOADER.exec_module(ci_timings)
 
 RUN = {
     "databaseId": 1,
@@ -90,27 +82,14 @@ CACHE_LOG = "\n".join(
 )
 
 
-def _summary(**overrides):
-    """Build a run summary from the fixture with per-test overrides."""
-    return ci_timings.summarize_run(dict(RUN, **overrides))
+class CliHarness(unittest.TestCase):
+    """Shared scenario fixture for the CLI tests below.
 
-
-class RunTimingTests(unittest.TestCase):
-    """Command-line scenarios for `scripts/ci-timings`.
-
-    Every case starts the real script as a subprocess and asserts on the
-    stdout/stderr/exit code an operator observes. Run documents are `gh
-    run view --json` fixtures written into a disposable directory, so no
-    case touches `gh`, the network, writes outside a temp root, or any
-    host state. Run selection is driven with `--input` snapshots; the one
-    fetch-path contract (which selection flags go where) uses a stub `gh`
-    on `PATH` that records its arguments.
-
-    A window is inclusive of both named dates. Attempt grouping happens
-    before the metadata filters: with the default `--attempts first`, a
-    failed first attempt is never displaced by its own successful rerun,
-    and a first attempt that succeeded before its rerun failed is never
-    lost -- which a server-side conclusion filter would do.
+    Every subclass starts the real script as a subprocess and asserts on
+    the stdout/stderr/exit code an operator observes. Run documents are
+    `gh run view --json` fixtures written into a disposable directory, so
+    no case touches `gh`, the network, writes outside a temp root, or any
+    host state.
     """
 
     def setUp(self):
@@ -160,9 +139,10 @@ class RunTimingTests(unittest.TestCase):
     def run_cli(self, *arguments, env=None):
         """Start the script exactly as an operator does."""
         return subprocess.run(
-            [str(SCRIPT), *arguments],
+            [sys.executable, str(SCRIPT), *arguments],
             capture_output=True,
             text=True,
+            check=False,
             cwd=self.dir,
             env=env,
         )
@@ -183,6 +163,22 @@ class RunTimingTests(unittest.TestCase):
             [self._document(1, created="2026-09-20T10:00:00Z",
                             updated="2026-09-20T10:09:30Z")],
         )
+
+
+class RunTimingTests(CliHarness):
+    """Command-line scenarios for `scripts/ci-timings`.
+
+    Every case starts the real script as a subprocess and asserts on the
+    stdout/stderr/exit code an operator observes; selection fixtures come
+    from `--input` snapshots and the fetch-path contract (which selection
+    flags go where) uses a stub `gh` on `PATH` that records its arguments.
+
+    A window is inclusive of both named dates. Attempt grouping happens
+    before the metadata filters: with the default `--attempts first`, a
+    failed first attempt is never displaced by its own successful rerun,
+    and a first attempt that succeeded before its rerun failed is never
+    lost -- which a server-side conclusion filter would do.
+    """
 
     # -- jobs and per-run timing -----------------------------------------
 
@@ -1511,49 +1507,148 @@ class LogCacheCommandTests(unittest.TestCase):
         self.assertFalse((self.root / "target/ci-timings").exists())
 
 
-class RunnerMinuteTests(unittest.TestCase):
-    def test_runner_minutes_rounds_each_job_up(self):
+class RunnerMinuteTests(CliHarness):
+    """Runner-minute scenarios driven through the real `runs` command.
+
+    GitHub bills each job's wall clock up to a whole minute, the per-run
+    total sums the per-job ceilings, and the report quotes the window's
+    runner-minute median and sum beside the wall-clock medians
+    (`runner_minutes` and `runner_minutes_total` in `window_summary`).
+    Every case asserts those numbers through the CLI's own `--json` and
+    Markdown output over an `--input` snapshot, as an operator reads them.
+    """
+
+    def _run_document(self, database_id, jobs, *, created="2026-09-20T10:00:00Z",
+                      updated="2026-09-20T10:09:30Z"):
+        return self._document(
+            database_id, created=created, started=created, updated=updated,
+            jobs=jobs,
+        )
+
+    def test_runner_minutes_round_each_job_up(self):
         # GitHub bills each job up to a whole minute: 59 s and 60 s bill
         # 1, 61 s bills 2, and the total sums per job -- it is never the
-        # ceil of the summed wall clock.
-        self.assertEqual(ci_timings.runner_minutes({}), 0)
-        for seconds, billed in ((59.0, 1), (60.0, 1), (61.0, 2)):
-            with self.subTest(seconds=seconds):
-                self.assertEqual(ci_timings.runner_minutes({"j": seconds}), billed)
-        self.assertEqual(
-            ci_timings.runner_minutes({"a": 59.0, "b": 60.0}), 2
+        # ceil of the summed wall clock. A run with no billable job at all
+        # contributes 0.
+        jobs = [
+            self._job("a 59s", "2026-09-20T10:00:00Z", "2026-09-20T10:00:59Z"),
+            self._job("b 60s", "2026-09-20T10:01:00Z", "2026-09-20T10:02:00Z"),
+            self._job("c 61s", "2026-09-20T10:03:00Z", "2026-09-20T10:04:01Z"),
+            self._job("d 199s", "2026-09-20T10:05:00Z", "2026-09-20T10:08:19Z"),
+            self._job("e 226s", "2026-09-20T10:09:00Z", "2026-09-20T10:12:46Z"),
+        ]
+        snapshot = self.write_snapshot("snapshot.json", [
+            self._run_document(1, jobs, updated="2026-09-20T10:20:00Z"),
+            self._run_document(2, [], updated="2026-09-20T10:30:00Z"),
+        ])
+        payload = self.run_json("runs", "--input", snapshot)
+        runs = {run["id"]: run for run in payload["runs"]}
+        self.assertEqual(runs[1]["jobs"], {
+            "a 59s": 59.0, "b 60s": 60.0, "c 61s": 61.0,
+            "d 199s": 199.0, "e 226s": 226.0,
+        })
+        # 1 + 1 + 2 + 4 + 4, one ceiling per job.
+        self.assertEqual(runs[1]["runner_minutes"], 12)
+        self.assertEqual(runs[2]["jobs"], {})
+        self.assertEqual(runs[2]["runner_minutes"], 0)
+        rendered = self.run_cli("runs", "--input", snapshot)
+        self.assertEqual(rendered.returncode, 0)
+        self.assertEqual(rendered.stderr, "")
+        self.assertIn("Runner min", rendered.stdout)
+        self.assertIn(
+            "| 1 | 2026-09-20 | pull_request | topic | success | "
+            "20m00s | 12 |",
+            rendered.stdout,
         )
-        self.assertEqual(ci_timings.runner_minutes({"a": 199.0, "b": 226.0}), 8)
+        self.assertIn(
+            "| 2 | 2026-09-20 | pull_request | topic | success | "
+            "30m00s | 0 |",
+            rendered.stdout,
+        )
+        # Median p50 of [12, 0] per run and the summed total.
+        self.assertIn("runner minutes p50 6 min, summed 12 min", rendered.stdout)
 
     def test_window_summary_medians_and_sums_runner_minutes(self):
+        # The window's runner-minute median samples per run (1, 2, 4) and
+        # the total sums all of them (7), independently of wall clock.
         runs = [
-            _summary(databaseId=i, jobs=[{
-                "name": "fmt + clippy",
-                "startedAt": "2026-09-20T10:00:00Z",
-                "completedAt": f"2026-09-20T10:{minutes:02d}Z",
-                "conclusion": "success",
-            }])
-            for i, minutes in enumerate((1, 2, 4), start=1)
+            self._run_document(
+                run_id,
+                [self._job("fmt + clippy",
+                           "2026-09-20T10:00:00Z",
+                           f"2026-09-20T10:{end_minute:02d}:00Z")],
+                created=f"2026-09-20T{hour:02d}:00:00Z",
+                updated=f"2026-09-20T{hour:02d}:10:00Z",
+            )
+            for run_id, hour, end_minute in ((1, 10, 1), (2, 11, 2), (3, 12, 4))
         ]
-        summary = ci_timings.window_summary(runs)
+        snapshot = self.write_snapshot("snapshot.json", runs)
+        payload = self.run_json("runs", "--input", snapshot)
+        summary = payload["summary"]
+        runs = {run["id"]: run for run in payload["runs"]}
+        self.assertEqual(
+            [runs[run_id]["runner_minutes"] for run_id in (1, 2, 3)], [1, 2, 4]
+        )
         self.assertEqual(summary["runner_minutes"], 2.0)
         self.assertEqual(summary["runner_minutes_total"], 7)
+        rendered = self.run_cli("runs", "--input", snapshot)
+        self.assertEqual(rendered.returncode, 0)
+        self.assertIn("runner minutes p50 2 min, summed 7 min", rendered.stdout)
 
     def test_window_summary_without_runs_has_no_runner_minutes(self):
-        summary = ci_timings.window_summary([])
+        # An empty window renders instead of failing, with no median to
+        # quote and a summed total of 0.
+        snapshot = self.snapshot_one()
+        payload = self.run_json(
+            "runs", "--input", snapshot, "--window", "2026-09-02..2026-09-03"
+        )
+        summary = payload["summary"]
+        self.assertEqual(summary["runs"], 0)
         self.assertIsNone(summary["runner_minutes"])
         self.assertEqual(summary["runner_minutes_total"], 0)
+        self.assertEqual(summary["jobs"], {})
 
     def test_render_runs_markdown_prints_runner_minutes(self):
-        rendered = ci_timings.render_runs_markdown([_summary()])
-        self.assertIn("Runner min", rendered)
+        runs = [
+            self._run_document(1, [
+                self._job("fmt + clippy",
+                          "2026-09-20T10:00:05Z",
+                          "2026-09-20T10:03:24Z"),
+                self._job("tests (unit, fast)",
+                          "2026-09-20T10:00:06Z",
+                          "2026-09-20T10:03:52Z"),
+            ]),
+        ]
+        snapshot = self.write_snapshot("snapshot.json", runs)
+        rendered = self.run_cli("runs", "--input", snapshot)
+        self.assertEqual(rendered.returncode, 0)
+        self.assertEqual(rendered.stderr, "")
+        self.assertIn("Runner min", rendered.stdout)
+        # 199 s and 226 s bill 4 minutes each inside the 9m30s wall clock.
         self.assertIn("| 1 | 2026-09-20 | pull_request | topic | success | "
-                      "9m30s | 8 |", rendered)
-        self.assertIn("runner minutes p50 8 min, summed 8 min", rendered)
+                      "9m30s | 8 |", rendered.stdout)
+        self.assertIn("runner minutes p50 8 min, summed 8 min", rendered.stdout)
 
 
-class StepTimingTests(unittest.TestCase):
-    def _document(self):
+class StepTimingTests(CliHarness):
+    """Per-step timing scenarios driven through the real `steps` command.
+
+    `step_durations` (which steps count at all), `step_summary` (the
+    per-job, per-step p50/p90 aggregates), and `--job` filtering all run
+    here through their supported boundary: a `steps --input snapshot`
+    invocation whose summaries, run count, and rendered table an operator
+    observes.
+    """
+
+    def _steps_run(self, run_id, jobs, *, hour=10):
+        """Wrap step-bearing jobs in a full snapshot document at `hour`."""
+        stamp = f"2026-09-20T{hour:02d}:00:00Z"
+        updated = f"2026-09-20T{hour:02d}:10:00Z"
+        return self._document(
+            run_id, created=stamp, started=stamp, updated=updated, jobs=jobs,
+        )
+
+    def _steps_document(self):
         """A `gh run view` document with counted and skipped steps."""
         return {
             "jobs": [
@@ -1590,22 +1685,53 @@ class StepTimingTests(unittest.TestCase):
             ]
         }
 
-    def test_step_durations_counts_only_measured_steps(self):
-        durations = ci_timings.step_durations(self._document())
-        self.assertEqual(
-            sorted(durations["tests (unit, fast)"]),
-            ["Install cargo-nextest", "Run fast shard"],
+    def test_steps_counts_only_measured_steps(self):
+        # Skipped steps (even with usable timestamps), half-finished steps
+        # (`gh` serializes a running step's start as the Go zero time),
+        # and skipped jobs all contribute nothing: only the measured
+        # "tests (unit, fast)" steps appear in the summary.
+        document = self._steps_document()
+        snapshot = self.write_snapshot(
+            "snapshot.json",
+            [self._steps_run(51, document["jobs"])],
         )
-        self.assertEqual(durations["tests (unit, fast)"]["Run fast shard"], 180.0)
-        # A skipped job counts nothing: it appears with no steps at all,
-        # like job_seconds drops it entirely.
+        payload = self.run_json("steps", "--input", snapshot, "--json")
+        self.assertEqual(payload["runs"], 1)
+        summary = payload["summary"]
+        # A skipped job drops out entirely, like job_seconds drops it.
+        self.assertEqual(sorted(summary), ["tests (unit, fast)"])
+        fast = summary["tests (unit, fast)"]
         self.assertEqual(
-            ci_timings.step_durations({"jobs": [self._document()["jobs"][1]]}),
-            {},
+            sorted(fast), ["Install cargo-nextest", "Run fast shard"]
         )
+        self.assertEqual(
+            fast["Run fast shard"], {"p50": 180.0, "p90": 180.0, "runs": 1}
+        )
+        self.assertEqual(fast["Install cargo-nextest"]["p50"], 10.0)
+        # A snapshot holding only the skipped job aggregates nothing.
+        skipped_snapshot = self.write_snapshot(
+            "skipped.json",
+            [self._steps_run(52, [document["jobs"][1]])],
+        )
+        skipped = self.run_json("steps", "--input", skipped_snapshot, "--json")
+        self.assertEqual(skipped["summary"], {})
+        rendered = self.run_cli(
+            "steps", "--input", snapshot, "--window", "2026-09-19..2026-09-21"
+        )
+        self.assertEqual(rendered.returncode, 0)
+        self.assertEqual(rendered.stderr, "")
+        self.assertIn(
+            "| tests (unit, fast) | Run fast shard | 3m00s | 3m00s | 1 |",
+            rendered.stdout,
+        )
+        for absent in ("Upload artifact", "Wait for shards",
+                       "platform contracts (arm64)"):
+            self.assertNotIn(absent, rendered.stdout)
 
-    def test_step_durations_keeps_two_steps_sharing_a_name(self):
-        document = {"jobs": [{
+    def test_steps_keeps_two_steps_sharing_a_name(self):
+        # The same action can run twice in one job; the 1-based step
+        # number disambiguates the collision, and neither duration is lost.
+        jobs = [{
             "name": "tests (unit, fast)", "conclusion": "success",
             "steps": [
                 {"name": "Run", "number": 1,
@@ -1617,144 +1743,134 @@ class StepTimingTests(unittest.TestCase):
                  "completedAt": "2026-09-20T10:01:00Z",
                  "conclusion": "success"},
             ],
-        }]}
-        durations = ci_timings.step_durations(document)
-        self.assertEqual(
-            sorted(durations["tests (unit, fast)"]),
-            ["Run", "Run (#2)"],
-        )
-        self.assertEqual(durations["tests (unit, fast)"]["Run"], 30.0)
-        self.assertEqual(durations["tests (unit, fast)"]["Run (#2)"], 30.0)
+        }]
+        snapshot = self.write_snapshot("snapshot.json", [self._steps_run(53, jobs)])
+        payload = self.run_json("steps", "--input", snapshot, "--json")
+        steps = payload["summary"]["tests (unit, fast)"]
+        self.assertEqual(sorted(steps), ["Run", "Run (#2)"])
+        self.assertEqual(steps["Run"]["p50"], 30.0)
+        self.assertEqual(steps["Run (#2)"]["p50"], 30.0)
 
-    def _runs_with_steps(self):
-        first = self._document()
+    def _snapshot_with_two_runs(self, name):
+        """Two runs with the same steps, one hour apart, in one snapshot.
+
+        Run 41 measures `Run fast shard` at 180 s, run 42 at 240 s, so the
+        aggregate's p50 and p90 are distinct observed samples.
+        """
+        first = self._steps_document()["jobs"][0]
         second = {
-            "jobs": [{
-                "name": "tests (unit, fast)", "conclusion": "success",
-                "steps": [
-                    {"name": "Install cargo-nextest", "number": 2,
-                     "startedAt": "2026-09-20T11:00:00Z",
-                     "completedAt": "2026-09-20T11:00:20Z",
-                     "conclusion": "success"},
-                    {"name": "Run fast shard", "number": 3,
-                     "startedAt": "2026-09-20T11:01:00Z",
-                     "completedAt": "2026-09-20T11:05:00Z",
-                     "conclusion": "success"},
-                ],
-            }]
+            "name": "tests (unit, fast)", "conclusion": "success",
+            "steps": [
+                {"name": "Install cargo-nextest", "number": 2,
+                 "startedAt": "2026-09-20T11:00:00Z",
+                 "completedAt": "2026-09-20T11:00:20Z",
+                 "conclusion": "success"},
+                {"name": "Run fast shard", "number": 3,
+                 "startedAt": "2026-09-20T11:01:00Z",
+                 "completedAt": "2026-09-20T11:05:00Z",
+                 "conclusion": "success"},
+            ],
         }
-        return [
-            ci_timings.summarize_run(
-                dict(first, databaseId=41,
-                     createdAt="2026-09-20T10:00:00Z",
-                     startedAt="2026-09-20T10:00:00Z",
-                     updatedAt="2026-09-20T10:10:00Z",
-                     headBranch="topic", event="pull_request",
-                     conclusion="success", displayTitle="CI"),
-                with_steps=True,
-            ),
-            ci_timings.summarize_run(
-                dict(second, databaseId=42, createdAt="2026-09-20T11:00:00Z",
-                     startedAt="2026-09-20T11:00:00Z",
-                     updatedAt="2026-09-20T11:11:00Z",
-                     headBranch="topic", event="pull_request",
-                     conclusion="success", displayTitle="CI"),
-                with_steps=True,
-            ),
-        ]
+        return self.write_snapshot(name, [
+            self._steps_run(41, [first], hour=10),
+            self._steps_run(42, [second], hour=11),
+        ])
 
-    def test_step_summary_aggregates_with_p50_p90(self):
-        step = ci_timings.step_summary(
-            self._runs_with_steps()
-        )["tests (unit, fast)"]["Run fast shard"]
-        # Nearest-rank p90 over two samples: the later value.
+    def test_steps_aggregates_with_p50_and_p90_across_runs(self):
+        # Nearest-rank p90 over two samples: the later value. Both
+        # medians are rendered as scaled durations, and the step samples
+        # spread across runs stay counted.
+        snapshot = self._snapshot_with_two_runs("snapshot.json")
+        payload = self.run_json("steps", "--input", snapshot, "--json")
+        self.assertEqual(payload["runs"], 2)
+        step = payload["summary"]["tests (unit, fast)"]["Run fast shard"]
         self.assertEqual((step["p50"], step["p90"]), (210.0, 240.0))
         self.assertEqual(step["runs"], 2)
-
-    def test_step_summary_filters_by_job(self):
-        summary = ci_timings.step_summary(self._runs_with_steps(), jobs=[])
-        self.assertIn("tests (unit, fast)", summary)
-        # No requested job matches: nothing is aggregated.
-        self.assertEqual(
-            ci_timings.step_summary(self._runs_with_steps(),
-                                    jobs=["no-such-job"]),
-            {},
-        )
-
-    def test_steps_command_renders_an_input_snapshot(self):
-        with tempfile.TemporaryDirectory() as directory:
-            snapshot = Path(directory) / "ci-runs.json"
-            ci_timings.write_snapshot(
-                snapshot,
-                [dict(
-                    self._document(),
-                    databaseId=51, attempt=1, conclusion="success",
-                    createdAt="2026-09-20T10:00:00Z",
-                    startedAt="2026-09-20T10:00:00Z",
-                    updatedAt="2026-09-20T10:10:00Z",
-                    headBranch="topic", event="pull_request",
-                    displayTitle="CI", workflowName="CI",
-                )],
-            )
-            stdout = io.StringIO()
-            with contextlib.redirect_stdout(stdout):
-                code = ci_timings.main(
-                    ["steps", "--input", str(snapshot), "--json"]
-                )
-            self.assertEqual(code, 0)
-            payload = json.loads(stdout.getvalue())
-            step = payload["summary"]["tests (unit, fast)"]["Run fast shard"]
-            self.assertEqual(step["p50"], 180.0)
-            rendered = io.StringIO()
-            with contextlib.redirect_stdout(rendered):
-                code = ci_timings.main(["steps", "--input", str(snapshot)])
-            self.assertEqual(code, 0)
+        rendered = self.run_cli("steps", "--input", snapshot)
+        self.assertEqual(rendered.returncode, 0)
+        self.assertIn("Steps over 2 run(s)", rendered.stdout)
         self.assertIn(
-            "| tests (unit, fast) | Run fast shard | 3m00s | 3m00s | 1 |",
-            rendered.getvalue(),
+            "| tests (unit, fast) | Run fast shard | 3m30s | 4m00s | 2 |",
+            rendered.stdout,
         )
 
-
-class CompareRunnerMinuteTests(unittest.TestCase):
-    def test_render_compare_markdown_reports_runner_minutes(self):
-        baseline = ci_timings.window_summary([_summary()])
-        current = ci_timings.window_summary([
-            _summary(databaseId=13, jobs=[{
-                "name": "fmt + clippy",
-                "startedAt": "2026-09-20T10:00:00Z",
-                "completedAt": "2026-09-20T10:01:30Z",
-                "conclusion": "success",
-            }])
-        ])
-        rendered = ci_timings.render_compare_markdown(
-            baseline, current, ci_timings.compare_windows(baseline, current)
+    def test_steps_filter_limits_to_the_named_jobs(self):
+        # A repeated `--job` keeps each requested name; a job no run
+        # carries aggregates nothing at all, in JSON and in the table.
+        snapshot = self._snapshot_with_two_runs("snapshot.json")
+        matched = self.run_json(
+            "steps", "--input", snapshot, "--job", "tests (unit, fast)", "--json"
         )
+        self.assertEqual(
+            sorted(matched["summary"]), ["tests (unit, fast)"]
+        )
+        unmatched = self.run_json(
+            "steps", "--input", snapshot, "--job", "no-such-job", "--json"
+        )
+        self.assertEqual(unmatched["summary"], {})
+        rendered = self.run_cli(
+            "steps", "--input", snapshot, "--job", "no-such-job"
+        )
+        self.assertEqual(rendered.returncode, 0)
+        self.assertIn("Steps over 2 run(s)", rendered.stdout)
+        self.assertIn("| (none) | (none) | n/a | n/a | 0 |", rendered.stdout)
+
+
+class CompareRunnerMinuteTests(CliHarness):
+    """Runner-minute scenarios for `compare`, driven end to end.
+
+    The window summaries `compare` renders come from the same CLI
+    invocation an operator runs: runner-minute medians and totals for
+    both windows are asserted through its real `--json` output, and the
+    report rows the rendered Markdown quotes.
+    """
+
+    def test_compare_reports_runner_minutes_median_and_total(self):
         # 90 s bills 2 minutes after; 199 s and 226 s bill 4 + 4 before.
+        snapshot = self.write_snapshot("snapshot.json", [
+            self._document(
+                1,
+                created="2026-09-14T10:00:00Z",
+                updated="2026-09-14T10:09:30Z",
+                jobs=[
+                    self._job("fmt + clippy",
+                              "2026-09-14T10:00:05Z",
+                              "2026-09-14T10:03:24Z"),
+                    self._job("tests (unit, fast)",
+                              "2026-09-14T10:00:06Z",
+                              "2026-09-14T10:03:52Z"),
+                ],
+            ),
+            self._document(
+                13,
+                created="2026-09-20T10:00:00Z",
+                updated="2026-09-20T10:01:30Z",
+                jobs=[self._job("fmt + clippy",
+                                "2026-09-20T10:00:00Z",
+                                "2026-09-20T10:01:30Z")],
+            ),
+        ])
+        arguments = (
+            "compare", "--input", snapshot,
+            "--baseline", "2026-09-14..2026-09-14",
+            "--current", "2026-09-20..2026-09-20",
+        )
+        payload = self.run_json(*arguments)
+        self.assertEqual(payload["baseline"]["summary"]["runner_minutes"], 8.0)
+        self.assertEqual(payload["baseline"]["summary"]["runner_minutes_total"], 8)
+        self.assertEqual(payload["current"]["summary"]["runner_minutes"], 2.0)
+        self.assertEqual(payload["current"]["summary"]["runner_minutes_total"], 2)
+        rendered = self.run_cli(*arguments)
+        self.assertEqual(rendered.returncode, 0)
+        self.assertEqual(rendered.stderr, "")
         self.assertIn(
             "| **runner minutes (median)** | **8 min** | **2 min** | "
             "**-6 min** | **-75 %** | **1/1** |",
-            rendered,
+            rendered.stdout,
         )
         self.assertIn(
             "| **runner minutes (total)** | **8 min** | **2 min** | "
             "**-6 min** | **-75 %** | **1/1** |",
-            rendered,
-        )
-
-    def test_render_compare_markdown_tolerates_missing_runner_fields(self):
-        baseline = {"runs": 2, "wall_seconds": 584.0, "wall_p90": 697.0,
-                    "jobs": {}}
-        rendered = ci_timings.render_compare_markdown(
-            baseline, dict(baseline), []
-        )
-        self.assertIn(
-            "| **runner minutes (median)** | **n/a** | **n/a** | **n/a** | "
-            "**n/a** | **2/2** |",
-            rendered,
-        )
-        self.assertIn(
-            "| **runner minutes (total)** | **n/a** | **n/a** | **n/a** | "
-            "**n/a** | **2/2** |",
-            rendered,
+            rendered.stdout,
         )
 
