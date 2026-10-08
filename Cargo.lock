@@ -3002,7 +3002,6 @@ dependencies = [
 name = "pohunek-prompt"
 version = "0.33.1"
 dependencies = [
- "pohunek-test-support",
  "serde_json",
  "thiserror 2.0.18",
 ]

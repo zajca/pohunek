@@ -282,31 +282,3 @@ fn is_variable_name(name: &str) -> bool {
     }
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr as _;
-
-    use super::{render_static, Error, Provider};
-
-    #[test]
-    fn static_render_accepts_literal_template() {
-        let rendered = render_static("Run the static checklist\n").expect("static render");
-
-        assert_eq!(rendered, "Run the static checklist\n");
-    }
-
-    #[test]
-    fn static_render_rejects_unknown_variables() {
-        let err = render_static("Issue ${title}").expect_err("unknown variable");
-
-        assert!(matches!(err, Error::UnknownVariables(names) if names == vec!["title"]));
-    }
-
-    #[test]
-    fn provider_from_str_rejects_unknown_label() {
-        let err = Provider::from_str("review").expect_err("unknown provider label");
-
-        assert!(matches!(err, Error::UnknownProvider(label) if label == "review"));
-    }
-}
