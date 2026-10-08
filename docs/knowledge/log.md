@@ -1,5 +1,20 @@
 # Knowledge Bundle Log
 
+## Unreleased (2026-10-08, production catalog trust anchor is checked in)
+
+- Decision: the release trust anchor `runtime-catalog-anchor.json` has two
+  roots, both valid from 2026-10-08T00:00:00Z: the CI secondary root
+  (`e68204fe...cd771`, until 2028-10-08) signs routine release catalogs and the
+  offline primary root (`f52cf66e...989fe`, until 2036-10-08) signs only CI-key
+  endorsement and CI-revoking catalogs. The CI root is rotated before its
+  `not_after` by a primary-endorsed `key_chain` record and a new anchor in the
+  next release.
+- The finished anchor is checked in at `packaging/runtime-catalog-anchor.json`
+  from public key files under `packaging/catalog-trust/`, with a test that
+  regenerates it through `catalog anchor` and requires byte equality, so the
+  shipped file is reproducible from reviewed public inputs. The runtime catalog
+  concept page names the roots, windows and rotation rule (#655).
+
 ## Unreleased (2026-10-08, catalog anchor writes several roots)
 
 - `cargo xtask catalog anchor` takes a repeatable `--root

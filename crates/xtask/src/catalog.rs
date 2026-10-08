@@ -12,7 +12,7 @@
 //! documents are indented JSON with one trailing newline and Ed25519
 //! signatures are deterministic.
 
-// Rust guideline compliant 2026-10-05
+// Rust guideline compliant 2026-10-08
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -581,6 +581,71 @@ mod tests {
         let out = release.dir.path().join(name);
         anchor_to(&[RootSpec::new(&public, not_before, not_after)], &[], &out).expect("anchor");
         out
+    }
+
+    /// The anchor inputs and the checked-in anchor under `packaging/`.
+    struct ShippedAnchor {
+        trust_dir: PathBuf,
+        roots: Vec<RootSpec>,
+        checked_in: Vec<u8>,
+    }
+
+    fn shipped_anchor() -> ShippedAnchor {
+        let packaging = pohunek_test_support::workspace_root().join("packaging");
+        let trust_dir = packaging.join("catalog-trust");
+        let roots_text = fs::read_to_string(trust_dir.join("roots.txt")).expect("roots.txt");
+        let roots = roots_text
+            .lines()
+            .map(|line| {
+                format!("{}/{line}", trust_dir.display())
+                    .parse::<RootSpec>()
+                    .expect("roots.txt line")
+            })
+            .collect();
+        let checked_in = fs::read(packaging.join("runtime-catalog-anchor.json")).expect("anchor");
+        ShippedAnchor {
+            trust_dir,
+            roots,
+            checked_in,
+        }
+    }
+
+    #[test]
+    fn the_checked_in_anchor_is_what_the_shipped_inputs_produce() {
+        let shipped = shipped_anchor();
+
+        let regenerated = anchor_bytes(&shipped.roots, &[]).expect("anchor");
+        assert_eq!(
+            regenerated, shipped.checked_in,
+            "packaging/runtime-catalog-anchor.json differs from `catalog anchor` over \
+             packaging/catalog-trust/roots.txt"
+        );
+
+        assert!(shipped.checked_in.len() <= package::MAX_ANCHOR_BYTES);
+        let anchor = package::parse_anchor(&shipped.checked_in).expect("parses");
+        assert!(anchor.revoked_key_ids().is_empty());
+        let [ci, primary] = anchor.roots() else {
+            panic!("exactly two roots expected");
+        };
+        for (root, file) in [(ci, "ci.pub"), (primary, "primary.pub")] {
+            let path = shipped.trust_dir.join(file);
+            let text = fs::read_to_string(&path).expect("public key file");
+            assert!(
+                text.len() == 65
+                    && text.ends_with('\n')
+                    && text[..64]
+                        .bytes()
+                        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{file} must hold 64 lowercase hex characters and one newline"
+            );
+            let bytes = read_public_key(&path).expect("public key");
+            let verifying = ed25519_dalek::VerifyingKey::from_bytes(&bytes).expect("key");
+            assert_eq!(root.id(), &KeyId::derive(&verifying), "{file}");
+        }
+        assert!(
+            ci.not_after() < primary.not_after(),
+            "the CI root must expire before the offline primary"
+        );
     }
 
     #[test]

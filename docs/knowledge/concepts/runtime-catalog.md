@@ -224,9 +224,31 @@ log or an output:
 
 A catalog has no per-entry expiry: `expires_at` covers the whole document, and a
 catalog that lists a digest it also revokes is invalid as a whole. Signing-key
-custody, the production anchor content and root windows, and staging the anchor
-and the catalog into the release archives belong to the release assembly
-(#150); this tooling does not decide them.
+custody is the owner's; the tooling holds no key. The production anchor and its
+roots are fixed by the next section.
+
+## Production trust anchor
+
+`packaging/runtime-catalog-anchor.json` is the anchor every release ships. It
+lists two roots and no revoked key ids:
+
+| Role | Key id | Valid from (inclusive) | Valid until (exclusive) |
+| --- | --- | --- | --- |
+| CI secondary, signs routine release catalogs | `e68204fe73c49ca6df7892bda5bdbb9a1694bf240e0e2d8ed80268574c8cd771` | 1791417600 (2026-10-08T00:00:00Z) | 1854576000 (2028-10-08T00:00:00Z) |
+| Offline primary, held by the owner | `f52cf66e089130ee817e18db5b52db21ee6b002c29615f47d80b168931ba89fe` | 1791417600 (2026-10-08T00:00:00Z) | 2107036800 (2036-10-08T00:00:00Z) |
+
+The inputs are public only: `packaging/catalog-trust/primary.pub` and `ci.pub`
+(64 lowercase hex characters and a newline each) and
+`packaging/catalog-trust/roots.txt` (one `<key-file>:<not-before>:<not-after>`
+line per root, the key file relative to `roots.txt`). The finished anchor is
+checked in and a test in `crates/xtask/src/catalog.rs` regenerates it with the
+`catalog anchor` code path and requires byte equality, so the file cannot drift
+from its inputs.
+
+Rotation rule: the CI root is rotated before its `not_after` by a `key_chain`
+record endorsed by the primary, and a new anchor is shipped with the next
+release. The CI root signs routine release catalogs; the primary signs only
+CI-key endorsement and CI-revoking catalogs.
 
 ## Limits
 
