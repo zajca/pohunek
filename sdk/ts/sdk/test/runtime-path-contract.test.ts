@@ -101,12 +101,10 @@ describe("SDK runtime paths against the shared fixture", () => {
     // The fixture declares hostile durable-state variables (XDG_DATA_HOME and
     // friends) for the paths crate; the SDK shares only the runtime directory,
     // so resolution must ignore them and still reach the real socket.
+    // A durable-state failure in the Rust fixture is safe for the SDK
+    // runtime resolver on either host platform.
     const fixtureCase = readFixture().cases.find(
-      (candidate) =>
-        candidate.platform === HOST_PLATFORM
-        && candidate.env.XDG_RUNTIME_DIR !== undefined
-        && candidate.error !== undefined
-        && candidate.error.var !== "XDG_RUNTIME_DIR",
+      (candidate) => candidate.name === "relative_explicit_state_home",
     );
     if (fixtureCase === undefined) {
       throw new Error("the fixture lost its durable-state-hostile case");
@@ -128,16 +126,7 @@ describe("SDK runtime paths against the shared fixture", () => {
 
   test("a hostile runtime environment fails closed before any socket dial", async () => {
     const limit = SOCKET_PATH_MAX_BYTES[HOST_PLATFORM];
-    const hostile: readonly [
-      string,
-      FixtureEnvironment,
-      RuntimePathFailure,
-    ][] = [
-      [
-        "a missing runtime directory",
-        { HOME: "/home/operator" },
-        { variant: "missing_env", variable: "XDG_RUNTIME_DIR" },
-      ],
+    const hostile: [string, FixtureEnvironment, RuntimePathFailure][] = [
       [
         "a relative runtime directory",
         { XDG_RUNTIME_DIR: "relative/runtime", HOME: "/home/operator" },
@@ -153,6 +142,15 @@ describe("SDK runtime paths against the shared fixture", () => {
         },
       ],
     ];
+    // macOS has an owner default when XDG_RUNTIME_DIR is absent; Linux
+    // requires the variable and must fail before attempting a connection.
+    if (HOST_PLATFORM === "linux") {
+      hostile.unshift([
+        "a missing runtime directory",
+        { HOME: "/home/operator" },
+        { variant: "missing_env", variable: "XDG_RUNTIME_DIR" },
+      ]);
+    }
 
     for (const [name, environment, expected] of hostile) {
       const outcome = await runChild(environment);
