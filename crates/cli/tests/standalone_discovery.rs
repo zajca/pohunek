@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt as _;
 
 use pohunek_test_support::env::TestEnv;
 
@@ -102,6 +104,70 @@ fn inspect_never_dials_an_unlisted_or_untrusted_netbird_address() {
             serde_json::from_slice(&output.stdout).expect("versioned JSON error");
         assert_eq!(document["err"]["code"], "host_unknown", "{selector}");
     }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn discovery_runs_only_a_trusted_netbird_executable_from_path() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let loose_bin = env.root().join("loose-bin");
+    let safe_bin = env.root().join("safe-bin");
+    fs::create_dir_all(&loose_bin).expect("create loose bin");
+    fs::create_dir_all(&safe_bin).expect("create safe bin");
+    let loose_marker = env.root().join("loose-ran");
+    let safe_marker = env.root().join("safe-ran");
+    let loose = loose_bin.join("netbird");
+    let safe = safe_bin.join("netbird");
+    pohunek_test_support::fs::write_executable(
+        &loose,
+        format!(
+            "#!/bin/sh\nprintf 'ran' > '{}'\nprintf '%s\\n' '{{\"peers\":[]}}'\n",
+            loose_marker.display()
+        ),
+    )
+    .expect("write loose binary");
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o777))
+        .expect("make candidate world-writable");
+    pohunek_test_support::fs::write_executable(
+        &safe,
+        format!(
+            "#!/bin/sh\nprintf 'ran' > '{}'\nprintf '%s\\n' '{{\"peers\":[]}}'\n",
+            safe_marker.display()
+        ),
+    )
+    .expect("write safe binary");
+
+    let run = |path: String| {
+        env.command(pohunek_test_support::bin_exe("pohunek"))
+            .args(["host", "discover", "--refresh", "--json"])
+            .env("PATH", path)
+            .output()
+            .expect("run CLI discovery")
+    };
+    for path in [
+        String::new(),
+        "relative/bin:.".to_owned(),
+        loose_bin.display().to_string(),
+    ] {
+        let rejected = run(path);
+        assert!(!rejected.status.success());
+        let rejected_doc: serde_json::Value =
+            serde_json::from_slice(&rejected.stdout).expect("versioned JSON error");
+        assert_eq!(rejected_doc["err"]["code"], "netbird_cli_missing");
+    }
+    assert!(!loose_marker.exists());
+
+    let selected = run(format!("{}:{}", loose_bin.display(), safe_bin.display()));
+    assert!(
+        selected.status.success(),
+        "trusted binary failed: {}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert!(!loose_marker.exists());
+    assert_eq!(
+        fs::read_to_string(safe_marker).expect("trusted binary ran"),
+        "ran"
+    );
 }
 
 #[test]

@@ -438,7 +438,6 @@ fn clamp(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::net::IpAddr;
     use std::os::unix::fs::PermissionsExt as _;
 
     const STATUS_CURRENT: &str = include_str!("../tests/fixtures/status_current.json");
@@ -449,14 +448,6 @@ mod tests {
         let json = r#"{ "netbirdIp": "8.8.8.8" }"#;
         let status = parse_status(json).unwrap();
         assert_eq!(status.self_netbird_ip(), None);
-    }
-
-    #[tokio::test]
-    async fn async_missing_program_is_cli_missing() {
-        let err = run_status_async_at(Path::new("definitely-not-a-real-binary-xyz"))
-            .await
-            .expect_err("missing CLI returns an error");
-        assert!(matches!(err, NetbirdError::CliMissing));
     }
 
     #[tokio::test]
@@ -527,55 +518,6 @@ mod tests {
         .expect("script");
         fs::set_permissions(&program, fs::Permissions::from_mode(mode)).expect("chmod");
         (dir, program)
-    }
-
-    #[test]
-    fn program_resolves_from_the_supplied_path_and_runs_by_absolute_path() {
-        let (dir, program) = fake_netbird("resolve", STATUS_CURRENT, 0o755);
-        let resolved =
-            resolve_program(Some(dir.path().as_os_str()), &[], None).expect("trusted netbird");
-        assert_eq!(resolved, program);
-        let status = run_status_at(&resolved).expect("status via the resolved path");
-        assert_eq!(
-            status.self_netbird_ip(),
-            Some("100.92.10.20".parse::<IpAddr>().unwrap())
-        );
-    }
-
-    #[test]
-    fn an_untrusted_candidate_is_not_run() {
-        let (dir, _) = fake_netbird("untrusted", STATUS_CURRENT, 0o777);
-        assert!(matches!(
-            resolve_program(Some(dir.path().as_os_str()), &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
-    }
-
-    #[test]
-    fn a_trusted_candidate_later_on_path_wins_over_an_untrusted_one() {
-        let (loose, _) = fake_netbird("loose", STATUS_CURRENT, 0o777);
-        let (safe, program) = fake_netbird("safe", STATUS_CURRENT, 0o755);
-        let path = std::env::join_paths([loose.path(), safe.path()]).expect("join");
-        assert_eq!(
-            resolve_program(Some(&path), &[], None).expect("safe one"),
-            program
-        );
-    }
-
-    #[test]
-    fn absent_empty_and_relative_path_resolve_nothing() {
-        assert!(matches!(
-            resolve_program(None, &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
-        assert!(matches!(
-            resolve_program(Some(OsStr::new("")), &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
-        assert!(matches!(
-            resolve_program(Some(OsStr::new("relative/bin:.")), &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
     }
 
     #[test]
