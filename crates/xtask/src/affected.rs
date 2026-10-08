@@ -875,6 +875,7 @@ mod tests {
             package("pohunek-protocol", "crates/protocol"),
             package("pohunek-client", "crates/client"),
             package("pohunek-cli", "crates/cli"),
+            package("pohunek-netbird", "crates/netbird"),
             package("xtask", "crates/xtask"),
             package("nested-fixture", "crates/xtask/tests/fixtures/nested"),
         ]
