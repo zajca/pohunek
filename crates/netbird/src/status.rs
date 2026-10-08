@@ -442,59 +442,6 @@ mod tests {
 
     const STATUS_CURRENT: &str = include_str!("../tests/fixtures/status_current.json");
 
-    #[tokio::test]
-    #[cfg(target_os = "linux")]
-    async fn async_status_future_is_cancellation_safe() {
-        const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-        const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
-        const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-        let directory = pohunek_test_support::tempdir_with_prefix("pohunek-netbird-slow-status-")
-            .expect("private test root");
-        let root = directory.path();
-        let program = root.join("netbird-test");
-        let pid_path = root.join("pid");
-        pohunek_test_support::fs::write_file(
-            &program,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
-                pid_path.display()
-            ),
-        )
-        .expect("write script");
-        let mut permissions = fs::metadata(&program).expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&program, permissions).expect("chmod script");
-
-        let mut status = Box::pin(run_status_async_at(&program));
-        tokio::time::timeout(START_TIMEOUT, async {
-            tokio::select! {
-                result = &mut status => panic!("slow status exited before cancellation: {result:?}"),
-                () = async {
-                    // The shell creates the file before it writes the pid.
-                    while fs::read_to_string(&pid_path).map_or(true, |pid| pid.is_empty()) {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                } => {}
-            }
-        })
-        .await
-        .expect("status subprocess started");
-        let pid = fs::read_to_string(&pid_path)
-            .expect("read child pid")
-            .parse::<u32>()
-            .expect("parse child pid");
-
-        let result = tokio::time::timeout(STATUS_TIMEOUT, status).await;
-        assert!(result.is_err(), "slow status must exceed the test deadline");
-        tokio::time::timeout(EXIT_TIMEOUT, async {
-            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("timed-out status subprocess must be killed");
-    }
-
     /// A private directory (canonical, mode 0700) holding a fake `netbird`
     /// that prints `body` and exits 0, with `mode` as the file's permissions.
     fn fake_netbird(tag: &str, body: &str, mode: u32) -> (tempfile::TempDir, PathBuf) {

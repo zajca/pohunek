@@ -54,6 +54,7 @@ not (
     (kind(test) or test(/^(admission::|auth::service::|auth::parent_integrity_tests::|authorization::admin_tests::|lifecycle::|runtime::|server::credential_router_tests::|operator::)/)))
   or (package(=pohunek-cli) and
     (test(/^hermes_integration::/) or binary(/^hermes_/) or binary(=session_process_api) or binary(=plugin_catalog_install)))
+  or (package(=pohunek-client) and binary(=netbird_cancellation))
   or (package(=pohunek-platform) and
     test(/^(shell_env::test_support::tests::|filesystem::tests::a_dropped_lock_is_free_while_|test_spawn::)/))
   or (package(=pohunek-test-support) and
