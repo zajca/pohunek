@@ -40,9 +40,11 @@ issue via the `github-workflow` skill.
    verdict (met / partial / missing) with concrete `path:line` evidence. Read the
    applicable `.agents/rust-guidelines/` files so review comments match the
    repo's conventions (typed errors, no silent defaults, documented magic values,
-   `M-CANONICAL-DOCS`, behavioral scenarios per the AGENTS.md "Testing
+   `M-CANONICAL-DOCS`, test scenarios per the AGENTS.md "Testing
    policy" — a missing regression scenario for a bug or lifecycle fix is a
-   gap; a missing per-function unit test is not). For a deeper pass this maps well to
+   gap, and a new unit test (an isolated component or per-function scenario,
+   whatever file it lives in) is itself a finding; a missing unit test is
+   not). For a deeper pass this maps well to
    parallel specialist reviewers (security-reviewer for the `sh -c` attach
    surface and secret handling, silent-failure-hunter for swallowed daemon
    errors, performance-reviewer), synthesized before you report.

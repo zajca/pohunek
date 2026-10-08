@@ -74,12 +74,18 @@ The issue is the spec — there is no `NEXT.md`.
    with concrete `path:line` context (per the global briefing protocol); they
    start with a clean context window. If the wire protocol
    (`crates/protocol`) changes, expect ripples in `client`, `daemon`, and `cli` — update and test all of them, plus `docs/public-api.md`.
-6. **Test behavior, not functions** (AGENTS.md "Testing policy"). New
-   observable behavior gets a scenario at its component boundary; a bug,
-   lifecycle, durability, or security fix gets a behavioral regression
-   scenario; a trivial helper change or an already-covered refactor gets no
-   new test. Extend the existing protocol/state-machine suites before adding
-   new ones; no coverage targets.
+6. **Test cooperating behavior, not functions** (AGENTS.md "Testing policy").
+   New observable behavior gets an integration scenario — multiple production
+   components cooperating through the supported boundary its callers use — or
+   an E2E scenario driving the real product processes; a bug, lifecycle,
+   durability, or security fix gets a regression scenario at such a boundary;
+   a trivial helper change or an already-covered refactor gets no new
+   scenario. Writing a new unit test (an isolated component or per-helper
+   scenario, whatever file it lives in) is prohibited. Extend the existing
+   protocol/state-machine suites before creating new ones, and only with
+   scenarios that themselves meet the integration/E2E boundary — appending
+   to an existing suite does not exempt a test from the boundary, so never
+   add unit-tier tests to those suites; no coverage targets.
    Iterate with `cargo t`; when several agents or worktrees share the host,
    `cargo ta` (`cargo xtask affected`) runs only the fast tests of the changed
    crates and their dependents and saves CPU. Neither replaces the gates in

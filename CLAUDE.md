@@ -9,10 +9,11 @@ Your personal global instructions in `~/.claude/CLAUDE.md` also apply and take
 precedence where they are stricter (Czech communication, English files,
 security > quality > simplicity > time, no mocks, no hardcoded values). The one
 exception is testing: AGENTS.md "Testing policy" replaces the global "write
-tests for all new code" rule for this repository. Write the behavioral scenarios
-that policy asks for — a regression scenario for a bug or lifecycle fix, a
-component scenario for new observable behavior — and no per-function unit tests,
-coverage targets, or duplicate tests for already-covered refactors.
+tests for all new code" rule and **prohibits new unit tests entirely** — a
+test is only an integration scenario (cooperating production components
+through a supported boundary) or an E2E scenario (real product processes).
+For the full boundary, required evidence, and the state of the unit-tier
+tests still in the suite (`#671` migration), read AGENTS.md "Testing policy".
 
 ## Mandatory: read the Rust guidelines before any Rust edit
 

@@ -83,10 +83,12 @@ slice:
    - **verify the task/finding against the code first** and report a false
      premise with `path:line` evidence instead of changing code;
    - for a bug, lifecycle, durability, concurrency, or security fix, add a
-     behavioral regression scenario — in the component's existing scenario
-     when one fits — and show it fails without the change and passes with
-     it; add no new test for a trivial helper change or a refactor existing
-     scenarios already cover (AGENTS.md "Testing policy");
+     regression scenario — an integration scenario driving cooperating
+     production components through a supported boundary, or an E2E scenario
+     driving the real product processes — extending the existing scenario
+     when one fits, and show it fails without the change and passes with it;
+     add no test for a trivial helper change or a refactor existing scenarios
+     already cover, and never write a new unit test (AGENTS.md "Testing policy");
    - run the checks its change affects: its crate's tests, clippy `-D warnings` (host, and
      `--target aarch64-apple-darwin` for platform/daemon code), `cargo fmt`,
      and `cargo xtask docs check` when docs changed;
@@ -226,9 +228,11 @@ address its findings in a new fix PR off the updated `main` (same loop).
   watchers, reconciliation) must not act on work a live task still owns.
 - **Fail closed**: uncertain evidence never deletes, kills, or retires
   anything; it keeps a visible, retryable state.
-- **Tests** follow AGENTS.md "Testing policy": behavioral scenarios through a
-  component's supported boundary with independent expected results; no
-  per-function unit tests, coverage targets, or duplicates of covered behavior.
+- **Tests** follow AGENTS.md "Testing policy": integration scenarios driving
+  cooperating production components through a supported boundary, or E2E
+  scenarios driving the real product processes, with independent expected
+  results; no new unit tests, no coverage targets, no duplicates of covered
+  behavior.
 - Tests are deterministic (hooks, barriers, paused time — no sleeps) and
   hermetic (no dependence on the host's process table, paths, or timing).
 

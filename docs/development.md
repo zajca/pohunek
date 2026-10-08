@@ -46,7 +46,7 @@ Routine loops (cargo-nextest profiles live in `.config/nextest.toml`; see
 `AGENTS.md` "Fast loops" for watcher, and CI-timing variants):
 
 ```bash
-cargo t                        # all fast unit + integration tests, no PTY/DB fixtures
+cargo t                        # all fast tests, no PTY/DB fixtures
 cargo t -p pohunek-daemon       # fast tests in one crate
 cargo ti                       # fast daemon/client/session-worker surface
 cargo tw                       # unfiltered full suite, four test processes
@@ -135,10 +135,12 @@ cargo xtask ts check      # CI gate
 - **Protocol ripples**: touching `crates/protocol` means updating `client`,
   `daemon`, `cli`, the generated TS types, `docs/public-api.md`,
   and the `docs/knowledge/` bundle in the same change.
-- **Behavioral tests, not per-function tests** (AGENTS.md "Testing policy"):
-  a regression scenario for each bug or lifecycle fix, a component scenario for
-  new observable behavior, no coverage target. The protocol and state machines
-  have rich suites — extend them.
+- **Integration/E2E tests, not unit tests** (AGENTS.md "Testing policy"): a
+  test drives cooperating production components through a supported boundary,
+  or the real product processes — never a unit test. Extending an existing
+  suite does not exempt an added test from that boundary; the unit-tier
+  tests still in the suite are #671 migration work, not everyday additions.
+  The protocol and state machines have rich suites — extend them first.
 
 ## Release
 

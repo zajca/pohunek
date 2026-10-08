@@ -462,7 +462,7 @@ mechanism.
 Rust:
 
 ```bash
-cargo t                                       # default inner loop: cost-filtered fast unit + integration tests
+cargo t                                       # default inner loop: cost-filtered fast tests
 cargo ta                                      # CPU-saving loop: fast tests of changed crates + dependents
 cargo ta --print                              # per-file reasons and the command; runs nothing
 cargo t -p pohunek-daemon                     # fast tests in one crate (alias takes -p)
@@ -691,63 +691,59 @@ feature — `--all-features` only covers the everything-on case.
 
 ## Testing policy
 
-A test earns its place by protecting externally meaningful behavior that a
-regression could break. There is no line or branch coverage target, no minimum
-test count, and no rule that every function, utility, or change gets its own
-unit test. This policy is the project rule for pohunek in every agent client: it
-takes precedence over personal global instructions that ask for tests for all
-new code (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`), and it is how this
-repository reads the vendored Rust guidelines' call for test coverage over
-observable behavior — behavioral scenarios, not a percentage. The durability,
-security, compatibility, timing, flaky, and hermetic obligations elsewhere in
-this file are unchanged.
+Every test is an **integration scenario** or an **E2E scenario** — in the Rust and
+TypeScript workspaces, the Python script tests, and each suite, with no unit-test
+tier: writing a new unit test is prohibited. This project rule takes precedence over
+personal global instructions that ask for tests for all new code
+(`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`); the durability, security,
+compatibility, timing, flaky, and hermetic obligations elsewhere in this file are
+unchanged.
 
-- **Test a component through its supported boundary.** Exercise a coherent
-  component (a registry, store, worker, parser, request handler, CLI command)
-  through the interface its callers use, in-process with hermetic dependencies
-  where that works. Extend an existing scenario before adding a per-helper
-  test. A slow full-system test is not the default substitute for a unit test.
-- **Expected results are independent of the code under test.** They come from
-  a specification, an independent fixture, a published recording, or a
-  demonstrated regression — never regenerated from the output of the change
-  under test to make it pass.
-- **Do not write low-value tests.** No tests that restate trivial getters,
-  setters, defaults, labels, or forwarding wrappers, that repeat another test's
-  assertion, or that are self-roundtrips adding no distinct contract or failure
-  signal.
-- **Always keep a scenario for** recovery and concurrency, data migration and
-  persisted-schema guards, protocol compatibility (the N/N-1 window),
-  authorization, hostile input, secret redaction, filesystem and process
-  ownership, and native platform lifecycle. A small focused test can be exactly
-  the right granularity for these; size alone is never a reason to keep or to
-  delete a test.
-- **When a change needs a test:**
-  - a bug fix, and any lifecycle, durability, concurrency, or security fix, gets
-    a behavioral regression scenario that fails without the fix and passes with
-    it — in the component's existing scenario when one fits;
-  - new externally observable behavior (a command, flag, protocol method or
-    event, store transition, error contract) gets a scenario at its component
-    boundary;
-  - a trivial helper change needs no new unit test, and a refactor whose
-    behavior existing scenarios already cover needs no duplicate test — those
-    scenarios are its evidence.
-- **Removing tests.** Delete a low-value test without replacement when no
-  meaningful scenario is lost. Never shrink the suite by ignoring, filtering,
-  renaming, or moving tests, weakening assertions, dropping every negative case,
-  or adding retries, and never fold independently diagnosable behaviors into one
-  giant scenario. Coverage and mutation tooling are not part of this
-  repository's process. Test lists in historical plans and RFCs (`docs/design/`,
-  `docs/phases/`, `docs/superpowers/`) record what was planned then; they are
-  not mandates to add or recreate tests.
+- **Integration** drives two or more production components through a boundary they
+  already expose to callers — the CLI against a daemon API, a public RPC exercising
+  the registry, store, and reconciliation behind it, or the SDK client against the
+  testkit fixture daemon and loopback relay — with hermetic dependencies where
+  possible. A scenario pinning one function, helper, or module in isolation through
+  an in-process seam is a unit test, whatever its file.
+- **E2E** starts the actual binaries (`pohunekd`, `pohunek-sessiond`, `pohunek`) or
+  drives the released artifacts (the runtime packages driving the pinned real agents)
+  over real infrastructure (real PTYs, real supervisor, disposable PostgreSQL),
+  asserting what an operator observes. The product is always real; only a
+  product-external service (a loopback model stub) may be stubbed, and a product
+  stand-in (testkit fixture daemon, loopback relay) makes it integration.
+- **Expected results are independent of the code under test:** from a
+  specification, an independent fixture, a published recording, or a demonstrated
+  regression — never regenerated from the change under test.
+- **Always keep integration/E2E evidence for** recovery and concurrency, data
+  migration and persisted-schema guards, protocol compatibility (the N/N-1 window),
+  authorization, hostile input, secret redaction, filesystem and process ownership,
+  and native platform lifecycle; scenario size alone never justifies keeping or
+  deleting a test.
+- **When a change needs a scenario:** a bug or
+  lifecycle/durability/concurrency/security fix gets a regression scenario that fails
+  without the fix and passes with it — extend an existing integration/E2E scenario
+  when one fits; new observable behavior (a command, flag, protocol method/event,
+  error contract) is exercised through its callers' supported boundary; a trivial
+  helper change or an already-covered refactor needs no new test.
+- **Removing tests.** Delete a low-value test (a repeated assertion,
+  self-roundtrip, or wrapper) when no meaningful integration/E2E scenario is lost;
+  never shrink the suite by ignoring, filtering, renaming, or moving tests, weakening
+  assertions, dropping negative cases, or adding retries; never fold independently
+  diagnosable behaviors into one giant scenario. Coverage and mutation tooling stay
+  out of the process; historical plan/RFC test lists are history, not mandates.
+- **Existing unit-tier tests.** Isolated component and per-helper scenarios (mostly
+  inline `#[cfg(test)]`) from earlier policies still exist, running and gating until
+  replaced — epic #601 removed 617 declarations with no measured speed gain and left
+  the tier. Auditing them (replace at a supported boundary or delete) is the
+  follow-up PR sequence on [#671](https://github.com/zajca/pohunek/issues/671); until
+  then this policy governs every new and touched test.
 
-Validation: while iterating, run the checks the change affects (`cargo t -p
-<crate>`, `cargo ta`, one test file, the relevant Bun, script, or docs check).
-Before declaring work done or publishing it, run the complete gate set from
-"Build, test, lint" that applies to the change once, on the final revision. A
-later fix re-runs the checks whose inputs it changed; a check whose inputs are
-unchanged keeps its evidence and does not restart, and any change to a check's
-inputs invalidates its earlier result. CI is the final landing evidence: a gate
-that cannot run locally is reported as CI-only, never as green.
+Validation: while iterating, run the checks the change affects (`cargo t -p <crate>`,
+`cargo ta`, one test file, the relevant Bun, script, or docs check); before declaring
+work done, run the applicable gate set from "Build, test, lint" once, on the final
+revision — a later fix re-runs the checks whose inputs it changed, unchanged checks
+keep their evidence, and CI is the final landing evidence (a gate that cannot run
+locally is CI-only, never green).
 
 ## Coding conventions (project-specific)
 
@@ -773,11 +769,16 @@ that cannot run locally is reported as CI-only, never as green.
   error; types holding secrets get hand-written redacting `Debug`. Never read
   `.env*`, key/cert files, or print token values. Keep this posture.
 - **Shared logic goes in a library crate, not a binary.**
-- **Tests follow the Testing policy above.** Component scenarios may live inline
-  (`#[cfg(test)]`) when they need private access, or in `tests/` when the public
-  boundary is enough; do not expose private APIs only to move a test. The
-  protocol and state-machine suites are the place to extend for behavior they
-  own.
+- **Tests follow the Testing policy above.** A test drives cooperating
+  production components through a supported boundary (integration) or the real
+  product processes (E2E); never a new unit test. File placement (`tests/` vs
+  inline `#[cfg(test)]`) follows the boundary a scenario exercises, not a
+  unit/component tier, and a test does not expose a private API only to move
+  it (see "Testing policy" for the migration state of the existing unit-tier
+  tests). Extending the protocol or state-machine suites is still the first
+  option for behavior they own, but an added scenario must itself meet the
+  integration/E2E boundary — appending to an existing suite does not exempt a
+  test from it, and never adds unit-tier tests to those suites.
 - **Keep the assistant knowledge bundle current.** `docs/knowledge/` is the
   hand-authored source for the Universal Pohunek Assistant (materialized via
   `assistant.materialize`). Whenever a change alters something the bundle
