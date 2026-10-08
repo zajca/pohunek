@@ -14,6 +14,9 @@
   regenerates it through `catalog anchor` and requires byte equality, so the
   shipped file is reproducible from reviewed public inputs. The runtime catalog
   concept page names the roots, windows and rotation rule (#655).
+- Daemon release archives carry the anchor at the archive root beside `pohunekd`;
+  CLI and relay archives carry none, and staging a daemon archive without the
+  checked-in anchor is refused.
 
 ## Unreleased (2026-10-08, catalog anchor writes several roots)
 

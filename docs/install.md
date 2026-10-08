@@ -15,7 +15,10 @@ archive contains its license, the README, the reference pages under `docs/`
 (features, install, CLI, SDK, development), and the offline knowledge
 documentation under `docs/offline/`.
 Daemon archives contain `pohunekd`, `pohunek-sessiond`, `pohunek`, and the
-`packaging/install-daemon.sh` wrapper around `pohunek service install`.
+`packaging/install-daemon.sh` wrapper around `pohunek service install`, plus
+`runtime-catalog-anchor.json`, the runtime-catalog trust anchor that the daemon
+reads from the directory of its executable. CLI and relay archives do not
+contain it.
 Every CLI, daemon, and relay archive is packed deterministically
 (members sorted, root-owned, stamped with the tagged commit time) and carries a
 `MANIFEST` with the SHA-256 of every member; the daemon installer verifies
