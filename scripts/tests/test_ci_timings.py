@@ -1,6 +1,5 @@
 """Regression checks for the CI timing/measurement helper (stdlib only)."""
 
-import argparse
 import contextlib
 import io
 import importlib.machinery
@@ -1048,198 +1047,303 @@ class JunitCommandTests(unittest.TestCase):
 
 
 class FetchTests(unittest.TestCase):
-    def _fetch(self, listed, attempts, cache_contents=None, limit=40):
-        """Run `list_documents` against a stubbed `gh`, returning the calls."""
-        calls = []
+    """Fetch-path scenarios through the real `runs` command and a fake `gh`.
 
-        def fake_gh_json(arguments):
-            calls.append(arguments)
-            if arguments[1] == "list":
-                return listed
-            run_id = int(arguments[2])
-            attempt = int(arguments[arguments.index("--attempt") + 1])
-            return {
-                "databaseId": run_id,
-                "attempt": attempt,
-                "workflowName": "CI",
-                "conclusion": "success",
-                "createdAt": "2026-09-20T10:00:00Z",
-                "startedAt": "2026-09-20T10:00:00Z",
-                "updatedAt": "2026-09-20T10:09:30Z",
-                "jobs": [],
-            }
+    Every case starts `scripts/ci-timings runs` as a subprocess with a
+    private fake `gh` on `PATH` that records every call and serves a
+    scripted `gh run list` / `gh run view --json --attempt` answer from a
+    state file. Assertions cover what an operator meets: the rendered or
+    JSON output, the snapshot persisted into a disposable `--cache` file
+    under the temp root, and the argv sequence the fetch actually sent to
+    `gh`. No case touches the real `gh`, the network, or writes outside
+    its temp root; a view request the fake `gh` has no scripted answer for
+    fails the invocation loudly instead of faking an empty result.
+    """
 
-        original = ci_timings.gh_json
-        ci_timings.gh_json = fake_gh_json
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                cache = Path(directory) / "ci-runs.json"
-                if cache_contents is not None:
-                    ci_timings.write_snapshot(cache, cache_contents)
-                args = argparse.Namespace(
-                    cache=str(cache), limit=limit, event=None, branch=None,
-                    conclusion="success", attempts=attempts,
-                )
-                fetch = ci_timings.list_documents(args)
-                stored = ci_timings.read_snapshot(cache) if cache.exists() else []
-            return fetch.documents, stored, calls, fetch.truncated
-        finally:
-            ci_timings.gh_json = original
-
-    def test_fetch_all_attempts_reaches_intermediate_reruns(self):
-        # `gh run list` only ever describes attempt 3; attempt 2 exists only
-        # if it is requested by number.
-        listed = [{"databaseId": 77, "attempt": 3, "conclusion": "failure"}]
-        documents, stored, calls, _ = self._fetch(listed, "all")
-        self.assertEqual(
-            sorted(document["attempt"] for document in documents), [1, 2, 3]
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "with Path(os.environ['GH_CALLS']).open('a') as calls:\n"
+            "    calls.write(json.dumps(args) + '\\n')\n"
+            "if args[:2] == ['run', 'list']:\n"
+            "    listed = json.loads(Path(os.environ['GH_LIST']).read_text())\n"
+            "    # `gh run list` honors --status against the latest attempt\n"
+            "    # only; mirroring that is what proves the real command never\n"
+            "    # relies on it for the local conclusion filter.\n"
+            "    if '--status' in args:\n"
+            "        wanted = args[args.index('--status') + 1]\n"
+            "        listed = [entry for entry in listed\n"
+            "                  if entry.get('conclusion') == wanted]\n"
+            "    print(json.dumps(listed))\n"
+            "elif args[:2] == ['run', 'view'] and '--attempt' in args:\n"
+            "    views = json.loads(Path(os.environ['GH_VIEWS']).read_text())\n"
+            "    key = str(args[2]) + ':' + args[args.index('--attempt') + 1]\n"
+            "    if key not in views:\n"
+            "        raise SystemExit('fake gh has no scripted view: ' + key)\n"
+            "    print(json.dumps(views[key]))\n"
+            "else:\n"
+            "    raise SystemExit('unexpected gh request: ' + repr(args))\n"
         )
-        self.assertEqual(len(stored), 3)
-        self.assertEqual(
-            [call[call.index("--attempt") + 1] for call in calls if call[1] == "view"],
-            ["1", "2", "3"],
-        )
+        gh.chmod(0o755)
+        self.list = self.root / "gh-list.json"
+        self.views = self.root / "gh-views.json"
+        self.calls = self.root / "gh-calls.jsonl"
+        self.cache = self.root / "cache" / "ci-runs.json"
+        self.environment = {
+            **os.environ,
+            "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+            "GH_LIST": str(self.list),
+            "GH_VIEWS": str(self.views),
+            "GH_CALLS": str(self.calls),
+        }
 
-    def test_fetch_first_attempt_keeps_the_original_run(self):
-        listed = [{"databaseId": 77, "attempt": 2, "conclusion": "success"}]
-        documents, _, _, _ = self._fetch(listed, "first")
-        self.assertEqual(
-            sorted(document["attempt"] for document in documents), [1, 2]
-        )
+    # -- fixture helpers ---------------------------------------------------
 
-    def test_fetch_skips_attempts_already_cached(self):
-        cached = {
-            "databaseId": 77,
-            "attempt": 1,
+    def set_listing(self, entries):
+        """Script the next `gh run list` answer."""
+        self.list.write_text(json.dumps(entries))
+
+    def set_views(self, documents):
+        """Script `gh run view` answers keyed by `<runId>:<attempt>`."""
+        self.views.write_text(json.dumps(documents))
+
+    def view_document(self, run_id, *, attempt, conclusion="success",
+                      created="2026-09-20T10:00:00Z", updated=None):
+        """A full `gh run view --json` document the fake `gh` can serve."""
+        return {
+            "databaseId": run_id,
+            "name": "ci.yml",
+            "displayTitle": "CI",
+            "event": "pull_request",
+            "conclusion": conclusion,
+            "createdAt": created,
+            "startedAt": created,
+            "updatedAt": updated or "2026-09-20T10:09:30Z",
+            "attempt": attempt,
+            "headBranch": "topic",
             "workflowName": "CI",
-            "conclusion": "failure",
-            "createdAt": "2026-09-20T10:00:00Z",
-            "startedAt": "2026-09-20T10:00:00Z",
-            "updatedAt": "2026-09-20T10:09:30Z",
             "jobs": [],
         }
-        listed = [{"databaseId": 77, "attempt": 2, "conclusion": "success"}]
-        _, stored, calls, _ = self._fetch(listed, "first", cache_contents=[cached])
-        self.assertEqual(len(stored), 2)
-        self.assertEqual(
-            [call[call.index("--attempt") + 1] for call in calls if call[1] == "view"],
-            ["2"],
+
+    def seed_cache(self, documents):
+        """Place a run snapshot on disk as a previous fetch left it."""
+        self.cache.parent.mkdir(parents=True, exist_ok=True)
+        self.cache.write_text(json.dumps(list(documents)))
+
+    def gh_calls(self):
+        """Every argv the fetch has handed to `gh`, in order."""
+        return [
+            json.loads(line) for line in self.calls.read_text().splitlines()
+        ]
+
+    def view_attempts(self):
+        """The `--attempt` values of the view calls made, in order."""
+        return [
+            call[call.index("--attempt") + 1]
+            for call in self.gh_calls() if call[1] == "view"
+        ]
+
+    def run_cli(self, *arguments):
+        """Run `ci-timings ...` with the disposable `--cache` always set.
+
+        Without it the script would fall back to the repository's real
+        `target/ci-timings` cache and both leak host state into the sample
+        and let it answer the fetch instead of `gh`.
+        """
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *arguments,
+             "--cache", str(self.cache)],
+            cwd=self.root, env=self.environment,
+            capture_output=True, text=True, check=False,
         )
+
+    def run_json(self, *arguments):
+        result = self.run_cli(*arguments, "--json")
+        self.assertEqual(
+            result.returncode, 0,
+            f"unexpected failure: {result.stderr}",
+        )
+        return json.loads(result.stdout)
+
+    # -- attempt selection -------------------------------------------------
+
+    def test_fetch_all_attempts_reaches_intermediate_reruns(self):
+        # `gh run list` only ever describes attempt 3; attempts 1 and 2
+        # exist only when requested by number, and `--attempts all` must
+        # request them all -- a silent drop would shrink `--attempts all`
+        # aggregates to whatever the listing happened to describe.
+        self.set_listing([{"databaseId": 77, "attempt": 3, "conclusion": "success"}])
+        self.set_views({
+            f"77:{number}": self.view_document(77, attempt=number)
+            for number in (1, 2, 3)
+        })
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21",
+            "--attempts", "all",
+        )
+        self.assertEqual(
+            sorted(run["attempt"] for run in payload["runs"]), [1, 2, 3]
+        )
+        self.assertEqual(self.view_attempts(), ["1", "2", "3"])
+        stored = json.loads(self.cache.read_text())
+        self.assertEqual(sorted(item["attempt"] for item in stored), [1, 2, 3])
+
+    def test_fetch_first_attempt_keeps_the_original_run(self):
+        # The listing describes attempt 2, but the `first` default still
+        # fetches attempt 1 by number and keeps it as the run's sample:
+        # a rerun displacing the original would re-time the whole window.
+        self.set_listing([{"databaseId": 77, "attempt": 2, "conclusion": "success"}])
+        self.set_views({
+            "77:1": self.view_document(77, attempt=1),
+            "77:2": self.view_document(77, attempt=2),
+        })
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21"
+        )
+        self.assertEqual([run["attempt"] for run in payload["runs"]], [1])
+        self.assertEqual(self.view_attempts(), ["1", "2"])
+
+    # -- cache reuse -------------------------------------------------------
+
+    def test_fetch_skips_attempts_already_cached(self):
+        # Attempt 1 sits in the cache from an earlier fetch; only the
+        # attempt the cache cannot answer is requested from `gh`, and the
+        # cache then holds every attempt of the run.
+        self.seed_cache([self.view_document(77, attempt=1,
+                                            conclusion="failure")])
+        self.set_listing([{"databaseId": 77, "attempt": 2, "conclusion": "success"}])
+        self.set_views({"77:2": self.view_document(77, attempt=2)})
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21", "--attempts", "all",
+        )
+        self.assertEqual(
+            sorted(run["attempt"] for run in payload["runs"]), [1, 2]
+        )
+        # The cached attempt 1 answered itself; only attempt 2 asked `gh`.
+        self.assertEqual(self.view_attempts(), ["2"])
+        stored = json.loads(self.cache.read_text())
+        self.assertEqual(sorted(item["attempt"] for item in stored), [1, 2])
+
+    def test_fetch_reuses_a_cached_document_without_refetching(self):
+        # A complete cache serves the query with no `gh run view` call at
+        # all, so a re-measurement costs no fetch.
+        cached = self.view_document(77, attempt=1)
+        self.seed_cache([cached])
+        self.set_listing([{"databaseId": 77, "attempt": 1, "conclusion": "success"}])
+        self.set_views({})  # Any view request would fail the invocation.
+        first = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21"
+        )
+        self.assertEqual([run["id"] for run in first["runs"]], [77])
+        self.assertEqual(self.view_attempts(), [])
+        self.calls.write_text("")
+        second = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21"
+        )
+        self.assertEqual([run["id"] for run in second["runs"]], [77])
+        self.assertEqual(
+            [call for call in self.gh_calls() if call[1] == "view"], []
+        )
+
+    # -- conclusion filter after fetching ----------------------------------
 
     def test_fetch_then_filter_recovers_a_run_whose_rerun_failed(self):
-        """The whole finding-3 pipeline: listing shows only the failed rerun.
+        """The fetch-before-filter pipeline: listing shows only the rerun.
 
         `gh run list` reports attempt 2's `failure`, so a server-side
-        `--status success` would drop the run outright. Fetching both
-        attempts and applying the conclusion locally keeps attempt 1.
+        `--status success` would drop the run outright -- the fake `gh`
+        honors `--status` the way the real one does exactly for this
+        purpose. Fetching both attempts and applying the conclusion
+        locally keeps attempt 1's success in the report.
         """
-        conclusions = {1: "success", 2: "failure"}
-        calls = []
-
-        def fake_gh_json(arguments):
-            calls.append(arguments)
-            if arguments[1] == "list":
-                # `gh run list` describes the latest attempt only, and honors
-                # --status against it. Modelling that is what makes this test
-                # fail if --conclusion is ever pushed server-side again.
-                listed = {"databaseId": 27, "attempt": 2, "conclusion": "failure"}
-                if "--status" in arguments:
-                    wanted = arguments[arguments.index("--status") + 1]
-                    if listed["conclusion"] != wanted:
-                        return []
-                return [listed]
-            attempt = int(arguments[arguments.index("--attempt") + 1])
-            return {
-                "databaseId": 27,
-                "attempt": attempt,
-                "workflowName": "CI",
-                "conclusion": conclusions[attempt],
-                "createdAt": "2026-09-20T10:00:00Z",
-                "startedAt": "2026-09-20T10:00:00Z",
-                "updatedAt": "2026-09-20T10:09:30Z",
-                "jobs": [
-                    {
-                        "name": "tests (unit, fast)",
-                        "startedAt": "2026-09-20T10:00:06Z",
-                        "completedAt": "2026-09-20T10:03:52Z",
-                        "conclusion": conclusions[attempt],
-                    },
-                ],
-            }
-
-        original = ci_timings.gh_json
-        ci_timings.gh_json = fake_gh_json
-        try:
-            with tempfile.TemporaryDirectory() as directory:
-                args = argparse.Namespace(
-                    input=None, cache=str(Path(directory) / "ci-runs.json"),
-                    limit=40, event=None, branch=None, conclusion="success",
-                    attempts="first",
-                )
-                summaries = ci_timings.load_run_summaries(args).runs
-                selected = ci_timings.select_runs(summaries, args)
-        finally:
-            ci_timings.gh_json = original
-
-        listing = [call for call in calls if call[1] == "list"][0]
+        self.set_listing([{"databaseId": 27, "attempt": 2, "conclusion": "failure"}])
+        self.set_views({
+            "27:1": self.view_document(27, attempt=1, conclusion="success"),
+            "27:2": self.view_document(27, attempt=2, conclusion="failure"),
+        })
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21",
+            "--conclusion", "success",
+        )
+        listing = [call for call in self.gh_calls() if call[1] == "list"][0]
         self.assertNotIn("--status", listing)
         self.assertEqual(
-            [(run["id"], run["attempt"], run["conclusion"]) for run in selected],
+            [(run["id"], run["attempt"], run["conclusion"])
+             for run in payload["runs"]],
             [(27, 1, "success")],
         )
+
+    # -- cache scope -------------------------------------------------------
 
     def test_fetch_ignores_unrelated_cached_runs(self):
         """The sample follows the query, not the local cache's history.
 
         A snapshot accumulates every run ever fetched. Returning all of it
         would make the same command report different medians depending on
-        what someone fetched earlier on that machine.
+        what someone fetched earlier on that machine; the stale run must
+        stay on disk for a later query that actually names it.
         """
-        stale = {
-            "databaseId": 99, "attempt": 1, "workflowName": "CI",
-            "conclusion": "success", "createdAt": "2026-01-01T10:00:00Z",
-            "startedAt": "2026-01-01T10:00:00Z",
-            "updatedAt": "2026-01-01T10:09:30Z", "jobs": [],
-        }
-        listed = [{"databaseId": 77, "attempt": 1, "conclusion": "success"}]
-        documents, stored, _, _ = self._fetch(
-            listed, "first", cache_contents=[stale]
+        self.seed_cache([self.view_document(
+            99, attempt=1,
+            created="2026-01-01T10:00:00Z",
+            updated="2026-01-01T10:09:30Z",
+        )])
+        self.set_listing([{"databaseId": 77, "attempt": 1, "conclusion": "success"}])
+        self.set_views({"77:1": self.view_document(77, attempt=1)})
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21"
         )
-        self.assertEqual([d["databaseId"] for d in documents], [77])
-        # The unrelated run stays on disk for a later query that wants it.
-        self.assertEqual(
-            sorted(d["databaseId"] for d in stored), [77, 99]
-        )
+        self.assertEqual([run["id"] for run in payload["runs"]], [77])
+        stored = json.loads(self.cache.read_text())
+        self.assertEqual(sorted(item["databaseId"] for item in stored), [77, 99])
 
-    def test_fetch_reuses_a_cached_document_without_refetching(self):
-        cached = {
-            "databaseId": 77, "attempt": 1, "workflowName": "CI",
-            "conclusion": "success", "createdAt": "2026-09-20T10:00:00Z",
-            "startedAt": "2026-09-20T10:00:00Z",
-            "updatedAt": "2026-09-20T10:09:30Z", "jobs": [],
-        }
-        listed = [{"databaseId": 77, "attempt": 1, "conclusion": "success"}]
-        documents, _, calls, _ = self._fetch(
-            listed, "first", cache_contents=[cached]
-        )
-        self.assertEqual([d["databaseId"] for d in documents], [77])
-        self.assertEqual([call for call in calls if call[1] == "view"], [])
+    # -- truncation --------------------------------------------------------
 
     def test_fetch_reports_a_listing_that_filled_the_limit(self):
-        # A full listing means `gh` may have had more, so the sample is a
-        # truncation rather than the whole window.
-        listed = [
-            {"databaseId": i, "attempt": 1, "conclusion": "success"}
-            for i in range(1, 4)
-        ]
-        self.assertTrue(self._fetch(listed, "first", limit=3)[3])
-        self.assertFalse(self._fetch(listed, "first", limit=4)[3])
+        # A listing exactly as long as --limit means `gh` may have had
+        # more: the sample is a truncation, and the report must say so
+        # instead of passing a partial median for a complete one.
+        self.set_listing([
+            {"databaseId": run_id, "attempt": 1, "conclusion": "success"}
+            for run_id in (1, 2, 3)
+        ])
+        self.set_views({
+            f"{run_id}:1": self.view_document(run_id, attempt=1)
+            for run_id in (1, 2, 3)
+        })
+        window = ("--window", "2026-09-19..2026-09-21")
+        filled = self.run_cli("runs", *window, "--limit", "3")
+        self.assertEqual(filled.returncode, 0, filled.stderr)
+        self.assertIn("filled --limit 3", filled.stderr)
+        self.assertIn("missing older runs", filled.stderr)
+        headroom = self.run_cli("runs", *window, "--limit", "4")
+        self.assertEqual(headroom.returncode, 0, headroom.stderr)
+        self.assertEqual(headroom.stderr, "")
+
+    # -- unfinished runs ---------------------------------------------------
 
     def test_fetch_skips_unfinished_runs(self):
-        listed = [{"databaseId": 77, "attempt": 1, "conclusion": None}]
-        documents, _, calls, _ = self._fetch(listed, "first")
-        self.assertEqual(documents, [])
-        self.assertEqual([call for call in calls if call[1] == "view"], [])
+        # An unfinished run has no conclusion and no completed job
+        # timestamps: it is skipped without a view request, kept out of
+        # the sample, and nothing half-fetched may land in the cache.
+        self.set_listing([{"databaseId": 77, "attempt": 1, "conclusion": None}])
+        self.set_views({})  # Any view request would fail the invocation.
+        payload = self.run_json(
+            "runs", "--window", "2026-09-19..2026-09-21"
+        )
+        self.assertEqual(payload["runs"], [])
+        self.assertEqual(self.view_attempts(), [])
+        self.assertEqual([call[1] for call in self.gh_calls()], ["list"])
+        self.assertFalse(self.cache.exists())
 
 
 class LogCacheCommandTests(unittest.TestCase):
