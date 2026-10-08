@@ -570,6 +570,19 @@ cargo build -p pohunek-daemon --config 'profile.dev.debug=true' \
     --config 'profile.dev.package."*".debug=true'               # dependencies too
 ```
 
+Optimized test dependencies: the root `Cargo.toml` compiles `regex-automata`,
+`curve25519-dalek`, `ed25519-dalek` and `sha2` at `opt-level = 3` in the
+`dev`/`test` profile, one `[profile.dev.package.<crate>]` block each; dependency
+debuginfo stays off through `"*"`. The hot loops of the slowest fast tests run
+inside these crates (lazy-DFA determinization for every pi detector case,
+ed25519 and SHA-256 on every signed relay append), and at `opt-level = 0` they
+dominate fast-loop time. Add a crate only when a profile of a slow test (for
+example `valgrind --tool=callgrind` on its test binary) puts most of the time in
+that dependency's own functions. Generic code is instantiated in the calling
+crate and keeps that crate's opt-level, so the override does not reach it. Each
+entry costs one optimized compile of the crate per cold build. Measure the fast
+loop and `scripts/measure-dev-loop` before and after the addition.
+
 Reproduce CI timing evidence from `gh` run data. Every fetch accumulates into
 the snapshot `target/ci-timings/ci-runs.json`; passing that file as `--input`
 re-measures from it with no network calls, while the plain commands always
