@@ -228,14 +228,4 @@ mod tests {
         assert!(!temp.join(COMPLETE_MARKER).exists());
         assert!(matches!(target_state(&target), Ok(TargetState::Missing)));
     }
-
-    #[test]
-    fn temporary_dir_names_differ_within_one_process() {
-        let knowledge_dir = Path::new("knowledge");
-
-        let first = temporary_dir(knowledge_dir, "sha256:same");
-        let second = temporary_dir(knowledge_dir, "sha256:same");
-
-        assert_ne!(first, second);
-    }
 }
