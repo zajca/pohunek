@@ -1387,7 +1387,7 @@ fn seed_durable_metadata(paths: &BasePaths) {
 
 /// Backups a schema migration leaves next to the store, plus lookalikes the
 /// purge must keep.
-fn seed_schema_backups(paths: &BasePaths) -> Vec<PathBuf> {
+fn seed_schema_backups(paths: &BasePaths) -> (Vec<PathBuf>, Vec<PathBuf>) {
     let store = std::ffi::OsStr::new(pohunek_paths::METADATA_STORE_NAME);
     let backups = vec![
         paths
@@ -1395,17 +1395,42 @@ fn seed_schema_backups(paths: &BasePaths) -> Vec<PathBuf> {
             .join(pohunek_paths::schema_backup_name(store, 1)),
         paths
             .data_dir
-            .join(pohunek_paths::schema_backup_temp_name(store, 4242, 7)),
+            .join(pohunek_paths::schema_backup_name(store, 42)),
+        paths
+            .data_dir
+            .join(pohunek_paths::schema_backup_temp_name(store, 4242, 0)),
     ];
+    assert_eq!(
+        backups,
+        [
+            "metadata.jsonl.pre-schema-1",
+            "metadata.jsonl.pre-schema-42",
+            "metadata.jsonl.pre-schema-tmp.4242.0",
+        ]
+        .map(|name| paths.data_dir.join(name))
+    );
     for backup in &backups {
         std::fs::write(backup, "{\"kind\":\"resume\"}\n").expect("schema backup");
     }
-    std::fs::write(
-        paths.data_dir.join("metadata.jsonl.pre-schema-1.bak"),
-        "keep",
-    )
-    .expect("lookalike");
-    backups
+    let lookalikes = [
+        "metadata.jsonl.tmp.1.2",
+        "metadata.jsonl.pre-schema-",
+        "metadata.jsonl.pre-schema-01",
+        "metadata.jsonl.pre-schema--1",
+        "metadata.jsonl.pre-schema-1.bak",
+        "metadata.jsonl.pre-schema-tmp",
+        "metadata.jsonl.pre-schema-tmp.1",
+        "metadata.jsonl.pre-schema-tmp.1.2.3",
+        "metadata.jsonl.pre-schema-tmp.x.2",
+        "other.jsonl.pre-schema-1",
+        "xmetadata.jsonl.pre-schema-1",
+    ]
+    .map(|name| paths.data_dir.join(name))
+    .to_vec();
+    for lookalike in &lookalikes {
+        std::fs::write(lookalike, "keep").expect("unrelated file");
+    }
+    (backups, lookalikes)
 }
 
 fn assert_purged(paths: &BasePaths) {
@@ -1451,7 +1476,7 @@ async fn purge_removes_the_schema_migration_backups_with_the_store() {
     let harness = Harness::new();
     let paths = harness.context.paths().clone();
     seed_durable_metadata(&paths);
-    let backups = seed_schema_backups(&paths);
+    let (backups, lookalikes) = seed_schema_backups(&paths);
     let _record = pending_install_at_config(&harness).await;
 
     let report = harness.engine().uninstall(PURGE).await.expect("uninstall");
@@ -1466,13 +1491,15 @@ async fn purge_removes_the_schema_migration_backups_with_the_store() {
             backup.display()
         );
     }
-    assert!(
-        paths
-            .data_dir
-            .join("metadata.jsonl.pre-schema-1.bak")
-            .exists(),
-        "a file outside the backup grammar is kept"
-    );
+    for lookalike in &lookalikes {
+        assert_eq!(
+            std::fs::read_to_string(lookalike).expect("unrelated file survives"),
+            "keep",
+            "{} is not a schema backup",
+            lookalike.display()
+        );
+        assert!(!report.removed.contains(lookalike));
+    }
 }
 
 #[tokio::test]
