@@ -28,7 +28,6 @@ import tempfile
 import time
 import tomllib
 import unittest
-from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "test-partitions"
 REPO_ROOT = SCRIPT.parent.parent
@@ -127,6 +126,7 @@ def main():
         stale_report = os.environ.get("PARTITIONS_STALE_REPORT")
         log.write(json.dumps({
             "name": Path(sys.argv[0]).name,
+            "pid": os.getpid(),
             "argv": argv,
             "stale_report_exists": Path(stale_report).exists() if stale_report else None,
             "tmpdir": os.environ.get("TMPDIR"),
@@ -150,11 +150,17 @@ def main():
             if len(ready) != 2 or int(ready[0]) != worker.pid:
                 raise SystemExit("fake nextest: worker did not become ready")
             worker.stdout.close()
-            Path(pid_file).write_text(json.dumps({
+            pid_record = Path(pid_file)
+            temporary = pid_record.with_suffix(".tmp")
+            temporary.write_text(json.dumps({
                 "worker": worker.pid, "workload": int(ready[1]),
             }))
+            os.replace(temporary, pid_record)
         if status := os.environ.get("PARTITIONS_FAKE_RUN_STATUS"):
             raise SystemExit(int(status))
+        if os.environ.get("PARTITIONS_HOLD_RUN"):
+            import signal
+            signal.pause()
         return
 
     fast = os.environ["PARTITIONS_FAST"]
@@ -252,7 +258,7 @@ class ScriptScenario(unittest.TestCase):
     def set_inventory(self, binaries):
         self.inventory.write_text(json.dumps({"binaries": binaries}))
 
-    def run_script(self, *arguments, extra_env=None):
+    def script_environment(self, extra_env=None):
         environment = {**os.environ}
         environment.update(extra_env or {})
         # Our bin first: `which cargo-nextest` and every bare `cargo` lookup
@@ -264,9 +270,12 @@ class ScriptScenario(unittest.TestCase):
         environment["PARTITIONS_FIXTURE"] = str(self.inventory)
         # The fast filter the fake must strip from the shard expressions.
         environment["PARTITIONS_FAST"] = self.config_fast_filter()
+        return environment
+
+    def run_script(self, *arguments, extra_env=None):
         command = [sys.executable, str(self.script), *arguments]
         process = subprocess.Popen(
-            command, cwd=self.root, env=environment, text=True,
+            command, cwd=self.root, env=self.script_environment(extra_env), text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True,
         )
@@ -538,6 +547,42 @@ class WorkerRunActionTests(ScriptScenario):
         self.assertEqual(call["tmpdir_mode"], 0o700)
         self.assertFalse(Path(call["tmpdir"]).exists())
 
+    def test_cancellation_stops_the_runner_and_cleans_the_worker(self):
+        pid_file = self.root / "worker.pid"
+        command = [sys.executable, str(self.script), "run", "unit"]
+        process = subprocess.Popen(
+            command, cwd=self.root,
+            env=self.script_environment({
+                "PARTITIONS_SPAWN_WORKER_PID_FILE": str(pid_file),
+                "PARTITIONS_HOLD_RUN": "1",
+            }),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
+        )
+        pids = None
+        try:
+            wait_for(pid_file.exists)
+            pids = json.loads(pid_file.read_text())
+            self.assertIsNone(process.poll(), "the run is still active before cancellation")
+            process.send_signal(signal.SIGTERM)
+            _, stderr = process.communicate(timeout=self.timeout_seconds)
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("leaked pohunek-sessiond worker", stderr)
+            call = self.nextest_calls()[-1]
+            wait_for(lambda: gone_or_zombie(call["pid"]))
+            wait_for(lambda: gone_or_zombie(pids["worker"]))
+            wait_for(lambda: gone_or_zombie(pids["workload"]))
+            self.assertFalse(Path(call["tmpdir"]).exists())
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.communicate()
+            if pids is not None:
+                try:
+                    os.killpg(pids["worker"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
 
 class LeakedWorkerTests(unittest.TestCase):
     def worker(self, socket, pid=100, executable="/w/target/debug/pohunek-sessiond", start="1"):
@@ -754,29 +799,6 @@ class LeakedWorkerTests(unittest.TestCase):
             self.assertEqual([p.pid for p, _ in found], [process.pid])
             partitions.kill_if_unchanged(process)
 
-    def run_with(self, runner, leaks):
-        """`run_checked` with a mocked runner process and a fixed set of leaks."""
-        events = []
-        base = Path("/tmp/zz99")
-        with mock.patch.object(sys, "platform", "linux"), \
-                mock.patch.object(partitions, "make_run_base", return_value=base), \
-                mock.patch.object(partitions.subprocess, "Popen", return_value=runner), \
-                mock.patch.object(partitions, "read_processes", return_value=leaks), \
-                mock.patch.object(partitions, "kill_if_unchanged",
-                                  side_effect=lambda p: events.append(("kill", p.pid))), \
-                mock.patch.object(partitions, "remove_tree",
-                                  side_effect=lambda *a, **k: events.append(("rmtree",))):
-            try:
-                return partitions.run_checked(["nextest"]), events
-            except BaseException as error:
-                return error, events
-
-    def stand_in_runner(self, wait, running=False):
-        runner = mock.Mock()
-        runner.wait.side_effect = wait
-        runner.poll.return_value = None if running else 0
-        return runner
-
     def test_remove_tree_removes_directories_without_permissions(self):
         with tempfile.TemporaryDirectory() as root:
             tree = Path(root) / "base"
@@ -786,14 +808,6 @@ class LeakedWorkerTests(unittest.TestCase):
             locked.chmod(0)
             partitions.remove_tree(tree)
             self.assertFalse(tree.exists())
-
-    def test_a_cancelled_run_stops_the_runner_cleans_workers_and_reraises(self):
-        leaks = [self.worker("/tmp/zz99/ph-x/d.sock", pid=100)]
-        runner = self.stand_in_runner([KeyboardInterrupt(), 0], running=True)
-        error, events = self.run_with(runner, leaks)
-        self.assertIsInstance(error, KeyboardInterrupt)
-        runner.terminate.assert_called_once()
-        self.assertEqual(events, [("kill", 100), ("rmtree",)], "workers are cleaned before the base is removed")
 
 
 class JunitReportActionTests(ScriptScenario):
