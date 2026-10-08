@@ -571,6 +571,8 @@ Signed runtime catalog:
 - `crates/daemon/src/doctor.rs` — the `catalog_trust_anchor` doctor check.
 - `crates/xtask/src/catalog.rs` — `cargo xtask catalog build|sign|verify|anchor|public-key`.
 - `crates/xtask/src/catalog_key.rs` — owner-private signing key file reader.
+- `packaging/runtime-catalog-anchor.json` — the production trust anchor shipped beside `pohunekd`.
+- `packaging/catalog-trust/roots.txt` — the production roots and windows (with the `primary.pub` and `ci.pub` public keys) the anchor is generated from.
 - `crates/cli/tests/plugin_catalog_install.rs` — clean-environment official install through a real daemon with a test key.
 
 Hermes compatibility evidence:

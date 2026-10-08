@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "roots": [
+    {
+      "key_id": "e68204fe73c49ca6df7892bda5bdbb9a1694bf240e0e2d8ed80268574c8cd771",
+      "public_key": "bb8ed4ca3c1942b19d4774083a85e18259a2a498259dbd42073ccc8385aa344a",
+      "not_before": 1791417600,
+      "not_after": 1854576000
+    },
+    {
+      "key_id": "f52cf66e089130ee817e18db5b52db21ee6b002c29615f47d80b168931ba89fe",
+      "public_key": "6e1a40f0d584e78bea571a5b15c8c26e056c4f495541699e38cf2473d1cb089a",
+      "not_before": 1791417600,
+      "not_after": 2107036800
+    }
+  ],
+  "revoked_key_ids": []
+}
