@@ -243,6 +243,22 @@ and convergence rules are in RFC §§11 and 16. A snapshot is not offline histor
 Relay outages do not stop host sessions or affect local and NetBird owner
 operation; revoked-share sessions continue permanently as owner-only.
 
+## Planned unattended factory extension (design only)
+
+The accepted relay dark factory RFC (`docs/design/relay-dark-factory-rfc.md`,
+[#185](https://github.com/zajca/pohunek/issues/185)) adds an unattended
+Manage–Execute–Audit mode above this relay design; it is not implemented and
+ships no relay surface yet. It adds task-layer ACLs and delegation budgets,
+attention escalation to human principals, and — in its 2026-10-08 amendment —
+six contracts: durable client work items, a client acceptance policy,
+host-enforced human input control (`task.input_control`), protected
+audit-reserve accounting, the versioned FactorySpec run manifest, and bounded
+progress diagnostics. Factory task and run state stays client-owned; the
+relay persists only bounded, content-free metadata inside the classification
+rules above. The relay RFC reconciliation is tracked by
+[#233](https://github.com/zajca/pohunek/issues/233); factory RFC section 3 maps
+the affected contracts. These are design obligations, not shipped capabilities.
+
 ## Implementation references
 
 The complete normative contract is in
