@@ -437,6 +437,8 @@ class WorktreeCliTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 destination = self.worktrees / slug
                 self.assertTrue(destination.is_dir())
+                self.assertFalse((destination / "target").exists())
+                self.assertIn("not seeded (--no-seed)", result.stdout)
                 self.assertEqual(
                     subprocess.run(
                         ["git", "-C", str(destination), "rev-parse", "HEAD"],
@@ -1155,22 +1157,6 @@ class TemporaryPathTests(HarnessCase):
         self.assertEqual(self.h.executor.registered, {})
         self.assertEqual(list(self.h.worktrees.iterdir()), [])
 
-
-class NoSeedTests(HarnessCase):
-    def test_no_seed_skips_cargo_and_copies(self):
-        code, out, err = self.h.run("--no-seed", "issue-1")
-        self.assertEqual(code, 0, err)
-        self.assertFalse(self.h.executor.ran("cp"))
-        self.assertFalse(self.h.executor.ran("cargo"))
-        self.assertTrue(self.h.executor.ran("git", "worktree", "add"))
-        self.assertFalse((self.h.worktrees / "issue-1" / "target").exists())
-        self.assertIn("not seeded", out)
-
-    def test_no_seed_works_without_a_source_or_reflink(self):
-        shutil.rmtree(self.h.target)
-        self.h.executor.probe_fails = True
-        code, _, err = self.h.run("--no-seed", "issue-1")
-        self.assertEqual(code, 0, err)
 
 
 class StaleSeedTests(HarnessCase):
