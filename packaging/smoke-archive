@@ -1,0 +1,388 @@
+#!/bin/sh
+# Network-isolated smoke of a final release daemon archive.
+#
+# usage: smoke-archive --archive <pohunek-daemon-...tar.gz> --stage <dir>
+#                      --consumer <release-consumer-test-executable>
+#                      [--runtime <id>]... [--isolation auto|userns|sudo]
+#
+# Proves that the archive alone - its binaries, its signed catalog and trust
+# anchor, its runtime packages - installs and serves every official runtime
+# through the real upstream, with no network and no source tree:
+#
+#   1. extracts the archive into a fresh private temp directory after refusing
+#      absolute, `..`, link and special members, and runs the archive's own
+#      `packaging/verify-archive` on the unpacked tree;
+#   2. derives the runtimes from `runtime/packages/*.tar.zst` (the set is data;
+#      `--runtime` only restricts it) and requires a staged upstream
+#      `<stage>/<runtime>/` for every one of them (a missing stage fails);
+#   3. enters a fresh network namespace (plus a PID namespace, so no process can
+#      outlive the run), brings loopback up, asserts that loopback is the only
+#      interface and that no default route exists, and re-verifies every stage
+#      with `sha256sum -c STAGE.sha256` and a link check, using POSIX tools only;
+#   4. runs the prebuilt consumer test executable once per runtime with
+#      PATH = `<stage>/<runtime>/bin` + the system node directory, a hermetic
+#      HOME/XDG tree, a temp working directory and only the
+#      `POHUNEK_CONSUMER_*` contract variables, pointing into the extracted
+#      archive (`POHUNEK_CONSUMER_CATALOG` selects smoke mode, so the archive's
+#      own signed catalog and anchor are the trust);
+#   5. checks every consumer report against the archive: `package_digest` equals
+#      the catalog entry's digest (and the package file's bytes) and
+#      `executables` equal the SHA-256 of the archive's binaries.
+#
+# Isolation strategies (`--isolation`, default auto picks the first that works):
+#   userns  `unshare --user --map-root-user --net --pid`: needs unprivileged
+#           user namespaces (Ubuntu 24.04 blocks them through AppArmor unless
+#           `kernel.apparmor_restrict_unprivileged_userns=0`).
+#   sudo    `sudo -n unshare --net --pid`, loopback brought up as root, then
+#           the invoking uid/gid is restored with `setpriv` before anything else
+#           runs, with all capabilities dropped.
+# When neither works the script fails; there is no un-isolated fallback.
+#
+# This script comes from the checkout and runs outside the namespace up to
+# step 3. "No source-tree path" is about everything the daemon, worker, CLI and
+# upstream see: the archive, stage and temp paths are refused when they lie
+# inside the checkout, and the consumer executable is copied to the temp
+# directory and run from there. Linux only (util-linux unshare, iproute2, jq).
+
+set -eu
+
+# Name of the consumer test selected from the prebuilt executable; it is the
+# one real out-of-process test of crates/cli/tests/release_consumer.rs.
+consumer_test=the_release_binaries_serve_the_runtime_out_of_process
+# The executables a daemon archive ships and the consumer report hashes.
+binaries="pohunek pohunekd pohunek-sessiond"
+
+fail() {
+    printf 'smoke-archive: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    echo "usage: smoke-archive --archive <daemon.tar.gz> --stage <dir> --consumer <executable> [--runtime <id>]... [--isolation auto|userns|sudo]" >&2
+    exit 2
+}
+
+safe_id() {
+    case $1 in
+        '' | *[!a-z0-9._-]*) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Inner half: runs inside the network and PID namespaces.
+# ---------------------------------------------------------------------------
+
+stage_check() {
+    stage_dir=$1
+    [ -d "$stage_dir" ] && [ ! -L "$stage_dir" ] || fail "staged upstream is not a directory: $stage_dir"
+    [ -f "$stage_dir/STAGE.sha256" ] || fail "staged upstream has no STAGE.sha256: $stage_dir"
+    (cd "$stage_dir" && sha256sum -c STAGE.sha256 >/dev/null 2>&1) \
+        || fail "staged upstream does not match STAGE.sha256: $stage_dir"
+    stage_real=$(cd "$stage_dir" && pwd -P)
+    # `sha256sum -c` follows links, so a link leaving the stage would pass with
+    # matching foreign bytes.
+    find "$stage_dir" -type l | while IFS= read -r link; do
+        target=$(readlink -f -- "$link") || fail "unresolvable link in staged upstream: $link"
+        case $target in
+            "$stage_real"/*) ;;
+            *) fail "link leaves the staged upstream: $link" ;;
+        esac
+    done
+    # Every file that can run must be covered by the digest list; STAGE.links
+    # (links and executable bits) holds no payload.
+    listed=$(sed 's/^[0-9a-fA-F]*  *\*\{0,1\}//; s|^\./||' "$stage_dir/STAGE.sha256" | LC_ALL=C sort)
+    present=$(cd "$stage_dir" && find . -type f ! -name STAGE.sha256 ! -name STAGE.links | sed 's|^\./||' | LC_ALL=C sort)
+    printf '%s\n' "$listed" > "$work/listed.txt"
+    printf '%s\n' "$present" > "$work/present.txt"
+    unlisted=$(LC_ALL=C comm -13 "$work/listed.txt" "$work/present.txt")
+    [ -z "$unlisted" ] || fail "staged upstream holds files STAGE.sha256 does not list: $(printf '%s' "$unlisted" | head -n 1)"
+}
+
+network_check() {
+    link=$(ip -o link show lo 2>/dev/null) || fail "cannot read the loopback state (iproute2 'ip' is required)"
+    case $link in
+        *[\<,]UP[\>,]*) ;;
+        *) fail "loopback is not up inside the namespace" ;;
+    esac
+    ifaces=$(sed -n '3,$p' /proc/net/dev | sed 's/:.*//; s/^ *//')
+    [ "$ifaces" = lo ] || fail "the namespace is not isolated, interfaces: $(printf '%s' "$ifaces" | tr '\n' ' ')"
+    default_routes=$(awk 'NR > 1 && $2 == "00000000"' /proc/net/route)
+    [ -z "$default_routes" ] || fail "the namespace has a default route"
+}
+
+stray_check() {
+    for proc_dir in /proc/[0-9]*; do
+        pid=${proc_dir#/proc/}
+        if [ "$pid" != "$$" ]; then
+            fail "a process outlived the consumer run (pid $pid)"
+        fi
+    done
+}
+
+inner_main() {
+    isolation=$1
+    work=$2
+    root=$3
+    stage=$4
+    consumer=$5
+    node_dir=$6
+    shift 6
+    if [ "$isolation" = userns ]; then
+        ip link set lo up || fail "cannot bring loopback up inside the namespace"
+    fi
+    network_check
+    for rt in "$@"; do
+        stage_check "$stage/$rt"
+    done
+    for rt in "$@"; do
+        run=$work/run/$rt
+        mkdir -p "$work/t" "$run/home" "$run/cwd" "$run/config" "$run/data" "$run/state" "$run/cache"
+        (
+            cd "$run/cwd"
+            exec env -i \
+                PATH="$stage/$rt/bin:$node_dir" \
+                HOME="$run/home" \
+                XDG_CONFIG_HOME="$run/config" \
+                XDG_DATA_HOME="$run/data" \
+                XDG_STATE_HOME="$run/state" \
+                XDG_CACHE_HOME="$run/cache" \
+                TMPDIR="$work/t" \
+                LANG=C.UTF-8 \
+                POHUNEK_CONSUMER_BIN_DIR="$root" \
+                POHUNEK_CONSUMER_RUNTIME="$rt" \
+                POHUNEK_CONSUMER_PACKAGE="$root/runtime/packages/$rt.tar.zst" \
+                POHUNEK_CONSUMER_CATALOG="$root/runtime/runtime-catalog.json" \
+                POHUNEK_CONSUMER_REPORT="$run/report.json" \
+                "$consumer" --exact "$consumer_test" --nocapture
+        ) || fail "the consumer run failed for runtime $rt"
+        stray_check
+        [ -f "$run/report.json" ] || fail "the consumer wrote no report for runtime $rt"
+    done
+}
+
+if [ "${1:-}" = __inner ]; then
+    shift
+    inner_main "$@"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Outer half: argument handling, extraction, namespace entry, report checks.
+# ---------------------------------------------------------------------------
+
+archive=
+stage=
+consumer=
+isolation=auto
+requested=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --archive) [ "$#" -ge 2 ] || usage; archive=$2; shift 2 ;;
+        --stage) [ "$#" -ge 2 ] || usage; stage=$2; shift 2 ;;
+        --consumer) [ "$#" -ge 2 ] || usage; consumer=$2; shift 2 ;;
+        --runtime)
+            [ "$#" -ge 2 ] || usage
+            safe_id "$2" || fail "invalid runtime id: $2"
+            requested="$requested $2"
+            shift 2
+            ;;
+        --isolation) [ "$#" -ge 2 ] || usage; isolation=$2; shift 2 ;;
+        --isolation=*) isolation=${1#--isolation=}; shift ;;
+        *) usage ;;
+    esac
+done
+[ -n "$archive" ] && [ -n "$stage" ] && [ -n "$consumer" ] || usage
+case $isolation in
+    auto | userns | sudo) ;;
+    *) fail "--isolation must be auto, userns or sudo" ;;
+esac
+[ "$(uname -s)" = Linux ] || fail "the archive smoke needs Linux network namespaces"
+for tool in tar sha256sum jq unshare ip awk sed find readlink comm mktemp; do
+    command -v "$tool" >/dev/null 2>&1 || fail "required tool is missing: $tool"
+done
+[ -f "$archive" ] && [ ! -L "$archive" ] || fail "archive is not a regular file: $archive"
+[ -d "$stage" ] && [ ! -L "$stage" ] || fail "stage is not a directory: $stage"
+[ -f "$consumer" ] && [ -x "$consumer" ] || fail "consumer is not an executable file: $consumer"
+archive=$(cd "$(dirname -- "$archive")" && pwd -P)/$(basename -- "$archive")
+stage=$(cd "$stage" && pwd -P)
+consumer=$(cd "$(dirname -- "$consumer")" && pwd -P)/$(basename -- "$consumer")
+self=$(cd "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")
+checkout=$(cd "$(dirname -- "$self")/.." && pwd -P)
+
+umask 022
+work=$(mktemp -d "${TMPDIR:-/tmp}/pks.XXXXXX")
+chmod 700 "$work"
+work=$(cd "$work" && pwd -P)
+ns_pid=
+cleanup() {
+    status=$?
+    trap '' EXIT
+    if [ -n "$ns_pid" ]; then
+        kill "$ns_pid" 2>/dev/null || true
+        wait "$ns_pid" 2>/dev/null || true
+    fi
+    rm -rf -- "$work"
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Nothing the daemon, worker, CLI or upstream sees may lie in the checkout.
+for path in "$stage" "$work"; do
+    case $path in
+        "$checkout" | "$checkout"/*) fail "$path lies inside the checkout $checkout" ;;
+    esac
+done
+
+# --- extraction --------------------------------------------------------------
+tar -tvzf "$archive" > "$work/members-long.txt" 2>/dev/null || fail "cannot list the archive: $archive"
+tar -tzf "$archive" > "$work/members.txt" 2>/dev/null || fail "cannot list the archive: $archive"
+[ -s "$work/members.txt" ] || fail "the archive is empty"
+while IFS= read -r line; do
+    case $line in
+        -* | d*) ;;
+        *) fail "the archive holds a link or special member: $line" ;;
+    esac
+done < "$work/members-long.txt"
+top=
+while IFS= read -r member; do
+    case $member in
+        '' | /* | ../* | */../* | */.. | .. | ./* | */./* | *//* | *[!A-Za-z0-9._+@=,/-]*)
+            fail "the archive holds an unsafe member path: $member"
+            ;;
+    esac
+    first=${member%%/*}
+    if [ -z "$top" ]; then
+        top=$first
+    elif [ "$first" != "$top" ]; then
+        fail "the archive has more than one top-level entry: $first"
+    fi
+done < "$work/members.txt"
+mkdir "$work/archive"
+tar -xzf "$archive" -C "$work/archive" --no-same-owner 2>/dev/null || fail "cannot extract the archive"
+root=$work/archive/$top
+[ -d "$root" ] && [ ! -L "$root" ] || fail "the archive has no top-level directory"
+unsafe=$(find "$root" ! -type f ! -type d -print | head -n 1)
+[ -z "$unsafe" ] || fail "the extracted archive holds a link or special file: $unsafe"
+
+# --- archive checks ----------------------------------------------------------
+for member in MANIFEST packaging/verify-archive runtime-catalog-anchor.json runtime/runtime-catalog.json $binaries; do
+    [ -f "$root/$member" ] || fail "the archive lacks $member"
+done
+"$root/packaging/verify-archive" "$root" daemon $binaries >/dev/null \
+    || fail "the archive's own verify-archive refused the archive"
+manifest_covers() {
+    grep -q "^sha256 [0-9a-f]\{64\} $1\$" "$root/MANIFEST" || fail "MANIFEST does not cover $1"
+}
+manifest_covers runtime/runtime-catalog.json
+
+shipped=
+for package in "$root"/runtime/packages/*.tar.zst; do
+    [ -f "$package" ] || continue
+    rt=$(basename -- "$package" .tar.zst)
+    safe_id "$rt" || fail "invalid runtime package name: $package"
+    manifest_covers "runtime/packages/$rt.tar.zst"
+    shipped="$shipped $rt"
+done
+[ -n "$shipped" ] || fail "the archive ships no runtime package"
+if [ -z "$requested" ]; then
+    runtimes=$shipped
+else
+    runtimes=
+    for rt in $requested; do
+        case " $shipped " in
+            *" $rt "*) runtimes="$runtimes $rt" ;;
+            *) fail "runtime $rt is not shipped by the archive (shipped:$shipped)" ;;
+        esac
+    done
+fi
+for rt in $runtimes; do
+    [ -d "$stage/$rt" ] && [ ! -L "$stage/$rt" ] \
+        || fail "no staged upstream for the shipped package $rt: $stage/$rt"
+done
+
+expected_digest() {
+    jq -r --arg rt "$1" '[.catalog.entries[] | select(.runtime_id == $rt)] | if length == 1 then .[0].digest else empty end' \
+        "$root/runtime/runtime-catalog.json" || fail "cannot read the catalog"
+}
+for rt in $runtimes; do
+    digest=$(expected_digest "$rt")
+    case $digest in
+        sha256:????????????????????????????????????????????????????????????????) ;;
+        *) fail "the catalog has no single entry with a digest for runtime $rt" ;;
+    esac
+    [ "$digest" = "sha256:$(sha256sum -- "$root/runtime/packages/$rt.tar.zst" | cut -d' ' -f1)" ] \
+        || fail "the shipped package of $rt does not match its catalog digest"
+done
+expected_binary_sha() {
+    sha256sum -- "$root/$1" | cut -d' ' -f1
+}
+
+# --- namespace ---------------------------------------------------------------
+cp -- "$consumer" "$work/consumer"
+chmod 755 "$work/consumer"
+node_bin=$(command -v node) || fail "node is required on PATH (the upstreams are node programs)"
+node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
+uid=$(id -u)
+gid=$(id -g)
+mkdir "$work/run"
+
+run_userns() {
+    unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
+        /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
+}
+run_sudo() {
+    sudo -n env PATH="$PATH" unshare --net --pid --fork --kill-child --mount-proc \
+        /bin/sh -c 'ip link set lo up && u=$1 && g=$2 && shift 2 && exec setpriv --reuid="$u" --regid="$g" --clear-groups --inh-caps=-all --bounding-set=-all "$@"' \
+        sh "$uid" "$gid" /bin/sh "$self" __inner sudo "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
+}
+probe_userns() {
+    unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1
+}
+probe_sudo() {
+    command -v sudo >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 \
+        && sudo -n unshare --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1
+}
+
+chosen=$isolation
+if [ "$chosen" = auto ]; then
+    if probe_userns; then
+        chosen=userns
+    elif probe_sudo; then
+        chosen=sudo
+    else
+        fail "no network isolation is available: unprivileged user namespaces are denied and 'sudo -n unshare' does not work; refusing to run un-isolated"
+    fi
+fi
+echo "smoke-archive: isolation $chosen, runtimes:$runtimes"
+case $chosen in
+    userns) probe_userns || fail "isolation userns is not available on this host" ;;
+    sudo) probe_sudo || fail "isolation sudo is not available on this host" ;;
+esac
+
+# The namespace runs in the background so a signal reaches the trap at once.
+"run_$chosen" &
+ns_pid=$!
+ns_status=0
+wait "$ns_pid" || ns_status=$?
+ns_pid=
+[ "$ns_status" -eq 0 ] || fail "the isolated run failed (exit $ns_status)"
+
+# --- reports -----------------------------------------------------------------
+for rt in $runtimes; do
+    report=$work/run/$rt/report.json
+    [ -f "$report" ] || fail "no consumer report for runtime $rt"
+    jq -e --arg rt "$rt" --arg digest "$(expected_digest "$rt")" \
+        --arg a "$(expected_binary_sha pohunek)" \
+        --arg b "$(expected_binary_sha pohunekd)" \
+        --arg c "$(expected_binary_sha pohunek-sessiond)" \
+        '.schema == 1 and .runtime == $rt and .package_digest == $digest
+         and (.executables | keys) == ["pohunek", "pohunek-sessiond", "pohunekd"]
+         and .executables.pohunek == $a and .executables.pohunekd == $b
+         and .executables["pohunek-sessiond"] == $c' "$report" >/dev/null \
+        || fail "the consumer report for $rt does not match the archive's catalog digest and binaries"
+    upstream=$(jq -r '.upstream_version' "$report")
+    echo "smoke-archive: $rt ok (upstream $upstream, package $(expected_digest "$rt"))"
+done
+echo "smoke-archive: all runtimes passed"

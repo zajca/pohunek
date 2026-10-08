@@ -223,6 +223,66 @@ marketplace switch off) and returns the profile `[env]`, and the text of the
 reply as it appears on screen. Reuse a stub from `crates/cli/tests/support/`
 or add one beside them.
 
+## Archive smoke
+
+`packaging/smoke-archive` proves that a final daemon archive from `cargo xtask
+release assemble` serves every official runtime with no network and no source
+tree. It runs the prebuilt consumer executable in smoke mode, once per runtime:
+
+```sh
+cargo test --no-run -p pohunek-cli --test release_consumer   # prints the executable path
+packaging/smoke-archive \
+  --archive <bundle>/pohunek-daemon-<v>-<target>.tar.gz \
+  --stage <stage-dir> \
+  --consumer <release_consumer-executable> \
+  [--runtime <id>]... [--isolation auto|userns|sudo]
+```
+
+`<stage-dir>/<runtime>/` is the staged upstream of each runtime: an npm prefix
+with `bin/<binary>` and a `STAGE.sha256` digest list. The runtime set is data:
+it is the `runtime/packages/*.tar.zst` the archive ships, and a shipped package
+without a staged upstream is a failure, not a skip (`--runtime` only restricts
+the set). Steps, each fail-closed:
+
+1. Refuse an archive with absolute, `..`, link or special members, extract it
+   into a private temp directory, run the archive's own
+   `packaging/verify-archive`, and require the catalog and every package to be
+   covered by `MANIFEST` and every package to match its catalog digest.
+2. Enter a fresh network and PID namespace, bring loopback up and assert that
+   loopback is the only interface and that no default route exists. A process
+   that outlives a consumer run fails the run and dies with the namespace.
+3. Inside the namespace verify each stage with `sha256sum -c STAGE.sha256`
+   (every file listed, no link leaving the stage).
+4. Run the consumer copy from a temp working directory with `PATH` =
+   `<stage>/<runtime>/bin` + the system node directory, a hermetic
+   `HOME`/`XDG_*`, and only the `POHUNEK_CONSUMER_*` variables, pointing into
+   the extracted archive (`POHUNEK_CONSUMER_CATALOG` is the archive's signed
+   catalog, so its own anchor is the trust).
+5. Require each report's `package_digest` to equal the catalog entry's digest
+   and its `executables` to equal the SHA-256 of the archive's binaries.
+
+Isolation strategies, chosen at run time (`--isolation` forces one): `userns`
+(`unshare --user --map-root-user --net --pid`, needs unprivileged user
+namespaces, which Ubuntu 24.04 blocks through AppArmor unless
+`kernel.apparmor_restrict_unprivileged_userns=0`) and `sudo` (`sudo -n unshare
+--net --pid`, loopback raised as root, then the invoking uid/gid is restored
+with `setpriv` and all capabilities dropped). If neither works the script
+fails; there is no un-isolated fallback. It needs Linux, util-linux `unshare`,
+iproute2 `ip`, `jq` and `node` on `PATH`.
+
+What it proves: the released bytes, catalog and anchor, the staged upstream
+and the packages work together offline, and the consumer saw no path of the
+checkout (stage and temp paths inside the checkout are refused, the consumer
+executable is copied out of `target/`). The script itself comes from the
+checkout and runs outside the namespace until step 2. It does not prove other
+platforms: macOS has no network namespaces, so a macOS row is not covered. The
+consumer's temp root is kept short (`/tmp/pks.XXXXXX/t`) because the suite
+refuses a `TMPDIR` that makes its socket paths too long.
+
+Scenarios: `python3 -m unittest scripts.tests.test_smoke_archive` (synthetic
+archive and stub consumers; the `sudo` scenario is skipped where `sudo -n` is
+unavailable).
+
 ## Conventions that matter here
 
 - **Rust guidelines are mandatory.** The Microsoft Pragmatic Rust Guidelines
