@@ -101,7 +101,9 @@ async fn managed_cli_lists_sessions_and_rejects_self_attach_across_daemon_restar
          list) \"$cli\" session list --json; printf 'list-exit:%s\\n' \"$?\";; \
          attach-*) printf 'attempt:%s\\n' \"$action\"; \
          \"$cli\" attach \"$POHUNEK_SESSION_ID\" 2>&1; \
-         printf '%s-exit:%s\\n' \"$action\" \"$?\";; esac; done",
+         printf '%s-exit:%s\\n' \"$action\" \"$?\";; \
+         stop-after) \"$cli\" session stop \"$POHUNEK_SESSION_ID\" --json 2>&1; \
+         printf 'stop-after-exit:%s\\n' \"$?\";; esac; done",
         cli.display()
     );
     let profile = format!(
@@ -170,6 +172,25 @@ async fn managed_cli_lists_sessions_and_rejects_self_attach_across_daemon_restar
             "CLI must report the daemon's self-feedback rejection"
         );
     }
+    client
+        .call::<method::SessionInput>(SessionInputParams {
+            session_id: SessionId(session.clone()),
+            text: "stop-after".to_owned(),
+            wait: None,
+        })
+        .await
+        .expect("request self-target stop inside managed PTY");
+    let output = read_until(
+        &mut attach,
+        "denied self-target stop after restart",
+        |bytes| contains(bytes, b"stop-after-exit:1"),
+    )
+    .await;
+    assert!(
+        contains(&output, b"plugin_self_target_denied"),
+        "CLI must surface the self-target mutation denial"
+    );
+    fixture.assert_same_runtime(&before).await;
     drop(attach);
     client
         .call::<method::SessionRemove>(SessionId(session))

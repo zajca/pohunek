@@ -23,8 +23,8 @@ use pohunek_test_support::process_env::ProcessEnv;
 use pohunek_test_support::wait::{guard, wait_until};
 use pohunek_test_support::worker_binary;
 use protocol::{
-    event, CwdSource, RuntimeRef, SessionAttachParams, SessionId, SessionInfo, SessionInputParams,
-    SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
+    event, CwdSource, RuntimeRef, RuntimeState, SessionAttachParams, SessionId, SessionInfo,
+    SessionInputParams, SessionNewParams, ENV_DAEMON_ID, ENV_SESSION_ID,
 };
 
 // Sessions use the production stop grace, `SessionRegistryConfig::default()`:
@@ -273,8 +273,22 @@ impl ProcessInspector for PollBlindInspector {
 /// leaves room for the worker's nested control socket.
 fn worker_backed_registry(
     env: &TestEnv,
+    config: SessionRegistryConfig,
+    inspector: Arc<dyn ProcessInspector>,
+) -> SessionRegistry {
+    worker_backed_registry_with_launcher(
+        env,
+        config,
+        inspector,
+        Arc::new(SubprocessWorkerLauncher::new()),
+    )
+}
+
+fn worker_backed_registry_with_launcher(
+    env: &TestEnv,
     mut config: SessionRegistryConfig,
     inspector: Arc<dyn ProcessInspector>,
+    launcher: Arc<SubprocessWorkerLauncher>,
 ) -> SessionRegistry {
     let worker_environment = SubprocessWorkerEnvironment {
         runtime_home: env.runtime_dir().to_path_buf(),
@@ -292,7 +306,6 @@ fn worker_backed_registry(
             .supervision(worker_binary())
             .with_environment_source(EnvironmentSource::fixed(env.environment().clone())),
     );
-    let launcher = Arc::new(SubprocessWorkerLauncher::new());
     SessionRegistry::new_with_launcher_and_inspector(config, launcher, inspector)
 }
 
@@ -377,6 +390,197 @@ async fn procwatch_auto_reports_and_pidfd_clears_real_child_agent() {
     assert_eq!(after_scan.active_agent_pid, None);
     assert_eq!(after_scan.active_agent, None);
     let _ = registry.stop(&created.id).await;
+}
+
+#[tokio::test]
+async fn procwatch_keeps_worker_agent_after_daemon_restart() {
+    let env = TestEnv::new().expect("create the test environment");
+    let dir = env.cwd();
+    let fake_codex = dir.join("codex");
+    let pid_file = dir.join("agent.pid");
+    symlink_sleep_as(&fake_codex);
+    let script = format!(
+        "{} {SHELL_LINGER_SECS} & echo $! > {}; wait $!",
+        fake_codex.display(),
+        pid_file.display()
+    );
+    let config = SessionRegistryConfig {
+        shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+        store_path: Some(env.state_home().join("metadata.jsonl")),
+        procwatch_poll: TEST_PROCWATCH_POLL,
+        ..SessionRegistryConfig::default()
+    };
+    let launcher = Arc::new(SubprocessWorkerLauncher::new());
+    let (created, child_pid, first_daemon_id) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("first daemon runtime");
+                runtime.block_on(async {
+                    let first = worker_backed_registry_with_launcher(
+                        &env,
+                        config.clone(),
+                        Arc::new(HostInspector::new()),
+                        Arc::clone(&launcher),
+                    );
+                    let created = {
+                        let _process_env = without_pohunek_markers();
+                        first
+                            .create(SessionNewParams {
+                                name: Some("procwatch-restart-agent".to_owned()),
+                                agent: "shell".to_owned(),
+                                cwd: Some(dir.to_path_buf()),
+                                cols: TEST_COLS,
+                                rows: TEST_ROWS,
+                                project: None,
+                                repo: None,
+                                branch: None,
+                                base_branch: None,
+                                input: None,
+                                metadata: BTreeMap::new(),
+                            })
+                            .await
+                            .expect("create shell session")
+                    };
+                    let child_pid = wait_for_pid_file(&pid_file).await;
+                    wait_for_observed_pid(&first, &created.id, child_pid).await;
+                    let daemon_id = first.daemon_instance_id().to_owned();
+                    first.begin_daemon_shutdown();
+                    (created, child_pid, daemon_id)
+                })
+            })
+            .join()
+            .expect("first daemon thread")
+    });
+
+    let second = worker_backed_registry_with_launcher(
+        &env,
+        config,
+        Arc::new(HostInspector::new()),
+        launcher,
+    );
+    assert_ne!(second.daemon_instance_id(), first_daemon_id);
+    second.reconcile_workers().await.expect("adopt live worker");
+    let reconciled = second
+        .inspect(&created.id)
+        .await
+        .expect("inspect adopted session");
+    assert_eq!(
+        reconciled.runtime.as_ref().map(|runtime| runtime.state),
+        Some(RuntimeState::Live),
+        "a restarted daemon must adopt the live worker"
+    );
+    let adopted = wait_until("the restarted daemon to observe the agent", || async {
+        let info = second.inspect(&created.id).await.expect("inspect session");
+        (info.active_agent_pid == Some(child_pid)).then_some(info)
+    })
+    .await;
+    assert_eq!(adopted.active_agent.as_deref(), Some("codex"));
+    second
+        .stop(&created.id)
+        .await
+        .expect("stop adopted session");
+    second
+        .remove(&created.id)
+        .await
+        .expect("remove adopted session");
+}
+
+#[tokio::test]
+async fn procwatch_skips_nested_worker_agent_with_same_session_marker() {
+    let env = TestEnv::new().expect("create the test environment");
+    let dir = env.cwd();
+    let fake_codex = dir.join("codex");
+    let pid_file = dir.join("nested-agent.pid");
+    let missing_session_pid_file = dir.join("missing-session-agent.pid");
+    symlink_sleep_as(&fake_codex);
+    let script = format!(
+        "POHUNEK_DAEMON_ID=daemon-nested POHUNEK_WORKER_INSTANCE_ID=runtime-nested \
+         {} {SHELL_LINGER_SECS} & echo $! > {}; \
+         (unset POHUNEK_SESSION_ID; \
+         POHUNEK_DAEMON_ID=daemon-nested exec {} {SHELL_LINGER_SECS}) \
+         & echo $! > {}; wait",
+        fake_codex.display(),
+        pid_file.display(),
+        fake_codex.display(),
+        missing_session_pid_file.display()
+    );
+    let inspector = PollBlindInspector::new();
+    let registry = worker_backed_registry(
+        &env,
+        SessionRegistryConfig {
+            shell_command: ShellCommand::new("/bin/sh", ["-c", script.as_str()]),
+            procwatch_poll: TEST_PROCWATCH_POLL,
+            ..SessionRegistryConfig::default()
+        },
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
+    let created = {
+        let _process_env = without_pohunek_markers();
+        registry
+            .create(SessionNewParams {
+                name: Some("procwatch-nested-worker".to_owned()),
+                agent: "shell".to_owned(),
+                cwd: Some(dir.to_path_buf()),
+                cols: TEST_COLS,
+                rows: TEST_ROWS,
+                project: None,
+                repo: None,
+                branch: None,
+                base_branch: None,
+                input: None,
+                metadata: BTreeMap::new(),
+            })
+            .await
+            .expect("create shell session")
+    };
+    let nested_pid = wait_for_pid_file(&pid_file).await;
+    let markers = wait_until("the nested agent to exec with worker markers", || async {
+        inspector
+            .ownership_markers(nested_pid)
+            .ok()
+            .filter(|markers| markers.worker_instance_id.as_deref() == Some("runtime-nested"))
+    })
+    .await;
+    assert_eq!(markers.session_id.as_deref(), Some(created.id.0.as_str()));
+    assert_eq!(
+        markers.worker_instance_id.as_deref(),
+        Some("runtime-nested")
+    );
+    let missing_session_pid = wait_for_pid_file(&missing_session_pid_file).await;
+    wait_until("the agent to exec with hostile markers", || async {
+        inspector
+            .ownership_markers(missing_session_pid)
+            .ok()
+            .filter(|markers| {
+                markers.session_id.is_none()
+                    && markers.daemon_id.as_deref() == Some("daemon-nested")
+                    && markers.worker_instance_id.as_deref()
+                        == created
+                            .runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.worker_instance_id.as_deref())
+            })
+    })
+    .await;
+
+    let listed_at = inspector.listings();
+    wait_until("procwatch to scan the nested agent", || async {
+        (inspector.listings() >= listed_at + 2).then_some(())
+    })
+    .await;
+    let observed = registry
+        .inspect(&created.id)
+        .await
+        .expect("inspect session");
+    assert_eq!(
+        observed.active_agent_pid, None,
+        "nested worker agent was adopted"
+    );
+    registry.stop(&created.id).await.expect("stop session");
+    registry.remove(&created.id).await.expect("remove session");
 }
 
 #[tokio::test]

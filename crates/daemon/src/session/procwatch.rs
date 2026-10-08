@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use pohunek_platform::process::WorkerInstanceMarker;
 use protocol::{event, CwdSource, RuntimeRef, SessionInfo};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
@@ -165,7 +166,13 @@ impl SessionRegistry {
                     .await
                     .get(id)
                     .and_then(|entry| entry.pinned.clone());
-                Some(self.observed_agents_from_facts(id, facts, now, pinned.as_ref()))
+                Some(self.observed_agents_from_facts_for_runtime(
+                    id,
+                    facts,
+                    now,
+                    pinned.as_ref(),
+                    Some(&expected.worker_instance_id),
+                ))
             }
             Err(err) => {
                 warn!(
@@ -361,12 +368,24 @@ impl SessionRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn observed_agents_from_facts(
         &self,
         id: &SessionId,
         facts: Vec<ProcessFact>,
         now: Instant,
         pinned: Option<&Arc<RuntimeDefinition>>,
+    ) -> HashMap<Pid, ObservedAgent> {
+        self.observed_agents_from_facts_for_runtime(id, facts, now, pinned, None)
+    }
+
+    fn observed_agents_from_facts_for_runtime(
+        &self,
+        id: &SessionId,
+        facts: Vec<ProcessFact>,
+        now: Instant,
+        pinned: Option<&Arc<RuntimeDefinition>>,
+        worker_instance_id: Option<&str>,
     ) -> HashMap<Pid, ObservedAgent> {
         facts
             .into_iter()
@@ -385,7 +404,7 @@ impl SessionRegistry {
                     None => identify_definition(self.inner.profiles.runtimes(), &fact)?,
                 };
                 let agent_base = RuntimeRef::from(definition.runtime_id().clone());
-                if self.is_foreign_owned_agent(id, fact.pid) {
+                if self.is_foreign_owned_agent(id, fact.pid, worker_instance_id) {
                     return None;
                 }
                 let cwd = self.inner.inspector.cwd(fact.pid).ok();
@@ -405,17 +424,19 @@ impl SessionRegistry {
             .collect()
     }
 
-    /// Whether `pid` carries pohunek ownership markers naming a different
-    /// daemon instance or session — an agent PTY spawned by a *nested* daemon
-    /// (a test-suite loopback daemon, a self-hosted dev run) that lives inside
-    /// this session's process subtree. Adopting it would hijack this session's
-    /// active agent and cwd (and, transitively, its project association), so it
-    /// must never become an observed agent. Missing markers keep the process
-    /// eligible: an agent this session launched inherits the session's own
-    /// markers, and an env-scrubbed process stays observable as before.
-    /// Unreadable markers also keep it eligible — preferring the established
-    /// behavior over dropping a legitimate agent on a transient read failure.
-    fn is_foreign_owned_agent(&self, id: &SessionId, pid: Pid) -> bool {
+    /// Rejects agents owned by another session or worker runtime.
+    ///
+    /// A live worker keeps its launch daemon ID after daemon restart. Its
+    /// worker instance marker remains stable, while a nested daemon's worker
+    /// has a different marker. A stale daemon ID is accepted only when both
+    /// the session and worker instance markers match. Missing or unreadable
+    /// markers retain the established observation behavior.
+    fn is_foreign_owned_agent(
+        &self,
+        id: &SessionId,
+        pid: Pid,
+        worker_instance_id: Option<&str>,
+    ) -> bool {
         let markers = match self.inner.inspector.ownership_markers(pid) {
             Ok(markers) => markers,
             Err(err) => {
@@ -428,15 +449,29 @@ impl SessionRegistry {
                 return false;
             }
         };
-        let foreign_daemon = markers
-            .daemon_id
-            .as_deref()
-            .is_some_and(|daemon_id| daemon_id != self.inner.daemon_instance_id);
         let foreign_session = markers
             .session_id
             .as_deref()
             .is_some_and(|session_id| session_id != id.0);
-        foreign_daemon || foreign_session
+        if foreign_session {
+            return true;
+        }
+        if let Some(expected) = worker_instance_id {
+            match markers.worker_instance() {
+                WorkerInstanceMarker::Instance(actual) if actual != expected => return true,
+                WorkerInstanceMarker::Instance(_)
+                    if markers.session_id.as_deref() == Some(id.0.as_str()) =>
+                {
+                    return false;
+                }
+                WorkerInstanceMarker::Conflicting => return true,
+                WorkerInstanceMarker::Instance(_) | WorkerInstanceMarker::Absent => {}
+            }
+        }
+        markers
+            .daemon_id
+            .as_deref()
+            .is_some_and(|daemon_id| daemon_id != self.inner.daemon_instance_id)
     }
 
     async fn existing_observed_identities(&self, id: &SessionId) -> HashSet<ObservedIdentity> {

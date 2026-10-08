@@ -586,7 +586,9 @@ parent session's recovery reference. Managed children inherit the stable
 receive `POHUNEK_DAEMON_ID` from the daemon instance that initialized their
 worker. A daemon restart leaves this launch-time value in the live PTY;
 `pohunek attach` rejects a session attaching to itself by matching its session
-and stable worker IDs, including after the restart. Identity hooks
+and stable worker IDs, including after the restart. The daemon also denies a
+managed child request to mutate its own session, recognizing the worker's
+launch-time daemon ID after a restart. Identity hooks
 prefer the worker endpoint so accepted state survives daemon outage. The worker
 binds every private report to the process that sends it: the connecting peer,
 taken from the kernel and never from the request, must be the reported process
