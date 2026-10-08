@@ -51,6 +51,10 @@ def run(args, cwd=None, env=None, check=True):
     return result
 
 
+ANCHOR_BYTES = b'{"anchor":"fixture"}\n'
+ANCHOR_NAME = "runtime-catalog-anchor.json"
+
+
 class Workspace:
     """A repository-root-like directory with built binaries and docs."""
 
@@ -73,6 +77,11 @@ class Workspace:
         for page in RELEASE_PAGES:
             (self.root / page).write_text("%s\n" % page)
         (self.root / "packaging").mkdir()
+        # Stand-in for the checked-in anchor; the staging tests only need bytes
+        # that survive unchanged, and the executable bit proves staging fixes the mode.
+        self.anchor = self.root / "packaging" / "runtime-catalog-anchor.json"
+        self.anchor.write_bytes(ANCHOR_BYTES)
+        self.anchor.chmod(0o755)
         shutil.copy(PACKAGING / "install-daemon.sh", self.root / "packaging")
         shutil.copy(PACKAGING / "verify-archive", self.root / "packaging")
         (self.root / "scripts").mkdir()
@@ -124,6 +133,32 @@ class StageArchiveTest(unittest.TestCase):
         for page in RELEASE_PAGES:
             self.assertEqual((staging / page).read_text(), "%s\n" % page)
         self.assertEqual((staging / "completions/_pohunek").read_text(), "completion for zsh\n")
+
+    def test_daemon_archive_carries_the_catalog_anchor_unmodified_and_not_executable(self):
+        ws = Workspace(self)
+        staged = ws.out / ws.stage("daemon") / ANCHOR_NAME
+        self.assertEqual(staged.read_bytes(), ANCHOR_BYTES)
+        self.assertEqual(staged.stat().st_mode & 0o777, 0o644)
+
+    def test_cli_and_relay_archives_carry_no_catalog_anchor(self):
+        for component in ("cli", "relay"):
+            ws = Workspace(self)
+            staging = ws.out / ws.stage(component)
+            self.assertFalse(list(staging.rglob(ANCHOR_NAME)), component)
+
+    def test_a_daemon_archive_without_the_anchor_is_refused_before_staging(self):
+        ws = Workspace(self)
+        ws.anchor.unlink()
+        result = run(
+            [PACKAGING / "stage-archive", "daemon", VERSION, TARGET, ws.bindir, ws.docs, ws.out],
+            cwd=ws.root,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("catalog trust anchor is missing", result.stderr)
+        self.assertEqual(list(ws.out.iterdir()), [])
+        # Archives that never carry the anchor do not need it.
+        ws.stage("cli")
 
     def test_cli_archive_carries_the_packaged_smoke_and_no_daemon(self):
         ws = Workspace(self)
@@ -215,6 +250,7 @@ class WriteManifestTest(unittest.TestCase):
             data = (ws.out / name / path).read_bytes()
             self.assertEqual(hashlib.sha256(data).hexdigest(), digest, path)
         self.assertIn("pohunekd", entries)
+        self.assertEqual(entries[ANCHOR_NAME], hashlib.sha256(ANCHOR_BYTES).hexdigest())
 
     def test_darwin_manifest_records_the_minimum_os(self):
         ws = Workspace(self)
@@ -353,6 +389,7 @@ class ArchiveTest(unittest.TestCase):
         modes = {m.name.rsplit("/", 1)[-1]: m.mode for m in members if m.isfile()}
         self.assertEqual(modes["pohunekd"], 0o755)
         self.assertEqual(modes["README.md"], 0o644)
+        self.assertEqual(modes[ANCHOR_NAME], 0o644)
         # No AppleDouble or extended-header members.
         self.assertFalse([n for n in names if "/._" in n or "PaxHeaders" in n])
 

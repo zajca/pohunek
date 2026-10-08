@@ -250,6 +250,12 @@ record endorsed by the primary, and a new anchor is shipped with the next
 release. The CI root signs routine release catalogs; the primary signs only
 CI-key endorsement and CI-revoking catalogs.
 
+Daemon archives (`pohunek-daemon-*` for glibc, musl and macOS arm64, the only
+archives holding `pohunekd`) carry `runtime-catalog-anchor.json` at the archive
+root, beside the `pohunekd` executable, with mode `0644`; `packaging/stage-archive`
+refuses to stage a daemon archive without it. CLI and relay archives carry no
+anchor.
+
 ## Limits
 
 Named constants in `crates/package/src/catalog.rs`: catalog 1 MiB, 256 entries,

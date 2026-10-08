@@ -58,6 +58,13 @@ mkdir -p "$output"
 for extra in $release_files; do
     [ -f "$extra" ] || fail "required release file is missing: $extra (run from the repository root)"
 done
+# Only the daemon archive carries the catalog trust anchor, so it stays out of
+# `release_files` (shared with the CLI and relay archives).
+anchor_file=runtime-catalog-anchor.json
+anchor_source=packaging/$anchor_file
+if [ "$component" = daemon ]; then
+    [ -f "$anchor_source" ] || fail "catalog trust anchor is missing: $anchor_source (run from the repository root)"
+fi
 [ -f packaging/verify-archive ] || fail "packaging/verify-archive is missing (run from the repository root)"
 
 name="$prefix-$version-$target"
@@ -82,6 +89,11 @@ case $component in
         copy_binary pohunek-sessiond
         mkdir -p "$staging/packaging"
         cp packaging/install-daemon.sh packaging/verify-archive "$staging/packaging/"
+        # The daemon reads the anchor from its executable's directory and
+        # refuses group/other-writable files; `archive` keeps the 0644 mode
+        # because no execute bit is set.
+        cp "$anchor_source" "$staging/$anchor_file"
+        chmod 0644 "$staging/$anchor_file"
         ;;
     relay)
         copy_binary pohunek-relayd
