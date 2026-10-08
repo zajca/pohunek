@@ -10,7 +10,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use pohunek_relay_client::{
-    config::{Limits, Origin},
+    config::{Limits, Origin, MAX_REQUEST_TIMEOUT, MAX_RESPONSE_BYTES},
     Client, Error,
 };
 use pohunek_test_support::env::TestEnv;
@@ -228,8 +228,70 @@ async fn revoke(
     StatusCode::NO_CONTENT
 }
 
+fn assert_safe_origin() {
+    for value in [
+        "http://relay.example",
+        "https://user:secret@relay.example",
+        "https://relay.example/path",
+        "https://relay.example?token=secret",
+        "https://relay.example/#fragment",
+        "file:///tmp/socket",
+    ] {
+        assert!(matches!(
+            Origin::parse(value),
+            Err(Error::Configuration("origin"))
+        ));
+    }
+    assert_eq!(
+        Origin::parse("https://RELAY.example:443")
+            .expect("canonical origin")
+            .as_str(),
+        "https://relay.example/"
+    );
+}
+
+fn assert_rejected_client_settings(origin: &Origin) {
+    for (limits, field) in [
+        (
+            Limits {
+                request_timeout: Duration::ZERO,
+                response_bytes: 4096,
+            },
+            "request_timeout",
+        ),
+        (
+            Limits {
+                request_timeout: MAX_REQUEST_TIMEOUT + Duration::from_secs(1),
+                response_bytes: 4096,
+            },
+            "request_timeout",
+        ),
+        (
+            Limits {
+                request_timeout: Duration::from_secs(2),
+                response_bytes: 0,
+            },
+            "response_bytes",
+        ),
+        (
+            Limits {
+                request_timeout: Duration::from_secs(2),
+                response_bytes: MAX_RESPONSE_BYTES + 1,
+            },
+            "response_bytes",
+        ),
+    ] {
+        assert!(matches!(
+            Client::new(origin.clone(), limits, None),
+            Err(Error::Configuration(name)) if name == field
+        ));
+    }
+}
+
 #[tokio::test]
 async fn device_poll_account_and_self_revoke_use_exact_protected_headers() {
+    assert_safe_origin();
+
     let state = AuthFixture {
         polls: Arc::new(AtomicUsize::new(0)),
         revoked: Arc::new(AtomicBool::new(false)),
@@ -241,6 +303,7 @@ async fn device_poll_account_and_self_revoke_use_exact_protected_headers() {
         .route("/v1/auth/credentials/self/revoke", post(revoke))
         .with_state(state.clone());
     let fixture = Fixture::new(app).await;
+    assert_rejected_client_settings(&fixture.origin);
     let client = fixture.client(4096);
     let start = client.start_device().await.expect("start device login");
     assert_eq!(
