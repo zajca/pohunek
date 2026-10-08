@@ -8,6 +8,41 @@ use thiserror::Error;
 
 use super::search_path::SearchPath;
 
+/// The nix-darwin system profile is linked from macOS's root-owned run directory.
+const DARWIN_RUN_DIRECTORY: &str = "/private/var/run";
+
+/// The one nix-darwin program allowed through the system run directory.
+const DARWIN_NETBIRD_PATH: &str = "/run/current-system/sw/bin/netbird";
+
+/// macOS reserves gids 0 (wheel) and 1 (daemon) for system accounts.
+const DARWIN_SYSTEM_GROUPS: [u32; 2] = [0, 1];
+
+#[derive(Clone, Copy)]
+struct DarwinRunProfile<'a> {
+    candidate: &'a Path,
+    directory: &'a Path,
+    owner: u32,
+    groups: &'a [u32],
+}
+
+#[derive(Clone, Copy)]
+struct RunEntryFacts {
+    directory_owner: u32,
+    directory_group: u32,
+    directory_mode: u32,
+    link_owner: u32,
+    is_symlink: bool,
+}
+
+fn darwin_run_profile() -> Option<DarwinRunProfile<'static>> {
+    cfg!(target_os = "macos").then_some(DarwinRunProfile {
+        candidate: Path::new(DARWIN_NETBIRD_PATH),
+        directory: Path::new(DARWIN_RUN_DIRECTORY),
+        owner: 0,
+        groups: &DARWIN_SYSTEM_GROUPS,
+    })
+}
+
 /// Reports why a program name did not resolve to an executable.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
@@ -109,7 +144,8 @@ pub enum Refusal {
 /// A name containing `/` is a configured executable: it must be absolute and
 /// executable, and `search` is not consulted. A bare name is looked up in the
 /// directories of `search` in order, and the first executable regular file
-/// wins. Symlinks resolve like `execve` resolves them.
+/// wins. Symlinks resolve like `execve` resolves them. On macOS, `NetBird` found
+/// through the nix-darwin system profile returns its verified canonical path.
 ///
 /// # Examples
 ///
@@ -172,6 +208,15 @@ fn resolve_in<'a>(
     directories: impl Iterator<Item = &'a Path>,
     owners: Owners,
 ) -> Result<PathBuf, ExecutableError> {
+    resolve_in_with_profile(program, directories, owners, darwin_run_profile())
+}
+
+fn resolve_in_with_profile<'a>(
+    program: &OsStr,
+    directories: impl Iterator<Item = &'a Path>,
+    owners: Owners,
+    profile: Option<DarwinRunProfile<'_>>,
+) -> Result<PathBuf, ExecutableError> {
     let bytes = program.as_bytes();
     if bytes.is_empty() || bytes.contains(&0) {
         return Err(ExecutableError::InvalidName);
@@ -181,13 +226,12 @@ fn resolve_in<'a>(
         if !path.is_absolute() {
             return Err(ExecutableError::RelativePath);
         }
-        return inspect_executable(path, owners)
-            .map(|()| path.to_path_buf())
+        return inspect_executable_with_profile(path, owners, profile)
             .map_err(ExecutableError::NotExecutable);
     }
     directories
         .map(|directory| directory.join(program))
-        .find(|candidate| inspect_executable(candidate, owners).is_ok())
+        .find_map(|candidate| inspect_executable_with_profile(&candidate, owners, profile).ok())
         .ok_or(ExecutableError::NotFound)
 }
 
@@ -222,14 +266,15 @@ impl Owners {
 /// (`faccessat(X_OK, AT_EACCESS)`). A symlink's own owner is irrelevant once its
 /// target is validated. An untrusted candidate is skipped, like one the shell
 /// cannot execute. An executable the user cannot read cannot be opened and is
-/// skipped as well. The path is returned as found, not canonicalized, so a
+/// skipped as well. Ordinarily the path is returned as found, so a
 /// multi-call binary keeps the name it was invoked by; group-writable
 /// executables (an admin-group Intel Homebrew) are out of scope.
 ///
 /// A path-based exec cannot be made atomic with the check, so the directories
 /// the lookup passes through must also be owner-controlled
-/// ([`lookup_chain_is_owner_controlled`]): then nobody else can rename or
-/// retarget an entry after the check.
+/// ([`lookup_chain_is_owner_controlled`]). The macOS nix-darwin `NetBird` path
+/// crosses a system-group-writable directory; its canonical target is checked
+/// and returned so a later symlink replacement cannot change what runs.
 pub(super) fn is_executable_file(path: &Path) -> bool {
     is_trusted_executable(path, Owners::current())
 }
@@ -259,7 +304,11 @@ pub fn is_trusted_executable_file(path: &Path) -> bool {
 /// others can write (a sticky `/tmp`) may hold a chain entry only when that
 /// entry is owned by `owners` too: sticky protects an entry from everyone but
 /// its owner, so an entry another account created there is the attack itself.
-fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> Result<(), Refusal> {
+fn lookup_chain_is_owner_controlled(
+    path: &Path,
+    owners: Owners,
+    profile: Option<DarwinRunProfile<'_>>,
+) -> Result<bool, Refusal> {
     use std::collections::VecDeque;
     use std::ffi::OsString;
     use std::os::unix::fs::MetadataExt as _;
@@ -281,6 +330,7 @@ fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> Result<(), R
         .collect();
     let mut directory = PathBuf::from("/");
     let mut searched: Vec<PathBuf> = Vec::new();
+    let mut trusted_darwin_run = false;
     let mut links = 0_usize;
     while let Some(name) = pending.pop_front() {
         if name == ".." {
@@ -299,7 +349,28 @@ fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> Result<(), R
             return Err(Refusal::ChainBroken);
         };
         let holder_mode = holder.mode();
-        if holder_mode & WRITABLE_BY_OTHERS != 0 && !(holder_mode & STICKY != 0 && owned) {
+        let darwin_run_entry = profile.is_some_and(|profile| {
+            darwin_run_entry_is_trusted(
+                profile,
+                path,
+                &directory,
+                &name,
+                RunEntryFacts {
+                    directory_owner: holder.uid(),
+                    directory_group: holder.gid(),
+                    directory_mode: holder_mode,
+                    link_owner: metadata.uid(),
+                    is_symlink: metadata.file_type().is_symlink(),
+                },
+            ) && darwin_run_directory_acl_is_safe(&directory)
+        });
+        if darwin_run_entry {
+            trusted_darwin_run = true;
+        }
+        if holder_mode & WRITABLE_BY_OTHERS != 0
+            && !(holder_mode & STICKY != 0 && owned)
+            && !darwin_run_entry
+        {
             return Err(Refusal::ChainSharedDirectory {
                 dir: directory,
                 owner: metadata.uid(),
@@ -331,12 +402,28 @@ fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> Result<(), R
             }
         }
     }
+    validate_lookup_directories(
+        &searched,
+        trusted_darwin_run.then(|| profile.expect("trusted run has a profile").directory),
+    )?;
+    Ok(trusted_darwin_run)
+}
+
+fn validate_lookup_directories(
+    searched: &[PathBuf],
+    trusted_run_directory: Option<&Path>,
+) -> Result<(), Refusal> {
     // The filesystem root has no components for the ancestor policy to judge;
     // renaming below it needs write access to a directory that is judged.
     for dir in searched
         .iter()
         .filter(|dir| dir.as_path() != Path::new("/"))
     {
+        if trusted_run_directory == Some(dir.as_path()) {
+            // The entry and directory were checked above; the generic ancestor
+            // policy cannot accept macOS's non-sticky root:daemon run directory.
+            continue;
+        }
         crate::filesystem::TrustedDir::open_absolute_ancestor(dir).map_err(|error| {
             Refusal::ChainDirectory {
                 dir: dir.clone(),
@@ -347,12 +434,56 @@ fn lookup_chain_is_owner_controlled(path: &Path, owners: Owners) -> Result<(), R
     Ok(())
 }
 
+/// Allows only the stock nix-darwin link through macOS's system run directory.
+fn darwin_run_entry_is_trusted(
+    profile: DarwinRunProfile<'_>,
+    candidate: &Path,
+    directory: &Path,
+    name: &std::ffi::OsStr,
+    facts: RunEntryFacts,
+) -> bool {
+    candidate == profile.candidate
+        && directory == profile.directory
+        && name == "current-system"
+        && facts.directory_owner == profile.owner
+        && profile.groups.contains(&facts.directory_group)
+        && facts.directory_mode & 0o002 == 0
+        && facts.link_owner == profile.owner
+        && facts.is_symlink
+}
+
+/// Rejects any allow ACL on macOS's run directory, including delete-child grants.
+fn darwin_run_directory_acl_is_safe(directory: &Path) -> bool {
+    let opened = rustix::fs::open(
+        directory,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    );
+    opened.is_ok_and(|descriptor| {
+        matches!(
+            crate::filesystem::validate_private_acl(&std::fs::File::from(descriptor), directory),
+            Ok(())
+        )
+    })
+}
+
 fn is_trusted_executable(path: &Path, owners: Owners) -> bool {
     inspect_executable(path, owners).is_ok()
 }
 
 /// Runs every check of [`is_executable_file`] and names the first that fails.
-fn inspect_executable(path: &Path, owners: Owners) -> Result<(), Refusal> {
+fn inspect_executable(path: &Path, owners: Owners) -> Result<PathBuf, Refusal> {
+    inspect_executable_with_profile(path, owners, darwin_run_profile())
+}
+
+fn inspect_executable_with_profile(
+    path: &Path,
+    owners: Owners,
+    profile: Option<DarwinRunProfile<'_>>,
+) -> Result<PathBuf, Refusal> {
     use rustix::fs::{FileType, Mode, OFlags};
 
     let errno = |error: &std::io::Error| error.raw_os_error().unwrap_or(0);
@@ -398,8 +529,20 @@ fn inspect_executable(path: &Path, owners: Owners) -> Result<(), Refusal> {
             })
         }
     }
-    lookup_chain_is_owner_controlled(path, owners)?;
-    execute_access(&target)
+    let pin_target = lookup_chain_is_owner_controlled(path, owners, profile)?;
+    if pin_target {
+        // The original symlink can be renamed by macOS's daemon group. The
+        // canonical target must be safe independently before it is returned.
+        if lookup_chain_is_owner_controlled(&target, owners, profile)? {
+            return Err(Refusal::ChainBroken);
+        }
+    }
+    execute_access(&target)?;
+    Ok(if pin_target {
+        target
+    } else {
+        path.to_path_buf()
+    })
 }
 
 /// The permission bits of `mode` as a `u32` (`mode_t` is 16 bits on macOS).
@@ -811,21 +954,186 @@ mod tests {
             effective: u32::MAX - 1,
             root: u32::MAX - 2,
         };
-        assert!(lookup_chain_is_owner_controlled(&link, strangers).is_err());
+        lookup_chain_is_owner_controlled(&link, strangers, None).expect_err("foreign link");
         // A plain entry another account put into the sticky directory is the
         // same attack.
-        assert!(lookup_chain_is_owner_controlled(&sticky.join("plain"), strangers).is_err());
+        lookup_chain_is_owner_controlled(&sticky.join("plain"), strangers, None)
+            .expect_err("foreign entry");
         // A symlink in a private directory is judged by its owner alone.
         let private = dir.path().join("private");
         make_dir(dir.path(), &private);
         let own = private.join("agent");
         std::os::unix::fs::symlink(&real, &own).expect("symlink");
-        assert!(lookup_chain_is_owner_controlled(&own, strangers).is_err());
+        lookup_chain_is_owner_controlled(&own, strangers, None).expect_err("foreign owner");
         let me = Owners {
             effective: rustix::process::geteuid().as_raw(),
             root: u32::MAX - 2,
         };
-        assert_eq!(lookup_chain_is_owner_controlled(&own, me), Ok(()));
+        assert_eq!(lookup_chain_is_owner_controlled(&own, me, None), Ok(false));
+    }
+
+    #[test]
+    fn darwin_system_profile_exception_is_narrow() {
+        let run = Path::new(DARWIN_RUN_DIRECTORY);
+        let system = OsStr::new("current-system");
+        let netbird = Path::new(DARWIN_NETBIRD_PATH);
+        let profile = DarwinRunProfile {
+            candidate: netbird,
+            directory: run,
+            owner: 0,
+            groups: &DARWIN_SYSTEM_GROUPS,
+        };
+        let base = RunEntryFacts {
+            directory_owner: 0,
+            directory_group: 1,
+            directory_mode: 0o775,
+            link_owner: 0,
+            is_symlink: true,
+        };
+        assert!(darwin_run_entry_is_trusted(
+            profile, netbird, run, system, base
+        ));
+        assert!(darwin_run_entry_is_trusted(
+            profile,
+            netbird,
+            run,
+            system,
+            RunEntryFacts {
+                directory_group: 0,
+                ..base
+            }
+        ));
+        for (candidate, directory, name, facts) in [
+            (
+                Path::new("/run/current-system/sw/bin/other"),
+                run,
+                system,
+                base,
+            ),
+            (netbird, Path::new("/private/var/tmp"), system, base),
+            (netbird, run, OsStr::new("other"), base),
+            (
+                netbird,
+                run,
+                system,
+                RunEntryFacts {
+                    directory_owner: 501,
+                    ..base
+                },
+            ),
+            (
+                netbird,
+                run,
+                system,
+                RunEntryFacts {
+                    directory_group: 20,
+                    ..base
+                },
+            ),
+            (
+                netbird,
+                run,
+                system,
+                RunEntryFacts {
+                    directory_mode: 0o777,
+                    ..base
+                },
+            ),
+            (
+                netbird,
+                run,
+                system,
+                RunEntryFacts {
+                    link_owner: 501,
+                    ..base
+                },
+            ),
+            (
+                netbird,
+                run,
+                system,
+                RunEntryFacts {
+                    is_symlink: false,
+                    ..base
+                },
+            ),
+        ] {
+            assert!(!darwin_run_entry_is_trusted(
+                profile, candidate, directory, name, facts
+            ));
+        }
+    }
+
+    #[test]
+    fn nix_profile_netbird_uses_the_verified_target() {
+        let dir = fixture();
+        let run = dir.path().join("run");
+        let generation = dir.path().join("generation/sw/bin");
+        let replacement = dir.path().join("replacement/sw/bin");
+        make_dir(dir.path(), &run);
+        make_dir(dir.path(), &generation);
+        make_dir(dir.path(), &replacement);
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o775)).expect("run mode");
+        let original = executable(&generation, "netbird");
+        executable(&generation, "other");
+        executable(&replacement, "netbird");
+        let link = run.join("current-system");
+        std::os::unix::fs::symlink(dir.path().join("generation"), &link).expect("system link");
+        let bin = link.join("sw/bin");
+        let candidate = bin.join("netbird");
+        let group = [std::os::unix::fs::MetadataExt::gid(
+            &fs::metadata(&run).expect("run"),
+        )];
+        let profile = DarwinRunProfile {
+            candidate: &candidate,
+            directory: &run,
+            owner: rustix::process::geteuid().as_raw(),
+            groups: &group,
+        };
+        let owners = Owners::current();
+        assert_eq!(
+            resolve_in_with_profile(
+                OsStr::new("netbird"),
+                [bin.as_path()].into_iter(),
+                owners,
+                Some(profile)
+            ),
+            Ok(original.clone())
+        );
+        assert_eq!(
+            resolve_in_with_profile(
+                OsStr::new("other"),
+                [bin.as_path()].into_iter(),
+                owners,
+                Some(profile)
+            ),
+            Err(ExecutableError::NotFound)
+        );
+        let verified = resolve_in_with_profile(
+            OsStr::new("netbird"),
+            [bin.as_path()].into_iter(),
+            owners,
+            Some(profile),
+        )
+        .expect("NetBird resolves");
+        fs::remove_file(&link).expect("unlink system profile");
+        std::os::unix::fs::symlink(dir.path().join("replacement"), &link).expect("replace link");
+        assert_ne!(fs::canonicalize(&candidate).expect("replacement"), verified);
+        assert_eq!(verified, original);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nix_darwin_netbird_resolves_when_installed() {
+        let program = Path::new(DARWIN_NETBIRD_PATH);
+        if !program.exists() {
+            return;
+        }
+        let search = std::env::join_paths(["/run/current-system/sw/bin"]).expect("join");
+        assert_eq!(
+            resolve_executable_in_path_value(OsStr::new("netbird"), Some(&search)),
+            Ok(fs::canonicalize(program).expect("canonical NetBird path"))
+        );
     }
 
     #[test]
