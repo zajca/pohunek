@@ -360,8 +360,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        downgrade_request_params, event_payload, result, upgrade_event_payload,
-        upgrade_result, INTRODUCED_METHODS, KNOWN_EVENTS, KNOWN_WARNING_KINDS,
+        downgrade_request_params, event_payload, result, upgrade_event_payload, upgrade_result,
+        INTRODUCED_METHODS, KNOWN_EVENTS, KNOWN_WARNING_KINDS,
     };
     use crate::{compat::CompatError, event, method};
 
