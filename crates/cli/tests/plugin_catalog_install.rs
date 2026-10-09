@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use package::{
-    build_archive, read_archive, ArchiveEntry, CatalogEntry, Limits, PackageDigest,
+    build_archive, read_archive, AnchorFile, ArchiveEntry, CatalogEntry, Limits, PackageDigest,
     ANCHOR_FILE_NAME, MAX_ANCHOR_BYTES,
 };
 use pohunek_test_support::env::TestEnv;
@@ -27,15 +27,15 @@ use pohunek_test_support::fs::{write_executable, write_file};
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::{bin_exe, worker_binary};
 use protocol::{PackageId, PackageVersion, RuntimeId};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::net::UnixStream;
 
 #[path = "support/catalog_fixture.rs"]
 mod catalog_fixture;
 
 use catalog_fixture::{
-    anchor_for, anchor_with, attestations_for, catalog_of, host_platform, key_id, signed, test_key,
-    ANY_CORE, RUNTIME_API, WINDOW_END, WINDOW_START,
+    anchor_for, anchor_with, attestations_for, catalog_of, host_platform, key_id, root_of, signed,
+    test_key, ANY_CORE, RUNTIME_API, WINDOW_END, WINDOW_START,
 };
 
 /// Package id of the fixture archive; it serves a non-reserved runtime id.
@@ -292,8 +292,28 @@ fn path_str(path: &Path) -> &str {
 #[tokio::test]
 async fn a_release_catalog_installs_the_package_as_official_in_a_clean_environment() {
     let key = test_key();
+    let secondary = test_key();
+    let revoked = test_key();
+    let first = root_of(&key, WINDOW_START, WINDOW_END);
+    let second = root_of(&secondary, WINDOW_START, WINDOW_END);
+    let revoked_id = key_id(&revoked);
+    let anchor = AnchorFile::new(
+        vec![first.clone(), second.clone()],
+        vec![revoked_id.clone()],
+    )
+    .expect("multi-root anchor");
+    let anchor_bytes = anchor.to_bytes().expect("anchor bytes");
+    let reversed = AnchorFile::new(vec![second, first], vec![revoked_id])
+        .expect("reversed multi-root anchor")
+        .to_bytes()
+        .expect("reversed anchor bytes");
+    assert_eq!(
+        anchor_bytes, reversed,
+        "root order cannot change anchor bytes"
+    );
+    assert!(anchor_bytes.ends_with(b"}\n"), "canonical anchor newline");
     let install = Install::start(&Anchor::File {
-        bytes: anchor_for(&key),
+        bytes: anchor_bytes,
         mode: 0o644,
     })
     .await;
@@ -394,6 +414,74 @@ async fn without_an_anchor_file_catalog_installs_stay_unavailable_and_explicit_d
     assert_eq!(document["ok"]["package"]["origin"], "explicit_digest");
 }
 
+fn edited_anchor(bytes: &[u8], edit: impl FnOnce(&mut Value)) -> Vec<u8> {
+    let mut document: Value = serde_json::from_slice(bytes).expect("valid anchor document");
+    edit(&mut document);
+    serde_json::to_vec(&document).expect("edited anchor document")
+}
+
+fn malformed_anchor_documents(valid: &[u8]) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "malformed public key with a secret-looking value",
+            edited_anchor(valid, |document| {
+                document["roots"][0]["public_key"] = json!("secret-looking-text");
+            }),
+        ),
+        (
+            "empty root validity window",
+            edited_anchor(valid, |document| {
+                let not_before = document["roots"][0]["not_before"].clone();
+                document["roots"][0]["not_after"] = not_before;
+            }),
+        ),
+        (
+            "empty root list",
+            edited_anchor(valid, |document| {
+                document["roots"] = json!([]);
+            }),
+        ),
+        (
+            "repeated root",
+            edited_anchor(valid, |document| {
+                let root = document["roots"][0].clone();
+                document["roots"].as_array_mut().expect("roots").push(root);
+            }),
+        ),
+        (
+            "unknown anchor member",
+            edited_anchor(valid, |document| {
+                document["extra"] = json!(1);
+            }),
+        ),
+        (
+            "unknown root member",
+            edited_anchor(valid, |document| {
+                document["roots"][0]["extra"] = json!(1);
+            }),
+        ),
+        (
+            "unsupported anchor schema",
+            edited_anchor(valid, |document| {
+                document["schema_version"] = json!(2);
+            }),
+        ),
+        (
+            "duplicate JSON key",
+            br#"{"schema_version":1,"schema_version":1,"roots":[],"revoked_key_ids":[]}"#.to_vec(),
+        ),
+        (
+            "floating-point schema version",
+            br#"{"schema_version":1.0,"roots":[],"revoked_key_ids":[]}"#.to_vec(),
+        ),
+        ("trailing JSON content", [valid, b" trailing"].concat()),
+    ]
+}
+
+fn file_anchor(bytes: Vec<u8>, mode: u32) -> Anchor {
+    Anchor::File { bytes, mode }
+}
+
 #[tokio::test]
 async fn an_anchor_that_cannot_be_trusted_fails_closed_and_doctor_reports_it() {
     let key = test_key();
@@ -403,49 +491,19 @@ async fn an_anchor_that_cannot_be_trusted_fails_closed_and_doctor_reports_it() {
         .expect("utf-8")
         .replace(key_id(&key).as_str(), other_id.as_str())
         .into_bytes();
-    let scenarios: Vec<(&str, Anchor)> = vec![
-        (
-            "malformed json",
-            Anchor::File {
-                bytes: b"{ not json".to_vec(),
-                mode: 0o644,
-            },
-        ),
-        (
-            "empty file",
-            Anchor::File {
-                bytes: Vec::new(),
-                mode: 0o644,
-            },
-        ),
+    let mut scenarios: Vec<(&str, Anchor)> = vec![
+        ("malformed json", file_anchor(b"{ not json".to_vec(), 0o644)),
+        ("empty file", file_anchor(Vec::new(), 0o644)),
         (
             "key id that does not match its key",
-            Anchor::File {
-                bytes: mismatched,
-                mode: 0o644,
-            },
+            file_anchor(mismatched, 0o644),
         ),
         (
             "oversized file",
-            Anchor::File {
-                bytes: vec![b' '; MAX_ANCHOR_BYTES + 1],
-                mode: 0o644,
-            },
+            file_anchor(vec![b' '; MAX_ANCHOR_BYTES + 1], 0o644),
         ),
-        (
-            "group-writable file",
-            Anchor::File {
-                bytes: valid.clone(),
-                mode: 0o664,
-            },
-        ),
-        (
-            "world-writable file",
-            Anchor::File {
-                bytes: valid.clone(),
-                mode: 0o666,
-            },
-        ),
+        ("group-writable file", file_anchor(valid.clone(), 0o664)),
+        ("world-writable file", file_anchor(valid.clone(), 0o666)),
         (
             "symbolic link to a valid anchor",
             Anchor::Link {
@@ -453,6 +511,11 @@ async fn an_anchor_that_cannot_be_trusted_fails_closed_and_doctor_reports_it() {
             },
         ),
     ];
+    scenarios.extend(
+        malformed_anchor_documents(&valid)
+            .into_iter()
+            .map(|(label, bytes)| (label, file_anchor(bytes, 0o644))),
+    );
     for (label, anchor) in &scenarios {
         let install = Install::start(anchor).await;
         let built = install.archive("1.0.0");
@@ -477,6 +540,10 @@ async fn an_anchor_that_cannot_be_trusted_fails_closed_and_doctor_reports_it() {
         assert!(
             detail.contains("trust anchor"),
             "{label}: the detail names the anchor: {detail}"
+        );
+        assert!(
+            !detail.contains("secret-looking-text"),
+            "{label}: the detail must not reveal anchor content: {detail}"
         );
         // The daemon keeps serving local trust while the anchor is refused.
         let (code, document) = install
