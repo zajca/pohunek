@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -99,6 +99,7 @@ struct LastSeen {
 struct PollBlindInspector {
     host: HostInspector,
     frozen: Mutex<Option<LastSeen>>,
+    unreadable_pid: Mutex<Option<Pid>>,
     listings: AtomicUsize,
 }
 
@@ -107,6 +108,7 @@ impl PollBlindInspector {
         Arc::new(Self {
             host: HostInspector::new(),
             frozen: Mutex::new(None),
+            unreadable_pid: Mutex::new(None),
             listings: AtomicUsize::new(0),
         })
     }
@@ -114,6 +116,10 @@ impl PollBlindInspector {
     /// Ends the freeze; every method reports host truth from here on.
     fn thaw(&self) {
         *self.lock() = None;
+    }
+
+    fn make_markers_unreadable(&self, pid: Pid) {
+        *self.unreadable_pid.lock().expect("unreadable PID lock") = Some(pid);
     }
 
     /// Number of process listings taken so far.
@@ -244,6 +250,11 @@ impl ProcessInspector for PollBlindInspector {
     }
 
     fn ownership_markers(&self, pid: Pid) -> Result<OwnershipMarkers, ProcwatchError> {
+        if *self.unreadable_pid.lock().expect("unreadable PID lock") == Some(pid) {
+            return Err(ProcwatchError::Unobservable {
+                operation: "read_ownership_markers",
+            });
+        }
         match self.frozen_view(pid, |last_seen| last_seen.markers.clone()) {
             Some(markers) => Ok(markers),
             None => self.host.ownership_markers(pid),
@@ -455,10 +466,11 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
             .expect("first daemon thread")
     });
 
+    let inspector = PollBlindInspector::new();
     let second = worker_backed_registry_with_launcher(
         &env,
         config,
-        Arc::new(HostInspector::new()),
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
         launcher,
     );
     assert_ne!(second.daemon_instance_id(), first_daemon_id);
@@ -482,10 +494,64 @@ async fn procwatch_keeps_worker_agent_after_daemon_restart() {
         .stop(&created.id)
         .await
         .expect("stop adopted session");
-    second
-        .remove(&created.id)
+    assert_unreadable_bystander_liveness(&second, &inspector, &created.id, dir).await;
+}
+
+/// Removal remains fail-closed for a live unreadable process, but an exited
+/// process with the same unreadable markers no longer blocks the session.
+async fn assert_unreadable_bystander_liveness(
+    registry: &SessionRegistry,
+    inspector: &PollBlindInspector,
+    session_id: &SessionId,
+    cwd: &Path,
+) {
+    let mut bystander = ReapOnDrop(
+        Command::new("/bin/sleep")
+            .arg(SHELL_LINGER_SECS.to_string())
+            .current_dir(cwd)
+            .env_clear()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unrelated process"),
+    );
+    let host = HostInspector::new();
+    let identity = host
+        .identity(bystander.0.id())
+        .expect("inspect unrelated process")
+        .expect("unrelated process is alive");
+    assert!(host.is_running(identity).expect("inspect live bystander"));
+    inspector.make_markers_unreadable(bystander.0.id());
+    let blocked = registry.remove(session_id).await;
+    bystander.0.kill().expect("terminate unrelated process");
+    let blocked = blocked.expect_err("a live unreadable process must keep cleanup unconfirmed");
+    assert_eq!(blocked.code, "runtime_supervision_ambiguous");
+    assert!(
+        blocked.msg.contains(&bystander.0.id().to_string()),
+        "{blocked:?}"
+    );
+
+    wait_until("unrelated process to exit without being reaped", || async {
+        (!host
+            .is_running(identity)
+            .expect("inspect unrelated process liveness"))
+        .then_some(())
+    })
+    .await;
+    registry
+        .remove(session_id)
         .await
         .expect("remove adopted session");
+}
+
+/// A failed assertion must not leave the test's long-running bystander alive.
+struct ReapOnDrop(Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 #[tokio::test]
