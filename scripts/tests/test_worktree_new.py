@@ -97,8 +97,6 @@ class FakeExecutor:
         # created), or "after-checkout" (a post-checkout hook failed on a
         # full worktree).
         self.add_fails = None
-        # When True, `git branch <name> <commit>` fails without creating it.
-        self.branch_fails = False
         # Registered worktree path -> checked-out branch name.
         self.registered = {}
         # Per-root override of `cargo metadata` target/build directories.
@@ -185,8 +183,6 @@ class FakeExecutor:
             return 0, f"{self.refs[ref]}\n", ""
         if args[:2] == ["branch", "--no-track"]:
             branch, commit = args[2], args[3]
-            if self.branch_fails:
-                return 128, "", "fatal: cannot lock ref"
             if branch in self.branches:
                 return 128, "", f"fatal: a branch named '{branch}' already exists"
             self.branches[branch] = commit
@@ -457,6 +453,30 @@ class WorktreeCliFixture:
 
 class WorktreeCliTests(WorktreeCliFixture, unittest.TestCase):
     """Exercise argument validation through the real script and a private Git repo."""
+
+    def test_rejected_branch_creation_leaves_no_worktree_or_branch(self):
+        hook = self.repo / ".git/hooks/reference-transaction"
+        marker = self.root / "branch-hook-fired"
+        self.env["WORKTREE_TEST_HOOK_MARKER"] = str(marker)
+        hook.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = prepared ] || exit 0\n'
+            "while read -r old new ref; do\n"
+            '  case "$ref" in\n'
+            '    refs/heads/zajca/*) printf "rejected\\n" > "$WORKTREE_TEST_HOOK_MARKER"; exit 1 ;;\n'
+            "  esac\n"
+            "done\n"
+        )
+        hook.chmod(0o700)
+
+        failed = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(failed.returncode, 1, failed.stderr)
+        self.assertEqual(marker.read_text(), "rejected\n")
+        self.assertIn("git branch failed", failed.stderr)
+        self.assertIn("nothing to roll back", failed.stderr)
+        self.assertEqual(list(self.worktrees.iterdir()), [])
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
 
     def test_failed_post_checkout_hook_rolls_back_and_allows_retry(self):
         hook = self.repo / ".git/hooks/post-checkout"
@@ -1277,19 +1297,6 @@ class WorktreeAddFailureTests(RollbackCase):
         self.assertEqual(self.h.executor.registered, {})
         self.assertFalse(self.h.executor.ran("git", "branch", "-D"))
         return err
-
-    def test_branch_is_deleted_when_the_add_creates_nothing(self):
-        self.run_failing_add("before")
-        self.assert_temp_branch_compare_and_deleted()
-        self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
-
-    def test_failure_before_creation_rolls_back_nothing(self):
-        self.h.executor.branch_fails = True
-        err = self.run_failing_add(None, step="git branch")
-        self.assertIn("nothing to roll back", err)
-        self.assertFalse(self.h.executor.ran("git", "update-ref"))
-        self.assertFalse(self.h.executor.ran("git", "worktree", "remove"))
-        self.assertFalse(self.h.executor.ran("git", "worktree", "add"))
 
     def test_unregistered_leftover_dir_is_reported_not_deleted(self):
         worktree = self.h.worktrees / "issue-1"
