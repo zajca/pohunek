@@ -147,36 +147,3 @@ define_id!(
 );
 define_id!(StreamId, "Identifies one framed data stream.");
 define_id!(WriteId, "Identifies one deduplicated PTY input plan.");
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deserialization_enforces_identifier_invariants() {
-        let error = serde_json::from_str::<WorkerId>("\"../../worker\"")
-            .expect_err("path-like identifier must fail");
-
-        assert!(error.to_string().contains("disallowed byte"));
-    }
-
-    #[test]
-    fn identifier_limit_is_enforced() {
-        let value = "a".repeat(MAX_ID_BYTES + 1);
-        let error = SessionId::new(value).expect_err("oversized identifier must fail");
-
-        assert_eq!(
-            error,
-            IdError::TooLong {
-                actual: MAX_ID_BYTES + 1,
-                maximum: MAX_ID_BYTES,
-            }
-        );
-    }
-
-    #[test]
-    fn reserved_path_components_are_rejected() {
-        assert_eq!(WorkerId::new(".."), Err(IdError::Reserved));
-        assert_eq!(WorkerId::new("."), Err(IdError::Reserved));
-    }
-}

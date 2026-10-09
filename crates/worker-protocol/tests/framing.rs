@@ -662,3 +662,46 @@ async fn an_oversized_serialized_line_is_rejected_with_a_clean_stream() {
         None
     );
 }
+
+#[tokio::test]
+async fn invalid_worker_identifiers_are_rejected_before_a_handshake_is_accepted() {
+    let response = ControlMessage::Response(ControlResponse {
+        request_id: RequestId::new("request-1").expect("valid request"),
+        kind: negotiated_response(),
+    });
+    let valid_wire = serde_json::to_value(&response).expect("encode valid handshake");
+    let (reader_side, mut peer) = tokio::io::duplex(1024);
+    let mut reader = ControlReader::new(reader_side);
+    let overlong = "a".repeat(256);
+
+    for invalid in [".", "..", "../../worker", overlong.as_str()] {
+        let mut wire = valid_wire.clone();
+        wire["worker_id"] = serde_json::Value::String(invalid.to_owned());
+        peer.write_all(&serde_json::to_vec(&wire).expect("encode malformed handshake"))
+            .await
+            .expect("send malformed handshake");
+        peer.write_all(b"\n").await.expect("finish control line");
+        assert!(
+            matches!(
+                reader.read::<ControlMessage>().await,
+                Err(ControlCodecError::Json(_))
+            ),
+            "identifier {invalid:?} must be rejected on the control stream"
+        );
+    }
+
+    let mut writer = ControlWriter::new(peer);
+    writer.write(&response).await.expect("send valid handshake");
+    drop(writer);
+    assert_eq!(
+        reader
+            .read::<ControlMessage>()
+            .await
+            .expect("valid handshake"),
+        Some(response)
+    );
+    assert_eq!(
+        reader.read::<ControlMessage>().await.expect("clean EOF"),
+        None
+    );
+}
