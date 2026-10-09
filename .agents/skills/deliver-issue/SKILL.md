@@ -34,8 +34,9 @@ the review loop, CI triage, and the merge decision. Where a step below says
   target unclear, or a required credential/permission is missing. Record a
   stop as a blocker comment on the issue, then report it.
 - Never end a turn waiting for the operator. Waiting for CI or a review is
-  done with a Monitor or a background command, so the next notification
-  resumes the work.
+  done through whatever watch/monitor capability the runtime offers (a
+  monitor tool, a background command, or a scheduled wakeup), so the next
+  callback or notification resumes the work.
 - File every verified out-of-scope finding as its own issue automatically
   (dedup, add to the project, link as a sub-issue of the delivered issue) per
   `github-workflow`. Never "offer" a follow-up.
@@ -47,13 +48,15 @@ the review loop, CI triage, and the merge decision. Where a step below says
    `updatedAt`. Before each later phase re-read it and reconcile substantive
    spec drift explicitly (new/changed DoD, decisions) on the issue.
 2. Set the project status to `In Progress`.
-3. Create a task list (TaskCreate) mirroring the phases and DoD items; keep it
+3. Create a local task list (any progress-tracking mechanism the runtime
+   provides) mirroring the phases and DoD items; keep it
    current — it is the local progress view, the issue is the record.
 
 ## Phase 2 — plan
 
 1. Read AGENTS.md, `docs/architecture.md`, and every doc the issue names.
-   Before any `.rs` work, read `.agents/rust-guidelines/` per CLAUDE.md.
+   Before any `.rs` work, read `.agents/rust-guidelines/` per AGENTS.md
+   ("Coding conventions") or the guidelines' own `SKILL.md` index.
 2. Split the work into a PR stack per `milestone` step 4 and
    `pullRequests` in `.github/agent-workflow.json`: one concern per slice,
    dependency order, each slice mapped to its DoD items. Record the slice
@@ -78,7 +81,8 @@ slice:
    environment rules (below), and the report format. Brief every worker with
    "read the context file first" plus its own 4-step briefing (known facts,
    `path:line` starts, testable success criteria, owned files).
-2. Spawn the workers in parallel (one message, several Agent calls). Each
+2. Spawn the workers in parallel (several subagent/worker delegations in one
+   step, using your runtime's parallel-worker mechanism). Each
    worker must:
    - **verify the task/finding against the code first** and report a false
      premise with `path:line` evidence instead of changing code;
@@ -94,8 +98,11 @@ slice:
      and `cargo xtask docs check` when docs changed;
    - report root cause, changes with `path:line`, test evidence, and open
      points.
-3. Follow-ups in a worker's area go to **the same worker** via SendMessage
-   (it keeps its context); spawn fresh workers only for new areas.
+3. Follow-ups in a worker's area go to **the same worker** — resume or
+   re-message the worker that owns that area (it keeps its context); where the
+   runtime offers no way to resume a worker, spawn a fresh worker briefed
+   with the previous one's report and owned files. Spawn fresh workers only
+   for new areas.
 4. Every "open point" a worker reports is resolved before the phase ends:
    fixed in this issue when it is in scope, otherwise filed as a follow-up
    issue. Nothing is left only in chat.
@@ -128,7 +135,9 @@ head; checking only CI loses review rounds.
    <n> --json labels` and add it when missing or removed (`gh pr edit <n>
    --add-label ai:review`; `gh label create ai:review` first if the label
    does not exist). Do this for every PR of the stack and after every push.
-2. **Watch.** Start one Monitor per push that polls until (a) every check of
+2. **Watch.** Start one background watcher per push (a monitor tool where
+   the runtime has one; otherwise a polling loop or repeated scheduled
+   checks) that polls until (a) every check of
    the PR is non-pending and (b) a review whose `commit_id` equals the pushed
    head exists (`gh api repos/<repo>/pulls/<n>/reviews`); emit each failed
    check and the review id as events. Also read human reviews, inline review
@@ -242,8 +251,8 @@ address its findings in a new fix PR off the updated `main` (same loop).
   not word-split `$VAR`, so a zsh `env $U …` silently removes nothing:
   `bash -c 'for v in $(compgen -e | grep "^POHUNEK_"); do unset "$v"; done; cargo nextest run …'`.
   Never print variable values. Never call `env` or `printenv` in any form
-  (including `env | grep -c` to verify): the user's `Bash(env)` ask rule
-  fires on any occurrence and blocks the autonomous run on a confirmation;
+  (including `env | grep -c` to verify): a runtime permission or ask rule may
+  fire on any occurrence and block the autonomous run on a confirmation;
   verify with `compgen -e | grep -c '^POHUNEK_'`.
 - The relay PostgreSQL tests need `POHUNEK_RELAY_TEST_DATABASE_URL`; without
   it about 140 relay tests fail locally by design — they are CI-only

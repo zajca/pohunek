@@ -53,7 +53,10 @@ changes, also run `cargo xtask docs check`.
 
 The milestone loop described in AGENTS.md (plan → implement in a worktree →
 review against the issue's DoD → merge and advance → release) is encoded as
-skills under `.claude/skills/`. Prefer them over re-deriving the steps each
+skills under `.agents/skills/` (the canonical file layout; `.claude/skills/<name>`
+is a relative symlink to `../../.agents/skills/<name>`, kept for Claude Code
+skill discovery — the symlink resolves to the same files, so edits belong only
+in the canonical tree). Prefer them over re-deriving the steps each
 time; they auto-trigger from the usual phrasing. All of them route their
 GitHub-issue and project updates through the shared **`github-workflow`**
 skill (deduplication, issue body/comment structure, project status
