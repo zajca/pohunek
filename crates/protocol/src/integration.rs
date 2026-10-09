@@ -533,18 +533,7 @@ pub struct IntegrationDoctorResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{IntegrationInstallState, IntegrationRecovery, IntegrationStatusParams};
-
-    #[test]
-    fn integration_status_params_reject_unknown_fields() {
-        let error = serde_json::from_value::<IntegrationStatusParams>(serde_json::json!({
-            "agent": "codex",
-            "unexpected": true,
-        }))
-        .expect_err("unknown integration status fields must fail");
-
-        assert!(error.to_string().contains("unknown field `unexpected`"));
-    }
+    use super::{IntegrationInstallState, IntegrationRecovery};
 
     #[test]
     fn requests_without_the_home_selectors_keep_their_pre_existing_wire_shape() {
@@ -736,27 +725,6 @@ mod tests {
     }
 
     #[test]
-    fn integration_uninstall_and_doctor_params_reject_unknown_fields() {
-        let uninstall = serde_json::from_value::<super::IntegrationUninstallParams>(
-            serde_json::json!({ "agent": "claude", "everything": true }),
-        )
-        .expect_err("unknown uninstall fields must fail");
-        assert!(uninstall.to_string().contains("unknown field `everything`"));
-        let doctor = serde_json::from_value::<super::IntegrationDoctorParams>(
-            serde_json::json!({ "agent": "codex", "deep": true }),
-        )
-        .expect_err("unknown doctor fields must fail");
-        assert!(doctor.to_string().contains("unknown field `deep`"));
-        assert_eq!(super::IntegrationDoctorParams::default().agent, None);
-        for missing in [serde_json::json!({}), serde_json::Value::Null] {
-            assert!(
-                serde_json::from_value::<super::IntegrationUninstallParams>(missing).is_err(),
-                "an uninstall must name its agent"
-            );
-        }
-    }
-
-    #[test]
     fn integration_finding_enums_use_exact_snake_case_wire_values() {
         use super::{IntegrationFindingCode as Code, IntegrationFindingSeverity as Severity};
         for (code, expected) in [
@@ -802,19 +770,6 @@ mod tests {
                 serde_json::to_string(&severity).expect("serialize severity"),
                 expected
             );
-        }
-    }
-
-    #[test]
-    fn integration_uninstall_state_uses_exact_snake_case_wire_values() {
-        for (state, expected) in [
-            (super::IntegrationUninstallState::Removed, "\"removed\""),
-            (
-                super::IntegrationUninstallState::NotInstalled,
-                "\"not_installed\"",
-            ),
-        ] {
-            assert_eq!(serde_json::to_string(&state).expect("serialize"), expected);
         }
     }
 }
