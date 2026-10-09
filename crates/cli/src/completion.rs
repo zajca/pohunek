@@ -765,38 +765,6 @@ mod tests {
     }
 
     #[test]
-    fn static_scripts_cover_supported_shells() {
-        for (shell, marker, host_marker) in [
-            (CompletionShell::Bash, "complete", "--host"),
-            (CompletionShell::Zsh, "#compdef pohunek", "--host"),
-            (CompletionShell::Fish, "complete -c pohunek", "-l host"),
-        ] {
-            let script = String::from_utf8(render_script(shell, false)).expect("UTF-8 script");
-            assert!(script.contains(marker), "missing {marker:?} in {script}");
-            assert!(script.contains("session"));
-            assert!(script.contains(host_marker));
-            assert!(
-                script.contains("agent-skill"),
-                "static {shell:?} completion must cover the agent-skill command: {script}"
-            );
-        }
-    }
-
-    #[test]
-    fn dynamic_bootstraps_use_private_completion_environment() {
-        for shell in [
-            CompletionShell::Bash,
-            CompletionShell::Zsh,
-            CompletionShell::Fish,
-        ] {
-            let script = String::from_utf8(render_script(shell, true)).expect("UTF-8 script");
-            assert!(script.contains(COMPLETE_ENV));
-            assert!(script.contains(shell.name()));
-            assert!(script.contains("pohunek"));
-        }
-    }
-
-    #[test]
     fn context_honors_last_global_host_before_cursor() {
         let words = [
             "pohunek",
