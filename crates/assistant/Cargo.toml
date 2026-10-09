@@ -16,5 +16,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+# The socket transport tests spin a tokio runtime for the client/responder.
+tokio = { workspace = true }
+# Hermetic fixture roots; never std::env::temp_dir.
+pohunek-test-support = { workspace = true }
+
 [lints]
 workspace = true
