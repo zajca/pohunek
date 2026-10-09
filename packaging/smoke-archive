@@ -206,6 +206,21 @@ stage_check() {
     conflicting_link=$(LC_ALL=C comm -12 "$work/stage-links-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
     [ -z "$conflicting_link" ] || fail "staged upstream has a duplicate STAGE.links link path: $stage_dir/$conflicting_link"
     stage_real=$(cd "$stage_dir" && pwd -P)
+    # Empty directories are absent from both manifests, but their names must
+    # still obey the stage tree's name contract. NUL-delimited paths preserve
+    # newlines and other hostile bytes while scanning the tree in one pass.
+    (cd "$stage_dir" && find . -type d -print0) > "$work/stage-dirs.txt" \
+        || fail "cannot enumerate staged upstream directories: $stage_dir"
+    iconv -f UTF-8 -t UTF-8 "$work/stage-dirs.txt" >/dev/null \
+        || fail "staged upstream has an invalid UTF-8 directory name: $stage_dir"
+    [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$work/stage-dirs.txt" | LC_ALL=C tr -d '\000' | wc -c)" -eq 0 ] \
+        || fail "staged upstream has an unsafe directory name: $stage_dir"
+    if LC_ALL=C.UTF-8 grep -azq '[[:cntrl:]]' "$work/stage-dirs.txt"; then
+        fail "staged upstream has a Unicode control in a directory name: $stage_dir"
+    else
+        control_status=$?
+        [ "$control_status" -eq 1 ] || fail "cannot check staged upstream directory names: $stage_dir"
+    fi
     files=$(cat "$work/stage-files-sorted.txt")
     links=$(cat "$work/stage-links-sorted.txt")
     listed=$({ printf '%s\n' "$files"; printf '%s\n' "$links"; } | sed '/^$/d' | LC_ALL=C sort)
@@ -228,6 +243,8 @@ stage_check() {
                 [ -n "$target" ] && [ -L "$stage_dir/$path" ] \
                     && [ "$(readlink -- "$stage_dir/$path")" = "$target" ] \
                     || fail "staged upstream link differs from STAGE.links: $stage_dir/$path"
+                # Smoke also requires the full target chain to resolve before
+                # launching an upstream, including any intermediate links.
                 resolved=$(readlink -f -- "$stage_dir/$path") \
                     || fail "unresolvable link in staged upstream: $stage_dir/$path"
                 case $resolved in

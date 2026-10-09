@@ -244,6 +244,24 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("manifests do not list", result.stderr)
 
+    def test_an_empty_directory_with_a_backslash_name_is_refused(self):
+        (self.stage / "pi" / "bad\\name").mkdir()
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe directory name", result.stderr)
+
+    def test_an_empty_directory_with_a_newline_name_is_refused(self):
+        (self.stage / "pi" / "bad\nname").mkdir()
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe directory name", result.stderr)
+
+    def test_an_empty_directory_with_a_unicode_control_name_is_refused(self):
+        (self.stage / "pi" / "bad\u0085name").mkdir()
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unicode control in a directory name", result.stderr)
+
     def test_a_link_leaving_the_stage_is_refused(self):
         outside = self.base / "outside"
         outside.write_text("x\n")
@@ -293,6 +311,15 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
             manifest.write("link\tbin/alias\t../bin/pi\n")
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_link_with_missing_intermediate_target_is_refused(self):
+        stage = self.stage / "pi"
+        (stage / "bin" / "alias").symlink_to("missing/target")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\tbin/alias\tmissing/target\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unresolvable link in staged upstream", result.stderr)
 
     def test_a_link_target_with_unicode_control_is_refused(self):
         stage = self.stage / "pi"
