@@ -35,7 +35,7 @@ use protocol::{
     SessionRemoveResult, SessionReportAgentParams, SessionReportAgentResult,
     SessionReportNativeIdParams, SessionReportNativeIdResult, SessionResizeParams,
     SessionResizeResult, SessionState, SessionStopResult, StateSource, TerminalDimensions,
-    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    WorktreeRemoveParams, WorktreeRemoveResult, ENV_DAEMON_ID, ENV_SESSION_ID, PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -1480,6 +1480,8 @@ async fn health_returns_versions() {
 
 #[tokio::test]
 async fn public_bind_serves_host_discover_with_supplied_registry() {
+    let mut origin_env = ProcessEnv::lock();
+    origin_env.remove(ENV_DAEMON_ID).remove(ENV_SESSION_ID);
     let socket = temp_socket("host-discover-public-bind");
     let (shutdown, handle) = spawn_server(&socket, "9.9.9-test").await;
 
@@ -1493,6 +1495,16 @@ async fn public_bind_serves_host_discover_with_supplied_registry() {
     let records: Vec<HostRecord> =
         serde_json::from_value(ok_payload(resp)).expect("host records deserialize");
     assert!(records.is_empty());
+
+    let default_req = Request::make(
+        "host-discover-default",
+        method::HOST_DISCOVER,
+        serde_json::json!({}),
+    );
+    let default_resp = exchange(&mut client, &default_req).await;
+    let default_records: Vec<HostRecord> =
+        serde_json::from_value(ok_payload(default_resp)).expect("default host records deserialize");
+    assert!(default_records.is_empty());
 
     let _ = shutdown.send(());
     let _ = handle.await;

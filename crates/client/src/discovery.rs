@@ -593,29 +593,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn response_version_is_the_classification_authority() {
-        let other = PROTOCOL_VERSION.get() + 1;
-        let other_version = ProtocolVersion::new(other).expect("nonzero test version");
-        let response = Response::err(
-            other_version,
-            "probe",
-            protocol::ProtocolError::version_mismatch(
-                ProtocolVersionRange::new(PROTOCOL_VERSION, PROTOCOL_VERSION)
-                    .expect("valid exact test range"),
-                ProtocolVersionRange::new(other_version, other_version)
-                    .expect("valid exact test range"),
-            ),
-        )
-        .expect("valid test response");
-        assert_eq!(
-            classify_response(&response, CURRENT_PROTOCOL_VERSIONS),
-            HostClass::VersionMismatch {
-                daemon_protocol_version: other
-            }
-        );
-    }
-
     /// A daemon stub that answers a health probe like a daemon whose only
     /// protocol version is `served`: success when the probe asks for it, a typed
     /// mismatch stamped with `served` otherwise.
@@ -668,14 +645,21 @@ mod tests {
         // A previous-version requester: a v3-only daemon is reachable, a
         // v4-only one is not.
         let v3_only = single_version_stub(previous).await;
+        let actual = classify(v3_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await;
+        assert_eq!(actual, reachable);
         assert_eq!(
-            classify(v3_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await,
-            reachable
+            serde_json::to_value(&actual).expect("serialize classification"),
+            serde_json::json!({"classification": "reachable_daemon", "daemon_version": "stub"})
         );
         let v4_only = single_version_stub(PROTOCOL_VERSION).await;
+        let actual = classify(v4_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await;
+        assert_eq!(actual, mismatch(PROTOCOL_VERSION));
         assert_eq!(
-            classify(v4_only, DEFAULT_PROBE_TIMEOUT, None, exact(previous)).await,
-            mismatch(PROTOCOL_VERSION)
+            serde_json::to_value(&actual).expect("serialize classification"),
+            serde_json::json!({
+                "classification": "version_mismatch",
+                "daemon_protocol_version": PROTOCOL_VERSION.get()
+            })
         );
 
         // A current-only requester sees the opposite.
@@ -770,15 +754,17 @@ mod tests {
     #[tokio::test]
     async fn closed_daemon_is_unreachable() {
         let closed = RefusedEndpoint::reserve();
+        let actual = classify(
+            closed.addr,
+            Duration::from_millis(100),
+            None,
+            CURRENT_PROTOCOL_VERSIONS,
+        )
+        .await;
+        assert_eq!(actual, HostClass::Unreachable);
         assert_eq!(
-            classify(
-                closed.addr,
-                Duration::from_millis(100),
-                None,
-                CURRENT_PROTOCOL_VERSIONS
-            )
-            .await,
-            HostClass::Unreachable
+            serde_json::to_value(&actual).expect("serialize classification"),
+            serde_json::json!({"classification": "unreachable"})
         );
     }
 
@@ -955,6 +941,18 @@ mod tests {
         assert_eq!(records[1].peer_id.as_deref(), Some("127.0.0.1"));
         assert_eq!(records[0].port, 1);
         assert_eq!(records[1].class, HostClass::Candidate);
+        assert_eq!(
+            serde_json::to_value(&records[1]).expect("serialize discovered host"),
+            serde_json::json!({
+                "name": "second",
+                "fqdn": "second.example",
+                "address": null,
+                "port": 1,
+                "overlay": "netbird",
+                "peer_id": "127.0.0.1",
+                "classification": "candidate"
+            })
+        );
     }
 
     #[tokio::test]
