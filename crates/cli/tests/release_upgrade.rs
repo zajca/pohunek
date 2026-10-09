@@ -51,12 +51,10 @@ const SHELL: &str = "/bin/sh";
 const PROFILE: &str = "fake-claude";
 
 /// Native id the fresh launch reports through the previous release's hook.
-/// The worker keeps the first launch identity, so this stays the session's
-/// native reference, and `resume` relaunches with it.
 const NATIVE_BEFORE: &str = "native-before-upgrade";
 
-/// Id reported after the upgrade. A later report does not replace the launch
-/// identity; it becomes the session's active agent session id.
+/// Id reported after the upgrade. The new daemon persists this later report
+/// as the current native conversation for a verified launch process.
 const NATIVE_AFTER: &str = "native-after-upgrade";
 
 /// Hook event ids of the notifications the test waits for; each carries a
@@ -690,6 +688,7 @@ impl Upgrade {
         wait_native_id(head, id, NATIVE_BEFORE);
         input(head, id, &format!("report:{NATIVE_AFTER}"));
         wait_active_agent_id(head, id, NATIVE_AFTER);
+        wait_native_id(head, id, NATIVE_AFTER);
         // The runbook step after an upgrade: reinstall the managed hooks. The
         // previous release's notification hook is dropped by every daemon that
         // expects the current hook, so the new one is installed over it while
@@ -765,11 +764,11 @@ impl Upgrade {
                 && resumed.worker_instance_id != after.worker_instance_id,
             "resume must start a new runtime generation: {after:?} -> {resumed:?}"
         );
-        wait_screen(head, id, &format!("args=[--resume {NATIVE_BEFORE}]"));
+        wait_screen(head, id, &format!("args=[--resume {NATIVE_AFTER}]"));
         let launches = self.run.wait_launches(2);
         assert_eq!(launches.len(), 2, "one launch per runtime: {launches:?}");
         assert!(
-            launches[1].contains(&format!("--resume {NATIVE_BEFORE}")),
+            launches[1].contains(&format!("--resume {NATIVE_AFTER}")),
             "resume launched without the native reference: {launches:?}"
         );
         let status = poll_until("the resumed worker runs from this build", || {
@@ -778,7 +777,7 @@ impl Upgrade {
                 .then_some(status)
         });
         assert_eq!(status["active_version"], self.head_version.as_str());
-        wait_native_id(head, id, NATIVE_BEFORE);
+        wait_native_id(head, id, NATIVE_AFTER);
         wait_notification(head, id, EVENT_AFTER_RESUME);
 
         // The relaunch froze the profile revision.
