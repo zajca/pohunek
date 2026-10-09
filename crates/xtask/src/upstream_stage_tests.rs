@@ -733,6 +733,36 @@ fn a_link_with_a_missing_final_target_is_refused_by_both_verifiers() {
 }
 
 #[test]
+fn a_regular_file_used_as_a_directory_in_a_link_target_is_refused() {
+    for target in [
+        "../lib/node_modules/@fake/up/package.json/.",
+        "../lib/node_modules/@fake/up/package.json/",
+    ] {
+        let fixture = Fixture::new();
+        let stage = fixture.staged();
+        assert!(
+            stage
+                .join("lib/node_modules/@fake/up/package.json")
+                .is_file(),
+            "the target's base must be an existing regular file"
+        );
+        symlink(target, stage.join("bin/odd")).expect("link through a regular file");
+        let manifest = stage.join("STAGE.links");
+        let mut links = fs::read_to_string(&manifest).expect("links manifest");
+        links.push_str("link\tbin/odd\t");
+        links.push_str(target);
+        links.push('\n');
+        write_file(manifest, links).expect("record link");
+
+        refused(fixture.verify(), "bin/odd", Fault::EscapingLink);
+        assert!(
+            !fixture.posix_verify(),
+            "POSIX verifier accepted a regular file as a directory: {target}"
+        );
+    }
+}
+
+#[test]
 fn a_symlink_cycle_is_refused_by_both_verifiers() {
     let fixture = Fixture::new();
     let stage = fixture.staged();

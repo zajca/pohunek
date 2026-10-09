@@ -151,6 +151,9 @@ resolved_inside() (
     resolved=$(readlink -e "$candidate" && printf x) || exit 1
     case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
   done
+  # Resolve the symlink itself to retain a final slash or dot after a file.
+  resolved=$(readlink -e "$path" && printf x) || exit 1
+  case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
 )
 contains_line() {
   [ -n "$1" ] && printf '%s\n' "$1" | grep -Fxq -- "$2"

@@ -163,6 +163,9 @@ resolved_inside() (
     resolved=$(readlink -e "$candidate" && printf x) || exit 1
     case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
   done
+  # Resolve the symlink itself to retain a final slash or dot after a file.
+  resolved=$(readlink -e "$path" && printf x) || exit 1
+  case $resolved in "$root$nl"x|"$root"/*"$nl"x) ;; *) exit 1 ;; esac
 )
 contains_line() {
   [ -n "$1" ] && printf '%s\n' "$1" | grep -Fxq -- "$2"
@@ -848,7 +851,9 @@ fn resolved_inside(stage_root: &Path, path: &Path, target: &Path) -> bool {
             return false;
         }
     }
-    true
+    // Path::components discards a trailing slash or dot, while the kernel
+    // rejects either when the preceding component is a regular file.
+    fs::canonicalize(path).is_ok_and(|resolved| resolved.starts_with(stage_root))
 }
 
 /// A path rendered with control characters escaped, for error messages.
