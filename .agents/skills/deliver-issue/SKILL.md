@@ -94,7 +94,7 @@ slice:
      add no test for a trivial helper change or a refactor existing scenarios
      already cover, and never write a new unit test (AGENTS.md "Testing policy");
    - run the checks its change affects: its crate's tests, clippy `-D warnings` (host, and
-     `--target aarch64-apple-darwin` for platform/daemon code), `cargo fmt`,
+     `scripts/darwin-check` for platform/daemon code), `cargo fmt`,
      and `cargo xtask docs check` when docs changed;
    - report root cause, changes with `path:line`, test evidence, and open
      points.
@@ -262,8 +262,9 @@ address its findings in a new fix PR off the updated `main` (same loop).
 - The relay PostgreSQL tests need `POHUNEK_RELAY_TEST_DATABASE_URL`; without
   it about 140 relay tests fail locally by design — they are CI-only
   evidence, not regressions.
-- `cargo clippy --target aarch64-apple-darwin -p pohunek-cli` cannot build
-  `ring` on a Linux host; macOS behavior of the CLI is CI-only evidence.
+- `cargo clippy --target aarch64-apple-darwin` cannot build `ring` or `psm` on a
+  Linux host without an Apple SDK; run `scripts/darwin-check` instead (it needs
+  `zig` on PATH). It only lints, so macOS behavior is CI-only evidence.
 - `/tmp` is a small tmpfs: no worktrees or target dirs there. macOS puts
   temporary directories below the `/var` symlink — canonicalize test roots
   that trusted-directory checks inspect.

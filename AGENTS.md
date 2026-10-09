@@ -214,9 +214,17 @@ with `MACOSX_DEPLOYMENT_TARGET=14.0`: it checks, lints, and tests
 `pohunek-paths`, `pohunek-session-worker`, `pohunek-service-config`,
 `pohunek-daemon`, and `pohunek-cli`, and fails hard when the runner's
 `gui/<uid>` launchd domain is absent. Linux clippy never compiles the
-launchd backend, so lint it from Linux with
-`cargo clippy --target aarch64-apple-darwin -p <crate> --all-targets -- -D warnings`
-before pushing. The real-systemd suites (`crates/platform/tests/systemd.rs`,
+launchd backend or any other `cfg(target_os = "macos")` code, so lint it from
+Linux with `scripts/darwin-check` before pushing (`scripts/darwin-check -p
+<crate>` narrows it; `bacon darwin-check` re-runs it on save). It runs
+`cargo clippy --target aarch64-apple-darwin --all-targets --all-features -- -D
+warnings` over the workspace and needs `rustup target add aarch64-apple-darwin`
+plus `zig` on PATH: `ring` and `psm` compile C in their build scripts, and `zig
+cc` supplies the macOS libc headers a Linux host lacks. It only checks, so a
+green run says the macOS code compiles and lints, not that it behaves; the CI
+job `macOS lint from Linux (aarch64-apple-darwin clippy)` runs the same
+script on every pull request, and the native jobs stay the behavior evidence.
+The real-systemd suites (`crates/platform/tests/systemd.rs`,
 `crates/daemon/tests/systemd_durable_worker.rs`,
 `crates/cli/tests/service_systemd.rs`) are `#[ignore]`d and need
 `POHUNEK_SYSTEMD_E2E=1` plus a running user manager; the Linux CI job

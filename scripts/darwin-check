@@ -1,0 +1,42 @@
+#!/bin/sh
+# Lint the macOS-only code (`cfg(target_os = "macos")`: the launchd backend,
+# the Darwin process backend, Keychain callers) from a Linux host.
+#
+#   scripts/darwin-check                  # the whole workspace, as CI does
+#   scripts/darwin-check -p pohunek-cli   # cargo package selection
+#
+# This is `cargo clippy --target aarch64-apple-darwin --all-targets
+# --all-features -- -D warnings`. It only checks: nothing is linked and nothing
+# runs, so it replaces neither the native `platform contracts (arm64)` job nor
+# the macOS acceptance jobs; it moves their compile and lint failures earlier.
+#
+# Needs the Rust target (`rustup target add aarch64-apple-darwin`) and, on a
+# non-macOS host, `zig` on PATH: the build scripts of `ring` and `psm` compile C
+# for the Apple target, and `zig cc` carries the macOS libc headers that a
+# Linux host lacks (scripts/darwin-check-cc translates the compiler flags). A
+# macOS host builds natively and needs neither zig nor the wrapper.
+set -eu
+
+target=aarch64-apple-darwin
+root=$(cd "$(dirname "$0")/.." && pwd)
+
+if ! rustc --print target-libdir --target "$target" >/dev/null 2>&1; then
+  echo "darwin-check: the Rust target $target is not installed; run: rustup target add $target" >&2
+  exit 1
+fi
+
+if [ "$(uname -s)" != Darwin ]; then
+  if ! command -v zig >/dev/null 2>&1; then
+    echo "darwin-check: zig is required on this host to compile the macOS build scripts; install it with your package manager (e.g. 'nix profile install nixpkgs#zig' or 'sudo pacman -S zig')" >&2
+    exit 1
+  fi
+  CC_aarch64_apple_darwin=$root/scripts/darwin-check-cc
+  export CC_aarch64_apple_darwin
+fi
+
+if [ "$#" -eq 0 ]; then
+  set -- --workspace
+fi
+
+cd "$root"
+exec cargo clippy --target "$target" "$@" --all-targets --all-features -- -D warnings

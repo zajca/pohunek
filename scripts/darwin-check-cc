@@ -1,0 +1,35 @@
+#!/bin/sh
+# C compiler for the aarch64-apple-darwin build scripts on a host that has no
+# Apple SDK (see scripts/darwin-check).
+#
+# The `cc` crate compiles C for an Apple target with clang-style flags
+# (`--target=arm64-apple-macosx<min>`, `-arch arm64`, `-mmacosx-version-min=<min>`).
+# `zig cc` ships the macOS libc headers (TargetConditionals.h and friends) but
+# names the target itself, so those three flags are replaced by one `-target`
+# that keeps the deployment target the crate asked for.
+set -eu
+
+min_version=
+skip_next=0
+remaining=$#
+while [ "$remaining" -gt 0 ]; do
+  arg=$1
+  shift
+  remaining=$((remaining - 1))
+  if [ "$skip_next" = 1 ]; then
+    skip_next=0
+    continue
+  fi
+  case $arg in
+    --target=*) ;;
+    -arch) skip_next=1 ;;
+    -mmacosx-version-min=*) min_version=${arg#-mmacosx-version-min=} ;;
+    *) set -- "$@" "$arg" ;;
+  esac
+done
+
+target=aarch64-macos
+if [ -n "$min_version" ]; then
+  target=$target.$min_version
+fi
+exec zig cc -target "$target" "$@"

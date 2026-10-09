@@ -26,6 +26,7 @@ errors, mirroring CI.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features   # under -D warnings
+scripts/darwin-check                                    # macOS-only code; needs zig on a Linux host
 cargo build -p pohunek-session-worker --bin pohunek-sessiond
 cargo nextest run --profile ci --test-threads 4 --workspace --all-features
 cargo test --doc --workspace --all-features             # nextest excludes doctests
