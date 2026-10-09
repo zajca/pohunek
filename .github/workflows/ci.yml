@@ -1102,7 +1102,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:17-alpine
+        # Docker Official Image from Google's cache, pinned to its OCI index.
+        image: mirror.gcr.io/library/postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
         env:
           POSTGRES_DB: pohunek_test
           POSTGRES_HOST_AUTH_METHOD: trust
