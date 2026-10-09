@@ -1259,6 +1259,28 @@ async fn stop_real_daemon(
         .expect("wait for real daemon")
 }
 
+#[test]
+fn daemon_startup_rejects_missing_config_home_and_home() {
+    let env = TestEnv::new().expect("create isolated daemon environment");
+    let output = env
+        .command(bin_exe("pohunekd"))
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("HOME")
+        .env("POHUNEK_WORKER_LAUNCHER", "subprocess")
+        .output()
+        .expect("run real daemon");
+
+    assert!(
+        !output.status.success(),
+        "daemon must refuse missing path roots"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("XDG_CONFIG_HOME or HOME"),
+        "daemon must name the missing configuration root: {stderr}"
+    );
+}
+
 #[tokio::test]
 #[expect(
     clippy::too_many_lines,
@@ -1331,6 +1353,10 @@ async fn daemon_startup_creates_private_host_state_from_ordinary_xdg_state_home(
     .await
     .expect("daemon.health returns before control timeout");
     assert!(response.is_ok(), "daemon health succeeds after bootstrap");
+    assert!(
+        data_home.join(APP_DIR).join("data.lock").is_file(),
+        "the running daemon owns the data authority lock in the XDG data root"
+    );
 
     let session_request = Request::make(
         "startup-private-state-session-new",
