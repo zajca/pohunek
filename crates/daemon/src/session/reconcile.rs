@@ -2643,14 +2643,30 @@ impl SessionRegistry {
         &self,
         record: &SessionRecord,
     ) -> Option<InspectSnapshot> {
-        let generation = record.runtime.generation.as_deref()?;
-        let journals = self.discover_worker_journals().await.ok()?;
-        let scan = journals.get(record.session_id.as_str())?;
-        scan.journal_of_generation(generation)
+        self.generation_journal_snapshot_checked(record)
+            .await
             .ok()
-            .flatten()?
-            .snapshot()
-            .ok()
+            .flatten()
+    }
+
+    /// Reads an exact generation without treating failed evidence as absence.
+    ///
+    /// Explicit recovery must propagate the reason; terminal import may use
+    /// [`Self::generation_journal_snapshot`] to leave a target unchanged.
+    pub(super) async fn generation_journal_snapshot_checked(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<Option<InspectSnapshot>, String> {
+        let Some(generation) = record.runtime.generation.as_deref() else {
+            return Ok(None);
+        };
+        let journals = self.discover_worker_journals().await?;
+        let Some(scan) = journals.get(record.session_id.as_str()) else {
+            return Ok(None);
+        };
+        scan.journal_of_generation(generation)?
+            .map(|journal| journal.snapshot().map_err(str::to_owned))
+            .transpose()
     }
 
     /// Whether this generation journal carries an unpromoted native claim.

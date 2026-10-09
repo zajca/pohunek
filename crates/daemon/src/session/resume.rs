@@ -146,6 +146,12 @@ pub(super) struct RelaunchPlan {
     pub(super) profile: RecoveryProfile,
 }
 
+struct ActivityGroup {
+    existence: ReferenceExistence,
+    root: PathBuf,
+    references: Vec<(usize, SessionRef)>,
+}
+
 /// The profile a session was launched from no longer resolves.
 fn profile_missing(binding: &ResumeBinding, reason: &str) -> ProtocolError {
     ProtocolError::new(
@@ -185,6 +191,21 @@ fn profile_changed(binding: &ResumeBinding, was_frozen: bool) -> ProtocolError {
     )
 }
 
+fn native_evidence_unavailable(
+    binding: &ResumeBinding,
+    reason: impl std::fmt::Display,
+) -> ProtocolError {
+    ProtocolError::new(
+        ErrorClass::Runtime,
+        "native_identity_evidence_unavailable",
+        format!(
+            "session {} native conversation evidence cannot be verified: {reason}",
+            binding.session_id
+        ),
+        Some("inspect the durable store and worker journal, then retry recovery".to_owned()),
+    )
+}
+
 impl SessionRegistry {
     /// Adds verified native-reference last activity to public response copies.
     ///
@@ -213,34 +234,77 @@ impl SessionRegistry {
         let Ok(base_environment) = self.launch_base_environment() else {
             return;
         };
-        for (info, binding) in sessions.iter_mut().zip(bindings) {
-            let (Some(binding), Some(target)) = (binding, info.native_session_id.as_deref()) else {
-                continue;
-            };
-            let Ok(definition) = self.binding_definition(&binding) else {
-                continue;
-            };
-            let launch = binding_native_launch(&binding, &definition);
-            let Some(existence) = reference_existence(&binding, launch.as_ref(), &definition)
-            else {
-                continue;
-            };
-            let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse) else {
-                continue;
-            };
-            let Ok(reference) = SessionRef::id(target) else {
-                continue;
-            };
-            let profile_env = profile.env;
-            let base = base_environment.clone();
-            let modified = tokio::task::spawn_blocking(move || {
-                let lookup = |name: &str| effective_variable(&base, profile_env.as_slice(), name);
-                existence.modified_at_unix_nanos(&reference, &lookup)
+        let lookups = sessions
+            .iter()
+            .zip(bindings)
+            .map(|(info, binding)| {
+                let (Some(binding), Some(target)) = (binding, info.native_session_id.as_deref())
+                else {
+                    return None;
+                };
+                let Ok(definition) = self.binding_definition(&binding) else {
+                    return None;
+                };
+                let launch = binding_native_launch(&binding, &definition);
+                let existence = reference_existence(&binding, launch.as_ref(), &definition)?;
+                let Ok(profile) = self.resolve_recovery_profile(&binding, ProfileChange::Refuse)
+                else {
+                    return None;
+                };
+                let Ok(reference) = SessionRef::id(target) else {
+                    return None;
+                };
+                Some((existence, reference, profile.env))
             })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten();
+            .collect::<Vec<_>>();
+        let sessions_len = sessions.len();
+        let modified = tokio::task::spawn_blocking(move || {
+            let mut groups: Vec<ActivityGroup> = Vec::new();
+            for (index, lookup) in lookups.into_iter().enumerate() {
+                let Some((existence, reference, profile_env)) = lookup else {
+                    continue;
+                };
+                let resolve = |name: &str| {
+                    effective_variable(&base_environment, profile_env.as_slice(), name)
+                };
+                let Ok(Some(root)) = existence.activity_store_root(&resolve) else {
+                    continue;
+                };
+                if let Some(group) = groups
+                    .iter_mut()
+                    .find(|group| group.existence == existence && group.root == root)
+                {
+                    group.references.push((index, reference));
+                } else {
+                    groups.push(ActivityGroup {
+                        existence,
+                        root,
+                        references: vec![(index, reference)],
+                    });
+                }
+            }
+            let mut modified = vec![None; sessions_len];
+            for group in groups {
+                let references = group
+                    .references
+                    .iter()
+                    .map(|(_, reference)| reference.clone())
+                    .collect::<Vec<_>>();
+                for ((index, _), nanos) in group.references.into_iter().zip(
+                    group
+                        .existence
+                        .modified_many_unix_nanos(&group.root, &references),
+                ) {
+                    modified[index] = nanos;
+                }
+            }
+            modified
+        })
+        .await;
+        let Ok(modified) = modified else {
+            return;
+        };
+        for (info, modified) in sessions.iter_mut().zip(modified) {
             info.native_last_activity_at = modified
                 .and_then(|nanos| time::OffsetDateTime::from_unix_timestamp_nanos(nanos).ok())
                 .and_then(|time| {
@@ -328,6 +392,8 @@ impl SessionRegistry {
     /// `native_identity_missing` or `native_identity_unverified` when a hook
     /// runtime lacks a trusted native reference, `not_resumable` when another
     /// entry lacks the reference required by its frozen resume template,
+    /// `native_identity_evidence_unavailable` when the durable record or exact
+    /// worker generation cannot be read and matched,
     /// `native_identity_uncertain` when the worker journal carries a newer
     /// conversation switch the daemon cannot verify, so recovery neither
     /// launches an agent into a conversation it cannot confirm nor falls back
@@ -423,12 +489,8 @@ impl SessionRegistry {
         };
         let launch = binding_native_launch(&binding, &definition)
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
-        if let Some(error) = self
-            .hook_recovery_journal_error(&record, &binding, &launch)
-            .await
-        {
-            return Err(error);
-        }
+        self.hook_recovery_journal_error(&record, &binding, &launch)
+            .await?;
         let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
 
         let info = match self
@@ -445,22 +507,24 @@ impl SessionRegistry {
         Ok(info)
     }
 
-    /// Refuses recovery of a hook binding whose tested generation journal
-    /// invalidates the persisted state: a missing reference, or a newer
-    /// conversation switch the daemon cannot verify.
+    /// Refuses recovery of a hook binding whose reference or exact generation
+    /// evidence cannot be verified against the durable state.
     ///
-    /// Returns the typed error, or `None` when the launch may proceed.
+    /// # Errors
+    ///
+    /// Returns a typed error when the target or its generation cannot be
+    /// verified before a new worker is created.
     async fn hook_recovery_journal_error(
         &self,
         record: &crate::store::SessionRecord,
         binding: &ResumeBinding,
         launch: &NativeSessionLaunch,
-    ) -> Option<ProtocolError> {
+    ) -> Result<(), ProtocolError> {
         if let Some(error) = self
             .missing_hook_reference_error(record, binding, launch)
             .await
         {
-            return Some(error);
+            return Err(error);
         }
         self.unverified_switch_claim_error(record, binding, launch)
             .await
@@ -520,41 +584,60 @@ impl SessionRegistry {
         record: &crate::store::SessionRecord,
         binding: &ResumeBinding,
         launch: &NativeSessionLaunch,
-    ) -> Option<ProtocolError> {
+    ) -> Result<(), ProtocolError> {
         if launch.assigned().is_some() {
-            return None;
+            return Ok(());
         }
         let (ref_kind, stored) = match launch.reference_kind() {
-            SessionRefKind::Id => (
-                SessionRefKind::Id,
-                record.info.native_session_id.as_deref()?,
-            ),
+            SessionRefKind::Id => (SessionRefKind::Id, record.info.native_session_id.as_deref()),
             SessionRefKind::Path => (
                 SessionRefKind::Path,
-                record.info.native_session_path.as_deref()?,
+                record.info.native_session_path.as_deref(),
             ),
+        };
+        let Some(stored) = stored else {
+            return Ok(());
         };
         // The journal of the last durable worker generation is the evidence a
         // terminal runtime leaves behind. The in-memory entry may have already
         // retired its job and dropped the generation token, so the durable
-        // record names it. A store problem leaves recovery on the verified
-        // target alone.
+        // record names it. An unreadable durable record is uncertain evidence.
         let durable = self
             .load_durable_session_record(&SessionId(record.session_id.clone()))
             .await
-            .ok()
-            .flatten();
+            .map_err(|_error| {
+                native_evidence_unavailable(binding, "the durable session record cannot be read")
+            })?;
         let durable = durable.filter(|durable| durable.runtime.generation.is_some());
         let durable = durable.as_ref().unwrap_or(record);
-        let snapshot = self.generation_journal_snapshot(durable).await?;
+        let Some(snapshot) = self
+            .generation_journal_snapshot_checked(durable)
+            .await
+            .map_err(|_reason| {
+                native_evidence_unavailable(binding, "the worker journal cannot be read")
+            })?
+        else {
+            if durable.runtime.generation.is_some() {
+                return Err(native_evidence_unavailable(
+                    binding,
+                    "the expected worker journal is absent",
+                ));
+            }
+            return Ok(());
+        };
         let instance = snapshot
             .worker_instance_id
             .as_ref()
             .map(pohunek_worker_protocol::WorkerInstanceId::as_str);
         if instance != durable.runtime.worker_instance_id.as_deref() {
-            return None;
+            return Err(native_evidence_unavailable(
+                binding,
+                "the worker journal names another instance",
+            ));
         }
-        let instance = instance?;
+        let instance = instance.ok_or_else(|| {
+            native_evidence_unavailable(binding, "the worker journal has no instance identity")
+        })?;
         let provider = super::agent_kind_label(&durable.info.agent_base);
         let ordering = durable
             .native_identity_ordering
@@ -580,9 +663,9 @@ impl SessionRegistry {
             false
         };
         if !uncertain {
-            return None;
+            return Ok(());
         }
-        Some(runtime_error(
+        Err(runtime_error(
             "native_identity_uncertain",
             format!(
                 "session {} has a newer native conversation switch that could not be verified; native recovery is unavailable",
@@ -646,6 +729,8 @@ impl SessionRegistry {
     /// Returns `migration_manifest_missing` while unmigrated legacy resume
     /// bindings exist, before anything is written, `agent_profile_changed` or
     /// `agent_profile_missing` when the profile no longer matches the source,
+    /// `native_identity_evidence_unavailable` when the source's durable record
+    /// or exact worker generation cannot be read and matched,
     /// `native_identity_uncertain` when the source's worker journal carries a
     /// newer conversation switch the daemon cannot verify, so no fork child
     /// launches from a source whose target the daemon cannot confirm,
@@ -670,12 +755,8 @@ impl SessionRegistry {
             .clone()
             .filter(NativeSessionLaunch::supports_fork)
             .ok_or_else(agent_fork_unsupported)?;
-        if let Some(error) = self
-            .hook_recovery_journal_error(&record, &binding, &launch)
-            .await
-        {
-            return Err(error);
-        }
+        self.hook_recovery_journal_error(&record, &binding, &launch)
+            .await?;
         let change = ProfileChange::requested(params.accept_profile_change);
 
         // A fork starts a new process of the runtime, so a runtime with a

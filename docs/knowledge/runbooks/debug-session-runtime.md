@@ -130,9 +130,11 @@ A terminal or lost hook runtime without a trusted native reference refuses
 means its own generation journal has no native claim;
 `runtime/native_identity_unverified` means it has a claim but no verified
 launch-process binding. `runtime/native_identity_evidence_unavailable` means
-the generation journal cannot be read or selected unambiguously. Preserve the
-journal for diagnosis. A foreign process claim keeps the existing typed
-process-identity reason and cannot replace the stored native reference.
+the durable session record or exact generation journal cannot be read, the
+journal is absent or ambiguous, or its worker instance does not match the
+record. Preserve both records for diagnosis. A foreign process claim keeps the
+existing typed process-identity reason and cannot replace the stored native
+reference.
 `runtime/native_identity_uncertain` means the generation journal carries a
 newer conversation switch that this daemon cannot verify: the journal names a
 different conversation than the persisted one and no newer accepted report

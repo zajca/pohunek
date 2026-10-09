@@ -8,6 +8,26 @@ const LAUNCH: &str = "fixture-claude-launch";
 const CLEAR: &str = "fixture-claude-clear";
 const SELECTED: &str = "fixture-claude-selected";
 
+async fn listed_sessions(control: &mut Framed<UnixStream, LinesCodec>) -> Vec<SessionInfo> {
+    serde_json::from_value(ok_payload(
+        exchange(
+            control,
+            &Request::make("list-batched-activity", method::SESSION_LIST, Value::Null),
+        )
+        .await,
+    ))
+    .expect("public session list")
+}
+
+fn activity_for<'a>(id: &SessionId, sessions: &'a [SessionInfo]) -> Option<&'a str> {
+    sessions
+        .iter()
+        .find(|session| &session.id == id)
+        .expect("session appears in list")
+        .native_last_activity_at
+        .as_deref()
+}
+
 struct ClaudeRig {
     socket: TestSocket,
     control: Framed<UnixStream, LinesCodec>,
@@ -18,14 +38,28 @@ struct ClaudeRig {
     ack_log: PathBuf,
     config_home: PathBuf,
     worker_state_root: PathBuf,
+    additional_sessions: Vec<SessionId>,
     _bin: TestDir,
     _state: TestDir,
-    _cwd: TestDir,
+    cwd: TestDir,
     _agents: TestDir,
     _config: TestDir,
 }
 
 impl ClaudeRig {
+    fn journal_path(&self) -> PathBuf {
+        let session_dir = self.worker_state_root.join(self.session.id.0.as_str());
+        let mut journals = std::fs::read_dir(&session_dir)
+            .expect("read the session's worker journal directory")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|name| name == "json"))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        journals.sort();
+        assert_eq!(journals.len(), 1, "one worker generation: {journals:?}");
+        journals.remove(0)
+    }
+
     async fn new(tag: &str) -> Self {
         let bin = temp_dir(&format!("{tag}-bin"));
         let state = temp_dir(&format!("{tag}-state"));
@@ -101,9 +135,10 @@ impl ClaudeRig {
             ack_log,
             config_home,
             worker_state_root,
+            additional_sessions: Vec::new(),
             _bin: bin,
             _state: state,
-            _cwd: cwd,
+            cwd,
             _agents: agents,
             _config: config,
         }
@@ -134,6 +169,35 @@ impl ClaudeRig {
             .expect("write fixture transcript");
     }
 
+    async fn start_with_reference(&mut self, reference: &str) -> SessionId {
+        let mut params = session_params_in(self.cwd.to_path_buf());
+        "claude-fixture".clone_into(&mut params.agent);
+        let session: SessionInfo = serde_json::from_value(ok_payload(
+            create_session_with_params(&mut self.control, params).await,
+        ))
+        .expect("create another Claude session");
+        let id = session.id;
+        self.additional_sessions.push(id.clone());
+        let submitted = input_session(
+            &mut self.control,
+            &id,
+            &format!("report startup {reference}"),
+        )
+        .await;
+        assert!(submitted.accepted, "fixture hook command accepted");
+        let control = tokio::sync::Mutex::new(&mut self.control);
+        wait_until(
+            "another Claude hook report to reach session.inspect",
+            || async {
+                let mut control = control.lock().await;
+                let session = inspect_session(&mut control, &id).await;
+                (session.active_agent_session_id.as_deref() == Some(reference)).then_some(())
+            },
+        )
+        .await;
+        id
+    }
+
     async fn stop(&mut self, id: &SessionId) -> SessionInfo {
         let request = Request::make(
             "claude-recovery-stop",
@@ -156,6 +220,7 @@ impl ClaudeRig {
     async fn finish(mut self, child: Option<SessionId>) {
         for id in child
             .into_iter()
+            .chain(self.additional_sessions.clone())
             .chain(std::iter::once(self.session.id.clone()))
         {
             let _ = self.stop(&id).await;
@@ -265,6 +330,59 @@ async fn claude_public_inspect_and_list_show_verified_transcript_activity() {
     assert_eq!(missing.native_session_id.as_deref(), Some(CLEAR));
     assert_eq!(missing.native_last_activity_at, None);
     assert_eq!(listed_missing[0].native_last_activity_at, None);
+}
+
+#[tokio::test]
+async fn claude_list_reads_multiple_targets_in_one_large_store_without_following_symlinks() {
+    const FILLER_FILES: usize = 1_024;
+    let mut rig = ClaudeRig::new("claude-batched-activity").await;
+    let project = rig.config_home.join("projects/fixture");
+    std::fs::create_dir_all(&project).expect("create fixture transcript directory");
+    for index in 0..FILLER_FILES {
+        std::fs::write(project.join(format!("unrelated-{index}.jsonl")), "{}\n")
+            .expect("populate shared transcript store");
+    }
+    rig.transcript(LAUNCH);
+    rig.transcript(CLEAR);
+    for (reference, seconds) in [(LAUNCH, 1_700_000_000), (CLEAR, 1_700_000_100)] {
+        std::fs::File::options()
+            .write(true)
+            .open(project.join(format!("{reference}.jsonl")))
+            .expect("open transcript to set activity")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)),
+            )
+            .expect("set transcript activity");
+    }
+    let outside = rig.config_home.join("outside-conversation.jsonl");
+    std::fs::write(&outside, "{}\n").expect("write outside transcript");
+    std::os::unix::fs::symlink(&outside, project.join(format!("{SELECTED}.jsonl")))
+        .expect("link transcript outside the store");
+    rig.report("startup", LAUNCH).await;
+    let clear_id = rig.start_with_reference(CLEAR).await;
+    let symlink_id = rig.start_with_reference(SELECTED).await;
+    let listed = listed_sessions(&mut rig.control).await;
+    assert_eq!(
+        activity_for(&rig.session.id, &listed),
+        Some("2023-11-14T22:13:20Z")
+    );
+    assert_eq!(
+        activity_for(&clear_id, &listed),
+        Some("2023-11-14T22:15:00Z")
+    );
+    assert_eq!(activity_for(&symlink_id, &listed), None);
+
+    std::fs::remove_file(project.join(format!("{CLEAR}.jsonl")))
+        .expect("remove one transcript after the first list");
+    let listed_again = listed_sessions(&mut rig.control).await;
+    assert_eq!(
+        activity_for(&rig.session.id, &listed_again),
+        Some("2023-11-14T22:13:20Z")
+    );
+    assert_eq!(activity_for(&clear_id, &listed_again), None);
+    assert_eq!(activity_for(&symlink_id, &listed_again), None);
+    rig.finish(None).await;
 }
 
 #[tokio::test]
@@ -403,20 +521,7 @@ impl ClaudeRig {
     /// hermetic-allowed: #421 journal evidence is private to the session's
     /// real worker state root inside this fixture.
     fn rejournal_newer_switch(&mut self, reference: &str) {
-        let session_dir = self.worker_state_root.join(self.session.id.0.as_str());
-        let mut journals = std::fs::read_dir(&session_dir)
-            .expect("read the session's worker journal directory")
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| entry.path().extension().is_some_and(|name| name == "json"))
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        journals.sort();
-        assert_eq!(
-            journals.len(),
-            1,
-            "one worker generation, so one journal: {journals:?}"
-        );
-        let journal = journals.remove(0);
+        let journal = self.journal_path();
         let raw = std::fs::read(&journal).expect("read the terminal worker journal");
         let mut value: serde_json::Value =
             serde_json::from_slice(&raw).expect("the journal the worker wrote is valid JSON");
@@ -518,4 +623,87 @@ async fn claude_newer_unverified_switch_claim_refuses_fork_before_creating_a_chi
     assert_eq!(error.code, "native_identity_uncertain");
     assert_eq!(sessions.len(), 1, "refused fork cannot register a child");
     assert_eq!(argv_after, argv_before, "refused fork cannot launch");
+}
+
+async fn assert_unavailable_journal_refuses_recovery(
+    tag: &str,
+    rewrite: impl FnOnce(&[u8]) -> Vec<u8>,
+) {
+    let mut rig = ClaudeRig::new(tag).await;
+    rig.transcript(LAUNCH);
+    rig.report("startup", LAUNCH).await;
+    let id = rig.session.id.clone();
+    let stopped = rig.stop(&id).await;
+    let journal = rig.journal_path();
+    let original = std::fs::read(&journal).expect("read exact worker generation journal");
+    std::fs::write(&journal, rewrite(&original)).expect("rewrite worker journal evidence");
+    let argv_before = std::fs::read(&rig.argv_log).expect("initial launch argv");
+
+    let resume = rig.resume().await;
+    let fork = exchange(
+        &mut rig.control,
+        &Request::make(
+            "fork-with-unavailable-journal",
+            method::SESSION_FORK,
+            serde_json::json!({
+                "session_id": id,
+                "cwd_mode": "same",
+                "cols": 80,
+                "rows": 24
+            }),
+        ),
+    )
+    .await;
+    let after = inspect_session(&mut rig.control, &id).await;
+    let argv_after = std::fs::read(&rig.argv_log).expect("argv after refused recovery");
+    std::fs::write(&journal, original).expect("restore worker journal for cleanup");
+    let sessions: Vec<SessionInfo> = serde_json::from_value(ok_payload(
+        exchange(
+            &mut rig.control,
+            &Request::make(
+                "list-after-unavailable-journal",
+                method::SESSION_LIST,
+                Value::Null,
+            ),
+        )
+        .await,
+    ))
+    .expect("session list after refused fork");
+    rig.finish(None).await;
+
+    for response in [resume, fork] {
+        let Err(error) = response.into_result() else {
+            panic!("unavailable generation evidence must refuse resume and fork");
+        };
+        assert_eq!(error.code, "native_identity_evidence_unavailable");
+        assert!(error.recover.is_some(), "recovery must offer a retry hint");
+    }
+    assert_eq!(sessions.len(), 1, "refused fork cannot register a child");
+    assert_eq!(
+        after.runtime, stopped.runtime,
+        "resume cannot mint a generation"
+    );
+    assert_eq!(
+        argv_after, argv_before,
+        "neither request can launch an agent"
+    );
+}
+
+#[tokio::test]
+async fn claude_corrupt_exact_generation_journal_refuses_resume_and_fork() {
+    assert_unavailable_journal_refuses_recovery("claude-corrupt-recovery-journal", |_original| {
+        b"{ invalid journal".to_vec()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn claude_mismatched_generation_instance_refuses_resume_and_fork() {
+    assert_unavailable_journal_refuses_recovery("claude-mismatched-recovery-journal", |original| {
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(original).expect("real worker journal decodes");
+        journal["runtime_id"] = serde_json::json!("different-worker-instance");
+        serde_json::to_vec(&journal).expect("mismatched journal serializes")
+    })
+    .await;
 }

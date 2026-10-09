@@ -484,6 +484,62 @@ impl From<ReferenceCheckFailure> for ProtocolError {
 }
 
 impl ReferenceExistence {
+    /// The canonical store root used to group activity lookups safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same root failure as a single reference lookup.
+    pub(crate) fn activity_store_root(
+        &self,
+        env: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Result<Option<PathBuf>, ReferenceCheckFailure> {
+        match self {
+            Self::Unchecked => Ok(None),
+            Self::File(file) => canonicalize(&file.resolve_root(env)?).map(Some),
+        }
+    }
+
+    /// Reads several file modification times in one bounded, no-follow scan.
+    ///
+    /// Callers group references by this check and its effective store root.
+    /// An unavailable file or store leaves activity unknown; explicit recovery
+    /// uses [`Self::verify`] and its typed failure instead.
+    pub(crate) fn modified_many_unix_nanos(
+        &self,
+        root: &Path,
+        references: &[SessionRef],
+    ) -> Vec<Option<i128>> {
+        let Self::File(file) = self else {
+            return vec![None; references.len()];
+        };
+        let mut wanted = references
+            .iter()
+            .map(|reference| {
+                let value = reference.value();
+                (value.len() <= MAX_CHECKED_REFERENCE_BYTES && is_plain_component(value))
+                    .then(|| file.file_name.replace(NAME_PLACEHOLDER, value))
+            })
+            .collect::<Vec<_>>();
+        let mut found = vec![None; references.len()];
+        if wanted.iter().all(Option::is_none) {
+            return vec![None; references.len()];
+        }
+        // Each found file was opened and verified independently. A later scan
+        // failure leaves only unresolved references without activity.
+        let _ = file.scan_store_many(root, &mut wanted, &mut found);
+        found
+            .into_iter()
+            .map(|stat: Option<fs::Stat>| {
+                stat.and_then(|stat| {
+                    let nanos = i128::from(stat.st_mtime_nsec);
+                    (0..1_000_000_000)
+                        .contains(&nanos)
+                        .then_some(i128::from(stat.st_mtime) * 1_000_000_000 + nanos)
+                })
+            })
+            .collect()
+    }
+
     /// Confirms that the conversation `reference` names still exists.
     ///
     /// `env` resolves environment variables for the launch: the session's
@@ -530,6 +586,111 @@ impl ReferenceExistence {
 }
 
 impl FileExistence {
+    fn scan_store_many(
+        &self,
+        root: &Path,
+        wanted: &mut [Option<String>],
+        found: &mut [Option<fs::Stat>],
+    ) -> Result<(), ReferenceCheckFailure> {
+        let mut directory = open_root(root)?;
+        for component in self.dir.iter().flat_map(|dir| dir.split('/')) {
+            directory =
+                open_child_directory(&directory, OsStr::new(component)).map_err(|errno| {
+                    classify_open_error(errno, ReferenceCheckFailure::RootUnavailable)
+                })?;
+        }
+        let mut visited = 0_usize;
+        self.scan_directory_many(&directory, 0, wanted, found, &mut visited)
+    }
+
+    fn scan_directory_many(
+        &self,
+        directory: &OwnedFd,
+        depth: u8,
+        wanted: &mut [Option<String>],
+        found: &mut [Option<fs::Stat>],
+        visited: &mut usize,
+    ) -> Result<(), ReferenceCheckFailure> {
+        let entries =
+            fs::Dir::read_from(directory).map_err(|_errno| ReferenceCheckFailure::Missing)?;
+        let mut subdirectories = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_errno| ReferenceCheckFailure::Missing)?;
+            let name_bytes = entry.file_name().to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            *visited += 1;
+            if *visited > MAX_EXISTENCE_ENTRIES {
+                return Err(ReferenceCheckFailure::ScanLimit);
+            }
+            let name = OsStr::from_bytes(name_bytes);
+            let Ok(stat) = fs::statat(directory, name, fs::AtFlags::SYMLINK_NOFOLLOW) else {
+                continue;
+            };
+            match fs::FileType::from_raw_mode(stat.st_mode) {
+                fs::FileType::RegularFile => {
+                    let Some(text) = name.to_str() else {
+                        continue;
+                    };
+                    let matches = wanted
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, target)| {
+                            target
+                                .as_deref()
+                                .filter(|target| self.name_matches(text, target))
+                                .map(|_target| index)
+                        })
+                        .collect::<Vec<_>>();
+                    if matches.is_empty() {
+                        continue;
+                    }
+                    let file = fs::openat(
+                        directory,
+                        name,
+                        fs::OFlags::RDONLY
+                            | fs::OFlags::NONBLOCK
+                            | fs::OFlags::NOFOLLOW
+                            | fs::OFlags::CLOEXEC,
+                        fs::Mode::empty(),
+                    )
+                    .map_err(|errno| {
+                        classify_open_error(errno, ReferenceCheckFailure::StoreChanged)
+                    })?;
+                    let opened =
+                        fs::fstat(&file).map_err(|_errno| ReferenceCheckFailure::StoreChanged)?;
+                    if fs::FileType::from_raw_mode(opened.st_mode) != fs::FileType::RegularFile {
+                        return Err(ReferenceCheckFailure::StoreChanged);
+                    }
+                    for index in matches {
+                        found[index] = Some(opened);
+                        wanted[index] = None;
+                    }
+                    if wanted.iter().all(Option::is_none) {
+                        return Ok(());
+                    }
+                }
+                fs::FileType::Directory if depth < self.max_depth => {
+                    subdirectories.push(name.to_os_string());
+                }
+                _ => {}
+            }
+        }
+        for name in subdirectories {
+            let child = match open_child_directory(directory, &name) {
+                Ok(child) => child,
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(_errno) => return Err(ReferenceCheckFailure::StoreChanged),
+            };
+            self.scan_directory_many(&child, depth + 1, wanted, found, visited)?;
+            if wanted.iter().all(Option::is_none) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
     fn stat(
         &self,
         reference: &str,
@@ -923,20 +1084,71 @@ mod tests {
     #[test]
     fn a_timestamped_file_below_the_declared_directory_is_found() {
         let store = store_with("proj", "2026-10-04T10-00-00Z_abc-123.jsonl");
+        let sessions = store.root.join("sessions/proj");
+        let first = sessions.join("2026-10-04T10-00-00Z_abc-123.jsonl");
+        let second = sessions.join("2026-10-04T11-00-00Z_abc-124.jsonl");
+        fs::write(&second, "{}").expect("write another Pi-shaped transcript");
+        for (file, seconds) in [(&first, 1_700_000_000), (&second, 1_700_000_100)] {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .expect("open transcript")
+                .set_times(
+                    std::fs::FileTimes::new().set_modified(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+                    ),
+                )
+                .expect("set transcript activity");
+        }
+        let outside = store.root.join("outside.jsonl");
+        fs::write(&outside, "{}").expect("write outside transcript");
+        std::os::unix::fs::symlink(&outside, sessions.join("t_abc-125.jsonl"))
+            .expect("link outside transcript");
+        let outside_project = store.root.join("outside-project");
+        fs::create_dir(&outside_project).expect("create outside project");
+        fs::write(outside_project.join("t_abc-127.jsonl"), "{}")
+            .expect("write outside project transcript");
+        std::os::unix::fs::symlink(&outside_project, store.root.join("sessions/linked"))
+            .expect("link outside project directory");
         let check = existence(pi_spec());
         let env = env_of(vec![(
             "AGENT_CONFIG_DIR",
             store.root.clone().into_os_string(),
         )]);
         assert_eq!(check.verify(&reference("abc-123"), &env), Ok(()));
+        assert_eq!(check.verify(&reference("abc-124"), &env), Ok(()));
         assert_eq!(
-            check.verify(&reference("abc-124"), &env),
+            check.verify(&reference("abc-126"), &env),
             Err(ReferenceCheckFailure::Missing)
         );
         assert_eq!(
             check.verify(&reference("c-123"), &env),
             Err(ReferenceCheckFailure::Missing),
             "an ends_with match needs the declared `_` boundary"
+        );
+        let root = check
+            .activity_store_root(&env)
+            .expect("resolve Pi-shaped root")
+            .expect("file check has a root");
+        assert_eq!(
+            check.modified_many_unix_nanos(
+                &root,
+                &[
+                    reference("abc-123"),
+                    reference("abc-124"),
+                    reference("abc-125"),
+                    reference("c-123"),
+                    reference("abc-127"),
+                ],
+            ),
+            vec![
+                Some(1_700_000_000_000_000_000),
+                Some(1_700_000_100_000_000_000),
+                None,
+                None,
+                None,
+            ],
+            "one Pi-shaped suffix scan returns distinct activity and ignores a symlink"
         );
     }
 
