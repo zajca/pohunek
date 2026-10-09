@@ -92,15 +92,90 @@ cd "$1"
 for manifest in STAGE.sha256 STAGE.links; do
   [ -f "$manifest" ] && [ ! -h "$manifest" ] || exit 1
 done
-sha256sum -c STAGE.sha256 >/dev/null
 tab=$(printf '\t')
-files=$(sed 's/^[0-9a-f]\{64\}  //' STAGE.sha256)
-links=$(while IFS="$tab" read -r kind path target; do
-  if [ "$kind" = link ]; then printf '%s\n' "$path"; fi
-done < STAGE.links)
-execs=$(while IFS="$tab" read -r kind path target; do
-  if [ "$kind" = exec ]; then printf '%s\n' "$path"; fi
-done < STAGE.links)
+nl='
+'
+# UTF-8 C1 controls are C2 80..9F; grep's C locale recognizes only ASCII controls.
+c1_prefix=$(printf '\302')
+c1_first=$(printf '\200')
+c1_last=$(printf '\237')
+has_control() {
+  printf '%s' "$1" | LC_ALL=C grep -q -e '[[:cntrl:]]' -e "$c1_prefix[$c1_first-$c1_last]"
+}
+safe_path() {
+  case $1 in
+    ''|/*|*/|*//*|.|..|./*|../*|*/./*|*/../*|*/.|*/..|*\\*) return 1 ;;
+  esac
+  ! has_control "$1"
+}
+safe_target() {
+  case $1 in ''|*\\*) return 1 ;; esac
+  ! has_control "$1"
+}
+stays_inside() (
+  path=$1
+  target=$2
+  case $target in /*) exit 1 ;; esac
+  depth=0
+  while [ "$path" != "${path#*/}" ]; do
+    depth=$((depth + 1))
+    path=${path#*/}
+  done
+  set -f
+  IFS=/
+  set -- $target
+  for component do
+    case $component in
+      ..) [ "$depth" -gt 0 ] || exit 1; depth=$((depth - 1)) ;;
+      ''|.) ;;
+      *) depth=$((depth + 1)) ;;
+    esac
+  done
+)
+contains_line() {
+  [ -n "$1" ] && printf '%s\n' "$1" | grep -Fxq -- "$2"
+}
+files=
+while :; do
+  line=
+  if IFS= read -r line; then :; elif [ -z "$line" ]; then break; else exit 1; fi
+  case $line in *'  '*) ;; *) exit 1 ;; esac
+  digest=${line%%'  '*}
+  path=${line#"$digest  "}
+  [ "${#digest}" -eq 64 ] || exit 1
+  case $digest in *[!0-9a-f]*) exit 1 ;; esac
+  safe_path "$path" || exit 1
+  contains_line "$files" "$path" && exit 1
+  files="${files}${files:+$nl}$path"
+done < STAGE.sha256
+links=
+execs=
+while :; do
+  line=
+  if IFS= read -r line; then :; elif [ -z "$line" ]; then break; else exit 1; fi
+  case $line in
+    "exec${tab}"*)
+      path=${line#"exec${tab}"}
+      case $path in *"$tab"*) exit 1 ;; esac
+      safe_path "$path" || exit 1
+      contains_line "$files" "$path" || exit 1
+      contains_line "$execs" "$path" && exit 1
+      execs="${execs}${execs:+$nl}$path"
+      ;;
+    "link${tab}"*)
+      fields=${line#"link${tab}"}
+      case $fields in *"$tab"*) ;; *) exit 1 ;; esac
+      path=${fields%%"$tab"*}
+      target=${fields#"$path$tab"}
+      case $target in *"$tab"*) exit 1 ;; esac
+      safe_path "$path" && safe_target "$target" && stays_inside "$path" "$target" || exit 1
+      contains_line "$files" "$path" && exit 1
+      contains_line "$links" "$path" && exit 1
+      links="${links}${links:+$nl}$path"
+      ;;
+    *) exit 1 ;;
+  esac
+done < STAGE.links
 expected=$({ printf '%s\n' "$files"; printf '%s\n' "$links"; } | sed '/^$/d' | LC_ALL=C sort)
 actual=$(find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o ! -type d -print | sed 's|^\./||' | LC_ALL=C sort)
 [ "$expected" = "$actual" ]
@@ -113,10 +188,9 @@ printf '%s\n' "$files" | while IFS= read -r path; do
   fi
 done
 while IFS="$tab" read -r kind path target; do
-  case $kind in
-    link) [ -h "$path" ] && [ "$(readlink "$path")" = "$target" ] || exit 1 ;;
-    exec) ;;
-    *) exit 1 ;;
-  esac
+  if [ "$kind" = link ]; then
+    [ -h "$path" ] && [ "$(readlink "$path")" = "$target" ] || exit 1
+  fi
 done < STAGE.links
+sha256sum -c STAGE.sha256 >/dev/null
 ```

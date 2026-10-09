@@ -520,6 +520,163 @@ fn a_missing_or_corrupt_manifest_is_refused() {
 }
 
 #[test]
+fn malformed_links_manifest_is_refused_by_both_verifiers() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let original = fs::read_to_string(stage.join("STAGE.links")).expect("links manifest");
+    let exec = "exec\tlib/node_modules/@fake/up/bin/up.sh\n";
+    let link = "link\tbin/up\t../lib/node_modules/@fake/up/bin/up.sh\n";
+    let cases = [
+        (
+            "manifest as executable",
+            format!("{original}exec\tSTAGE.sha256\n"),
+        ),
+        ("duplicate executable", format!("{original}{exec}")),
+        ("duplicate link", format!("{original}{link}")),
+        (
+            "extra executable field",
+            format!("{original}exec\tlib/node_modules/@fake/up/bin/up.sh\textra\n"),
+        ),
+        (
+            "unterminated final line",
+            format!("{original}exec\tSTAGE.sha256"),
+        ),
+    ];
+    for (name, content) in cases {
+        write_file(stage.join("STAGE.links"), content).expect("mutate links manifest");
+        refused(fixture.verify(), "STAGE.links", Fault::Malformed);
+        assert!(
+            !fixture.posix_verify(),
+            "{name}: POSIX verifier accepted it"
+        );
+    }
+
+    let target = "../lib/node_modules/@fake/up/bin/up.sh\u{85}";
+    let link_path = stage.join("bin/up");
+    fs::remove_file(&link_path).expect("remove staged link");
+    symlink(target, &link_path).expect("link with C1 control in target");
+    write_file(
+        stage.join("STAGE.links"),
+        original.replace(link, &format!("link\tbin/up\t{target}\n")),
+    )
+    .expect("record link with C1 control");
+    refused(fixture.verify(), "STAGE.links", Fault::Malformed);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted a C1 control in a link target"
+    );
+}
+
+#[test]
+fn a_link_outside_the_stage_is_refused_by_both_verifiers() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let link = stage.join("bin/up");
+    fs::remove_file(&link).expect("remove staged link");
+    symlink("../../outside", &link).expect("link outside the stage");
+    let manifest = stage.join("STAGE.links");
+    let original = fs::read_to_string(&manifest).expect("links manifest");
+    write_file(
+        &manifest,
+        original.replace(
+            "link\tbin/up\t../lib/node_modules/@fake/up/bin/up.sh\n",
+            "link\tbin/up\t../../outside\n",
+        ),
+    )
+    .expect("record the escaping link target");
+
+    refused(fixture.verify(), "bin/up", Fault::EscapingLink);
+    assert!(
+        !fixture.posix_verify(),
+        "POSIX verifier accepted an escaping link target"
+    );
+}
+
+#[test]
+fn malformed_sha256_manifest_is_refused_by_both_verifiers() {
+    use sha2::{Digest as _, Sha256};
+
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let original = fs::read_to_string(stage.join("STAGE.sha256")).expect("sha256 manifest");
+    let content = b"unsafe manifest path\n";
+    let digest = format!("{:x}", Sha256::digest(content));
+    for unsafe_path in [
+        "lib/node_modules/dep/bad\tname",
+        "lib/node_modules/dep/bad\u{85}name",
+    ] {
+        write_file(stage.join(unsafe_path), content).expect("write unsafe named file");
+        write_file(
+            stage.join("STAGE.sha256"),
+            format!("{original}{digest}  {unsafe_path}\n"),
+        )
+        .expect("mutate sha256 manifest");
+        refused(fixture.verify(), "STAGE.sha256", Fault::Malformed);
+        assert!(
+            !fixture.posix_verify(),
+            "POSIX verifier accepted an unsafe file name"
+        );
+        fs::remove_file(stage.join(unsafe_path)).expect("remove unsafe named file");
+    }
+    let last_line = original.lines().next().expect("at least one file");
+    let cases = [
+        ("duplicate file", format!("{original}{last_line}\n")),
+        (
+            "unterminated final line",
+            original
+                .strip_suffix('\n')
+                .expect("terminated manifest")
+                .to_owned(),
+        ),
+    ];
+    for (name, content) in cases {
+        write_file(stage.join("STAGE.sha256"), content).expect("mutate sha256 manifest");
+        refused(fixture.verify(), "STAGE.sha256", Fault::Malformed);
+        assert!(
+            !fixture.posix_verify(),
+            "{name}: POSIX verifier accepted it"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fifo_listed_as_a_file_is_refused_before_hashing() {
+    let fixture = Fixture::new();
+    let stage = fixture.staged();
+    let path = "lib/node_modules/dep/index.js";
+    fs::remove_file(stage.join(path)).expect("remove staged file");
+    let created = Command::new("mkfifo")
+        .arg(stage.join(path))
+        .env_clear()
+        .env("PATH", TOOL_PATH)
+        .status()
+        .expect("create FIFO");
+    assert!(created.success(), "mkfifo failed");
+
+    refused(fixture.verify(), path, Fault::SpecialFile);
+    let status = Command::new("timeout")
+        .args([
+            "--kill-after=1s",
+            "15s",
+            "/bin/sh",
+            "-c",
+            POSIX_VERIFY,
+            "sh",
+        ])
+        .arg(&stage)
+        .env_clear()
+        .env("PATH", TOOL_PATH)
+        .status()
+        .expect("run the bounded POSIX verifier");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the POSIX verifier must reject the FIFO before sha256sum can block"
+    );
+}
+
+#[test]
 fn a_manifest_symlink_outside_the_stage_is_refused_by_both_verifiers() {
     for name in ["STAGE.sha256", "STAGE.links"] {
         let fixture = Fixture::new();
