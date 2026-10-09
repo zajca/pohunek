@@ -361,11 +361,11 @@ sudo_supervisor() {
         IFS= read -r _ <&3 || :
         # The supervisor is the group leader until this signal arrives, so
         # the group ID cannot have been reused for an unrelated process.
-        kill -KILL -- "-$sudo_group" 2>/dev/null || true
+        /usr/bin/kill -KILL 0 2>/dev/null || true
     ) &
     sudo_watchdog=$!
     sudo_stop() {
-        kill -KILL -- "-$sudo_group" 2>/dev/null || true
+        /usr/bin/kill -KILL 0 2>/dev/null || true
     }
     trap sudo_stop HUP INT TERM
     sudo_status=0
@@ -448,7 +448,7 @@ cleanup() {
         if [ "$chosen" != sudo ]; then
             # Signal the private group before reaping its leader, so its ID
             # cannot be reused for an unrelated process group.
-            kill -KILL -- "-$ns_pid" 2>/dev/null || kill -KILL "$ns_pid" 2>/dev/null || true
+            /usr/bin/kill -KILL -- "-$ns_pid" 2>/dev/null || kill -KILL "$ns_pid" 2>/dev/null || true
         fi
         wait "$ns_pid" 2>/dev/null || true
     fi
