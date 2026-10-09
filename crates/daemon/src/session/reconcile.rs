@@ -431,7 +431,7 @@ impl SessionRegistry {
     /// with: the schema id the journal names must resolve, and a worker that
     /// journaled none is validated with the schema of the record's own
     /// runtime.
-    fn record_hook_schema(
+    pub(super) fn record_hook_schema(
         &self,
         record: &SessionRecord,
         journaled: Option<&str>,

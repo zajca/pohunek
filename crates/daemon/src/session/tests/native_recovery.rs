@@ -259,6 +259,51 @@ impl Rig {
         self.adopt_daemon().await;
     }
 
+    /// The journal file of the session's current worker generation.
+    fn session_journal(&self) -> PathBuf {
+        self.config
+            .worker_state_root
+            .as_ref()
+            .expect("worker state root")
+            .join(&self.session.id.0)
+            .join(format!(
+                "{}.json",
+                self.durable_record()
+                    .runtime
+                    .worker_id
+                    .expect("recorded worker")
+            ))
+    }
+
+    /// Stops the daemon's own worker metadata watcher, so no metadata apply
+    /// imports the worker's snapshot below; the terminal commit under test is
+    /// then the only reader of the switching evidence.
+    async fn stop_metadata_watcher(&self) {
+        let watcher = {
+            let sessions = self.registry.inner.sessions.lock().await;
+            sessions
+                .get(&self.session.id)
+                .expect("live session")
+                .runtime_watch_cancel
+                .clone()
+        };
+        watcher.cancel();
+    }
+
+    /// Commits a terminal exit the way `record_exit` is called by the stop
+    /// path (`stopped_by_user`) and by the natural-exit watcher.
+    async fn commit_terminal_exit(&self, exit: RuntimeExit, stopped_by_user: bool) {
+        let committed = self
+            .registry
+            .record_exit(&self.session.id, exit, stopped_by_user, None, None)
+            .await
+            .expect("terminal commit of the fixture session");
+        assert!(
+            committed,
+            "the quiescent fixture session commits its terminal outcome"
+        );
+    }
+
     async fn finish(&self) {
         let _ = self.registry.stop(&self.session.id).await;
     }
@@ -626,5 +671,280 @@ async fn a_hook_switch_during_daemon_outage_supersedes_the_older_stored_target()
         .expect("resume switched conversation after outage");
     wait_for_file_contains(&rig.launches, &format!("resume {SWITCHED_ID}")).await;
     rig.finish().await;
+    rig.remove().await;
+}
+
+/// Reads the terminal outcome the worker journaled for a natural exit.
+fn journaled_exit(value: &serde_json::Value) -> RuntimeExit {
+    let outcome = &value["outcome"];
+    let exit_code = outcome["exit_code"]
+        .as_i64()
+        .and_then(|code| i32::try_from(code).ok());
+    let signal = outcome["signal"].as_str().map(ToOwned::to_owned);
+    RuntimeExit {
+        exit_code,
+        success: exit_code == Some(0) && signal.is_none(),
+    }
+}
+
+/// Rewrites the live worker's journal into the shape a previous release
+/// journaled: no separately journaled native reference, and when
+/// `keep_schema` is `false` also no delivered hook schema, so the daemon
+/// re-projects the volatile claim with the schema of the session's pinned
+/// runtime. The switch of the verified launch process survives only as the
+/// leased active-identity claim.
+fn write_legacy_journal(
+    journal: &std::path::Path,
+    keep_schema: bool,
+    patch: impl FnOnce(&mut serde_json::Value),
+) {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(journal).expect("worker journal")).expect("decode");
+    value["native_reference_claim"] = serde_json::Value::Null;
+    if !keep_schema {
+        value["hook_schema"] = serde_json::Value::Null;
+    }
+    patch(&mut value);
+    fs::write(
+        journal,
+        serde_json::to_vec(&value).expect("encode legacy journal"),
+    )
+    .expect("persist legacy journal");
+}
+
+/// Runs a fixture conversation switch that the daemon never imported, joined
+/// by the fixture agent's natural exit, and hands the rig to the caller with
+/// the worker's controller lease released.
+///
+/// The lease release is how a generated worker cannot be asked: once the sole
+/// controller is released, every control request of the held connection fails
+/// its lease validation, so the terminal commit under test reads the worker's
+/// journal as its only evidence. The daemon's own metadata watcher is stopped
+/// before the switch is reported, so no metadata apply imports it first.
+///
+/// `patch` adjusts the journaled claim before the legacy rewrite, and
+/// `keep_schema` controls whether the delivered hook schema id stays in the
+/// journal. Returns the journaled terminal outcome with its decoded journal,
+/// so a test can restore patched claim fields before the removal proof.
+type LegacySwitch = (Rig, serde_json::Value, RuntimeExit);
+
+async fn switched_legacy_session(
+    tag: &str,
+    keep_schema: bool,
+    patch: impl FnOnce(&mut serde_json::Value),
+) -> LegacySwitch {
+    let rig = Rig::new(tag, true).await;
+    let first = rig.report(NATIVE_ID).await;
+    rig.settle(&first).await;
+    assert_eq!(
+        rig.durable_record().info.native_session_id.as_deref(),
+        Some(NATIVE_ID)
+    );
+    rig.stop_metadata_watcher().await;
+    let _switched = rig.report(SWITCHED_ID).await;
+    assert_eq!(
+        rig.durable_record().info.native_session_id.as_deref(),
+        Some(NATIVE_ID),
+        "the daemon has not imported the switch before the terminal commit"
+    );
+
+    // The fixture agent's shell exits; the current worker journals its
+    // terminal outcome with the promoted reference of the switch still in
+    // memory before the test rewrites the journal into the previous shape.
+    let mut writer = &rig.commands;
+    writer
+        .write_all(b"exit\n")
+        .expect("signal fixture agent exit");
+    let journal = rig.session_journal();
+    wait_until("the worker to journal the fixture agent's exit", || async {
+        let bytes = fs::read(&journal).ok()?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        value["phase"]
+            .as_str()
+            .filter(|phase| *phase == "terminal")
+            .map(|_| ())
+    })
+    .await;
+
+    let value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&journal).expect("terminal journal")).expect("decode");
+    assert_eq!(
+        value["active_identity"]["native_reference"].as_str(),
+        Some(SWITCHED_ID),
+        "the volatile claim of the switch is journaled"
+    );
+    write_legacy_journal(&journal, keep_schema, patch);
+    let exit = journaled_exit(&value);
+
+    let (worker, _) = live_worker_and_identity(&rig.registry, &rig.session.id).await;
+    worker
+        .release_controller()
+        .await
+        .expect("release the fixture controller lease");
+    assert!(
+        worker.inspect().await.is_err(),
+        "a released controller lease leaves the worker unaskable"
+    );
+    (rig, value, exit)
+}
+
+/// Asserts that a terminal commit of a legacy journal adopted the switched
+/// conversation, then that resume relaunches from it.
+async fn assert_resume_recovered_switched(rig: &Rig) {
+    let durable = rig.durable_record();
+    rig.registry
+        .resume(&rig.session.id)
+        .await
+        .expect("resume the native recovery target");
+    wait_for_file_contains(&rig.launches, &format!("resume {SWITCHED_ID}")).await;
+    rig.finish().await;
+    let recovered = rig
+        .registry
+        .inspect(&rig.session.id)
+        .await
+        .expect("recovered session before removal");
+    rig.remove().await;
+    assert_eq!(durable.info.native_session_id.as_deref(), Some(SWITCHED_ID));
+    assert_eq!(
+        durable
+            .recovery
+            .as_ref()
+            .and_then(|binding| binding.native_session_id.as_deref()),
+        Some(SWITCHED_ID),
+        "the durable resume binding names the switched conversation"
+    );
+    assert_eq!(
+        recovered.native_session_id.as_deref(),
+        Some(SWITCHED_ID),
+        "the recovered session relaunched from the switched conversation"
+    );
+}
+
+/// A previous-release worker keeps a mid-session conversation switch only as
+/// the leased active-identity claim of its journal. Its controller lease was
+/// released, so the stop's final commit reads that journal as its only
+/// evidence, and resume relaunches the switched conversation, never the
+/// conversation the daemon last imported.
+#[tokio::test]
+async fn an_unreported_legacy_switch_survives_the_explicit_stop() {
+    let (rig, _value, exit) =
+        switched_legacy_session("codex-legacy-switch-stop", true, |_| {}).await;
+
+    assert!(
+        rig.registry.stop(&rig.session.id).await.is_err(),
+        "the unaskable worker cannot answer its stop RPC"
+    );
+    rig.commit_terminal_exit(exit, true).await;
+    let stopped = rig
+        .registry
+        .inspect(&rig.session.id)
+        .await
+        .expect("stopped fixture session");
+    assert_eq!(
+        stopped.native_session_id.as_deref(),
+        Some(SWITCHED_ID),
+        "the stop's terminal commit imports the journaled switch"
+    );
+
+    assert_resume_recovered_switched(&rig).await;
+}
+
+/// The same final commit as the explicit stop, for a natural exit, with a
+/// journal that names no hook schema: the fallback claim is validated with
+/// the schema of the session's pinned runtime.
+#[tokio::test]
+async fn an_unreported_legacy_switch_survives_the_natural_exit() {
+    let (rig, _value, exit) =
+        switched_legacy_session("codex-legacy-switch-exit", false, |_| {}).await;
+
+    rig.commit_terminal_exit(exit, false).await;
+    let ended = rig
+        .registry
+        .inspect(&rig.session.id)
+        .await
+        .expect("ended fixture session");
+    assert_eq!(
+        ended.native_session_id.as_deref(),
+        Some(SWITCHED_ID),
+        "the natural exit's final commit imports the journaled switch"
+    );
+
+    assert_resume_recovered_switched(&rig).await;
+}
+
+/// Restores the journaled claim's process to the journal child it named, so a
+/// claim field patched by a negative scenario reads as valid journal evidence
+/// again before the removal proves its journal.
+fn restore_claim_child_process(value: &mut serde_json::Value) {
+    value["active_identity"]["process"] = value["child"].clone();
+}
+
+/// A claim of another process than the verified launch process never
+/// promotes the durable recovery target, not even through the last commit of
+/// the stopped runtime.
+#[tokio::test]
+async fn a_terminal_stop_never_imports_a_foreign_switch_process() {
+    let (rig, _value, exit) =
+        switched_legacy_session("codex-legacy-switch-foreign-stop", true, |value| {
+            value["active_identity"]["process"]["pid"] = 999.into();
+            value["active_identity"]["process"]["start_identity"] = 9990.into();
+        })
+        .await;
+
+    assert!(
+        rig.registry.stop(&rig.session.id).await.is_err(),
+        "the unaskable worker cannot answer its stop RPC"
+    );
+    rig.commit_terminal_exit(exit, true).await;
+
+    let durable = rig.durable_record();
+    assert_eq!(
+        durable.info.native_session_id.as_deref(),
+        Some(NATIVE_ID),
+        "a foreign-process switch never promotes the recovery target"
+    );
+    assert_eq!(
+        durable
+            .recovery
+            .as_ref()
+            .and_then(|binding| binding.native_session_id.as_deref()),
+        Some(NATIVE_ID)
+    );
+
+    let journal = rig.session_journal();
+    write_legacy_journal(&journal, true, restore_claim_child_process);
+    rig.remove().await;
+}
+
+/// A claim whose sequence is older than the accepted report of the same
+/// worker process never promotes the durable recovery target, not even
+/// through the last commit of the stopped runtime.
+#[tokio::test]
+async fn a_terminal_stop_never_imports_a_stale_switch() {
+    let (rig, _value, exit) =
+        switched_legacy_session("codex-legacy-switch-stale-stop", true, |value| {
+            value["active_identity"]["sequence"] = 0.into();
+        })
+        .await;
+
+    assert!(
+        rig.registry.stop(&rig.session.id).await.is_err(),
+        "the unaskable worker cannot answer its stop RPC"
+    );
+    rig.commit_terminal_exit(exit, true).await;
+
+    let durable = rig.durable_record();
+    assert_eq!(
+        durable.info.native_session_id.as_deref(),
+        Some(NATIVE_ID),
+        "a stale switch never promotes the recovery target"
+    );
+    assert_eq!(
+        durable
+            .recovery
+            .as_ref()
+            .and_then(|binding| binding.native_session_id.as_deref()),
+        Some(NATIVE_ID)
+    );
     rig.remove().await;
 }
