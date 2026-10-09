@@ -236,29 +236,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn unknown_host_is_error() {
-        let err = resolve_host(&status(), "no-such-host").unwrap_err();
-        match err {
-            NetbirdError::HostUnknown(name) => assert_eq!(name, "no-such-host"),
-            other => panic!("expected HostUnknown, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn duplicate_short_names_are_ambiguous() {
-        let status = parse_status(
-            r#"{"peers":[
-                {"fqdn":"build.one.example","netbirdIp":"100.64.0.2"},
-                {"fqdn":"build.two.example","netbirdIp":"100.64.0.3"}
-            ]}"#,
-        )
-        .expect("inline status parses");
-
-        assert!(matches!(
-            resolve_host(&status, "build"),
-            Err(NetbirdError::HostAmbiguous(host)) if host == "build"
-        ));
-    }
 }

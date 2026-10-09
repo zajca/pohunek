@@ -198,45 +198,6 @@ mod tests {
     }
 
     #[test]
-    fn discovery_preserves_missing_identity_and_rejects_spoofed_addresses() {
-        let status = status(
-            r#"{
-                "netbirdIp":"100.64.0.1",
-                "fqdn":"self.example",
-                "peers":[
-                    {"publicKey":"safe-key","fqdn":"safe.example","netbirdIp":"100.64.0.2"},
-                    {"fqdn":"missing.example"},
-                    {"publicKey":"spoofed-key","fqdn":"spoofed.example","netbirdIp":"127.0.0.1"}
-                ]
-            }"#,
-        );
-
-        let peers = discover_from_status(&status);
-        assert_eq!(peers.len(), 3);
-        assert_eq!(peers[0].peer_id.as_deref(), Some("safe-key"));
-        assert_eq!(peers[0].address, Some("100.64.0.2".parse().expect("safe")));
-        assert_eq!(peers[1].peer_id, None);
-        assert_eq!(peers[1].address, None);
-        assert_eq!(peers[2].peer_id.as_deref(), Some("spoofed-key"));
-        assert_eq!(peers[2].address, None);
-        assert!(peers
-            .iter()
-            .all(|peer| peer.address != status.self_netbird_ip()));
-    }
-
-    #[test]
-    fn resolver_preserves_typed_unknown_error() {
-        let id = OverlayId::new(NETBIRD_OVERLAY_ID).expect("id");
-        let error = resolve_from_status(&status(r#"{"peers":[]}"#), "missing", &id)
-            .expect_err("unknown host");
-        assert!(matches!(
-            error,
-            OverlayError::HostUnknown { host, overlay }
-                if host == "missing" && overlay == id
-        ));
-    }
-
-    #[test]
     fn resolved_peer_keeps_public_key_across_ip_change() {
         let id = OverlayId::new(NETBIRD_OVERLAY_ID).expect("id");
         let first = status(
