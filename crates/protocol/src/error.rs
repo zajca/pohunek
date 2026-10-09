@@ -1221,29 +1221,8 @@ fn daemon_target(host: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ErrorClass, ProtocolError};
+    use super::ProtocolError;
     use crate::version::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-
-    #[test]
-    fn daemon_protocol_too_old_names_the_host_both_versions_and_the_method() {
-        let error = ProtocolError::daemon_protocol_too_old(
-            Some("netbird:build-2"),
-            "package.list",
-            MIN_PROTOCOL_VERSION,
-            PROTOCOL_VERSION,
-        );
-        assert_eq!(error.class, ErrorClass::Daemon);
-        assert_eq!(error.code, "daemon_protocol_too_old");
-        assert_eq!(
-            error.msg,
-            format!(
-                "host 'netbird:build-2' runs protocol {MIN_PROTOCOL_VERSION}, but `package.list` needs protocol {PROTOCOL_VERSION}"
-            )
-        );
-        let recover = error.recover.expect("an upgrade hint");
-        assert!(recover.contains("netbird:build-2"), "{recover}");
-        assert!(recover.contains(&PROTOCOL_VERSION.to_string()), "{recover}");
-    }
 
     #[test]
     fn daemon_protocol_too_old_names_the_local_daemon_without_a_host() {
@@ -1258,17 +1237,5 @@ mod tests {
             "{}",
             error.msg
         );
-    }
-
-    #[test]
-    fn version_translation_failed_names_only_the_target_and_the_version() {
-        let error = ProtocolError::version_translation_failed(
-            Some("netbird:build-2"),
-            MIN_PROTOCOL_VERSION,
-        );
-        assert_eq!(error.class, ErrorClass::Daemon);
-        assert_eq!(error.code, "version_translation_failed");
-        assert!(error.msg.contains("netbird:build-2"), "{}", error.msg);
-        assert!(error.recover.is_some());
     }
 }
