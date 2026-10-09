@@ -224,6 +224,14 @@ fn emit_index(dir: &Path, type_names: &[String]) -> Result<(), XtaskError> {
 fn emit_methods(dir: &Path) -> Result<(), XtaskError> {
     let mut specs = method::METHOD_SPECS.to_vec();
     specs.sort_by_key(|spec| spec.name);
+    for pair in specs.windows(2) {
+        if pair[0].name == pair[1].name {
+            return Err(XtaskError::Usage(format!(
+                "duplicate public protocol method: {}",
+                pair[0].name
+            )));
+        }
+    }
 
     let imports = method_imports(&specs);
     let mut body = String::new();
