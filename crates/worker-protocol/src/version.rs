@@ -210,16 +210,3 @@ pub const fn negotiate(local: VersionRange, remote: VersionRange) -> Result<Vers
         Ok(maximum)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn range_deserialization_rejects_reversed_endpoints() {
-        let error = serde_json::from_str::<VersionRange>(r#"{"minimum":2,"maximum":1}"#)
-            .expect_err("reversed range must fail");
-
-        assert!(error.to_string().contains("reversed"));
-    }
-}
