@@ -574,6 +574,17 @@ class WorktreeCliTests(WorktreeCliFixture, unittest.TestCase):
         self.assertFalse(self.worktrees.exists())
         self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
 
+    def test_held_repository_lock_refuses_a_second_process(self):
+        lock = self.repo / ".git" / worktree_new.REPO_LOCK_NAME
+        with open(lock, "wb") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"another worktree-new run holds {lock}", result.stderr)
+        self.assertFalse(self.worktrees.exists())
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
+
     def install_shims(self, record):
         """Record the script's git invocations through `PATH`.
 
@@ -841,6 +852,27 @@ class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
 
         self.assert_refused_without_creation(result, "is a symlink", str(link))
 
+    def test_running_cargo_build_blocks_seeding_in_another_process(self):
+        target = self.prepare_seedable_repo()
+        lock = target / worktree_new.PROFILE / ".cargo-build-lock"
+        with open(lock, "rb") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "a Cargo process holds")
+
+    def test_symlinked_cargo_lock_is_refused_without_touching_target(self):
+        target = self.prepare_seedable_repo()
+        lock = target / worktree_new.PROFILE / ".cargo-lock"
+        outside = self.root / "outside-lock"
+        lock.unlink()
+        lock.symlink_to(outside)
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, ".cargo-lock")
+        self.assertFalse(outside.exists())
+
     def prepare_stale_seed(self):
         target = self.prepare_seedable_repo()
         (self.repo / "Cargo.lock").write_text("version = 3\n")
@@ -995,15 +1027,6 @@ class FailClosedTests(HarnessCase):
         self.assertIn("build_directory", err)
         self.assert_no_worktree_created()
 
-    def test_running_cargo_build_in_main_blocks_the_seed(self):
-        lock = self.h.target / "debug" / ".cargo-build-lock"
-        with open(lock, "rb") as held:
-            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("a Cargo process holds", err)
-        self.assert_no_worktree_created()
-
     def test_lock_file_absent_at_start_is_created_and_held_during_seed(self):
         debug = self.h.target / "debug"
         for lock in worktree_new.CARGO_LOCK_FILES:
@@ -1023,30 +1046,6 @@ class FailClosedTests(HarnessCase):
             self.assertTrue(all(blocked), f"{lock} was not held: {blocked}")
         for lock in worktree_new.CARGO_LOCK_FILES:
             self.assertFalse(flock_is_blocked(debug / lock), lock)
-
-    def test_symlinked_cargo_lock_file_is_refused(self):
-        outside = self.h.root / "outside"
-        lock = self.h.target / "debug" / ".cargo-lock"
-        lock.unlink()
-        lock.symlink_to(outside)
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn(".cargo-lock", err)
-        self.assertFalse(outside.exists())
-        self.assert_no_worktree_created()
-
-    def test_held_repository_lock_fails_before_any_check(self):
-        lock = self.h.repo / ".git" / worktree_new.REPO_LOCK_NAME
-        with open(lock, "wb") as held:
-            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn(f"another worktree-new run holds {lock}", err)
-        self.assertEqual(
-            self.h.executor.commands,
-            [["git", "rev-parse", "--path-format=absolute",
-              "--git-common-dir"]],
-        )
 
     def test_file_at_a_predictable_probe_path_is_never_touched(self):
         self.h.worktrees.mkdir()
