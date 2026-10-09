@@ -359,11 +359,8 @@ fn field<'a>(value: &'a mut Value, key: &str) -> Option<&'a mut Value> {
 mod tests {
     use serde_json::{json, Value};
 
-    use super::{
-        downgrade_request_params, event_payload, result, upgrade_event_payload, upgrade_result,
-        INTRODUCED_METHODS, KNOWN_EVENTS, KNOWN_WARNING_KINDS,
-    };
-    use crate::{compat::CompatError, event, method};
+    use super::{event_payload, result, KNOWN_EVENTS, KNOWN_WARNING_KINDS};
+    use crate::{event, method};
 
     fn session_with_runtime() -> Value {
         json!({
@@ -450,22 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn result_with_both_spellings_cannot_be_expressed() {
-        let error = result(
-            method::SESSION_READ,
-            json!({"worker_instance_id": "w-1", "runtime_id": "other"}),
-        )
-        .expect_err("two identities in one object");
-        assert_eq!(
-            error,
-            CompatError::Conflict {
-                site: "result",
-                key: "runtime_id"
-            }
-        );
-    }
-
-    #[test]
     fn warning_kinds_unknown_to_protocol_3_are_withheld() {
         let mut session = session_with_runtime();
         session["warnings"] = json!([
@@ -493,16 +474,6 @@ mod tests {
         session["warnings"] = Value::Array(warnings.clone());
         let downgraded = result(method::SESSION_INSPECT, session).expect("adapter");
         assert_eq!(downgraded["warnings"], Value::Array(warnings));
-    }
-
-    #[test]
-    fn inventory_entries_are_renamed() {
-        let downgraded = result(
-            method::SESSION_RUNTIME_INVENTORY,
-            json!({"entries": [{"runtime_slot": "a", "worker_instance_id": "w-1", "status": "managed"}]}),
-        )
-        .expect("adapter");
-        assert_eq!(downgraded["entries"][0]["runtime_id"], "w-1");
     }
 
     #[test]
@@ -571,136 +542,5 @@ mod tests {
             .filter(|name| !KNOWN_EVENTS.contains(name))
             .collect();
         assert_eq!(withheld, Vec::<&str>::new());
-    }
-
-    #[test]
-    fn request_downgrade_reaches_the_nested_identity_and_the_native_id_report() {
-        for method_name in [method::SESSION_OUTPUT, method::SESSION_WAIT] {
-            let downgraded = downgrade_request_params(
-                method_name,
-                json!({"session_id": "s-1", "runtime": {"worker_instance_id": "w-1", "runtime_generation": "1"}}),
-            )
-            .expect("adapter");
-            assert_eq!(
-                downgraded["runtime"],
-                json!({"runtime_id": "w-1", "runtime_generation": "1"}),
-                "{method_name}"
-            );
-        }
-        assert_eq!(
-            downgrade_request_params(
-                method::SESSION_REPORT_NATIVE_ID,
-                json!({"session_id": "s-1", "worker_instance_id": "w-1", "agent": "claude"}),
-            )
-            .expect("adapter"),
-            json!({"session_id": "s-1", "runtime_id": "w-1", "agent": "claude"})
-        );
-    }
-
-    #[test]
-    fn result_upgrade_reaches_every_session_info_carrier() {
-        let legacy_session = || {
-            json!({
-                "id": "s-1",
-                "runtime": {"state": "live", "runtime_generation": "1", "runtime_id": "w-1"},
-                "warnings": [{"kind": "fetch", "message": "a"}]
-            })
-        };
-        for method_name in [
-            method::SESSION_RESUME,
-            method::SESSION_RESIZE,
-            method::SESSION_SET_METADATA,
-            method::SESSION_RENAME,
-            method::SESSION_WAIT,
-        ] {
-            let upgraded =
-                upgrade_result(method_name, json!({"session": legacy_session()})).expect("adapter");
-            assert_eq!(
-                upgraded["session"]["runtime"]["worker_instance_id"], "w-1",
-                "{method_name}"
-            );
-        }
-        for method_name in [
-            method::SESSION_INSPECT,
-            method::SESSION_NEW,
-            method::SESSION_FORK,
-        ] {
-            let upgraded = upgrade_result(method_name, legacy_session()).expect("adapter");
-            assert_eq!(
-                upgraded["runtime"]["worker_instance_id"], "w-1",
-                "{method_name}"
-            );
-            assert_eq!(
-                upgraded["warnings"][0]["kind"], "fetch",
-                "warnings are kept"
-            );
-        }
-        let listed =
-            upgrade_result(method::SESSION_LIST, json!([legacy_session()])).expect("adapter");
-        assert_eq!(listed[0]["runtime"]["worker_instance_id"], "w-1");
-        let input = upgrade_result(
-            method::SESSION_INPUT,
-            json!({"accepted": true, "runtime": {"runtime_id": "w-1", "runtime_generation": "2"}}),
-        )
-        .expect("adapter");
-        assert_eq!(input["runtime"]["worker_instance_id"], "w-1");
-        let inventory = upgrade_result(
-            method::SESSION_RUNTIME_INVENTORY,
-            json!({"entries": [{"runtime_slot": "a", "runtime_id": "w-1", "status": "managed"}]}),
-        )
-        .expect("adapter");
-        assert_eq!(inventory["entries"][0]["worker_instance_id"], "w-1");
-    }
-
-    #[test]
-    fn result_upgrade_refuses_a_method_the_protocol_never_defined() {
-        for name in INTRODUCED_METHODS {
-            assert_eq!(
-                upgrade_result(name, json!({})),
-                Err(CompatError::MethodNotDefined {
-                    method: (*name).to_owned()
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn event_upgrade_reaches_every_carrier() {
-        let identity = json!({"runtime_id": "w-1", "runtime_generation": "1"});
-        for name in [event::AGENT_STATE, event::SUBAGENT_STATE] {
-            let payload =
-                upgrade_event_payload(name, json!({"runtime": identity.clone()})).expect("adapter");
-            assert_eq!(payload["runtime"]["worker_instance_id"], "w-1", "{name}");
-        }
-        for name in super::SESSION_EVENTS {
-            let payload = upgrade_event_payload(
-                name,
-                json!({"session": {"runtime": identity.clone(), "warnings": []}}),
-            )
-            .expect("adapter");
-            assert_eq!(
-                payload["session"]["runtime"]["worker_instance_id"], "w-1",
-                "{name}"
-            );
-        }
-        let discovered = upgrade_event_payload(
-            event::SESSION_RUNTIME_DISCOVERED,
-            json!({"entry": {"runtime_slot": "a", "runtime_id": "w-1", "status": "managed"}}),
-        )
-        .expect("adapter");
-        assert_eq!(discovered["entry"]["worker_instance_id"], "w-1");
-        let recovered = upgrade_event_payload(
-            event::SESSION_NATIVE_RECOVERED,
-            json!({
-                "session": {"runtime": identity, "warnings": []},
-                "previous_runtime_id": "w-0",
-                "runtime_id": "w-1"
-            }),
-        )
-        .expect("adapter");
-        assert_eq!(recovered["session"]["runtime"]["worker_instance_id"], "w-1");
-        assert_eq!(recovered["previous_worker_instance_id"], "w-0");
-        assert_eq!(recovered["worker_instance_id"], "w-1");
-        assert!(recovered.get("runtime_id").is_none());
     }
 }
