@@ -369,6 +369,8 @@ async function reachableSpecifiers(packageRoot: string, entry: string): Promise<
   return specifiers;
 }
 
+// Packaging builds three real release assets, so it shares the bounded
+// subprocess budget instead of Bun's short default hook timeout.
 beforeAll(async () => {
   workDir = await mkdtemp(join(tmpdir(), "pohunek-pack-contract-"));
   outDir = join(workDir, "assets");
@@ -393,7 +395,7 @@ beforeAll(async () => {
     outDir,
     sourceDateEpoch: SOURCE_DATE_EPOCH,
   });
-});
+}, INSTALL_TIMEOUT_MS);
 
 afterAll(async () => {
   await server?.stop(true);
