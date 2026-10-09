@@ -28,8 +28,6 @@ SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
 worktree_new = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(worktree_new)
 
-# Error text of GNU cp when FICLONE crosses filesystems (tmpfs, other btrfs).
-CROSS_DEVICE = "cp: failed to clone: Invalid cross-device link"
 # Upper bound for a cross-thread handshake in the concurrency tests; it only
 # bounds a hang when the code under test deadlocks, a passing run never
 # waits for it.
@@ -86,7 +84,6 @@ class FakeExecutor:
         self.branches = {"main": BASE_COMMIT}
         # Commit-ish -> commit id.
         self.refs = {"origin/main": BASE_COMMIT, "HEAD": BASE_COMMIT}
-        self.probe_fails = False
         # stdout of `git log -1 --first-parent --format=%ct <base> -- Cargo.lock`; empty
         # when no commit touches the lockfile.
         self.lockfile_log = f"{OLD_EPOCH}\n"
@@ -316,8 +313,6 @@ class FakeExecutor:
         source, dest = Path(args[2]), Path(args[3])
         if self.on_copy is not None:
             self.on_copy(source, dest)
-        if self.probe_fails:
-            return 1, "", CROSS_DEVICE
         if self.copy_fails_for is not None and source.name == self.copy_fails_for:
             return 1, "", "cp: No space left on device"
         if source.is_dir():
@@ -698,13 +693,10 @@ class WorktreeCliTests(WorktreeCliFixture, unittest.TestCase):
 
 
 class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
-    """Seed-source validation and stale-skip checks through the real script.
+    """Seed checks through the real script, Git, and Cargo processes.
 
-    Each case runs the real `scripts/worktree-new` against the private
-    real Git repository with real `cargo metadata`, breaks exactly one
-    condition in the main checkout's target dir, and must fail before any
-    cp, worktree, or branch exists — so the scenarios never need reflink
-    support, and no rollback or destination cleanup is ever involved.
+    Copy scenarios observe an external cp process that emulates reflink
+    support, so the suite runs on filesystems without reflinks.
     """
 
     def setUp(self):
@@ -728,6 +720,59 @@ class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
         self.git("add", "Cargo.toml")
         self.git("commit", "-q", "-m", "cargo fixture")
         return target
+
+    def install_cp_probe(self, target):
+        """Observe real script copies through an external cp process."""
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        cp_probe = bin_dir / "cp"
+        cp_probe.write_text(f"""#!{sys.executable}
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+args = sys.argv[1:]
+if args[:2] != ["-a", "--reflink=always"]:
+    sys.exit("unexpected cp options")
+source, dest = map(Path, args[2:])
+locks = {{}}
+for name in json.loads(os.environ["WORKTREE_TEST_LOCK_NAMES"]):
+    with (Path(os.environ["WORKTREE_TEST_SOURCE_PROFILE"]) / name).open("rb") as held:
+        try:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            locks[name] = True
+        else:
+            locks[name] = False
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+entry = {{
+    "source": str(source), "dest": str(dest),
+    "parent_mode": stat.S_IMODE(dest.parent.stat().st_mode),
+    "locks": locks,
+}}
+with open(os.environ["WORKTREE_TEST_CP_LOG"], "a") as log:
+    log.write(json.dumps(entry) + "\\n")
+if os.environ.get("WORKTREE_TEST_FAIL_PROBE") == "1":
+    print("cp: failed to clone: Invalid cross-device link", file=sys.stderr)
+    sys.exit(1)
+real_cp = os.environ["WORKTREE_TEST_REAL_CP"]
+os.execv(real_cp, [real_cp, "-a", *args[2:]])
+""")
+        cp_probe.chmod(0o755)
+        self.cp_log = self.root / "cp-observations.jsonl"
+        self.env["PATH"] = f"{bin_dir}{os.pathsep}{self.env['PATH']}"
+        self.env["WORKTREE_TEST_CP_LOG"] = str(self.cp_log)
+        self.env["WORKTREE_TEST_REAL_CP"] = shutil.which("cp")
+        self.env["WORKTREE_TEST_SOURCE_PROFILE"] = str(
+            target / worktree_new.PROFILE)
+        self.env["WORKTREE_TEST_LOCK_NAMES"] = json.dumps(
+            worktree_new.CARGO_LOCK_FILES)
+
+    def cp_observations(self):
+        return [json.loads(line) for line in self.cp_log.read_text().splitlines()]
 
     def assert_refused_at_source_validation(self, result, *error_texts):
         """Exit 1 with the expected error and recovery hint, and nothing
@@ -784,6 +829,14 @@ class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
         result = self.run_script("issue-1", "HEAD")
 
         self.assert_refused_without_creation(result, "CARGO_TARGET_DIR", "--no-seed")
+
+    def test_separate_build_directory_fails_before_creation(self):
+        self.prepare_seedable_repo()
+        self.env["CARGO_BUILD_BUILD_DIR"] = str(self.root / "build-dir")
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "build_directory", "--no-seed")
 
     def test_missing_activity_directory_fails_before_copy(self):
         target = self.prepare_seedable_repo()
@@ -872,6 +925,64 @@ class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
 
         self.assert_refused_without_creation(result, ".cargo-lock")
         self.assertFalse(outside.exists())
+    def test_unsupported_reflink_fails_without_fallback(self):
+        target = self.prepare_seedable_repo()
+        self.install_cp_probe(target)
+        self.env["WORKTREE_TEST_FAIL_PROBE"] = "1"
+        self.worktrees.mkdir()
+        foreign = self.worktrees / FOREIGN_PROBE_NAME
+        foreign.write_text("someone else's file")
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for text in ("reflink is not supported", "--no-seed",
+                     "Invalid cross-device link"):
+            self.assertIn(text, result.stderr)
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
+        self.assertEqual(len(self.cp_observations()), 1)
+        self.assertEqual(foreign.read_text(), "someone else's file")
+        self.assertEqual(list(self.worktrees.iterdir()), [foreign])
+
+    def test_absent_cargo_locks_are_held_during_seed(self):
+        target = self.prepare_seedable_repo()
+        profile = target / worktree_new.PROFILE
+        for name in worktree_new.CARGO_LOCK_FILES:
+            (profile / name).unlink()
+        self.install_cp_probe(target)
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observations = self.cp_observations()
+        self.assertGreater(len(observations), 1)
+        for entry in observations:
+            self.assertEqual(entry["locks"], {
+                name: True for name in worktree_new.CARGO_LOCK_FILES})
+        for name in worktree_new.CARGO_LOCK_FILES:
+            self.assertFalse(flock_is_blocked(profile / name), name)
+
+    def test_probe_uses_private_directory_and_preserves_foreign_file(self):
+        target = self.prepare_seedable_repo()
+        self.install_cp_probe(target)
+        self.worktrees.mkdir()
+        foreign = self.worktrees / FOREIGN_PROBE_NAME
+        foreign.write_text("someone else's file")
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (probe,) = [entry for entry in self.cp_observations()
+                    if Path(entry["dest"]).parent.name.startswith(
+                        worktree_new.PROBE_DIR_PREFIX)]
+        probe_dir = Path(probe["dest"]).parent
+        self.assertEqual(probe_dir.parent, self.worktrees)
+        self.assertEqual(probe["parent_mode"], 0o700)
+        self.assertFalse(probe_dir.exists())
+        self.assertEqual(foreign.read_text(), "someone else's file")
+        self.assertEqual(
+            sorted(path.name for path in self.worktrees.iterdir()),
+            [FOREIGN_PROBE_NAME, "issue-1"])
 
     def prepare_stale_seed(self):
         target = self.prepare_seedable_repo()
@@ -1007,77 +1118,6 @@ class SeededCreateTests(HarnessCase):
 
 
 class FailClosedTests(HarnessCase):
-    def test_unsupported_reflink_fails_without_fallback(self):
-        self.h.executor.probe_fails = True
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("reflink is not supported", err)
-        self.assertIn("--no-seed", err)
-        self.assertIn("Invalid cross-device link", err)
-        self.assert_no_worktree_created()
-        copies = [c for c in self.h.executor.commands if c[0] == "cp"]
-        self.assertEqual(len(copies), 1, "only the probe may run")
-        self.assertEqual(list(self.h.worktrees.iterdir()), [])
-
-    def test_separate_build_dir_fails(self):
-        self.h.executor.layouts[self.h.repo] = (
-            self.h.repo / "target", self.h.root / "build-dir")
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("build_directory", err)
-        self.assert_no_worktree_created()
-
-    def test_lock_file_absent_at_start_is_created_and_held_during_seed(self):
-        debug = self.h.target / "debug"
-        for lock in worktree_new.CARGO_LOCK_FILES:
-            (debug / lock).unlink()
-        observed = {}
-
-        def probe_locks(source, dest):
-            for lock in worktree_new.CARGO_LOCK_FILES:
-                observed.setdefault(lock, []).append(
-                    flock_is_blocked(debug / lock))
-
-        self.h.executor.on_copy = probe_locks
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(set(observed), set(worktree_new.CARGO_LOCK_FILES))
-        for lock, blocked in observed.items():
-            self.assertTrue(all(blocked), f"{lock} was not held: {blocked}")
-        for lock in worktree_new.CARGO_LOCK_FILES:
-            self.assertFalse(flock_is_blocked(debug / lock), lock)
-
-    def test_file_at_a_predictable_probe_path_is_never_touched(self):
-        self.h.worktrees.mkdir()
-        foreign = self.h.worktrees / FOREIGN_PROBE_NAME
-        foreign.write_text("someone else's file")
-        for probe_fails in (True, False):
-            with self.subTest(probe_fails=probe_fails):
-                self.h.executor.probe_fails = probe_fails
-                slug = f"issue-{int(probe_fails)}"
-                code, _, err = self.h.run(slug)
-                self.assertEqual(code, 1 if probe_fails else 0, err)
-                self.assertEqual(foreign.read_text(), "someone else's file")
-        leftovers = [p.name for p in self.h.worktrees.iterdir()
-                     if p.name.startswith(worktree_new.PROBE_DIR_PREFIX)]
-        self.assertEqual(leftovers, [])
-
-    def test_probe_clones_into_a_private_directory(self):
-        seen = []
-
-        def record(source, dest):
-            if not seen:
-                seen.append((dest, dest.parent.stat().st_mode & 0o777))
-
-        self.h.executor.on_copy = record
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        dest, mode = seen[0]
-        self.assertTrue(
-            dest.parent.name.startswith(worktree_new.PROBE_DIR_PREFIX))
-        self.assertEqual(dest.parent.parent, self.h.worktrees)
-        self.assertEqual(mode, 0o700)
-        self.assertFalse(dest.parent.exists())
 
     def test_bare_common_dir_is_rejected(self):
         self.h.executor.common_dir = self.h.root / "bare.git"
