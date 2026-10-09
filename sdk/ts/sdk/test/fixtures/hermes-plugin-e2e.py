@@ -20,6 +20,7 @@ from typing import Any
 
 
 _PLUGIN_PACKAGE_NAME = "pohunek_e2e_plugin"
+IDENTITY_KEY = "worker_instance_id"
 _MARKER = "pohunek-hermes-plugin-e2e-marker"
 _REMOTE_MARKER = "pohunek-hermes-plugin-remote-marker"
 _NATIVE_REFERENCE = "hermes-e2e-native"
@@ -42,6 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy", required=True)
     parser.add_argument("--project-id", required=True)
     parser.add_argument("--remote-host", required=True)
+    parser.add_argument(
+        "--identity-key",
+        choices=("worker_instance_id", "runtime_id"),
+        default="worker_instance_id",
+    )
+    parser.add_argument("--expect-incompatible", action="store_true")
+    parser.add_argument("--expect-invalid-policy", action="store_true")
+    parser.add_argument("--expect-invalid-envelope", action="store_true")
     return parser.parse_args()
 
 
@@ -108,7 +117,7 @@ def runtime_from(session: Any) -> tuple[str, str]:
     runtime = session.get("runtime")
     if not isinstance(runtime, dict):
         raise FixtureError("session runtime is missing")
-    worker_instance_id = require_string(runtime.get("worker_instance_id"), "worker_instance_id")
+    worker_instance_id = require_string(runtime.get(IDENTITY_KEY), IDENTITY_KEY)
     generation = canonical_u64(runtime.get("runtime_generation"), "runtime_generation")
     return worker_instance_id, generation
 
@@ -187,6 +196,8 @@ def wait_for_screen_marker(
             raise FixtureError("screen logical ID mismatch while waiting for output")
         if screen.get("worker_instance_id") != worker_instance_id or screen.get("runtime_generation") != generation:
             raise FixtureError("screen runtime ID mismatch while waiting for output")
+        if "runtime_id" in screen:
+            raise FixtureError("screen changed the current typed JSON identity shape")
         text = screen.get("text")
         if isinstance(text, str) and marker in text:
             return
@@ -208,6 +219,8 @@ def require_output_shape(value: Any, session_id: str, worker_instance_id: str, g
         raise FixtureError("output logical ID mismatch")
     if value.get("worker_instance_id") != worker_instance_id or value.get("runtime_generation") != generation:
         raise FixtureError("output runtime ID mismatch")
+    if "runtime_id" in value:
+        raise FixtureError("output changed the current typed JSON identity shape")
     for field in ("history_start_offset", "start_offset", "next_offset", "runtime_end_offset"):
         canonical_u64(value.get(field), field)
     if not isinstance(value.get("has_more"), bool) or not isinstance(value.get("timed_out"), bool):
@@ -221,7 +234,7 @@ def settle_output(
     """Advance past startup bytes and prove one bounded output no-change result."""
     for _ in range(20):
         settled = invoke(handlers, "pohunek_session_output", {
-            "session": session_id, "worker_instance_id": worker_instance_id, "runtime_generation": generation,
+            "session": session_id, IDENTITY_KEY: worker_instance_id, "runtime_generation": generation,
             "after_offset": cursor, "max_bytes": 4096, "wait_ms": 50,
         })
         next_cursor = require_output_shape(settled, session_id, worker_instance_id, generation)
@@ -268,8 +281,16 @@ def assert_origin_denials(plugin: Any, policy: Any, session_id: str) -> None:
 def run() -> dict[str, Any]:
     """Exercise a full-mode non-origin shell session through the real CLI surface."""
     args = parse_args()
+    global IDENTITY_KEY
+    IDENTITY_KEY = args.identity_key
     plugin, temporary = load_plugin(Path(args.assets_dir), Path(args.policy))
     try:
+        if args.expect_invalid_policy:
+            try:
+                plugin.load_policy(plugin.POLICY_PATH)
+            except plugin.PolicyError:
+                return {"ok": True, "invalid_policy": True}
+            raise FixtureError("malformed previous policy was accepted")
         return run_plugin(plugin, args)
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -279,6 +300,23 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     """Run the assertions while the isolated import package is available."""
     policy = plugin.load_policy(plugin.POLICY_PATH)
     tools = plugin.Tools(policy, None)
+    if args.expect_invalid_envelope:
+        try:
+            tools.verify_cli()
+        except plugin.CliError as error:
+            if error.code != "pohunek_cli_invalid_envelope":
+                raise FixtureError("malformed CLI envelope returned the wrong typed error") from error
+            return {"ok": True, "invalid_envelope": True}
+        raise FixtureError("malformed CLI envelope was accepted")
+    if args.expect_incompatible:
+        try:
+            tools.verify_cli()
+        except plugin.CliError as error:
+            if error.code != "pohunek_cli_incompatible":
+                raise FixtureError("out-of-window policy returned the wrong typed error") from error
+            return {"ok": True, "incompatible": True}
+        raise FixtureError("out-of-window policy was accepted")
+    tools.verify_cli()
     handlers = tools.handlers()
     if len(handlers) != 16:
         raise FixtureError("full policy did not register the complete tool surface")
@@ -286,6 +324,20 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     hosts = invoke(handlers, "pohunek_hosts", {})
     if hosts != {"hosts": ["local", args.remote_host], "wildcard": False, "discovery_performed": False}:
         raise FixtureError("policy hosts result is invalid")
+
+    if args.identity_key == "runtime_id":
+        original_run = tools._runner.run
+        interrupted = False
+
+        def interrupted_start(invocation: Any) -> Any:
+            nonlocal interrupted
+            if not interrupted and "session" in invocation.argv and "new" in invocation.argv:
+                original_run(invocation)
+                interrupted = True
+                raise plugin.CliError("request_timeout")
+            return original_run(invocation)
+
+        tools._runner.run = interrupted_start
 
     started = invoke(
         handlers,
@@ -304,8 +356,14 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     )
     if not isinstance(started, dict):
         raise FixtureError("start result is invalid")
+    if args.identity_key == "runtime_id":
+        if not interrupted:
+            raise FixtureError("previous plugin start recovery was not exercised")
+        tools._runner.run = original_run
     session_id = require_string(started.get("id"), "session_id")
     started_runtime, started_generation = runtime_from(started)
+    if args.identity_key == "runtime_id" and started["runtime"].get("worker_instance_id") != started_runtime:
+        raise FixtureError("previous start recovery identity alias differs from the current identity")
     inspected, worker_instance_id, generation = inspect_until_live(handlers, session_id)
     require_session_result(inspected, session_id, "inspect")
     if worker_instance_id != started_runtime or generation != started_generation:
@@ -323,6 +381,8 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         raise FixtureError("screen logical ID mismatch")
     if screen.get("worker_instance_id") != worker_instance_id or screen.get("runtime_generation") != generation:
         raise FixtureError("screen runtime ID mismatch")
+    if "runtime_id" in screen:
+        raise FixtureError("screen changed the current typed JSON identity shape")
     canonical_u64(screen.get("watermark"), "watermark")
     if screen.get("truncated") is not False or not isinstance(screen.get("text"), str):
         raise FixtureError("screen truncation shape is invalid")
@@ -332,7 +392,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_output",
         {
             "session": session_id,
-            "worker_instance_id": worker_instance_id,
+            IDENTITY_KEY: worker_instance_id,
             "runtime_generation": generation,
             "max_bytes": 4096,
         },
@@ -345,7 +405,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_wait",
         {
             "session": session_id,
-            "worker_instance_id": worker_instance_id,
+            IDENTITY_KEY: worker_instance_id,
             "runtime_generation": generation,
             "after_output_offset": cursor,
             "timeout_ms": 25,
@@ -359,7 +419,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_wait",
         {
             "session": session_id,
-            "worker_instance_id": worker_instance_id,
+            IDENTITY_KEY: worker_instance_id,
             "runtime_generation": generation,
             "after_output_offset": cursor,
             "timeout_ms": 2_000,
@@ -372,7 +432,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "pohunek_session_output",
         {
             "session": session_id,
-            "worker_instance_id": worker_instance_id,
+            IDENTITY_KEY: worker_instance_id,
             "runtime_generation": generation,
             "after_offset": cursor,
             "max_bytes": 4096,
@@ -392,7 +452,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         "host": args.remote_host, "session": session_id, "input": f"printf '{_REMOTE_MARKER}\\n'\n",
     })
     remote_wait = invoke(handlers, "pohunek_session_wait", {
-        "host": args.remote_host, "session": session_id, "worker_instance_id": worker_instance_id,
+        "host": args.remote_host, "session": session_id, IDENTITY_KEY: worker_instance_id,
         "runtime_generation": generation, "after_output_offset": cursor, "timeout_ms": 2_000,
     })
     require_wait(remote_wait, session_id, "output_advanced")
@@ -413,7 +473,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     gap_page = None
     for _ in range(_MAX_RETRIES):
         candidate = invoke(handlers, "pohunek_session_output", {
-            "session": session_id, "worker_instance_id": worker_instance_id, "runtime_generation": generation,
+            "session": session_id, IDENTITY_KEY: worker_instance_id, "runtime_generation": generation,
             "after_offset": "0", "max_bytes": 262_144,
         })
         if isinstance(candidate, dict) and isinstance(candidate.get("gap"), dict):
@@ -428,7 +488,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
         raise FixtureError("gap did not begin at the requested cursor")
     canonical_u64(gap.get("end_offset"), "gap.end")
     recovered = invoke(handlers, "pohunek_session_output", {
-        "session": session_id, "worker_instance_id": worker_instance_id, "runtime_generation": generation,
+        "session": session_id, IDENTITY_KEY: worker_instance_id, "runtime_generation": generation,
         "after_offset": gap_cursor, "max_bytes": 4096,
     })
     require_output_shape(recovered, session_id, worker_instance_id, generation)
@@ -466,7 +526,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     hermes_session, hermes_runtime, hermes_generation = inspect_until_native(handlers, hermes_id)
     require_session_result(hermes_session, hermes_id, "Hermes start")
     hermes_output = invoke(handlers, "pohunek_session_output", {
-        "session": hermes_id, "worker_instance_id": hermes_runtime,
+        "session": hermes_id, IDENTITY_KEY: hermes_runtime,
         "runtime_generation": hermes_generation, "max_bytes": 4096,
     })
     old_cursor = require_output_shape(hermes_output, hermes_id, hermes_runtime, hermes_generation)
@@ -485,7 +545,7 @@ def run_plugin(plugin: Any, args: argparse.Namespace) -> dict[str, Any]:
     if resumed_runtime == hermes_runtime or int(resumed_generation) <= int(hermes_generation):
         raise FixtureError("Hermes resume did not mint a new runtime identity")
     stale = invoke(handlers, "pohunek_session_wait", {
-        "session": hermes_id, "worker_instance_id": hermes_runtime, "runtime_generation": hermes_generation,
+        "session": hermes_id, IDENTITY_KEY: hermes_runtime, "runtime_generation": hermes_generation,
         "after_output_offset": old_cursor, "timeout_ms": 2_000,
     })
     require_wait(stale, hermes_id, "runtime_changed")

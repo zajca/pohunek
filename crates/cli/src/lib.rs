@@ -1247,7 +1247,7 @@ enum SessionAction {
     /// Read bounded retained terminal output.
     Output {
         target: Target,
-        #[arg(long, requires = "runtime_generation")]
+        #[arg(long, alias = "runtime-id", requires = "runtime_generation")]
         worker_instance_id: Option<String>,
         #[arg(long, requires = "worker_instance_id")]
         runtime_generation: Option<u64>,
@@ -1264,7 +1264,7 @@ enum SessionAction {
     /// Wait for one bounded session change.
     Wait {
         target: Target,
-        #[arg(long, requires = "runtime_generation")]
+        #[arg(long, alias = "runtime-id", requires = "runtime_generation")]
         worker_instance_id: Option<String>,
         #[arg(long, requires = "worker_instance_id")]
         runtime_generation: Option<u64>,

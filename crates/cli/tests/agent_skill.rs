@@ -142,8 +142,14 @@ fn agent_skill_json_envelope_is_one_document_with_skill_and_hash() {
         panic!("stdout must be exactly one JSON document ({err}): {stdout:?}")
     });
     assert_eq!(doc["cli_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(doc["protocol"]["minimum"], protocol::PROTOCOL_VERSION.get());
-    assert_eq!(doc["protocol"]["maximum"], protocol::PROTOCOL_VERSION.get());
+    assert_eq!(
+        doc["protocol"]["minimum"],
+        protocol::CLIENT_PROTOCOL_VERSIONS.minimum().get()
+    );
+    assert_eq!(
+        doc["protocol"]["maximum"],
+        protocol::CLIENT_PROTOCOL_VERSIONS.maximum().get()
+    );
     assert_eq!(doc["ok"]["skill"], EMBEDDED_SKILL);
     assert_eq!(doc["ok"]["content_sha256"], expected_content_sha256());
     assert!(doc.get("err").is_none());

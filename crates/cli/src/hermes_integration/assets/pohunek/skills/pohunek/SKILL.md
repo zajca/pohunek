@@ -151,6 +151,17 @@ stored range no longer overlaps the installed CLI. It otherwise preserves the
 installed CLI path, access mode, host allowlist, and bounds unless their
 replacement flags are supplied.
 
+A plugin installed by v0.33.0 keeps its `3..=3` policy and CLI tools working
+while protocol 3 remains in the CLI's `3..=4` window. The CLI accepts its old
+`--runtime-id` observation flag and returns the old `runtime_id` spelling
+alongside `worker_instance_id` in session summaries, including the list result
+used to recover a timed-out start. Other typed CLI results keep their current
+shape. This does not change the
+policy's access mode, host allowlist, or file permissions. A policy entirely
+outside the CLI window fails closed as `pohunek_cli_incompatible`; update the
+plugin and policy with `pohunek integration update --agent hermes` using its
+installed target. The bridge is removed when protocol 3 leaves the window.
+
 The plugin preserves the daemon's exact origin-session protection. It must deny
 these eight methods when they target the session hosting Hermes:
 
