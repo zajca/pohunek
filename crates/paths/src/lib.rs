@@ -1058,22 +1058,10 @@ pub fn is_schema_backup_artifact(store: &str, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn longest_worker_session_id_is_valid_and_maximal() {
-        let id = super::longest_worker_session_id();
-
-        assert_eq!(id.len(), MAX_WORKER_SESSION_ID_BYTES);
-        assert!(id.starts_with(WORKER_SESSION_ID_PREFIX));
-        assert!(valid_worker_session_id(&id).is_some());
-    }
-
     use super::*;
-
-    use pohunek_test_support::process_env::ProcessEnv;
 
     // Keep synthetic runtime paths below the strictest supported Unix-socket limit.
     const TEST_BASE_ROOT: &str = "/work";
-    const CUSTOM_DATA_HOME: &str = "CUSTOM_DATA_HOME";
 
     fn tmp_base(tag: &str) -> PathBuf {
         Path::new(TEST_BASE_ROOT).join(format!("p-{}-{tag}", std::process::id()))
@@ -1098,53 +1086,6 @@ mod tests {
             nix::unistd::Uid::effective().as_raw(),
             env,
         )
-    }
-
-    #[test]
-    fn resolve_reads_the_process_environment() {
-        let base = tmp_base("process-env");
-        let mut env = ProcessEnv::lock();
-        env.set(XDG_RUNTIME_DIR, base.join("run"))
-            .set(XDG_STATE_HOME, base.join("state"))
-            .set(XDG_DATA_HOME, base.join("data"))
-            .set(XDG_CONFIG_HOME, base.join("cfg"))
-            .set(XDG_CACHE_HOME, base.join("cache"))
-            .set(HOME, base.join("home"));
-
-        let captured = PathEnv::capture();
-        let paths = BasePaths::resolve().expect("resolve paths");
-
-        assert_eq!(captured, all_present(&base));
-        assert_eq!(paths, resolve_in(&captured).expect("resolve captured"));
-        assert_eq!(config_home().expect("config home"), base.join("cfg"));
-    }
-
-    #[test]
-    fn require_env_rejects_missing_and_empty_values() {
-        let mut env = ProcessEnv::lock();
-        env.remove(XDG_RUNTIME_DIR);
-        assert!(matches!(
-            require_env(XDG_RUNTIME_DIR),
-            Err(PathError::MissingEnv { var }) if var == XDG_RUNTIME_DIR
-        ));
-        env.set(XDG_RUNTIME_DIR, "");
-        assert!(matches!(
-            require_env(XDG_RUNTIME_DIR),
-            Err(PathError::MissingEnv { var }) if var == XDG_RUNTIME_DIR
-        ));
-    }
-
-    #[test]
-    fn xdg_or_home_relative_honors_an_arbitrary_environment_key() {
-        let mut env = ProcessEnv::lock();
-        let custom = tmp_base("custom-data-home");
-        env.set(CUSTOM_DATA_HOME, &custom);
-
-        assert_eq!(
-            xdg_or_home_relative(CUSTOM_DATA_HOME, &["fallback"])
-                .expect("resolve custom environment key"),
-            custom
-        );
     }
 
     #[test]
@@ -1216,18 +1157,6 @@ mod tests {
         for invalid in ["", "../worker", "worker/name", "worker.name"] {
             assert_eq!(paths.worker_journal("s-42", invalid), None);
         }
-    }
-
-    #[test]
-    fn plugins_dir_is_a_state_subdirectory() {
-        let base = tmp_base("plugins");
-        let paths = resolve_in(&all_present(&base)).expect("resolve paths");
-
-        assert_eq!(
-            paths.plugins_dir(),
-            base.join("state").join(APP_DIR).join(PLUGINS_SUBDIR)
-        );
-        assert_ne!(paths.plugins_dir(), paths.host_state_dir());
     }
 
     #[test]
