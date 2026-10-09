@@ -4340,7 +4340,12 @@ impl SessionRegistry {
     /// Every commit of terminal recovery metadata (a PTY exit, an explicit
     /// stop, a lost worker) passes through here, so a conversation switch the
     /// worker accepted is never dropped by the transition that ends the
-    /// session. A worker that cannot be asked leaves the reference as is.
+    /// session. The import is the terminal one: the ordered journaled
+    /// reference wins, and a previous-release worker that keeps a switch only
+    /// as its leased active-identity claim still carries it across here,
+    /// validated with the schema of the session's pinned runtime when the
+    /// snapshot names none. With neither a worker snapshot nor a readable
+    /// generation journal, the reference stays as is.
     async fn import_final_native_reference(
         &self,
         id: &SessionId,
@@ -4368,7 +4373,8 @@ impl SessionRegistry {
                 None => return,
             },
         };
-        reconcile::import_native_reference(&mut record, &snapshot);
+        let schema = self.record_hook_schema(&record, snapshot.hook_schema.as_deref());
+        reconcile::import_terminal_native_reference(&mut record, &snapshot, schema);
         candidate
             .info
             .native_session_id

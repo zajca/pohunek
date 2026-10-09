@@ -105,7 +105,7 @@ async fn assert_provider_named_launch_process(worker: &Worker) {
 ///
 /// `PATH` is read under the binary-wide environment lock, so a test that
 /// replaces it concurrently cannot make the lookup fail.
-fn bash_path() -> PathBuf {
+pub(super) fn bash_path() -> PathBuf {
     static BASH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BASH.get_or_init(resolve_bash).clone()
 }

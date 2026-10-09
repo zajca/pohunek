@@ -259,8 +259,10 @@ impl SessionRegistry {
     ///
     /// Returns `session_not_found` for an unknown id,
     /// `session_runtime_not_recoverable` unless the runtime is terminal or lost,
-    /// `not_resumable` when the entry lacks the native reference required by its
-    /// frozen resume template, `agent_profile_changed` or `agent_profile_missing`
+    /// `native_identity_missing` or `native_identity_unverified` when a hook
+    /// runtime lacks a trusted native reference, `not_resumable` when another
+    /// entry lacks the reference required by its frozen resume template,
+    /// `agent_profile_changed` or `agent_profile_missing`
     /// when the profile no longer matches the session, or any worker launch
     /// error from recovery.
     pub async fn resume(&self, id: &SessionId) -> Result<SessionInfo, ProtocolError> {
@@ -279,7 +281,7 @@ impl SessionRegistry {
     ) -> Result<SessionInfo, ProtocolError> {
         self.ensure_not_external(id).await?;
         let guard = self.lock_lifecycle(id).await;
-        let (binding, definition, registration) = {
+        let (binding, definition, registration, record) = {
             let sessions = self.inner.sessions.lock().await;
             let entry = sessions.get(id).ok_or_else(|| session_not_found(&id.0))?;
             let binding = Self::resume_binding_from_entry(id, entry);
@@ -344,10 +346,17 @@ impl SessionRegistry {
                     previous_native_report: entry.last_native_report.clone().map(Box::new),
                     runtime_watch_cancel: entry.runtime_watch_cancel.clone(),
                 },
+                Self::session_record(id, entry, entry.desired_state, None),
             )
         };
         let launch = binding_native_launch(&binding, &definition)
             .ok_or_else(|| agent_not_resumable(&binding.agent))?;
+        if let Some(error) = self
+            .missing_hook_reference_error(&record, &binding, &launch)
+            .await
+        {
+            return Err(error);
+        }
         let relaunch = self.plan_relaunch(&binding, definition, launch, change)?;
 
         let info = match self
@@ -362,6 +371,34 @@ impl SessionRegistry {
         };
         self.persist_resume_binding(&info.id).await;
         Ok(info)
+    }
+
+    async fn missing_hook_reference_error(
+        &self,
+        record: &crate::store::SessionRecord,
+        binding: &ResumeBinding,
+        launch: &NativeSessionLaunch,
+    ) -> Option<ProtocolError> {
+        let missing = launch.assigned().is_none()
+            && match launch.reference_kind() {
+                SessionRefKind::Id => binding.native_session_id.is_none(),
+                SessionRefKind::Path => binding.native_session_path.is_none(),
+            };
+        if !missing {
+            return None;
+        }
+        let code = match self.generation_has_native_claim(record).await {
+            Ok(true) => "native_identity_unverified",
+            Ok(false) => "native_identity_missing",
+            Err(_) => "native_identity_evidence_unavailable",
+        };
+        Some(runtime_error(
+            code,
+            format!(
+                "session {} has no verified native conversation reference",
+                binding.session_id
+            ),
+        ))
     }
 
     /// Resolves the runtime a binding relaunches with and checks that it may

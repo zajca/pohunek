@@ -53,6 +53,7 @@ use super::{
 };
 
 mod conflict_cleanup;
+mod native_recovery;
 mod native_supersede;
 
 /// Bounds retries around intentional same-runtime snapshot races in transition tests.
@@ -12324,7 +12325,7 @@ async fn hermes_resume_without_native_reference_fails_before_relaunch() {
         .await
         .expect_err("resume requires an exact native reference");
 
-    assert_eq!(error.code, "not_resumable");
+    assert_eq!(error.code, "native_identity_missing");
     assert_eq!(
         fs::read_to_string(&marker).expect("argv marker after rejection"),
         before,
