@@ -458,6 +458,41 @@ class WorktreeCliFixture:
 class WorktreeCliTests(WorktreeCliFixture, unittest.TestCase):
     """Exercise argument validation through the real script and a private Git repo."""
 
+    def test_bare_repository_is_rejected_before_creating_a_worktree(self):
+        bare = self.root / "bare.git"
+        self.git("init", "-q", "--bare", str(bare))
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--no-seed", "issue-1", "HEAD"],
+            cwd=bare, env=self.env, capture_output=True, text=True,
+            check=False, timeout=CLI_TIMEOUT_SECONDS)
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("non-bare main checkout", result.stderr)
+        self.assertFalse(self.worktrees.exists())
+
+    def test_control_characters_in_real_git_worktree_paths_are_preserved(self):
+        odd_parent = self.root / "odd\rname\nworktree"
+        odd_parent.mkdir()
+        self.repo.rename(odd_parent / "pohunek")
+        self.repo = odd_parent / "pohunek"
+        self.worktrees = odd_parent / "pohunek-worktrees"
+        detached = odd_parent / "detached\rname\nworktree"
+        self.git("worktree", "add", "--detach", str(detached), "HEAD")
+
+        result = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destination = self.worktrees / "issue-1"
+        self.assertTrue(destination.is_dir())
+        listed = subprocess.run(
+            ["git", "worktree", "list", "--porcelain", "-z"],
+            cwd=self.repo, env=self.env, capture_output=True, check=True,
+            timeout=CLI_TIMEOUT_SECONDS).stdout
+        self.assertIn(f"worktree {destination}".encode() + b"\0", listed)
+        self.assertIn(f"worktree {detached}".encode() + b"\0", listed)
+        self.assertEqual(self.git("branch", "--list", "zajca/worktree-new-tmp-*").stdout, "")
+
     def test_valid_slugs_create_branches_and_registered_worktrees(self):
         for slug in ("issue-168", "pr112-review", "a_b.c", "X9", "a" * 100):
             with self.subTest(slug=slug):
@@ -1123,17 +1158,6 @@ os.execv(real_cp, [real_cp, "-a", *args[2:]])
         self.assertIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
 
 
-class FailClosedTests(HarnessCase):
-
-    def test_bare_common_dir_is_rejected(self):
-        self.h.executor.common_dir = self.h.root / "bare.git"
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("non-bare main checkout", err)
-
-
-
-
 class RollbackCase(HarnessCase):
     def assert_temp_branch_compare_and_deleted(self):
         """Rollback deleted exactly one ref: this run's temporary branch,
@@ -1672,29 +1696,6 @@ class ConcurrencyTests(HarnessCase):
         self.assertIn(worktree, shared.registered)
         self.assertIn("zajca/issue-1", shared.branches)
         self.assertTrue((worktree / "target" / "debug" / "deps").is_dir())
-
-
-class WorktreeListTests(HarnessCase):
-    def test_path_with_a_newline_is_parsed_intact(self):
-        odd = self.h.worktrees / "odd\nworktree issue-1"
-        self.h.executor.registered[odd] = "zajca/odd"
-        self.h.executor.registered[self.h.worktrees / "detached"] = None
-        listed = worktree_new.list_worktrees(self.h.repo, self.h.executor)
-        self.assertEqual(listed[odd.resolve()], "refs/heads/zajca/odd")
-        self.assertIsNone(listed[(self.h.worktrees / "detached").resolve()])
-        self.assertNotIn((self.h.worktrees / "odd").resolve(), listed)
-        self.assertTrue(worktree_new.worktree_registered(
-            odd, self.h.repo, self.h.executor))
-        self.assertFalse(worktree_new.worktree_registered(
-            self.h.worktrees / "issue-1", self.h.repo, self.h.executor))
-
-    def test_real_execute_keeps_carriage_returns_and_newlines(self):
-        # The running interpreter is the only external program used.
-        result = worktree_new.execute(
-            [sys.executable, "-c",
-             "import sys; sys.stdout.buffer.write(b'a\\rb\\nc\\0')"],
-            cwd=self.h.root)
-        self.assertEqual(result.stdout, "a\rb\nc\0")
 
 
 if __name__ == "__main__":
