@@ -18,11 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pohunek_client::protocol::compat::introduced_methods;
+use pohunek_client::protocol::event::AGENT_STATE;
 use pohunek_client::protocol::method::{self, Method as _};
 use pohunek_client::protocol::{
     self, ErrorClass, Event, ProtocolError, ProtocolVersion, ProtocolVersionRange, Request,
-    Response, SessionOutputParams, SessionReadParams, SessionScreenParams, SessionWaitParams,
-    MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    Response, SessionId, SessionOutputParams, SessionReadParams, SessionScreenParams,
+    SessionWaitParams, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use pohunek_client::{next_request_id, Client, ClientError, ClientOptions, OriginSource};
 use pohunek_test_support::wait::guard;
@@ -100,6 +101,10 @@ struct Seen {
     connections: usize,
     /// Version range each accepted request advertised.
     ranges: Vec<(String, ProtocolVersionRange)>,
+    /// `(method, origin session id, origin daemon id)` the accepted request
+    /// carried. A protocol 3 line must keep the caller's origin pair through
+    /// the downgrade.
+    origins: Vec<(String, Option<String>, Option<String>)>,
 }
 
 impl Seen {
@@ -215,6 +220,10 @@ async fn write_line(stream: &mut BufReader<TcpStream>, line: &str) {
         .expect("write a stub line");
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one stub daemon serves every scenario: request matching, ranges, origins and the subscription stream share the loop"
+)]
 async fn serve(stream: TcpStream, connection: usize, seen: Arc<Mutex<Seen>>, script: Script) {
     let requests = entries(REQUESTS, "requests.json");
     let results = entries(RESULTS, "results.json");
@@ -249,6 +258,11 @@ async fn serve(stream: TcpStream, connection: usize, seen: Arc<Mutex<Seen>>, scr
             .expect("stub state")
             .ranges
             .push((request.method().to_owned(), request.version_range()));
+        seen.lock().expect("stub state").origins.push((
+            request.method().to_owned(),
+            request.origin_session_id().map(|id| id.0.clone()),
+            request.origin_daemon_id().map(str::to_owned),
+        ));
 
         let recorded = requests
             .iter()
@@ -313,6 +327,38 @@ async fn serve(stream: TcpStream, connection: usize, seen: Arc<Mutex<Seen>>, scr
                 )
                 .await;
             }
+            // Two protocol 3 events the recordings cannot name, appended after
+            // every replay: one carrying a correlation id the current shape
+            // must keep, and one whose name the current protocol never
+            // defined. Both prove the adapter, not the recordings.
+            let correlated = events
+                .iter()
+                .find(|entry| entry["event"] == AGENT_STATE)
+                .expect("a recorded agent.state event");
+            let id_event = Event::new(
+                version,
+                correlated["event"].as_str().expect("event name"),
+                correlated["payload"].clone(),
+            )
+            .expect("event")
+            .with_id("evt-correlated")
+            .expect("id");
+            write_line(
+                &mut stream,
+                &serde_json::to_string(&id_event).expect("serialize event"),
+            )
+            .await;
+            let unnamed = Event::new(
+                version,
+                "event_name_the_current_protocol_never_defined",
+                json!({"runtime_id": "kept"}),
+            )
+            .expect("event");
+            write_line(
+                &mut stream,
+                &serde_json::to_string(&unnamed).expect("serialize event"),
+            )
+            .await;
             return;
         }
     }
@@ -376,6 +422,42 @@ fn contains_key(value: &Value, wanted: &str) -> bool {
         Value::Array(items) => items.iter().any(|inner| contains_key(inner, wanted)),
         _ => false,
     }
+}
+
+/// The id-bearing event the stub appends after its recordings: a recorded
+/// `agent.state` replay with a correlation id attached. The current shape must
+/// keep the id and restamp and translate the payload as with any recorded
+/// event.
+fn assert_correlated_upgrade(event: &Event, recorded: &[Value]) {
+    let correlated = recorded
+        .iter()
+        .find(|entry| entry["event"] == AGENT_STATE)
+        .expect("a recorded agent.state event");
+    assert_eq!(event.id(), Some("evt-correlated"), "{}", event.event());
+    assert_eq!(event.version(), PROTOCOL_VERSION);
+    assert_eq!(
+        event.payload(),
+        &rename_keys_everywhere(&correlated["payload"]),
+        "{}",
+        event.event()
+    );
+}
+
+/// The event whose name the current protocol never defined: the adapter passes
+/// it through untranslated (its payload keys are kept as the previous release
+/// wrote them) and restamps it for the current connection.
+fn assert_unknown_name_passes_through(event: &Event) {
+    assert_eq!(
+        event.event(),
+        "event_name_the_current_protocol_never_defined"
+    );
+    assert_eq!(event.version(), PROTOCOL_VERSION);
+    assert_eq!(event.payload(), &json!({"runtime_id": "kept"}));
+    assert!(
+        !contains_key(event.payload(), "worker_instance_id"),
+        "an unknown event name is not translated: {}",
+        event.payload()
+    );
 }
 
 #[tokio::test]
@@ -480,16 +562,40 @@ async fn a_version_dependent_request_learns_the_version_before_it_is_sent() {
                 name == method::SESSION_OUTPUT && params.get("runtime").is_some()
             })
             .expect("a runtime-bearing session.output recording");
-        let value = client
-            .request(&request_for(method::SESSION_OUTPUT, params))
-            .await
-            .expect("session.output");
+        // An explicit caller origin rides the request through the downgrade;
+        // the recorded Exchange helper carries none.
+        let request = request_for(method::SESSION_OUTPUT, params)
+            .with_origin(
+                Some(SessionId("s-origin".to_owned())),
+                Some("d-origin".to_owned()),
+            )
+            .expect("origin");
+        let value = client.request(&request).await.expect("session.output");
         assert_eq!(value, expected);
         assert_eq!(
             daemon.methods(),
             [method::DAEMON_HEALTH, method::SESSION_OUTPUT],
             "the version is learned first, then the request is sent in protocol 3"
         );
+        let seen = daemon.seen.lock().expect("stub state");
+        let (_, origin_session, origin_daemon) = seen
+            .origins
+            .iter()
+            .find(|(name, ..)| name == method::SESSION_OUTPUT)
+            .expect("the downgraded request reached the daemon");
+        assert_eq!(origin_session.as_deref(), Some("s-origin"));
+        assert_eq!(origin_daemon.as_deref(), Some("d-origin"));
+        let (_, range) = seen
+            .ranges
+            .iter()
+            .find(|(name, _)| name == method::SESSION_OUTPUT)
+            .expect("the downgraded request's range");
+        assert_eq!(
+            *range,
+            exact(previous()),
+            "the request is pinned to the negotiated version exactly"
+        );
+        drop(seen);
         assert_eq!(daemon.violations(), Vec::<String>::new());
     })
     .await;
@@ -616,6 +722,18 @@ async fn subscription_events_arrive_in_the_current_shape() {
                 event.event()
             );
         }
+        let correlated = subscription
+            .next_event()
+            .await
+            .expect("an event")
+            .expect("the stub appends its adapter-proof events");
+        assert_correlated_upgrade(&correlated, &recorded);
+        let unnamed = subscription
+            .next_event()
+            .await
+            .expect("an event")
+            .expect("the stub appends its adapter-proof events");
+        assert_unknown_name_passes_through(&unnamed);
         assert!(subscription
             .next_event()
             .await
@@ -643,6 +761,20 @@ async fn subscription_events_arrive_in_the_current_shape() {
                 event.event()
             );
         }
+        let line = lines
+            .next_line()
+            .await
+            .expect("a line")
+            .expect("the stub appends its adapter-proof events");
+        let event: Event = serde_json::from_str(&line).expect("a current-shape event line");
+        assert_correlated_upgrade(&event, &recorded);
+        let line = lines
+            .next_line()
+            .await
+            .expect("a line")
+            .expect("the stub appends its adapter-proof events");
+        let event: Event = serde_json::from_str(&line).expect("a current-shape event line");
+        assert_unknown_name_passes_through(&event);
         assert_eq!(daemon.violations(), Vec::<String>::new());
     })
     .await;
@@ -982,6 +1114,45 @@ async fn host_discovery_keeps_the_whole_window_after_the_connection_selected_a_v
             range_of(method::SESSION_LIST),
             exact(PROTOCOL_VERSION),
             "every other request is pinned to the selected version"
+        );
+        assert_eq!(seen.violations, Vec::<String>::new());
+    })
+    .await;
+}
+
+/// A cold client can send the range-forwarding member without learning the
+/// daemon's version first: the request means the same in every version of the
+/// window, so no `daemon.health` probe precedes it and the whole client window
+/// rides on the request for the daemon to classify peers by.
+#[tokio::test]
+async fn host_discover_is_sent_without_a_version_probe() {
+    guard("the forwarding member", async {
+        let daemon = PreviousDaemon::start().await;
+        let mut client = daemon.client().await;
+        let (name, params, expected) = recorded_exchanges()
+            .into_iter()
+            .find(|(name, ..)| name == method::HOST_DISCOVER)
+            .expect("a host.discover recording");
+        let value = client
+            .request(&request_for(&name, params))
+            .await
+            .expect("host.discover");
+        assert_eq!(value, expected);
+        assert_eq!(
+            daemon.methods(),
+            [method::HOST_DISCOVER],
+            "no version probe precedes a version-independent request"
+        );
+        let seen = daemon.seen.lock().expect("stub state");
+        let (_, range) = seen
+            .ranges
+            .iter()
+            .find(|(name, _)| name == method::HOST_DISCOVER)
+            .expect("the forwarded request's range");
+        assert_eq!(
+            *range,
+            protocol::CLIENT_PROTOCOL_VERSIONS,
+            "the request keeps the client's whole window"
         );
         assert_eq!(seen.violations, Vec::<String>::new());
     })
