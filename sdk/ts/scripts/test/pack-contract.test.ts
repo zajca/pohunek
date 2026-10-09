@@ -23,6 +23,7 @@ const execFileAsync = promisify(execFile);
 const TEST_VERSION = "0.0.0-test";
 const SOURCE_DATE_EPOCH = 1_700_000_000;
 const INSTALL_TIMEOUT_MS = 120_000;
+const PACK_TIMEOUT_MS = 30_000;
 const BUN_EXECUTABLE = process.execPath;
 const REPOSITORY_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
 const TSC_ENTRY = join(REPOSITORY_ROOT, "node_modules", "typescript", "bin", "tsc");
@@ -481,7 +482,7 @@ describe("SDK release pack contract", () => {
     for (const [index, item] of second.entries()) {
       expect(item.sha256).toBe(packed[index]!.sha256);
     }
-  });
+  }, PACK_TIMEOUT_MS);
 
   test("the release script refuses invalid inputs on its real command line", async () => {
     // The script runs exactly as the Release workflow runs it, with
