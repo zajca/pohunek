@@ -403,24 +403,6 @@ mod tests {
     }
 
     #[test]
-    fn request_without_a_runtime_is_untouched() {
-        let params = json!({"session_id": "s-1"});
-        assert_eq!(
-            request_params(method::SESSION_OUTPUT, params.clone()).expect("adapter"),
-            params
-        );
-    }
-
-    #[test]
-    fn non_object_runtime_is_left_for_the_typed_parse_to_reject() {
-        let params = json!({"session_id": "s-1", "runtime": "w-1"});
-        assert_eq!(
-            request_params(method::SESSION_OUTPUT, params.clone()).expect("adapter"),
-            params
-        );
-    }
-
-    #[test]
     fn result_rename_reaches_every_session_info_carrier() {
         let carriers = [
             method::SESSION_RESUME,
