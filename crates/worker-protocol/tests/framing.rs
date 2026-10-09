@@ -467,9 +467,9 @@ async fn control_reader_accepts_fragmented_crlf_lines_and_a_final_unterminated_l
         },
     };
 
-    // 1024 bytes hold the whole exchange without backpressure; the write-side
-    // chunk boundaries below still split the lines explicitly.
-    let (codec_side, counterpart_side) = tokio::io::duplex(1024);
+    // One byte of pipe capacity forces every read boundary, including the
+    // boundary between CR and LF, while the producer and reader run together.
+    let (codec_side, counterpart_side) = tokio::io::duplex(1);
     let expected_negotiated = negotiated.clone();
     let expected_advanced = advanced.clone();
     let counterpart = tokio::spawn(async move {
@@ -487,8 +487,7 @@ async fn control_reader_accepts_fragmented_crlf_lines_and_a_final_unterminated_l
                 .expect("serialize negotiated response");
         crlf_line.extend_from_slice(b"\r\n");
         let crlf_beginning = crlf_line.len() - 1;
-        // The CR lands in the first chunk and its LF opens the next one, so
-        // the reader must handle a CRLF pair split across read boundaries.
+        // The one-byte pipe delivers CR before LF on separate reads.
         raw.write_all(&crlf_line[..crlf_beginning])
             .await
             .expect("write response body with CR");
