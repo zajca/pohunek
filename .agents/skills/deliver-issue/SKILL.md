@@ -118,10 +118,12 @@ slice:
    evidence, never silently skipped.
 2. Commit per `pr-handoff`: explicit staging, `--no-gpg-sign`, concise
    imperative English message with the *why*, no trailers or footers.
-3. Push and open the PR stack per `pr-handoff` (evidence-built
+3. Push and open the PR stack sequentially per `pr-handoff` (evidence-built
    descriptions, `Refs #N` / final `Closes #N`) and label every PR
-   `ai:review`, the only trigger of the automated review. Comment the stack
-   links on the issue.
+   `ai:review`, the only trigger of the automated review. Keep higher slices
+   rebased and gate-checked locally, and push only the lowest slice currently
+   awaiting CI or review. Publish the next one after the prior head finishes;
+   record unpublished slices as pending on the issue.
 
 ## Phase 5 — the CI + review loop
 
@@ -153,10 +155,11 @@ head; checking only CI loses review rounds.
    `--force-with-lease` with the old head SHA — and record the retrigger on
    the issue. In a stack, keep the ancestry: rebase onto `main` only the
    bottom slice, rebase any other slice onto its rewritten parent, amend in
-   place, and restack every slice above the rewritten one with the
-   pr-handoff restack procedure (`git rebase --update-refs`, gates on each
-   rebased slice, push all with `--force-with-lease`) before restarting the
-   review watches. Repeat at most three times; after that record the blocker on
+   place, and restack every slice above the rewritten one locally with the
+   pr-handoff procedure (`git rebase --update-refs`, gates on each rebased
+   slice). Push the affected slice first, then publish higher slices one at a
+   time only after the lower current head finishes CI and review. Repeat at
+   most three times; after that record the blocker on
    the issue and keep waiting with long wakeups. Never merge without the
    review of the final head.
 3. **CI failure triage** — before changing anything:
@@ -189,10 +192,12 @@ head; checking only CI loses review rounds.
    changed (`cargo ta --print` names the affected crates; workspace-wide
    inputs such as `Cargo.toml`, `Cargo.lock`, `.config/nextest.toml`, or the
    CI workflow mean the full applicable gate set); checks with unchanged
-   inputs keep their evidence. Commit, push to the owning slice
-   branch (restack upper slices with `git rebase --update-refs` and
-   `--force-with-lease` per `pr-handoff`), then post one issue comment per
-   round: review id, each finding → fixed (`path:line`, test) / rejected
+   inputs keep their evidence. Before replacing a head whose PR run is still
+   active, identify and cancel that PR's obsolete run per `pr-handoff`, then
+   verify its final status. Commit and push to the owning slice branch;
+   restack upper slices locally with `git rebase --update-refs`, and publish
+   them bottom-up after the lower head's CI and review. Post one issue comment
+   per round: review id, each finding → fixed (`path:line`, test) / rejected
    (evidence) / follow-up (#issue), CI triage results, gate results, new
    head SHA. Go back to step 1 (re-check the `ai:review` label).
 
