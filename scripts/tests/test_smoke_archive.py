@@ -719,6 +719,29 @@ class SmokeArchivePreflightTest(_SmokeArchiveFixture, unittest.TestCase):
     def test_termination_kills_the_sudo_namespace_and_its_workload(self):
         self.assert_termination_kills_namespace("sudo")
 
+    @unittest.skipUnless(
+        shutil.which("sudo") and shutil.which("timeout") and sudo_available(),
+        "needs passwordless sudo and GNU timeout",
+    )
+    def test_sudo_supervisor_opens_fifo_after_writer_has_closed(self):
+        fifo = self.base / "early-cancel"
+        os.mkfifo(fifo)
+        # With no writer from the start, the old blocking `exec 3<` never
+        # reached its watchdog. Keep timeout inside sudo to reap that root
+        # process if the regression returns.
+        command = [
+            "/usr/bin/sudo", "-n", "/usr/bin/timeout", "--foreground",
+            "--signal=TERM", "--kill-after=2s", "5s", "/usr/bin/setsid",
+            "/bin/sh", str(SCRIPT), "__sudo_supervisor", str(os.getuid()),
+            str(os.getgid()), str(fifo), str(self.tmpdir), "/nonexistent",
+            "/nonexistent", str(self.consumer), "/usr/bin", "pi",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 124, "root FIFO reader blocked without a writer")
+        self.assertNotIn("sudo:", result.stderr, result.stderr)
+        self.assertNotIn("sudo supervisor has no private process group", result.stderr)
+        self.assert_cleaned_up()
+
     def test_sudo_strategy_does_not_run_shadow_tools_from_caller_path(self):
         shadow = self.base / "shadow"
         shadow.mkdir()

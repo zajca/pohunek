@@ -350,7 +350,14 @@ sudo_supervisor() {
     [ -p "$sudo_cancel" ] && [ ! -L "$sudo_cancel" ] || fail "sudo cancellation pipe is not a FIFO"
     /usr/bin/chmod 600 "$sudo_cancel"
     /usr/bin/chown 0:0 "$sudo_cancel"
-    exec 3< "$sudo_cancel"
+    # Linux permits opening a FIFO read/write without a peer. Hold that
+    # temporary writer while opening the read end, then drop it so a writer
+    # that exited before this point is observed as EOF by the watchdog.
+    exec 3<> "$sudo_cancel"
+    exec 4< "$sudo_cancel"
+    exec 3>&-
+    exec 3<&4
+    exec 4<&-
     # The writer is held only by the outer shell. A root-owned FIFO keeps the
     # unprivileged consumer from delaying EOF or requesting cancellation.
     /usr/bin/unshare --net --pid --fork --kill-child --mount-proc \
