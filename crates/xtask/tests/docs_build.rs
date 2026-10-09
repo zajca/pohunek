@@ -7,8 +7,9 @@ use xtask::{build_docs, build_site, validate_docs, BuildOptions, SiteOptions};
 fn validate_docs_reports_committed_bundle() {
     let report = validate_docs(repo_root().join("docs/knowledge")).expect("bundle validates");
 
-    assert!(report.files_checked > 0);
-    assert!(report.concept_count > 0);
+    assert_eq!(report.schema_version, knowledge::CONCEPT_SCHEMA_VERSION);
+    assert_eq!(report.files_checked, 34);
+    assert_eq!(report.concept_count, 32);
 }
 
 #[test]
