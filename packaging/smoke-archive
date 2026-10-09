@@ -241,16 +241,28 @@ stage_check() {
         case $kind in
             link)
                 [ -n "$target" ] && [ -L "$stage_dir/$path" ] \
-                    && [ "$(readlink -- "$stage_dir/$path")" = "$target" ] \
                     || fail "staged upstream link differs from STAGE.links: $stage_dir/$path"
-                # Smoke also requires the full target chain to resolve before
-                # launching an upstream, including any intermediate links.
-                resolved=$(readlink -f -- "$stage_dir/$path") \
-                    || fail "unresolvable link in staged upstream: $stage_dir/$path"
-                case $resolved in
-                    "$stage_real"/*) ;;
-                    *) fail "link leaves the staged upstream: $stage_dir/$path" ;;
-                esac
+                actual_target=$(readlink -n -- "$stage_dir/$path" && printf '.') \
+                    || fail "cannot read staged upstream link: $stage_dir/$path"
+                actual_target=${actual_target%.}
+                [ "$actual_target" = "$target" ] \
+                    || fail "staged upstream link differs from STAGE.links: $stage_dir/$path"
+                # A final realpath can re-enter the stage after an intermediate
+                # component escaped it. Check every resolved prefix instead.
+                link_prefix=$(dirname -- "$stage_dir/$path")
+                link_rest=$target
+                while :; do
+                    link_component=${link_rest%%/*}
+                    link_prefix=$link_prefix/$link_component
+                    resolved=$(readlink -e -- "$link_prefix") \
+                        || fail "unresolvable link in staged upstream: $stage_dir/$path"
+                    case $resolved in
+                        "$stage_real" | "$stage_real"/*) ;;
+                        *) fail "link leaves the staged upstream: $stage_dir/$path" ;;
+                    esac
+                    [ "$link_rest" != "$link_component" ] || break
+                    link_rest=${link_rest#*/}
+                done
                 ;;
             exec)
                 [ -z "$target" ] && [ -f "$stage_dir/$path" ] && [ ! -L "$stage_dir/$path" ] \

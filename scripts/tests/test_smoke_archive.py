@@ -285,6 +285,15 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("link differs from STAGE.links", result.stderr)
 
+    def test_a_link_target_with_an_appended_newline_differs_from_manifest(self):
+        stage = self.stage / "pi"
+        (stage / "bin" / "alias").symlink_to("pi\n")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\tbin/alias\tpi\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("link differs from STAGE.links", result.stderr)
+
     def test_an_absolute_link_target_inside_stage_is_refused(self):
         stage = self.stage / "pi"
         target = stage / "bin" / "pi"
@@ -311,6 +320,42 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
             manifest.write("link\tbin/alias\t../bin/pi\n")
         result = self.smoke("--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_link_chain_inside_stage_is_accepted(self):
+        stage = self.stage / "pi"
+        (stage / "alias").symlink_to(".")
+        (stage / "second").symlink_to("alias/bin/pi")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\talias\t.\nlink\tsecond\talias/bin/pi\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_link_chain_that_exits_and_reenters_stage_is_refused(self):
+        stage = self.stage / "pi"
+        external = self.stage / "external"
+        external.mkdir()
+        (external / "return").symlink_to(stage / "bin" / "pi")
+        (stage / "bin" / "alias").symlink_to(".")
+        (stage / "bin" / "escape").symlink_to("alias/../../external/return")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\tbin/alias\t.\nlink\tbin/escape\talias/../../external/return\n")
+        self.assertEqual((stage / "bin" / "escape").resolve(strict=True), stage / "bin" / "pi")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("link leaves the staged upstream", result.stderr)
+
+    @unittest.skipUnless(shutil.which("timeout"), "needs the timeout command as a hang guard")
+    def test_a_symlink_cycle_is_refused_without_hanging(self):
+        stage = self.stage / "pi"
+        (stage / "bin" / "a").symlink_to("b")
+        (stage / "bin" / "b").symlink_to("a")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\tbin/a\tb\nlink\tbin/b\ta\n")
+        result = self.smoke("--runtime", "pi", timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(result.returncode, (124, 137), "the symlink cycle reached the hang guard")
+        self.assertIn("unresolvable link in staged upstream", result.stderr)
+        self.assert_cleaned_up()
 
     def test_a_link_with_missing_intermediate_target_is_refused(self):
         stage = self.stage / "pi"
