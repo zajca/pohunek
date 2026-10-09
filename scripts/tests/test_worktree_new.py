@@ -731,6 +731,14 @@ class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
             sorted(p.name for p in self.worktrees.iterdir()), [])
         self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
 
+    def assert_refused_without_creation(self, result, *error_texts):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        for text in error_texts:
+            self.assertIn(text, result.stderr)
+        if self.worktrees.exists():
+            self.assertEqual(list(self.worktrees.iterdir()), [])
+        self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
+
     def test_missing_source_profile_fails(self):
         target = self.prepare_seedable_repo()
         shutil.rmtree(target / worktree_new.PROFILE)
@@ -757,6 +765,81 @@ class SeedSourceValidationCliTests(WorktreeCliFixture, unittest.TestCase):
 
         self.assert_refused_at_source_validation(
             result, "no seed source", "not a Cargo target dir", "--no-seed")
+
+    def test_non_default_target_directory_fails_before_creation(self):
+        self.prepare_seedable_repo()
+        self.env["CARGO_TARGET_DIR"] = str(self.root / "shared-target")
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "CARGO_TARGET_DIR", "--no-seed")
+
+    def test_missing_activity_directory_fails_before_copy(self):
+        target = self.prepare_seedable_repo()
+        shutil.rmtree(target / worktree_new.PROFILE / "deps")
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "no seed source", "--no-seed")
+
+    def test_symlinked_profile_directory_is_refused_without_touching_target(self):
+        target = self.prepare_seedable_repo()
+        profile = target / worktree_new.PROFILE
+        outside = self.root / "outside-profile"
+        profile.rename(outside)
+        profile.symlink_to(outside)
+        for name in worktree_new.CARGO_LOCK_FILES:
+            (outside / name).unlink()
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "is a symlink", str(profile))
+        for name in worktree_new.CARGO_LOCK_FILES:
+            self.assertFalse((outside / name).exists())
+
+    def test_symlinked_seed_subdirectory_is_refused(self):
+        target = self.prepare_seedable_repo()
+        deps = target / worktree_new.PROFILE / "deps"
+        outside = self.root / "outside-deps"
+        deps.rename(outside)
+        deps.symlink_to(outside)
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "is a symlink", str(deps))
+
+    def test_symlinked_cachedir_tag_is_refused(self):
+        target = self.prepare_seedable_repo()
+        tag = target / worktree_new.CACHEDIR_TAG
+        outside = self.root / "outside-tag"
+        tag.rename(outside)
+        tag.symlink_to(outside)
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "is a symlink", str(tag))
+
+    def test_nested_seed_file_symlink_is_refused(self):
+        target = self.prepare_seedable_repo()
+        output = target / worktree_new.PROFILE / "build" / "dep-1" / "out"
+        outside = self.root / "outside-file"
+        outside.write_text("fixture content")
+        link = output / "generated.rs"
+        link.symlink_to(outside)
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "is a symlink", str(link))
+        self.assertEqual(outside.read_text(), "fixture content")
+
+    def test_nested_seed_directory_symlink_is_refused(self):
+        target = self.prepare_seedable_repo()
+        link = target / worktree_new.PROFILE / ".fingerprint" / "dep-1" / "linked"
+        link.symlink_to(self.root)
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assert_refused_without_creation(result, "is a symlink", str(link))
 
     def prepare_stale_seed(self):
         target = self.prepare_seedable_repo()
@@ -904,14 +987,6 @@ class FailClosedTests(HarnessCase):
         self.assertEqual(len(copies), 1, "only the probe may run")
         self.assertEqual(list(self.h.worktrees.iterdir()), [])
 
-    def test_non_default_source_layout_fails(self):
-        self.h.executor.layouts[self.h.repo] = (
-            self.h.root / "shared-target", self.h.root / "shared-target")
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("CARGO_TARGET_DIR", err)
-        self.assert_no_worktree_created()
-
     def test_separate_build_dir_fails(self):
         self.h.executor.layouts[self.h.repo] = (
             self.h.repo / "target", self.h.root / "build-dir")
@@ -972,63 +1047,6 @@ class FailClosedTests(HarnessCase):
             [["git", "rev-parse", "--path-format=absolute",
               "--git-common-dir"]],
         )
-
-    def assert_symlink_refused(self, err):
-        self.assertIn("is a symlink", err)
-        self.assert_no_worktree_created()
-        self.assertFalse(self.h.executor.ran("cp"))
-        self.assertFalse(self.h.executor.ran("git", "branch"))
-
-    def test_symlinked_seed_subdir_fails_closed(self):
-        deps = self.h.target / "debug" / "deps"
-        outside = self.h.root / "outside-deps"
-        deps.rename(outside)
-        deps.symlink_to(outside)
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assert_symlink_refused(err)
-        self.assertIn(str(deps), err)
-
-    def test_symlinked_profile_dir_fails_closed(self):
-        debug = self.h.target / "debug"
-        outside = self.h.root / "outside-debug"
-        debug.rename(outside)
-        debug.symlink_to(outside)
-        for lock in worktree_new.CARGO_LOCK_FILES:
-            (outside / lock).unlink()
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assert_symlink_refused(err)
-        for lock in worktree_new.CARGO_LOCK_FILES:
-            self.assertFalse((outside / lock).exists(), lock)
-
-    def test_symlinked_cachedir_tag_fails_closed(self):
-        tag = self.h.target / "CACHEDIR.TAG"
-        outside = self.h.root / "outside-tag"
-        tag.rename(outside)
-        tag.symlink_to(outside)
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assert_symlink_refused(err)
-        self.assertIn(str(tag), err)
-
-    def test_nested_symlink_in_a_seed_subdir_fails_closed(self):
-        out = self.h.target / "debug" / "build" / "dep-1" / "out"
-        outside = self.h.root / "outside-file"
-        outside.write_text("main checkout data")
-        (out / "generated.rs").symlink_to(outside)
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assert_symlink_refused(err)
-        self.assertIn(str(out / "generated.rs"), err)
-
-    def test_nested_symlinked_dir_fails_closed(self):
-        fingerprint = self.h.target / "debug" / ".fingerprint" / "dep-1"
-        (fingerprint / "linked").symlink_to(self.h.root)
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assert_symlink_refused(err)
-        self.assertIn(str(fingerprint / "linked"), err)
 
     def test_file_at_a_predictable_probe_path_is_never_touched(self):
         self.h.worktrees.mkdir()
@@ -1498,14 +1516,6 @@ class StaleSeedTests(HarnessCase):
             except (OSError, OverflowError) as error:
                 self.skipTest(f"platform rejects the mtime: {error}")
         self.assert_seeded(*self.h.run("issue-1"))
-
-    def test_missing_activity_dir_keeps_the_seed_path(self):
-        self.make_stale()
-        shutil.rmtree(self.h.target / "debug/deps")
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("no seed source", err)
-        self.assert_no_worktree_created()
 
     def test_force_seed_seeds_a_stale_seed(self):
         self.make_stale()
