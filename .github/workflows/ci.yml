@@ -528,7 +528,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [unit, daemon, relay, cli]
+        shard: [core, daemon, relay, cli]
     defaults:
       run:
         working-directory: relocated
@@ -548,7 +548,7 @@ jobs:
           path: ${{ runner.temp }}/nextest-archive
 
       - name: Check script regressions
-        if: matrix.shard == 'unit'
+        if: matrix.shard == 'core'
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
       # No dependency on Clippy, PostgreSQL, PTYs, or the release build.

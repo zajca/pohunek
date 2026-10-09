@@ -158,7 +158,7 @@ jobs:
         run: cargo xtask ts check
 
   # The SDK gate owns everything that decides whether the SDK tarballs may be
-  # published: workspace typecheck/lint/unit tests, the pack contract, and the
+  # published: workspace typecheck/lint/integration tests, the pack contract, and the
   # SDK and Hermes plugin suites against freshly built real binaries.
   sdk-gate:
     name: SDK typecheck + lint + test + pack contract + e2e

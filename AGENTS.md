@@ -468,7 +468,7 @@ cargo ta --print                              # per-file reasons and the command
 cargo t -p pohunek-daemon                     # fast tests in one crate (alias takes -p)
 cargo nextest run --profile local -p pohunek-cli some_test_name  # one test
 cargo clippy -p pohunek-daemon --all-targets  # lint one crate
-python3 scripts/test-partitions run cli       # exact CI shard: unit/daemon/relay/cli/relay-db/heavy
+python3 scripts/test-partitions run cli       # exact CI shard: core/daemon/relay/cli/relay-db/heavy
 python3 scripts/test-partitions check         # exhaustive, disjoint nextest inventory check
 python3 scripts/test-partitions --archive-file nextest-archive.tar.zst run heavy  # CI mode: no compile
 ```
@@ -599,7 +599,7 @@ scripts/ci-timings compare --baseline 2026-09-14..2026-09-16 \
 scripts/ci-timings compare --input target/ci-timings/ci-runs.json \
     --baseline 2026-09-14..2026-09-16 --current 2026-09-20..2026-09-21 \
     --event pull_request --conclusion success      # same tables, no network
-scripts/ci-timings junit --label "tests (unit, fast)" --run RUN_ID junit-unit.xml
+scripts/ci-timings junit --label "tests (core, fast)" --run RUN_ID junit-core.xml
                                   # or: --job-seconds N to supply the job wall
                                   # by hand; --job NAME picks the paired CI job
 scripts/ci-timings cache --run RUN_ID             # rust-cache restores per job, plus sccache

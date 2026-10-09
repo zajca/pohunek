@@ -29,7 +29,7 @@ CLI = "package(=pohunek-cli)"
 # Relay heavy tests are the only consumers of the PostgreSQL fixture, so they
 # form their own shard: CI runs them in a job whose Postgres service is gated
 # by a paths filter on the relay crates.
-SHARDS = ("unit", "daemon", "relay", "cli", "relay-db", "heavy")
+SHARDS = ("core", "daemon", "relay", "cli", "relay-db", "heavy")
 # Executable name of the session worker a real daemon starts.
 WORKER_EXECUTABLE = "pohunek-sessiond"
 # Argument that carries the worker's control socket path.
@@ -64,7 +64,7 @@ def filters():
     with (ROOT / ".config/nextest.toml").open("rb") as config:
         fast = tomllib.load(config)["profile"]["fast"]["default-filter"]
     owners = {"daemon": DAEMON, "relay": RELAY, "cli": CLI}
-    owners["unit"] = f"not (({DAEMON}) or ({RELAY}) or ({CLI}))"
+    owners["core"] = f"not (({DAEMON}) or ({RELAY}) or ({CLI}))"
     return {
         **{name: f"({fast}) and ({owner})" for name, owner in owners.items()},
         "relay-db": f"(not ({fast})) and ({RELAY})",
