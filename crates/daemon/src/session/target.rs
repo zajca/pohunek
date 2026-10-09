@@ -128,6 +128,8 @@ pub(super) enum PtyRegistration {
         previous_worker_id: Option<String>,
         /// Runtime generation being replaced, when known.
         previous_worker_instance_id: Option<String>,
+        /// Whether the lost runtime's marker cleanup still needs proof.
+        previous_cleanup_unconfirmed: bool,
         /// Worker job being replaced, when the record names one.
         previous_job: Option<Generation>,
         /// Monotonic generation being replaced.
@@ -666,6 +668,7 @@ impl SessionRegistry {
                     transaction_id,
                     previous_worker_id,
                     previous_worker_instance_id,
+                    previous_cleanup_unconfirmed,
                     previous_job,
                     runtime_watch_cancel,
                     ..
@@ -683,6 +686,16 @@ impl SessionRegistry {
                         })
                         .await
                         .map_err(|previous| LaunchFailure::Cleaned(previous.into_error()))?;
+                    if *previous_cleanup_unconfirmed {
+                        self.confirm_recovery_cleanup(
+                            &id,
+                            previous_job.as_ref(),
+                            previous_worker_id.as_deref(),
+                            previous_worker_instance_id.as_deref(),
+                        )
+                        .await
+                        .map_err(LaunchFailure::Cleaned)?;
+                    }
                     (
                         transaction_id.clone(),
                         TransactionKind::Recover,
@@ -1258,6 +1271,7 @@ mod tests {
             transaction_id: "recover-overflow".to_owned(),
             previous_worker_id: None,
             previous_worker_instance_id: None,
+            previous_cleanup_unconfirmed: false,
             previous_runtime_generation: protocol::RuntimeGeneration::new(u64::MAX),
             previous_job: None,
             created_at: "2026-08-04T00:00:00Z".to_owned(),

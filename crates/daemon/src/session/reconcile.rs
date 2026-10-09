@@ -2222,6 +2222,68 @@ impl SessionRegistry {
             .map_err(crate::runtime::lifecycle::PreviousLive::into_error)
     }
 
+    /// Confirms cleanup of the exact journaled runtime before native recovery.
+    ///
+    /// The record's runtime id is not a signal permit by itself: only a
+    /// matching journal of its generation proves which markers may be swept.
+    ///
+    /// # Errors
+    ///
+    /// Returns `runtime_supervision_ambiguous` when journal evidence is missing
+    /// or inconsistent, or when the marker sweep cannot confirm cleanup.
+    pub(super) async fn confirm_recovery_cleanup(
+        &self,
+        id: &SessionId,
+        generation: Option<&super::Generation>,
+        worker_id: Option<&str>,
+        worker_instance_id: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        let refusal = |detail: String| {
+            ProtocolError::new(
+                protocol::ErrorClass::Runtime,
+                SUPERVISION_AMBIGUOUS,
+                format!("session {} cannot be recovered: {detail}", id.0),
+                Some("inspect and end the previous runtime's marked processes, then retry session.resume".to_owned()),
+            )
+        };
+        let (Some(generation), Some(worker_id), Some(worker_instance_id)) =
+            (generation, worker_id, worker_instance_id)
+        else {
+            return Err(refusal(
+                "the previous runtime has no complete journal identity".to_owned(),
+            ));
+        };
+        let scan = self
+            .discover_worker_journals()
+            .await
+            .map_err(refusal)?
+            .remove(&id.0)
+            .unwrap_or_default();
+        let journal = scan
+            .journal_of_generation(generation.generation())
+            .map_err(refusal)?
+            .filter(|journal| {
+                journal.worker_id == worker_id
+                    && journal.worker().worker_instance_id == Some(worker_instance_id)
+            })
+            .ok_or_else(|| {
+                refusal(
+                    "the recorded worker and runtime do not match a journal of their generation"
+                        .to_owned(),
+                )
+            })?;
+        let worker_start = journal.worker().identity().map_err(refusal)?.start_identity;
+        let outcome = self
+            .sweep_lost_runtime_detailed(&id.0, worker_instance_id, Some(worker_start))
+            .await;
+        if outcome.cleanup == Cleanup::Unconfirmed {
+            return Err(refusal(
+                "marked process cleanup is still unconfirmed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Proves that no marked process of a runtime the removal of `id`
     /// forgets is left.
     ///

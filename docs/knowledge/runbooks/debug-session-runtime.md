@@ -100,7 +100,11 @@ Interpret runtime states as follows:
   journal still said live, and the ownership-marker sweep removed that
   generation's leftover processes. `runtime_lost_cleanup_unconfirmed` means the
   same, but the sweep could not confirm that every marked process ended;
-  inspect `ps` for processes of that session before recovering it. A lost
+  `session.resume` retries the marker sweep against the exact journaled runtime;
+  it refuses with `runtime_supervision_ambiguous` and a recovery hint until
+  cleanup is confirmed. Inspect and end any remaining marked processes, then
+  retry. If the recorded runtime cannot be matched to its journal, recovery
+  remains refused. A lost
   session without a journal for its generation reports `worker_unavailable`;
   its job is retired, but no process is swept, so check `ps` for leftovers.
   A session is reported `lost` only after the service manager retired its job;

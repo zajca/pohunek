@@ -11875,14 +11875,18 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     let store_path = temp_store_path("manual-resume");
     let marker = temp_dir("manual-resume-marker").join("argv.txt");
     let (agents_dir, mut exit_gate) = temp_agent_that_exits_then_resumes("manual-resume", &marker);
-    let registry = SessionRegistry::new(SessionRegistryConfig {
-        shell_command: hermetic_shell(),
-        stop_grace: Duration::from_millis(50),
-        store_path: Some(store_path),
-        agents_dir: Some(agents_dir),
-        socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
-        ..SessionRegistryConfig::default()
-    });
+    let inspector = Arc::new(UnreadableCandidateHost::default());
+    let registry = SessionRegistry::new_with_inspector(
+        SessionRegistryConfig {
+            shell_command: hermetic_shell(),
+            stop_grace: Duration::from_millis(50),
+            store_path: Some(store_path),
+            agents_dir: Some(agents_dir),
+            socket_path: Some(PathBuf::from("/run/pohunek/d.sock")),
+            ..SessionRegistryConfig::default()
+        },
+        Arc::clone(&inspector) as Arc<dyn ProcessInspector>,
+    );
 
     let created = registry
         .create(resumable_params())
@@ -11907,16 +11911,22 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         .expect("session exits");
     assert_eq!(done.state, SessionState::Done);
     let original_created_at = done.created_at.clone();
+    let original_runtime = done.runtime.as_ref().expect("terminal runtime");
+    let previous_worker_id = original_runtime.worker_id.clone().expect("worker id");
+    let previous_worker_instance_id = original_runtime
+        .worker_instance_id
+        .clone()
+        .expect("runtime id");
     let mut sessions = registry.inner.sessions.lock().await;
     let entry = sessions.get_mut(&created.id).expect("terminal entry");
     entry.info.runtime = Some(SessionRuntime {
         state: RuntimeState::Lost,
-        runtime_generation: protocol::RuntimeGeneration::new(1),
-        worker_id: Some("worker-before-recovery".to_owned()),
-        worker_instance_id: Some("runtime-before-recovery".to_owned()),
+        runtime_generation: original_runtime.runtime_generation,
+        worker_id: Some(previous_worker_id),
+        worker_instance_id: Some(previous_worker_instance_id.clone()),
         started_at: Some(original_created_at.clone()),
         last_connected_at: None,
-        loss_reason: Some("test_runtime_lost".to_owned()),
+        loss_reason: Some(super::supervision::RUNTIME_LOST_CLEANUP_UNCONFIRMED.to_owned()),
     });
     entry.runtime = super::RuntimeHandle::Unavailable(RuntimeState::Lost);
     let lost_job = entry.job.clone().expect("created session records its job");
@@ -11930,6 +11940,70 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
         .await
         .expect("retire the lost generation");
     let mut events = registry.subscribe();
+    let launches_before_refusal = fs::read_to_string(&marker).expect("initial agent argv");
+
+    inspector.set_listing_fails(true);
+    let refused = registry
+        .resume(&created.id)
+        .await
+        .expect_err("an unconfirmed sweep cannot start a new generation");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert!(refused.recover.is_some(), "{refused:?}");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("agent argv after refusal"),
+        launches_before_refusal,
+        "no recovered agent was launched"
+    );
+    assert_eq!(
+        registry
+            .inspect(&created.id)
+            .await
+            .expect("the refused session remains")
+            .runtime
+            .expect("lost runtime remains")
+            .runtime_generation,
+        original_runtime.runtime_generation,
+    );
+    inspector.set_listing_fails(false);
+
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("lost session")
+        .info
+        .runtime
+        .as_mut()
+        .expect("lost runtime")
+        .worker_instance_id = Some("unproven-runtime".to_owned());
+    drop(sessions);
+    let refused = registry
+        .resume(&created.id)
+        .await
+        .expect_err("a record-only runtime id is no sweep permit");
+    assert_eq!(
+        refused.code,
+        crate::runtime::lifecycle::SUPERVISION_AMBIGUOUS,
+        "{refused:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).expect("agent argv after identity refusal"),
+        launches_before_refusal,
+        "no recovered agent was launched"
+    );
+    let mut sessions = registry.inner.sessions.lock().await;
+    sessions
+        .get_mut(&created.id)
+        .expect("lost session")
+        .info
+        .runtime
+        .as_mut()
+        .expect("lost runtime")
+        .worker_instance_id = Some(previous_worker_instance_id.clone());
+    drop(sessions);
 
     let resumed = registry
         .resume(&created.id)
@@ -11968,14 +12042,14 @@ async fn explicit_native_recovery_from_lost_preserves_identity_emits_event_and_i
     assert_eq!(recovered_event.session.id, created.id);
     assert_eq!(
         recovered_event.previous_worker_instance_id.as_deref(),
-        Some("runtime-before-recovery")
+        Some(previous_worker_instance_id.as_str())
     );
     // The durable-worker backend always mints a fresh runtime generation on
     // `initialize`, including for explicit native recovery, so the recovered
     // event must carry a *new* id distinct from the replaced generation.
     assert_ne!(
         recovered_event.worker_instance_id.as_deref(),
-        Some("runtime-before-recovery"),
+        Some(previous_worker_instance_id.as_str()),
         "native recovery must mint a new worker runtime, not reuse the previous one"
     );
     assert!(
