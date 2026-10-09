@@ -18,14 +18,14 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pohunek_daemon::runtime::Worker;
+use pohunek_daemon::runtime::{Worker, WorkerError};
 use pohunek_test_support::env::TestEnv;
 use pohunek_test_support::wait::wait_until;
 use pohunek_test_support::worker_binary;
 use pohunek_worker_protocol::{
-    is_denylisted, BaseEnv, DaemonId, Dimensions, Initialize, InitializeLimits, LaunchIdentity,
-    RuntimePhase, SecretEnv, SessionId, StopPolicy, TransactionId, Version,
-    BASE_ENVIRONMENT_VERSION, PREVIOUS_VERSION,
+    is_denylisted, BaseEnv, ControlCode, DaemonId, Dimensions, Initialize, InitializeLimits,
+    LaunchIdentity, RuntimePhase, SecretEnv, SessionId, StopPolicy, TransactionId, Version,
+    CURRENT_VERSION, PREVIOUS_VERSION,
 };
 
 /// Bounds waiting for the worker socket and the child's exit.
@@ -131,12 +131,16 @@ impl Fixture {
         }
     }
 
-    async fn connect(&mut self, maximum_version: Version) -> Worker {
+    fn wait_ready(&self) {
         // The worker reads NOTIFY_SOCKET from its own environment, proving
         // the service-manager variables really were present in the worker.
         let mut ready = [0_u8; 256];
         let length = self.notify.recv(&mut ready).expect("worker readiness");
         assert!(ready[..length].starts_with(b"READY=1"));
+    }
+
+    async fn connect(&mut self, maximum_version: Version) -> Worker {
+        self.wait_ready();
 
         let socket = self
             .root
@@ -263,9 +267,10 @@ async fn child_environment(worker: &Worker, initialize: Initialize) -> BTreeMap<
 }
 
 #[tokio::test]
-async fn version_six_child_gets_only_base_term_profile_and_identity() {
+async fn current_worker_child_gets_only_base_term_profile_and_identity() {
     let mut fixture = Fixture::start();
-    let worker = fixture.connect(BASE_ENVIRONMENT_VERSION).await;
+    let worker = fixture.connect(CURRENT_VERSION).await;
+    assert_eq!(worker.selected_version().await, CURRENT_VERSION);
     let worker_id = worker.worker_id().await;
     assert!(pohunek_paths::valid_worker_id(worker_id.as_str()).is_some());
     let initialize = fixture.initialize(worker_id.clone());
@@ -310,6 +315,7 @@ async fn version_six_child_gets_only_base_term_profile_and_identity() {
 async fn version_five_child_inherits_the_worker_without_service_manager_variables() {
     let mut fixture = Fixture::start();
     let worker = fixture.connect(PREVIOUS_VERSION).await;
+    assert_eq!(worker.selected_version().await, PREVIOUS_VERSION);
     let initialize = fixture.initialize(worker.worker_id().await);
 
     let environment = child_environment(&worker, initialize).await;
@@ -341,4 +347,50 @@ async fn version_five_child_inherits_the_worker_without_service_manager_variable
         assert!(!is_denylisted(name), "{name} leaked to the child");
     }
     assert!(!environment.contains_key("NOTIFY_SOCKET"));
+}
+
+#[tokio::test]
+async fn worker_socket_rejects_a_disjoint_protocol_range() {
+    let mut fixture = Fixture::start();
+    fixture.wait_ready();
+    let socket = fixture.socket_path();
+    let session_id = fixture.session_id.clone();
+    let next_version = Version::new(CURRENT_VERSION.get() + 1).expect("next version is nonzero");
+    let child = std::cell::RefCell::new(&mut fixture.worker);
+    let error = wait_until("the worker to reject a disjoint protocol range", || async {
+        match Worker::connect_with_range(
+            &socket,
+            &session_id,
+            DAEMON_ID,
+            next_version,
+            next_version,
+        )
+        .await
+        {
+            Err(WorkerError::Socket { .. }) => {
+                assert!(
+                    child
+                        .borrow_mut()
+                        .try_wait()
+                        .expect("inspect worker")
+                        .is_none(),
+                    "worker exited before accepting a controller"
+                );
+                None
+            }
+            Err(error) => Some(error),
+            Ok(_) => panic!("a worker accepted a version newer than its supported range"),
+        }
+    })
+    .await;
+    assert!(
+        matches!(
+            error,
+            WorkerError::Rejected {
+                code: ControlCode::WorkerProtocolIncompatible,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
 }
