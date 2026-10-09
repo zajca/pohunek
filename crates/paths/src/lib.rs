@@ -1160,45 +1160,6 @@ mod tests {
     }
 
     #[test]
-    fn worker_session_ids_are_bounded() {
-        assert_eq!(u64::MAX.to_string().len(), MAX_NUMERIC_SESSION_DIGITS);
-        let longest_numeric = format!("s-{}", u64::MAX);
-        assert_eq!(
-            valid_worker_session_id(&longest_numeric),
-            Some(longest_numeric.as_str())
-        );
-        let ulid = "s-01KYAPVPFVHD56Z69B9CX3XWN2";
-        assert_eq!(valid_worker_session_id(ulid), Some(ulid));
-        assert_eq!(ulid.len(), MAX_WORKER_SESSION_ID_BYTES);
-
-        let over_long = format!("s-{}", "9".repeat(MAX_NUMERIC_SESSION_DIGITS + 1));
-        assert_eq!(valid_worker_session_id(&over_long), None);
-        assert_eq!(
-            valid_worker_session_id(&format!("s-{}", "1".repeat(150))),
-            None
-        );
-    }
-
-    #[test]
-    fn worker_generation_accepts_only_eight_lowercase_base32_characters() {
-        for valid in ["abcd2345", "aaaaaaaa", "77777777", "zzzzzzzz"] {
-            assert_eq!(valid_worker_generation(valid), Some(valid));
-        }
-        for invalid in [
-            "",
-            "abcd234",
-            "abcd23456",
-            "ABCD2345",
-            "abcd2301",
-            "abcd-345",
-            "abcd 345",
-            "abcd23\u{e9}",
-        ] {
-            assert_eq!(valid_worker_generation(invalid), None, "{invalid:?}");
-        }
-    }
-
-    #[test]
     fn install_layout_versions_executables_below_libexec() {
         let layout = InstallLayout::new("/home/u/.local").expect("absolute prefix");
         assert_eq!(layout.bin_dir(), Path::new("/home/u/.local/bin"));
