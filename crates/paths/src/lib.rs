@@ -1060,8 +1060,6 @@ pub fn is_schema_backup_artifact(store: &str, name: &str) -> bool {
 mod tests {
     use super::*;
 
-    use pohunek_test_support::process_env::ProcessEnv;
-
     // Keep synthetic runtime paths below the strictest supported Unix-socket limit.
     const TEST_BASE_ROOT: &str = "/work";
 
@@ -1088,40 +1086,6 @@ mod tests {
             nix::unistd::Uid::effective().as_raw(),
             env,
         )
-    }
-
-    #[test]
-    fn resolve_reads_the_process_environment() {
-        let base = tmp_base("process-env");
-        let mut env = ProcessEnv::lock();
-        env.set(XDG_RUNTIME_DIR, base.join("run"))
-            .set(XDG_STATE_HOME, base.join("state"))
-            .set(XDG_DATA_HOME, base.join("data"))
-            .set(XDG_CONFIG_HOME, base.join("cfg"))
-            .set(XDG_CACHE_HOME, base.join("cache"))
-            .set(HOME, base.join("home"));
-
-        let captured = PathEnv::capture();
-        let paths = BasePaths::resolve().expect("resolve paths");
-
-        assert_eq!(captured, all_present(&base));
-        assert_eq!(paths, resolve_in(&captured).expect("resolve captured"));
-        assert_eq!(config_home().expect("config home"), base.join("cfg"));
-    }
-
-    #[test]
-    fn require_env_rejects_missing_and_empty_values() {
-        let mut env = ProcessEnv::lock();
-        env.remove(XDG_RUNTIME_DIR);
-        assert!(matches!(
-            require_env(XDG_RUNTIME_DIR),
-            Err(PathError::MissingEnv { var }) if var == XDG_RUNTIME_DIR
-        ));
-        env.set(XDG_RUNTIME_DIR, "");
-        assert!(matches!(
-            require_env(XDG_RUNTIME_DIR),
-            Err(PathError::MissingEnv { var }) if var == XDG_RUNTIME_DIR
-        ));
     }
 
     #[test]

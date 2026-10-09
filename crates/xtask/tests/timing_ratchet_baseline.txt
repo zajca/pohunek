@@ -28,7 +28,6 @@ crates/daemon/tests/remote_tcp.rs 2
 crates/daemon/tests/state_authority.rs 1
 crates/daemon/tests/supervised/mod.rs 3
 crates/daemon/tests/systemd_durable_worker.rs 6
-crates/netbird/src/status.rs 1
 crates/platform/src/process/darwin.rs 3
 crates/platform/src/process/linux.rs 1
 crates/platform/src/process/sweep/tests.rs 1

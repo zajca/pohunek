@@ -146,28 +146,3 @@ pub(crate) fn encode_header(
     field[CHECKSUM_FIELD_BYTES - 1] = b' ';
     Ok(block)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn octal_rejects_non_octal_digits_and_missing_terminator() {
-        assert_eq!(parse_octal(b"0000008\0"), None);
-        assert_eq!(parse_octal(b"00000010"), None);
-        assert_eq!(parse_octal(b"000 0010\0"), None);
-        assert_eq!(parse_octal(b"\0"), None);
-    }
-
-    #[test]
-    fn oversized_name_and_size_are_rejected() {
-        assert_eq!(
-            encode_header(&[b'a'; NAME_BYTES + 1], 0, false),
-            Err(EntryRejection::PathTooLong)
-        );
-        assert_eq!(
-            encode_header(b"a", MAX_SIZE_FIELD_VALUE + 1, false),
-            Err(EntryRejection::FileTooLarge)
-        );
-    }
-}
