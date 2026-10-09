@@ -2,6 +2,10 @@
 
 ## Unreleased (2026-10-08, digest-bound release evidence, #150)
 
+- `packaging/smoke-archive` runs a finished daemon archive in a network- and
+  PID-isolated namespace: it verifies the staged upstreams, installs every
+  shipped package from the archive's own signed catalog and anchor, and runs
+  the real-runtime consumer suite against the archive's binaries.
 - `cargo xtask compat stage-upstream|verify-stage` install and verify the pinned
   upstream runtime releases from `compat/<rt>/npm` lockfiles with an integrity
   per package; the locks gain `integrity`, `scripts` and `version_output`. The

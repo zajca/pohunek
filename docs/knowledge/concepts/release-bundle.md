@@ -106,3 +106,15 @@ the top-level files.
 The bundle is built in a hidden sibling directory of `--output` and renamed
 into place at the end. `--output` must not exist (an empty directory is
 accepted). On any refusal nothing is left behind.
+
+## Archive smoke
+
+`packaging/smoke-archive` takes a final daemon archive from the bundle, the
+staged upstreams (`<stage>/<runtime>/` with `STAGE.sha256`) and the prebuilt
+release consumer executable, and runs the consumer once per shipped package in
+a network- and PID-isolated namespace (`unshare` through a user namespace, or
+`sudo -n unshare` with a `setpriv` drop; no un-isolated fallback). The runtimes
+are the `runtime/packages/*.tar.zst` the archive carries; a shipped package
+without a staged upstream fails. Each consumer report must name the catalog
+entry's package digest and the SHA-256 of the archive's own binaries. The
+procedure and its limits are in `docs/development.md` ("Archive smoke").
