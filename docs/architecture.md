@@ -713,8 +713,12 @@ edited before or after the schema migration is still refused with
 
 A store written by a newer daemon, or older than every kept step, is refused
 with a typed `StoreSchemaError`; the daemon exits at startup and the store is
-not touched. There is no downgrade path: install the newer release again, or
-restore the `.pre-schema-<old>` backup taken by the migration.
+not touched. An interrupted service upgrade never automatically downgrades over a store
+the previous daemon cannot read. Its rollback first judges that reader, then
+stops the new daemon and judges the store again before starting the previous
+version. A refused rollback keeps the transaction; restore the
+`.pre-schema-<old>` backup taken by the migration or keep the newer release
+installed. There is no automatic reverse schema migration.
 
 The guard test `crates/daemon/src/store/shape_guard.rs` fails when the
 serialized field set of a record kind differs from

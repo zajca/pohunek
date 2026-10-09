@@ -124,6 +124,12 @@ pub const PREFLIGHT_OUTPUT: usize = 4 * 1024 * 1024;
 /// Enough for the daemon's one-line failure while keeping errors bounded.
 pub const PREFLIGHT_DIAGNOSTICS: usize = 4 * 1024;
 
+/// Maximum metadata store size examined before restoring a legacy daemon.
+///
+/// Matches the daemon's durable store read limit; a larger store cannot be
+/// proven readable by the previous release and must not be downgraded.
+pub const ROLLBACK_STORE_BYTES: usize = 16 * 1024 * 1024;
+
 /// Deadline for `systemd-analyze verify` on the rendered units.
 ///
 /// Verification loads the unit and its dependencies from disk; thirty seconds

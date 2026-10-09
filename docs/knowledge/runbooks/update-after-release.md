@@ -508,12 +508,21 @@ transaction, so rerunning with `--accept-runtime-loss` (or after the sessions
 end) resumes it. A rerun for the already active
 version skip it, as does a resume after the replacement.
 
-Cancelling or rolling back an interrupted upgrade restores the previous daemon
-and is not gated by the adoption preflight: only a command that replaces the
-daemon with the new version is. The previous release must be able to read the
-store the new daemon wrote (a store the new daemon migrated has a
-`<store>.pre-schema-<n>` backup beside it); a downgrade over a migrated store
-is not supported. Worker journals that cannot be read are never treated as
+Cancelling an interrupted upgrade before the daemon registration step leaves
+the previous daemon in place. At or after registration, rollback judges the
+previous daemon against the current store and live workers before changing the
+service. A previous daemon with `upgrade-preflight` judges its own reader and
+adoption; v0.33.0 and v0.33.1 have no such command, so only their schema-1
+store is admitted, and live worker recovery needs `--accept-runtime-loss`. A
+newer, corrupt, or unreadable store refuses rollback even with that flag. The
+installer stops the new daemon and judges again before starting the old one,
+so a write during the first check cannot become an unsafe downgrade. If that
+second check refuses, the daemon remains stopped and the transaction remains
+for recovery. `service check` applies the same read-only judgment; successful
+`--json` reports include the rollback preflight and
+`accepted_runtime_loss` in `rolled_back`. Restore the schema backup after
+stopping the daemon, or keep the newer release installed, to recover from an
+unreadable store. Worker journals that cannot be read are never treated as
 "no live workers": a journal root that cannot be scanned yields an
 `evidence_unavailable` entry, and while a store line that names no session
 cannot be read, an unreadable or unsupported journal of an unknown session is

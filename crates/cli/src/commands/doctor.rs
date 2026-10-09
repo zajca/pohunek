@@ -468,6 +468,8 @@ mod tests {
             operation: "upgrade",
             version: "1.0.0".to_owned(),
             step: "bootstrap",
+            preflight: None,
+            accepted_runtime_loss: false,
         });
         assert_eq!(
             launchd_job_check(Ok(pending), false, Supervision::Native).status,
@@ -534,6 +536,8 @@ mod tests {
             operation: "upgrade",
             version: "1.0.0".to_owned(),
             step: "bootstrap",
+            preflight: None,
+            accepted_runtime_loss: false,
         };
         let mut failed = status(true, Some(job("failed")));
         failed.pending_transaction = Some(pending());

@@ -15,7 +15,9 @@ use package::ANCHOR_FILE_NAME;
 use pohunek_client::ClientError;
 use pohunek_daemon::catalog_anchor::{load_from_directory, CatalogTrust};
 use pohunek_daemon::session::upgrade_preflight::PreflightInputs;
-use pohunek_daemon::store::{DesiredState, RuntimeRecord, SessionRecord, Store as DaemonStore};
+use pohunek_daemon::store::{
+    DesiredState, ProjectRecord, RuntimeRecord, SessionRecord, Store as DaemonStore,
+};
 use pohunek_paths::BasePaths;
 use pohunek_platform::process::{
     Error as ProcessError, ExitWatch, OwnershipMarkers, ProcessFact, ProcessIdentity, StartIdentity,
@@ -25,8 +27,8 @@ use pohunek_service_config::preflight::{StoreState, Verdict};
 use pohunek_session_worker::RuntimePhase;
 use pohunek_test_support::wait::wait_until;
 use protocol::{
-    DaemonHealthResult, RuntimeGeneration, RuntimeRef, RuntimeState, SessionCapabilities,
-    SessionId, SessionRuntime, SessionState, StateSource,
+    DaemonHealthResult, ProjectSource, RuntimeGeneration, RuntimeRef, RuntimeState,
+    SessionCapabilities, SessionId, SessionRuntime, SessionState, StateSource,
 };
 
 use super::*;
@@ -215,6 +217,12 @@ struct World {
     silent_version: Option<String>,
     /// Version whose daemon definition `replace` refuses without effect.
     refused_replace: Option<String>,
+    /// Version whose daemon installation is refused during rollback.
+    refused_install: Option<String>,
+    /// A daemon store write made when the replacement starts.
+    store_on_replace: Option<PathBuf>,
+    /// A final store write made while the replacement stops.
+    store_on_uninstall: Option<PathBuf>,
     installs: usize,
     /// Daemon definition replacements, each of which restarts the daemon.
     replaces: usize,
@@ -266,6 +274,12 @@ impl DaemonSupervisor for Fake {
         Box::pin(async move {
             let mut world = self.world();
             world.installs += 1;
+            if world.refused_install.as_deref() == Some(&*version_of(definition.executable())) {
+                return Err(supervisor::Error::Operation {
+                    operation: "install",
+                    source: "injected restore failure".into(),
+                });
+            }
             if world.registration == Registration::Fails {
                 return Err(supervisor::Error::Operation {
                     operation: "install",
@@ -302,6 +316,9 @@ impl DaemonSupervisor for Fake {
             }
             world.registered = Some(definition.clone());
             world.running = true;
+            if let Some(path) = world.store_on_replace.take() {
+                write_new_store(&path);
+            }
             Ok(())
         })
     }
@@ -334,6 +351,9 @@ impl DaemonSupervisor for Fake {
             let mut world = self.world();
             world.registered = None;
             world.running = false;
+            if let Some(path) = world.store_on_uninstall.take() {
+                write_new_store(&path);
+            }
             Ok(())
         })
     }
@@ -1988,13 +2008,12 @@ async fn an_upgrade_is_not_ready_while_another_process_serves_the_socket() {
     harness.assert_installed(V2);
 }
 
-/// Fails an upgrade to `V2` at readiness and its rollback at the daemon
-/// restore, after the rollback already rewrote `service.toml` to `V1`.
+/// Fails an upgrade at readiness and the stopped daemon's restoration.
 async fn fail_upgrade_and_its_rollback(harness: &Harness) {
     {
         let mut world = harness.fake.world();
         world.silent_version = Some(V2.to_owned());
-        world.refused_replace = Some(V1.to_owned());
+        world.refused_install = Some(V1.to_owned());
     };
     let error = harness.upgrade(V2).await.expect_err("not ready");
     let Error::RollbackFailed { original, rollback } = &error else {
@@ -2016,10 +2035,13 @@ async fn fail_upgrade_and_its_rollback(harness: &Harness) {
         V1,
         "the rollback restored service.toml before it failed"
     );
-    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+    assert!(
+        harness.fake.daemon_version().is_none(),
+        "new daemon is stopped"
+    );
     let mut world = harness.fake.world();
     world.silent_version = None;
-    world.refused_replace = None;
+    world.refused_install = None;
 }
 
 #[tokio::test]
@@ -4432,7 +4454,7 @@ async fn no_gate_refusal_before_the_swap_restarts_the_daemon() {
 }
 
 #[tokio::test]
-async fn cancelling_an_interrupted_upgrade_is_not_gated_by_the_adoption_preflight() {
+async fn cancellation_checks_the_previous_daemon_when_it_may_have_been_replaced() {
     for interrupted_at in [Step::Binaries, Step::Registering, Step::Registered] {
         let harness = Harness::new();
         harness.install(V1).await.expect("install");
@@ -4442,37 +4464,353 @@ async fn cancelling_an_interrupted_upgrade_is_not_gated_by_the_adoption_prefligh
             .upgrade(&harness.staged(V2), V2)
             .await
             .expect_err("interrupted");
-        // Sessions the new daemon would lose appear while the old one runs, and
-        // the preflight is unavailable too: neither may stop the cancellation.
+        // A session becomes unadoptable while the upgrade is interrupted.
         seed_unadoptable_session(&harness);
         let calls = Arc::new(AtomicUsize::new(0));
-        let engine = harness
-            .engine()
-            .with_adoption_preflight(Box::new(CountingFailure(Arc::clone(&calls))));
-
-        let checked = crate::service::check_with_preflight(
-            &harness.context,
-            &harness.staged(V1),
-            &CountingFailure(Arc::clone(&calls)),
-            V1,
-            false,
-        )
-        .await
-        .expect("check does not refuse the cancellation");
-        let report = engine
-            .upgrade(&harness.staged(V1), V1)
+        if interrupted_at == Step::Binaries {
+            let report = harness
+                .engine()
+                .with_adoption_preflight(Box::new(CountingFailure(Arc::clone(&calls))))
+                .upgrade(&harness.staged(V1), V1)
+                .await
+                .expect("the old daemon still runs before registration");
+            assert!(report.preflight.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            harness.assert_installed(V1);
+            continue;
+        }
+        let refused = harness
+            .upgrade(V1)
             .await
-            .expect("asking for the restored version cancels the upgrade");
-
-        assert!(checked.preflight.is_none());
+            .expect_err("rollback needs consent");
+        assert!(
+            matches!(refused, Error::RollbackAtRisk { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(harness.pending().expect("record kept").step, interrupted_at);
+        let report = harness
+            .upgrade_accepting_loss(V1)
+            .await
+            .expect("accepted rollback completes");
         assert!(
             report.unchanged && report.rolled_back.is_some(),
             "{report:?}"
         );
-        assert!(report.preflight.is_none());
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "{interrupted_at:?}");
+        assert!(report.accepted_runtime_loss);
+        let preflight = report.preflight.expect("rollback preflight");
+        assert_eq!(preflight.daemon_version, crate::service::VERSION);
+        assert_eq!(preflight.sessions.len(), 1);
+        assert!(
+            report
+                .rolled_back
+                .expect("rolled back")
+                .accepted_runtime_loss
+        );
         harness.assert_installed(V1);
     }
+}
+
+/// Records a store the previous schema-1 daemon must not load.
+fn write_new_store(path: &Path) {
+    let directory = path.parent().expect("store parent");
+    std::fs::create_dir_all(directory).expect("create data directory");
+    std::fs::set_permissions(
+        directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private data directory");
+    let project = ProjectRecord {
+        git_common_dir: directory.join("repository/.git"),
+        repo_root: directory.join("repository"),
+        custom_name: None,
+        origin_url: None,
+        default_base_branch: None,
+        is_bare: false,
+        source: ProjectSource::Manual,
+        added_at: "2026-10-09T00:00:00Z".to_owned(),
+        last_used_at: "2026-10-09T00:00:00Z".to_owned(),
+    };
+    DaemonStore::new(path.to_path_buf())
+        .record_project(&project)
+        .expect("write current-schema project record");
+}
+
+fn write_legacy_store_bytes(path: &Path, bytes: &[u8]) {
+    let directory = path.parent().expect("store parent");
+    std::fs::create_dir_all(directory).expect("create data directory");
+    std::fs::set_permissions(
+        directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private data directory");
+    std::fs::write(path, bytes).expect("write legacy store fixture");
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .expect("private store file");
+}
+
+#[tokio::test]
+async fn cancellation_keeps_new_daemon_when_previous_reader_cannot_read_store() {
+    const PREVIOUS: &str = "0.33.1";
+    for accepted in [false, true] {
+        let harness = Harness::new();
+        harness
+            .install(PREVIOUS)
+            .await
+            .expect("install previous release");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registered);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted after replacement");
+        write_new_store(&store_path(&harness));
+        let before = harness.pending().expect("pending upgrade");
+        let replaces = harness.fake.world().replaces;
+        let checked = crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(PREVIOUS),
+            &InProcessPreflight::default(),
+            PREVIOUS,
+            accepted,
+        )
+        .await
+        .expect_err("read-only check rejects the same old reader");
+        assert_eq!(checked.code(), "service_rollback_store_unusable");
+        let result = harness
+            .engine()
+            .with_runtime_loss_accepted(accepted)
+            .upgrade(&harness.staged(PREVIOUS), PREVIOUS)
+            .await;
+        let error = result.expect_err("old reader cannot load schema 4");
+        assert_eq!(error.code(), "service_rollback_store_unusable");
+        assert_eq!(harness.pending(), Some(before));
+        assert_eq!(harness.fake.world().replaces, replaces);
+        assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+        assert_eq!(harness.config().expect("config").active_version(), V2);
+    }
+}
+
+#[tokio::test]
+async fn downgrade_accepts_a_previous_release_store_record() {
+    const PREVIOUS: &str = "0.33.1";
+    // A project record written by v0.33.0, with no live worker to gate.
+    const LEGACY_PROJECT: &str = r#"{"kind":"project","git_common_dir":"/workspace/project/.git","repo_root":"/workspace/project","custom_name":"Fixture Project","origin_url":"https://github.com/example/repo.git","is_bare":false,"source":"auto","added_at":"2026-06-19T00:00:00Z","last_used_at":"2026-06-19T00:00:00Z"}"#;
+    let harness = Harness::new();
+    harness
+        .install(PREVIOUS)
+        .await
+        .expect("install previous release");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    write_legacy_store_bytes(
+        &store_path(&harness),
+        format!("{LEGACY_PROJECT}\n").as_bytes(),
+    );
+
+    let report = harness
+        .upgrade(PREVIOUS)
+        .await
+        .expect("previous reader accepts schema-1 project record");
+    let preflight = report.preflight.expect("rollback preflight");
+    assert_eq!(preflight.store.state, StoreState::UpToDate);
+    assert_eq!(preflight.store.schema_from, Some(1));
+    assert_eq!(preflight.store.records, 1);
+    harness.assert_installed(PREVIOUS);
+}
+
+#[tokio::test]
+async fn downgrade_refuses_malformed_or_unknown_store_records_before_any_effect() {
+    const PREVIOUS: &str = "0.33.1";
+    for bytes in [
+        b"{invalid json}\n".as_slice(),
+        b"{\"kind\":\"unknown\"}\n".as_slice(),
+    ] {
+        let harness = Harness::new();
+        harness
+            .install(PREVIOUS)
+            .await
+            .expect("install previous release");
+        let mut engine = harness.engine();
+        engine.interrupt_after = Some(Step::Registered);
+        engine
+            .upgrade(&harness.staged(V2), V2)
+            .await
+            .expect_err("interrupted after replacement");
+        write_legacy_store_bytes(&store_path(&harness), bytes);
+        let before = harness.pending().expect("pending upgrade");
+        let (installs, replaces) = {
+            let world = harness.fake.world();
+            (world.installs, world.replaces)
+        };
+
+        let checked = crate::service::check_with_preflight(
+            &harness.context,
+            &harness.staged(PREVIOUS),
+            &InProcessPreflight::default(),
+            PREVIOUS,
+            true,
+        )
+        .await
+        .expect_err("read-only check refuses invalid store");
+        assert_eq!(checked.code(), "service_rollback_store_unusable");
+        assert!(matches!(
+            &checked,
+            Error::RollbackStoreUnusable { code, .. } if code == "legacy_store_invalid"
+        ));
+        let error = harness
+            .upgrade_accepting_loss(PREVIOUS)
+            .await
+            .expect_err("rollback refuses invalid store");
+        assert_eq!(error.code(), "service_rollback_store_unusable");
+        assert!(matches!(
+            &error,
+            Error::RollbackStoreUnusable { code, .. } if code == "legacy_store_invalid"
+        ));
+        assert_eq!(harness.pending(), Some(before));
+        let after = {
+            let world = harness.fake.world();
+            (world.installs, world.replaces, world.running)
+        };
+        assert_eq!(after.0, installs);
+        assert_eq!(after.1, replaces);
+        assert!(after.2, "refusal leaves the new daemon running");
+        assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+        assert_eq!(harness.config().expect("config").active_version(), V2);
+    }
+}
+
+#[tokio::test]
+async fn downgrade_refuses_an_untrusted_store_even_with_runtime_loss_consent() {
+    const PREVIOUS: &str = "0.33.1";
+    let harness = Harness::new();
+    harness
+        .install(PREVIOUS)
+        .await
+        .expect("install previous release");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    let store = store_path(&harness);
+    write_new_store(&store);
+    std::fs::set_permissions(&store, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .expect("make store untrusted");
+    let before = harness.pending().expect("pending upgrade");
+    let error = harness
+        .upgrade_accepting_loss(PREVIOUS)
+        .await
+        .expect_err("runtime-loss consent cannot override untrusted store");
+    assert_eq!(error.code(), "service_rollback_store_unusable");
+    assert!(error.to_string().contains("unreadable"));
+    assert_eq!(harness.pending(), Some(before));
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+}
+
+#[tokio::test]
+async fn readiness_failure_keeps_transaction_when_previous_reader_cannot_read_store() {
+    const PREVIOUS: &str = "0.33.1";
+    let harness = Harness::new();
+    harness
+        .install(PREVIOUS)
+        .await
+        .expect("install previous release");
+    {
+        let mut world = harness.fake.world();
+        world.silent_version = Some(V2.to_owned());
+        world.store_on_replace = Some(store_path(&harness));
+    };
+    let error = harness
+        .upgrade(V2)
+        .await
+        .expect_err("new daemon is not ready");
+    let Error::RollbackFailed { original, rollback } = error else {
+        panic!("unexpected failure {error:?}");
+    };
+    assert!(matches!(*original, Error::DaemonNotReady { .. }));
+    assert_eq!(rollback.code(), "service_rollback_store_unusable");
+    assert!(rollback.to_string().contains("schema"));
+    assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
+    assert_eq!(harness.config().expect("config").active_version(), V2);
+    assert_eq!(
+        harness.pending().expect("transaction kept").step,
+        Step::Registered
+    );
+}
+
+#[tokio::test]
+async fn downgrade_rechecks_store_after_stopping_the_new_daemon() {
+    const PREVIOUS: &str = "0.33.1";
+    let harness = Harness::new();
+    harness
+        .install(PREVIOUS)
+        .await
+        .expect("install previous release");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    let installs = harness.fake.world().installs;
+    harness.fake.world().store_on_uninstall = Some(store_path(&harness));
+
+    let error = harness
+        .upgrade_accepting_loss(PREVIOUS)
+        .await
+        .expect_err("a final new-daemon write must be refused");
+    assert_eq!(error.code(), "service_rollback_store_unusable");
+    assert!(harness.pending().expect("transaction kept").rolling_back);
+    assert_eq!(harness.fake.world().installs, installs);
+    assert_eq!(harness.fake.daemon_version(), None);
+    assert_eq!(harness.config().expect("config").active_version(), V2);
+}
+
+#[tokio::test]
+async fn accepted_legacy_downgrade_reports_its_preflight_and_runtime_loss() {
+    const PREVIOUS: &str = "0.33.1";
+    let harness = Harness::new();
+    harness
+        .install(PREVIOUS)
+        .await
+        .expect("install previous release");
+    let mut engine = harness.engine();
+    engine.interrupt_after = Some(Step::Registered);
+    engine
+        .upgrade(&harness.staged(V2), V2)
+        .await
+        .expect_err("interrupted after replacement");
+    let executable = harness.layout().worker_executable(V2).expect("worker path");
+    write_live_journal(harness.context.paths(), SESSION, "w-1", &executable);
+
+    let refused = harness
+        .upgrade(PREVIOUS)
+        .await
+        .expect_err("live worker needs consent");
+    assert_eq!(refused.code(), "service_rollback_sessions_at_risk");
+    let report = harness
+        .upgrade_accepting_loss(PREVIOUS)
+        .await
+        .expect("accepted downgrade");
+    assert!(report.unchanged);
+    assert!(report.accepted_runtime_loss);
+    let preflight = report.preflight.expect("rollback preflight");
+    assert_eq!(preflight.daemon_version, PREVIOUS);
+    assert_eq!(preflight.store.state, StoreState::Missing);
+    assert_eq!(preflight.sessions.len(), 1);
+    assert_eq!(
+        preflight.sessions[0].code,
+        "legacy_worker_adoption_unverified"
+    );
+    let rolled_back = report.rolled_back.expect("rollback summary");
+    assert!(rolled_back.accepted_runtime_loss);
+    assert_eq!(rolled_back.preflight, Some(preflight));
+    harness.assert_installed(PREVIOUS);
 }
 
 /// A preflight that fails the test when it is consulted.

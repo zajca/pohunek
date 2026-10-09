@@ -146,6 +146,7 @@ use super::report::{
     state_name, InstallReport, JobReport, KeptVersion, PendingReport, SearchPathReport,
     StatusReport, UninstallReport, UpgradeReport, VersionReport, WorkerReport,
 };
+use super::rollback;
 use super::settings;
 use super::usage::{Journals, Usage};
 #[cfg(target_os = "linux")]
@@ -382,15 +383,7 @@ impl<'a> Engine<'a> {
             self.ensure_not_installed(&config_path).await?;
         }
         let discovered = discover_for_plan(self.context, &plan)?;
-        let (resume, rolled_back) = match plan {
-            Plan::Fresh => (None, None),
-            Plan::Resume(record) => (Some(record), None),
-            Plan::RollBack(record) => {
-                let report = pending_report(&record);
-                self.rollback_pending(&record).await?;
-                (None, Some(report))
-            }
-        };
+        let (resume, rolled_back) = self.resolve_plan(plan).await?;
         // The rollback removed the foreign transaction's files; what is left
         // must not be an installation.
         if rolled_back.is_some() {
@@ -487,6 +480,25 @@ impl<'a> Engine<'a> {
         ensure_no_daemon_job(self.backend).await
     }
 
+    /// Applies a pending transaction decision and reports its rollback.
+    async fn resolve_plan(
+        &self,
+        plan: Plan,
+    ) -> Result<(Option<Record>, Option<PendingReport>), Error> {
+        match plan {
+            Plan::Fresh => Ok((None, None)),
+            Plan::Resume(record) => Ok((Some(record), None)),
+            Plan::RollBack(record) => {
+                let mut report = pending_report(&record);
+                if let Some(gated) = self.rollback_pending(&record).await? {
+                    report.accepted_runtime_loss = gated.accepted;
+                    report.preflight = Some(gated.report);
+                }
+                Ok((None, Some(report)))
+            }
+        }
+    }
+
     /// Upgrades the installation to `version` from the binaries in `from`.
     ///
     /// # Errors
@@ -505,15 +517,7 @@ impl<'a> Engine<'a> {
         let config_path = self.context.config_path();
         let plan = upgrade_plan(self.store.load()?, version)?;
         let gated = self.adoption_gate(&plan, from, version).await?;
-        let (resume, rolled_back) = match plan {
-            Plan::Fresh => (None, None),
-            Plan::Resume(record) => (Some(record), None),
-            Plan::RollBack(record) => {
-                let report = pending_report(&record);
-                self.rollback_pending(&record).await?;
-                (None, Some(report))
-            }
-        };
+        let (resume, rolled_back) = self.resolve_plan(plan).await?;
         let config = load_config(&config_path)?.ok_or(Error::NotInstalled {
             path: config_path.clone(),
         })?;
@@ -537,12 +541,16 @@ impl<'a> Engine<'a> {
                 to_version: version.to_owned(),
                 unchanged: true,
                 resumed: false,
-                rolled_back,
                 removed_versions,
                 kept_versions,
                 gc_error,
-                preflight: None,
-                accepted_runtime_loss: false,
+                preflight: rolled_back
+                    .as_ref()
+                    .and_then(|report| report.preflight.clone()),
+                accepted_runtime_loss: rolled_back
+                    .as_ref()
+                    .is_some_and(|report| report.accepted_runtime_loss),
+                rolled_back,
             });
         }
         let mut record = if let Some(record) = resume {
@@ -585,12 +593,19 @@ impl<'a> Engine<'a> {
             to_version: version.to_owned(),
             unchanged: false,
             resumed,
-            rolled_back,
             removed_versions,
             kept_versions,
             gc_error,
-            accepted_runtime_loss: gated.as_ref().is_some_and(|gated| gated.accepted),
-            preflight: gated.map(|Gated { report, .. }| report),
+            accepted_runtime_loss: gated.as_ref().is_some_and(|gated| gated.accepted)
+                || rolled_back
+                    .as_ref()
+                    .is_some_and(|report| report.accepted_runtime_loss),
+            preflight: gated.map(|Gated { report, .. }| report).or_else(|| {
+                rolled_back
+                    .as_ref()
+                    .and_then(|report| report.preflight.clone())
+            }),
+            rolled_back,
         })
     }
 
@@ -655,11 +670,19 @@ impl<'a> Engine<'a> {
                 // The rollback removes `service.toml`, so only the record lets
                 // a rerun after a failed purge find this installation; it is
                 // cleared once the purge below finished.
-                report.rolled_back = Some(pending_report(&pending));
-                self.rollback(&pending).await?;
+                let mut rolled_back = pending_report(&pending);
+                if let Some(gated) = self.rollback(&pending).await? {
+                    rolled_back.accepted_runtime_loss = gated.accepted;
+                    rolled_back.preflight = Some(gated.report);
+                }
+                report.rolled_back = Some(rolled_back);
             } else {
-                report.rolled_back = Some(pending_report(&pending));
-                self.rollback_pending(&pending).await?;
+                let mut rolled_back = pending_report(&pending);
+                if let Some(gated) = self.rollback_pending(&pending).await? {
+                    rolled_back.accepted_runtime_loss = gated.accepted;
+                    rolled_back.preflight = Some(gated.report);
+                }
+                report.rolled_back = Some(rolled_back);
             }
         }
         let config_path = self.context.config_path();
@@ -933,7 +956,7 @@ impl<'a> Engine<'a> {
             return Err(error);
         }
         match self.rollback(record).await {
-            Ok(()) => {
+            Ok(_gated) => {
                 self.store.clear()?;
                 Err(error)
             }
@@ -945,9 +968,10 @@ impl<'a> Engine<'a> {
     }
 
     /// Rolls back an interrupted transaction found at startup.
-    async fn rollback_pending(&self, record: &Record) -> Result<(), Error> {
-        self.rollback(record).await?;
-        self.store.clear()
+    async fn rollback_pending(&self, record: &Record) -> Result<Option<Gated>, Error> {
+        let gated = self.rollback(record).await?;
+        self.store.clear()?;
+        Ok(gated)
     }
 
     /// Undoes every effect `record`'s transaction may have had.
@@ -965,9 +989,10 @@ impl<'a> Engine<'a> {
     /// session check; `settle`, `install`, `upgrade`, and `uninstall` all
     /// route those records elsewhere, so reaching this is a broken invariant
     /// that must fail loudly rather than stop sessions.
-    async fn rollback(&self, record: &Record) -> Result<(), Error> {
+    async fn rollback(&self, record: &Record) -> Result<Option<Gated>, Error> {
         let layout = install_layout(&record.prefix)?;
         let config_path = self.context.config_path();
+        let mut gated = None;
         match record.operation {
             Operation::Install => {
                 if record.step >= Step::Registering {
@@ -994,7 +1019,21 @@ impl<'a> Engine<'a> {
                         path: self.store.path(),
                         detail: "an upgrade record names no previous version".to_owned(),
                     })?;
+                if record.step >= Step::Registering {
+                    gated = Some(self.rollback_gate(&layout, previous).await?);
+                }
                 self.mark_rolling_back(record)?;
+                if record.step >= Step::Registering {
+                    // Stopping the new daemon closes the store-write race.
+                    // A refused second judgment leaves the transaction and
+                    // the daemon stopped, without starting an unsafe reader.
+                    self.backend
+                        .daemon()
+                        .uninstall()
+                        .await
+                        .map_err(|source| supervisor_error("stop daemon for rollback", source))?;
+                    gated = Some(self.rollback_gate(&layout, previous).await?);
+                }
                 let current = load_config(&config_path)?.ok_or(Error::NotInstalled {
                     path: config_path.clone(),
                 })?;
@@ -1004,7 +1043,7 @@ impl<'a> Engine<'a> {
                     let definition = daemon_definition(self.context, &restored)?;
                     self.backend
                         .daemon()
-                        .replace(&definition)
+                        .install(&definition)
                         .await
                         .map_err(|source| supervisor_error("restore daemon", source))?;
                     self.wait_ready(previous).await?;
@@ -1015,7 +1054,7 @@ impl<'a> Engine<'a> {
         layout::claim_existing_prefix(&layout, &namespace)?;
         let install = record.operation == Operation::Install;
         if record.version_dir_preexisted && !install {
-            return Ok(());
+            return Ok(gated);
         }
         let usage = self.usage(&layout).await?;
         if !record.version_dir_preexisted && usage.keep_reason(&record.version, None).is_none() {
@@ -1031,7 +1070,32 @@ impl<'a> Engine<'a> {
         {
             layout::release_prefix(&layout, &namespace)?;
         }
-        Ok(())
+        Ok(gated)
+    }
+
+    /// Judges a rollback using the previous version's daemon reader.
+    async fn rollback_gate(&self, layout: &InstallLayout, previous: &str) -> Result<Gated, Error> {
+        let daemon_dir =
+            layout
+                .version_dir(previous)
+                .ok_or_else(|| Error::RollbackPreflightFailed {
+                    version: previous.to_owned(),
+                    detail: "previous version has no valid installation directory".to_owned(),
+                })?;
+        rollback::gate(
+            rollback::Inputs {
+                preflight: &*self.preflight,
+                context: self.context,
+                backend: Some(self.backend),
+                layout,
+                inspector: &*self.inspector,
+            },
+            &daemon_dir,
+            previous,
+            self.reported(previous),
+            self.accept_runtime_loss,
+        )
+        .await
     }
 
     /// Journals that `record`'s rollback has begun.
@@ -1536,7 +1600,7 @@ fn is_live(session: &SessionInfo) -> bool {
 /// job may still be waiting to spawn. Only `Stopped` and `Failed` prove the
 /// end without further evidence; a caller that needs more proof reads the
 /// worker journal.
-fn job_alive(observation: &ServiceObservation) -> bool {
+pub(super) fn job_alive(observation: &ServiceObservation) -> bool {
     observation.process.is_some()
         || matches!(
             observation.state,
@@ -1552,6 +1616,8 @@ pub(crate) fn pending_report(record: &Record) -> PendingReport {
         operation: record.operation.as_str(),
         version: record.version.clone(),
         step: record.step.as_str(),
+        preflight: None,
+        accepted_runtime_loss: false,
     }
 }
 
@@ -1818,7 +1884,7 @@ pub(crate) fn upgrade_plan(pending: Option<Record>, version: &str) -> Result<Pla
 /// Install and rollback check the prefix before any effect, so a prefix the
 /// configuration would reject never lets a pending transaction be rolled
 /// back first.
-fn install_layout(prefix: &Path) -> Result<InstallLayout, Error> {
+pub(crate) fn install_layout(prefix: &Path) -> Result<InstallLayout, Error> {
     pohunek_service_config::validate_prefix(prefix).map_err(|_invalid| Error::InvalidPath {
         flag: "--prefix",
         path: prefix.to_path_buf(),

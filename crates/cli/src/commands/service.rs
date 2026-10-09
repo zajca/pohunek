@@ -339,6 +339,14 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
         let _ = writeln!(text, "warning: old versions were not cleaned up: {error}");
     }
     if let Some(preflight) = &report.preflight {
+        if report
+            .rolled_back
+            .as_ref()
+            .and_then(|pending| pending.preflight.as_ref())
+            == Some(preflight)
+        {
+            return text;
+        }
         render_preflight(&mut text, preflight, report.accepted_runtime_loss);
     }
     text
@@ -534,10 +542,15 @@ fn render_transaction(text: &mut String, report: &report::StatusReport) {
 }
 
 fn render_rolled_back(pending: &report::PendingReport) -> String {
-    format!(
+    let mut text = format!(
         "rolled back an interrupted {} of {} (stopped after step {})",
         pending.operation, pending.version, pending.step
-    )
+    );
+    if let Some(preflight) = &pending.preflight {
+        text.push('\n');
+        render_preflight(&mut text, preflight, pending.accepted_runtime_loss);
+    }
+    text.trim_end().to_owned()
 }
 
 #[cfg(test)]
@@ -732,6 +745,8 @@ mod tests {
                 operation: "upgrade",
                 version: "0.9.0".to_owned(),
                 step: "config",
+                preflight: None,
+                accepted_runtime_loss: false,
             }),
             pending_action: Some("roll_back"),
             locked: true,
@@ -769,6 +784,8 @@ mod tests {
                 operation: "install",
                 version: "1.0.0".to_owned(),
                 step: "config",
+                preflight: None,
+                accepted_runtime_loss: false,
             }),
         });
         assert!(text.contains("pending    install 1.0.0 stopped after step config"));
@@ -839,6 +856,8 @@ mod tests {
                 operation: "install",
                 version: "1.0.0".to_owned(),
                 step: "ready",
+                preflight: None,
+                accepted_runtime_loss: false,
             }),
         };
         let json = render_json(&status).expect("status JSON");
