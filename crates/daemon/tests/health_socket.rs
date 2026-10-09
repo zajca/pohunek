@@ -1527,6 +1527,60 @@ async fn public_bind_serves_host_discover_with_supplied_registry() {
 }
 
 #[tokio::test]
+async fn public_socket_rejects_invalid_origin_envelopes_without_leaking_values() {
+    let socket = temp_socket("invalid-origin-envelope");
+    let (shutdown, handle) = spawn_server(&socket, "test").await;
+    let mut client = connect(&socket).await;
+    let base = serde_json::to_value(Request::make(
+        "origin-envelope",
+        method::DAEMON_HEALTH,
+        Value::Null,
+    ))
+    .expect("serialize base request");
+
+    for (field, value) in [
+        ("origin_session_id", "s-origin"),
+        ("origin_daemon_id", "d-origin"),
+    ] {
+        let mut invalid = base.clone();
+        invalid[field] = Value::from(value);
+        let response = exchange_line(
+            &mut client,
+            serde_json::to_string(&invalid).expect("serialize invalid origin request"),
+        )
+        .await;
+        assert_eq!(response.id(), "invalid-request");
+        let error = err_payload(response);
+        assert_eq!(error.code, "bad_request");
+        assert!(error.msg.contains("origin markers must be absent together"));
+        assert!(!error.msg.contains(value));
+    }
+
+    let secret = "origin-secret/value";
+    let mut unsafe_origin = base;
+    unsafe_origin["origin_session_id"] = Value::from("s-origin");
+    unsafe_origin["origin_daemon_id"] = Value::from(secret);
+    let response = exchange_line(
+        &mut client,
+        serde_json::to_string(&unsafe_origin).expect("serialize unsafe origin request"),
+    )
+    .await;
+    assert_eq!(response.id(), "invalid-request");
+    let error = err_payload(response);
+    assert_eq!(error.code, "bad_request");
+    assert!(!error.msg.contains(secret));
+
+    let healthy = Request::make("after-invalid-origin", method::DAEMON_HEALTH, Value::Null);
+    assert_eq!(
+        ok_payload(exchange(&mut client, &healthy).await)["status"],
+        "ok"
+    );
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+#[tokio::test]
 async fn host_discover_with_the_whole_window_is_served_on_a_connection_frozen_on_the_current_version(
 ) {
     let socket = temp_socket("host-discover-window-after-freeze");

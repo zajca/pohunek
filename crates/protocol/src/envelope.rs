@@ -600,50 +600,6 @@ mod tests {
     use crate::SessionId;
 
     #[test]
-    fn request_origin_requires_both_markers() {
-        for value in [
-            json!({
-                "v": {"minimum": 2, "maximum": 2},
-                "id": "request-1",
-                "method": "daemon.health",
-                "params": {},
-                "origin_session_id": "s-origin"
-            }),
-            json!({
-                "v": {"minimum": 2, "maximum": 2},
-                "id": "request-1",
-                "method": "daemon.health",
-                "params": {},
-                "origin_daemon_id": "d-origin"
-            }),
-        ] {
-            let error = serde_json::from_value::<Request>(value)
-                .expect_err("one origin marker must be rejected");
-            assert!(error
-                .to_string()
-                .contains("origin markers must be absent together"));
-        }
-    }
-
-    #[test]
-    fn request_origin_rejects_unsafe_values_without_echoing_them() {
-        let secret = "origin-secret/value";
-        let value = json!({
-            "v": {"minimum": 2, "maximum": 2},
-            "id": "request-1",
-            "method": "daemon.health",
-            "params": {},
-            "origin_session_id": "s-origin",
-            "origin_daemon_id": secret
-        });
-
-        let error = serde_json::from_value::<Request>(value)
-            .expect_err("unsafe origin marker must be rejected")
-            .to_string();
-        assert!(!error.contains(secret));
-    }
-
-    #[test]
     fn request_origin_builder_accepts_only_a_valid_pair() {
         let request = Request::new("request-1", "daemon.health", json!({}))
             .expect("valid request")
