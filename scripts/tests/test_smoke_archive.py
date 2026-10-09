@@ -13,6 +13,7 @@ import io
 import json
 import os
 from pathlib import Path
+import select
 import selectors
 import shutil
 import signal
@@ -93,6 +94,29 @@ def process_tree(root_pid):
         except FileNotFoundError:
             pass
     return found
+
+
+def process_snapshot(pids):
+    snapshot = []
+    for pid in pids:
+        proc = Path("/proc") / str(pid)
+        try:
+            status = (proc / "status").read_text().splitlines()
+            details = {key: value.strip() for key, value in (line.split(":", 1) for line in status if ":" in line)}
+            fds = []
+            for fd in (proc / "fd").iterdir():
+                if fd.name in ("0", "1", "2", "3"):
+                    try:
+                        fds.append(f"{fd.name}={os.readlink(fd)}")
+                    except OSError:
+                        pass
+            snapshot.append(
+                f"{pid}: {details.get('Name')} {details.get('State')} ppid={details.get('PPid')} "
+                f"pgid={os.getpgid(pid)} fds={','.join(fds)}"
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            snapshot.append(f"{pid}: exited or inaccessible")
+    return "; ".join(snapshot)
 
 
 class _SmokeArchiveFixture:
@@ -241,7 +265,23 @@ class _SmokeArchiveFixture:
                 for _, fd in child_fds:
                     exited.register(fd, selectors.EVENT_READ)
                 os.kill(process.pid, signal.SIGTERM)
-                _, stderr = process.communicate(timeout=10)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired as error:
+                    exited_pids = [pid for pid, fd in child_fds if select.select([fd], [], [], 0)[0]]
+                    raise AssertionError(
+                        f"outer cancellation timed out: outer={process.poll()}, exited={exited_pids}, "
+                        f"processes={process_snapshot([process.pid, *descendants])}"
+                    ) from error
+                try:
+                    _, stderr = process.communicate(timeout=10)
+                except subprocess.TimeoutExpired as error:
+                    exited_pids = [pid for pid, fd in child_fds if select.select([fd], [], [], 0)[0]]
+                    raise AssertionError(
+                        f"cancellation timed out: outer={process.poll()}, exited={exited_pids}, "
+                        f"processes={process_snapshot([process.pid, *descendants])}, "
+                        f"stderr={error.stderr!r}"
+                    ) from error
                 self.assertEqual(process.returncode, 143, stderr.decode(errors="replace"))
                 while exited.get_map():
                     ready = exited.select(timeout=10)

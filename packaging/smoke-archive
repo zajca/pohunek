@@ -438,8 +438,11 @@ ns_pid=
 cleanup() {
     status=$?
     trap '' EXIT
-    # The sudo supervisor's watchdog sees EOF even if sudo uses a PTY and
-    # moves its root-owned children out of the launcher's process group.
+    # Wake the root watchdog explicitly: a stray inherited FIFO writer must
+    # not keep it blocked after the outer shell closes its own descriptor.
+    if [ -n "$ns_pid" ] && [ "$chosen" = sudo ]; then
+        printf 'cancel\n' >&3 || true
+    fi
     exec 3>&-
     if [ -n "$ns_pid" ]; then
         if [ "$chosen" != sudo ]; then
