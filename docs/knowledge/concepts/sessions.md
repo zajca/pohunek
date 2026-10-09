@@ -347,10 +347,14 @@ retirement (`runtime_supervision_unavailable`); a worker journaled under another
 generation still runs (`runtime_identity_mismatch`); or the session's journals
 cannot be read, or a journaled worker of the generation still runs or cannot be
 inspected after the retirement (`runtime_supervision_ambiguous`). Every
-removal, whatever the runtime state, then sweeps the processes that carry the
-session's runtime ownership markers, because a descendant that left the
-worker's process group (macOS kills only the group) outlives the stop and the
-job retirement. A sweep that cannot confirm every marked process exited fails
+removal, whatever the runtime state, then sweeps the processes carrying a
+journal-proven runtime marker. A recorded runtime absent from its worker journal
+is swept only when its process also carries the removed session's ID. A process
+with that runtime marker but another session ID is left alone; one with no
+session ID is not signalled and keeps cleanup unconfirmed. A descendant that
+left the worker's process group (macOS kills
+only the group) can outlive the stop and job retirement. A sweep that cannot
+confirm every marked process exited fails
 the removal with `runtime_supervision_ambiguous` and keeps the session listed
 with its removal intent; `session rm` again, or the next daemon start,
 finishes it once the leftover process is gone. When the only obstacle is
