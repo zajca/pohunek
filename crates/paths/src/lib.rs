@@ -124,7 +124,7 @@ impl Platform {
         }
         #[cfg(target_os = "macos")]
         {
-            Ok(Self::MacOs)
+            Ok(Self::MacOS)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
