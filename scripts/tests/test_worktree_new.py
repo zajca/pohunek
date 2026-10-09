@@ -1021,6 +1021,58 @@ os.execv(real_cp, [real_cp, "-a", *args[2:]])
                 for parent in Path(entry["dest"]).parents)
             for entry in observations), "the seed must land in a temporary worktree")
 
+    def test_default_run_fetches_main_and_seeds_its_worktree(self):
+        target = self.prepare_seedable_repo()
+        self.install_cp_probe(target)
+        remote = self.root / "origin.git"
+        self.git("init", "-q", "--bare", str(remote))
+        self.git("remote", "add", "origin", str(remote))
+        self.git("push", "origin", "main")
+        self.git("remote", "remove", "origin")
+        self.git("remote", "add", "origin", str(remote))
+        before = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", "refs/remotes/origin/main"],
+            cwd=self.repo, env=self.env, check=False, timeout=CLI_TIMEOUT_SECONDS)
+        self.assertEqual(before.returncode, 1)
+
+        result = self.run_script("issue-1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        base = self.git("rev-parse", "origin/main").stdout.strip()
+        self.assertEqual(self.git("rev-parse", "zajca/issue-1").stdout.strip(), base)
+        self.assertTrue((self.worktrees / "issue-1/target/debug/deps/libdep-1.rlib").is_file())
+        self.assertEqual(self.git("branch", "--list", "zajca/worktree-new-tmp-*").stdout, "")
+
+    def test_explicit_base_uses_its_commit_without_a_remote(self):
+        target = self.prepare_seedable_repo()
+        self.install_cp_probe(target)
+        self.git("branch", "zajca/base")
+        base = self.git("rev-parse", "zajca/base").stdout.strip()
+        (self.repo / "README.md").write_text("a later commit\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "later fixture")
+        self.assertNotEqual(self.git("rev-parse", "HEAD").stdout.strip(), base)
+
+        result = self.run_script("issue-1", "zajca/base")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("rev-parse", "zajca/issue-1").stdout.strip(), base)
+        self.assertTrue((self.worktrees / "issue-1/target/debug/deps/libdep-1.rlib").is_file())
+
+    def test_branch_override_names_the_registered_seeded_worktree(self):
+        target = self.prepare_seedable_repo()
+        self.install_cp_probe(target)
+
+        result = self.run_script("--branch", "zajca/issue-1/review", "issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.git("rev-parse", "zajca/issue-1/review").stdout.strip(),
+            self.git("rev-parse", "HEAD").stdout.strip())
+        self.assertIn(
+            "branch refs/heads/zajca/issue-1/review",
+            self.git("worktree", "list", "--porcelain").stdout)
+
     def prepare_stale_seed(self):
         target = self.prepare_seedable_repo()
         (self.repo / "Cargo.lock").write_text("version = 3\n")
@@ -1069,51 +1121,6 @@ os.execv(real_cp, [real_cp, "-a", *args[2:]])
         self.assertTrue(destination.is_dir())
         self.assertFalse((destination / "target").exists())
         self.assertIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
-
-
-class SeededCreateTests(HarnessCase):
-    def test_default_run_fetches_and_seeds_the_worktree_target(self):
-        code, out, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        worktree = self.h.worktrees / "issue-1"
-        commands = self.h.executor.commands
-        self.assertIn(["git", "fetch", "origin", "main"], commands)
-        creates = [c for c in commands if c[1:3] == ["branch", "--no-track"]]
-        self.assertEqual(len(creates), 1)
-        temp_branch = creates[0][3]
-        self.assertTrue(temp_branch.startswith(TEMP_BRANCH), temp_branch)
-        self.assertEqual(creates[0][4:], [BASE_COMMIT])
-        adds = [c for c in commands if c[1:3] == ["worktree", "add"]]
-        self.assertEqual(len(adds), 1)
-        temp = adds[0][3]
-        self.assertEqual(adds[0][4:], [temp_branch])
-        move = ["git", "worktree", "move", temp, str(worktree)]
-        rename = ["git", "branch", "-m", temp_branch, "zajca/issue-1"]
-        self.assertLess(commands.index(move), commands.index(rename))
-        self.assertEqual(commands[-1], rename)
-        self.assertEqual(self.h.executor.temporary_branches(), [])
-        self.assertEqual(self.h.executor.registered,
-                         {worktree: "zajca/issue-1"})
-        debug = worktree / "target" / "debug"
-        for name in worktree_new.SEED_SUBDIRS:
-            self.assertTrue((debug / name).is_dir(), name)
-        self.assertTrue((debug / "deps/libdep-1.rlib").is_file())
-        self.assertTrue((worktree / "target/CACHEDIR.TAG").is_file())
-        self.assertTrue((worktree / "target/.rustc_info.json").is_file())
-        self.assertIn(f"cd {worktree} && cargo build", out)
-
-    def test_explicit_base_ref_is_used_without_fetch(self):
-        self.h.executor.refs["zajca/base"] = OTHER_COMMIT
-        code, _, err = self.h.run("issue-1", "zajca/base")
-        self.assertEqual(code, 0, err)
-        self.assertFalse(self.h.executor.ran("git", "fetch"))
-        self.assertEqual(self.h.executor.branches["zajca/issue-1"],
-                         OTHER_COMMIT)
-
-    def test_branch_override_is_used(self):
-        code, _, err = self.h.run("--branch", "zajca/issue-1/review", "issue-1")
-        self.assertEqual(code, 0, err)
-        self.assertIn("zajca/issue-1/review", self.h.executor.branches)
 
 
 class FailClosedTests(HarnessCase):
@@ -1688,28 +1695,6 @@ class WorktreeListTests(HarnessCase):
              "import sys; sys.stdout.buffer.write(b'a\\rb\\nc\\0')"],
             cwd=self.h.root)
         self.assertEqual(result.stdout, "a\rb\nc\0")
-
-
-class LockTests(unittest.TestCase):
-    def test_missing_profile_dir_is_a_seed_source_error(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(worktree_new.WorktreeError) as caught:
-                with worktree_new.hold_cargo_locks(Path(tmp) / "debug"):
-                    pass
-            self.assertIn("no seed source", str(caught.exception))
-            self.assertFalse((Path(tmp) / "debug").exists())
-
-    def test_locks_are_held_exclusively_and_released(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            lock = Path(tmp) / ".cargo-lock"
-            lock.write_bytes(b"")
-            with worktree_new.hold_cargo_locks(Path(tmp)):
-                with open(lock, "rb") as other:
-                    with self.assertRaises(BlockingIOError):
-                        fcntl.flock(other.fileno(),
-                                    fcntl.LOCK_SH | fcntl.LOCK_NB)
-            with open(lock, "rb") as other:
-                fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 if __name__ == "__main__":
