@@ -984,6 +984,43 @@ os.execv(real_cp, [real_cp, "-a", *args[2:]])
             sorted(path.name for path in self.worktrees.iterdir()),
             [FOREIGN_PROBE_NAME, "issue-1"])
 
+    def test_seeded_worktree_contains_only_reusable_artifacts(self):
+        source_target = self.prepare_seedable_repo()
+        self.install_cp_probe(source_target)
+        before = sorted(path.relative_to(source_target)
+                        for path in source_target.rglob("*"))
+
+        result = self.run_script("issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        destination = self.worktrees / "issue-1"
+        target = destination / "target"
+        profile = target / worktree_new.PROFILE
+        self.assertIn(f"cd {destination} && cargo build", result.stdout)
+        self.assertIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
+        self.assertIn("zajca/issue-1", self.git("branch", "--list", "zajca/issue-1").stdout)
+        self.assertEqual(self.git("branch", "--list", "zajca/worktree-new-tmp-*").stdout, "")
+        self.assertEqual([path.name for path in self.worktrees.iterdir()], ["issue-1"])
+        self.assertEqual(sorted(path.name for path in target.iterdir()),
+                         [".rustc_info.json", "CACHEDIR.TAG", worktree_new.PROFILE])
+        for name in worktree_new.SEED_SUBDIRS:
+            self.assertTrue((profile / name).is_dir(), name)
+        self.assertEqual((profile / "deps/libdep-1.rlib").read_bytes(), b"rlib")
+        self.assertTrue((target / "CACHEDIR.TAG").is_file())
+        self.assertTrue((target / ".rustc_info.json").is_file())
+        for name in ("pohunek-sessiond", "libpohunek_daemon.rlib", "examples",
+                     *worktree_new.CARGO_LOCK_FILES):
+            self.assertFalse((profile / name).exists(), name)
+        self.assertEqual(before, sorted(path.relative_to(source_target)
+                                        for path in source_target.rglob("*")))
+        observations = self.cp_observations()
+        self.assertGreater(len(observations), 1)
+        self.assertTrue(any(
+            any(parent.parent == self.worktrees and parent.name.startswith(
+                f"{worktree_new.TEMP_WORKTREE_PREFIX}issue-1-")
+                for parent in Path(entry["dest"]).parents)
+            for entry in observations), "the seed must land in a temporary worktree")
+
     def prepare_stale_seed(self):
         target = self.prepare_seedable_repo()
         (self.repo / "Cargo.lock").write_text("version = 3\n")
@@ -1065,35 +1102,6 @@ class SeededCreateTests(HarnessCase):
         self.assertTrue((worktree / "target/.rustc_info.json").is_file())
         self.assertIn(f"cd {worktree} && cargo build", out)
 
-    def test_uplifted_main_outputs_are_not_seeded(self):
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        debug = self.h.worktrees / "issue-1" / "target" / "debug"
-        self.assertFalse((debug / "pohunek-sessiond").exists())
-        self.assertFalse((debug / "libpohunek_daemon.rlib").exists())
-        self.assertFalse((debug / "examples").exists())
-        for lock in worktree_new.CARGO_LOCK_FILES:
-            self.assertFalse((debug / lock).exists(), lock)
-
-    def test_every_copy_is_a_mandatory_reflink(self):
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        copies = [c for c in self.h.executor.commands if c[0] == "cp"]
-        self.assertTrue(copies)
-        for command in copies:
-            self.assertEqual(command[1:3], ["-a", "--reflink=always"])
-
-    def test_probe_and_staging_leave_no_residue(self):
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
-                         ["issue-1"])
-        target = self.h.worktrees / "issue-1" / "target"
-        self.assertEqual(
-            sorted(p.name for p in target.iterdir()),
-            [".rustc_info.json", "CACHEDIR.TAG", "debug"],
-        )
-
     def test_explicit_base_ref_is_used_without_fetch(self):
         self.h.executor.refs["zajca/base"] = OTHER_COMMIT
         code, _, err = self.h.run("issue-1", "zajca/base")
@@ -1106,15 +1114,6 @@ class SeededCreateTests(HarnessCase):
         code, _, err = self.h.run("--branch", "zajca/issue-1/review", "issue-1")
         self.assertEqual(code, 0, err)
         self.assertIn("zajca/issue-1/review", self.h.executor.branches)
-
-    def test_main_target_is_left_untouched(self):
-        before = sorted(str(p.relative_to(self.h.target))
-                        for p in self.h.target.rglob("*"))
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        after = sorted(str(p.relative_to(self.h.target))
-                       for p in self.h.target.rglob("*"))
-        self.assertEqual(before, after)
 
 
 class FailClosedTests(HarnessCase):
@@ -1451,25 +1450,6 @@ class PlainGitRaceTests(HarnessCase):
 
 
 class TemporaryPathTests(HarnessCase):
-    def test_prefix_matches_the_script(self):
-        self.assertEqual(TEMP_PREFIX, worktree_new.TEMP_WORKTREE_PREFIX)
-
-    def test_success_leaves_only_the_final_worktree(self):
-        seen = []
-        self.h.executor.on_copy = lambda source, dest: seen.append(dest)
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 0, err)
-        worktree = self.h.worktrees / "issue-1"
-        self.assertEqual(self.h.executor.registered,
-                         {worktree: "zajca/issue-1"})
-        self.assertEqual(sorted(p.name for p in self.h.worktrees.iterdir()),
-                         ["issue-1"])
-        self.assertEqual(self.h.executor.temporary_branches(), [])
-        temp_name = f"{TEMP_PREFIX}issue-1-{os.getpid()}-"
-        seeded = [d for d in seen
-                  if any(p.name.startswith(temp_name) for p in d.parents)]
-        self.assertTrue(seeded, "the seed must land in the temporary path")
-
     def test_failure_leaves_no_temporary_worktree(self):
         self.h.executor.copy_fails_for = "incremental"
         code, _, err = self.h.run("issue-1")
