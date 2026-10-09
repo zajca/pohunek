@@ -483,6 +483,55 @@ class WorktreeCliTests(unittest.TestCase):
                 self.assertFalse(self.worktrees.exists())
                 self.assertEqual(self.git("branch", "--list", "zajca/*").stdout, "")
 
+    def test_existing_destination_directory_is_not_modified(self):
+        destination = self.worktrees / "issue-1"
+        destination.mkdir(parents=True)
+        sentinel = destination / "owned.txt"
+        sentinel.write_text("keep this file\n")
+
+        result = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(sentinel.read_text(), "keep this file\n")
+        self.assertEqual(self.git("branch", "--list", "zajca/issue-1").stdout, "")
+        self.assertNotIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
+
+    def test_existing_destination_symlink_is_not_followed(self):
+        self.worktrees.mkdir()
+        destination = self.worktrees / "issue-1"
+        destination.symlink_to(self.root / "missing")
+
+        result = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("already exists", result.stderr)
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(self.git("branch", "--list", "zajca/issue-1").stdout, "")
+        self.assertNotIn(str(destination), self.git("worktree", "list", "--porcelain").stdout)
+
+    def test_existing_branch_is_not_replaced(self):
+        self.git("branch", "zajca/issue-1", "HEAD")
+        (self.repo / "README.md").write_text("new main commit\n")
+        self.git("add", "README.md")
+        self.git("commit", "-q", "-m", "advance main")
+        self.assertNotEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.base)
+
+        result = self.run_script("--no-seed", "issue-1", "HEAD")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("branch zajca/issue-1 already exists", result.stderr)
+        self.assertEqual(self.git("rev-parse", "refs/heads/zajca/issue-1").stdout.strip(), self.base)
+        self.assertFalse((self.worktrees / "issue-1").exists())
+
+    def test_unresolvable_base_ref_creates_no_branch_or_worktree(self):
+        result = self.run_script("--no-seed", "issue-1", "no-such-ref")
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("does not name a commit", result.stderr)
+        self.assertEqual(self.git("branch", "--list", "zajca/issue-1").stdout, "")
+        self.assertFalse((self.worktrees / "issue-1").exists())
+
 
 class SeededCreateTests(HarnessCase):
     def test_default_run_fetches_and_seeds_the_worktree_target(self):
@@ -600,34 +649,6 @@ class FailClosedTests(HarnessCase):
         code, _, err = self.h.run("issue-1")
         self.assertEqual(code, 1)
         self.assertIn("not a Cargo target dir", err)
-        self.assert_no_worktree_created()
-
-    def test_existing_destination_fails(self):
-        (self.h.worktrees / "issue-1").mkdir(parents=True)
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("already exists", err)
-        self.assertFalse(self.h.executor.ran("git", "worktree", "add"))
-
-    def test_existing_destination_symlink_fails(self):
-        self.h.worktrees.mkdir()
-        (self.h.worktrees / "issue-1").symlink_to(self.h.root / "missing")
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("already exists", err)
-        self.assertFalse(self.h.executor.ran("git", "worktree", "add"))
-
-    def test_existing_branch_fails(self):
-        self.h.executor.branches["zajca/issue-1"] = OTHER_COMMIT
-        code, _, err = self.h.run("issue-1")
-        self.assertEqual(code, 1)
-        self.assertIn("branch zajca/issue-1 already exists", err)
-        self.assert_no_worktree_created()
-
-    def test_unresolvable_base_ref_fails(self):
-        code, _, err = self.h.run("issue-1", "no-such-ref")
-        self.assertEqual(code, 1)
-        self.assertIn("does not name a commit", err)
         self.assert_no_worktree_created()
 
     def test_non_default_source_layout_fails(self):
