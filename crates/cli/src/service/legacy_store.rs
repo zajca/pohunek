@@ -10,6 +10,17 @@
 //! check alone cannot prove this: a record with a known `kind` but a missing
 //! or ill-typed field is accepted there and yet dropped by the reader.
 //!
+//! A record the reader keeps is not preserved wholesale either: each reader's
+//! `serde` shape carries only its own relaunch-snapshot fields, so a recovery
+//! binding frozen in the other release's spellings leaves the reader
+//! untouched — `serde` never denies an unknown key and the reader's rules
+//! still hold — but its next whole-store rewrite drops the foreign snapshot:
+//! v0.33.0 has no `native_launch` or `launch_binding`, and v0.33.1 has no
+//! resume or fork relaunch modes. The validation therefore also refuses any
+//! recovery binding whose relaunch snapshot the selected reader would
+//! silently rewrite away, including the snapshot nested in a session record;
+//! a binding in the selected reader's own spellings still passes.
+//!
 //! The two releases disagree, so each one is frozen separately in this crate,
 //! independent of the legacy daemon binary, and a rollback validates against
 //! the reader of the exact previous version. Each mirror mirrors its tag
@@ -98,6 +109,103 @@ trait ReaderSkip {
     fn skip_reason(record: &Self) -> Option<&'static str>;
 }
 
+/// One relaunch-snapshot field the selected reader does not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SnapshotLoss {
+    /// The wire key the record still carries and the reader's
+    /// `ResumeBinding` shape has no field for.
+    key: &'static str,
+    /// Which release's relaunch snapshot the key stands for, worded as the
+    /// refusal detail continues it.
+    origin: &'static str,
+}
+
+/// The relaunch-snapshot spellings the v0.33.0 `ResumeBinding` has no field
+/// for: v0.33.1 froze the typed native launch spec and the launch binding of
+/// the runtime definition it was frozen with into every recovery binding, and
+/// the v0.33.0 deserializer silently ignores both keys, so its whole-store
+/// rewrite drops the native recovery they carry.
+const NATIVE_LAUNCH_SNAPSHOT_LOSS: &[SnapshotLoss] = &[
+    SnapshotLoss {
+        key: "native_launch",
+        origin: "the 0.33.1 native launch spec",
+    },
+    SnapshotLoss {
+        key: "launch_binding",
+        origin: "the 0.33.1 launch pin",
+    },
+];
+
+/// The relaunch-snapshot spellings the v0.33.1 `ResumeBinding` has no field
+/// for: v0.33.0 froze the relaunch argv mode, the native reference kind and
+/// the fork snapshot into every recovery binding, and the v0.33.1
+/// deserializer silently ignores all of them, so its whole-store rewrite
+/// drops the relaunch shape they drive.
+const RESUME_MODE_SNAPSHOT_LOSS: &[SnapshotLoss] = &[
+    SnapshotLoss {
+        key: "resume_mode",
+        origin: "the 0.33.0 resume argv mode",
+    },
+    SnapshotLoss {
+        key: "ref_kind",
+        origin: "the 0.33.0 native reference kind",
+    },
+    SnapshotLoss {
+        key: "resumable",
+        origin: "the 0.33.0 resumability flag",
+    },
+    SnapshotLoss {
+        key: "fork_mode",
+        origin: "the 0.33.0 fork argv mode",
+    },
+    SnapshotLoss {
+        key: "fork_resume_mode",
+        origin: "the 0.33.0 fork resume argv mode",
+    },
+    SnapshotLoss {
+        key: "fork_ref_kind",
+        origin: "the 0.33.0 fork reference kind",
+    },
+    SnapshotLoss {
+        key: "forkable",
+        origin: "the 0.33.0 forkability flag",
+    },
+];
+
+/// The relaunch-snapshot rewrite loss of one frozen reader, over its record
+/// type.
+///
+/// [`ReaderSkip`] carries what the reader skips at load; a reader can also
+/// keep a record whose recovery binding carries a relaunch snapshot it has
+/// no field for and rewrite that snapshot away at its next whole-store
+/// rewrite, so the trait carries, per reader, the released foreign spellings
+/// whose presence the validation must refuse instead of admitting the
+/// rewrite.
+trait ReaderRewriteLoss {
+    /// The released relaunch-snapshot spellings this reader's `ResumeBinding`
+    /// shape silently drops.
+    const REWRITE_LOSS: &'static [SnapshotLoss];
+}
+
+/// Returns the relaunch-snapshot field of `loss` that `record`'s recovery
+/// binding still carries, or `None` when the reader keeps the whole binding.
+///
+/// The recovery binding of a record is the record body itself for a `resume`
+/// record and the session's nested `recovery` snapshot; both spellings carry
+/// the same legacy `ResumeBinding` fields, so the same loss applies to
+/// either location.
+fn relaunch_snapshot_loss(
+    record: &serde_json::Map<String, Value>,
+    loss: &'static [SnapshotLoss],
+) -> Option<&'static SnapshotLoss> {
+    let binding = match record.get("kind").and_then(Value::as_str) {
+        Some("resume") => Some(record),
+        Some("session") => record.get("recovery").and_then(Value::as_object),
+        _ => None,
+    }?;
+    loss.iter().find(|lost| binding.contains_key(lost.key))
+}
+
 /// Validates one schema-1 store body against the reader that `reader`
 /// freezes.
 ///
@@ -126,7 +234,7 @@ pub(super) fn validate_records(
 /// Validates a store body against one frozen reader's typed record shape.
 fn validate_through<T>(bytes: &[u8]) -> Result<usize, (&'static str, String)>
 where
-    T: serde::de::DeserializeOwned + ReaderSkip,
+    T: serde::de::DeserializeOwned + ReaderSkip + ReaderRewriteLoss,
 {
     let body = std::str::from_utf8(bytes).map_err(|error| {
         (
@@ -177,11 +285,27 @@ where
         }
         let checked = serde_json::from_str::<T>(line);
         match checked {
-            Ok(record) => {
-                if let Some(reason) = T::skip_reason(&record) {
+            Ok(parsed) => {
+                if let Some(reason) = T::skip_reason(&parsed) {
                     return Err((
                         "legacy_store_invalid",
                         format!("line {number} would be skipped: {reason}"),
+                    ));
+                }
+                // The reader keeps the record, but its serde shape carries
+                // only its own relaunch snapshot: a binding still spelling
+                // the other release's snapshot is rewritten without it, so
+                // the validation refuses the line instead of admitting the
+                // silent loss.
+                if let Some(lost) = relaunch_snapshot_loss(record, T::REWRITE_LOSS) {
+                    return Err((
+                        "legacy_store_invalid",
+                        format!(
+                            "line {number} would drop its relaunch snapshot: {key} is {origin}, \
+                             which the previous daemon silently rewrites away",
+                            key = lost.key,
+                            origin = lost.origin
+                        ),
                     ));
                 }
             }
@@ -225,6 +349,12 @@ impl ReaderSkip for Record {
             _ => None,
         }
     }
+}
+
+impl ReaderRewriteLoss for Record {
+    /// The v0.33.0 relaunch snapshot spellings the v0.33.1 `ResumeBinding`
+    /// silently rewrites away.
+    const REWRITE_LOSS: &'static [SnapshotLoss] = RESUME_MODE_SNAPSHOT_LOSS;
 }
 
 /// One line of the legacy store: internally tagged by `kind`, `snake_case`.
@@ -1226,6 +1356,12 @@ impl ReaderSkip for Record330 {
             _ => None,
         }
     }
+}
+
+impl ReaderRewriteLoss for Record330 {
+    /// The v0.33.1 relaunch snapshot spellings the v0.33.0 `ResumeBinding`
+    /// silently rewrites away.
+    const REWRITE_LOSS: &'static [SnapshotLoss] = NATIVE_LAUNCH_SNAPSHOT_LOSS;
 }
 
 /// Whether a v0.33.0 session record keeps its agent kinds.

@@ -5095,14 +5095,152 @@ async fn pending_upgrade_with_legacy_store_line(harness: &Harness, previous: &st
     write_legacy_store_bytes(&store_path(harness), format!("{line}\n").as_bytes());
 }
 
+/// Pins a schema-1 store `line` as refused by a rollback to `previous`,
+/// judged by that release's frozen reader: the read-only check refuses, and
+/// the rollback refuses with and without runtime-loss consent, all before
+/// any effect. `verdict` names the fragment the refusal detail carries, to
+/// tell the reader's skip rule apart from the relaunch-rewrite loss.
+async fn pending_store_line_refuses(
+    harness: &Harness,
+    previous: &str,
+    name: &str,
+    line: &str,
+    verdict: &str,
+) {
+    pending_upgrade_with_legacy_store_line(harness, previous, line).await;
+    let before = harness.pending().expect("pending upgrade");
+    let (installs, replaces) = {
+        let world = harness.fake.world();
+        (world.installs, world.replaces)
+    };
+    let store_before = std::fs::read(store_path(harness)).expect("read store");
+
+    let checked = crate::service::check_with_preflight(
+        &harness.context,
+        &harness.staged(previous),
+        &InProcessPreflight::default(),
+        previous,
+        true,
+    )
+    .await
+    .expect_err("read-only check refuses what the reader would lose");
+    assert_eq!(
+        checked.code(),
+        "service_rollback_store_unusable",
+        "{previous} {name}"
+    );
+    assert!(
+        matches!(
+            &checked,
+            Error::RollbackStoreUnusable { code, detail, .. }
+                if code == "legacy_store_invalid" && detail.contains(verdict)
+        ),
+        "{previous} {name}: {checked:?}"
+    );
+
+    let error = harness
+        .upgrade(previous)
+        .await
+        .expect_err("rollback refuses what the reader would lose, consent or not");
+    assert_eq!(
+        error.code(),
+        "service_rollback_store_unusable",
+        "{previous} {name}"
+    );
+    assert!(
+        matches!(
+            &error,
+            Error::RollbackStoreUnusable { code, detail, .. }
+                if code == "legacy_store_invalid" && detail.contains(verdict)
+        ),
+        "{previous} {name}: {error:?}"
+    );
+
+    let error = harness
+        .upgrade_accepting_loss(previous)
+        .await
+        .expect_err("rollback refuses what the reader would lose, consent or not");
+    assert_eq!(
+        error.code(),
+        "service_rollback_store_unusable",
+        "{previous} {name}"
+    );
+    assert!(
+        matches!(
+            &error,
+            Error::RollbackStoreUnusable { code, detail, .. }
+                if code == "legacy_store_invalid" && detail.contains(verdict)
+        ),
+        "{previous} {name}: {error:?}"
+    );
+
+    // Nothing changed: the pending transaction is kept, the new daemon
+    // still runs its recorded config, and the store is untouched for the
+    // operator.
+    assert_eq!(harness.pending(), Some(before), "{previous} {name}");
+    let after = {
+        let world = harness.fake.world();
+        (world.installs, world.replaces, world.running)
+    };
+    assert_eq!(after.0, installs, "{previous} {name}");
+    assert_eq!(after.1, replaces, "{previous} {name}");
+    assert!(after.2, "{previous} {name}: the new daemon still runs");
+    assert_eq!(
+        harness.fake.daemon_version().as_deref(),
+        Some(V2),
+        "{previous} {name}"
+    );
+    assert_eq!(
+        harness.config().expect("config").active_version(),
+        V2,
+        "{previous} {name}"
+    );
+    assert_eq!(
+        std::fs::read(store_path(harness)).expect("read store"),
+        store_before,
+        "{previous} {name}: the store is untouched"
+    );
+}
+
+/// Pins a schema-1 store `line` as kept by a rollback to `previous`, judged
+/// by that release's frozen reader: the pending upgrade rolls back to
+/// `previous` and its reader keeps the whole store.
+async fn pending_store_line_keeps(harness: &Harness, previous: &str, line: &str) {
+    pending_upgrade_with_legacy_store_line(harness, previous, line).await;
+    let report = harness
+        .upgrade(previous)
+        .await
+        .expect("the previous reader keeps the record");
+    let preflight = report.preflight.expect("rollback preflight");
+    assert_eq!(preflight.store.state, StoreState::UpToDate, "{previous}");
+    assert_eq!(preflight.store.records, 1, "{previous}");
+    harness.assert_installed(previous);
+}
+
+/// A resume line whose `resume_mode` the v0.33.0 reader requires to be one
+/// of its relaunch modes and skips the line over: a record the v0.33.1
+/// reader deserializes and still rewrites the relaunch snapshot away from.
+const V0_33_0_UNKNOWN_RESUME_MODE: &str = r#"{"kind":"resume","session_id":"s-mode","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-1","resume_mode":"no-such-mode"}"#;
+
+/// A resume line whose launch spec has no reference placeholder.
+const V0_33_1_REFERENCE_LESS_LAUNCH: &str = r#"{"kind":"resume","session_id":"s-launch","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-1","native_launch":{"reference_kind":"id","resume_args":[]}}"#;
+
+/// A resume line whose launch pin names a digest the strict digest grammar
+/// rejects.
+const V0_33_1_UNDIGESTED_LAUNCH_PIN: &str = r#"{"kind":"resume","session_id":"s-pin","agent":"codex","agent_base":"codex","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-2","launch_binding":{"runtime_id":"codex","provenance":{"kind":"package","package":{"id":"codex","version":"1.2.3"},"package_digest":"nothex"}}}"#;
+
+/// A resume line whose launch spec names a reference kind the readers never
+/// spell.
+const V0_33_1_UNKNOWN_REFERENCE_KIND: &str = r#"{"kind":"resume","session_id":"s-ref","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-3","native_launch":{"reference_kind":"nonsense","resume_args":["--resume","{reference}"]}}"#;
+
 /// Schema-1 lines the v0.33.0 reader would silently drop but the v0.33.1
-/// reader keeps. The resume mode is a required enum at v0.33.0 and an
+/// reader keeps: the resume mode is a required enum at v0.33.0 and an
 /// ignored field at v0.33.1, and a grammar-valid custom agent base is a
 /// runtime id at v0.33.1 but an unknown `AgentKind` at v0.33.0.
 const V0_33_0_DROPS: &[(&str, &str)] = &[
     (
         "resume with an unknown resume_mode",
-        r#"{"kind":"resume","session_id":"s-mode","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-1","resume_mode":"no-such-mode"}"#,
+        V0_33_0_UNKNOWN_RESUME_MODE,
     ),
     (
         "resume with a grammar-valid custom agent base",
@@ -5136,128 +5274,153 @@ const V0_33_0_DROPS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Schema-1 lines the v0.33.1 reader would silently drop but the v0.33.0
-/// reader keeps: v0.33.1 validates the native launch snapshot the v0.33.0
-/// reader never carried.
+/// Schema-1 lines the v0.33.1 reader would silently drop: v0.33.1 validates
+/// the native launch snapshot its recovery bindings carry. The v0.33.0
+/// reader deserializes each of these lines and refuses it under the same
+/// gate for silently rewriting that snapshot away.
 const V0_33_1_DROPS: &[(&str, &str)] = &[
     (
         "resume with a reference-less native launch",
-        r#"{"kind":"resume","session_id":"s-launch","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-1","native_launch":{"reference_kind":"id","resume_args":[]}}"#,
+        V0_33_1_REFERENCE_LESS_LAUNCH,
     ),
     (
         "resume with an undigested launch binding",
-        r#"{"kind":"resume","session_id":"s-pin","agent":"codex","agent_base":"codex","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-2","launch_binding":{"runtime_id":"codex","provenance":{"kind":"package","package":{"id":"codex","version":"1.2.3"},"package_digest":"nothex"}}}"#,
+        V0_33_1_UNDIGESTED_LAUNCH_PIN,
     ),
     (
         "resume with an unknown native reference kind",
-        r#"{"kind":"resume","session_id":"s-ref","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-3","native_launch":{"reference_kind":"nonsense","resume_args":["--resume","{reference}"]}}"#,
+        V0_33_1_UNKNOWN_REFERENCE_KIND,
     ),
 ];
 
-/// A resume snapshot in the v0.33.0 release's own real spellings: the
-/// v0.33.0 reader deserializes every field and keeps the record, while the
-/// v0.33.1 reader ignores the fields it never carried.
-const V0_33_0_MODE_SNAPSHOT_BOTH_KEEP: &str = r#"{"kind":"resume","session_id":"s-modes","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_path":"/w/transcript.jsonl","ref_kind":"path","resumable":true,"resume_mode":"subcommand","forkable":true,"fork_mode":"claude_session","fork_resume_mode":"flag","fork_ref_kind":"id"}"#;
+/// Schema-1 recovery bindings in the v0.33.1 relaunch-snapshot spellings
+/// that the v0.33.0 reader parses, keeps, and still rewrites without the
+/// snapshot — the valid snapshot and the lines v0.33.1 itself drops alike:
+/// the preservation rule refuses a rollback that would silently lose the
+/// native recovery on restore.
+const V0_33_1_REWRITE_LOSS: &[(&str, &str)] = &[
+    (
+        "resume with a native launch snapshot",
+        V0_33_1_LAUNCH_SNAPSHOT,
+    ),
+    (
+        "session with a native launch recovery",
+        V0_33_1_RECOVERY_LAUNCH,
+    ),
+    (
+        "resume with a reference-less native launch",
+        V0_33_1_REFERENCE_LESS_LAUNCH,
+    ),
+    (
+        "resume with an undigested launch binding",
+        V0_33_1_UNDIGESTED_LAUNCH_PIN,
+    ),
+    (
+        "resume with an unknown native reference kind",
+        V0_33_1_UNKNOWN_REFERENCE_KIND,
+    ),
+];
+
+/// Schema-1 recovery bindings in the v0.33.0 relaunch-snapshot spellings
+/// that the v0.33.1 reader parses, keeps, and still rewrites without the
+/// snapshot, with no `native_launch` to keep the relaunch shape the reader
+/// drops: the preservation rule refuses a rollback that would silently lose
+/// the relaunch modes.
+const V0_33_0_REWRITE_LOSS: &[(&str, &str)] = &[
+    ("resume with relaunch modes", V0_33_0_MODE_SNAPSHOT),
+    ("session with a relaunch recovery", V0_33_0_RECOVERY_MODES),
+    (
+        "resume with an unknown resume_mode",
+        V0_33_0_UNKNOWN_RESUME_MODE,
+    ),
+];
+
+/// A recovery binding in the v0.33.0 release's own relaunch snapshot
+/// spellings: the v0.33.0 reader deserializes and keeps every field, while
+/// the v0.33.1 reader has no `native_launch` to compensate for the relaunch
+/// argv modes it silently rewrites away.
+const V0_33_0_MODE_SNAPSHOT: &str = r#"{"kind":"resume","session_id":"s-modes","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_path":"/w/transcript.jsonl","ref_kind":"path","resumable":true,"resume_mode":"subcommand","forkable":true,"fork_mode":"claude_session","fork_resume_mode":"flag","fork_ref_kind":"id"}"#;
+
+/// A session record whose nested `recovery` binding carries the v0.33.0
+/// release's own relaunch snapshot spellings: kept by the v0.33.0 reader and
+/// rewritten without the snapshot by the v0.33.1 reader.
+const V0_33_0_RECOVERY_MODES: &str = concat!(
+    r#"{"kind":"session","schema_version":1,"session_id":"s-modes","desired_state":"stopped","#,
+    r#""info":{"id":"s-modes","agent":"claude","agent_base":"claude","cwd":"/work","pid":46,"cols":80,"rows":24,"state":"stopped","state_source":"process","native_session_path":"/w/transcript.jsonl","created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"},"#,
+    r#""recovery":{"session_id":"s-modes","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_path":"/w/transcript.jsonl","ref_kind":"path","resumable":true,"resume_mode":"subcommand","forkable":true,"fork_mode":"claude_session","fork_resume_mode":"flag","fork_ref_kind":"id"},"#,
+    r#""runtime":{"state":"lost"}}"#,
+);
+
+/// A recovery binding in the v0.33.1 release's own relaunch snapshot
+/// spellings: the v0.33.0 reader deserializes it and still rewrites the
+/// native launch spec and its launch pin away, so the rollback refuses it
+/// instead of losing native recovery on restore.
+const V0_33_1_LAUNCH_SNAPSHOT: &str = concat!(
+    r#"{"kind":"resume","session_id":"s-launch","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-1","#,
+    r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"},"reference"]},"#,
+    r#""launch_binding":{"runtime_id":"claude","provenance":{"kind":"builtin","descriptor_digest":"#,
+    r#""sha256:0000000000000000000000000000000000000000000000000000000000000000"}}}"#,
+);
+
+/// A session record whose nested `recovery` binding carries the v0.33.1
+/// release's own relaunch snapshot spellings: kept by the v0.33.1 reader and
+/// rewritten without the native launch snapshot by the v0.33.0 reader.
+const V0_33_1_RECOVERY_LAUNCH: &str = concat!(
+    r#"{"kind":"session","schema_version":1,"session_id":"s-native","desired_state":"stopped","#,
+    r#""info":{"id":"s-native","agent":"claude","agent_base":"claude","cwd":"/work","pid":45,"cols":80,"rows":24,"state":"stopped","state_source":"process","native_session_id":"native-2","created_at":"2026-06-19T00:00:00Z","updated_at":"2026-06-19T00:00:00Z"},"#,
+    r#""recovery":{"session_id":"s-native","agent":"claude","agent_base":"claude","cwd":"/work","cols":80,"rows":24,"native_session_id":"native-2","#,
+    r#""native_launch":{"reference_kind":"id","resume_args":[{"literal":"--resume"},"reference"]}},"#,
+    r#""runtime":{"state":"lost"}}"#,
+);
 
 #[tokio::test]
 async fn a_downgrade_is_judged_by_the_previous_release_reader_alone() {
     // The two released readers disagree on what a schema-1 record must
-    // carry, so each release's rollback is judged against that release's own
-    // reader. With no live workers, a store line the previous reader would
-    // silently rewrite away refuses the rollback and the uninstall even with
-    // runtime-loss consent, before any effect; a line its reader keeps rolls
-    // back.
-    for (previous, refusals) in [("0.33.0", V0_33_0_DROPS), ("0.33.1", V0_33_1_DROPS)] {
+    // carry and which relaunch snapshot its recovery bindings preserve, so
+    // each release's rollback is judged against that release's own reader.
+    // With no live workers, a store line the previous reader would silently
+    // rewrite away — a line it skips, or a relaunch snapshot it drops from a
+    // recovery binding it keeps — refuses the read-only check and the
+    // rollback before any effect, with and without runtime-loss consent; a
+    // line its reader keeps rolls back.
+    for (previous, refusals, verdict) in [
+        ("0.33.0", V0_33_0_DROPS, "would be skipped"),
+        ("0.33.1", V0_33_1_DROPS, "would be skipped"),
+        (
+            "0.33.0",
+            V0_33_1_REWRITE_LOSS,
+            "would drop its relaunch snapshot",
+        ),
+        (
+            "0.33.1",
+            V0_33_0_REWRITE_LOSS,
+            "would drop its relaunch snapshot",
+        ),
+    ] {
         for (name, line) in refusals {
             let harness = Harness::new();
-            pending_upgrade_with_legacy_store_line(&harness, previous, line).await;
-            let before = harness.pending().expect("pending upgrade");
-            let (installs, replaces) = {
-                let world = harness.fake.world();
-                (world.installs, world.replaces)
-            };
-            let store_before = std::fs::read(store_path(&harness)).expect("read store");
-
-            let checked = crate::service::check_with_preflight(
-                &harness.context,
-                &harness.staged(previous),
-                &InProcessPreflight::default(),
-                previous,
-                true,
-            )
-            .await
-            .expect_err("read-only check refuses what the reader would skip");
-            assert_eq!(checked.code(), "service_rollback_store_unusable", "{name}");
-            assert!(
-                matches!(
-                    &checked,
-                    Error::RollbackStoreUnusable { code, .. } if code == "legacy_store_invalid"
-                ),
-                "{previous} {name}: {checked:?}"
-            );
-
-            let error = harness
-                .upgrade_accepting_loss(previous)
-                .await
-                .expect_err("rollback refuses what the reader would skip");
-            assert_eq!(error.code(), "service_rollback_store_unusable", "{name}");
-            assert!(
-                matches!(
-                    &error,
-                    Error::RollbackStoreUnusable { code, .. } if code == "legacy_store_invalid"
-                ),
-                "{previous} {name}: {error:?}"
-            );
-            // Nothing changed: the record survives, the new daemon still
-            // runs, and the store is untouched for the operator.
-            assert_eq!(harness.pending(), Some(before), "{name}");
-            let after = {
-                let world = harness.fake.world();
-                (world.installs, world.replaces, world.running)
-            };
-            assert_eq!(after.0, installs, "{name}");
-            assert_eq!(after.1, replaces, "{name}");
-            assert!(after.2, "{name}: the new daemon still runs");
-            assert_eq!(harness.fake.daemon_version().as_deref(), Some(V2));
-            assert_eq!(
-                std::fs::read(store_path(&harness)).expect("read store"),
-                store_before,
-                "{name}: the store is untouched"
-            );
+            pending_store_line_refuses(&harness, previous, name, line, verdict).await;
         }
     }
 
-    // Where its own reader keeps the record, the rollback proceeds: what
-    // v0.33.0 drops stays with v0.33.1, and the reverse.
-    for (previous, keeps) in [("0.33.1", V0_33_0_DROPS), ("0.33.0", V0_33_1_DROPS)] {
-        for (name, line) in keeps {
-            let harness = Harness::new();
-            pending_upgrade_with_legacy_store_line(&harness, previous, line).await;
-            let report = harness
-                .upgrade(previous)
-                .await
-                .expect("the previous reader keeps the record");
-            let preflight = report.preflight.expect("rollback preflight");
-            assert_eq!(preflight.store.state, StoreState::UpToDate, "{name}");
-            assert_eq!(preflight.store.records, 1, "{name}");
-            harness.assert_installed(previous);
-        }
-    }
-
-    // A snapshot in the v0.33.0 release's own spellings is kept by both
-    // released readers.
-    for previous in ["0.33.0", "0.33.1"] {
+    // Where its own reader keeps the record, the rollback proceeds: the
+    // v0.33.1 reader keeps every agent kind v0.33.0 drops at its runtime-id
+    // spellings (the mode line refused above is not among them, rewritten
+    // without its relaunch snapshot), and each reader keeps the relaunch
+    // snapshot it froze itself, at a resume line and nested in a session
+    // record alike.
+    for (_, line) in &V0_33_0_DROPS[1..] {
         let harness = Harness::new();
-        pending_upgrade_with_legacy_store_line(&harness, previous, V0_33_0_MODE_SNAPSHOT_BOTH_KEEP)
-            .await;
-        let report = harness
-            .upgrade(previous)
-            .await
-            .expect("both readers keep the v0.33.0 spellings");
-        let preflight = report.preflight.expect("rollback preflight");
-        assert_eq!(preflight.store.state, StoreState::UpToDate);
-        assert_eq!(preflight.store.records, 1);
-        harness.assert_installed(previous);
+        pending_store_line_keeps(&harness, "0.33.1", line).await;
+    }
+    for (previous, snapshots) in [
+        ("0.33.0", [V0_33_0_MODE_SNAPSHOT, V0_33_0_RECOVERY_MODES]),
+        ("0.33.1", [V0_33_1_LAUNCH_SNAPSHOT, V0_33_1_RECOVERY_LAUNCH]),
+    ] {
+        for snapshot in snapshots {
+            let harness = Harness::new();
+            pending_store_line_keeps(&harness, previous, snapshot).await;
+        }
     }
 }
 
