@@ -1,0 +1,56 @@
+name: Setup zig
+description: >-
+  Download a pinned zig release, verify its sha256 before extracting, and put
+  its directory on PATH. zig is used only as a C compiler (`zig cc`) that ships
+  the macOS libc headers, so the macOS build scripts of `scripts/darwin-check`
+  compile on a Linux runner without an Apple SDK.
+
+inputs:
+  version:
+    description: zig release version (e.g. 0.17.0).
+    required: true
+  sha256:
+    description: Expected sha256 of zig-x86_64-linux-<version>.tar.xz.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install zig
+      shell: bash
+      env:
+        ZIG_VERSION: ${{ inputs.version }}
+        ZIG_SHA256: ${{ inputs.sha256 }}
+        # `--retry-all-errors` retries every failure, including a connection
+        # reset (curl exit 35 or 56) that plain `--retry` treats as permanent.
+        # A permanent error such as 404 is retried too and fails after the last
+        # attempt. The sha256 check below still guards the bytes.
+        DOWNLOAD_RETRIES: "5"
+        DOWNLOAD_RETRY_DELAY_SECONDS: "2"
+      run: |
+        set -eu
+        # GitHub does not enforce `required: true` on composite inputs.
+        if [ -z "$ZIG_VERSION" ] || [ -z "$ZIG_SHA256" ]; then
+          echo "::error::setup-zig: inputs 'version' and 'sha256' are required" >&2
+          exit 1
+        fi
+        # The pinned archive is the x86_64 Linux build; fail rather than
+        # download a binary for the wrong architecture.
+        if [ "$(uname -m)" != x86_64 ]; then
+          echo "::error::setup-zig: unsupported architecture $(uname -m)" >&2
+          exit 1
+        fi
+        archive="zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+        dest="${RUNNER_TEMP:?}/zig"
+        mkdir -p "$dest"
+        curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+          --retry "$DOWNLOAD_RETRIES" --retry-all-errors \
+          --retry-delay "$DOWNLOAD_RETRY_DELAY_SECONDS" \
+          --output "$dest/$archive" \
+          "https://ziglang.org/download/${ZIG_VERSION}/${archive}"
+        # Fails closed: extraction only runs after the hash matches.
+        (cd "$dest" && printf '%s  %s\n' "$ZIG_SHA256" "$archive" | sha256sum -c -)
+        tar -xJf "$dest/$archive" -C "$dest" --strip-components=1
+        rm -f "$dest/$archive"
+        echo "$dest" >> "$GITHUB_PATH"
+        "$dest/zig" version

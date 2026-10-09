@@ -57,7 +57,7 @@ env:
   # Compile cache (issue #164): Swatinem/rust-cache is the only compile-cache
   # layer. Each Rust job restores the entry of its job type (`shared-key`:
   # clippy, test-debug, bins, release, xtask, docs, hack, nightly-udeps,
-  # platform-contracts). The full key also hashes the toolchain, the
+  # platform-contracts, darwin-check). The full key also hashes the toolchain, the
   # RUST*/CARGO* environment (RUSTFLAGS included), and the Cargo manifests.
   # rust-cache saves only on a key miss and the first finisher wins, so each
   # key has exactly one designated saver, the job that builds the superset
@@ -74,6 +74,12 @@ env:
   # asset `digest`), cross-checked against a local download. Bump both together.
   MOLD_VERSION: "2.42.1"
   MOLD_SHA256: 6ff270c9bf07d2bec5c98aa324eb7c4daf6a1a4d815c05ff1708049616047855
+  # Pinned zig release for .github/actions/setup-zig, used only as the C compiler
+  # of the `darwin-check` job. ZIG_SHA256 is the sha256 ziglang.org publishes for
+  # zig-x86_64-linux-0.17.0.tar.xz (https://ziglang.org/download/index.json).
+  # Bump both together.
+  ZIG_VERSION: "0.17.0"
+  ZIG_SHA256: 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
 
 jobs:
   platform-contracts:
@@ -470,6 +476,47 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features
+
+  # Lints the macOS-only code on a Linux runner in about two minutes cold
+  # (issue #365), so a `cfg(target_os = "macos")` compile or lint error fails a
+  # pull request here instead of after the 9-13 minute native `platform
+  # contracts (arm64)` job. It only checks: nothing is linked or run, so the
+  # native jobs stay the acceptance evidence. The Apple SDK is absent, so
+  # scripts/darwin-check compiles the C build scripts of `ring` and `psm` with
+  # `zig cc`, which carries the macOS libc headers. Runs on every event, like
+  # `fmt + clippy`: one cheap job whose failure is the signal, with no paths
+  # filter that could hide a macOS-only break.
+  darwin-check:
+    name: macOS lint from Linux (aarch64-apple-darwin clippy)
+    runs-on: ubuntu-latest
+    env:
+      # No mold link argument: the lint links nothing, and with an explicit
+      # `--target` RUSTFLAGS apply to the Apple target only.
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zig
+        uses: ./.github/actions/setup-zig
+        with:
+          version: ${{ env.ZIG_VERSION }}
+          sha256: ${{ env.ZIG_SHA256 }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
+          components: clippy
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: darwin-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy for aarch64-apple-darwin
+        run: scripts/darwin-check
 
   # Compiles every workspace test binary exactly once for the fast shards, the
   # heavy job, and the relay DB job (issue #170). Designated `test-debug`

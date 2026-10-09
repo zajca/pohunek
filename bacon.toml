@@ -9,6 +9,7 @@
 #   bacon                                         # fast nextest loop
 #   bacon check                                   # compile errors only, the fastest signal
 #   bacon clippy-fast                             # the CI lint gate
+#   bacon darwin-check                            # lint the macOS-only code from Linux
 #   bacon affected                                # fast loop for changed crates only
 #   bacon nextest-fast -- -p pohunek-daemon       # narrow to one crate
 #   bacon nextest-fast -- some_test_name           # narrow to one test
@@ -63,6 +64,13 @@ command = [
     "cargo", "clippy", "--workspace", "--all-targets", "--all-features",
     "--", "-D", "warnings",
 ]
+need_stdout = false
+
+# The macOS lint from a Linux host: `cfg(target_os = "macos")` code is not
+# compiled by any other job here. Needs `zig` on PATH on non-macOS hosts and
+# `rustup target add aarch64-apple-darwin`; see scripts/darwin-check.
+[jobs.darwin-check]
+command = ["scripts/darwin-check"]
 need_stdout = false
 
 # Explicit job switches. They override bacon's built-in `a` (`check-all`),
