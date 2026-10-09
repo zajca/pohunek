@@ -544,6 +544,25 @@ async fn previous_version_client_drives_a_worker_backed_session_in_the_previous_
         "the protocol 4 spelling is not part of a protocol 3 request: {current_spelling}"
     );
 
+    // A previous-version request without a runtime succeeded above. A value
+    // with the wrong shape must reach the daemon's typed request validation
+    // and be rejected without taking down the connection.
+    let malformed_runtime = exchange(
+        &mut client,
+        &previous_request(
+            "output-bad-runtime",
+            method::SESSION_OUTPUT,
+            json!({
+                "session_id": live.session_id,
+                "runtime": "w-1",
+                "max_bytes": OUTPUT_MAX_BYTES,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(malformed_runtime["v"], PREVIOUS_VERSION);
+    assert_eq!(malformed_runtime["err"]["code"], "bad_request");
+
     let stopped = exchange(
         &mut client,
         &previous_request("stop-1", method::SESSION_STOP, json!(live.session_id)),
