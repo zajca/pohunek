@@ -98,6 +98,25 @@ async fn request_response_connect_local_sends_json_request_line_and_returns_ok_p
 }
 
 #[tokio::test]
+async fn missing_local_daemon_reports_a_start_recovery_hint() {
+    let socket_file = SocketFile::new();
+    let Err(error) =
+        Client::connect_local_with_options(socket_file.path(), no_origin_options()).await
+    else {
+        panic!("an absent local daemon must not connect");
+    };
+    assert!(matches!(error, ClientError::DaemonUnreachable { .. }));
+
+    let structured = error.to_protocol_error();
+    assert_eq!(structured.class, ErrorClass::Daemon);
+    assert_eq!(structured.code, "daemon_unreachable");
+    assert!(structured
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("daemon start")));
+}
+
+#[tokio::test]
 async fn request_response_connect_trusted_tcp_addr_sends_json_request_line_and_returns_ok_payload()
 {
     let (result, request_line) = run_remote(Reply::Line(response_ok_line())).await;
@@ -693,6 +712,7 @@ async fn request_response_remote_daemon_error_maps_to_remote_protocol_with_sourc
         "structured message names host: {}",
         structured.msg
     );
+    assert!(structured.msg.contains("agent failed during test"));
 }
 
 #[tokio::test]
@@ -761,17 +781,24 @@ async fn request_response_timeout_poisons_connection_before_late_response_can_be
         .await
         .expect("connect local test daemon");
 
-    match client
+    let timeout_error = client
         .request(&first_request)
         .await
-        .expect_err("first request times out")
-    {
+        .expect_err("first request times out");
+    match &timeout_error {
         ClientError::RequestTimeout { host, timeout } => {
-            assert_eq!(host, None);
-            assert_eq!(timeout, Duration::from_millis(20));
+            assert_eq!(host, &None);
+            assert_eq!(*timeout, Duration::from_millis(20));
         }
         other => panic!("expected typed request timeout, got {other:?}"),
     }
+    let structured = timeout_error.to_protocol_error();
+    assert_eq!(structured.class, ErrorClass::Transport);
+    assert_eq!(structured.code, "request_timeout");
+    assert!(structured
+        .recover
+        .as_deref()
+        .is_some_and(|hint| hint.contains("reconcile")));
     assert_sent_specific_request(
         &daemon
             .first_request_line

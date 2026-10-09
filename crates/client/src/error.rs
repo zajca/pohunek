@@ -515,24 +515,6 @@ mod tests {
     }
 
     #[test]
-    fn local_daemon_unreachable_maps_to_daemon_error_with_recovery_hint() {
-        let err = ClientError::DaemonUnreachable {
-            socket: PathBuf::from("/run/pohunek/daemon.sock"),
-            source: io::Error::new(io::ErrorKind::NotFound, "socket missing"),
-        };
-
-        let structured = err.to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Daemon);
-        assert_eq!(structured.code, "daemon_unreachable");
-        let recover = structured
-            .recover
-            .as_deref()
-            .expect("daemon-unreachable carries a recover hint");
-        assert!(recover.contains("daemon start"), "recover: {recover}");
-    }
-
-    #[test]
     fn client_descriptor_exhaustion_does_not_recommend_starting_daemon() {
         let err = ClientError::ClientFileDescriptorsExhausted {
             socket: PathBuf::from("/run/pohunek/daemon.sock"),
@@ -673,57 +655,5 @@ mod tests {
             .recover
             .as_deref()
             .is_some_and(|hint| hint.contains("<non-zero-port>")));
-    }
-
-    #[test]
-    fn request_timeout_maps_to_transient_transport_code() {
-        let structured = ClientError::RequestTimeout {
-            host: Some("build-box".to_owned()),
-            timeout: Duration::from_secs(5),
-        }
-        .to_protocol_error();
-
-        assert_eq!(structured.class, ErrorClass::Transport);
-        assert_eq!(structured.code, "request_timeout");
-        assert!(structured.msg.contains("build-box"));
-        assert!(structured
-            .recover
-            .as_deref()
-            .is_some_and(|hint| hint.contains("reconcile")));
-    }
-
-    #[test]
-    fn remote_protocol_preserves_source_contract_and_adds_host_context() {
-        let source = ProtocolError::version_mismatch(
-            ProtocolVersionRange::new(
-                ProtocolVersion::new(1).expect("nonzero version"),
-                ProtocolVersion::new(1).expect("nonzero version"),
-            )
-            .expect("valid exact range"),
-            ProtocolVersionRange::new(
-                ProtocolVersion::new(2).expect("nonzero version"),
-                ProtocolVersion::new(2).expect("nonzero version"),
-            )
-            .expect("valid exact range"),
-        );
-        let structured = ClientError::RemoteProtocol {
-            host: "build-box".to_owned(),
-            source: source.clone(),
-        }
-        .to_protocol_error();
-
-        assert_eq!(structured.class, source.class);
-        assert_eq!(structured.code, source.code);
-        assert_eq!(structured.recover, source.recover);
-        assert!(
-            structured.msg.contains("build-box"),
-            "msg names host: {}",
-            structured.msg
-        );
-        assert!(
-            structured.msg.contains("does not overlap"),
-            "msg preserves source detail: {}",
-            structured.msg
-        );
     }
 }
