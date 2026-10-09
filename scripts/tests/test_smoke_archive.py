@@ -79,11 +79,7 @@ def processes_with_marker():
     return found
 
 
-@unittest.skipUnless(
-    sys.platform.startswith("linux") and shutil.which("unshare") and shutil.which("jq") and userns_available(),
-    "needs Linux with unprivileged user namespaces, unshare and jq",
-)
-class SmokeArchiveTest(unittest.TestCase):
+class _SmokeArchiveFixture:
     def setUp(self):
         self.base = Path(tempfile.mkdtemp(prefix="pohunek-smoke-test-"))
         self.addCleanup(shutil.rmtree, self.base, ignore_errors=True)
@@ -138,22 +134,25 @@ class SmokeArchiveTest(unittest.TestCase):
         self.consumer.write_text(text)
         self.consumer.chmod(0o755)
 
-    def smoke(self, *extra, archive=None, stage=None, node_dir=None):
+    def smoke(self, *extra, archive=None, stage=None, node_dir=None, timeout=None):
         env = dict(os.environ)
         env["TMPDIR"] = str(self.tmpdir)
         if node_dir is not None:
             env["PATH"] = f"{node_dir}:{env['PATH']}"
+        command = [
+            str(SCRIPT),
+            "--archive",
+            str(archive or self.archive),
+            "--stage",
+            str(stage or self.stage),
+            "--consumer",
+            str(self.consumer),
+            *extra,
+        ]
+        if timeout is not None:
+            command = ["timeout", "--signal=TERM", "--kill-after=2s", f"{timeout}s", *command]
         return subprocess.run(
-            [
-                str(SCRIPT),
-                "--archive",
-                str(archive or self.archive),
-                "--stage",
-                str(stage or self.stage),
-                "--consumer",
-                str(self.consumer),
-                *extra,
-            ],
+            command,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -164,6 +163,12 @@ class SmokeArchiveTest(unittest.TestCase):
         self.assertEqual(list(self.tmpdir.iterdir()), [], "the temp directory was left behind")
         self.assertEqual(processes_with_marker(), [], "a process was left behind")
 
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux") and shutil.which("unshare") and shutil.which("jq") and userns_available(),
+    "needs Linux with unprivileged user namespaces, unshare and jq",
+)
+class SmokeArchiveTest(_SmokeArchiveFixture, unittest.TestCase):
     # -- scenarios ----------------------------------------------------------
 
     def test_success_runs_every_shipped_runtime_in_a_hermetic_environment(self):
@@ -222,18 +227,145 @@ echo "ENV-CATALOG=$POHUNEK_CONSUMER_CATALOG"; echo "ENV-ARGS=$*"
         self.assertIn("does not match STAGE.sha256", result.stderr)
         self.assert_cleaned_up()
 
-    def test_an_unlisted_file_and_a_link_leaving_the_stage_are_refused(self):
+    @unittest.skipUnless(shutil.which("timeout"), "needs the timeout command as a hang guard")
+    def test_a_sha256_listed_fifo_is_refused_before_hashing(self):
+        payload = self.stage / "pi" / "bin" / "pi"
+        payload.unlink()
+        os.mkfifo(payload)
+        result = self.smoke("--runtime", "pi", timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(result.returncode, (124, 137), "the FIFO reached the hang guard")
+        self.assertIn("file types differ from STAGE.sha256", result.stderr)
+        self.assert_cleaned_up()
+
+    def test_an_unlisted_file_is_refused(self):
         (self.stage / "pi" / "extra").write_text("not listed\n")
         result = self.smoke("--runtime", "pi")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("does not list", result.stderr)
-        (self.stage / "pi" / "extra").unlink()
+        self.assertIn("manifests do not list", result.stderr)
+
+    def test_a_link_leaving_the_stage_is_refused(self):
         outside = self.base / "outside"
         outside.write_text("x\n")
         (self.stage / "pi" / "escape").symlink_to(outside)
+        with (self.stage / "pi" / "STAGE.links").open("a") as manifest:
+            manifest.write(f"link\tescape\t{outside}\n")
         result = self.smoke("--runtime", "pi")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("link leaves the staged upstream", result.stderr)
+        self.assertIn("invalid STAGE.links link path or target", result.stderr)
+
+    def test_a_retargeted_link_is_refused(self):
+        stage = self.stage / "pi"
+        (stage / "bin" / "alias").symlink_to("pi")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\tbin/alias\tpi\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (stage / "bin" / "alias").unlink()
+        (stage / "bin" / "alias").symlink_to("../bin/pi")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("link differs from STAGE.links", result.stderr)
+
+    def test_an_absolute_link_target_inside_stage_is_refused(self):
+        stage = self.stage / "pi"
+        target = stage / "bin" / "pi"
+        (stage / "bin" / "alias").symlink_to(target)
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write(f"link\tbin/alias\t{target}\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid STAGE.links link path or target", result.stderr)
+
+    def test_a_link_target_that_exits_and_reenters_stage_is_refused(self):
+        stage = self.stage / "pi"
+        (stage / "alias").symlink_to("../pi/bin/pi")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\talias\t../pi/bin/pi\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid STAGE.links link path or target", result.stderr)
+
+    def test_a_link_target_can_use_parent_inside_stage(self):
+        stage = self.stage / "pi"
+        (stage / "bin" / "alias").symlink_to("../bin/pi")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\tbin/alias\t../bin/pi\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_link_target_with_unicode_control_is_refused(self):
+        stage = self.stage / "pi"
+        target = "pi\u0085"
+        (stage / "bin" / "alias").symlink_to(target)
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write(f"link\tbin/alias\t{target}\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unicode control character in STAGE.links", result.stderr)
+
+    def test_a_changed_executable_bit_is_refused(self):
+        (self.stage / "pi" / "bin" / "pi").chmod(0o644)
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("executable bits differ from STAGE.links", result.stderr)
+
+    def test_an_exec_record_for_a_file_missing_from_sha256_is_refused(self):
+        with (self.stage / "pi" / "STAGE.links").open("a") as manifest:
+            manifest.write("exec\tSTAGE.sha256\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid STAGE.links exec path", result.stderr)
+
+    def test_duplicate_exec_record_is_refused(self):
+        with (self.stage / "pi" / "STAGE.links").open("a") as manifest:
+            manifest.write("exec\tbin/pi\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate STAGE.links exec path", result.stderr)
+
+    def test_duplicate_link_record_is_refused(self):
+        stage = self.stage / "pi"
+        (stage / "bin" / "alias").symlink_to("pi")
+        with (stage / "STAGE.links").open("a") as manifest:
+            manifest.write("link\tbin/alias\tpi\nlink\tbin/alias\tpi\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate STAGE.links link path", result.stderr)
+
+    def test_unterminated_links_record_is_refused(self):
+        (self.stage / "pi" / "STAGE.links").write_text("exec\tbin/pi")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unterminated STAGE.links entry", result.stderr)
+
+    def test_links_record_with_an_extra_field_is_refused(self):
+        (self.stage / "pi" / "STAGE.links").write_text("exec\tbin/pi\textra\n")
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid STAGE.links entry", result.stderr)
+
+    def test_duplicate_sha256_path_is_refused(self):
+        manifest = self.stage / "pi" / "STAGE.sha256"
+        with manifest.open("a") as output:
+            output.write(manifest.read_text())
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("duplicate STAGE.sha256 path", result.stderr)
+
+    def test_unterminated_sha256_record_is_refused(self):
+        manifest = self.stage / "pi" / "STAGE.sha256"
+        manifest.write_text(manifest.read_text().rstrip("\n"))
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unterminated STAGE.sha256 entry", result.stderr)
+
+    def test_unsafe_sha256_path_is_refused_before_hashing(self):
+        manifest = self.stage / "pi" / "STAGE.sha256"
+        manifest.write_text(manifest.read_text().replace("bin/pi", "../pi"))
+        result = self.smoke("--runtime", "pi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe STAGE.sha256 path", result.stderr)
 
     def test_path_traversal_and_link_members_are_refused_before_extraction(self):
         for member_name, kind in (("../evil", "file"), ("/abs/evil", "file"), (f"{NAME}/link", "symlink")):
@@ -315,6 +447,21 @@ PY
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("isolation userns", result.stdout)
 
+    def test_userns_strategy_does_not_run_shadow_tools_from_caller_path(self):
+        shadow = self.base / "shadow"
+        shadow.mkdir()
+        marker = self.base / "shadow-invoked"
+        for tool in ("unshare", "ip", "setpriv", "sudo"):
+            script = shadow / tool
+            script.write_text(f"#!/bin/sh\nprintf '%s\\n' {tool} >> '{marker}'\nexit 77\n")
+            script.chmod(0o755)
+        (shadow / "node").symlink_to(Path(shutil.which("node")).resolve())
+
+        result = self.smoke("--isolation=userns", "--runtime", "pi", node_dir=shadow)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+        self.assert_cleaned_up()
+
     @unittest.skipUnless(
         shutil.which("sudo") and shutil.which("setpriv") and sudo_available(),
         "skipped: `sudo -n unshare` is unavailable here, so the sudo strategy is not exercised locally",
@@ -324,6 +471,37 @@ PY
         result = self.smoke("--isolation=sudo", "--runtime", "pi")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"UID={os.getuid()}", result.stdout)
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux") and shutil.which("unshare") and shutil.which("jq") and shutil.which("node"),
+    "needs Linux with unshare, jq and node",
+)
+class SmokeArchivePreflightTest(_SmokeArchiveFixture, unittest.TestCase):
+    def test_sudo_strategy_does_not_run_shadow_tools_from_caller_path(self):
+        shadow = self.base / "shadow"
+        shadow.mkdir()
+        marker = self.base / "shadow-invoked"
+        for tool in ("sudo", "unshare", "ip", "setpriv"):
+            script = shadow / tool
+            script.write_text(f"#!/bin/sh\nprintf '%s\\n' {tool} >> '{marker}'\nexit 77\n")
+            script.chmod(0o755)
+        (shadow / "node").symlink_to(Path(shutil.which("node")).resolve())
+
+        result = self.smoke("--isolation=sudo", "--runtime", "pi", node_dir=shadow)
+        self.assertFalse(marker.exists(), result.stdout + result.stderr)
+        if result.returncode != 0:
+            self.assertIn("isolation sudo is not available", result.stderr)
+        self.assert_cleaned_up()
+
+    def test_node_symlink_into_checkout_is_refused_before_isolation(self):
+        node_dir = self.base / "node-bin"
+        node_dir.mkdir()
+        (node_dir / "node").symlink_to(SCRIPT)
+        result = self.smoke("--runtime", "pi", node_dir=node_dir)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("node on PATH resolves inside the checkout", result.stderr)
+        self.assert_cleaned_up()
 
 
 def run_checked(args, env=None):

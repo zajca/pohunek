@@ -18,7 +18,7 @@
 #   3. enters a fresh network namespace (plus a PID namespace, so no process can
 #      outlive the run), brings loopback up, asserts that loopback is the only
 #      interface and that no default route exists, and re-verifies every stage
-#      with `sha256sum -c STAGE.sha256` and a link check, using POSIX tools only;
+#      against STAGE.sha256 and STAGE.links using POSIX tools only;
 #   4. runs the prebuilt consumer test executable once per runtime with
 #      PATH = `<stage>/<runtime>/bin` + the system node and tool directories,
 #      a hermetic HOME/XDG tree, a temp working directory and only the
@@ -68,6 +68,33 @@ safe_id() {
     esac
 }
 
+safe_stage_path() {
+    case $1 in
+        '' | /* | */ | *//* | . | .. | ./* | ../* | */./* | */../* | */. | */..) return 1 ;;
+    esac
+    return 0
+}
+
+safe_stage_target() {
+    [ -n "$1" ] || return 1
+    case $1 in /*) return 1 ;; esac
+    target_rest=$1
+    target_depth=$2
+    while :; do
+        component=${target_rest%%/*}
+        case $component in
+            '' | .) ;;
+            ..)
+                [ "$target_depth" -gt 0 ] || return 1
+                target_depth=$((target_depth - 1))
+                ;;
+            *) target_depth=$((target_depth + 1)) ;;
+        esac
+        [ "$target_rest" != "$component" ] || break
+        target_rest=${target_rest#*/}
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Inner half: runs inside the network and PID namespaces.
 # ---------------------------------------------------------------------------
@@ -75,27 +102,150 @@ safe_id() {
 stage_check() {
     stage_dir=$1
     [ -d "$stage_dir" ] && [ ! -L "$stage_dir" ] || fail "staged upstream is not a directory: $stage_dir"
-    [ -f "$stage_dir/STAGE.sha256" ] || fail "staged upstream has no STAGE.sha256: $stage_dir"
-    (cd "$stage_dir" && sha256sum -c STAGE.sha256 >/dev/null 2>&1) \
-        || fail "staged upstream does not match STAGE.sha256: $stage_dir"
-    stage_real=$(cd "$stage_dir" && pwd -P)
-    # `sha256sum -c` follows links, so a link leaving the stage would pass with
-    # matching foreign bytes.
-    find "$stage_dir" -type l | while IFS= read -r link; do
-        target=$(readlink -f -- "$link") || fail "unresolvable link in staged upstream: $link"
-        case $target in
-            "$stage_real"/*) ;;
-            *) fail "link leaves the staged upstream: $link" ;;
+    for manifest in STAGE.sha256 STAGE.links; do
+        [ -f "$stage_dir/$manifest" ] && [ ! -L "$stage_dir/$manifest" ] \
+            || fail "staged upstream has no regular $manifest: $stage_dir"
+        iconv -f UTF-8 -t UTF-8 "$stage_dir/$manifest" >/dev/null \
+            || fail "staged upstream has invalid UTF-8 in $manifest: $stage_dir"
+        case $manifest in
+            STAGE.sha256) allowed_controls='\012' ;;
+            STAGE.links) allowed_controls='\011\012' ;;
         esac
+        [ "$(LC_ALL=C tr -cd '[:cntrl:]\\' < "$stage_dir/$manifest" | LC_ALL=C tr -d "$allowed_controls" | wc -c)" -eq 0 ] \
+            || fail "staged upstream has a control character or backslash in $manifest: $stage_dir"
+        if [ "$manifest" = STAGE.links ]; then
+            LC_ALL=C tr -d '\011' < "$stage_dir/$manifest" > "$work/stage-text-check.txt"
+        else
+            cp -- "$stage_dir/$manifest" "$work/stage-text-check.txt"
+        fi
+        if LC_ALL=C.UTF-8 grep -q '[[:cntrl:]]' "$work/stage-text-check.txt"; then
+            fail "staged upstream has a Unicode control character in $manifest: $stage_dir"
+        else
+            control_status=$?
+            [ "$control_status" -eq 1 ] || fail "cannot check Unicode controls in $manifest: $stage_dir"
+        fi
     done
-    # Every file that can run must be covered by the digest list; STAGE.links
-    # (links and executable bits) holds no payload.
-    listed=$(sed 's/^[0-9a-fA-F]*  *\*\{0,1\}//; s|^\./||' "$stage_dir/STAGE.sha256" | LC_ALL=C sort)
-    present=$(cd "$stage_dir" && find . -type f ! -name STAGE.sha256 ! -name STAGE.links | sed 's|^\./||' | LC_ALL=C sort)
+    : > "$work/stage-files.txt"
+    : > "$work/stage-links.txt"
+    : > "$work/stage-execs.txt"
+    while :; do
+        line=
+        if IFS= read -r line; then
+            :
+        else
+            [ -z "$line" ] || fail "staged upstream has an unterminated STAGE.sha256 entry: $stage_dir"
+            break
+        fi
+        digest=${line%%  *}
+        path=${line#"$digest  "}
+        [ "$line" = "$digest  $path" ] && [ "${#digest}" -eq 64 ] \
+            || fail "staged upstream has an invalid STAGE.sha256 entry: $stage_dir"
+        case $digest in
+            *[!0-9a-f]*) fail "staged upstream has an invalid STAGE.sha256 digest: $stage_dir" ;;
+        esac
+        safe_stage_path "$path" || fail "staged upstream has an unsafe STAGE.sha256 path: $stage_dir"
+        printf '%s\n' "$path" >> "$work/stage-files.txt"
+    done < "$stage_dir/STAGE.sha256"
+    tab=$(printf '\t')
+    while :; do
+        line=
+        if IFS= read -r line; then
+            :
+        else
+            [ -z "$line" ] || fail "staged upstream has an unterminated STAGE.links entry: $stage_dir"
+            break
+        fi
+        case $line in
+            "exec$tab"*)
+                path=${line#"exec$tab"}
+                case $path in
+                    *"$tab"*) fail "staged upstream has an invalid STAGE.links entry: $stage_dir" ;;
+                esac
+                safe_stage_path "$path" \
+                    || fail "staged upstream has an invalid STAGE.links exec path: $stage_dir/$path"
+                printf '%s\n' "$path" >> "$work/stage-execs.txt"
+                ;;
+            "link$tab"*)
+                rest=${line#"link$tab"}
+                case $rest in
+                    *"$tab"*) ;;
+                    *) fail "staged upstream has an invalid STAGE.links entry: $stage_dir" ;;
+                esac
+                path=${rest%%"$tab"*}
+                target=${rest#*"$tab"}
+                case $target in
+                    *"$tab"*) fail "staged upstream has an invalid STAGE.links entry: $stage_dir" ;;
+                esac
+                link_parent=$path
+                link_depth=0
+                while :; do
+                    case $link_parent in
+                        */*) link_parent=${link_parent#*/}; link_depth=$((link_depth + 1)) ;;
+                        *) break ;;
+                    esac
+                done
+                safe_stage_path "$path" && safe_stage_target "$target" "$link_depth" \
+                    || fail "staged upstream has an invalid STAGE.links link path or target: $stage_dir/$path"
+                printf '%s\n' "$path" >> "$work/stage-links.txt"
+                ;;
+            *) fail "staged upstream has an invalid STAGE.links entry: $stage_dir" ;;
+        esac
+    done < "$stage_dir/STAGE.links"
+    for kind in files links execs; do
+        LC_ALL=C sort "$work/stage-$kind.txt" > "$work/stage-$kind-sorted.txt"
+        duplicate=$(LC_ALL=C uniq -d "$work/stage-$kind-sorted.txt" | head -n 1)
+        case $kind in
+            files) kind_name=STAGE.sha256 ;;
+            links) kind_name='STAGE.links link' ;;
+            execs) kind_name='STAGE.links exec' ;;
+        esac
+        [ -z "$duplicate" ] || fail "staged upstream has a duplicate $kind_name path: $stage_dir/$duplicate"
+    done
+    unknown_exec=$(LC_ALL=C comm -23 "$work/stage-execs-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
+    [ -z "$unknown_exec" ] || fail "staged upstream has an invalid STAGE.links exec path: $stage_dir/$unknown_exec"
+    conflicting_link=$(LC_ALL=C comm -12 "$work/stage-links-sorted.txt" "$work/stage-files-sorted.txt" | head -n 1)
+    [ -z "$conflicting_link" ] || fail "staged upstream has a duplicate STAGE.links link path: $stage_dir/$conflicting_link"
+    stage_real=$(cd "$stage_dir" && pwd -P)
+    files=$(cat "$work/stage-files-sorted.txt")
+    links=$(cat "$work/stage-links-sorted.txt")
+    listed=$({ printf '%s\n' "$files"; printf '%s\n' "$links"; } | sed '/^$/d' | LC_ALL=C sort)
+    present=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o ! -type d -print | sed 's|^\./||' | LC_ALL=C sort)
     printf '%s\n' "$listed" > "$work/listed.txt"
     printf '%s\n' "$present" > "$work/present.txt"
     unlisted=$(LC_ALL=C comm -13 "$work/listed.txt" "$work/present.txt")
-    [ -z "$unlisted" ] || fail "staged upstream holds files STAGE.sha256 does not list: $(printf '%s' "$unlisted" | head -n 1)"
+    [ -z "$unlisted" ] || fail "staged upstream holds entries its manifests do not list: $(printf '%s' "$unlisted" | head -n 1)"
+    [ "$listed" = "$present" ] || fail "staged upstream differs from its STAGE manifests: $stage_dir"
+    actual_files=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o -type f -print | sed 's|^\./||' | LC_ALL=C sort)
+    [ "$files" = "$actual_files" ] || fail "staged upstream file types differ from STAGE.sha256: $stage_dir"
+    actual_links=$(cd "$stage_dir" && find . -type l -print | sed 's|^\./||' | LC_ALL=C sort)
+    [ "$links" = "$actual_links" ] || fail "staged upstream link types differ from STAGE.links: $stage_dir"
+    actual_execs=$(cd "$stage_dir" && find . -path ./STAGE.sha256 -prune -o -path ./STAGE.links -prune -o -type f -perm -100 -print | sed 's|^\./||' | LC_ALL=C sort)
+    [ "$(cat "$work/stage-execs-sorted.txt")" = "$actual_execs" ] \
+        || fail "staged upstream executable bits differ from STAGE.links: $stage_dir"
+    while IFS="$tab" read -r kind path target; do
+        case $kind in
+            link)
+                [ -n "$target" ] && [ -L "$stage_dir/$path" ] \
+                    && [ "$(readlink -- "$stage_dir/$path")" = "$target" ] \
+                    || fail "staged upstream link differs from STAGE.links: $stage_dir/$path"
+                resolved=$(readlink -f -- "$stage_dir/$path") \
+                    || fail "unresolvable link in staged upstream: $stage_dir/$path"
+                case $resolved in
+                    "$stage_real"/*) ;;
+                    *) fail "link leaves the staged upstream: $stage_dir/$path" ;;
+                esac
+                ;;
+            exec)
+                [ -z "$target" ] && [ -f "$stage_dir/$path" ] && [ ! -L "$stage_dir/$path" ] \
+                    || fail "staged upstream executable differs from STAGE.links: $stage_dir/$path"
+                ;;
+            *) fail "staged upstream has an invalid STAGE.links entry: $stage_dir" ;;
+        esac
+    done < "$stage_dir/STAGE.links"
+    # Only read listed payloads after every path has been checked as a regular
+    # file. `sha256sum -c` would otherwise block forever on a listed FIFO.
+    (cd "$stage_dir" && sha256sum -c STAGE.sha256 >/dev/null 2>&1) \
+        || fail "staged upstream does not match STAGE.sha256: $stage_dir"
 }
 
 network_check() {
@@ -197,7 +347,7 @@ case $isolation in
     *) fail "--isolation must be auto, userns or sudo" ;;
 esac
 [ "$(uname -s)" = Linux ] || fail "the archive smoke needs Linux network namespaces"
-for tool in tar sha256sum jq unshare ip awk sed find readlink comm mktemp; do
+for tool in tar sha256sum jq unshare ip awk sed find readlink comm sort uniq tr wc cat head iconv mktemp; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool is missing: $tool"
 done
 [ -f "$archive" ] && [ ! -L "$archive" ] || fail "archive is not a regular file: $archive"
@@ -324,25 +474,37 @@ cp -- "$consumer" "$work/consumer"
 chmod 755 "$work/consumer"
 node_bin=$(command -v node) || fail "node is required on PATH (the upstreams are node programs)"
 node_dir=$(cd "$(dirname -- "$node_bin")" && pwd -P)
+node_real=$(readlink -f -- "$node_bin") || fail "cannot resolve node on PATH: $node_bin"
+[ -f "$node_real" ] && [ -x "$node_real" ] || fail "node on PATH is not an executable file: $node_bin"
+for path in "$node_dir" "$node_real"; do
+    case $path in
+        "$checkout" | "$checkout"/*) fail "node on PATH resolves inside the checkout $checkout: $path" ;;
+    esac
+done
 uid=$(id -u)
 gid=$(id -g)
 mkdir "$work/run"
 
+# Namespace setup and stage verification must never resolve tools through the
+# caller's PATH, which may include writable directories populated by npm.
+root_path=/usr/sbin:/usr/bin:/sbin:/bin
+
 run_userns() {
-    unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
+    /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc \
         /bin/sh "$self" __inner userns "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
 }
 run_sudo() {
-    sudo -n env PATH="$PATH" unshare --net --pid --fork --kill-child --mount-proc \
+    /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --net --pid --fork --kill-child --mount-proc \
         /bin/sh -c 'ip link set lo up && u=$1 && g=$2 && shift 2 && exec setpriv --reuid="$u" --regid="$g" --clear-groups --inh-caps=-all --bounding-set=-all "$@"' \
         sh "$uid" "$gid" /bin/sh "$self" __inner sudo "$work" "$root" "$stage" "$work/consumer" "$node_dir" $runtimes
 }
 probe_userns() {
-    unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1
+    /usr/bin/env -i PATH="$root_path" /usr/bin/unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc /usr/bin/true >/dev/null 2>&1
 }
 probe_sudo() {
-    command -v sudo >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 \
-        && sudo -n unshare --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1
+    [ -x /usr/bin/sudo ] && [ -x /usr/bin/unshare ] && [ -x /usr/bin/setpriv ] \
+        && /usr/bin/sudo -n /usr/bin/env -i PATH="$root_path" /usr/bin/unshare \
+            --net --pid --fork --kill-child --mount-proc true >/dev/null 2>&1
 }
 
 chosen=$isolation
