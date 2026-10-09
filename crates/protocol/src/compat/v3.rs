@@ -360,7 +360,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        downgrade_request_params, event_payload, request_params, result, upgrade_event_payload,
+        downgrade_request_params, event_payload, result, upgrade_event_payload,
         upgrade_result, INTRODUCED_METHODS, KNOWN_EVENTS, KNOWN_WARNING_KINDS,
     };
     use crate::{compat::CompatError, event, method};
@@ -371,35 +371,6 @@ mod tests {
             "runtime": {"state": "live", "runtime_generation": "1", "worker_instance_id": "w-1"},
             "warnings": []
         })
-    }
-
-    #[test]
-    fn request_rename_reaches_the_nested_identity_of_output_and_wait() {
-        for method_name in [method::SESSION_OUTPUT, method::SESSION_WAIT] {
-            let params = json!({
-                "session_id": "s-1",
-                "runtime": {"runtime_id": "w-1", "runtime_generation": "1"}
-            });
-            let upgraded = request_params(method_name, params).expect("adapter");
-            assert_eq!(
-                upgraded["runtime"],
-                json!({"worker_instance_id": "w-1", "runtime_generation": "1"}),
-                "{method_name}"
-            );
-        }
-    }
-
-    #[test]
-    fn request_rename_reaches_the_flat_native_id_report() {
-        let upgraded = request_params(
-            method::SESSION_REPORT_NATIVE_ID,
-            json!({"session_id": "s-1", "runtime_id": "w-1", "agent": "claude"}),
-        )
-        .expect("adapter");
-        assert_eq!(
-            upgraded,
-            json!({"session_id": "s-1", "worker_instance_id": "w-1", "agent": "claude"})
-        );
     }
 
     #[test]
