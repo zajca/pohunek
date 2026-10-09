@@ -158,38 +158,3 @@ impl<'de> Visitor<'de> for StrictVisitor {
         Ok(StrictValue(Value::Object(object)))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_duplicate_keys_at_any_depth() {
-        assert_eq!(
-            parse_strict(br#"{"a":1,"a":2}"#),
-            Err(JsonError::DuplicateKey)
-        );
-        assert_eq!(
-            parse_strict(br#"{"a":[{"k":1,"k":1}]}"#),
-            Err(JsonError::DuplicateKey)
-        );
-    }
-
-    #[test]
-    fn rejects_non_integer_numbers() {
-        for input in [&b"-1"[..], b"1.5", b"1e3", b"1.0"] {
-            assert_eq!(parse_strict(input), Err(JsonError::UnsupportedNumber));
-        }
-    }
-
-    #[test]
-    fn escaped_and_literal_spellings_of_a_string_canonicalize_identically() {
-        // Same logical document: `\u006b` is `k`, `\u0041` is `A`, `\/` is `/`
-        // and `\u00e9` is `é`; only the newline must stay escaped.
-        let escaped = parse_strict(br#"{"\u006b":"\u0041\/\n\u00e9"}"#).unwrap();
-        let literal = parse_strict("{\"k\":\"A/\\n\u{e9}\"}".as_bytes()).unwrap();
-        let expected = "{\"k\":\"A/\\n\u{e9}\"}".as_bytes();
-        assert_eq!(canonical_bytes(&escaped), expected);
-        assert_eq!(canonical_bytes(&literal), expected);
-    }
-}

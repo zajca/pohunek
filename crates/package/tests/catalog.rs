@@ -565,6 +565,11 @@ fn trailing_data_and_non_integer_numbers_are_rejected() {
         verify(exponent.as_bytes(), &anchor).unwrap_err(),
         CatalogError::UnsupportedNumber
     );
+    let negative = text.replacen("\"sequence\":7", "\"sequence\":-7", 1);
+    assert_eq!(
+        verify(negative.as_bytes(), &anchor).unwrap_err(),
+        CatalogError::UnsupportedNumber
+    );
 }
 
 #[test]
@@ -581,6 +586,29 @@ fn whitespace_and_key_order_do_not_change_the_signed_bytes() {
     let reordered = serde_json::to_vec(&value).unwrap();
     assert_ne!(reordered, bytes);
     verify(&reordered, &anchor).expect("verifies");
+}
+
+#[test]
+fn escaped_json_spelling_keeps_the_catalog_signature_valid() {
+    let root_key = signing_key("root");
+    let anchor = anchor_for(&root_key);
+    let signed = String::from_utf8(signed_by(&root_key, catalog(SEQUENCE)))
+        .expect("catalog document is UTF-8");
+    let escaped_key = signed.replacen("\"catalog\":", "\"\\u0063atalog\":", 1);
+    let escaped_value =
+        escaped_key.replacen("pohunek.runtime.codex", "pohunek.runtime.c\\u006fdex", 1);
+    assert_ne!(escaped_value, signed);
+
+    let verified = verify(escaped_value.as_bytes(), &anchor).expect("equivalent signed document");
+    assert_eq!(verified.signer(), &key_id(&root_key));
+    assert_eq!(
+        verified.authorize(
+            &PackageId::parse("pohunek.runtime.codex").expect("package id"),
+            &RuntimeId::codex(),
+            &digest('a'),
+        ),
+        Authorization::Official
+    );
 }
 
 #[test]

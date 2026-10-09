@@ -144,6 +144,139 @@ impl TestHome {
 /// fixture: it may fail on a host without a graphical session.
 const HOST_SESSION_CHECK: &str = "launchd_domain";
 
+#[test]
+fn doctor_process_skips_untrusted_git_candidates_before_a_trusted_one() {
+    let home = TestHome::new();
+    let loose_file_dir = home.root.join("loose-file-bin");
+    let loose_dir = home.root.join("loose-directory-bin");
+    let trusted_dir = home.root.join("trusted-bin");
+    for directory in [&loose_file_dir, &loose_dir, &trusted_dir] {
+        fs::create_dir(directory).expect("create executable fixture directory");
+    }
+    let loose_file = loose_file_dir.join("git");
+    let loose_directory_file = loose_dir.join("git");
+    let trusted_file = trusted_dir.join("git");
+    for file in [&loose_file, &loose_directory_file, &trusted_file] {
+        pohunek_test_support::fs::write_executable(file, b"#!/bin/sh\nexit 0\n")
+            .expect("write executable fixture");
+    }
+    fs::set_permissions(&loose_file, fs::Permissions::from_mode(0o777))
+        .expect("make first executable untrusted");
+    fs::set_permissions(&loose_dir, fs::Permissions::from_mode(0o777))
+        .expect("make second executable directory untrusted");
+
+    let git_check = |path: &std::ffi::OsStr| {
+        let output = home
+            .command()
+            .args(["doctor", "--json"])
+            .env("PATH", path)
+            .output()
+            .expect("run doctor process");
+        let document: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("doctor JSON envelope: {error}\n{}", describe(&output)));
+        document["ok"]["checks"]
+            .as_array()
+            .expect("doctor checks")
+            .iter()
+            .find(|check| check["name"] == "bin:git")
+            .expect("git check")
+            .clone()
+    };
+
+    for unsafe_only in [&loose_file_dir, &loose_dir] {
+        let check = git_check(unsafe_only.as_os_str());
+        assert_eq!(check["status"], "fail", "{check}");
+    }
+    let path = std::env::join_paths([&loose_file_dir, &loose_dir, &trusted_dir])
+        .expect("join fixture PATH");
+    let check = git_check(&path);
+    assert_eq!(check["status"], "ok", "{check}");
+    assert!(
+        check["detail"]
+            .as_str()
+            .expect("git detail")
+            .contains(&trusted_file.display().to_string()),
+        "{check}"
+    );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn doctor_process_creates_private_probe_directories_without_following_planted_symlinks() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let logs = env.state_home().join("pohunek/logs");
+    fs::create_dir_all(&logs).expect("create log probe directory");
+    let victim = env.root().join("victim");
+    fs::write(&victim, b"precious").expect("write symlink target");
+    std::os::unix::fs::symlink(&victim, logs.join(".pohunek-doctor-probe"))
+        .expect("plant old predictable probe name");
+
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["doctor", "--json"])
+        .env("PATH", "")
+        .output()
+        .expect("run doctor process");
+    let document: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("doctor JSON envelope: {error}\n{}", describe(&output)));
+    let checks = document["ok"]["checks"].as_array().expect("doctor checks");
+    let names = checks
+        .iter()
+        .map(|check| check["name"].as_str().expect("check name"))
+        .collect::<Vec<_>>();
+    assert!(
+        names.starts_with(&[
+            "bin:git",
+            "bin:codex",
+            "bin:claude",
+            "socket_dir_writable",
+            "state_dir_writable",
+            "log_dir_writable",
+            "netbird_cli",
+            "schema_version",
+        ]),
+        "{names:?}"
+    );
+    for name in [
+        "socket_dir_writable",
+        "state_dir_writable",
+        "log_dir_writable",
+    ] {
+        let check = checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .expect("directory check");
+        assert_eq!(check["status"], "ok", "{check}");
+    }
+    for directory in [
+        env.runtime_dir().join("pohunek"),
+        env.data_home().join("pohunek"),
+    ] {
+        let mode = fs::metadata(&directory)
+            .expect("doctor created private directory")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "{}", directory.display());
+        assert_eq!(
+            fs::read_dir(&directory)
+                .expect("read directory after probe")
+                .count(),
+            0,
+            "probe left a file in {}",
+            directory.display()
+        );
+    }
+    assert_eq!(fs::read(&victim).expect("read symlink target"), b"precious");
+    assert_eq!(
+        fs::read_dir(&logs)
+            .expect("read log probe directory")
+            .count(),
+        1,
+        "only the planted link may remain"
+    );
+}
+
 /// Mode of every directory the daemon creates privately.
 const PRIVATE_DIR_MODE: u32 = 0o700;
 
