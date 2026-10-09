@@ -1,27 +1,40 @@
-//! Parser coverage for `pohunek assistant`.
-//!
-//! These tests are hermetic: they drive `pohunek_cli::command()` through
-//! `try_get_matches_from`, which never opens a socket or touches the
-//! filesystem. They pin the assistant flag surface on the default form and on
-//! every intent wrapper, plus the parse errors clap must raise.
+//! Public CLI behavior for `pohunek assistant` argument forms.
 
-use pohunek_cli::command;
+use std::process::{Command, Output};
 
-/// The intent wrapper subcommands, which share the default form's flags.
+use pohunek_test_support::env::TestEnv;
+
 const INTENT_WRAPPERS: [&str; 5] = ["setup", "project", "update", "debug", "help"];
 
-/// Parse the given argument list against the full pohunek CLI.  Returns `Ok`
-/// when clap accepts the input, `Err` otherwise.
-fn try_parse<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<(), clap::Error> {
-    command()
-        .try_get_matches_from(std::iter::once("pohunek").chain(args))
-        .map(|_| ())
+thread_local! {
+    static TEST_ENV: TestEnv = TestEnv::new().expect("private test environment");
 }
 
-/// Every assistant flag parses together on the default form and on each
-/// intent wrapper, with either repository selector and a free-form request.
+fn pohunek() -> Command {
+    TEST_ENV.with(|env| env.command(pohunek_test_support::bin_exe("pohunek")))
+}
+
+fn run_assistant(args: &[&str]) -> Output {
+    pohunek().args(args).output().expect("spawn pohunek")
+}
+
+fn json_error(output: &Output) -> serde_json::Value {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    serde_json::from_slice(&output.stdout).expect("one JSON error document")
+}
+
+fn assert_reaches_daemon(args: &[&str]) {
+    let output = run_assistant(args);
+    let document = json_error(&output);
+    assert_eq!(
+        document["err"]["code"], "daemon_unreachable",
+        "{args:?}: {document:?}"
+    );
+}
+
 #[test]
-fn assistant_flags_parse_on_the_default_form_and_every_intent_wrapper() {
+fn assistant_flags_reach_the_daemon_on_default_and_intent_forms() {
     let project_form = [
         "--agent",
         "codex",
@@ -42,43 +55,75 @@ fn assistant_flags_parse_on_the_default_form_and_every_intent_wrapper() {
         "some",
         "request",
     ];
-    let repo_form = ["--agent", "hermes", "--repo", "/code/ui", "configure", "it"];
+    let repo_form = [
+        "--agent",
+        "hermes",
+        "--repo",
+        "/code/ui",
+        "--json",
+        "--print-prompt",
+        "--no-start-daemon",
+        "configure",
+        "it",
+    ];
     for form in [&project_form[..], &repo_form[..]] {
-        try_parse(std::iter::once("assistant").chain(form.iter().copied()))
-            .unwrap_or_else(|error| panic!("assistant {form:?} should parse: {error}"));
+        let args: Vec<&str> = std::iter::once("assistant")
+            .chain(form.iter().copied())
+            .collect();
+        assert_reaches_daemon(&args);
         for wrapper in INTENT_WRAPPERS {
             let form_without_intent = form
                 .iter()
                 .copied()
                 .filter(|arg| !matches!(*arg, "--intent" | "debug"));
-            try_parse(
-                ["assistant", wrapper]
-                    .into_iter()
-                    .chain(form_without_intent),
-            )
-            .unwrap_or_else(|error| panic!("assistant {wrapper} {form:?} should parse: {error}"));
+            let args: Vec<&str> = ["assistant", wrapper]
+                .into_iter()
+                .chain(form_without_intent)
+                .collect();
+            assert_reaches_daemon(&args);
         }
     }
 }
 
 #[test]
-fn assistant_intent_flag_parses_all_values() {
+fn assistant_intent_flag_accepts_every_public_value() {
     for value in INTENT_WRAPPERS {
-        try_parse(["assistant", "--intent", value])
-            .unwrap_or_else(|e| panic!("--intent {value} should parse: {e}"));
+        assert_reaches_daemon(&[
+            "assistant",
+            "--intent",
+            value,
+            "--json",
+            "--no-start-daemon",
+        ]);
     }
 }
 
 #[test]
-fn assistant_intent_flag_rejects_unknown_value() {
-    try_parse(["assistant", "--intent", "nonsense"])
-        .expect_err("unknown --intent value must be rejected");
+fn assistant_intent_flag_rejects_unknown_value_as_usage_error() {
+    let output = run_assistant(&[
+        "assistant",
+        "--intent",
+        "nonsense",
+        "--json",
+        "--no-start-daemon",
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON usage error");
+    assert_eq!(document["err"]["code"], "cli_usage");
+    assert!(document["err"]["msg"]
+        .as_str()
+        .is_some_and(|message| message.contains("nonsense")));
 }
 
 #[test]
-fn assistant_help_wrapper_does_not_collide_with_clap_help() {
-    // `assistant help` must parse as the `help` intent wrapper, not trigger
-    // clap's built-in --help display (which would exit non-zero in try_parse).
-    try_parse(["assistant", "help"])
-        .expect("assistant help parses as the intent wrapper, not as clap built-in help");
+fn assistant_help_wrapper_is_a_command_not_the_help_screen() {
+    assert_reaches_daemon(&["assistant", "help", "--json", "--no-start-daemon"]);
+
+    let output = run_assistant(&["assistant", "--help"]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let help = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(help.contains("Usage:"), "{help}");
 }
