@@ -1,9 +1,9 @@
 //! End-to-end: clap argument-parse failures honor `--json`.
 //!
 //! These drive the real `pohunek` binary (located through `pohunek_test_support::bin_exe`) at
-//! the argument-parsing layer only. Every command here fails to parse — or is a
-//! `--help` display — *before* any daemon connection or filesystem access, so
-//! the tests are hermetic: no socket, no state directory, no env setup.
+//! the argument-parsing and origin-environment validation layers. Commands fail
+//! before any daemon connection or filesystem access and use a private
+//! environment, so no socket or host state is needed.
 //!
 //! They lock in the milestone-10 `DoD` #2 contract for the one path that used to
 //! escape it: a usage error under `--json` must print a single structured
@@ -325,6 +325,54 @@ fn incomplete_origin_environment_fails_fast_without_marker_leakage() {
             serde_json::from_str(&stdout).expect("one JSON error document");
         assert_eq!(document["err"]["code"], "incomplete_origin_environment");
     }
+}
+
+#[test]
+fn invalid_origin_environment_fails_fast_without_marker_leakage() {
+    for (invalid, marker) in [
+        ("POHUNEK_SESSION_ID", "private-session-marker\n"),
+        ("POHUNEK_DAEMON_ID", "private-daemon-marker\n"),
+    ] {
+        let out = pohunek()
+            .args(["session", "screen", "s-1", "--json"])
+            .env("POHUNEK_SESSION_ID", "valid-session")
+            .env("POHUNEK_DAEMON_ID", "valid-daemon")
+            .env(invalid, marker)
+            .output()
+            .expect("spawn pohunek");
+
+        assert_eq!(out.status.code(), Some(1));
+        assert!(out.stderr.is_empty());
+        let stdout = String::from_utf8(out.stdout).expect("UTF-8 stdout");
+        assert!(!stdout.contains(marker.trim_end()));
+        let document: serde_json::Value =
+            serde_json::from_str(&stdout).expect("one JSON error document");
+        assert_eq!(document["err"]["code"], "invalid_origin_environment");
+        assert_eq!(document["err"]["class"], "configuration");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_origin_environment_fails_fast_without_marker_leakage() {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let marker = std::ffi::OsString::from_vec(b"private-origin-marker-\xff".to_vec());
+    let out = pohunek()
+        .args(["session", "screen", "s-1", "--json"])
+        .env("POHUNEK_SESSION_ID", marker)
+        .env("POHUNEK_DAEMON_ID", "valid-daemon")
+        .output()
+        .expect("spawn pohunek");
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stderr.is_empty());
+    let stdout = String::from_utf8(out.stdout).expect("UTF-8 stdout");
+    assert!(!stdout.contains("private-origin-marker"));
+    let document: serde_json::Value =
+        serde_json::from_str(&stdout).expect("one JSON error document");
+    assert_eq!(document["err"]["code"], "invalid_origin_environment");
+    assert_eq!(document["err"]["class"], "configuration");
 }
 
 #[test]

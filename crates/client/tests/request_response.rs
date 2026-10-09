@@ -7,6 +7,7 @@ use pohunek_client::protocol::{
 };
 use pohunek_client::{next_request_id, Client, ClientError, ClientOptions, OriginSource};
 use pohunek_test_support::env::TestEnv;
+use pohunek_test_support::process_env::ProcessEnv;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
@@ -95,6 +96,23 @@ async fn request_response_connect_local_sends_json_request_line_and_returns_ok_p
 
     assert_eq!(result.expect("local request succeeds"), ok_payload());
     assert_sent_request(&request_line);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn omitted_origin_source_ignores_incomplete_process_environment() {
+    let mut process_env = ProcessEnv::lock();
+    process_env.set(protocol::ENV_SESSION_ID, "private-session-marker");
+    process_env.remove(protocol::ENV_DAEMON_ID);
+
+    let (result, request_line) = run_local(Reply::Line(response_ok_line())).await;
+    drop(process_env);
+
+    assert_eq!(
+        result.expect("omitted origin ignores the environment"),
+        ok_payload()
+    );
+    assert_sent_request(&request_line);
+    assert!(!request_line.contains("private-session-marker"));
 }
 
 #[tokio::test]
