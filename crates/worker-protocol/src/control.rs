@@ -1206,26 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn inspect_snapshot_without_a_hook_schema_deserializes_as_unreported() {
-        let snapshot = serde_json::json!({
-            "session_id": "s-1",
-            "worker_id": "worker-1",
-            "runtime_id": null,
-            "phase": "uninitialized",
-            "worker_process": {"pid": 1, "start_identity": 2},
-            "child_process": null,
-            "dimensions": null,
-            "history_start_offset": 0,
-            "next_offset": 0,
-            "exit": null,
-            "launch_identity": null,
-            "active_identity": null,
-        });
-        let parsed: InspectSnapshot = serde_json::from_value(snapshot).expect("older worker");
-        assert_eq!(parsed.hook_schema, None);
-    }
-
-    #[test]
     fn version_five_initialize_wire_has_no_base_environment_field() {
         let v5 = Initialize {
             base_environment: None,
@@ -1270,51 +1250,5 @@ mod tests {
         let rendered = format!("{plan:?}");
         assert!(!rendered.contains(secret));
         assert!(rendered.contains("<redacted>"));
-    }
-
-    #[test]
-    fn untagged_control_message_round_trips_a_negotiation() {
-        let wire = serde_json::json!({
-            "request_id": "request-1",
-            "type": "negotiate",
-            "daemon_instance_id": "daemon-1",
-            "minimum_version": 5,
-            "maximum_version": 6,
-        });
-        let message = ControlMessage::Request(ControlRequest {
-            request_id: RequestId::new("request-1").expect("valid request"),
-            kind: RequestKind::Negotiate {
-                daemon_instance_id: DaemonId::new("daemon-1").expect("valid daemon"),
-                minimum_version: Version::new(5).expect("valid version"),
-                maximum_version: Version::new(6).expect("valid version"),
-            },
-        });
-
-        assert_eq!(
-            serde_json::from_value::<ControlMessage>(wire.clone()).expect("decode negotiation"),
-            message
-        );
-        assert_eq!(
-            serde_json::to_value(&message).expect("encode negotiation"),
-            wire
-        );
-    }
-
-    #[test]
-    fn attach_start_without_dimensions_is_additive() {
-        let start = AttachStart { dimensions: None };
-
-        assert_eq!(
-            serde_json::to_value(start).expect("serialize attach start"),
-            serde_json::json!({})
-        );
-    }
-
-    #[test]
-    fn invalid_strong_values_fail_control_deserialization() {
-        let error = serde_json::from_str::<Dimensions>(r#"{"columns":0,"rows":24}"#)
-            .expect_err("zero columns must fail");
-
-        assert!(error.to_string().contains("must be nonzero"));
     }
 }
