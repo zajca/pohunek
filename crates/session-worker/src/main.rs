@@ -317,6 +317,7 @@ mod tests {
             environment_allowlist: vec!["PATH".to_owned()],
             search_path: pohunek_platform::shell_env::SearchPath::default(),
             sweep_grace: other,
+            input_timing: pohunek_service_config::DEFAULT_INPUT_TIMING,
             open_files: 8192,
         })
         .expect("valid service configuration")

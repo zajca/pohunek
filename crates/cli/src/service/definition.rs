@@ -6,7 +6,7 @@ use std::path::Path;
 
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::{JobDefinition, JobSpec, RestartPolicy, SEARCH_PATH_VARIABLE};
-use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig};
+use pohunek_service_config::{ConfigSpec, Deadlines, ServiceConfig, DEFAULT_INPUT_TIMING};
 use pohunek_worker_protocol::DEFAULT_ENVIRONMENT_ALLOWLIST;
 
 use super::context::Context;
@@ -97,6 +97,7 @@ pub(crate) fn config_with_search_path(
             .collect(),
         search_path,
         sweep_grace: settings::SWEEP_GRACE,
+        input_timing: DEFAULT_INPUT_TIMING,
         open_files: settings::OPEN_FILES,
     })?)
 }
@@ -204,6 +205,7 @@ mod tests {
         let context = context(root.as_path());
         let config =
             initial_config(&context, &root.as_path().join("prefix"), "1.2.3").expect("config");
+        assert_eq!(config.input_timing(), DEFAULT_INPUT_TIMING);
         let definition = daemon_definition(&context, &config).expect("definition");
         assert_eq!(
             definition.executable(),
@@ -306,8 +308,10 @@ mod tests {
         config.write(&written).expect("write service.toml");
         let loaded = ServiceConfig::load(&written).expect("load service.toml");
         assert_eq!(loaded.search_path(), config.search_path());
+        assert_eq!(loaded.input_timing(), DEFAULT_INPUT_TIMING);
         let upgraded = with_version(&loaded, "1.2.4").expect("upgrade");
         assert_eq!(upgraded.search_path(), config.search_path());
+        assert_eq!(upgraded.input_timing(), DEFAULT_INPUT_TIMING);
         assert_eq!(
             daemon_definition(&context, &upgraded)
                 .expect("definition")

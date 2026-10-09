@@ -97,6 +97,11 @@ pub struct UpgradeReport {
     /// Whether `--accept-runtime-loss` accepted at-risk sessions in the
     /// upgrade or a preceding rollback.
     pub accepted_runtime_loss: bool,
+    /// The `service.toml` schema the transaction migrates from, when it does.
+    ///
+    /// A migration stops the daemon before it rewrites `service.toml` and
+    /// restores the exact pre-upgrade bytes on rollback.
+    pub config_schema_migration: Option<u32>,
 }
 
 /// Result of `pohunek service uninstall`.
@@ -148,6 +153,12 @@ pub struct CheckReport {
     /// Whether `--accept-runtime-loss` would accept at-risk sessions in the
     /// upgrade or a preceding rollback.
     pub accepted_runtime_loss: bool,
+    /// The `service.toml` schema the checked transaction would migrate from,
+    /// when it would.
+    ///
+    /// A migration stops the daemon before it rewrites `service.toml` and
+    /// restores the exact pre-upgrade bytes on rollback.
+    pub config_schema_migration: Option<u32>,
 }
 
 /// A version directory garbage collection kept.

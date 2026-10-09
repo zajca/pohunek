@@ -496,6 +496,26 @@ pub enum Error {
         detail: String,
     },
 
+    /// A config migration cannot prove the exact pre-upgrade `service.toml`.
+    ///
+    /// The transaction's owner-private backup and its journaled digest are
+    /// the only way to reproduce the bytes the previous daemon reads. A
+    /// missing backup, or one whose digest no longer matches the journal,
+    /// refuses resumption and rollback closed: nothing is written and no
+    /// daemon is restarted, because guessing the pre-upgrade bytes could
+    /// strand the installation between two schemas.
+    #[error(
+        "the interrupted configuration migration cannot continue: the pre-upgrade \
+         service.toml backup {} {detail}",
+        path.display()
+    )]
+    ConfigBackup {
+        /// The backup file, or the `service.toml` a byte check failed on.
+        path: PathBuf,
+        /// What is wrong; names the digest journaled in the record.
+        detail: String,
+    },
+
     /// Another `pohunek service` command holds the transaction lock.
     #[error("another `pohunek service` command is running (lock {})", path.display())]
     TransactionInProgress {
@@ -588,6 +608,7 @@ impl Error {
             Self::RollbackPreflightFailed { .. } => "service_rollback_preflight_failed",
             Self::OrphanWorkers { .. } => "service_orphan_workers",
             Self::Record { .. } => "service_record_invalid",
+            Self::ConfigBackup { .. } => "service_config_backup_invalid",
             Self::TransactionInProgress { .. } => "service_transaction_in_progress",
             Self::InheritedLock { .. } => "service_inherited_lock_invalid",
             Self::PrefixMismatch { .. } => "service_prefix_mismatch",
@@ -689,6 +710,9 @@ impl Error {
             }
             Self::InheritedLock { .. } => Some(
                 "run the command under `pohunek service lock -- <command>`, or without POHUNEK_SERVICE_LOCK_TOKEN in its environment",
+            ),
+            Self::ConfigBackup { .. } => Some(
+                "restore the pre-upgrade service.toml and its backup to the exact bytes the transaction record digests, then rerun; or remove the installation with `pohunek service uninstall`, which checks for live sessions first",
             ),
             _ => None,
         }

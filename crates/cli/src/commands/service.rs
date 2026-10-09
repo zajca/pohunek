@@ -318,6 +318,12 @@ fn render_upgrade(report: &report::UpgradeReport) -> String {
     if let Some(pending) = &report.rolled_back {
         let _ = writeln!(text, "{}", render_rolled_back(pending));
     }
+    if let Some(schema) = report.config_schema_migration {
+        let _ = writeln!(
+            text,
+            "migration  service.toml is upgraded from schema {schema}: the daemon stops before the write, and a rollback restores the exact previous file"
+        );
+    }
     if report.unchanged {
         let _ = writeln!(text, "pohunek {} is already active", report.to_version);
     } else {
@@ -366,6 +372,12 @@ fn render_check(report: &report::CheckReport) -> String {
             ""
         }
     );
+    if let Some(schema) = report.config_schema_migration {
+        let _ = writeln!(
+            text,
+            "migration  service.toml is upgraded from schema {schema}: the daemon stops before the write, and a rollback restores the exact previous file"
+        );
+    }
     let _ = writeln!(text, "prefix     {}", report.prefix.display());
     let _ = writeln!(text, "config     {}", report.config_path.display());
     if let (Some(pending), Some(action)) = (&report.pending_transaction, report.pending_action) {
@@ -752,6 +764,7 @@ mod tests {
             locked: true,
             preflight: None,
             accepted_runtime_loss: false,
+            config_schema_migration: None,
         });
         assert!(
             text.contains("install of pohunek 1.0.0 would pass its preflight (namespace ns), checked under the transaction lock"),
@@ -808,6 +821,7 @@ mod tests {
             gc_error: Some("journals unreadable".to_owned()),
             preflight: None,
             accepted_runtime_loss: false,
+            config_schema_migration: None,
         });
         assert!(text.contains("pohunek 2.0.0 is already active"), "{text}");
         assert!(!text.contains("upgraded"), "{text}");

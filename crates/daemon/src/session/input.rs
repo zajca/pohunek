@@ -631,18 +631,27 @@ pub(super) fn plan_initial_input_delivery(
 }
 
 /// Input rules for `definition`: the descriptor's framing, with its submit
-/// delay replaced by the configured override when the descriptor allows one.
+/// delay replaced for the runtimes whose descriptor allows one — the
+/// per-runtime override first, then the host setting, never a runtime name
+/// here.
 pub(super) fn input_rules_for_definition(
     definition: &RuntimeDefinition,
     config: &SessionRegistryConfig,
 ) -> InputRules {
-    let mut rules = definition.input_rules();
     if definition.submit_delay_configurable() {
-        if let Some(delay) = config.submit_delay_overrides.get(definition.runtime_id()) {
-            rules.submit_delay = *delay;
+        let mut rules = definition.input_rules();
+        let delay = config
+            .submit_delay_overrides
+            .get(definition.runtime_id())
+            .copied()
+            .or(config.host_submit_delay);
+        if let Some(delay) = delay {
+            rules.submit_delay = delay;
         }
+        rules
+    } else {
+        definition.input_rules()
     }
-    rules
 }
 
 /// [`input_rules_for_definition`] for the runtime `agent` names; a kind

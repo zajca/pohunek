@@ -10,7 +10,7 @@
 //! # Schema
 //!
 //! ```toml
-//! schema_version = 2
+//! schema_version = 3
 //! prefix = "/home/u/.local"                       # absolute install prefix
 //! active_version = "0.31.6"                       # <prefix>/libexec/pohunek/<version>
 //!
@@ -33,6 +33,10 @@
 //!
 //! [sweep]
 //! grace_ms = 5000                                  # 1..=600000
+//!
+//! [input]                                         # milliseconds, 1..=600000
+//! initial_startup_grace_ms = 5000
+//! submit_delay_ms = 150
 //!
 //! [limits]
 //! open_files = 8192                                # 256..=1048576
@@ -112,9 +116,16 @@ pub use error::ConfigError;
 ///
 /// A file with any other value is rejected before its keys are interpreted,
 /// so an older binary never half-understands a newer installation and a newer
-/// binary never reads a file that lacks keys it requires. Version 2 added
-/// `environment.search_path`; there is no migration.
-pub const SCHEMA_VERSION: u32 = 2;
+/// binary never reads a file that lacks keys it requires. Version 3 added
+/// `[input]`; schema 2 is read only through [`ServiceConfig::load_upgrade_source`].
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// Input timings written on fresh installs and assigned explicitly when
+/// upgrading a schema-2 service file, which had no input timing keys.
+pub const DEFAULT_INPUT_TIMING: InputTiming = InputTiming {
+    initial_startup_grace: Duration::from_secs(5),
+    submit_delay: Duration::from_millis(150),
+};
 
 /// File name of the configuration inside the application config directory.
 pub const FILE_NAME: &str = "service.toml";
@@ -132,12 +143,6 @@ pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 /// values; the other deadlines share it since anything longer would only hide
 /// a wedged operation from the operator.
 pub const MAX_DEADLINE: Duration = MAX_JOB_TIMEOUT;
-
-/// Upper bound for initial input when the agent exposes no reader-ready signal.
-///
-/// The daemon short-circuits this bound as soon as an editable prompt or
-/// bracketed-paste enable sequence is observed.
-pub const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
 /// Longest silent-reader wait for clients that omit the extended-wait opt-in.
 ///
@@ -240,6 +245,59 @@ pub struct Deadlines {
     pub daemon_restart_throttle: Duration,
 }
 
+/// Host input timings recorded in `[input]`, in whole milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InputTiming {
+    /// Upper bound before initial input uses the startup fallback.
+    pub initial_startup_grace: Duration,
+    /// Delay between Claude's input body and separate submit write.
+    pub submit_delay: Duration,
+}
+
+/// A validated service file read for an installer upgrade.
+///
+/// The source schema must be recorded with the upgrade transaction so a
+/// rollback can restore the format understood by the previous daemon.
+pub struct UpgradeSource {
+    /// Current typed values, with explicit input timings added for schema 2.
+    pub config: ServiceConfig,
+    /// Schema of the file before the upgrade.
+    pub source_schema_version: u32,
+    original_text: String,
+}
+
+impl std::fmt::Debug for UpgradeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpgradeSource")
+            .field("config", &self.config)
+            .field("source_schema_version", &self.source_schema_version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UpgradeSource {
+    /// Original validated bytes for binding a private backup to a transaction.
+    ///
+    /// The installer must not log these bytes and must verify their digest on
+    /// resume before restoring a previous daemon's configuration.
+    #[must_use]
+    pub fn original_bytes(&self) -> &[u8] {
+        self.original_text.as_bytes()
+    }
+
+    /// Atomically writes the original schema and values to a trusted path.
+    ///
+    /// Use this first to save the pre-upgrade file, then on rollback to
+    /// restore it before starting the previous daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same path, trust, and write errors as [`ServiceConfig::write`].
+    pub fn write_original(&self, path: &Path) -> Result<(), ConfigError> {
+        write_config_text(path, &self.original_text)
+    }
+}
+
 /// Unvalidated values for [`ServiceConfig::new`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSpec {
@@ -262,6 +320,8 @@ pub struct ConfigSpec {
     pub search_path: SearchPath,
     /// Delay between SIGTERM and SIGKILL when sweeping orphaned processes.
     pub sweep_grace: Duration,
+    /// Initial input readiness and Claude submit timings.
+    pub input_timing: InputTiming,
     /// Open-file limit applied to supervised jobs.
     pub open_files: u64,
 }
@@ -282,6 +342,7 @@ pub struct ServiceConfig {
     environment_allowlist: Vec<String>,
     search_path: SearchPath,
     sweep_grace: Duration,
+    input_timing: InputTiming,
     open_files: u64,
 }
 
@@ -333,6 +394,11 @@ impl ServiceConfig {
         )?;
         validate_allowlist(&spec.environment_allowlist)?;
         validate_duration("sweep.grace_ms", spec.sweep_grace)?;
+        validate_duration(
+            "input.initial_startup_grace_ms",
+            spec.input_timing.initial_startup_grace,
+        )?;
+        validate_duration("input.submit_delay_ms", spec.input_timing.submit_delay)?;
         if !(MIN_OPEN_FILES..=MAX_OPEN_FILES).contains(&spec.open_files) {
             return Err(ConfigError::OutOfRange {
                 key: "limits.open_files",
@@ -353,6 +419,7 @@ impl ServiceConfig {
             environment_allowlist: spec.environment_allowlist,
             search_path: spec.search_path,
             sweep_grace: spec.sweep_grace,
+            input_timing: spec.input_timing,
             open_files: spec.open_files,
         })
     }
@@ -374,17 +441,53 @@ impl ServiceConfig {
     /// key, [`ConfigError::UnsupportedSchema`] for another schema version, and
     /// every validation error of [`ServiceConfig::new`].
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let (parent, name) = split_config_path(path)?;
-        let directory = TrustedDir::open_absolute_owner_safe(parent, FORBIDDEN_DIRECTORY_BITS)
-            .map_err(|source| classify_read_error(path, source))?;
-        let bytes = directory
-            .read_file(name, FILE_MODE, MAX_CONFIG_BYTES)
-            .map_err(|source| classify_read_error(path, source))?;
-        let text = std::str::from_utf8(&bytes).map_err(|error| ConfigError::Parse {
-            path: path.to_path_buf(),
-            message: format!("file is not UTF-8: {error}"),
-        })?;
-        parse(path, text)
+        parse(path, &read_config_text(path)?)
+    }
+
+    /// Reads a current or schema-2 service file for an installer upgrade.
+    ///
+    /// Schema 2 had no `[input]` table. This method supplies the documented
+    /// [`DEFAULT_INPUT_TIMING`] explicitly; normal daemon and worker loads
+    /// still require every schema-3 key. The caller must preserve the source
+    /// schema across the transaction and restore it if the old daemon is
+    /// restarted on rollback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same trust and validation errors as [`Self::load`], and
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2 or 3.
+    pub fn load_upgrade_source(path: &Path) -> Result<UpgradeSource, ConfigError> {
+        Self::load_upgrade_source_bytes(path, read_config_text(path)?.as_bytes())
+    }
+
+    /// Parses already-read bytes as a service file for an installer upgrade.
+    ///
+    /// The bytes carry no trust on their own: the caller binds them first, for
+    /// example to the digest a transaction record journals for the exact
+    /// pre-upgrade file, and refuses a mismatch before using the result.
+    /// `path` names the bytes in every error. `load_upgrade_source` is this
+    /// function over a trusted read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] for bytes that are not UTF-8, invalid
+    /// TOML, or a missing, unknown, or mistyped key, and
+    /// [`ConfigError::UnsupportedSchema`] for schemas other than 2 or 3.
+    pub fn load_upgrade_source_bytes(
+        path: &Path,
+        bytes: &[u8],
+    ) -> Result<UpgradeSource, ConfigError> {
+        let original_text =
+            String::from_utf8(bytes.to_vec()).map_err(|error| ConfigError::Parse {
+                path: path.to_path_buf(),
+                message: format!("file is not UTF-8: {error}"),
+            })?;
+        let (config, source_schema_version) = parse_upgrade_source(path, &original_text)?;
+        Ok(UpgradeSource {
+            config,
+            source_schema_version,
+            original_text,
+        })
     }
 
     /// Atomically writes this configuration to an absolute `path` with mode `0600`.
@@ -401,20 +504,7 @@ impl ServiceConfig {
     /// [`ConfigError::Io`] when it cannot be opened or created, and
     /// [`ConfigError::Write`] when the replacement fails.
     pub fn write(&self, path: &Path) -> Result<(), ConfigError> {
-        let (parent, name) = split_config_path(path)?;
-        let directory =
-            open_or_create_directory(parent).map_err(|source| classify_read_error(path, source))?;
-        let temporary = format!(
-            ".{FILE_NAME}.{}.{}.tmp",
-            std::process::id(),
-            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        );
-        directory
-            .replace_file(name, temporary, self.to_toml().as_bytes(), FILE_MODE)
-            .map_err(|source| ConfigError::Write {
-                path: path.to_path_buf(),
-                source,
-            })
+        write_config_text(path, &self.to_toml())
     }
 
     /// Renders the configuration as the TOML document [`load`](Self::load) accepts.
@@ -449,6 +539,10 @@ impl ServiceConfig {
             sweep: RawSweep {
                 grace_ms: millis(self.sweep_grace),
             },
+            input: RawInput {
+                initial_startup_grace_ms: millis(self.input_timing.initial_startup_grace),
+                submit_delay_ms: millis(self.input_timing.submit_delay),
+            },
             limits: RawLimits {
                 open_files: self.open_files,
             },
@@ -474,6 +568,7 @@ impl ServiceConfig {
             environment_allowlist: self.environment_allowlist.clone(),
             search_path: self.search_path.clone(),
             sweep_grace: self.sweep_grace,
+            input_timing: self.input_timing,
             open_files: self.open_files,
         }
     }
@@ -599,6 +694,12 @@ impl ServiceConfig {
         self.sweep_grace
     }
 
+    /// Returns the host input timings.
+    #[must_use]
+    pub fn input_timing(&self) -> InputTiming {
+        self.input_timing
+    }
+
     /// Returns the open-file limit for supervised jobs.
     #[must_use]
     pub fn open_files(&self) -> u64 {
@@ -606,10 +707,57 @@ impl ServiceConfig {
     }
 }
 
+/// Reads a trusted service file while keeping parsing policy at the caller.
+fn read_config_text(path: &Path) -> Result<String, ConfigError> {
+    let (parent, name) = split_config_path(path)?;
+    let directory = TrustedDir::open_absolute_owner_safe(parent, FORBIDDEN_DIRECTORY_BITS)
+        .map_err(|source| classify_read_error(path, source))?;
+    let bytes = directory
+        .read_file(name, FILE_MODE, MAX_CONFIG_BYTES)
+        .map_err(|source| classify_read_error(path, source))?;
+    String::from_utf8(bytes).map_err(|error| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: format!("file is not UTF-8: {error}"),
+    })
+}
+
+/// Replaces a trusted service configuration or transaction backup atomically.
+fn write_config_text(path: &Path, text: &str) -> Result<(), ConfigError> {
+    let (parent, name) = split_config_path(path)?;
+    let directory =
+        open_or_create_directory(parent).map_err(|source| classify_read_error(path, source))?;
+    let temporary = format!(
+        ".{FILE_NAME}.{}.{}.tmp",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    directory
+        .replace_file(name, temporary, text.as_bytes(), FILE_MODE)
+        .map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
 /// On-disk form of the whole file.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    schema_version: u32,
+    prefix: String,
+    active_version: String,
+    namespace: RawNamespace,
+    deadlines: RawDeadlines,
+    environment: RawEnvironment,
+    sweep: RawSweep,
+    input: RawInput,
+    limits: RawLimits,
+}
+
+/// Exact on-disk schema-2 shape accepted only for an explicit upgrade.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfigV2 {
     schema_version: u32,
     prefix: String,
     active_version: String,
@@ -660,6 +808,14 @@ struct RawSweep {
     grace_ms: u64,
 }
 
+/// On-disk `[input]` table in milliseconds.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInput {
+    initial_startup_grace_ms: u64,
+    submit_delay_ms: u64,
+}
+
 /// On-disk `[limits]` table.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -687,6 +843,42 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
             found: i64::from(raw.schema_version),
         });
     }
+    config_from_raw(raw)
+}
+
+/// Parses only the exact previous schema at the installer upgrade boundary.
+fn parse_upgrade_source(path: &Path, text: &str) -> Result<(ServiceConfig, u32), ConfigError> {
+    let parse_error = |error: toml::de::Error| ConfigError::Parse {
+        path: path.to_path_buf(),
+        message: diagnostic(text, &error),
+    };
+    let table: toml::Table = toml::from_str(text).map_err(parse_error)?;
+    match table.get("schema_version") {
+        Some(toml::Value::Integer(2)) => {
+            let previous: RawConfigV2 = toml::from_str(text).map_err(parse_error)?;
+            let raw = RawConfig {
+                schema_version: SCHEMA_VERSION,
+                prefix: previous.prefix,
+                active_version: previous.active_version,
+                namespace: previous.namespace,
+                deadlines: previous.deadlines,
+                environment: previous.environment,
+                sweep: previous.sweep,
+                input: RawInput {
+                    initial_startup_grace_ms: millis(DEFAULT_INPUT_TIMING.initial_startup_grace),
+                    submit_delay_ms: millis(DEFAULT_INPUT_TIMING.submit_delay),
+                },
+                limits: previous.limits,
+            };
+            debug_assert_eq!(previous.schema_version, 2);
+            Ok((config_from_raw(raw)?, 2))
+        }
+        _ => Ok((parse(path, text)?, SCHEMA_VERSION)),
+    }
+}
+
+/// Converts the parsed current shape into validated typed values.
+fn config_from_raw(raw: RawConfig) -> Result<ServiceConfig, ConfigError> {
     let search_path = SearchPath::new(
         raw.environment
             .search_path
@@ -716,6 +908,10 @@ fn parse(path: &Path, text: &str) -> Result<ServiceConfig, ConfigError> {
         environment_allowlist: raw.environment.allowlist,
         search_path,
         sweep_grace: Duration::from_millis(raw.sweep.grace_ms),
+        input_timing: InputTiming {
+            initial_startup_grace: Duration::from_millis(raw.input.initial_startup_grace_ms),
+            submit_delay: Duration::from_millis(raw.input.submit_delay_ms),
+        },
         open_files: raw.limits.open_files,
     })
 }

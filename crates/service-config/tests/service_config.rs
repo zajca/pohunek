@@ -11,13 +11,13 @@ use pohunek_platform::filesystem::FsError;
 use pohunek_platform::shell_env::SearchPath;
 use pohunek_platform::supervisor::Namespace;
 use pohunek_service_config::{
-    ConfigError, ConfigSpec, Deadlines, ServiceConfig, MAX_ALLOWLIST_ENTRIES, MAX_CONFIG_BYTES,
-    MAX_DEADLINE, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
+    ConfigError, ConfigSpec, Deadlines, ServiceConfig, DEFAULT_INPUT_TIMING, MAX_ALLOWLIST_ENTRIES,
+    MAX_CONFIG_BYTES, MAX_DEADLINE, MAX_PATTERN_BYTES, MAX_SEARCH_PATH_BYTES,
 };
 use tempfile::TempDir;
 
 /// The schema example from the crate contract.
-const GOLDEN: &str = r#"schema_version = 2
+const GOLDEN: &str = r#"schema_version = 3
 prefix = "/home/u/.local"
 active_version = "0.31.6"
 
@@ -42,12 +42,16 @@ allowlist = ["PATH","HOME","USER","LOGNAME","SHELL","LANG","LC_*","TMPDIR",
 [sweep]
 grace_ms = 5000
 
+[input]
+initial_startup_grace_ms = 5000
+submit_delay_ms = 150
+
 [limits]
 open_files = 8192
 "#;
 
 /// Every required key and the `namespace` table, as a missing-field diagnostic names them.
-const REQUIRED_KEYS: [&str; 17] = [
+const REQUIRED_KEYS: [&str; 20] = [
     "schema_version",
     "prefix",
     "active_version",
@@ -63,6 +67,9 @@ const REQUIRED_KEYS: [&str; 17] = [
     "search_path",
     "allowlist",
     "grace_ms",
+    "input",
+    "initial_startup_grace_ms",
+    "submit_delay_ms",
     "open_files",
     "namespace",
 ];
@@ -140,6 +147,7 @@ fn spec() -> ConfigSpec {
         environment_allowlist: vec!["PATH".to_owned(), "LC_*".to_owned()],
         search_path: SearchPath::empty(),
         sweep_grace: Duration::from_secs(5),
+        input_timing: DEFAULT_INPUT_TIMING,
         open_files: 8192,
     }
 }
@@ -198,6 +206,7 @@ fn golden_example_parses_into_typed_values() {
     assert_eq!(config.environment_allowlist().len(), 13);
     assert_eq!(config.environment_allowlist()[6], "LC_*");
     assert_eq!(config.sweep_grace(), Duration::from_secs(5));
+    assert_eq!(config.input_timing(), DEFAULT_INPUT_TIMING);
     assert_eq!(config.open_files(), 8192);
     assert_eq!(
         config.namespace(),
@@ -213,9 +222,14 @@ fn golden_example_parses_into_typed_values() {
 fn every_missing_key_is_named() {
     let fixture = Fixture::new();
     for key in REQUIRED_KEYS {
-        let text = if key == "namespace" {
-            let start = GOLDEN.find("[namespace]").expect("namespace table");
-            let end = GOLDEN.find("[deadlines]").expect("deadlines table");
+        let text = if key == "namespace" || key == "input" {
+            let (table, next) = if key == "namespace" {
+                ("[namespace]", "[deadlines]")
+            } else {
+                ("[input]", "[limits]")
+            };
+            let start = GOLDEN.find(table).expect("table");
+            let end = GOLDEN.find(next).expect("next table");
             format!("{}{}", &GOLDEN[..start], &GOLDEN[end..])
         } else {
             let start = GOLDEN
@@ -244,7 +258,8 @@ fn missing_tables_are_named() {
     for (table, next) in [
         ("[deadlines]", "[environment]"),
         ("[environment]", "[sweep]"),
-        ("[sweep]", "[limits]"),
+        ("[sweep]", "[input]"),
+        ("[input]", "[limits]"),
     ] {
         let start = GOLDEN.find(table).expect("table");
         let end = GOLDEN.find(next).expect("next table");
@@ -268,6 +283,11 @@ fn unknown_keys_are_rejected_at_every_level() {
         replace(GOLDEN, "prefix =", "surprise = 1\nprefix ="),
         replace(GOLDEN, "uid = 1000", "uid = 1000\nsurprise = 1"),
         replace(GOLDEN, "grace_ms = 5000", "grace_ms = 5000\nsurprise = 1"),
+        replace(
+            GOLDEN,
+            "initial_startup_grace_ms = 5000",
+            "initial_startup_grace_ms = 5000\nsurprise = 1",
+        ),
         replace(
             GOLDEN,
             "open_files = 8192",
@@ -433,17 +453,120 @@ fn other_schema_versions_are_rejected_before_their_keys() {
     let fixture = Fixture::new();
     let newer = replace(
         GOLDEN,
-        "schema_version = 2",
-        "schema_version = 3\nfuture_key = true",
+        "schema_version = 3",
+        "schema_version = 4\nfuture_key = true",
     );
     assert!(matches!(
         fixture.load(&newer),
-        Err(ConfigError::UnsupportedSchema { found: 3 })
+        Err(ConfigError::UnsupportedSchema { found: 4 })
     ));
-    let zero = replace(GOLDEN, "schema_version = 2", "schema_version = 0");
+    let zero = replace(GOLDEN, "schema_version = 3", "schema_version = 0");
     assert!(matches!(
         fixture.load(&zero),
         Err(ConfigError::UnsupportedSchema { found: 0 })
+    ));
+}
+
+/// Frozen previous-release shape, independent of the schema-3 writer.
+const SCHEMA_TWO_GOLDEN: &str = r#"schema_version = 2
+prefix = "/home/u/.local"
+active_version = "0.33.1"
+
+[namespace]
+uid = 1000
+state_root = "/home/u/.local/state/pohunek"
+runtime_root = "/run/user/1000/pohunek"
+
+[deadlines]
+worker_connect_ms = 10000
+worker_initialize_ms = 45000
+launchctl_command_ms = 10000
+worker_exit_timeout_ms = 30000
+daemon_exit_timeout_ms = 30000
+daemon_restart_throttle_ms = 5000
+
+[environment]
+search_path = ["/opt/homebrew/bin", "/Users/u/.local/bin", "/usr/bin"]
+allowlist = ["PATH","HOME","USER","LOGNAME","SHELL","LANG","LC_*","TMPDIR",
+  "SSH_AUTH_SOCK","DISPLAY","WAYLAND_DISPLAY","DBUS_SESSION_BUS_ADDRESS","XDG_*"]
+
+[sweep]
+grace_ms = 5000
+
+[limits]
+open_files = 8192
+"#;
+
+fn schema_two_text() -> String {
+    SCHEMA_TWO_GOLDEN.to_owned()
+}
+
+#[test]
+fn upgrade_source_explicitly_migrates_schema_two_to_required_input_keys() {
+    let fixture = Fixture::new();
+    let previous = schema_two_text();
+    let path = fixture.write(&previous, 0o600);
+    assert!(matches!(
+        ServiceConfig::load(&path),
+        Err(ConfigError::UnsupportedSchema { found: 2 })
+    ));
+    let source = ServiceConfig::load_upgrade_source(&path).expect("schema 2 upgrade source");
+    assert_eq!(source.source_schema_version, 2);
+    assert_eq!(source.config.input_timing(), DEFAULT_INPUT_TIMING);
+    assert_eq!(source.original_bytes(), previous.as_bytes());
+    let backup = fixture.root.join("upgrade-backup/service.toml");
+    source.write_original(&backup).expect("save private backup");
+    assert_eq!(fs::read(&backup).expect("read backup"), previous.as_bytes());
+    assert_eq!(
+        fs::metadata(&backup)
+            .expect("backup metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    source.config.write(&path).expect("write schema 3");
+    let current = ServiceConfig::load_upgrade_source(&path).expect("schema 3 upgrade source");
+    assert_eq!(current.source_schema_version, 3);
+    assert_eq!(current.config, source.config);
+    assert!(fs::read_to_string(&path)
+        .expect("read migrated config")
+        .contains("submit_delay_ms = 150"));
+    let saved = ServiceConfig::load_upgrade_source(&backup).expect("verified backup");
+    assert_eq!(saved.source_schema_version, 2);
+    saved
+        .write_original(&path)
+        .expect("rollback exact schema 2");
+    assert_eq!(fs::read(&path).expect("read rollback"), previous.as_bytes());
+    assert!(matches!(
+        ServiceConfig::load(&path),
+        Err(ConfigError::UnsupportedSchema { found: 2 })
+    ));
+}
+
+#[test]
+fn upgrade_source_rejects_invalid_previous_shape_and_unsupported_schema() {
+    let fixture = Fixture::new();
+    let previous = schema_two_text();
+    let missing = replace(&previous, "grace_ms = 5000\n", "");
+    let path = fixture.write(&missing, 0o600);
+    assert!(matches!(
+        ServiceConfig::load_upgrade_source(&path),
+        Err(ConfigError::Parse { .. })
+    ));
+    let unexpected = format!("{previous}\n[unexpected]\nvalue = 1\n");
+    fixture.write(&unexpected, 0o600);
+    assert!(matches!(
+        ServiceConfig::load_upgrade_source(&path),
+        Err(ConfigError::Parse { .. })
+    ));
+    fixture.write(
+        &replace(&previous, "schema_version = 2", "schema_version = 1"),
+        0o600,
+    );
+    assert!(matches!(
+        ServiceConfig::load_upgrade_source(&path),
+        Err(ConfigError::UnsupportedSchema { found: 1 })
     ));
 }
 
@@ -474,6 +597,11 @@ fn durations_are_bounded() {
             "deadlines.daemon_restart_throttle_ms",
         ),
         ("grace_ms = 5000", "sweep.grace_ms"),
+        (
+            "initial_startup_grace_ms = 5000",
+            "input.initial_startup_grace_ms",
+        ),
+        ("submit_delay_ms = 150", "input.submit_delay_ms"),
     ] {
         let name = line.split(" = ").next().expect("key");
         for value in [0, max + 1] {
@@ -490,6 +618,35 @@ fn durations_are_bounded() {
         let text = replace(GOLDEN, line, &format!("{name} = {max}"));
         fixture.load(&text).expect("maximum deadline is accepted");
     }
+}
+
+#[test]
+fn custom_host_input_timing_is_loaded_and_preserved_on_write() {
+    let fixture = Fixture::new();
+    let custom = replace(
+        &replace(
+            GOLDEN,
+            "initial_startup_grace_ms = 5000",
+            "initial_startup_grace_ms = 11000",
+        ),
+        "submit_delay_ms = 150",
+        "submit_delay_ms = 275",
+    );
+    let loaded = fixture.load(&custom).expect("load custom host timing");
+    assert_eq!(
+        loaded.input_timing().initial_startup_grace,
+        Duration::from_secs(11)
+    );
+    assert_eq!(
+        loaded.input_timing().submit_delay,
+        Duration::from_millis(275)
+    );
+    loaded
+        .write(&fixture.path())
+        .expect("write custom host timing");
+    let written = fs::read_to_string(fixture.path()).expect("read written config");
+    assert!(written.contains("initial_startup_grace_ms = 11000"));
+    assert!(written.contains("submit_delay_ms = 275"));
 }
 
 #[test]
@@ -1067,7 +1224,7 @@ fn invalid_search_paths_are_rejected_without_quoting_the_value() {
 fn a_schema_one_file_is_rejected_with_an_actionable_error() {
     let fixture = Fixture::new();
     let without_search_path = GOLDEN
-        .replacen("schema_version = 2", "schema_version = 1", 1)
+        .replacen("schema_version = 3", "schema_version = 1", 1)
         .lines()
         .filter(|line| !line.starts_with("search_path = "))
         .collect::<Vec<_>>()
