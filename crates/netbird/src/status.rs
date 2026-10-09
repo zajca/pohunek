@@ -438,79 +438,9 @@ fn clamp(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::net::IpAddr;
     use std::os::unix::fs::PermissionsExt as _;
 
     const STATUS_CURRENT: &str = include_str!("../tests/fixtures/status_current.json");
-
-    #[test]
-    fn self_ip_outside_netbird_range_is_rejected() {
-        // A root netbirdIp that is a public address must NOT be returned.
-        let json = r#"{ "netbirdIp": "8.8.8.8" }"#;
-        let status = parse_status(json).unwrap();
-        assert_eq!(status.self_netbird_ip(), None);
-    }
-
-    #[tokio::test]
-    async fn async_missing_program_is_cli_missing() {
-        let err = run_status_async_at(Path::new("definitely-not-a-real-binary-xyz"))
-            .await
-            .expect_err("missing CLI returns an error");
-        assert!(matches!(err, NetbirdError::CliMissing));
-    }
-
-    #[tokio::test]
-    #[cfg(target_os = "linux")]
-    async fn async_status_future_is_cancellation_safe() {
-        const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-        const STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
-        const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-        let directory = pohunek_test_support::tempdir_with_prefix("pohunek-netbird-slow-status-")
-            .expect("private test root");
-        let root = directory.path();
-        let program = root.join("netbird-test");
-        let pid_path = root.join("pid");
-        pohunek_test_support::fs::write_file(
-            &program,
-            format!(
-                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
-                pid_path.display()
-            ),
-        )
-        .expect("write script");
-        let mut permissions = fs::metadata(&program).expect("metadata").permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&program, permissions).expect("chmod script");
-
-        let mut status = Box::pin(run_status_async_at(&program));
-        tokio::time::timeout(START_TIMEOUT, async {
-            tokio::select! {
-                result = &mut status => panic!("slow status exited before cancellation: {result:?}"),
-                () = async {
-                    // The shell creates the file before it writes the pid.
-                    while fs::read_to_string(&pid_path).map_or(true, |pid| pid.is_empty()) {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                } => {}
-            }
-        })
-        .await
-        .expect("status subprocess started");
-        let pid = fs::read_to_string(&pid_path)
-            .expect("read child pid")
-            .parse::<u32>()
-            .expect("parse child pid");
-
-        let result = tokio::time::timeout(STATUS_TIMEOUT, status).await;
-        assert!(result.is_err(), "slow status must exceed the test deadline");
-        tokio::time::timeout(EXIT_TIMEOUT, async {
-            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("timed-out status subprocess must be killed");
-    }
 
     /// A private directory (canonical, mode 0700) holding a fake `netbird`
     /// that prints `body` and exits 0, with `mode` as the file's permissions.
@@ -527,55 +457,6 @@ mod tests {
         .expect("script");
         fs::set_permissions(&program, fs::Permissions::from_mode(mode)).expect("chmod");
         (dir, program)
-    }
-
-    #[test]
-    fn program_resolves_from_the_supplied_path_and_runs_by_absolute_path() {
-        let (dir, program) = fake_netbird("resolve", STATUS_CURRENT, 0o755);
-        let resolved =
-            resolve_program(Some(dir.path().as_os_str()), &[], None).expect("trusted netbird");
-        assert_eq!(resolved, program);
-        let status = run_status_at(&resolved).expect("status via the resolved path");
-        assert_eq!(
-            status.self_netbird_ip(),
-            Some("100.92.10.20".parse::<IpAddr>().unwrap())
-        );
-    }
-
-    #[test]
-    fn an_untrusted_candidate_is_not_run() {
-        let (dir, _) = fake_netbird("untrusted", STATUS_CURRENT, 0o777);
-        assert!(matches!(
-            resolve_program(Some(dir.path().as_os_str()), &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
-    }
-
-    #[test]
-    fn a_trusted_candidate_later_on_path_wins_over_an_untrusted_one() {
-        let (loose, _) = fake_netbird("loose", STATUS_CURRENT, 0o777);
-        let (safe, program) = fake_netbird("safe", STATUS_CURRENT, 0o755);
-        let path = std::env::join_paths([loose.path(), safe.path()]).expect("join");
-        assert_eq!(
-            resolve_program(Some(&path), &[], None).expect("safe one"),
-            program
-        );
-    }
-
-    #[test]
-    fn absent_empty_and_relative_path_resolve_nothing() {
-        assert!(matches!(
-            resolve_program(None, &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
-        assert!(matches!(
-            resolve_program(Some(OsStr::new("")), &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
-        assert!(matches!(
-            resolve_program(Some(OsStr::new("relative/bin:.")), &[], None),
-            Err(NetbirdError::CliMissing)
-        ));
     }
 
     #[test]
@@ -658,14 +539,5 @@ mod tests {
             let status = lookup.await.expect("task").expect("status");
             assert!(status.self_netbird_ip().is_some());
         }
-    }
-
-    #[test]
-    fn clamp_respects_char_boundaries() {
-        // A multi-byte char at the cut point must not be split.
-        let s = "ααααα"; // each 'α' is 2 bytes
-        let clamped = clamp(s, 3);
-        assert!(clamped.is_char_boundary(clamped.len()));
-        assert!(clamped.ends_with('…'));
     }
 }

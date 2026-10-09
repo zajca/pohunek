@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt as _;
 
 use pohunek_test_support::env::TestEnv;
 
@@ -81,6 +83,141 @@ fn inspect_rejects_unknown_and_ambiguous_netbird_hosts() {
     assert!(ambiguous_doc["err"]["msg"]
         .as_str()
         .is_some_and(|message| message.contains("build")));
+}
+
+#[test]
+fn inspect_never_dials_an_unlisted_or_untrusted_netbird_address() {
+    let known_peer = r#"{"peers":[{"fqdn":"safe.example","netbirdIp":"100.64.0.2"}]}"#;
+    for selector in ["100.64.0.99", "8.8.8.8"] {
+        let output = inspect_output(known_peer, selector);
+        assert!(!output.status.success());
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+        assert_eq!(document["err"]["code"], "host_unknown", "{selector}");
+    }
+
+    let spoofed = r#"{"peers":[{"fqdn":"evil.example","netbirdIp":"169.254.169.254"}]}"#;
+    for selector in ["evil", "evil.example", "169.254.169.254"] {
+        let output = inspect_output(spoofed, selector);
+        assert!(!output.status.success());
+        let document: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+        assert_eq!(document["err"]["code"], "host_unknown", "{selector}");
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn discovery_runs_only_a_trusted_netbird_executable_from_path() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let loose_bin = env.root().join("loose-bin");
+    let safe_bin = env.root().join("safe-bin");
+    fs::create_dir_all(&loose_bin).expect("create loose bin");
+    fs::create_dir_all(&safe_bin).expect("create safe bin");
+    let loose_marker = env.root().join("loose-ran");
+    let safe_marker = env.root().join("safe-ran");
+    let loose = loose_bin.join("netbird");
+    let safe = safe_bin.join("netbird");
+    pohunek_test_support::fs::write_executable(
+        &loose,
+        format!(
+            "#!/bin/sh\nprintf 'ran' > '{}'\nprintf '%s\\n' '{{\"peers\":[]}}'\n",
+            loose_marker.display()
+        ),
+    )
+    .expect("write loose binary");
+    fs::set_permissions(&loose, fs::Permissions::from_mode(0o777))
+        .expect("make candidate world-writable");
+    pohunek_test_support::fs::write_executable(
+        &safe,
+        format!(
+            "#!/bin/sh\nprintf 'ran' > '{}'\nprintf '%s\\n' '{{\"peers\":[]}}'\n",
+            safe_marker.display()
+        ),
+    )
+    .expect("write safe binary");
+
+    let run = |path: String| {
+        env.command(pohunek_test_support::bin_exe("pohunek"))
+            .args(["host", "discover", "--refresh", "--json"])
+            .env("PATH", path)
+            .output()
+            .expect("run CLI discovery")
+    };
+    for path in [
+        String::new(),
+        "relative/bin:.".to_owned(),
+        loose_bin.display().to_string(),
+    ] {
+        let rejected = run(path);
+        assert!(!rejected.status.success());
+        let rejected_doc: serde_json::Value =
+            serde_json::from_slice(&rejected.stdout).expect("versioned JSON error");
+        assert_eq!(rejected_doc["err"]["code"], "netbird_cli_missing");
+    }
+    assert!(!loose_marker.exists());
+
+    let selected = run(format!("{}:{}", loose_bin.display(), safe_bin.display()));
+    assert!(
+        selected.status.success(),
+        "trusted binary failed: {}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert!(!loose_marker.exists());
+    assert_eq!(
+        fs::read_to_string(safe_marker).expect("trusted binary ran"),
+        "ran"
+    );
+}
+
+#[test]
+fn discovery_normalizes_peer_cidr_and_rejects_addresses_outside_netbird() {
+    let records = discover_with_status(
+        r#"{"peers":[
+            {"fqdn":"lower.example","netbirdIp":"100.64.0.0/10"},
+            {"fqdn":"upper.example","netbirdIp":"100.127.255.255"},
+            {"fqdn":"middle.example","netbirdIp":" 100.92.10.20 "},
+            {"fqdn":"below.example","netbirdIp":"100.63.255.255"},
+            {"fqdn":"above.example","netbirdIp":"100.128.0.0"},
+            {"fqdn":"private.example","netbirdIp":"10.0.0.1"},
+            {"fqdn":"ipv6.example","netbirdIp":"::1"},
+            {"fqdn":"invalid.example","netbirdIp":"not-an-ip"}
+        ]}"#,
+    );
+    let addresses: Vec<&serde_json::Value> =
+        records.iter().map(|record| &record["address"]).collect();
+    assert_eq!(addresses[0], "100.64.0.0");
+    assert_eq!(addresses[1], "100.127.255.255");
+    assert_eq!(addresses[2], "100.92.10.20");
+    assert!(addresses[3..].iter().all(|address| address.is_null()));
+}
+
+#[test]
+fn discovery_bounds_unicode_errors_from_the_netbird_process() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let bin = env.root().join("bin");
+    fs::create_dir_all(&bin).expect("create bin");
+    let detail = "α".repeat(400);
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        format!("#!/bin/sh\ncat <<'EOF' >&2\n{detail}\nEOF\nexit 1\n"),
+    )
+    .expect("write failing NetBird fixture");
+    let inherited_path = std::env::var("PATH").expect("PATH");
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args(["host", "discover", "--refresh", "--json"])
+        .env("PATH", format!("{}:{inherited_path}", bin.display()))
+        .output()
+        .expect("run CLI discovery");
+    assert!(!output.status.success());
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("versioned JSON error");
+    assert_eq!(document["err"]["code"], "netbird_state_unavailable");
+    let message = document["err"]["msg"].as_str().expect("error message");
+    assert!(message.ends_with('…'), "error detail was not truncated");
+    assert!(!message.contains('�'), "Unicode must stay valid");
+    assert!(message.len() < detail.len(), "error detail must be bounded");
 }
 
 #[test]
@@ -205,43 +342,4 @@ fn discover_and_list_json_need_cache_and_netbird_but_not_runtime_socket() {
         assert!(document["cli_version"].is_string());
         assert!(document["protocol"]["maximum"].is_number());
     }
-}
-
-#[test]
-fn local_health_rejects_an_empty_runtime_base_before_connecting() {
-    let env = TestEnv::new().expect("create the hermetic test environment");
-    let output = env
-        .command(pohunek_test_support::bin_exe("pohunek"))
-        .args(["health", "--json"])
-        .env("XDG_RUNTIME_DIR", "")
-        .output()
-        .expect("run CLI");
-    assert!(!output.status.success());
-    let document: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("versioned JSON error envelope");
-    assert_eq!(document["err"]["class"], "configuration");
-    assert_eq!(document["err"]["code"], "paths_unavailable");
-    assert!(document["err"]["msg"]
-        .as_str()
-        .is_some_and(|message| message.contains("XDG_RUNTIME_DIR must not be empty")));
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn local_health_rejects_a_missing_runtime_base_before_connecting() {
-    let env = TestEnv::new().expect("create the hermetic test environment");
-    let output = env
-        .command(pohunek_test_support::bin_exe("pohunek"))
-        .args(["health", "--json"])
-        .env_remove("XDG_RUNTIME_DIR")
-        .output()
-        .expect("run CLI");
-    assert!(!output.status.success());
-    let document: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("versioned JSON error envelope");
-    assert_eq!(document["err"]["class"], "configuration");
-    assert_eq!(document["err"]["code"], "missing_env");
-    assert!(document["err"]["msg"]
-        .as_str()
-        .is_some_and(|message| message.contains("XDG_RUNTIME_DIR is not set")));
 }

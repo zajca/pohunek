@@ -349,6 +349,41 @@ fn doctor_process_redacts_an_unavailable_local_daemon_in_human_and_json_output()
     assert_redacted_doctor_output(&human_stdout, &socket);
 }
 
+#[test]
+fn doctor_reports_only_a_safe_netbird_self_address() {
+    let home = TestHome::new();
+    let bin = home.root.join("doctor-netbird-bin");
+    fs::create_dir_all(&bin).expect("create NetBird fixture bin");
+    let program = bin.join("netbird");
+    for (address, expected_status) in [("100.64.0.10/16", "ok"), ("8.8.8.8", "warn")] {
+        pohunek_test_support::fs::write_executable(
+            &program,
+            format!("#!/bin/sh\nprintf '%s\\n' '{{\"netbirdIp\":\"{address}\"}}'\n"),
+        )
+        .expect("write NetBird status fixture");
+        let output = home
+            .command()
+            .env("PATH", &bin)
+            .args(["doctor", "--json"])
+            .output()
+            .expect("run doctor CLI");
+        let document: Value =
+            serde_json::from_slice(&output.stdout).expect("versioned doctor JSON");
+        let checks = document["ok"]["checks"].as_array().expect("doctor checks");
+        let check = checks
+            .iter()
+            .find(|check| check["name"] == "netbird_cli")
+            .expect("NetBird doctor check");
+        assert_eq!(check["status"], expected_status, "address {address}");
+        if expected_status == "warn" {
+            assert!(!check["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(address));
+        }
+    }
+}
+
 /// Renders a process outcome for assertion messages: status, stdout, stderr.
 fn describe(output: &Output) -> String {
     format!(
@@ -1480,29 +1515,26 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
 
     let private_session = "remote-origin-session";
     let private_daemon = "remote-origin-daemon";
-    let output = home
-        .command()
-        .env("PATH", path)
-        .env("LD_PRELOAD", connect_redirect)
-        .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
-        .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
-        .env(protocol::ENV_SESSION_ID, private_session)
-        .env(protocol::ENV_DAEMON_ID, private_daemon)
-        .args([
-            "--host",
-            "fixture-remote",
-            "session",
-            "screen",
-            SESSION_ID,
-            "--json",
-        ])
-        .output()
-        .expect("run remote pohunek");
+    for selector in ["fixture-remote", "FIXTURE-REMOTE.NETBIRD.TEST", netbird_ip] {
+        let output = home
+            .command()
+            .env("PATH", &path)
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+            .env(protocol::ENV_SESSION_ID, private_session)
+            .env(protocol::ENV_DAEMON_ID, private_daemon)
+            .args([
+                "--host", selector, "session", "screen", SESSION_ID, "--json",
+            ])
+            .output()
+            .expect("run remote pohunek");
+        let ok = assert_json_success(&output);
+        assert_eq!(ok["session_id"], SESSION_ID, "selector {selector}");
+    }
     let requests = tcp_fixture.finish();
     let local_requests = local_fixture.finish();
-    let ok = assert_json_success(&output);
-    assert_eq!(ok["session_id"], SESSION_ID);
-    assert!(requests.len() >= 2, "list and screen reach TCP fixture");
+    assert!(requests.len() >= 6, "every selector reaches TCP fixture");
     for request in requests {
         assert_eq!(
             request.origin_session_id().map(|id| id.0.as_str()),
@@ -1521,9 +1553,69 @@ fn fake_netbird_resolution_reaches_tcp_fixture_with_origin_pair() {
             .lines()
             .filter(|line| *line == expected_target)
             .count()
-            >= 2,
-        "both CLI connections must target the fake NetBird address before the test-only redirect"
+            >= 6,
+        "every CLI connection must target the fake NetBird address before the test-only redirect"
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn stable_netbird_peer_identity_follows_its_new_address_but_not_a_reassigned_one() {
+    let home = TestHome::new();
+    let tcp_fixture = TcpFixtureDaemon::start(Ipv4Addr::LOCALHOST, Scenario::Success);
+    let remote_port = tcp_fixture.address.port();
+    let (connect_redirect, connect_capture) = build_connect_redirect(&home);
+    let bin = home.root.join("identity-netbird-bin");
+    fs::create_dir_all(&bin).expect("create NetBird fixture bin");
+    let netbird = bin.join("netbird");
+    let selector = pohunek_client::ExternalIdentity::peer_id("stable/key+=")
+        .expect("stable peer identity")
+        .selector();
+    let host = format!("netbird:{selector}");
+
+    let write_status = |peer_id: &str, address: &str| {
+        pohunek_test_support::fs::write_executable(
+            &netbird,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{{\"peers\":[{{\"publicKey\":\"{peer_id}\",\"fqdn\":\"remote.example\",\"netbirdIp\":\"{address}\"}}]}}'\n"
+            ),
+        )
+        .expect("write NetBird status fixture");
+    };
+    let run = || {
+        home.command()
+            .env("PATH", &bin)
+            .env("LD_PRELOAD", &connect_redirect)
+            .env("POHUNEK_TEST_CONNECT_CAPTURE", &connect_capture)
+            .env("POHUNEK_REMOTE_PORT", remote_port.to_string())
+            .args(["--host", &host, "session", "screen", SESSION_ID, "--json"])
+            .output()
+            .expect("run remote CLI")
+    };
+
+    for address in ["100.64.0.42", "100.64.0.43"] {
+        write_status("stable/key+=", address);
+        let output = run();
+        assert_json_success(&output);
+        let captured = fs::read_to_string(&connect_capture).expect("read connect targets");
+        assert!(
+            captured
+                .lines()
+                .any(|line| line == format!("{address}:{remote_port}")),
+            "stable identity must route to its current address: {captured}"
+        );
+    }
+
+    let before = fs::read_to_string(&connect_capture).expect("read previous connect targets");
+    write_status("different-key", "100.64.0.42");
+    let rejected = run();
+    assert_json_error(&rejected, "host_unknown");
+    assert_eq!(
+        fs::read_to_string(&connect_capture).expect("read connect targets after reassignment"),
+        before,
+        "the old peer identity must not follow an address reassigned to another peer"
+    );
+    assert!(!tcp_fixture.finish().is_empty());
 }
 
 #[cfg(target_os = "linux")]

@@ -188,39 +188,3 @@ fn short_fqdn(fqdn: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
         .map(str::to_owned)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn status(json: &str) -> NetbirdStatus {
-        crate::parse_status(json).expect("status fixture")
-    }
-
-    #[test]
-    fn resolved_peer_keeps_public_key_across_ip_change() {
-        let id = OverlayId::new(NETBIRD_OVERLAY_ID).expect("id");
-        let first = status(
-            r#"{"peers":[{"publicKey":"stable-key","fqdn":"remote.example","netbirdIp":"100.64.0.2"}]}"#,
-        );
-        let second = status(
-            r#"{"peers":[{"publicKey":"stable-key","fqdn":"remote.example","netbirdIp":"100.64.0.3"}]}"#,
-        );
-
-        let first = resolve_from_status(&first, "stable-key", &id).expect("first route");
-        let second = resolve_from_status(&second, "stable-key", &id).expect("second route");
-
-        assert_eq!(first.peer_id.as_deref(), Some("stable-key"));
-        assert_eq!(second.peer_id.as_deref(), Some("stable-key"));
-        assert_eq!(
-            first.address,
-            "100.64.0.2".parse::<IpAddr>().expect("first IP")
-        );
-        assert_eq!(
-            second.address,
-            "100.64.0.3".parse::<IpAddr>().expect("second IP")
-        );
-    }
-}
-
-// Rust guideline compliant 2026-08-28
