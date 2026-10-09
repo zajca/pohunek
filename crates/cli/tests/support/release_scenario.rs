@@ -91,7 +91,7 @@ pub(crate) fn locate_smoke_upstream(
         format!("archive smoke staged upstream `{program}` is missing or unresolved: {error}")
     })?;
     let upstream = locate_upstream(program, path)?;
-    if !expected.starts_with(&stage_root) || upstream != expected {
+    if !expected.starts_with(&stage_root) || upstream != stage_bin.join(program) {
         return Err(format!(
             "archive smoke upstream `{program}` did not resolve within the verified stage"
         ));
