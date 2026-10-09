@@ -132,6 +132,12 @@ The assistant feature reuses this session lifecycle. Its opening prompt is just
 initial input to a normal session, so session warnings and applied-input status
 remain the source of truth for whether the agent received that prompt.
 
+For profile-backed agents, `session.new` writes initial input to the PTY after
+the agent shows an editable prompt or enables bracketed paste. The bounded
+startup grace permits delivery when the agent stays silent. The daemon writes
+the prompt body and submit key as separate fragments using the runtime's input
+rules. A successful write confirms PTY delivery, not agent consumption.
+
 A session can also carry owner metadata, set atomically at creation with
 repeatable `pohunek session new --meta key=value` flags (split on the first
 `=`, so a value may itself contain `=`; a missing `=`, an empty key, or a key

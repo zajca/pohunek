@@ -192,7 +192,11 @@ pub struct Detector {
     latest_cwd_hint: Option<String>,
     process_activity: ProcessActivityScanner,
     needs_visible_recheck: bool,
+    input_reader_prefix: usize,
+    input_reader_enabled: bool,
 }
+
+const BRACKETED_PASTE_MODE: &[u8] = b"\x1b[?2004";
 
 impl Detector {
     #[must_use]
@@ -207,10 +211,26 @@ impl Detector {
             latest_cwd_hint: None,
             process_activity: ProcessActivityScanner::default(),
             needs_visible_recheck: false,
+            input_reader_prefix: 0,
+            input_reader_enabled: false,
         }
     }
 
     pub fn feed(&mut self, now: Instant, bytes: &[u8]) -> Vec<ActivityTransition> {
+        for byte in bytes {
+            if self.input_reader_prefix == BRACKETED_PASTE_MODE.len() {
+                if *byte == b'h' {
+                    self.input_reader_enabled = true;
+                } else if *byte == b'l' {
+                    self.input_reader_enabled = false;
+                }
+                self.input_reader_prefix = usize::from(*byte == BRACKETED_PASTE_MODE[0]);
+            } else if *byte == BRACKETED_PASTE_MODE[self.input_reader_prefix] {
+                self.input_reader_prefix += 1;
+            } else {
+                self.input_reader_prefix = usize::from(*byte == BRACKETED_PASTE_MODE[0]);
+            }
+        }
         let has_process_activity = self.process_activity.observe(bytes);
         let recent_before = self.screen.recent_text();
         let osc_items = self.osc.advance(bytes);
@@ -258,6 +278,18 @@ impl Detector {
         transitions
     }
 
+    /// Whether terminal output identifies an editable agent input reader.
+    #[must_use]
+    pub fn input_ready(&self) -> bool {
+        self.input_reader_enabled
+            || self
+                .manifest_evidence(ContextFreshness::all())
+                .is_some_and(|evidence| {
+                    evidence.activity == AgentActivity::Idle
+                        && evidence.source == StateSource::Screen
+                })
+    }
+
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.screen.resize(rows, cols);
     }
@@ -275,8 +307,9 @@ impl Detector {
     ///
     /// A skipped broadcast chunk may have severed an in-flight escape sequence,
     /// so we discard the OSC parser state, the process-activity scanner state,
-    /// the cached OSC title/progress, and the `vt100` screen grid rather than
-    /// trust any of them. Fresh state repaints on the next agent refresh.
+    /// the cached OSC title/progress, bracketed-paste mode, and the `vt100`
+    /// screen grid rather than trust any of them. Fresh state repaints on the
+    /// next agent refresh.
     pub fn resync_after_lag(&mut self) {
         self.osc.reset();
         self.process_activity.reset();
@@ -285,6 +318,8 @@ impl Detector {
         self.latest_progress = None;
         self.latest_cwd_hint = None;
         self.screen.reset();
+        self.input_reader_prefix = 0;
+        self.input_reader_enabled = false;
         self.needs_visible_recheck = false;
     }
 

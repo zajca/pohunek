@@ -174,13 +174,13 @@ const DEFAULT_OUTPUT_HISTORY_LIMIT_BYTES: usize = 10_000_000;
 /// Overridable via [`SessionRegistryConfig::hook_timeout`].
 const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_mins(5);
 
-/// Default grace period to wait for a freshly spawned agent to produce its first
-/// PTY output before injecting a `session.new --input` prompt. It is an upper
-/// bound, not a fixed delay: the input is sent as soon as the agent emits any
-/// output (proxy for "TUI started, stdin reader ready") or this elapses,
-/// whichever comes first. Overridable via
+/// Default upper bound for a freshly spawned agent to expose an input-ready
+/// prompt or enable bracketed paste before `session.new --input` is injected.
+/// Silent agents use this fallback. It must cover ordinary TUI startup without
+/// delaying agents that publish readiness immediately. Overridable via
 /// [`SessionRegistryConfig::initial_input_startup_grace`].
-const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration = Duration::from_millis(500);
+const DEFAULT_INITIAL_INPUT_STARTUP_GRACE: Duration =
+    pohunek_service_config::DEFAULT_INITIAL_INPUT_STARTUP_GRACE;
 
 /// Default minimum interval between detector "PTY output lag" WARN logs per
 /// session. The first lag in a window logs immediately; further lags are counted
@@ -312,12 +312,10 @@ pub struct SessionRegistryConfig {
     /// runtimes whose descriptor marks it configurable.
     pub submit_delay_overrides: BTreeMap<RuntimeId, Duration>,
     /// Upper bound on how long [`SessionRegistry::create`] waits for a freshly
-    /// spawned agent to emit its first PTY output before injecting a
-    /// `session.new --input` prompt. The wait short-circuits as soon as the
-    /// agent produces any output, so this caps the delay rather than imposing
-    /// it; a value of `Duration::ZERO` disables the gate and injects
-    /// immediately. Prevents the prompt from being delivered to a TUI that has
-    /// not yet entered raw/bracketed-paste input mode.
+    /// spawned agent to show an editable prompt or enable bracketed paste
+    /// before injecting a `session.new --input` prompt. The wait short-circuits
+    /// on that readiness evidence; a silent agent receives input after this
+    /// bound. `Duration::ZERO` injects immediately.
     pub initial_input_startup_grace: Duration,
     /// Control socket path injected into session PTYs so direct or nested agent
     /// hooks can call home. `None` disables hook-handshake env injection (e.g.
@@ -621,6 +619,7 @@ struct SessionEntry {
     detector_resize: watch::Sender<(u16, u16)>,
     detector_config: watch::Sender<DetectorConfigUpdate>,
     detector_preview: mpsc::Sender<DetectionPreviewRequest>,
+    input_ready: watch::Receiver<bool>,
     default_detector_config: DetectorConfig,
     /// Definition this session was launched from: the verified installed
     /// package, or the built-in runtime (also once an official package serves
@@ -690,6 +689,7 @@ struct DetectorInputs {
     resize: watch::Receiver<(u16, u16)>,
     config: watch::Receiver<DetectorConfigUpdate>,
     preview: mpsc::Receiver<DetectionPreviewRequest>,
+    input_ready: watch::Sender<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2499,50 +2499,36 @@ impl SessionRegistry {
         Ok((spec, plan.pending_initial_input))
     }
 
-    /// Wait for a freshly spawned agent to produce its first PTY output before a
+    /// Wait for a freshly spawned agent to expose its input reader before a
     /// `session.new --input` prompt is injected, capped at
     /// [`SessionRegistryConfig::initial_input_startup_grace`].
-    ///
-    /// First output is a robust, agent-agnostic proxy for "the TUI has started
-    /// and its stdin reader is in raw/bracketed-paste mode". The wait
-    /// short-circuits the instant any output arrives (or has already arrived),
-    /// and returns after the grace period even if the agent stays silent, so it
-    /// only ever delays — never blocks — the create round-trip. A zero grace
-    /// disables the gate.
     async fn await_initial_input_readiness(&self, session_id: &SessionId) {
         let grace = self.inner.config.initial_input_startup_grace;
         if grace.is_zero() {
             return;
         }
-        let runtime = {
+        let mut input_ready = {
             let sessions = self.inner.sessions.lock().await;
             let Some(entry) = sessions.get(session_id) else {
                 return;
             };
-            entry.runtime.clone()
+            entry.input_ready.clone()
         };
-
-        match runtime {
-            RuntimeHandle::Worker(worker) => {
-                // Shutdown stops the wait, so the input is delivered while the
-                // create drain still waits for it.
-                let shutdown = self.inner.daemon_shutdown.clone();
-                let _ = tokio::time::timeout(grace, async {
-                    loop {
-                        match worker.inspect().await {
-                            Ok(snapshot) if snapshot.next_offset > 0 => break,
-                            Ok(_) => tokio::select! {
-                                () = shutdown.cancelled() => break,
-                                () = tokio::time::sleep(WORKER_CONNECT_RETRY) => {}
-                            },
-                            Err(_) => break,
-                        }
+        let shutdown = self.inner.daemon_shutdown.clone();
+        let _ = tokio::time::timeout(grace, async {
+            let mut detector_open = true;
+            while !*input_ready.borrow() {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    changed = input_ready.changed(), if detector_open => {
+                        // A stopped detector has no readiness evidence; the
+                        // outer deadline still bounds the fallback.
+                        detector_open = changed.is_ok();
                     }
-                })
-                .await;
+                }
             }
-            RuntimeHandle::Unavailable(_) => {}
-        }
+        })
+        .await;
     }
 
     /// Roll back a session whose initial `--input` could not be delivered or

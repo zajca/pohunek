@@ -58,6 +58,7 @@ impl SessionRegistry {
             resize: mut resize_rx,
             config: mut detector_config_rx,
             preview: mut preview_rx,
+            input_ready,
         } = inputs;
         let registry = self.clone();
         tokio::spawn(async move {
@@ -85,6 +86,7 @@ impl SessionRegistry {
                             &mut applied_config_generation,
                             update,
                         );
+                        input_ready.send_replace(detector.input_ready());
                     }
                     request = preview_rx.recv() => {
                         let Some(request) = request else {
@@ -99,6 +101,7 @@ impl SessionRegistry {
                         );
                     }
                     _ = tick.tick() => {
+                        input_ready.send_replace(detector.input_ready());
                         for transition in detector.tick(crate::time::now()) {
                             registry
                                 .record_detector_activity(&id, &runtime, transition)
@@ -120,7 +123,9 @@ impl SessionRegistry {
                     received = output_rx.recv() => {
                         match received {
                             Ok(chunk) => {
-                                for transition in detector.feed(crate::time::now(), &chunk) {
+                                let transitions = detector.feed(crate::time::now(), &chunk);
+                                input_ready.send_replace(detector.input_ready());
+                                for transition in transitions {
                                     registry
                                         .record_detector_activity(&id, &runtime, transition)
                                         .await;
@@ -138,6 +143,7 @@ impl SessionRegistry {
                                     log_lag_warn(&id, warn_kind);
                                 }
                                 detector.resync_after_lag();
+                                input_ready.send_replace(false);
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
@@ -441,6 +447,7 @@ mod tests {
             config,
         });
         let (_preview_tx, preview_rx) = mpsc::channel(1);
+        let (input_ready, _ready_rx) = watch::channel(false);
         let cancel = CancellationToken::new();
         registry.spawn_detector(DetectorInputs {
             scope: DetectorScope {
@@ -454,6 +461,7 @@ mod tests {
             resize: resize_rx,
             config: config_rx,
             preview: preview_rx,
+            input_ready,
         });
 
         tokio::time::pause();

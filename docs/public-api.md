@@ -2388,6 +2388,9 @@ runtime coordinates before dialing. `session wait` and waiting `session output`
 use the Rust SDK's dedicated connections and preserve inherited request-origin
 markers. `session new --request-timeout-ms <u32>` overrides the response deadline
 for that creation request; zero is rejected.
+Initial input waits for an editable prompt or bracketed-paste enable signal,
+up to the bounded startup grace for a silent agent; the body and submit key
+are sent as separate PTY writes under the runtime input rules.
 
 For example, keep untrusted prompt text out of argv by writing it on stdin:
 

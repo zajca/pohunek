@@ -3445,6 +3445,7 @@ impl SessionRegistry {
             config: default_detector_config.clone(),
         });
         let (detector_preview, detector_preview_rx) = mpsc::channel(1);
+        let (input_ready_tx, input_ready) = watch::channel(false);
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
@@ -3458,6 +3459,7 @@ impl SessionRegistry {
             detector_resize,
             detector_config,
             detector_preview,
+            input_ready,
             default_detector_config,
             pinned: self
                 .inner
@@ -3499,6 +3501,7 @@ impl SessionRegistry {
             resize: detector_resize_rx,
             config: detector_config_rx,
             preview: detector_preview_rx,
+            input_ready: input_ready_tx,
         });
         if !root_missing_during_drain {
             self.spawn_procwatch(
@@ -3677,6 +3680,7 @@ impl SessionRegistry {
             config: default_detector_config.clone(),
         });
         let (detector_preview, _) = mpsc::channel::<super::DetectionPreviewRequest>(1);
+        let (_, input_ready) = watch::channel(false);
         let info = record.info.clone();
         let entry = SessionEntry {
             info: info.clone(),
@@ -3694,6 +3698,7 @@ impl SessionRegistry {
             detector_resize,
             detector_config,
             detector_preview,
+            input_ready,
             default_detector_config,
             pinned: self
                 .inner
