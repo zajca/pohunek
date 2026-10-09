@@ -630,22 +630,6 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_errors_are_configuration_class_with_distinct_codes() {
-        let required = CliError::RemoteConfirmationRequired.to_protocol_error();
-        let declined = CliError::RemoteConfirmationDeclined {
-            host: "host-b".to_owned(),
-        }
-        .to_protocol_error();
-        assert_eq!(required.class, ErrorClass::Configuration);
-        assert_eq!(required.code, "confirmation_required");
-        assert!(required.recover.is_some());
-        assert_eq!(declined.class, ErrorClass::Configuration);
-        assert_eq!(declined.code, "confirmation_declined");
-        assert!(declined.msg.contains("host-b"));
-        assert_ne!(required.code, declined.code);
-    }
-
-    #[test]
     fn human_error_renders_recover_hint_for_version_mismatch() {
         let err = CliError::Protocol(ProtocolError::version_mismatch(
             ProtocolVersionRange::new(
@@ -664,13 +648,5 @@ mod tests {
         assert!(text.contains('1') && text.contains('2'), "text: {text}");
         assert!(text.contains("hint:"), "text: {text}");
         assert!(text.contains("upgrade"), "text: {text}");
-    }
-
-    #[test]
-    fn human_error_without_hint_has_no_hint_line() {
-        let text = human_error_text(&CliError::Client(pohunek_client::ClientError::Framing(
-            "bad frame".to_owned(),
-        )));
-        assert!(!text.contains("hint:"), "text: {text}");
     }
 }

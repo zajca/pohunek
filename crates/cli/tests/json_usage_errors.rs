@@ -1,16 +1,19 @@
 //! End-to-end: clap argument-parse failures honor `--json`.
 //!
 //! These drive the real `pohunek` binary (located through `pohunek_test_support::bin_exe`) at
-//! the argument-parsing and origin-environment validation layers. Commands fail
-//! before any daemon connection or filesystem access and use a private
-//! environment, so no socket or host state is needed.
+//! the argument-parsing and origin-environment validation layers. Most commands
+//! fail before a daemon connection. The duplicate-metadata case binds a private
+//! socket to prove that no request is sent after connecting. Every case uses a
+//! private environment and leaves host state untouched.
 //!
 //! They lock in the milestone-10 `DoD` #2 contract for the one path that used to
 //! escape it: a usage error under `--json` must print a single structured
 //! versioned `{cli_version, protocol, err}` document to stdout (nothing human leaking) and
 //! exit non-zero, so automation can branch on `code`.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::UnixListener;
 use std::process::{Command, Stdio};
 
 use pohunek_test_support::env::TestEnv;
@@ -83,6 +86,96 @@ fn session_new_rejects_malformed_metadata_at_the_cli_process_boundary() {
         &["session", "new", "--meta", "no-equals-sign", "--json"],
         "--meta",
     );
+}
+
+#[test]
+fn session_new_rejects_duplicate_metadata_before_sending_a_request() {
+    let env = TestEnv::new().expect("private CLI environment");
+    let runtime = env.runtime_dir().join("pohunek");
+    std::fs::create_dir(&runtime).expect("create daemon socket directory");
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700))
+        .expect("make socket directory private");
+    let listener = UnixListener::bind(runtime.join("daemon.sock")).expect("bind daemon socket");
+
+    let output = env
+        .command(pohunek_test_support::bin_exe("pohunek"))
+        .args([
+            "session",
+            "new",
+            "--agent",
+            "shell",
+            "--meta",
+            "link.provider=github",
+            "--meta",
+            "link.provider=linear",
+            "--json",
+        ])
+        .output()
+        .expect("run CLI");
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON error document");
+    assert_eq!(document["err"]["class"], "configuration");
+    assert_eq!(document["err"]["code"], "cli_usage");
+    assert!(document["err"]["msg"]
+        .as_str()
+        .is_some_and(|message| message.contains("link.provider")));
+    assert!(document["err"]["recover"].is_string());
+
+    listener.set_nonblocking(true).expect("nonblocking accept");
+    let (mut connection, _) = listener.accept().expect("the CLI connected to the socket");
+    connection.set_nonblocking(true).expect("nonblocking read");
+    let mut request = [0; 1];
+    assert_eq!(connection.read(&mut request).expect("read socket"), 0);
+}
+
+#[test]
+fn remote_session_confirmation_reports_distinct_machine_and_human_failures() {
+    let arguments = [
+        "--host",
+        "host-b",
+        "session",
+        "new",
+        "--agent",
+        "shell",
+        "--project",
+        "ui",
+    ];
+    let machine = pohunek()
+        .args(arguments)
+        .arg("--json")
+        .output()
+        .expect("run noninteractive remote start");
+    assert_eq!(machine.status.code(), Some(1), "{machine:?}");
+    assert!(machine.stderr.is_empty(), "{machine:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&machine.stdout).expect("one JSON error document");
+    assert_eq!(document["err"]["class"], "configuration");
+    assert_eq!(document["err"]["code"], "confirmation_required");
+    assert!(document["err"]["recover"].is_string());
+
+    let mut human = pohunek()
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start interactive remote command");
+    human
+        .stdin
+        .take()
+        .expect("prompt input")
+        .write_all(b"n\n")
+        .expect("decline remote start");
+    let declined = human.wait_with_output().expect("collect declined command");
+    assert_eq!(declined.status.code(), Some(1), "{declined:?}");
+    assert!(declined.stdout.is_empty(), "{declined:?}");
+    let stderr = String::from_utf8(declined.stderr).expect("UTF-8 human error");
+    assert!(stderr.contains("host-b"), "{stderr}");
+    assert!(stderr.contains("was not confirmed"), "{stderr}");
+    assert!(stderr.contains("hint:"), "{stderr}");
 }
 
 #[test]
