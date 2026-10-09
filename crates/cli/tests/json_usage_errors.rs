@@ -30,6 +30,98 @@ fn pohunek() -> Command {
     TEST_ENV.with(|env| env.command(pohunek_test_support::bin_exe("pohunek")))
 }
 
+fn assert_json_usage_error(arguments: &[&str], message_fragment: &str) {
+    let output = pohunek().args(arguments).output().expect("spawn pohunek");
+    assert_eq!(output.status.code(), Some(2), "{arguments:?}: {output:?}");
+    assert!(output.stderr.is_empty(), "{arguments:?}: {output:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON error document");
+    assert_eq!(document["err"]["code"], "cli_usage", "{arguments:?}");
+    assert_eq!(document["err"]["class"], "configuration", "{arguments:?}");
+    assert!(
+        document["err"]["msg"]
+            .as_str()
+            .is_some_and(|message| message.contains(message_fragment)),
+        "{arguments:?}: expected {message_fragment:?} in {document:?}"
+    );
+}
+
+#[test]
+fn assistant_rejects_project_and_repo_at_the_cli_process_boundary() {
+    assert_json_usage_error(
+        &[
+            "assistant",
+            "--project",
+            "ui",
+            "--repo",
+            "/srv/repo",
+            "--json",
+        ],
+        "cannot be used with",
+    );
+}
+
+#[test]
+fn session_new_rejects_conflicting_repository_selectors_at_the_cli_process_boundary() {
+    assert_json_usage_error(
+        &[
+            "session",
+            "new",
+            "--project",
+            "ui",
+            "--repo",
+            "/x",
+            "--json",
+        ],
+        "cannot be used with",
+    );
+}
+
+#[test]
+fn session_new_rejects_malformed_metadata_at_the_cli_process_boundary() {
+    assert_json_usage_error(
+        &["session", "new", "--meta", "no-equals-sign", "--json"],
+        "--meta",
+    );
+}
+
+#[test]
+fn session_new_rejects_mixed_input_sources_at_the_cli_process_boundary() {
+    assert_json_usage_error(
+        &[
+            "session",
+            "new",
+            "--input",
+            "secret",
+            "--input-stdin",
+            "--json",
+        ],
+        "cannot be used with",
+    );
+}
+
+#[test]
+fn session_input_timeout_names_the_user_facing_flag_at_the_cli_process_boundary() {
+    let arguments = [
+        "session",
+        "input",
+        "s-42",
+        "hello",
+        "--timeout",
+        "0",
+        "--json",
+    ];
+    let output = pohunek().args(arguments).output().expect("spawn pohunek");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let document: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON error document");
+    assert_eq!(document["err"]["code"], "cli_usage");
+    let message = document["err"]["msg"].as_str().expect("usage message");
+    assert!(message.contains("--timeout must be between 1 and 8000"));
+    assert!(!message.contains("--timeout-ms"));
+}
+
 #[test]
 fn missing_required_arg_under_json_is_structured_and_nonzero() {
     // `session inspect --json` — required <target> omitted (case 1 from the bug).
