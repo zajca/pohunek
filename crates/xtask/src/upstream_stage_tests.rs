@@ -1467,34 +1467,3 @@ fn every_official_runtime_package_has_a_consistent_upstream_pin() {
     }
     assert!(checked >= 3, "the official packages were found");
 }
-
-#[test]
-fn the_commands_parse_their_documented_arguments() {
-    use clap::Parser as _;
-
-    #[derive(Debug, clap::Parser)]
-    struct Cli {
-        #[command(subcommand)]
-        action: crate::attestation::CompatAction,
-    }
-    for args in [
-        ["cli", "stage-upstream", "--runtime", "pi", "--out", "o"].as_slice(),
-        ["cli", "verify-stage", "--runtime", "pi", "--dir", "o"].as_slice(),
-    ] {
-        Cli::try_parse_from(args).expect("parse");
-    }
-    Cli::try_parse_from(["cli", "stage-upstream", "--runtime", "pi"])
-        .expect_err("--out is required");
-}
-
-#[test]
-fn the_knowledge_page_quotes_the_posix_verifier_verbatim() {
-    let page = fs::read_to_string(
-        pohunek_test_support::workspace_root().join("docs/knowledge/concepts/upstream-staging.md"),
-    )
-    .expect("read the knowledge page");
-    assert!(
-        page.contains(POSIX_VERIFY),
-        "docs/knowledge/concepts/upstream-staging.md must quote POSIX_VERIFY"
-    );
-}

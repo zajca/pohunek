@@ -96,9 +96,8 @@ const RELEASE_PLACEHOLDER: &str = "{release}";
 /// `iconv`, `tr` and `wc`, so the network-isolated namespace can run it with
 /// no Rust tooling. It refuses a modified, added or removed file, a file
 /// replaced by a link, a retargeted link and a changed executable bit.
-/// `docs/knowledge/concepts/upstream-staging.md` quotes it verbatim; a test
-/// keeps the two equal and runs it against drifted stages.
-#[cfg(test)]
+/// `docs/knowledge/concepts/upstream-staging.md` quotes it verbatim; the docs
+/// check keeps the two equal, and staging scenarios run it against drifted trees.
 pub(crate) const POSIX_VERIFY: &str = r#"set -eu
 [ -d "$1" ] && [ ! -h "$1" ] || exit 1
 cd "$1"
