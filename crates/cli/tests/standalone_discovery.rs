@@ -1,5 +1,5 @@
 use std::fs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::fs::PermissionsExt as _;
 
 use pohunek_test_support::env::TestEnv;
@@ -218,6 +218,68 @@ fn discovery_bounds_unicode_errors_from_the_netbird_process() {
     assert!(message.ends_with('…'), "error detail was not truncated");
     assert!(!message.contains('�'), "Unicode must stay valid");
     assert!(message.len() < detail.len(), "error detail must be bounded");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn discovery_uses_only_trusted_home_fallback_executables() {
+    let env = TestEnv::new().expect("create the hermetic test environment");
+    let local_bin = env.home().join(".local/bin");
+    let cargo_bin = env.home().join(".cargo/bin");
+    fs::create_dir_all(&local_bin).expect("create first fallback directory");
+    fs::create_dir_all(&cargo_bin).expect("create second fallback directory");
+    let local_marker = env.root().join("local-ran");
+    let cargo_marker = env.root().join("cargo-ran");
+    let local = local_bin.join("netbird");
+    pohunek_test_support::fs::write_executable(
+        &local,
+        format!(
+            "#!/bin/sh\nprintf 'local' >> '{}'\nprintf '%s\\n' '{{\"peers\":[]}}'\n",
+            local_marker.display()
+        ),
+    )
+    .expect("write first fallback executable");
+    pohunek_test_support::fs::write_executable(
+        cargo_bin.join("netbird"),
+        format!(
+            "#!/bin/sh\nprintf 'cargo' >> '{}'\nprintf '%s\\n' '{{\"peers\":[]}}'\n",
+            cargo_marker.display()
+        ),
+    )
+    .expect("write second fallback executable");
+
+    let run = || {
+        let output = env
+            .command(pohunek_test_support::bin_exe("pohunek"))
+            .args(["host", "discover", "--refresh", "--json"])
+            .env("PATH", "")
+            .output()
+            .expect("run CLI discovery");
+        assert!(
+            output.status.success(),
+            "fallback discovery failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run();
+    assert_eq!(
+        fs::read_to_string(&local_marker).expect("first fallback ran"),
+        "local"
+    );
+    assert!(!cargo_marker.exists());
+
+    fs::set_permissions(&local, fs::Permissions::from_mode(0o777))
+        .expect("make first fallback executable untrusted");
+    run();
+    assert_eq!(
+        fs::read_to_string(&local_marker).expect("first fallback marker"),
+        "local"
+    );
+    assert_eq!(
+        fs::read_to_string(&cargo_marker).expect("second fallback ran"),
+        "cargo"
+    );
 }
 
 #[test]

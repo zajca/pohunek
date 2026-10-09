@@ -437,55 +437,6 @@ fn clamp(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    const STATUS_CURRENT: &str = include_str!("../tests/fixtures/status_current.json");
-
-    /// A private directory (canonical, mode 0700) holding a fake `netbird`
-    /// that prints `body` and exits 0, with `mode` as the file's permissions.
-    fn fake_netbird(tag: &str, body: &str, mode: u32) -> (tempfile::TempDir, PathBuf) {
-        let dir = pohunek_test_support::tempdir_with_prefix(&format!("pohunek-netbird-{tag}-"))
-            .expect("private test root");
-        let program = dir.path().join("netbird");
-        // The helper keeps a write descriptor from leaking into a concurrent
-        // fork, which would make executing the script fail with `ETXTBSY`.
-        pohunek_test_support::fs::write_file(
-            &program,
-            format!("#!/bin/sh\ncat <<'EOF'\n{body}\nEOF\n"),
-        )
-        .expect("script");
-        fs::set_permissions(&program, fs::Permissions::from_mode(mode)).expect("chmod");
-        (dir, program)
-    }
-
-    #[test]
-    fn a_minimal_path_falls_back_to_the_trusted_install_directories() {
-        let (dir, program) = fake_netbird("fallback", STATUS_CURRENT, 0o755);
-        let table = [dir.path().to_str().expect("utf8 root")];
-        let minimal = OsStr::new("/nonexistent-minimal-path");
-        assert_eq!(
-            resolve_program(Some(minimal), &table, None).expect("fallback netbird"),
-            program
-        );
-        // The PATH wins over the fallback when both hold a netbird.
-        let (preferred, preferred_program) = fake_netbird("preferred", STATUS_CURRENT, 0o755);
-        assert_eq!(
-            resolve_program(Some(preferred.path().as_os_str()), &table, None)
-                .expect("path netbird"),
-            preferred_program
-        );
-    }
-
-    #[test]
-    fn the_fallback_directories_obey_the_trust_policy() {
-        let (loose, _) = fake_netbird("fallback-loose", STATUS_CURRENT, 0o777);
-        let table = [loose.path().to_str().expect("utf8 root")];
-        assert!(matches!(
-            resolve_program(None, &table, None),
-            Err(NetbirdError::CliMissing)
-        ));
-    }
 
     #[test]
     fn a_stalled_lookup_neither_holds_the_future_nor_the_runtime() {
@@ -523,21 +474,5 @@ mod tests {
             "shutdown waited for the lookup"
         );
         drop(release);
-    }
-
-    #[tokio::test]
-    async fn healthy_concurrent_lookups_all_complete() {
-        static GATE: Semaphore = Semaphore::const_new(1);
-        let (_dir, program) = fake_netbird("concurrent", STATUS_CURRENT, 0o755);
-        let lookups: Vec<_> = (0..4)
-            .map(|_| {
-                let program = program.clone();
-                tokio::spawn(run_status_async_resolving(&GATE, move || Ok(program)))
-            })
-            .collect();
-        for lookup in lookups {
-            let status = lookup.await.expect("task").expect("status");
-            assert!(status.self_netbird_ip().is_some());
-        }
     }
 }

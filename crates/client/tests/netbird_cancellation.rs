@@ -81,3 +81,31 @@ async fn cancelling_discovery_kills_the_active_netbird_status_process() {
     .await;
     drop(process_env);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_discovery_calls_complete_through_one_netbird_provider() {
+    let root = pohunek_test_support::tempdir_with_prefix("pohunek-netbird-concurrent-")
+        .expect("private test root");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&bin).expect("create fixture bin");
+    pohunek_test_support::fs::write_executable(
+        bin.join("netbird"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"netbirdIp\":\"100.64.0.1\",\"peers\":[]}'\n",
+    )
+    .expect("write healthy NetBird fixture");
+
+    let mut process_env = ProcessEnv::lock();
+    process_env.set("PATH", bin.as_os_str());
+    process_env.remove("POHUNEK_REMOTE_PORT");
+    let registry = default_overlay_registry().expect("production NetBird registry");
+    let options = DiscoveryOptions::new().with_origin_source(OriginSource::Omitted);
+    let (first, second, third, fourth) = tokio::join!(
+        discover_hosts_with_options(&registry, options),
+        discover_hosts_with_options(&registry, options),
+        discover_hosts_with_options(&registry, options),
+        discover_hosts_with_options(&registry, options),
+    );
+    for result in [first, second, third, fourth] {
+        assert!(result.expect("concurrent discovery completed").is_empty());
+    }
+}
